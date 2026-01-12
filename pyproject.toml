@@ -1,10 +1,10 @@
 [project]
 name = "claude-swap"
-version = "0.2.1"
+version = "0.3.0"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["keyring>=25.0.0"]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
 keywords = ["claude", "claude-code", "account-switcher", "cli"]
@@ -14,6 +14,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",

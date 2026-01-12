@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform as platform_module
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -21,6 +22,7 @@ class Platform(Enum):
     MACOS = auto()
     LINUX = auto()
     WSL = auto()
+    WINDOWS = auto()
     UNKNOWN = auto()
 
     @classmethod
@@ -29,6 +31,8 @@ class Platform(Enum):
         system = platform_module.system()
         if system == "Darwin":
             return cls.MACOS
+        elif system == "Windows":
+            return cls.WINDOWS
         elif system == "Linux":
             if os.environ.get("WSL_DISTRO_NAME"):
                 return cls.WSL
@@ -92,7 +96,8 @@ class SwitchTransaction:
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
                     self.config_path.write_text(self.original_config)
-                    os.chmod(self.config_path, 0o600)
+                    if sys.platform != "win32":
+                        os.chmod(self.config_path, 0o600)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:
