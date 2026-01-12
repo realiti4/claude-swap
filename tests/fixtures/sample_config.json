@@ -1,0 +1,6 @@
+{
+  "oauthAccount": {
+    "emailAddress": "test@example.com",
+    "accountUuid": "test-uuid-1234-5678"
+  }
+}

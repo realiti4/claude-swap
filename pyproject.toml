@@ -1,7 +1,46 @@
 [project]
-name = "claude-switch"
-version = "0.1.0"
-description = "Add your description here"
+name = "claude-swap"
+version = "0.2.0"
+description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
+license = {text = "MIT"}
+keywords = ["claude", "claude-code", "account-switcher", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/realiti4/claude-swap"
+Repository = "https://github.com/realiti4/claude-swap"
+Issues = "https://github.com/realiti4/claude-swap/issues"
+
+[project.scripts]
+claude-swap = "claude_swap.cli:main"
+cswap = "claude_swap.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_swap"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
