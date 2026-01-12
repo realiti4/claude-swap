@@ -711,6 +711,11 @@ class ClaudeAccountSwitcher:
 
         # Remove backup directory
         if self.backup_dir.exists():
+            # Close log handlers before deleting (required on Windows)
+            for handler in self._logger.handlers[:]:
+                handler.close()
+                self._logger.removeHandler(handler)
+
             shutil.rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")
 

@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "cswap --list",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "claude_swap.cli",
+            "args": ["--list"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "cswap --purge",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "claude_swap.cli",
+            "args": ["--purge"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "cswap (custom args)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "claude_swap.cli",
+            "args": ["${input:cliArgs}"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "cliArgs",
+            "type": "promptString",
+            "description": "CLI arguments (e.g., --list, --status, --switch)"
+        }
+    ]
+}
