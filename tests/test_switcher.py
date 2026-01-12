@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -74,6 +75,11 @@ class TestPlatformDetection:
         assert Platform.detect() == Platform.WSL
 
     @patch("platform.system", return_value="Windows")
+    def test_windows_detection(self, mock_system, temp_home: Path):
+        """Test Windows platform detection."""
+        assert Platform.detect() == Platform.WINDOWS
+
+    @patch("platform.system", return_value="FreeBSD")
     def test_unknown_platform(self, mock_system, temp_home: Path):
         """Test unknown platform detection."""
         assert Platform.detect() == Platform.UNKNOWN
@@ -112,6 +118,7 @@ class TestJsonOperations:
         result = switcher._read_json(test_path)
         assert result is None
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="File permissions work differently on Windows")
     def test_json_file_permissions(self, temp_home: Path):
         """Test that JSON files are written with correct permissions."""
         switcher = ClaudeAccountSwitcher()
@@ -218,6 +225,7 @@ class TestDirectorySetup:
         assert switcher.configs_dir.exists()
         assert switcher.credentials_dir.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="File permissions work differently on Windows")
     def test_directory_permissions(self, temp_home: Path):
         """Test that directories have correct permissions."""
         switcher = ClaudeAccountSwitcher()

@@ -22,9 +22,12 @@ def temp_home(tmp_path: Path):
     claude_dir = home / ".claude"
     claude_dir.mkdir()
 
-    # Patch HOME environment variable
-    with patch.dict(os.environ, {"HOME": str(home)}):
-        yield home
+    # Patch HOME environment variable (and USERPROFILE for Windows)
+    env_patch = {"HOME": str(home), "USERPROFILE": str(home)}
+    with patch.dict(os.environ, env_patch):
+        # Also patch Path.home() directly for cross-platform compatibility
+        with patch("pathlib.Path.home", return_value=home):
+            yield home
 
 
 @pytest.fixture

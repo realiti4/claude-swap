@@ -73,15 +73,15 @@ cswap --purge             # Remove all claude-swap data
 
 - Backs up OAuth tokens and config when you add an account
 - Swaps credentials when you switch accounts
-- On macOS: credentials stored in Keychain (encrypted)
-- On Linux: credentials stored in `~/.claude-swap-backup/` (file permissions 600)
+- Account credentials stored securely in the system keyring (Windows Credential Manager, macOS Keychain, or Linux Secret Service)
 
 ## Data locations
 
 | Platform | Credentials | Config backups |
 |----------|-------------|----------------|
-| macOS | Keychain (`Claude Code-Account-*`) | `~/.claude-swap-backup/` |
-| Linux | `~/.claude-swap-backup/credentials/` | `~/.claude-swap-backup/configs/` |
+| Windows | Windows Credential Manager | `~/.claude-swap-backup/` |
+| macOS | macOS Keychain | `~/.claude-swap-backup/` |
+| Linux | System keyring (Secret Service) | `~/.claude-swap-backup/` |
 
 ## Uninstall
 

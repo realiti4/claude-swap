@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-import fcntl
+import sys
 import time
 from pathlib import Path
 from typing import IO
+
+# Platform-specific imports for file locking
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from claude_swap.exceptions import LockError
 
 
 class FileLock:
-    """Cross-process file lock using fcntl."""
+    """Cross-process file lock using platform-specific APIs."""
 
     def __init__(self, lock_path: Path):
         self.lock_path = lock_path
@@ -33,10 +39,15 @@ class FileLock:
         start = time.monotonic()
         while True:
             try:
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if sys.platform == "win32":
+                    # Windows: use msvcrt for file locking
+                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    # POSIX: use fcntl for file locking
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self._locked = True
                 return True
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 if time.monotonic() - start > timeout:
                     self._lock_file.close()
                     self._lock_file = None
@@ -46,7 +57,15 @@ class FileLock:
     def release(self) -> None:
         """Release the lock."""
         if self._lock_file and self._locked:
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                # Windows: unlock using msvcrt
+                try:
+                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # File may already be unlocked
+            else:
+                # POSIX: unlock using fcntl
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
             self._lock_file.close()
             self._lock_file = None
             self._locked = False

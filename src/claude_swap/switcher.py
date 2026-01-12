@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import keyring
+
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -22,6 +24,10 @@ from claude_swap.exceptions import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
+
+# Service name for keyring storage
+KEYRING_SERVICE = "claude-code"
+KEYRING_ACTIVE_USERNAME = "active-credentials"
 
 
 class ClaudeAccountSwitcher:
@@ -39,11 +45,19 @@ class ClaudeAccountSwitcher:
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
-        # Check for Docker environment file
+        # Check environment variables (works on all platforms)
+        if os.environ.get("CONTAINER") or os.environ.get("container"):
+            return True
+
+        # Windows doesn't have the same container indicators
+        if self.platform == Platform.WINDOWS:
+            return False
+
+        # Check for Docker environment file (Linux/macOS)
         if Path("/.dockerenv").exists():
             return True
 
-        # Check cgroup for container indicators
+        # Check cgroup for container indicators (Linux)
         cgroup_path = Path("/proc/1/cgroup")
         if cgroup_path.exists():
             try:
@@ -56,7 +70,7 @@ class ClaudeAccountSwitcher:
             except PermissionError:
                 pass
 
-        # Check mount info
+        # Check mount info (Linux)
         mountinfo_path = Path("/proc/self/mountinfo")
         if mountinfo_path.exists():
             try:
@@ -65,10 +79,6 @@ class ClaudeAccountSwitcher:
                     return True
             except PermissionError:
                 pass
-
-        # Check environment variables
-        if os.environ.get("CONTAINER") or os.environ.get("container"):
-            return True
 
         return False
 
@@ -96,7 +106,8 @@ class ClaudeAccountSwitcher:
         """Create backup directories with proper permissions."""
         for directory in [self.backup_dir, self.configs_dir, self.credentials_dir]:
             directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
+            if sys.platform != "win32":
+                os.chmod(directory, 0o700)
 
     def _read_json(self, path: Path) -> dict | None:
         """Read and parse JSON file."""
@@ -125,10 +136,15 @@ class ClaudeAccountSwitcher:
 
         # Move to final location
         shutil.move(str(temp_path), str(path))
-        os.chmod(path, 0o600)
+        if sys.platform != "win32":
+            os.chmod(path, 0o600)
 
     def _read_credentials(self) -> str | None:
-        """Read credentials based on platform.
+        """Read credentials from Claude Code's storage.
+
+        Claude Code stores credentials in:
+        - macOS: Keychain with service "Claude Code-credentials"
+        - Linux/WSL/Windows: File at ~/.claude/.credentials.json
 
         Returns:
             Credentials string if found, empty string if not found, None on error.
@@ -156,7 +172,7 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.error(f"Unexpected error reading credentials: {e}")
                 return None
-        else:  # linux/wsl
+        else:  # Linux/WSL/Windows - credentials stored in file
             cred_file = self.home / ".claude" / ".credentials.json"
             if cred_file.exists():
                 try:
@@ -167,7 +183,11 @@ class ClaudeAccountSwitcher:
             return ""
 
     def _write_credentials(self, credentials: str) -> None:
-        """Write credentials based on platform.
+        """Write credentials to Claude Code's storage.
+
+        Claude Code stores credentials in:
+        - macOS: Keychain with service "Claude Code-credentials"
+        - Linux/WSL/Windows: File at ~/.claude/.credentials.json
 
         Raises:
             CredentialWriteError: If writing credentials fails.
@@ -192,95 +212,46 @@ class ClaudeAccountSwitcher:
                 raise CredentialWriteError(
                     f"Failed to write credentials: {result.stderr}"
                 )
-        else:  # linux/wsl
+        else:  # Linux/WSL/Windows - credentials stored in file
             cred_dir = self.home / ".claude"
             cred_dir.mkdir(parents=True, exist_ok=True)
             cred_file = cred_dir / ".credentials.json"
             try:
                 cred_file.write_text(credentials)
-                os.chmod(cred_file, 0o600)
+                if sys.platform != "win32":
+                    os.chmod(cred_file, 0o600)
             except Exception as e:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
-        """Read account credentials from backup."""
-        if self.platform == Platform.MACOS:
-            try:
-                result = subprocess.run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        f"Claude Code-Account-{account_num}-{email}",
-                        "-w",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                return result.stdout.strip()
-            except subprocess.CalledProcessError:
-                return ""
-        else:
-            cred_file = (
-                self.credentials_dir
-                / f".claude-credentials-{account_num}-{email}.json"
-            )
-            if cred_file.exists():
-                return cred_file.read_text()
+        """Read account credentials from backup using keyring."""
+        username = f"account-{account_num}-{email}"
+        try:
+            creds = keyring.get_password(KEYRING_SERVICE, username)
+            return creds if creds else ""
+        except Exception as e:
+            self._logger.warning(f"Failed to read credentials from keyring: {e}")
             return ""
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
-        """Write account credentials to backup."""
-        if self.platform == Platform.MACOS:
-            result = subprocess.run(
-                [
-                    "security",
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    f"Claude Code-Account-{account_num}-{email}",
-                    "-a",
-                    os.environ.get("USER", "user"),
-                    "-w",
-                    credentials,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                self._logger.warning(
-                    f"Failed to write account credentials: {result.stderr}"
-                )
-        else:
-            cred_file = (
-                self.credentials_dir
-                / f".claude-credentials-{account_num}-{email}.json"
-            )
-            cred_file.write_text(credentials)
-            os.chmod(cred_file, 0o600)
+        """Write account credentials to backup using keyring."""
+        username = f"account-{account_num}-{email}"
+        try:
+            keyring.set_password(KEYRING_SERVICE, username, credentials)
+        except Exception as e:
+            self._logger.warning(f"Failed to write credentials to keyring: {e}")
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
-        """Delete account credentials from backup."""
-        if self.platform == Platform.MACOS:
-            subprocess.run(
-                [
-                    "security",
-                    "delete-generic-password",
-                    "-s",
-                    f"Claude Code-Account-{account_num}-{email}",
-                ],
-                capture_output=True,
-            )
-        else:
-            cred_file = (
-                self.credentials_dir
-                / f".claude-credentials-{account_num}-{email}.json"
-            )
-            if cred_file.exists():
-                cred_file.unlink()
+        """Delete account credentials from backup using keyring."""
+        username = f"account-{account_num}-{email}"
+        try:
+            keyring.delete_password(KEYRING_SERVICE, username)
+        except keyring.errors.PasswordDeleteError:
+            pass  # Credential doesn't exist, that's fine
+        except Exception as e:
+            self._logger.warning(f"Failed to delete credentials from keyring: {e}")
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -295,7 +266,8 @@ class ClaudeAccountSwitcher:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         config_file.write_text(config)
-        os.chmod(config_file, 0o600)
+        if sys.platform != "win32":
+            os.chmod(config_file, 0o600)
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
@@ -706,15 +678,12 @@ class ClaudeAccountSwitcher:
         """Remove all traces of claude-swap from the system.
 
         This removes:
-        - All keychain entries (macOS) or credential files (Linux)
+        - All stored account credentials from the system keyring
         - The ~/.claude-swap-backup directory and all its contents
         """
         print("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
-        if self.platform == Platform.MACOS:
-            print("  - All 'Claude Code-Account-*' keychain entries")
-        else:
-            print(f"  - All credential files in {self.credentials_dir}")
+        print("  - All stored account credentials from the system keyring")
         print()
         print("Note: This does NOT affect your current Claude Code login.")
         print()
@@ -726,22 +695,27 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # Remove keychain entries on macOS
-        if self.platform == Platform.MACOS:
-            data = self._get_sequence_data()
-            if data:
-                for account_num, account_info in data.get("accounts", {}).items():
-                    email = account_info.get("email", "")
-                    service_name = f"Claude Code-Account-{account_num}-{email}"
-                    result = subprocess.run(
-                        ["security", "delete-generic-password", "-s", service_name],
-                        capture_output=True,
-                    )
-                    if result.returncode == 0:
-                        removed_items.append(f"Keychain: {service_name}")
+        # Remove credentials from keyring
+        data = self._get_sequence_data()
+        if data:
+            for account_num, account_info in data.get("accounts", {}).items():
+                email = account_info.get("email", "")
+                username = f"account-{account_num}-{email}"
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, username)
+                    removed_items.append(f"Credential: {username}")
+                except keyring.errors.PasswordDeleteError:
+                    pass  # Credential doesn't exist
+                except Exception:
+                    pass  # Ignore other errors during purge
 
         # Remove backup directory
         if self.backup_dir.exists():
+            # Close log handlers before deleting (required on Windows)
+            for handler in self._logger.handlers[:]:
+                handler.close()
+                self._logger.removeHandler(handler)
+
             shutil.rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")
 

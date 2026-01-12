@@ -83,10 +83,11 @@ Examples:
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
 
-    # Check for root (unless in container)
-    if os.geteuid() == 0 and not switcher._is_running_in_container():
-        print("Error: Do not run this script as root (unless running in a container)")
-        sys.exit(1)
+    # Check for root (unless in container) - POSIX only
+    if sys.platform != "win32":
+        if os.geteuid() == 0 and not switcher._is_running_in_container():
+            print("Error: Do not run this script as root (unless running in a container)")
+            sys.exit(1)
 
     try:
         if args.add_account:
