@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -11,7 +12,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import keyring
+# Only import keyring on non-Linux platforms
+if sys.platform != "linux":
+    import keyring
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -224,34 +227,77 @@ class ClaudeAccountSwitcher:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
-        """Read account credentials from backup using keyring."""
-        username = f"account-{account_num}-{email}"
-        try:
-            creds = keyring.get_password(KEYRING_SERVICE, username)
-            return creds if creds else ""
-        except Exception as e:
-            self._logger.warning(f"Failed to read credentials from keyring: {e}")
+        """Read account credentials from backup.
+
+        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
+        On macOS/Windows: Uses system keyring.
+        """
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
+            if cred_file.exists():
+                try:
+                    encoded = cred_file.read_text()
+                    return base64.b64decode(encoded).decode("utf-8")
+                except Exception as e:
+                    self._logger.warning(f"Failed to read credentials file: {e}")
+                    return ""
             return ""
+        else:
+            # Use keyring for macOS/Windows
+            username = f"account-{account_num}-{email}"
+            try:
+                creds = keyring.get_password(KEYRING_SERVICE, username)
+                return creds if creds else ""
+            except Exception as e:
+                self._logger.warning(f"Failed to read credentials from keyring: {e}")
+                return ""
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
-        """Write account credentials to backup using keyring."""
-        username = f"account-{account_num}-{email}"
-        try:
-            keyring.set_password(KEYRING_SERVICE, username, credentials)
-        except Exception as e:
-            self._logger.warning(f"Failed to write credentials to keyring: {e}")
+        """Write account credentials to backup.
+
+        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
+        On macOS/Windows: Uses system keyring.
+        """
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
+            try:
+                encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+                cred_file.write_text(encoded)
+                os.chmod(cred_file, 0o600)
+            except Exception as e:
+                self._logger.warning(f"Failed to write credentials file: {e}")
+        else:
+            # Use keyring for macOS/Windows
+            username = f"account-{account_num}-{email}"
+            try:
+                keyring.set_password(KEYRING_SERVICE, username, credentials)
+            except Exception as e:
+                self._logger.warning(f"Failed to write credentials to keyring: {e}")
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
-        """Delete account credentials from backup using keyring."""
-        username = f"account-{account_num}-{email}"
-        try:
-            keyring.delete_password(KEYRING_SERVICE, username)
-        except keyring.errors.PasswordDeleteError:
-            pass  # Credential doesn't exist, that's fine
-        except Exception as e:
-            self._logger.warning(f"Failed to delete credentials from keyring: {e}")
+        """Delete account credentials from backup.
+
+        On Linux/WSL: Deletes file-based credential storage.
+        On macOS/Windows: Removes from system keyring.
+        """
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
+            try:
+                if cred_file.exists():
+                    cred_file.unlink()
+            except Exception as e:
+                self._logger.warning(f"Failed to delete credentials file: {e}")
+        else:
+            # Use keyring for macOS/Windows
+            username = f"account-{account_num}-{email}"
+            try:
+                keyring.delete_password(KEYRING_SERVICE, username)
+            except keyring.errors.PasswordDeleteError:
+                pass  # Credential doesn't exist, that's fine
+            except Exception as e:
+                self._logger.warning(f"Failed to delete credentials from keyring: {e}")
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -678,12 +724,15 @@ class ClaudeAccountSwitcher:
         """Remove all traces of claude-swap from the system.
 
         This removes:
-        - All stored account credentials from the system keyring
+        - All stored account credentials (files on Linux, keyring on macOS/Windows)
         - The ~/.claude-swap-backup directory and all its contents
         """
         print("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
-        print("  - All stored account credentials from the system keyring")
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            print("  - All stored account credential files")
+        else:
+            print("  - All stored account credentials from the system keyring")
         print()
         print("Note: This does NOT affect your current Claude Code login.")
         print()
@@ -695,19 +744,32 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # Remove credentials from keyring
+        # Remove credentials
         data = self._get_sequence_data()
         if data:
             for account_num, account_info in data.get("accounts", {}).items():
                 email = account_info.get("email", "")
-                username = f"account-{account_num}-{email}"
-                try:
-                    keyring.delete_password(KEYRING_SERVICE, username)
-                    removed_items.append(f"Credential: {username}")
-                except keyring.errors.PasswordDeleteError:
-                    pass  # Credential doesn't exist
-                except Exception:
-                    pass  # Ignore other errors during purge
+                if self.platform in (Platform.LINUX, Platform.WSL):
+                    # Remove credential files on Linux
+                    cred_file = (
+                        self.credentials_dir / f".creds-{account_num}-{email}.enc"
+                    )
+                    try:
+                        if cred_file.exists():
+                            cred_file.unlink()
+                            removed_items.append(f"Credential file: {cred_file.name}")
+                    except Exception:
+                        pass  # Ignore errors during purge
+                else:
+                    # Remove from keyring on macOS/Windows
+                    username = f"account-{account_num}-{email}"
+                    try:
+                        keyring.delete_password(KEYRING_SERVICE, username)
+                        removed_items.append(f"Credential: {username}")
+                    except keyring.errors.PasswordDeleteError:
+                        pass  # Credential doesn't exist
+                    except Exception:
+                        pass  # Ignore other errors during purge
 
         # Remove backup directory
         if self.backup_dir.exists():

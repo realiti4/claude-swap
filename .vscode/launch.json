@@ -14,6 +14,18 @@
             "console": "integratedTerminal"
         },
         {
+            "name": "cswap --switch",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "claude_swap.cli",
+            "args": ["--switch"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal"
+        },
+        {
             "name": "cswap --purge",
             "type": "debugpy",
             "request": "launch",
