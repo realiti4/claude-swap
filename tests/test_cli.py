@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import __version__
+
 
 class TestCLI:
     """Test CLI argument parsing and execution."""
@@ -21,7 +23,7 @@ class TestCLI:
             text=True,
         )
         assert result.returncode == 0
-        assert "0.2.0" in result.stdout
+        assert __version__ in result.stdout
 
     def test_help_flag(self):
         """Test --help flag."""
