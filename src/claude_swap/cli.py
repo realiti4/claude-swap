@@ -111,6 +111,13 @@ Examples:
         print("\nOperation cancelled")
         sys.exit(130)
 
+    # Passive update notification (never fails)
+    from claude_swap.update_check import check_for_update
+
+    msg = check_for_update(__version__)
+    if msg:
+        print(msg, file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
