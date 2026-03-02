@@ -19,6 +19,7 @@ def _parse_version(v: str) -> tuple[int, ...]:
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
+        cached = False
         latest_version = None
 
         # Try reading cache
@@ -26,21 +27,25 @@ def check_for_update(current_version: str) -> str | None:
             with open(CACHE_PATH) as f:
                 cache = json.load(f)
             if time.time() - cache["last_checked"] < CACHE_TTL:
-                latest_version = cache["latest_version"]
+                latest_version = cache.get("latest_version")
+                cached = True
 
         # Fetch from PyPI if cache miss or stale
-        if latest_version is None:
-            req = urllib.request.Request(PYPI_URL)
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                data = json.loads(resp.read().decode())
-            latest_version = data["info"]["version"]
+        if not cached:
+            try:
+                req = urllib.request.Request(PYPI_URL)
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    data = json.loads(resp.read().decode())
+                latest_version = data["info"]["version"]
+            except Exception:
+                latest_version = None
 
-            # Write cache
+            # Write cache regardless of success/failure
             os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
             with open(CACHE_PATH, "w") as f:
                 json.dump({"last_checked": time.time(), "latest_version": latest_version}, f)
 
-        if _parse_version(latest_version) > _parse_version(current_version):
+        if latest_version and _parse_version(latest_version) > _parse_version(current_version):
             return (
                 f"A newer version of claude-swap is available ({latest_version}). "
                 f"You are using {current_version}. Consider upgrading!"

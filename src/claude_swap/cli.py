@@ -116,7 +116,7 @@ Examples:
 
     msg = check_for_update(__version__)
     if msg:
-        print(msg, file=sys.stderr)
+        print(f"\n{msg}", file=sys.stderr)
 
 
 if __name__ == "__main__":
