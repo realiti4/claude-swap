@@ -48,6 +48,16 @@ Examples:
         help="Add current account to managed accounts",
     )
     group.add_argument(
+        "--export-account",
+        metavar="NUM|EMAIL",
+        help="Export account to a zip archive",
+    )
+    group.add_argument(
+        "--import-account",
+        metavar="FILE",
+        help="Import account from a zip archive",
+    )
+    group.add_argument(
         "--remove-account",
         metavar="NUM|EMAIL",
         help="Remove account by number or email",
@@ -92,6 +102,10 @@ Examples:
     try:
         if args.add_account:
             switcher.add_account()
+        elif args.export_account:
+            switcher.export_account(args.export_account)
+        elif args.import_account:
+            switcher.import_account(args.import_account)
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
