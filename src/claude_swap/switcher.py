@@ -789,3 +789,105 @@ class ClaudeAccountSwitcher:
             print("\nNo claude-swap data found to remove.")
 
         print("\nPurge complete.")
+
+    def export_account(self, identifier: str, output_path: str | None = None) -> None:
+        """Export an account to a zip archive."""
+        import zipfile
+        from datetime import datetime
+
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        # Resolve identifier
+        if not identifier.isdigit():
+            if not self._validate_email(identifier):
+                raise ValidationError(f"Invalid email format: {identifier}")
+
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
+
+        data = self._get_sequence_data()
+        account_info = data.get("accounts", {}).get(account_num)
+        email = account_info.get("email")
+
+        # Sync active account to backup before export if it's currently active
+        active_account = str(data.get("activeAccountNumber"))
+        if active_account == account_num:
+            current_creds = self._read_credentials()
+            config_path = self._get_claude_config_path()
+            if current_creds and config_path.exists():
+                self._write_account_credentials(account_num, email, current_creds)
+                self._write_account_config(account_num, email, config_path.read_text())
+
+        creds = self._read_account_credentials(account_num, email)
+        config = self._read_account_config(account_num, email)
+
+        if not creds or not config:
+            raise SwitchError(f"Missing backup data for Account-{account_num}")
+
+        if not output_path:
+            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_email = email.replace('@', '_at_')
+            output_path = f"claude_account_{account_num}_{safe_email}_{date_str}.zip"
+
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('config.json', config)
+            zf.writestr('credentials.txt', creds)
+
+        self._logger.info(f"Exported account {account_num} to {output_path}")
+        print(f"Successfully exported Account-{account_num} ({email}) to {output_path}")
+
+    def import_account(self, archive_path: str) -> None:
+        """Import an account from a zip archive."""
+        import zipfile
+
+        archive = Path(archive_path)
+        if not archive.exists():
+            raise ValidationError(f"Archive not found: {archive_path}")
+
+        try:
+            with zipfile.ZipFile(archive, 'r') as zf:
+                config_str = zf.read('config.json').decode('utf-8')
+                creds_str = zf.read('credentials.txt').decode('utf-8')
+        except Exception as e:
+            raise ValidationError(f"Failed to read archive (must contain config.json and credentials.txt): {e}")
+
+        try:
+            config_data = json.loads(config_str)
+            email = config_data.get("oauthAccount", {}).get("emailAddress")
+            account_uuid = config_data.get("oauthAccount", {}).get("accountUuid", "")
+        except Exception:
+            raise ValidationError("Invalid config.json in archive")
+
+        if not email:
+            raise ValidationError("Could not find email address in imported config")
+
+        self._setup_directories()
+        self._init_sequence_file()
+
+        if self._account_exists(email):
+            print(f"Account {email} is already managed.")
+            return
+
+        account_num = str(self._get_next_account_number())
+
+        # Store backups
+        self._write_account_credentials(account_num, email, creds_str)
+        self._write_account_config(account_num, email, config_str)
+
+        # Update sequence.json
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": email,
+            "uuid": account_uuid,
+            "added": get_timestamp(),
+        }
+        data["sequence"].append(int(account_num))
+        
+        # If no active account, make this active? No, just add it.
+        data["lastUpdated"] = get_timestamp()
+
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Imported account {account_num}: {email}")
+        print(f"Successfully imported Account-{account_num}: {email}")
