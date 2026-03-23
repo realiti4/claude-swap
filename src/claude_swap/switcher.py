@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -559,7 +560,7 @@ class ClaudeAccountSwitcher:
                     active_num = num
                     break
 
-        print("Accounts:")
+        accounts_info = []
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -571,8 +572,16 @@ class ClaudeAccountSwitcher:
                 creds = self._read_account_credentials(str(num), email)
 
             token = self._extract_access_token(creds)
-            usage = self._fetch_usage(token) if token else "no credentials"
+            accounts_info.append((num, email, is_active, token))
 
+        def fetch(token: str | None) -> str:
+            return self._fetch_usage(token) if token else "no credentials"
+
+        with ThreadPoolExecutor() as executor:
+            usages = list(executor.map(fetch, (t for _, _, _, t in accounts_info)))
+
+        print("Accounts:")
+        for (num, email, is_active, _), usage in zip(accounts_info, usages):
             marker = " (active)" if is_active else ""
             print(f"  {num}: {email}{marker} [{usage}]")
 
