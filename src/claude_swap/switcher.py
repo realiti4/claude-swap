@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Only import keyring on non-Linux platforms
@@ -299,6 +301,60 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.warning(f"Failed to delete credentials from keyring: {e}")
 
+    def _extract_access_token(self, credentials: str) -> str | None:
+        """Extract the OAuth access token from a credentials JSON string."""
+        try:
+            data = json.loads(credentials)
+            return data.get("claudeAiOauth", {}).get("accessToken")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+    def _format_reset(self, resets_at: str) -> str:
+        """Format reset time as 'in Xh Ym (HH:MM)' in local time."""
+        reset_utc = datetime.fromisoformat(resets_at)
+        now = datetime.now(timezone.utc)
+        remaining = reset_utc - now
+        total_seconds = max(0, int(remaining.total_seconds()))
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+
+        if days > 0:
+            countdown = f"{days}d {hours}h"
+        elif hours > 0:
+            countdown = f"{hours}h {minutes}m"
+        else:
+            countdown = f"{minutes}m"
+
+        reset_local = reset_utc.astimezone()
+        now_local = now.astimezone()
+        if reset_local.date() == now_local.date():
+            time_str = reset_local.strftime("%H:%M")
+        else:
+            day = str(reset_local.day)
+            time_str = reset_local.strftime(f"%b {day} %H:%M")
+
+        return f"in {countdown} ({time_str})"
+
+    def _fetch_usage(self, access_token: str) -> str:
+        """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
+        url = "https://api.anthropic.com/api/oauth/usage"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+            h5 = data["five_hour"]["utilization"]
+            h5_reset = self._format_reset(data["five_hour"]["resets_at"])
+            d7 = data["seven_day"]["utilization"]
+            d7_reset = self._format_reset(data["seven_day"]["resets_at"])
+            return f"5h: {h5:.0f}% {h5_reset} | 7d: {d7:.0f}% {d7_reset}"
+        except Exception:
+            return "usage unavailable"
+
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -507,10 +563,18 @@ class ClaudeAccountSwitcher:
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
-            if str(num) == active_num:
-                print(f"  {num}: {email} (active)")
+            is_active = str(num) == active_num
+
+            if is_active:
+                creds = self._read_credentials() or ""
             else:
-                print(f"  {num}: {email}")
+                creds = self._read_account_credentials(str(num), email)
+
+            token = self._extract_access_token(creds)
+            usage = self._fetch_usage(token) if token else "no credentials"
+
+            marker = " (active)" if is_active else ""
+            print(f"  {num}: {email}{marker} [{usage}]")
 
     def status(self) -> None:
         """Display current account status."""

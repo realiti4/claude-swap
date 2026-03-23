@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -284,3 +285,163 @@ class TestStatus:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         switcher.status()
+
+
+class TestExtractAccessToken:
+    """Test _extract_access_token."""
+
+    def test_valid_credentials(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-test-token"}})
+        assert switcher._extract_access_token(creds) == "sk-test-token"
+
+    def test_missing_key(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        creds = json.dumps({"claudeAiOauth": {}})
+        assert switcher._extract_access_token(creds) is None
+
+    def test_invalid_json(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._extract_access_token("not-json") is None
+
+    def test_empty_string(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._extract_access_token("") is None
+
+
+class TestFormatReset:
+    """Test _format_reset."""
+
+    def test_same_day_shows_time_only(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=2, minutes=15)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._format_reset(future.isoformat())
+        assert result.startswith("in 2h 15m")
+        # Time portion should be HH:MM only (no month/day since same day)
+        assert result.count(":") == 1
+
+    def test_different_day_shows_date(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(days=2)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._format_reset(future.isoformat())
+        assert "in " in result
+        import calendar
+        months = list(calendar.month_abbr)[1:]
+        assert any(m in result for m in months)
+
+    def test_minutes_only_when_under_one_hour(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(minutes=45)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._format_reset(future.isoformat())
+        assert result.startswith("in 45m")
+        assert "h" not in result.split("(")[0]
+
+
+class TestFetchUsage:
+    """Test _fetch_usage."""
+
+    def test_success(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=1)
+        response_data = {
+            "five_hour": {"utilization": 22.0, "resets_at": future.isoformat()},
+            "seven_day": {"utilization": 61.0, "resets_at": future.isoformat()},
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._fetch_usage("sk-test-token")
+
+        assert "5h: 22%" in result
+        assert "7d: 61%" in result
+        assert "in 1h 0m" in result
+
+    def test_network_error(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
+            result = switcher._fetch_usage("sk-test-token")
+        assert result == "usage unavailable"
+
+    def test_bad_response(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"{}"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            result = switcher._fetch_usage("sk-test-token")
+        assert result == "usage unavailable"
+
+
+class TestListAccountsUsage:
+    """Test list_accounts shows usage info."""
+
+    def test_list_shows_usage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        usage_response = {
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 50.0, "resets_at": "2026-01-02T00:00:00Z"},
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(usage_response).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("urllib.request.urlopen", return_value=mock_response):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "test@example.com (active) [5h: 10%" in output
+        assert "7d: 50%" in output
+        assert "account2@example.com [5h: 10%" in output
+
+    def test_list_no_credentials(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(switcher, "_read_account_credentials", return_value=""):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "[no credentials]" in output
