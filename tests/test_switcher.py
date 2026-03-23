@@ -320,10 +320,10 @@ class TestFormatReset:
         with patch("claude_swap.switcher.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
-            result = switcher._format_reset(future.isoformat())
-        assert result.startswith("in 2h 15m")
-        # Time portion should be HH:MM only (no month/day since same day)
-        assert result.count(":") == 1
+            countdown, clock = switcher._format_reset(future.isoformat())
+        assert countdown == "2h 15m"
+        # Clock should be HH:MM only (no month/day since same day)
+        assert clock.count(":") == 1
 
     def test_different_day_shows_date(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -333,11 +333,10 @@ class TestFormatReset:
         with patch("claude_swap.switcher.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
-            result = switcher._format_reset(future.isoformat())
-        assert "in " in result
+            countdown, clock = switcher._format_reset(future.isoformat())
         import calendar
         months = list(calendar.month_abbr)[1:]
-        assert any(m in result for m in months)
+        assert any(m in clock for m in months)
 
     def test_minutes_only_when_under_one_hour(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -347,9 +346,9 @@ class TestFormatReset:
         with patch("claude_swap.switcher.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
-            result = switcher._format_reset(future.isoformat())
-        assert result.startswith("in 45m")
-        assert "h" not in result.split("(")[0]
+            countdown, clock = switcher._format_reset(future.isoformat())
+        assert countdown == "45m"
+        assert "h" not in countdown
 
 
 class TestFetchUsage:
@@ -375,15 +374,15 @@ class TestFetchUsage:
             mock_dt.now.return_value = fixed_now
             result = switcher._fetch_usage("sk-test-token")
 
-        assert "5h: 22%" in result
-        assert "7d: 61%" in result
-        assert "in 1h 0m" in result
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert result["five_hour"]["countdown"] == "1h 0m"
 
     def test_network_error(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
             result = switcher._fetch_usage("sk-test-token")
-        assert result == "usage unavailable"
+        assert result is None
 
     def test_bad_response(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -394,7 +393,7 @@ class TestFetchUsage:
 
         with patch("urllib.request.urlopen", return_value=mock_response):
             result = switcher._fetch_usage("sk-test-token")
-        assert result == "usage unavailable"
+        assert result is None
 
 
 class TestListAccountsUsage:
@@ -426,9 +425,12 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "test@example.com (active) [5h: 10%" in output
-        assert "7d: 50%" in output
-        assert "account2@example.com [5h: 10%" in output
+        assert "test@example.com (active)" in output
+        assert "account2@example.com" in output
+        assert "├ 5h:" in output
+        assert "└ 7d:" in output
+        assert "10%" in output
+        assert "50%" in output
 
     def test_list_no_credentials(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -444,4 +446,4 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "[no credentials]" in output
+        assert "no credentials" in output

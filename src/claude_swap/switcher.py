@@ -310,8 +310,8 @@ class ClaudeAccountSwitcher:
         except (json.JSONDecodeError, AttributeError):
             return None
 
-    def _format_reset(self, resets_at: str) -> str:
-        """Format reset time as 'in Xh Ym (HH:MM)' in local time."""
+    def _format_reset(self, resets_at: str) -> tuple[str, str]:
+        """Return (countdown, clock) for a reset time in local time."""
         reset_utc = datetime.fromisoformat(resets_at)
         now = datetime.now(timezone.utc)
         remaining = reset_utc - now
@@ -335,9 +335,9 @@ class ClaudeAccountSwitcher:
             day = str(reset_local.day)
             time_str = reset_local.strftime(f"%b {day} %H:%M")
 
-        return f"in {countdown} ({time_str})"
+        return countdown, time_str
 
-    def _fetch_usage(self, access_token: str) -> str:
+    def _fetch_usage(self, access_token: str) -> dict | None:
         """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
         url = "https://api.anthropic.com/api/oauth/usage"
         headers = {
@@ -348,13 +348,14 @@ class ClaudeAccountSwitcher:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
-            h5 = data["five_hour"]["utilization"]
-            h5_reset = self._format_reset(data["five_hour"]["resets_at"])
-            d7 = data["seven_day"]["utilization"]
-            d7_reset = self._format_reset(data["seven_day"]["resets_at"])
-            return f"5h: {h5:.0f}% {h5_reset} | 7d: {d7:.0f}% {d7_reset}"
+            h5_countdown, h5_clock = self._format_reset(data["five_hour"]["resets_at"])
+            d7_countdown, d7_clock = self._format_reset(data["seven_day"]["resets_at"])
+            return {
+                "five_hour": {"pct": data["five_hour"]["utilization"], "countdown": h5_countdown, "clock": h5_clock},
+                "seven_day": {"pct": data["seven_day"]["utilization"], "countdown": d7_countdown, "clock": d7_clock},
+            }
         except Exception:
-            return "usage unavailable"
+            return None
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -574,16 +575,29 @@ class ClaudeAccountSwitcher:
             token = self._extract_access_token(creds)
             accounts_info.append((num, email, is_active, token))
 
-        def fetch(token: str | None) -> str:
-            return self._fetch_usage(token) if token else "no credentials"
+        def fetch(token: str | None) -> dict | str | None:
+            if not token:
+                return "no credentials"
+            return self._fetch_usage(token)
 
         with ThreadPoolExecutor() as executor:
             usages = list(executor.map(fetch, (t for _, _, _, t in accounts_info)))
 
         print("Accounts:")
-        for (num, email, is_active, _), usage in zip(accounts_info, usages):
+        for i, ((num, email, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
             marker = " (active)" if is_active else ""
-            print(f"  {num}: {email}{marker} [{usage}]")
+            print(f"  {num}: {email}{marker}")
+            if isinstance(usage, str):
+                print(f"     {usage}")
+            elif usage is None:
+                print("     usage unavailable")
+            else:
+                h5 = usage["five_hour"]
+                d7 = usage["seven_day"]
+                print(f"     ├ 5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+                print(f"     └ 7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+            if i < len(accounts_info) - 1:
+                print()
 
     def status(self) -> None:
         """Display current account status."""
