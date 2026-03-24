@@ -89,19 +89,31 @@ class ClaudeAccountSwitcher:
         return False
 
     def _get_claude_config_path(self) -> Path:
-        """Get Claude configuration file path with fallback."""
+        """Get the Claude configuration file path for the current session.
+
+        Claude Code may write to either ~/.claude/.claude.json or ~/.claude.json
+        depending on version or context. When both files exist with oauthAccount,
+        return the more recently modified one as it represents the active session.
+        """
         primary_config = self.home / ".claude" / ".claude.json"
         fallback_config = self.home / ".claude.json"
 
-        if primary_config.exists():
-            try:
-                data = json.loads(primary_config.read_text())
-                if "oauthAccount" in data:
-                    return primary_config
-            except (json.JSONDecodeError, KeyError):
-                pass
+        candidates = []
+        for path in [primary_config, fallback_config]:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text())
+                    if "oauthAccount" in data:
+                        candidates.append(path)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        return fallback_config
+        if not candidates:
+            return fallback_config
+        if len(candidates) == 1:
+            return candidates[0]
+        # Both have oauthAccount — use the more recently modified one
+        return max(candidates, key=lambda p: p.stat().st_mtime)
 
     def _validate_email(self, email: str) -> bool:
         """Validate email format."""
@@ -440,6 +452,11 @@ class ClaudeAccountSwitcher:
                 return True
         return False
 
+    @staticmethod
+    def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
+        """Return display tag for an account's org context."""
+        return org_name if org_name else "personal"
+
     def _resolve_account_identifier(self, identifier: str) -> str | None:
         """Resolve account identifier (number or email) to account number.
 
@@ -472,10 +489,45 @@ class ClaudeAccountSwitcher:
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
 
+    def _migrate_org_fields(self) -> None:
+        """Backfill organizationUuid/Name for accounts added before org support.
+
+        Reads each account's backup config to extract org info and writes it
+        back to sequence.json so that the composite key check works correctly.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return
+
+        updated = False
+        for num, account in data.get("accounts", {}).items():
+            if "organizationUuid" in account:
+                continue  # Already migrated
+            email = account.get("email", "")
+            config_text = self._read_account_config(num, email)
+            if config_text:
+                try:
+                    config_data = json.loads(config_text)
+                    oauth = config_data.get("oauthAccount", {})
+                    account["organizationUuid"] = oauth.get("organizationUuid", "") or ""
+                    account["organizationName"] = oauth.get("organizationName", "") or ""
+                except (json.JSONDecodeError, AttributeError):
+                    account["organizationUuid"] = ""
+                    account["organizationName"] = ""
+            else:
+                account["organizationUuid"] = ""
+                account["organizationName"] = ""
+            updated = True
+
+        if updated:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
     def add_account(self) -> None:
         """Add current account to managed accounts."""
         self._setup_directories()
         self._init_sequence_file()
+        self._migrate_org_fields()
 
         identity = self._get_current_account()
         if identity is None:
@@ -491,6 +543,7 @@ class ClaudeAccountSwitcher:
                  acc.get("organizationUuid", "") == current_org_uuid),
                 None,
             )
+            matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
 
             current_creds = self._read_credentials()
             if current_creds is None:
@@ -514,8 +567,9 @@ class ClaudeAccountSwitcher:
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
 
+            tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
-            print(f"Updated credentials for Account {account_num}: {current_email}")
+            print(f"Updated credentials for Account {account_num} ({current_email} [{tag}]).")
             return
 
         account_num = str(self._get_next_account_number())
@@ -560,7 +614,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        tag = organization_name if organization_name else "personal"
+        tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         print(f"Added Account {account_num}: {current_email} [{tag}]")
 
@@ -640,6 +694,7 @@ class ClaudeAccountSwitcher:
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
             org_name = account.get("organizationName", "") or ""
+            org_uuid = account.get("organizationUuid", "") or ""
             is_active = str(num) == active_num
 
             if is_active:
@@ -648,7 +703,7 @@ class ClaudeAccountSwitcher:
                 creds = self._read_account_credentials(str(num), email)
 
             token = self._extract_access_token(creds)
-            accounts_info.append((num, email, org_name, is_active, token))
+            accounts_info.append((num, email, org_name, org_uuid, is_active, token))
 
         def fetch(token: str | None) -> dict | str | None:
             if not token:
@@ -656,11 +711,11 @@ class ClaudeAccountSwitcher:
             return self._fetch_usage(token)
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, (t for _, _, _, _, t in accounts_info)))
+            usages = list(executor.map(fetch, (t for _, _, _, _, _, t in accounts_info)))
 
         print("Accounts:")
-        for i, ((num, email, org_name, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
-            tag = org_name if org_name else "personal"
+        for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+            tag = self._get_display_tag(email, org_name, org_uuid)
             marker = " (active)" if is_active else ""
             print(f"  {num}: {email} [{tag}]{marker}")
             if isinstance(usage, str):
@@ -704,7 +759,7 @@ class ClaudeAccountSwitcher:
                 break
 
         if account_num:
-            tag = org_name if org_name else "personal"
+            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
             print(f"Status: Account-{account_num} ({current_email} [{tag}])")
             print(f"  Total managed accounts: {total}")
