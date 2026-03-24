@@ -517,9 +517,12 @@ class ClaudeAccountSwitcher:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID
+        # Get account UUID and org fields
         config_data = self._read_json(config_path)
-        account_uuid = config_data.get("oauthAccount", {}).get("accountUuid", "")
+        oauth = config_data.get("oauthAccount", {})
+        account_uuid = oauth.get("accountUuid", "")
+        organization_uuid = oauth.get("organizationUuid", "") or ""
+        organization_name = oauth.get("organizationName", "") or ""
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -530,6 +533,8 @@ class ClaudeAccountSwitcher:
         data["accounts"][account_num] = {
             "email": current_email,
             "uuid": account_uuid,
+            "organizationUuid": organization_uuid,
+            "organizationName": organization_name,
             "added": get_timestamp(),
         }
         data["sequence"].append(int(account_num))
@@ -537,8 +542,9 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Added account {account_num}: {current_email}")
-        print(f"Added Account {account_num}: {current_email}")
+        tag = organization_name if organization_name else "personal"
+        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        print(f"Added Account {account_num}: {current_email} [{tag}]")
 
     def remove_account(self, identifier: str) -> None:
         """Remove account from managed accounts."""

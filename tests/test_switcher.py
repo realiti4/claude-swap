@@ -614,3 +614,87 @@ class TestGetCurrentAccount:
         switcher = ClaudeAccountSwitcher()
         result = switcher._get_current_account()
         assert result is None
+
+
+# ── Task 5: add_account with org fields ──────────────────────────────────────
+
+class TestAddAccountOrgFields:
+    def test_allows_same_email_different_org(self, temp_home, mock_credentials_file):
+        """Should allow adding same-email account if organizationUuid differs."""
+        import io
+        from contextlib import redirect_stdout
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        config_path = temp_home / ".claude" / ".claude.json"
+
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-A",
+                "organizationName": "Acme",
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher.add_account()
+
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+            }
+        }))
+        switcher.add_account()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 2
+        assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid-A"
+        assert seq["accounts"]["2"]["organizationUuid"] == ""
+
+    def test_blocks_true_duplicate(self, temp_home, mock_credentials_file):
+        """Should block adding an account with identical (email, organizationUuid) combination."""
+        import io
+        from contextlib import redirect_stdout
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        org_config = {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-A",
+                "organizationName": "Acme",
+            }
+        }
+        config_path.write_text(json.dumps(org_config))
+        switcher = ClaudeAccountSwitcher()
+        switcher.add_account()
+
+        config_path.write_text(json.dumps(org_config))
+        f = io.StringIO()
+        with redirect_stdout(f):
+            switcher.add_account()
+        assert "already managed" in f.getvalue()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 1
+
+    def test_stores_org_name_in_sequence(self, temp_home, mock_credentials_file):
+        """add_account should store organizationName in sequence.json."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid",
+                "organizationName": "My Org",
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher.add_account()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert seq["accounts"]["1"]["organizationName"] == "My Org"
+        assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid"
