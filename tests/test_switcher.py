@@ -698,3 +698,37 @@ class TestAddAccountOrgFields:
         seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
         assert seq["accounts"]["1"]["organizationName"] == "My Org"
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid"
+
+
+# ── Task 6: _resolve_account_identifier ambiguity ────────────────────────────
+
+class TestResolveIdentifierAmbiguity:
+    def test_by_number_always_works(self, temp_home, sample_sequence_data_with_org):
+        """Account number identifier should always resolve correctly."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._resolve_account_identifier("1") == "1"
+        assert switcher._resolve_account_identifier("2") == "2"
+
+    def test_raises_on_ambiguous_email(self, temp_home, sample_sequence_data_with_org):
+        """Should raise ConfigError when email matches multiple accounts."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from claude_swap.exceptions import ConfigError
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+        switcher = ClaudeAccountSwitcher()
+        with pytest.raises(ConfigError, match="ambiguous"):
+            switcher._resolve_account_identifier("user@example.com")
+
+    def test_unique_email_still_works(self, temp_home, sample_sequence_data):
+        """Unique email should still resolve to the correct account number."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._resolve_account_identifier("account1@example.com") == "1"

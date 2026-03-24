@@ -441,7 +441,11 @@ class ClaudeAccountSwitcher:
         return False
 
     def _resolve_account_identifier(self, identifier: str) -> str | None:
-        """Resolve account identifier (number or email) to account number."""
+        """Resolve account identifier (number or email) to account number.
+
+        Raises:
+            ConfigError: if the email matches multiple accounts (ambiguous).
+        """
         if identifier.isdigit():
             return identifier
 
@@ -449,10 +453,24 @@ class ClaudeAccountSwitcher:
         if not data:
             return None
 
-        for num, account in data.get("accounts", {}).items():
-            if account.get("email") == identifier:
-                return num
-        return None
+        matches = [
+            num for num, account in data.get("accounts", {}).items()
+            if account.get("email") == identifier
+        ]
+
+        if len(matches) == 0:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        details = ", ".join(
+            f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
+            for num in matches
+        )
+        raise ConfigError(
+            f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
+            f"Use account number instead (e.g., cswap --switch-to 1)."
+        )
 
     def add_account(self) -> None:
         """Add current account to managed accounts."""
