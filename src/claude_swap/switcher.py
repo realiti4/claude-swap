@@ -405,11 +405,12 @@ class ClaudeAccountSwitcher:
         account_nums = [int(k) for k in data["accounts"].keys()]
         return max(account_nums, default=0) + 1
 
-    def _get_current_account(self) -> str | None:
-        """Get current account email from .claude.json.
+    def _get_current_account(self) -> tuple[str, str] | None:
+        """Get current account identity (email, organization_uuid) from .claude.json.
 
         Returns:
-            Email address if found, None otherwise.
+            (email, organization_uuid) tuple if found, None otherwise.
+            organization_uuid is "" for personal accounts.
         """
         config_path = self._get_claude_config_path()
         if not config_path.exists():
@@ -419,17 +420,23 @@ class ClaudeAccountSwitcher:
         if not data:
             return None
 
-        email = data.get("oauthAccount", {}).get("emailAddress", "")
-        return email if email else None
+        oauth = data.get("oauthAccount", {})
+        email = oauth.get("emailAddress", "")
+        if not email:
+            return None
 
-    def _account_exists(self, email: str) -> bool:
-        """Check if account exists by email."""
+        organization_uuid = oauth.get("organizationUuid", "") or ""
+        return (email, organization_uuid)
+
+    def _account_exists(self, email: str, organization_uuid: str) -> bool:
+        """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
         if not data:
             return False
 
         for account in data.get("accounts", {}).values():
-            if account.get("email") == email:
+            if (account.get("email") == email and
+                    account.get("organizationUuid", "") == organization_uuid):
                 return True
         return False
 
@@ -452,13 +459,20 @@ class ClaudeAccountSwitcher:
         self._setup_directories()
         self._init_sequence_file()
 
-        current_email = self._get_current_account()
-        if current_email is None:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
+        current_email, current_org_uuid = identity
 
-        if self._account_exists(current_email):
-            # Refresh credentials for existing account
-            account_num = self._resolve_account_identifier(current_email)
+        if self._account_exists(current_email, current_org_uuid):
+            # Refresh credentials for existing account using composite key lookup
+            seq = self._get_sequence_data()
+            account_num = next(
+                (num for num, acc in seq.get("accounts", {}).items()
+                 if acc.get("email") == current_email and
+                 acc.get("organizationUuid", "") == current_org_uuid),
+                None,
+            )
 
             current_creds = self._read_credentials()
             if current_creds is None:
@@ -478,10 +492,9 @@ class ClaudeAccountSwitcher:
             self._write_account_config(account_num, current_email, current_config)
 
             # Update active account
-            data = self._get_sequence_data()
-            data["activeAccountNumber"] = int(account_num)
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            seq["activeAccountNumber"] = int(account_num)
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
 
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
             print(f"Updated credentials for Account {account_num}: {current_email}")
@@ -586,13 +599,15 @@ class ClaudeAccountSwitcher:
             return
 
         data = self._get_sequence_data()
-        current_email = self._get_current_account()
+        current_identity = self._get_current_account()
 
-        # Find active account number by email
+        # Find active account number by (email, organizationUuid) composite key
         active_num = None
-        if current_email is not None:
+        if current_identity is not None:
+            current_email, current_org_uuid = current_identity
             for num, account in data.get("accounts", {}).items():
-                if account.get("email") == current_email:
+                if (account.get("email") == current_email and
+                        account.get("organizationUuid", "") == current_org_uuid):
                     active_num = num
                     break
 
@@ -642,36 +657,42 @@ class ClaudeAccountSwitcher:
 
     def status(self) -> None:
         """Display current account status."""
-        current = self._get_current_account()
-        if current is None:
+        identity = self._get_current_account()
+        if identity is None:
             print("Status: No active Claude account")
             return
+        current_email, current_org_uuid = identity
 
         data = self._get_sequence_data()
         if not data:
-            print(f"Status: Active account: {current} (not managed)")
+            print(f"Status: Active account: {current_email} (not managed)")
             return
 
         account_num = None
+        org_name = ""
         for num, info in data.get("accounts", {}).items():
-            if info.get("email") == current:
+            if (info.get("email") == current_email and
+                    info.get("organizationUuid", "") == current_org_uuid):
                 account_num = num
+                org_name = info.get("organizationName", "") or ""
                 break
 
         if account_num:
+            tag = org_name if org_name else "personal"
             total = len(data.get("accounts", {}))
-            print(f"Status: Account-{account_num} ({current})")
+            print(f"Status: Account-{account_num} ({current_email} [{tag}])")
             print(f"  Total managed accounts: {total}")
         else:
-            print(f"Status: Active account: {current} (not managed)")
+            print(f"Status: Active account: {current_email} (not managed)")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
-        current_email = self._get_current_account()
+        identity = self._get_current_account()
 
-        if current_email is None:
+        if identity is None:
             print("No active Claude account found. Please log in first.")
             return
+        current_email, _ = identity
 
         response = input(
             f"No managed accounts found. Add current account "
@@ -688,12 +709,13 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        current_email = self._get_current_account()
-        if current_email is None:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found")
+        current_email, current_org_uuid = identity
 
         # Check if current account is managed
-        if not self._account_exists(current_email):
+        if not self._account_exists(current_email, current_org_uuid):
             print(f"Notice: Active account '{current_email}' was not managed.")
             self.add_account()
             data = self._get_sequence_data()
@@ -750,10 +772,11 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data()
             current_account = str(data.get("activeAccountNumber"))
             target_email = data["accounts"][target_account]["email"]
-            current_email = self._get_current_account()
+            current_identity = self._get_current_account()
 
-            if current_email is None:
+            if current_identity is None:
                 raise SwitchError("No current account to switch from")
+            current_email, _ = current_identity
 
             config_path = self._get_claude_config_path()
 

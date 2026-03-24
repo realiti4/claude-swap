@@ -174,13 +174,13 @@ class TestAccountExists:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        assert switcher._account_exists("account1@example.com") is True
-        assert switcher._account_exists("nonexistent@example.com") is False
+        assert switcher._account_exists("account1@example.com", "") is True
+        assert switcher._account_exists("nonexistent@example.com", "") is False
 
     def test_no_sequence_file(self, temp_home: Path):
         """Test account exists when no sequence file."""
         switcher = ClaudeAccountSwitcher()
-        assert switcher._account_exists("any@example.com") is False
+        assert switcher._account_exists("any@example.com", "") is False
 
 
 class TestResolveAccountIdentifier:
@@ -561,3 +561,56 @@ class TestAccountInfoOrgFields:
                                organization_name="", added="", number=2)
         assert org.display_label == "u@e.com [Acme]"
         assert personal.display_label == "u@e.com [personal]"
+
+
+# ── Task 3: _account_exists composite key ────────────────────────────────────
+
+class TestAccountExistsCompositeKey:
+    def test_distinguishes_org_and_personal(self, temp_home, mock_credentials_file):
+        """Accounts with same email but different organizationUuid should be treated as distinct."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "user@example.com",
+                    "uuid": "user-uuid",
+                    "organizationUuid": "org-uuid-A",
+                    "organizationName": "Acme",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        }))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._account_exists("user@example.com", "org-uuid-A") is True
+        assert switcher._account_exists("user@example.com", "") is False
+        assert switcher._account_exists("user@example.com", "org-uuid-B") is False
+
+
+# ── Task 4: _get_current_account returns tuple ───────────────────────────────
+
+class TestGetCurrentAccount:
+    def test_returns_org_info(self, temp_home, mock_org_claude_config):
+        """_get_current_account should return (email, organization_uuid) tuple."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        result = switcher._get_current_account()
+        assert result == ("user@example.com", "org-uuid-5678")
+
+    def test_returns_empty_org_for_personal(self, temp_home, mock_personal_claude_config):
+        """Personal account should return tuple with empty string for organization_uuid."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        result = switcher._get_current_account()
+        assert result == ("user@example.com", "")
+
+    def test_returns_none_when_no_config(self, temp_home):
+        """Should return None when config file does not exist."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        result = switcher._get_current_account()
+        assert result is None
