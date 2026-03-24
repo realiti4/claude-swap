@@ -348,12 +348,20 @@ class ClaudeAccountSwitcher:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
-            h5_countdown, h5_clock = self._format_reset(data["five_hour"]["resets_at"])
-            d7_countdown, d7_clock = self._format_reset(data["seven_day"]["resets_at"])
-            return {
-                "five_hour": {"pct": data["five_hour"]["utilization"], "countdown": h5_countdown, "clock": h5_clock},
-                "seven_day": {"pct": data["seven_day"]["utilization"], "countdown": d7_countdown, "clock": d7_clock},
-            }
+
+            result = {}
+
+            h5 = data.get("five_hour")
+            if h5:
+                h5_countdown, h5_clock = self._format_reset(h5["resets_at"])
+                result["five_hour"] = {"pct": h5["utilization"], "countdown": h5_countdown, "clock": h5_clock}
+
+            d7 = data.get("seven_day")
+            if d7:
+                d7_countdown, d7_clock = self._format_reset(d7["resets_at"])
+                result["seven_day"] = {"pct": d7["utilization"], "countdown": d7_countdown, "clock": d7_clock}
+
+            return result if result else None
         except Exception:
             return None
 
@@ -592,10 +600,16 @@ class ClaudeAccountSwitcher:
             elif usage is None:
                 print("     usage unavailable")
             else:
-                h5 = usage["five_hour"]
-                d7 = usage["seven_day"]
-                print(f"     ├ 5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
-                print(f"     └ 7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+                h5 = usage.get("five_hour")
+                d7 = usage.get("seven_day")
+                lines = []
+                if h5:
+                    lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+                if d7:
+                    lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+                for j, line in enumerate(lines):
+                    connector = "└" if j == len(lines) - 1 else "├"
+                    print(f"     {connector} {line}")
             if i < len(accounts_info) - 1:
                 print()
 
