@@ -63,7 +63,7 @@ cswap --switch-to user@example.com
 ### Other commands
 
 ```bash
-cswap --list              # List all managed accounts
+cswap --list              # List all accounts with usage stats
 cswap --status            # Show current account
 cswap --remove-account 2  # Remove an account
 cswap --purge             # Remove all claude-swap data
