@@ -674,7 +674,7 @@ class TestAddAccountOrgFields:
         f = io.StringIO()
         with redirect_stdout(f):
             switcher.add_account()
-        assert "already managed" in f.getvalue()
+        assert "Updated credentials" in f.getvalue()
 
         seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
         assert len(seq["accounts"]) == 1
