@@ -639,6 +639,7 @@ class ClaudeAccountSwitcher:
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
+            org_name = account.get("organizationName", "") or ""
             is_active = str(num) == active_num
 
             if is_active:
@@ -647,7 +648,7 @@ class ClaudeAccountSwitcher:
                 creds = self._read_account_credentials(str(num), email)
 
             token = self._extract_access_token(creds)
-            accounts_info.append((num, email, is_active, token))
+            accounts_info.append((num, email, org_name, is_active, token))
 
         def fetch(token: str | None) -> dict | str | None:
             if not token:
@@ -655,12 +656,13 @@ class ClaudeAccountSwitcher:
             return self._fetch_usage(token)
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, (t for _, _, _, t in accounts_info)))
+            usages = list(executor.map(fetch, (t for _, _, _, _, t in accounts_info)))
 
         print("Accounts:")
-        for i, ((num, email, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+        for i, ((num, email, org_name, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+            tag = org_name if org_name else "personal"
             marker = " (active)" if is_active else ""
-            print(f"  {num}: {email}{marker}")
+            print(f"  {num}: {email} [{tag}]{marker}")
             if isinstance(usage, str):
                 print(f"     {usage}")
             elif usage is None:

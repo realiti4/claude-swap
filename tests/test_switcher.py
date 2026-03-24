@@ -477,7 +477,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "test@example.com (active)" in output
+        assert "test@example.com [personal] (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
         assert "└ 7d:" in output
@@ -732,3 +732,116 @@ class TestResolveIdentifierAmbiguity:
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
         switcher = ClaudeAccountSwitcher()
         assert switcher._resolve_account_identifier("account1@example.com") == "1"
+
+
+# ── Task 7: list_accounts org display ────────────────────────────────────────
+
+class TestListAccountsOrgDisplay:
+    def test_shows_org_name_and_personal(self, temp_home, mock_credentials_file,
+                                         sample_sequence_data_with_org, capsys):
+        """list_accounts should display org name and personal tag."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-5678",
+                "organizationName": "Acme Corp",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "Acme Corp" in out
+        assert "personal" in out
+        assert "(active)" in out
+
+    def test_active_account_detected_by_org_uuid(self, temp_home, mock_credentials_file,
+                                                   sample_sequence_data_with_org, capsys):
+        """Only the account matching current org_uuid should be marked (active)."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if "(active)" in ln]
+        assert len(lines) == 1
+        assert "personal" in lines[0]
+
+
+# ── Task 8: backward compatibility ───────────────────────────────────────────
+
+class TestBackwardCompatibility:
+    def test_old_sequence_json_without_org_fields(self, temp_home, sample_sequence_data, capsys):
+        """Old sequence.json without organizationUuid should work correctly."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "accountUuid": "uuid-1",
+            }
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text('{"accessToken": "tok"}')
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "account1@example.com" in out
+        assert "personal" in out
+
+    def test_status_with_old_sequence_json(self, temp_home, sample_sequence_data, capsys):
+        """status should display personal for old sequence.json entries."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "accountUuid": "uuid-1",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
+        switcher.status()
+
+        out = capsys.readouterr().out
+        assert "account1@example.com" in out
+        assert "personal" in out
