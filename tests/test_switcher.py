@@ -237,6 +237,58 @@ class TestDirectorySetup:
             assert stat.st_mode & 0o777 == 0o700
 
 
+class TestAddAccountRefresh:
+    """Test refreshing credentials for an existing account."""
+
+    def test_readd_existing_account_updates_credentials(
+        self, temp_home: Path, mock_claude_config: Path, capsys
+    ):
+        """Re-adding an existing account should update its credentials, not duplicate it."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        old_creds = json.dumps({"claudeAiOauth": {"accessToken": "old-token"}})
+        new_creds = json.dumps({"claudeAiOauth": {"accessToken": "new-token"}})
+
+        # Track what was written to credential storage
+        stored = {}
+
+        def mock_write_creds(num, email, creds):
+            stored["creds"] = creds
+
+        def mock_read_creds(num, email):
+            return stored.get("creds", "")
+
+        # First add
+        with patch.object(switcher, "_read_credentials", return_value=old_creds), \
+             patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
+            switcher.add_account()
+
+        # Verify first add
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 1
+        assert data["accounts"]["1"]["email"] == "test@example.com"
+        assert "old-token" in stored["creds"]
+
+        # Re-add same account with new credentials
+        with patch.object(switcher, "_read_credentials", return_value=new_creds), \
+             patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
+            switcher.add_account()
+
+        # Should still have only 1 account
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 1
+        assert len(data["sequence"]) == 1
+
+        # Should have printed update message
+        output = capsys.readouterr().out
+        assert "Updated credentials" in output
+
+        # Verify credentials were actually updated
+        assert "new-token" in stored["creds"]
+
+
 class TestGetNextAccountNumber:
     """Test getting next account number."""
 

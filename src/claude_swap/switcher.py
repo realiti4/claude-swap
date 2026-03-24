@@ -457,7 +457,34 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No active Claude account found. Please log in first.")
 
         if self._account_exists(current_email):
-            print(f"Account {current_email} is already managed.")
+            # Refresh credentials for existing account
+            account_num = self._resolve_account_identifier(current_email)
+
+            current_creds = self._read_credentials()
+            if current_creds is None:
+                raise CredentialReadError("Failed to read credentials for current account")
+            if not current_creds:
+                raise CredentialReadError("No credentials found for current account")
+
+            config_path = self._get_claude_config_path()
+            try:
+                current_config = config_path.read_text()
+            except FileNotFoundError:
+                raise ConfigError("Claude config file not found")
+            except PermissionError:
+                raise ConfigError("Permission denied reading Claude config")
+
+            self._write_account_credentials(account_num, current_email, current_creds)
+            self._write_account_config(account_num, current_email, current_config)
+
+            # Update active account
+            data = self._get_sequence_data()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+            self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
+            print(f"Updated credentials for Account {account_num}: {current_email}")
             return
 
         account_num = str(self._get_next_account_number())
