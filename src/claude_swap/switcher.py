@@ -628,6 +628,28 @@ class ClaudeAccountSwitcher:
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
 
+            # For email identifiers, handle ambiguous matches interactively
+            data = self._get_sequence_data()
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} [{tag}]")
+                choice = input("Enter account number to remove: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print("Cancelled")
+                    return
+                identifier = choice
+
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
             raise AccountNotFoundError(
@@ -834,6 +856,28 @@ class ClaudeAccountSwitcher:
         if not identifier.isdigit():
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
+
+            # For email identifiers, handle ambiguous matches interactively
+            data = self._get_sequence_data()
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} [{tag}]")
+                choice = input("Enter account number to switch to: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print("Cancelled")
+                    return
+                identifier = choice
 
         target_account = self._resolve_account_identifier(identifier)
         if not target_account:
