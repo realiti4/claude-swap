@@ -46,8 +46,21 @@ class AccountInfo:
 
     email: str
     uuid: str
+    organization_uuid: str
+    organization_name: str
     added: str
     number: int
+
+    @property
+    def is_organization(self) -> bool:
+        """Whether this is an organization account."""
+        return bool(self.organization_uuid)
+
+    @property
+    def display_label(self) -> str:
+        """Display label: 'email [OrgName]' or 'email [personal]'."""
+        tag = self.organization_name if self.organization_name else "personal"
+        return f"{self.email} [{tag}]"
 
     @classmethod
     def from_dict(cls, number: int, data: dict) -> AccountInfo:
@@ -55,6 +68,8 @@ class AccountInfo:
         return cls(
             email=data.get("email", ""),
             uuid=data.get("uuid", ""),
+            organization_uuid=data.get("organizationUuid", "") or "",
+            organization_name=data.get("organizationName", "") or "",
             added=data.get("added", ""),
             number=number,
         )
@@ -64,6 +79,8 @@ class AccountInfo:
         return {
             "email": self.email,
             "uuid": self.uuid,
+            "organizationUuid": self.organization_uuid,
+            "organizationName": self.organization_name,
             "added": self.added,
         }
 

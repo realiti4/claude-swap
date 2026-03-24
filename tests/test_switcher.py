@@ -499,3 +499,65 @@ class TestListAccountsUsage:
 
         output = capsys.readouterr().out
         assert "no credentials" in output
+
+
+# ── Task 1: AccountInfo org fields ───────────────────────────────────────────
+
+class TestAccountInfoOrgFields:
+    def test_account_info_includes_org_fields(self):
+        """AccountInfo should store organization UUID and name."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo(
+            email="user@example.com",
+            uuid="user-uuid",
+            organization_uuid="org-uuid-123",
+            organization_name="Acme Corp",
+            added="2024-01-01T00:00:00Z",
+            number=1,
+        )
+        assert info.organization_uuid == "org-uuid-123"
+        assert info.organization_name == "Acme Corp"
+
+    def test_account_info_personal_account_has_empty_org(self):
+        """Personal accounts should have empty string for organization fields."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo.from_dict(1, {
+            "email": "user@example.com",
+            "uuid": "user-uuid",
+            "added": "2024-01-01T00:00:00Z",
+        })
+        assert info.organization_uuid == ""
+        assert info.organization_name == ""
+
+    def test_account_info_to_dict_includes_org_fields(self):
+        """to_dict() should include organization fields."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo(
+            email="user@example.com",
+            uuid="user-uuid",
+            organization_uuid="org-uuid",
+            organization_name="Acme",
+            added="2024-01-01T00:00:00Z",
+            number=1,
+        )
+        d = info.to_dict()
+        assert d["organizationUuid"] == "org-uuid"
+        assert d["organizationName"] == "Acme"
+
+    def test_account_info_is_organization_property(self):
+        """is_organization should be determined by organizationUuid presence."""
+        from claude_swap.models import AccountInfo
+        org = AccountInfo.from_dict(1, {"email": "u@e.com", "uuid": "u", "added": "", "organizationUuid": "o"})
+        personal = AccountInfo.from_dict(2, {"email": "u@e.com", "uuid": "u", "added": ""})
+        assert org.is_organization is True
+        assert personal.is_organization is False
+
+    def test_account_info_display_label(self):
+        """display_label should include org name or personal tag."""
+        from claude_swap.models import AccountInfo
+        org = AccountInfo(email="u@e.com", uuid="u", organization_uuid="o",
+                          organization_name="Acme", added="", number=1)
+        personal = AccountInfo(email="u@e.com", uuid="u", organization_uuid="",
+                               organization_name="", added="", number=2)
+        assert org.display_label == "u@e.com [Acme]"
+        assert personal.display_label == "u@e.com [personal]"
