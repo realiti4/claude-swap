@@ -8,6 +8,7 @@ import sys
 
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -86,7 +87,7 @@ Examples:
     # Check for root (unless in container) - POSIX only
     if sys.platform != "win32":
         if os.geteuid() == 0 and not switcher._is_running_in_container():
-            print("Error: Do not run this script as root (unless running in a container)")
+            error("Error: Do not run this script as root (unless running in a container)")
             sys.exit(1)
 
     try:
@@ -105,10 +106,10 @@ Examples:
         elif args.purge:
             switcher.purge()
     except ClaudeSwitchError as e:
-        print(f"Error: {e}")
+        error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nOperation cancelled")
+        print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
 
     # Passive update notification (never fails)
@@ -116,7 +117,7 @@ Examples:
 
     msg = check_for_update(__version__)
     if msg:
-        print(f"\n{msg}", file=sys.stderr)
+        print(f"\n{muted(msg)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
