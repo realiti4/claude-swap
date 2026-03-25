@@ -856,3 +856,163 @@ class TestBackwardCompatibility:
         out = capsys.readouterr().out
         assert "account1@example.com" in out
         assert "personal" in out
+
+
+class TestUpgradeMigration:
+    """Test upgrade path from pre-v0.6.0 (no org fields) to v0.6.0+."""
+
+    def _setup_pre_v06(self, temp_home, sequence_data, live_config):
+        """Helper to set up pre-v0.6.0 state with a live config."""
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir(exist_ok=True)
+        (backup_dir / "sequence.json").write_text(json.dumps(sequence_data))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps(live_config))
+
+    def test_status_after_upgrade_with_org_uuid(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """status() should detect managed account after auto-migration."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        switcher.status()
+
+        out = capsys.readouterr().out
+        assert "Account-1" in out
+        assert "not managed" not in out
+
+    def test_list_after_upgrade_marks_active(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """list_accounts() should mark the active account after auto-migration."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "(active)" in out
+
+    def test_migration_uses_live_config_over_backup(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Migration should prefer live config org fields for the active account."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data_migrated()
+
+        assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-live"
+        assert data["accounts"]["1"]["organizationName"] == "Live Org"
+
+    def test_migration_idempotent(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Running migration twice should not change the result."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data1 = switcher._get_sequence_data_migrated()
+        data2 = switcher._get_sequence_data_migrated()
+
+        assert data1["accounts"]["1"]["organizationUuid"] == data2["accounts"]["1"]["organizationUuid"]
+        assert data1["accounts"]["2"]["organizationUuid"] == data2["accounts"]["2"]["organizationUuid"]
+
+    def test_migration_skips_already_migrated(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Accounts that already have org fields should not be changed."""
+        sample_sequence_data_pre_v06["accounts"]["1"]["organizationUuid"] = "existing-org"
+        sample_sequence_data_pre_v06["accounts"]["1"]["organizationName"] = "Existing Org"
+
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "different-org",
+                "organizationName": "Different Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data_migrated()
+
+        assert data["accounts"]["1"]["organizationUuid"] == "existing-org"
+        assert data["accounts"]["1"]["organizationName"] == "Existing Org"
+        assert data["accounts"]["2"]["organizationUuid"] == ""
+
+    def test_switch_after_upgrade_no_duplicate(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """switch() on pre-v0.6.0 data should not auto-add a duplicate account."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        backup_dir = temp_home / ".claude-swap-backup"
+        creds_dir = backup_dir / "credentials"
+        creds_dir.mkdir(exist_ok=True)
+        import base64
+        encoded = base64.b64encode(
+            json.dumps({"claudeAiOauth": {"accessToken": "token-2"}}).encode()
+        ).decode()
+        (creds_dir / ".creds-2-other@example.com.enc").write_text(encoded)
+
+        configs_dir = backup_dir / "configs"
+        configs_dir.mkdir(exist_ok=True)
+        (configs_dir / ".claude-config-2-other@example.com.json").write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": "other@example.com",
+                "accountUuid": "other-uuid-5678",
+            }})
+        )
+
+        with patch.object(switcher, "_write_credentials"):
+            switcher.switch()
+
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 2
+        assert "auto" not in capsys.readouterr().out.lower()

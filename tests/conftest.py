@@ -108,6 +108,28 @@ def mock_personal_claude_config(temp_home: Path):
 
 
 @pytest.fixture
+def sample_sequence_data_pre_v06():
+    """Pre-v0.6.0 sequence.json data without organizationUuid/Name fields."""
+    return {
+        "activeAccountNumber": 1,
+        "lastUpdated": "2024-01-01T00:00:00Z",
+        "sequence": [1, 2],
+        "accounts": {
+            "1": {
+                "email": "user@example.com",
+                "uuid": "user-uuid-1234",
+                "added": "2024-01-01T00:00:00Z",
+            },
+            "2": {
+                "email": "other@example.com",
+                "uuid": "other-uuid-5678",
+                "added": "2024-01-02T00:00:00Z",
+            },
+        },
+    }
+
+
+@pytest.fixture
 def sample_sequence_data_with_org():
     """sequence.json data with mixed organization and personal accounts."""
     return {

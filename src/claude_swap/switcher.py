@@ -489,21 +489,62 @@ class ClaudeAccountSwitcher:
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
 
+    def _get_sequence_data_migrated(self) -> dict | None:
+        """Get sequence data, ensuring org-field migration has run."""
+        data = self._get_sequence_data()
+        if not data:
+            return data
+        needs_migration = any(
+            "organizationUuid" not in acc
+            for acc in data.get("accounts", {}).values()
+        )
+        if needs_migration:
+            self._migrate_org_fields()
+            data = self._get_sequence_data()  # Re-read after migration
+        return data
+
     def _migrate_org_fields(self) -> None:
         """Backfill organizationUuid/Name for accounts added before org support.
 
-        Reads each account's backup config to extract org info and writes it
-        back to sequence.json so that the composite key check works correctly.
+        For the currently active account, reads org info from the live config
+        (which is authoritative). For inactive accounts, falls back to backup
+        configs. Writes updated fields back to sequence.json.
         """
         data = self._get_sequence_data()
         if not data:
             return
 
+        # Read live config for the currently active account
+        live_email = ""
+        live_org_uuid = ""
+        live_org_name = ""
+        config_path = self._get_claude_config_path()
+        if config_path.exists():
+            try:
+                config_data = self._read_json(config_path)
+                if config_data:
+                    oauth = config_data.get("oauthAccount", {})
+                    live_email = oauth.get("emailAddress", "")
+                    live_org_uuid = oauth.get("organizationUuid", "") or ""
+                    live_org_name = oauth.get("organizationName", "") or ""
+            except Exception:
+                pass
+
         updated = False
         for num, account in data.get("accounts", {}).items():
             if "organizationUuid" in account:
                 continue  # Already migrated
+
             email = account.get("email", "")
+
+            # For the active account, prefer live config (backup may lack org fields)
+            if email == live_email and live_email:
+                account["organizationUuid"] = live_org_uuid
+                account["organizationName"] = live_org_name
+                updated = True
+                continue
+
+            # For inactive accounts, fall back to backup config
             config_text = self._read_account_config(num, email)
             if config_text:
                 try:
@@ -623,6 +664,9 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
+        # Ensure org fields are migrated before resolving accounts
+        self._get_sequence_data_migrated()
+
         # Resolve identifier
         if not identifier.isdigit():
             if not self._validate_email(identifier):
@@ -698,7 +742,7 @@ class ClaudeAccountSwitcher:
             self._first_run_setup()
             return
 
-        data = self._get_sequence_data()
+        data = self._get_sequence_data_migrated()
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -766,7 +810,7 @@ class ClaudeAccountSwitcher:
             return
         current_email, current_org_uuid = identity
 
-        data = self._get_sequence_data()
+        data = self._get_sequence_data_migrated()
         if not data:
             print(f"Status: Active account: {current_email} (not managed)")
             return
@@ -817,6 +861,9 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No active Claude account found")
         current_email, current_org_uuid = identity
 
+        # Ensure org fields are migrated before checking composite key
+        self._get_sequence_data_migrated()
+
         # Check if current account is managed
         if not self._account_exists(current_email, current_org_uuid):
             print(f"Notice: Active account '{current_email}' was not managed.")
@@ -851,6 +898,9 @@ class ClaudeAccountSwitcher:
         """Switch to specific account."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
+
+        # Ensure org fields are migrated before resolving accounts
+        self._get_sequence_data_migrated()
 
         # Resolve identifier
         if not identifier.isdigit():
