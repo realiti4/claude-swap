@@ -144,7 +144,7 @@ class TestGetCurrentAccount:
     def test_with_valid_config(self, temp_home: Path, mock_claude_config: Path):
         """Test reading email from valid config."""
         switcher = ClaudeAccountSwitcher()
-        assert switcher._get_current_account() == "test@example.com"
+        assert switcher._get_current_account() == ("test@example.com", "")
 
     def test_config_without_oauth(self, temp_home: Path):
         """Test config file without oauthAccount."""
@@ -593,7 +593,7 @@ class TestAccountExistsCompositeKey:
 
 # ── Task 4: _get_current_account returns tuple ───────────────────────────────
 
-class TestGetCurrentAccount:
+class TestGetCurrentAccountOrgSupport:
     def test_returns_org_info(self, temp_home, mock_org_claude_config):
         """_get_current_account should return (email, organization_uuid) tuple."""
         from claude_swap.switcher import ClaudeAccountSwitcher
@@ -619,12 +619,11 @@ class TestGetCurrentAccount:
 # ── Task 5: add_account with org fields ──────────────────────────────────────
 
 class TestAddAccountOrgFields:
-    def test_allows_same_email_different_org(self, temp_home, mock_credentials_file):
+    def test_allows_same_email_different_org(self, temp_home):
         """Should allow adding same-email account if organizationUuid differs."""
-        import io
-        from contextlib import redirect_stdout
         from claude_swap.switcher import ClaudeAccountSwitcher
 
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         config_path = temp_home / ".claude" / ".claude.json"
 
         config_path.write_text(json.dumps({
@@ -636,7 +635,9 @@ class TestAddAccountOrgFields:
             }
         }))
         switcher = ClaudeAccountSwitcher()
-        switcher.add_account()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
 
         config_path.write_text(json.dumps({
             "oauthAccount": {
@@ -644,19 +645,20 @@ class TestAddAccountOrgFields:
                 "accountUuid": "user-uuid",
             }
         }))
-        switcher.add_account()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
 
         seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
         assert len(seq["accounts"]) == 2
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid-A"
         assert seq["accounts"]["2"]["organizationUuid"] == ""
 
-    def test_blocks_true_duplicate(self, temp_home, mock_credentials_file):
+    def test_blocks_true_duplicate(self, temp_home):
         """Should block adding an account with identical (email, organizationUuid) combination."""
-        import io
-        from contextlib import redirect_stdout
         from claude_swap.switcher import ClaudeAccountSwitcher
 
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         config_path = temp_home / ".claude" / ".claude.json"
         org_config = {
             "oauthAccount": {
@@ -668,21 +670,28 @@ class TestAddAccountOrgFields:
         }
         config_path.write_text(json.dumps(org_config))
         switcher = ClaudeAccountSwitcher()
-        switcher.add_account()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
 
-        config_path.write_text(json.dumps(org_config))
+        import io
+        from contextlib import redirect_stdout
         f = io.StringIO()
-        with redirect_stdout(f):
+        config_path.write_text(json.dumps(org_config))
+        with redirect_stdout(f), \
+             patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
         assert "Updated credentials" in f.getvalue()
 
         seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
         assert len(seq["accounts"]) == 1
 
-    def test_stores_org_name_in_sequence(self, temp_home, mock_credentials_file):
+    def test_stores_org_name_in_sequence(self, temp_home):
         """add_account should store organizationName in sequence.json."""
         from claude_swap.switcher import ClaudeAccountSwitcher
 
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         config_path = temp_home / ".claude" / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
@@ -693,7 +702,9 @@ class TestAddAccountOrgFields:
             }
         }))
         switcher = ClaudeAccountSwitcher()
-        switcher.add_account()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
 
         seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
         assert seq["accounts"]["1"]["organizationName"] == "My Org"
