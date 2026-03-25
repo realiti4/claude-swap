@@ -1,6 +1,10 @@
 {
   "oauthAccount": {
     "emailAddress": "test@example.com",
-    "accountUuid": "test-uuid-1234-5678"
+    "accountUuid": "test-uuid-1234-5678",
+    "organizationUuid": "test-org-uuid-9999",
+    "organizationName": "Test Org",
+    "organizationRole": "member",
+    "displayName": "Test User"
   }
 }

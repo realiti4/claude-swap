@@ -89,19 +89,31 @@ class ClaudeAccountSwitcher:
         return False
 
     def _get_claude_config_path(self) -> Path:
-        """Get Claude configuration file path with fallback."""
+        """Get the Claude configuration file path for the current session.
+
+        Claude Code may write to either ~/.claude/.claude.json or ~/.claude.json
+        depending on version or context. When both files exist with oauthAccount,
+        return the more recently modified one as it represents the active session.
+        """
         primary_config = self.home / ".claude" / ".claude.json"
         fallback_config = self.home / ".claude.json"
 
-        if primary_config.exists():
-            try:
-                data = json.loads(primary_config.read_text())
-                if "oauthAccount" in data:
-                    return primary_config
-            except (json.JSONDecodeError, KeyError):
-                pass
+        candidates = []
+        for path in [primary_config, fallback_config]:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text())
+                    if "oauthAccount" in data:
+                        candidates.append(path)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        return fallback_config
+        if not candidates:
+            return fallback_config
+        if len(candidates) == 1:
+            return candidates[0]
+        # Both have oauthAccount — use the more recently modified one
+        return max(candidates, key=lambda p: p.stat().st_mtime)
 
     def _validate_email(self, email: str) -> bool:
         """Validate email format."""
@@ -405,11 +417,12 @@ class ClaudeAccountSwitcher:
         account_nums = [int(k) for k in data["accounts"].keys()]
         return max(account_nums, default=0) + 1
 
-    def _get_current_account(self) -> str | None:
-        """Get current account email from .claude.json.
+    def _get_current_account(self) -> tuple[str, str] | None:
+        """Get current account identity (email, organization_uuid) from .claude.json.
 
         Returns:
-            Email address if found, None otherwise.
+            (email, organization_uuid) tuple if found, None otherwise.
+            organization_uuid is "" for personal accounts.
         """
         config_path = self._get_claude_config_path()
         if not config_path.exists():
@@ -419,22 +432,37 @@ class ClaudeAccountSwitcher:
         if not data:
             return None
 
-        email = data.get("oauthAccount", {}).get("emailAddress", "")
-        return email if email else None
+        oauth = data.get("oauthAccount", {})
+        email = oauth.get("emailAddress", "")
+        if not email:
+            return None
 
-    def _account_exists(self, email: str) -> bool:
-        """Check if account exists by email."""
+        organization_uuid = oauth.get("organizationUuid", "") or ""
+        return (email, organization_uuid)
+
+    def _account_exists(self, email: str, organization_uuid: str) -> bool:
+        """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
         if not data:
             return False
 
         for account in data.get("accounts", {}).values():
-            if account.get("email") == email:
+            if (account.get("email") == email and
+                    account.get("organizationUuid", "") == organization_uuid):
                 return True
         return False
 
+    @staticmethod
+    def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
+        """Return display tag for an account's org context."""
+        return org_name if org_name else "personal"
+
     def _resolve_account_identifier(self, identifier: str) -> str | None:
-        """Resolve account identifier (number or email) to account number."""
+        """Resolve account identifier (number or email) to account number.
+
+        Raises:
+            ConfigError: if the email matches multiple accounts (ambiguous).
+        """
         if identifier.isdigit():
             return identifier
 
@@ -442,23 +470,80 @@ class ClaudeAccountSwitcher:
         if not data:
             return None
 
+        matches = [
+            num for num, account in data.get("accounts", {}).items()
+            if account.get("email") == identifier
+        ]
+
+        if len(matches) == 0:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        details = ", ".join(
+            f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
+            for num in matches
+        )
+        raise ConfigError(
+            f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
+            f"Use account number instead (e.g., cswap --switch-to 1)."
+        )
+
+    def _migrate_org_fields(self) -> None:
+        """Backfill organizationUuid/Name for accounts added before org support.
+
+        Reads each account's backup config to extract org info and writes it
+        back to sequence.json so that the composite key check works correctly.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return
+
+        updated = False
         for num, account in data.get("accounts", {}).items():
-            if account.get("email") == identifier:
-                return num
-        return None
+            if "organizationUuid" in account:
+                continue  # Already migrated
+            email = account.get("email", "")
+            config_text = self._read_account_config(num, email)
+            if config_text:
+                try:
+                    config_data = json.loads(config_text)
+                    oauth = config_data.get("oauthAccount", {})
+                    account["organizationUuid"] = oauth.get("organizationUuid", "") or ""
+                    account["organizationName"] = oauth.get("organizationName", "") or ""
+                except (json.JSONDecodeError, AttributeError):
+                    account["organizationUuid"] = ""
+                    account["organizationName"] = ""
+            else:
+                account["organizationUuid"] = ""
+                account["organizationName"] = ""
+            updated = True
+
+        if updated:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
     def add_account(self) -> None:
         """Add current account to managed accounts."""
         self._setup_directories()
         self._init_sequence_file()
+        self._migrate_org_fields()
 
-        current_email = self._get_current_account()
-        if current_email is None:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
+        current_email, current_org_uuid = identity
 
-        if self._account_exists(current_email):
-            # Refresh credentials for existing account
-            account_num = self._resolve_account_identifier(current_email)
+        if self._account_exists(current_email, current_org_uuid):
+            # Refresh credentials for existing account using composite key lookup
+            seq = self._get_sequence_data()
+            account_num = next(
+                (num for num, acc in seq.get("accounts", {}).items()
+                 if acc.get("email") == current_email and
+                 acc.get("organizationUuid", "") == current_org_uuid),
+                None,
+            )
+            matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
 
             current_creds = self._read_credentials()
             if current_creds is None:
@@ -478,13 +563,13 @@ class ClaudeAccountSwitcher:
             self._write_account_config(account_num, current_email, current_config)
 
             # Update active account
-            data = self._get_sequence_data()
-            data["activeAccountNumber"] = int(account_num)
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            seq["activeAccountNumber"] = int(account_num)
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
 
+            tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
-            print(f"Updated credentials for Account {account_num}: {current_email}")
+            print(f"Updated credentials for Account {account_num} ({current_email} [{tag}]).")
             return
 
         account_num = str(self._get_next_account_number())
@@ -504,9 +589,12 @@ class ClaudeAccountSwitcher:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID
+        # Get account UUID and org fields
         config_data = self._read_json(config_path)
-        account_uuid = config_data.get("oauthAccount", {}).get("accountUuid", "")
+        oauth = config_data.get("oauthAccount", {})
+        account_uuid = oauth.get("accountUuid", "")
+        organization_uuid = oauth.get("organizationUuid", "") or ""
+        organization_name = oauth.get("organizationName", "") or ""
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -517,6 +605,8 @@ class ClaudeAccountSwitcher:
         data["accounts"][account_num] = {
             "email": current_email,
             "uuid": account_uuid,
+            "organizationUuid": organization_uuid,
+            "organizationName": organization_name,
             "added": get_timestamp(),
         }
         data["sequence"].append(int(account_num))
@@ -524,8 +614,9 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Added account {account_num}: {current_email}")
-        print(f"Added Account {account_num}: {current_email}")
+        tag = self._get_display_tag(current_email, organization_name, organization_uuid)
+        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        print(f"Added Account {account_num}: {current_email} [{tag}]")
 
     def remove_account(self, identifier: str) -> None:
         """Remove account from managed accounts."""
@@ -536,6 +627,28 @@ class ClaudeAccountSwitcher:
         if not identifier.isdigit():
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
+
+            # For email identifiers, handle ambiguous matches interactively
+            data = self._get_sequence_data()
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} [{tag}]")
+                choice = input("Enter account number to remove: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print("Cancelled")
+                    return
+                identifier = choice
 
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
@@ -586,13 +699,15 @@ class ClaudeAccountSwitcher:
             return
 
         data = self._get_sequence_data()
-        current_email = self._get_current_account()
+        current_identity = self._get_current_account()
 
-        # Find active account number by email
+        # Find active account number by (email, organizationUuid) composite key
         active_num = None
-        if current_email is not None:
+        if current_identity is not None:
+            current_email, current_org_uuid = current_identity
             for num, account in data.get("accounts", {}).items():
-                if account.get("email") == current_email:
+                if (account.get("email") == current_email and
+                        account.get("organizationUuid", "") == current_org_uuid):
                     active_num = num
                     break
 
@@ -600,6 +715,8 @@ class ClaudeAccountSwitcher:
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
+            org_name = account.get("organizationName", "") or ""
+            org_uuid = account.get("organizationUuid", "") or ""
             is_active = str(num) == active_num
 
             if is_active:
@@ -608,7 +725,7 @@ class ClaudeAccountSwitcher:
                 creds = self._read_account_credentials(str(num), email)
 
             token = self._extract_access_token(creds)
-            accounts_info.append((num, email, is_active, token))
+            accounts_info.append((num, email, org_name, org_uuid, is_active, token))
 
         def fetch(token: str | None) -> dict | str | None:
             if not token:
@@ -616,12 +733,13 @@ class ClaudeAccountSwitcher:
             return self._fetch_usage(token)
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, (t for _, _, _, t in accounts_info)))
+            usages = list(executor.map(fetch, (t for _, _, _, _, _, t in accounts_info)))
 
         print("Accounts:")
-        for i, ((num, email, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+        for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+            tag = self._get_display_tag(email, org_name, org_uuid)
             marker = " (active)" if is_active else ""
-            print(f"  {num}: {email}{marker}")
+            print(f"  {num}: {email} [{tag}]{marker}")
             if isinstance(usage, str):
                 print(f"     {usage}")
             elif usage is None:
@@ -642,36 +760,42 @@ class ClaudeAccountSwitcher:
 
     def status(self) -> None:
         """Display current account status."""
-        current = self._get_current_account()
-        if current is None:
+        identity = self._get_current_account()
+        if identity is None:
             print("Status: No active Claude account")
             return
+        current_email, current_org_uuid = identity
 
         data = self._get_sequence_data()
         if not data:
-            print(f"Status: Active account: {current} (not managed)")
+            print(f"Status: Active account: {current_email} (not managed)")
             return
 
         account_num = None
+        org_name = ""
         for num, info in data.get("accounts", {}).items():
-            if info.get("email") == current:
+            if (info.get("email") == current_email and
+                    info.get("organizationUuid", "") == current_org_uuid):
                 account_num = num
+                org_name = info.get("organizationName", "") or ""
                 break
 
         if account_num:
+            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
-            print(f"Status: Account-{account_num} ({current})")
+            print(f"Status: Account-{account_num} ({current_email} [{tag}])")
             print(f"  Total managed accounts: {total}")
         else:
-            print(f"Status: Active account: {current} (not managed)")
+            print(f"Status: Active account: {current_email} (not managed)")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
-        current_email = self._get_current_account()
+        identity = self._get_current_account()
 
-        if current_email is None:
+        if identity is None:
             print("No active Claude account found. Please log in first.")
             return
+        current_email, _ = identity
 
         response = input(
             f"No managed accounts found. Add current account "
@@ -688,12 +812,13 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        current_email = self._get_current_account()
-        if current_email is None:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found")
+        current_email, current_org_uuid = identity
 
         # Check if current account is managed
-        if not self._account_exists(current_email):
+        if not self._account_exists(current_email, current_org_uuid):
             print(f"Notice: Active account '{current_email}' was not managed.")
             self.add_account()
             data = self._get_sequence_data()
@@ -732,6 +857,28 @@ class ClaudeAccountSwitcher:
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
 
+            # For email identifiers, handle ambiguous matches interactively
+            data = self._get_sequence_data()
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} [{tag}]")
+                choice = input("Enter account number to switch to: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print("Cancelled")
+                    return
+                identifier = choice
+
         target_account = self._resolve_account_identifier(identifier)
         if not target_account:
             raise AccountNotFoundError(
@@ -750,10 +897,11 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data()
             current_account = str(data.get("activeAccountNumber"))
             target_email = data["accounts"][target_account]["email"]
-            current_email = self._get_current_account()
+            current_identity = self._get_current_account()
 
-            if current_email is None:
+            if current_identity is None:
                 raise SwitchError("No current account to switch from")
+            current_email, _ = current_identity
 
             config_path = self._get_claude_config_path()
 
