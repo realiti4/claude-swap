@@ -361,6 +361,8 @@ class ClaudeAccountSwitcher:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
 
+            self._logger.debug("Usage API response: %s", json.dumps(data, indent=2))
+
             result = {}
 
             h5 = data.get("five_hour")
