@@ -30,6 +30,7 @@ from claude_swap.exceptions import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
+from claude_swap.printer import accent, bold_accent, bolded, dimmed, error, muted, warning
 
 # Service name for keyring storage
 KEYRING_SERVICE = "claude-code"
@@ -612,7 +613,10 @@ class ClaudeAccountSwitcher:
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
-            print(f"Updated credentials for Account {account_num} ({current_email} [{tag}]).")
+            print(
+                f"{accent('Updated credentials')} for Account {account_num} "
+                f"({current_email} {muted(f'[{tag}]')})."
+            )
             return
 
         account_num = str(self._get_next_account_number())
@@ -659,7 +663,7 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
-        print(f"Added Account {account_num}: {current_email} [{tag}]")
+        print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def remove_account(self, identifier: str) -> None:
         """Remove account from managed accounts."""
@@ -689,10 +693,10 @@ class ClaudeAccountSwitcher:
                         acc.get("organizationName", ""),
                         acc.get("organizationUuid", ""),
                     )
-                    print(f"  {num}: {identifier} [{tag}]")
+                    print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                 choice = input("Enter account number to remove: ").strip()
                 if not choice.isdigit() or choice not in matches:
-                    print("Cancelled")
+                    print(dimmed("Cancelled"))
                     return
                 identifier = choice
 
@@ -712,14 +716,14 @@ class ClaudeAccountSwitcher:
         active_account = data.get("activeAccountNumber")
 
         if str(active_account) == account_num:
-            print(f"Warning: Account-{account_num} ({email}) is currently active")
+            warning(f"Warning: Account-{account_num} ({email}) is currently active")
 
         confirm = input(
             f"Are you sure you want to permanently remove "
             f"Account-{account_num} ({email})? [y/N] "
         )
         if confirm.lower() != "y":
-            print("Cancelled")
+            print(dimmed("Cancelled"))
             return
 
         # Remove backup files
@@ -735,12 +739,12 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"Account-{account_num} ({email}) has been removed")
+        print(f"{accent('Removed')} Account-{account_num} ({email})")
 
     def list_accounts(self) -> None:
         """List all managed accounts."""
         if not self.sequence_file.exists():
-            print("No accounts are managed yet.")
+            print(dimmed("No accounts are managed yet."))
             self._first_run_setup()
             return
 
@@ -781,15 +785,18 @@ class ClaudeAccountSwitcher:
         with ThreadPoolExecutor() as executor:
             usages = list(executor.map(fetch, (t for _, _, _, _, _, t in accounts_info)))
 
-        print("Accounts:")
+        print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
             tag = self._get_display_tag(email, org_name, org_uuid)
-            marker = " (active)" if is_active else ""
-            print(f"  {num}: {email} [{tag}]{marker}")
+            if is_active:
+                marker = f" {bold_accent('(active)')}"
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
+            else:
+                print(f"  {num}: {email} {muted(f'[{tag}]')}")
             if isinstance(usage, str):
-                print(f"     {usage}")
+                print(f"     {dimmed(usage)}")
             elif usage is None:
-                print("     usage unavailable")
+                print(f"     {dimmed('usage unavailable')}")
             else:
                 h5 = usage.get("five_hour")
                 d7 = usage.get("seven_day")
@@ -800,7 +807,7 @@ class ClaudeAccountSwitcher:
                     lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
                 for j, line in enumerate(lines):
                     connector = "└" if j == len(lines) - 1 else "├"
-                    print(f"     {connector} {line}")
+                    print(f"     {dimmed(connector)} {muted(line)}")
             if i < len(accounts_info) - 1:
                 print()
 
@@ -808,13 +815,13 @@ class ClaudeAccountSwitcher:
         """Display current account status."""
         identity = self._get_current_account()
         if identity is None:
-            print("Status: No active Claude account")
+            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return
         current_email, current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
-            print(f"Status: Active account: {current_email} (not managed)")
+            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return
 
         account_num = None
@@ -829,17 +836,20 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
-            print(f"Status: Account-{account_num} ({current_email} [{tag}])")
-            print(f"  Total managed accounts: {total}")
+            print(
+                f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
+                f"({current_email} {muted(f'[{tag}]')})"
+            )
+            print(f"  {dimmed(f'Total managed accounts: {total}')}")
         else:
-            print(f"Status: Active account: {current_email} (not managed)")
+            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
         identity = self._get_current_account()
 
         if identity is None:
-            print("No active Claude account found. Please log in first.")
+            print(dimmed("No active Claude account found. Please log in first."))
             return
         current_email, _ = identity
 
@@ -848,7 +858,7 @@ class ClaudeAccountSwitcher:
             f"({current_email}) to managed list? [Y/n] "
         )
         if response.lower() == "n":
-            print("Setup cancelled. You can run 'cswap --add-account' later.")
+            print(dimmed("Setup cancelled. You can run 'cswap --add-account' later."))
             return
 
         self.add_account()
@@ -868,19 +878,19 @@ class ClaudeAccountSwitcher:
 
         # Check if current account is managed
         if not self._account_exists(current_email, current_org_uuid):
-            print(f"Notice: Active account '{current_email}' was not managed.")
+            print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
             data = self._get_sequence_data()
             account_num = data.get("activeAccountNumber")
             print(f"It has been automatically added as Account-{account_num}.")
-            print("Please run the switch command again to switch to the next account.")
+            print(dimmed("Please run the switch command again to switch to the next account."))
             return
 
         data = self._get_sequence_data()
         sequence = data.get("sequence", [])
 
         if len(sequence) < 2:
-            print("Only one account is managed. Add more accounts to switch between.")
+            print(dimmed("Only one account is managed. Add more accounts to switch between."))
             return
 
         active_account = data.get("activeAccountNumber")
@@ -924,10 +934,10 @@ class ClaudeAccountSwitcher:
                         acc.get("organizationName", ""),
                         acc.get("organizationUuid", ""),
                     )
-                    print(f"  {num}: {identifier} [{tag}]")
+                    print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                 choice = input("Enter account number to switch to: ").strip()
                 if not choice.isdigit() or choice not in matches:
-                    print("Cancelled")
+                    print(dimmed("Cancelled"))
                     return
                 identifier = choice
 
@@ -1025,10 +1035,10 @@ class ClaudeAccountSwitcher:
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
                 )
-                print(f"Switched to Account-{target_account} ({target_email})")
+                print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
                 self.list_accounts()
                 print()
-                print("Please restart Claude Code to use the new authentication.")
+                warning("Please restart Claude Code to use the new authentication.")
                 print()
 
             except Exception as e:
@@ -1055,19 +1065,19 @@ class ClaudeAccountSwitcher:
         - All stored account credentials (files on Linux, keyring on macOS/Windows)
         - The ~/.claude-swap-backup directory and all its contents
         """
-        print("This will remove ALL claude-swap data from your system:")
+        warning("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
         if self.platform in (Platform.LINUX, Platform.WSL):
             print("  - All stored account credential files")
         else:
             print("  - All stored account credentials from the system keyring")
         print()
-        print("Note: This does NOT affect your current Claude Code login.")
+        print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
 
         confirm = input("Are you sure you want to purge all data? [y/N] ")
         if confirm.lower() != "y":
-            print("Cancelled")
+            print(dimmed("Cancelled"))
             return
 
         removed_items = []
@@ -1110,10 +1120,10 @@ class ClaudeAccountSwitcher:
             removed_items.append(f"Directory: {self.backup_dir}")
 
         if removed_items:
-            print("\nRemoved:")
+            print(f"\n{accent('Removed:')}")
             for item in removed_items:
-                print(f"  - {item}")
+                print(f"  {dimmed('-')} {item}")
         else:
-            print("\nNo claude-swap data found to remove.")
+            print(f"\n{dimmed('No claude-swap data found to remove.')}")
 
-        print("\nPurge complete.")
+        print(f"\n{accent('Purge complete.')}")
