@@ -171,28 +171,34 @@ def fetch_usage_for_account(
     email: str,
     credentials: str,
     is_active: bool,
+    refresh: bool = False,
     persist_credentials: Callable[[str, str, str], None] | None = None,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired OAuth tokens if needed.
 
-    Active accounts are read-only -- no refresh is attempted because Claude
-    Code keeps its own live credentials fresh.  Inactive accounts may be
-    refreshed via a direct OAuth2 token-endpoint POST and the result is
-    persisted to backup storage only.
+    By default, active accounts are read-only because Claude Code keeps its own
+    live credentials fresh. When refresh=True, active accounts also participate
+    in the refresh flow. Inactive accounts always use the refresh path when a
+    valid refresh token is available.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return None
 
-    # Active account: use token as-is, never refresh.
-    if is_active:
+    refresh_enabled = refresh or not is_active
+
+    # Active account: use token as-is unless refresh was explicitly requested.
+    if is_active and not refresh_enabled:
         return fetch_usage(access_token)
 
-    # Inactive account: proactively refresh if expired.
     working_credentials = credentials
 
-    if oauth.get("refreshToken") and is_oauth_token_expired(oauth.get("expiresAt")):
+    if (
+        refresh_enabled
+        and oauth.get("refreshToken")
+        and is_oauth_token_expired(oauth.get("expiresAt"))
+    ):
         refreshed = refresh_oauth_credentials(working_credentials)
         if refreshed:
             working_credentials = refreshed
@@ -205,7 +211,12 @@ def fetch_usage_for_account(
         return build_usage_result(data)
     except urllib.error.HTTPError as e:
         _logger.debug("Usage fetch failed: %r", e)
-        if e.code != 401 or not oauth or not oauth.get("refreshToken"):
+        if (
+            e.code != 401
+            or not refresh_enabled
+            or not oauth
+            or not oauth.get("refreshToken")
+        ):
             return None
 
         # Retry once after refreshing on 401.

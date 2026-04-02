@@ -314,6 +314,80 @@ class TestFetchUsageForAccount:
         assert result is not None
         assert result["five_hour"]["pct"] == 10.0
 
+    def test_active_account_refreshes_when_requested(self):
+        """Active account refreshes expired token when refresh=True."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+
+        token_resp = MagicMock()
+        token_resp.read.return_value = self._make_token_response()
+        token_resp.__enter__ = lambda s: s
+        token_resp.__exit__ = MagicMock(return_value=False)
+
+        usage_resp = self._make_usage_response(h5_pct=90.0, d7_pct=91.0)
+        persist_mock = MagicMock()
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                return token_resp
+            if "oauth/usage" in req.full_url:
+                assert req.get_header("Authorization") == "Bearer new-access"
+                return usage_resp
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, True,
+                refresh=True,
+                persist_credentials=persist_mock,
+            )
+
+        assert result is not None
+        assert result["five_hour"]["pct"] == 90.0
+        persist_mock.assert_called_once()
+        refreshed_oauth = json.loads(persist_mock.call_args[0][2])["claudeAiOauth"]
+        assert refreshed_oauth["accessToken"] == "new-access"
+
+    def test_active_account_retries_401_when_refresh_requested(self):
+        """Active account retries 401 with refresh only when refresh=True."""
+        credentials = self._make_credentials()
+
+        token_resp = MagicMock()
+        token_resp.read.return_value = self._make_token_response()
+        token_resp.__enter__ = lambda s: s
+        token_resp.__exit__ = MagicMock(return_value=False)
+
+        usage_resp = self._make_usage_response(h5_pct=66.0, d7_pct=77.0)
+        usage_calls = 0
+        persist_mock = MagicMock()
+
+        def mock_urlopen(req, timeout=0):
+            nonlocal usage_calls
+            if "oauth/token" in req.full_url:
+                return token_resp
+            if "oauth/usage" in req.full_url:
+                usage_calls += 1
+                if usage_calls == 1:
+                    assert req.get_header("Authorization") == "Bearer old-access"
+                    raise urllib.error.HTTPError(
+                        req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                    )
+                assert req.get_header("Authorization") == "Bearer new-access"
+                return usage_resp
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, True,
+                refresh=True,
+                persist_credentials=persist_mock,
+            )
+
+        assert result is not None
+        assert result["seven_day"]["pct"] == 77.0
+        assert usage_calls == 2
+        persist_mock.assert_called_once()
+
     def test_refresh_failure_returns_none_gracefully(self):
         """If token refresh fails (e.g. revoked), usage returns None."""
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)

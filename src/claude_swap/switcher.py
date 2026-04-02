@@ -675,7 +675,7 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
-    def list_accounts(self) -> None:
+    def list_accounts(self, refresh: bool = False) -> None:
         """List all managed accounts."""
         if not self.sequence_file.exists():
             print(dimmed("No accounts are managed yet."))
@@ -719,10 +719,13 @@ class ClaudeAccountSwitcher:
 
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
                 with FileLock(self.lock_file):
+                    if is_active:
+                        self._write_credentials(new_creds)
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
             return oauth.fetch_usage_for_account(
                 str(num), email, creds, is_active,
+                refresh=refresh,
                 persist_credentials=persist,
             )
 

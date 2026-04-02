@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import __version__
+from claude_swap import cli
 
 
 class TestCLI:
@@ -68,6 +69,25 @@ class TestCLI:
         )
         # Should run (may fail due to no config, but flag should be accepted)
         assert "--debug" not in result.stderr or "unrecognized" not in result.stderr
+
+    def test_refresh_flag_requires_list(self, capsys):
+        """--refresh should only be accepted alongside --list."""
+        with patch.object(sys, "argv", ["claude-swap", "--refresh", "--status"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--refresh can only be used with --list" in capsys.readouterr().err
+
+    def test_refresh_flag_is_forwarded_to_list(self):
+        """--list --refresh should call list_accounts(refresh=True)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--list", "--refresh"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.list_accounts.assert_called_once_with(refresh=True)
 
 
 class TestCLICommands:

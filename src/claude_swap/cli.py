@@ -41,6 +41,11 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh expired OAuth tokens (use with --list)",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -81,6 +86,9 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.refresh and not args.list:
+        parser.error("--refresh can only be used with --list")
+
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -96,7 +104,7 @@ Examples:
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
-            switcher.list_accounts()
+            switcher.list_accounts(refresh=args.refresh)
         elif args.switch:
             switcher.switch()
         elif args.switch_to:
