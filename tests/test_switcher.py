@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -435,6 +436,24 @@ class TestFetchUsage:
         with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
             result = switcher._fetch_usage("sk-test-token")
         assert result is None
+
+    def test_http_error_logs_in_debug_mode(self, temp_home: Path, capsys):
+        switcher = ClaudeAccountSwitcher(debug=True)
+        http_error = urllib.error.HTTPError(
+            url="https://api.anthropic.com/api/oauth/usage",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,
+            fp=None,
+        )
+
+        with patch("urllib.request.urlopen", side_effect=http_error):
+            result = switcher._fetch_usage("sk-test-token")
+
+        assert result is None
+        debug_output = capsys.readouterr().err
+        assert "Usage fetch failed" in debug_output
+        assert "<HTTPError 429: 'Too Many Requests'>" in debug_output
 
     def test_bad_response(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()

@@ -381,7 +381,8 @@ class ClaudeAccountSwitcher:
                 result["seven_day"] = d7_entry
 
             return result if result else None
-        except Exception:
+        except Exception as e:
+            self._logger.debug("Usage fetch failed: %r", e)
             return None
 
     def _read_account_config(self, account_num: str, email: str) -> str:
