@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import urllib.error
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -340,162 +338,6 @@ class TestStatus:
         switcher.status()
 
 
-class TestExtractAccessToken:
-    """Test _extract_access_token."""
-
-    def test_valid_credentials(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-test-token"}})
-        assert switcher._extract_access_token(creds) == "sk-test-token"
-
-    def test_missing_key(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        creds = json.dumps({"claudeAiOauth": {}})
-        assert switcher._extract_access_token(creds) is None
-
-    def test_invalid_json(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        assert switcher._extract_access_token("not-json") is None
-
-    def test_empty_string(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        assert switcher._extract_access_token("") is None
-
-
-class TestFormatReset:
-    """Test _format_reset."""
-
-    def test_same_day_shows_time_only(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
-        future = fixed_now + timedelta(hours=2, minutes=15)
-        with patch("claude_swap.switcher.datetime") as mock_dt:
-            mock_dt.fromisoformat = datetime.fromisoformat
-            mock_dt.now.return_value = fixed_now
-            countdown, clock = switcher._format_reset(future.isoformat())
-        assert countdown == "2h 15m"
-        # Clock should be HH:MM only (no month/day since same day)
-        assert clock.count(":") == 1
-
-    def test_different_day_shows_date(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
-        future = fixed_now + timedelta(days=2)
-        with patch("claude_swap.switcher.datetime") as mock_dt:
-            mock_dt.fromisoformat = datetime.fromisoformat
-            mock_dt.now.return_value = fixed_now
-            countdown, clock = switcher._format_reset(future.isoformat())
-        import calendar
-        months = list(calendar.month_abbr)[1:]
-        assert any(m in clock for m in months)
-
-    def test_minutes_only_when_under_one_hour(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
-        future = fixed_now + timedelta(minutes=45)
-        with patch("claude_swap.switcher.datetime") as mock_dt:
-            mock_dt.fromisoformat = datetime.fromisoformat
-            mock_dt.now.return_value = fixed_now
-            countdown, clock = switcher._format_reset(future.isoformat())
-        assert countdown == "45m"
-        assert "h" not in countdown
-
-
-class TestFetchUsage:
-    """Test _fetch_usage."""
-
-    def test_success(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
-        future = fixed_now + timedelta(hours=1)
-        response_data = {
-            "five_hour": {"utilization": 22.0, "resets_at": future.isoformat()},
-            "seven_day": {"utilization": 61.0, "resets_at": future.isoformat()},
-        }
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(response_data).encode()
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("urllib.request.urlopen", return_value=mock_response), \
-             patch("claude_swap.switcher.datetime") as mock_dt:
-            mock_dt.fromisoformat = datetime.fromisoformat
-            mock_dt.now.return_value = fixed_now
-            result = switcher._fetch_usage("sk-test-token")
-
-        assert result["five_hour"]["pct"] == 22.0
-        assert result["seven_day"]["pct"] == 61.0
-        assert result["five_hour"]["countdown"] == "1h 0m"
-
-    def test_network_error(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
-            result = switcher._fetch_usage("sk-test-token")
-        assert result is None
-
-    def test_http_error_logs_in_debug_mode(self, temp_home: Path, capsys):
-        switcher = ClaudeAccountSwitcher(debug=True)
-        http_error = urllib.error.HTTPError(
-            url="https://api.anthropic.com/api/oauth/usage",
-            code=429,
-            msg="Too Many Requests",
-            hdrs=None,
-            fp=None,
-        )
-
-        with patch("urllib.request.urlopen", side_effect=http_error):
-            result = switcher._fetch_usage("sk-test-token")
-
-        assert result is None
-        debug_output = capsys.readouterr().err
-        assert "Usage fetch failed" in debug_output
-        assert "<HTTPError 429: 'Too Many Requests'>" in debug_output
-
-    def test_bad_response(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        mock_response = MagicMock()
-        mock_response.read.return_value = b"{}"
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("urllib.request.urlopen", return_value=mock_response):
-            result = switcher._fetch_usage("sk-test-token")
-        assert result is None
-
-    def test_null_resets_at(self, temp_home: Path):
-        """When resets_at is null, still return pct without clock/countdown."""
-        switcher = ClaudeAccountSwitcher()
-        from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
-        future = fixed_now + timedelta(hours=22)
-        response_data = {
-            "five_hour": {"utilization": 0.0, "resets_at": None},
-            "seven_day": {"utilization": 100.0, "resets_at": future.isoformat()},
-        }
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(response_data).encode()
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("urllib.request.urlopen", return_value=mock_response), \
-             patch("claude_swap.switcher.datetime") as mock_dt:
-            mock_dt.fromisoformat = datetime.fromisoformat
-            mock_dt.now.return_value = fixed_now
-            result = switcher._fetch_usage("sk-test-token")
-
-        assert result is not None
-        assert result["five_hour"]["pct"] == 0.0
-        assert "clock" not in result["five_hour"]
-        assert "countdown" not in result["five_hour"]
-        assert result["seven_day"]["pct"] == 100.0
-        assert "clock" in result["seven_day"]
-        assert "countdown" in result["seven_day"]
-
-
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -521,7 +363,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("urllib.request.urlopen", return_value=mock_response):
+             patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
         output = capsys.readouterr().out
@@ -555,7 +397,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("urllib.request.urlopen", return_value=mock_response):
+             patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
         output = capsys.readouterr().out
@@ -848,7 +690,7 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_fetch_usage", return_value=None):
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -875,7 +717,7 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_fetch_usage", return_value=None):
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -906,7 +748,7 @@ class TestBackwardCompatibility:
         (temp_home / ".claude" / ".credentials.json").write_text('{"accessToken": "tok"}')
 
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_fetch_usage", return_value=None):
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -986,7 +828,7 @@ class TestUpgradeMigration:
         )
 
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_fetch_usage", return_value=None):
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
