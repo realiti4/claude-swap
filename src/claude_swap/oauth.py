@@ -192,33 +192,22 @@ def fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
-    is_active: bool,
-    refresh: bool = False,
     persist_credentials: Callable[[str, str, str], None] | None = None,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired OAuth tokens if needed.
 
-    By default, active accounts are read-only because Claude Code keeps its own
-    live credentials fresh. When refresh=True, active accounts also participate
-    in the refresh flow. Inactive accounts always use the refresh path when a
-    valid refresh token is available.
+    All accounts participate in the refresh flow when a valid refresh token is
+    available and the access token is expired or near expiry.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return None
 
-    refresh_enabled = refresh or not is_active
-
-    # Active account: use token as-is unless refresh was explicitly requested.
-    if is_active and not refresh_enabled:
-        return fetch_usage(access_token)
-
     working_credentials = credentials
 
     if (
-        refresh_enabled
-        and oauth.get("refreshToken")
+        oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
         refreshed = refresh_oauth_credentials(working_credentials)
@@ -235,7 +224,6 @@ def fetch_usage_for_account(
         _logger.debug("Usage fetch failed: %r", e)
         if (
             e.code != 401
-            or not refresh_enabled
             or not oauth
             or not oauth.get("refreshToken")
         ):

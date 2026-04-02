@@ -421,27 +421,28 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         assert "no credentials" in output
 
-    def test_list_refresh_persists_active_account_to_live_and_backup(
+    def test_list_persist_merges_only_oauth_into_live_blob(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
+        """Persist callback re-reads live storage and merges only claudeAiOauth."""
         sample_sequence_data["sequence"] = [1]
         sample_sequence_data["accounts"] = {
             "1": sample_sequence_data["accounts"]["1"],
         }
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
-        refreshed_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-new"}})
+        orig_oauth = {"accessToken": "sk-active", "refreshToken": "rt-orig"}
+        active_creds = json.dumps({
+            "claudeAiOauth": orig_oauth,
+            "trustedDeviceToken": "device-abc",
+        })
+        new_oauth = {"accessToken": "sk-new", "refreshToken": "rt-new"}
+        refreshed_creds = json.dumps({"claudeAiOauth": new_oauth})
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, refresh, persist_credentials):
-            assert account_num == "1"
-            assert email == "test@example.com"
-            assert credentials == active_creds
-            assert is_active is True
-            assert refresh is True
+        def mock_fetch(account_num, email, credentials, persist_credentials):
             persist_credentials(account_num, email, refreshed_creds)
             return None
 
@@ -449,10 +450,44 @@ class TestListAccountsUsage:
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
-            switcher.list_accounts(refresh=True)
+            switcher.list_accounts()
 
-        write_live.assert_called_once_with(refreshed_creds)
+        # Live write should merge oauth into fresh blob, preserving trustedDeviceToken
+        written = json.loads(write_live.call_args[0][0])
+        assert written["claudeAiOauth"]["accessToken"] == "sk-new"
+        assert written["trustedDeviceToken"] == "device-abc"
         write_backup.assert_called_once_with("1", "test@example.com", refreshed_creds)
+
+    def test_list_persist_aborts_when_refresh_token_changed(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Persist aborts both live and backup writes when refresh token changed on disk."""
+        sample_sequence_data["sequence"] = [1]
+        sample_sequence_data["accounts"] = {
+            "1": sample_sequence_data["accounts"]["1"],
+        }
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        # Original creds had rt-orig, but live storage now has rt-different (another process refreshed)
+        orig_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-orig"}})
+        live_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-other", "refreshToken": "rt-different"}})
+        refreshed_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        def mock_fetch(account_num, email, credentials, persist_credentials):
+            persist_credentials(account_num, email, refreshed_creds)
+            return None
+
+        with patch.object(switcher, "_read_credentials", side_effect=[orig_creds, live_creds]), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+            switcher.list_accounts()
+
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
 
     def test_list_shows_token_status_when_requested(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys

@@ -235,9 +235,23 @@ class ClaudeAccountSwitcher:
             cred_dir.mkdir(parents=True, exist_ok=True)
             cred_file = cred_dir / ".credentials.json"
             try:
-                cred_file.write_text(credentials)
-                if sys.platform != "win32":
-                    os.chmod(cred_file, 0o600)
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
+                try:
+                    os.write(fd, credentials.encode())
+                    os.close(fd)
+                    fd = -1
+                    os.replace(tmp_path, str(cred_file))
+                    if sys.platform != "win32":
+                        os.chmod(str(cred_file), 0o600)
+                except BaseException:
+                    if fd >= 0:
+                        os.close(fd)
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
             except Exception as e:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
 
@@ -677,7 +691,6 @@ class ClaudeAccountSwitcher:
 
     def list_accounts(
         self,
-        refresh: bool = False,
         show_token_status: bool = False,
     ) -> None:
         """List all managed accounts."""
@@ -724,12 +737,28 @@ class ClaudeAccountSwitcher:
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
                 with FileLock(self.lock_file):
                     if is_active:
-                        self._write_credentials(new_creds)
+                        live = self._read_credentials()
+                        if live:
+                            try:
+                                live_data = json.loads(live)
+                                new_data = json.loads(new_creds)
+                                orig_data = json.loads(creds)
+                            except json.JSONDecodeError:
+                                return
+                            live_rt = live_data.get("claudeAiOauth", {}).get("refreshToken")
+                            orig_rt = orig_data.get("claudeAiOauth", {}).get("refreshToken")
+                            if live_rt != orig_rt:
+                                self._logger.debug("Refresh token changed on disk, skipping write")
+                                return
+                            live_data["claudeAiOauth"] = new_data.get("claudeAiOauth", {})
+                            self._write_credentials(json.dumps(live_data))
+                        else:
+                            self._logger.debug("Live credentials empty or unreadable, skipping write")
+                            return
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
             return oauth.fetch_usage_for_account(
-                str(num), email, creds, is_active,
-                refresh=refresh,
+                str(num), email, creds,
                 persist_credentials=persist,
             )
 

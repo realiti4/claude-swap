@@ -42,11 +42,6 @@ Examples:
         help="Enable debug logging",
     )
     parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Refresh expired OAuth tokens (use with --list)",
-    )
-    parser.add_argument(
         "--token-status",
         action="store_true",
         help="Show OAuth token expiry state (use with --list)",
@@ -91,8 +86,6 @@ Examples:
 
     args = parser.parse_args()
 
-    if args.refresh and not args.list:
-        parser.error("--refresh can only be used with --list")
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
 
@@ -112,7 +105,6 @@ Examples:
             switcher.remove_account(args.remove_account)
         elif args.list:
             switcher.list_accounts(
-                refresh=args.refresh,
                 show_token_status=args.token_status,
             )
         elif args.switch:
