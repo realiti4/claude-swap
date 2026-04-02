@@ -454,6 +454,26 @@ class TestListAccountsUsage:
         write_live.assert_called_once_with(refreshed_creds)
         write_backup.assert_called_once_with("1", "test@example.com", refreshed_creds)
 
+    def test_list_shows_token_status_when_requested(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None), \
+             patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes"):
+            switcher.list_accounts(show_token_status=True)
+
+        output = capsys.readouterr().out
+        assert "oauth: fresh, refresh token yes" in output
+
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
 
@@ -964,7 +984,16 @@ class TestUpgradeMigration:
             }})
         )
 
-        with patch.object(switcher, "_write_credentials"):
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "token-2"}})
+        with patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_config", return_value=json.dumps({
+                 "oauthAccount": {
+                     "emailAddress": "other@example.com",
+                     "accountUuid": "other-uuid-5678",
+                 }
+             })):
             switcher.switch()
 
         data = switcher._get_sequence_data()

@@ -675,7 +675,11 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
-    def list_accounts(self, refresh: bool = False) -> None:
+    def list_accounts(
+        self,
+        refresh: bool = False,
+        show_token_status: bool = False,
+    ) -> None:
         """List all managed accounts."""
         if not self.sequence_file.exists():
             print(dimmed("No accounts are managed yet."))
@@ -761,6 +765,11 @@ class ClaudeAccountSwitcher:
                 for j, line in enumerate(lines):
                     connector = "└" if j == len(lines) - 1 else "├"
                     print(f"     {dimmed(connector)} {muted(line)}")
+
+            if show_token_status:
+                token_status = oauth.build_token_status(accounts_info[i][5])
+                if token_status:
+                    print(f"     {dimmed('•')} {muted(token_status)}")
             if i < len(accounts_info) - 1:
                 print()
 

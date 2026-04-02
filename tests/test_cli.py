@@ -79,6 +79,15 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--refresh can only be used with --list" in capsys.readouterr().err
 
+    def test_token_status_flag_requires_list(self, capsys):
+        """--token-status should only be accepted alongside --list."""
+        with patch.object(sys, "argv", ["claude-swap", "--token-status", "--status"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--token-status can only be used with --list" in capsys.readouterr().err
+
     def test_refresh_flag_is_forwarded_to_list(self):
         """--list --refresh should call list_accounts(refresh=True)."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -87,7 +96,23 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.list_accounts.assert_called_once_with(refresh=True)
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            refresh=True,
+            show_token_status=False,
+        )
+
+    def test_token_status_flag_is_forwarded_to_list(self):
+        """--list --token-status should call list_accounts(show_token_status=True)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--list", "--token-status"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            refresh=False,
+            show_token_status=True,
+        )
 
 
 class TestCLICommands:

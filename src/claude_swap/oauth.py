@@ -57,22 +57,19 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
         if not refresh_token:
             return None
 
-        scopes = oauth.get("scopes")
-        if not isinstance(scopes, list) or not scopes:
-            _logger.debug("OAuth refresh skipped: scopes missing")
-            return None
-
         body = json.dumps({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": OAUTH_CLIENT_ID,
-            "scope": " ".join(scopes),
         }).encode()
 
         req = urllib.request.Request(
             OAUTH_TOKEN_URL,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "claude-swap/1.0",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -88,9 +85,33 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
 
         data["claudeAiOauth"] = oauth
         return json.dumps(data)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        return None
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
         return None
+
+
+
+def build_token_status(credentials: str) -> str | None:
+    """Return a short debug summary of stored OAuth token state."""
+    oauth = extract_oauth_data(credentials)
+    if not oauth:
+        return None
+
+    has_refresh_token = bool(oauth.get("refreshToken"))
+    expires_at = oauth.get("expiresAt")
+    refresh_str = "yes" if has_refresh_token else "no"
+
+    if not isinstance(expires_at, (int, float)):
+        return f"oauth: unknown expiry, refresh token {refresh_str}"
+
+    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+    state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
+    countdown, clock = format_reset(expires_utc.isoformat())
+    return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
 def format_reset(resets_at: str) -> tuple[str, str]:
@@ -127,6 +148,7 @@ def request_usage_data(access_token: str) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
+        "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:

@@ -162,19 +162,99 @@ class TestFetchUsage:
         assert "countdown" in result["seven_day"]
 
 
+class TestRefreshOAuthCredentials:
+    """Test direct OAuth refresh requests."""
+
+    @staticmethod
+    def _make_credentials(scopes=None):
+        if scopes is None:
+            scopes = ["user:profile", "user:inference", "user:sessions:claude_code"]
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 0,
+                "scopes": scopes,
+            }
+        })
+
+    def test_refresh_sends_correct_body(self):
+        seen_body = {}
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        def mock_urlopen(req, timeout=0):
+            seen_body.update(json.loads(req.data.decode()))
+            return mock_response
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            refreshed = oauth.refresh_oauth_credentials(self._make_credentials())
+
+        assert refreshed is not None
+        assert seen_body["grant_type"] == "refresh_token"
+        assert seen_body["refresh_token"] == "old-refresh"
+        assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
+        assert "scope" not in seen_body
+
+
+class TestBuildTokenStatus:
+    """Test token status formatting."""
+
+    def test_builds_fresh_token_status(self):
+        fixed_now = datetime(2026, 4, 2, 18, 0, 0, tzinfo=timezone.utc)
+        expires_at = int(datetime(2026, 4, 2, 19, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        credentials = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": expires_at,
+            }
+        })
+
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.fromtimestamp = datetime.fromtimestamp
+            mock_dt.now.return_value = fixed_now
+            status = oauth.build_token_status(credentials)
+
+        assert status is not None
+        assert "oauth: fresh, refresh token yes" in status
+        assert "in 1h 30m" in status
+
+    def test_builds_unknown_expiry_status(self):
+        credentials = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+            }
+        })
+
+        status = oauth.build_token_status(credentials)
+
+        assert status == "oauth: unknown expiry, refresh token yes"
+
+
 class TestFetchUsageForAccount:
     """Test refresh-aware usage fetches for managed accounts."""
 
     @staticmethod
     def _make_credentials(access="old-access", refresh="old-refresh",
-                          expires_at=None, org_uuid="org-1"):
+                          expires_at=None, org_uuid="org-1", scopes=None):
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if scopes is None:
+            scopes = ["user:profile", "user:inference", "user:sessions:claude_code"]
         return json.dumps({
             "claudeAiOauth": {
                 "accessToken": access,
                 "refreshToken": refresh,
                 "expiresAt": expires_at if expires_at is not None else now_ms + 3_600_000,
-                "scopes": ["user:profile", "user:inference", "user:sessions:claude_code"],
+                "scopes": scopes,
                 "subscriptionType": "pro",
                 "rateLimitTier": "default_claude_ai",
             },
@@ -410,3 +490,40 @@ class TestFetchUsageForAccount:
             )
 
         assert result is None
+
+    def test_refreshes_when_scopes_are_missing(self):
+        """Refresh should work even when stored credentials have no scopes."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(
+            expires_at=now_ms - 1_000,
+            scopes=None,
+        )
+        parsed = json.loads(credentials)
+        del parsed["claudeAiOauth"]["scopes"]
+        credentials = json.dumps(parsed)
+
+        token_resp = MagicMock()
+        token_resp.read.return_value = self._make_token_response()
+        token_resp.__enter__ = lambda s: s
+        token_resp.__exit__ = MagicMock(return_value=False)
+
+        usage_resp = self._make_usage_response()
+        persist_mock = MagicMock()
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                body = json.loads(req.data.decode())
+                assert "scope" not in body
+                return token_resp
+            if "oauth/usage" in req.full_url:
+                return usage_resp
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, False,
+                persist_credentials=persist_mock,
+            )
+
+        assert result is not None
+        persist_mock.assert_called_once()
