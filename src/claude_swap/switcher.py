@@ -10,9 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Only import keyring on non-Linux platforms
@@ -27,6 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
+from claude_swap import oauth
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -314,76 +313,6 @@ class ClaudeAccountSwitcher:
                 pass  # Credential doesn't exist, that's fine
             except Exception as e:
                 self._logger.warning(f"Failed to delete credentials from keyring: {e}")
-
-    def _extract_access_token(self, credentials: str) -> str | None:
-        """Extract the OAuth access token from a credentials JSON string."""
-        try:
-            data = json.loads(credentials)
-            return data.get("claudeAiOauth", {}).get("accessToken")
-        except (json.JSONDecodeError, AttributeError):
-            return None
-
-    def _format_reset(self, resets_at: str) -> tuple[str, str]:
-        """Return (countdown, clock) for a reset time in local time."""
-        reset_utc = datetime.fromisoformat(resets_at)
-        now = datetime.now(timezone.utc)
-        remaining = reset_utc - now
-        total_seconds = max(0, int(remaining.total_seconds()))
-        days, remainder = divmod(total_seconds, 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes = remainder // 60
-
-        if days > 0:
-            countdown = f"{days}d {hours}h"
-        elif hours > 0:
-            countdown = f"{hours}h {minutes}m"
-        else:
-            countdown = f"{minutes}m"
-
-        reset_local = reset_utc.astimezone()
-        now_local = now.astimezone()
-        if reset_local.date() == now_local.date():
-            time_str = reset_local.strftime("%H:%M")
-        else:
-            day = str(reset_local.day)
-            time_str = reset_local.strftime(f"%b {day} %H:%M")
-
-        return countdown, time_str
-
-    def _fetch_usage(self, access_token: str) -> dict | None:
-        """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
-        url = "https://api.anthropic.com/api/oauth/usage"
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "anthropic-beta": "oauth-2025-04-20",
-        }
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-
-            self._logger.debug("Usage API response: %s", json.dumps(data, indent=2))
-
-            result = {}
-
-            h5 = data.get("five_hour")
-            if h5:
-                h5_entry = {"pct": h5["utilization"]}
-                if h5.get("resets_at"):
-                    h5_entry["countdown"], h5_entry["clock"] = self._format_reset(h5["resets_at"])
-                result["five_hour"] = h5_entry
-
-            d7 = data.get("seven_day")
-            if d7:
-                d7_entry = {"pct": d7["utilization"]}
-                if d7.get("resets_at"):
-                    d7_entry["countdown"], d7_entry["clock"] = self._format_reset(d7["resets_at"])
-                result["seven_day"] = d7_entry
-
-            return result if result else None
-        except Exception as e:
-            self._logger.debug("Usage fetch failed: %r", e)
-            return None
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -779,16 +708,26 @@ class ClaudeAccountSwitcher:
             else:
                 creds = self._read_account_credentials(str(num), email)
 
-            token = self._extract_access_token(creds)
-            accounts_info.append((num, email, org_name, org_uuid, is_active, token))
+            accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
 
-        def fetch(token: str | None) -> dict | str | None:
-            if not token:
+        def fetch(
+            account_info: tuple[int, str, str, str, bool, str]
+        ) -> dict | str | None:
+            num, email, _, _, is_active, creds = account_info
+            if not creds or not oauth.extract_access_token(creds):
                 return "no credentials"
-            return self._fetch_usage(token)
+
+            def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
+                with FileLock(self.lock_file):
+                    self._write_account_credentials(acct_num, acct_email, new_creds)
+
+            return oauth.fetch_usage_for_account(
+                str(num), email, creds, is_active,
+                persist_credentials=persist,
+            )
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, (t for _, _, _, _, _, t in accounts_info)))
+            usages = list(executor.map(fetch, accounts_info))
 
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
