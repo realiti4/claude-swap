@@ -368,13 +368,17 @@ class ClaudeAccountSwitcher:
 
             h5 = data.get("five_hour")
             if h5:
-                h5_countdown, h5_clock = self._format_reset(h5["resets_at"])
-                result["five_hour"] = {"pct": h5["utilization"], "countdown": h5_countdown, "clock": h5_clock}
+                h5_entry = {"pct": h5["utilization"]}
+                if h5.get("resets_at"):
+                    h5_entry["countdown"], h5_entry["clock"] = self._format_reset(h5["resets_at"])
+                result["five_hour"] = h5_entry
 
             d7 = data.get("seven_day")
             if d7:
-                d7_countdown, d7_clock = self._format_reset(d7["resets_at"])
-                result["seven_day"] = {"pct": d7["utilization"], "countdown": d7_countdown, "clock": d7_clock}
+                d7_entry = {"pct": d7["utilization"]}
+                if d7.get("resets_at"):
+                    d7_entry["countdown"], d7_entry["clock"] = self._format_reset(d7["resets_at"])
+                result["seven_day"] = d7_entry
 
             return result if result else None
         except Exception:
@@ -802,9 +806,15 @@ class ClaudeAccountSwitcher:
                 d7 = usage.get("seven_day")
                 lines = []
                 if h5:
-                    lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+                    if "clock" in h5:
+                        lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+                    else:
+                        lines.append(f"5h: {h5['pct']:>3.0f}%")
                 if d7:
-                    lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+                    if "clock" in d7:
+                        lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+                    else:
+                        lines.append(f"7d: {d7['pct']:>3.0f}%")
                 for j, line in enumerate(lines):
                     connector = "└" if j == len(lines) - 1 else "├"
                     print(f"     {dimmed(connector)} {muted(line)}")

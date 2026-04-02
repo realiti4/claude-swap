@@ -447,6 +447,35 @@ class TestFetchUsage:
             result = switcher._fetch_usage("sk-test-token")
         assert result is None
 
+    def test_null_resets_at(self, temp_home: Path):
+        """When resets_at is null, still return pct without clock/countdown."""
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=22)
+        response_data = {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 100.0, "resets_at": future.isoformat()},
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._fetch_usage("sk-test-token")
+
+        assert result is not None
+        assert result["five_hour"]["pct"] == 0.0
+        assert "clock" not in result["five_hour"]
+        assert "countdown" not in result["five_hour"]
+        assert result["seven_day"]["pct"] == 100.0
+        assert "clock" in result["seven_day"]
+        assert "countdown" in result["seven_day"]
+
 
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
@@ -483,6 +512,37 @@ class TestListAccountsUsage:
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    def test_list_shows_usage_null_reset(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """When five_hour.resets_at is null and seven_day is at 100%, display both correctly."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        usage_response = {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 100.0, "resets_at": "2026-04-03T02:59:59Z"},
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(usage_response).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("urllib.request.urlopen", return_value=mock_response):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "5h:   0%" in output
+        assert "7d: 100%" in output
+        assert "usage unavailable" not in output
 
     def test_list_no_credentials(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
