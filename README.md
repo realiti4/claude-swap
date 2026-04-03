@@ -43,16 +43,6 @@ Log out of Claude Code, log in with another account, then:
 cswap --add-account
 ```
 
-### Refresh expired tokens
-
-If an account's token expires, log back into Claude Code with that account and re-run:
-
-```bash
-cswap --add-account
-```
-
-This will update the stored credentials without creating a duplicate.
-
 ### Switch accounts
 
 Rotate to the next account:
@@ -69,6 +59,16 @@ cswap --switch-to user@example.com
 ```
 
 **Note:** Restart Claude Code after switching for the new account to take effect.
+
+### Refresh expired tokens
+
+If an account's token expires, log back into Claude Code with that account and re-run:
+
+```bash
+cswap --add-account
+```
+
+This will update the stored credentials without creating a duplicate.
 
 ### Other commands
 
