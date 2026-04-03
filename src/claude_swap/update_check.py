@@ -8,7 +8,7 @@ import urllib.request
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
-CACHE_TTL = 72 * 3600  # 72 hours
+CACHE_TTL = 24 * 3600  # 24 hours
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 
