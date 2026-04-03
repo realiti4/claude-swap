@@ -20,10 +20,19 @@ def _make_pypi_response(version: str) -> MagicMock:
     return mock_resp
 
 
+def _write_cache(path, version, timestamp=None):
+    """Write a cache file in the shared cache format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "timestamp": timestamp if timestamp is not None else time.time(),
+        "data": version,
+    }))
+
+
 class TestCheckForUpdate:
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_newer_version_available(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(tmp_path / "cache.json"))
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")
@@ -35,7 +44,7 @@ class TestCheckForUpdate:
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_already_on_latest(self, mock_urlopen, tmp_path, monkeypatch):
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(tmp_path / "cache.json"))
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
         mock_urlopen.return_value = _make_pypi_response("0.3.2")
 
         result = check_for_update("0.3.2")
@@ -45,23 +54,20 @@ class TestCheckForUpdate:
     @patch("claude_swap.update_check.urllib.request.urlopen", side_effect=OSError("network error"))
     def test_network_error_returns_none_and_caches(self, mock_urlopen, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(cache_path))
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
 
         result = check_for_update("0.3.2")
 
         assert result is None
         assert cache_path.exists()
         cache = json.loads(cache_path.read_text())
-        assert cache["latest_version"] is None
+        assert cache["data"] is None
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_fresh_error_cache_skips_network(self, mock_urlopen, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        cache_path.write_text(json.dumps({
-            "last_checked": time.time(),
-            "latest_version": None,
-        }))
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(cache_path))
+        _write_cache(cache_path, None)
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
 
         result = check_for_update("0.3.2")
 
@@ -70,11 +76,8 @@ class TestCheckForUpdate:
 
     def test_fresh_cache_no_network(self, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        cache_path.write_text(json.dumps({
-            "last_checked": time.time(),
-            "latest_version": "0.5.0",
-        }))
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(cache_path))
+        _write_cache(cache_path, "0.5.0")
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
 
         with patch("claude_swap.update_check.urllib.request.urlopen") as mock_urlopen:
             result = check_for_update("0.3.2")
@@ -86,11 +89,8 @@ class TestCheckForUpdate:
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_stale_cache_fetches_from_pypi(self, mock_urlopen, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        cache_path.write_text(json.dumps({
-            "last_checked": time.time() - CACHE_TTL - 1,
-            "latest_version": "0.3.0",
-        }))
-        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", str(cache_path))
+        _write_cache(cache_path, "0.3.0", timestamp=time.time() - CACHE_TTL - 1)
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
         mock_urlopen.return_value = _make_pypi_response("0.4.0")
 
         result = check_for_update("0.3.2")

@@ -509,6 +509,75 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         assert "oauth: fresh, refresh token yes" in output
 
+    def test_list_uses_cached_usage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """When a fresh usage cache exists, list_accounts skips API calls."""
+        import time
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        # Pre-populate cache with usage data for both accounts
+        cached_usage = {
+            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                   "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
+            "2": {"five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
+                   "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"}},
+        }
+        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+            switcher.list_accounts()
+
+        # API should NOT have been called — data came from cache
+        mock_fetch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "25%" in output
+        assert "80%" in output
+
+    def test_list_ignores_cache_when_accounts_change(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """Cache is invalidated when the account set doesn't match."""
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        # Cache has only account "1" but the switcher has accounts "1" and "2"
+        cached_usage = {
+            "1": {"five_hour": {"pct": 25}},
+        }
+        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+
+        usage_result = {
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
+            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
+        }
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        # Should show live data (10%), not cached data (25%)
+        assert "10%" in output
+
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
 

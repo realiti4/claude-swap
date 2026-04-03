@@ -26,6 +26,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth
+from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -34,6 +35,9 @@ from claude_swap.printer import accent, bold_accent, bolded, dimmed, error, mute
 # Service name for keyring storage
 KEYRING_SERVICE = "claude-code"
 KEYRING_ACTIVE_USERNAME = "active-credentials"
+
+# Usage cache
+_USAGE_CACHE_TTL = 15  # seconds
 
 
 class ClaudeAccountSwitcher:
@@ -762,8 +766,18 @@ class ClaudeAccountSwitcher:
                 persist_credentials=persist,
             )
 
-        with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, accounts_info))
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+        account_keys = {str(info[0]) for info in accounts_info}
+        if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
+            usages = [cached.get(str(info[0])) for info in accounts_info]
+        else:
+            with ThreadPoolExecutor() as executor:
+                usages = list(executor.map(fetch, accounts_info))
+            write_cache(usage_cache_path, {
+                str(info[0]): usage
+                for info, usage in zip(accounts_info, usages)
+            })
 
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
