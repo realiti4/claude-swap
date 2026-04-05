@@ -332,6 +332,13 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.warning(f"Failed to delete credentials from keyring: {e}")
 
+    def _delete_account_files(self, account_num: str, email: str) -> None:
+        """Delete all backup files for an account (credentials + config)."""
+        self._delete_account_credentials(account_num, email)
+        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        if config_file.exists():
+            config_file.unlink()
+
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -652,10 +659,7 @@ class ClaudeAccountSwitcher:
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
             d_num, d_email = displace_slot
-            self._delete_account_credentials(d_num, d_email)
-            config_file = self.configs_dir / f".claude-config-{d_num}-{d_email}.json"
-            if config_file.exists():
-                config_file.unlink()
+            self._delete_account_files(d_num, d_email)
             data = self._get_sequence_data()
             if int(d_num) in data["sequence"]:
                 data["sequence"].remove(int(d_num))
@@ -665,10 +669,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             data = self._get_sequence_data()
             old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_credentials(migrate_from, old_email)
-            old_cfg = self.configs_dir / f".claude-config-{migrate_from}-{old_email}.json"
-            if old_cfg.exists():
-                old_cfg.unlink()
+            self._delete_account_files(migrate_from, old_email)
             if int(migrate_from) in data["sequence"]:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
@@ -761,10 +762,7 @@ class ClaudeAccountSwitcher:
             return
 
         # Remove backup files
-        self._delete_account_credentials(account_num, email)
-        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        if config_file.exists():
-            config_file.unlink()
+        self._delete_account_files(account_num, email)
 
         # Update sequence.json
         del data["accounts"][account_num]

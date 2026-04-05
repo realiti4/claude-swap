@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,16 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+
+# src layout: ensure subprocess can find claude_swap
+_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
+
+
+def _subprocess_env(**extra: str) -> dict[str, str]:
+    """Build env dict with PYTHONPATH pointing at src/."""
+    env = {**os.environ, **extra}
+    env["PYTHONPATH"] = _SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    return env
 
 
 class TestCLI:
@@ -22,6 +33,7 @@ class TestCLI:
             [sys.executable, "-m", "claude_swap", "--version"],
             capture_output=True,
             text=True,
+            env=_subprocess_env(),
         )
         assert result.returncode == 0
         assert __version__ in result.stdout
@@ -32,6 +44,7 @@ class TestCLI:
             [sys.executable, "-m", "claude_swap", "--help"],
             capture_output=True,
             text=True,
+            env=_subprocess_env(),
         )
         assert result.returncode == 0
         assert "Multi-Account Switcher" in result.stdout
@@ -46,6 +59,7 @@ class TestCLI:
             [sys.executable, "-m", "claude_swap"],
             capture_output=True,
             text=True,
+            env=_subprocess_env(),
         )
         assert result.returncode != 0
         assert "required" in result.stderr.lower() or "error" in result.stderr.lower()
@@ -56,6 +70,7 @@ class TestCLI:
             [sys.executable, "-m", "claude_swap", "--list", "--status"],
             capture_output=True,
             text=True,
+            env=_subprocess_env(),
         )
         assert result.returncode != 0
         assert "not allowed" in result.stderr.lower()
@@ -66,6 +81,7 @@ class TestCLI:
             [sys.executable, "-m", "claude_swap", "--debug", "--status"],
             capture_output=True,
             text=True,
+            env=_subprocess_env(),
         )
         # Should run (may fail due to no config, but flag should be accepted)
         assert "--debug" not in result.stderr or "unrecognized" not in result.stderr
@@ -91,21 +107,39 @@ class TestCLI:
             show_token_status=True,
         )
 
+    def test_slot_flag_requires_add_account(self, capsys):
+        """--slot should only be accepted alongside --add-account."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--slot can only be used with --add-account" in capsys.readouterr().err
+
+    def test_slot_flag_in_help(self):
+        """--slot should appear in help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "--slot" in result.stdout
+
 
 class TestCLICommands:
     """Test individual CLI commands."""
 
     def test_status_no_account(self, temp_home: Path):
         """Test status command with no account."""
-        with patch.dict("os.environ", {"HOME": str(temp_home)}):
-            result = subprocess.run(
-                [sys.executable, "-m", "claude_swap", "--status"],
-                capture_output=True,
-                text=True,
-                env={**subprocess.os.environ, "HOME": str(temp_home)},
-            )
-            # Should succeed even with no account
-            assert "No active Claude account" in result.stdout or result.returncode == 0
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--status"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(HOME=str(temp_home)),
+        )
+        # Should succeed even with no account
+        assert "No active Claude account" in result.stdout or result.returncode == 0
 
     def test_list_no_accounts(self, temp_home: Path):
         """Test list command with no accounts."""
@@ -114,6 +148,6 @@ class TestCLICommands:
             capture_output=True,
             text=True,
             input="n\n",  # Answer 'n' to first-run prompt
-            env={**subprocess.os.environ, "HOME": str(temp_home)},
+            env=_subprocess_env(HOME=str(temp_home)),
         )
         assert "No accounts" in result.stdout or "managed" in result.stdout.lower()
