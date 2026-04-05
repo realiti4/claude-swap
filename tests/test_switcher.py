@@ -1103,3 +1103,186 @@ class TestUpgradeMigration:
         data = switcher._get_sequence_data()
         assert len(data["accounts"]) == 2
         assert "auto" not in capsys.readouterr().out.lower()
+
+
+# ── --slot option for add_account ──────────────────────────────────────────────
+
+class TestAddAccountSlot:
+    """Test add_account with --slot option."""
+
+    def _make_switcher(self, temp_home, email="test@example.com", org_uuid="", org_name=""):
+        """Helper: write a claude config and return a switcher instance."""
+        config = {
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "uuid-" + email,
+                "organizationUuid": org_uuid,
+                "organizationName": org_name,
+            }
+        }
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps(config))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    def test_add_to_specific_empty_slot(self, temp_home, capsys):
+        """Adding to an empty slot should place the account there."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home)
+
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=5)
+
+        data = switcher._get_sequence_data()
+        assert "5" in data["accounts"]
+        assert data["accounts"]["5"]["email"] == "test@example.com"
+        assert data["activeAccountNumber"] == 5
+        assert 5 in data["sequence"]
+        assert "Added" in capsys.readouterr().out
+
+    def test_add_without_slot_auto_assigns(self, temp_home):
+        """Without --slot, should auto-assign next number (original behavior)."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home)
+
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert "1" in data["accounts"]
+
+    def test_slot_occupied_cancel(self, temp_home, capsys):
+        """When slot is occupied and user cancels, nothing should change."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        # Add account A to slot 3
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=3)
+
+        # Try to add account B to slot 3, answer "n"
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("builtins.input", return_value="n"):
+            switcher.add_account(slot=3)
+
+        # Slot 3 should still be account A
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["3"]["email"] == "a@example.com"
+        assert "Cancelled" in capsys.readouterr().out
+
+    def test_slot_occupied_overwrite(self, temp_home, capsys):
+        """When slot is occupied and user confirms, should overwrite."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        # Add account A to slot 3
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=3)
+
+        # Add account B to slot 3, answer "y"
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=3)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["3"]["email"] == "b@example.com"
+        assert len(data["accounts"]) == 1
+        assert "Added" in capsys.readouterr().out
+
+    def test_migrate_account_to_different_slot(self, temp_home, capsys):
+        """Moving an existing account to a new slot should clean up the old slot."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        # Add account to slot 1 (auto)
+        switcher = self._make_switcher(temp_home, email="user@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert "1" in data["accounts"]
+
+        # Move to slot 5
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=5)
+
+        data = switcher._get_sequence_data()
+        assert "1" not in data["accounts"]
+        assert "5" in data["accounts"]
+        assert data["accounts"]["5"]["email"] == "user@example.com"
+        assert 1 not in data["sequence"]
+        assert 5 in data["sequence"]
+        out = capsys.readouterr().out
+        assert "Moved from slot 1" in out
+
+    def test_migrate_with_occupied_target_cancel_preserves_old_slot(self, temp_home, capsys):
+        """If migration target is occupied and user cancels, old slot must survive."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        # Add account A to slot 1
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=1)
+
+        # Add account B to slot 3
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=3)
+
+        # Try to move A from slot 1 → slot 3, cancel
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("builtins.input", return_value="n"):
+            switcher.add_account(slot=3)
+
+        # Both slots should be untouched
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "a@example.com"
+        assert data["accounts"]["3"]["email"] == "b@example.com"
+        assert "Cancelled" in capsys.readouterr().out
+
+    def test_slot_must_be_positive(self, temp_home):
+        """Slot number must be >= 1."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home)
+
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             pytest.raises(ConfigError, match="must be >= 1"):
+            switcher.add_account(slot=0)
+
+    def test_sequence_stays_sorted(self, temp_home):
+        """Sequence list should remain sorted when using --slot."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        # Add to slot 5
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=5)
+
+        # Add to slot 2
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=2)
+
+        data = switcher._get_sequence_data()
+        assert data["sequence"] == [2, 5]
