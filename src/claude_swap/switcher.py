@@ -577,7 +577,11 @@ class ClaudeAccountSwitcher:
             )
             return
 
-        # Determine slot number
+        # Determine slot number and collect confirmation decisions
+        # (no destructive operations until new account is verified readable)
+        displace_slot = None  # slot to clean up (occupied by different account)
+        migrate_from = None   # old slot to clean up (same account, different slot)
+
         if slot is not None:
             if slot < 1:
                 raise ConfigError("Slot number must be >= 1")
@@ -585,7 +589,6 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data()
 
             # Find if current account already exists in a different slot
-            old_num = None
             if self._account_exists(current_email, current_org_uuid):
                 old_num = next(
                     (num for num, acc in data.get("accounts", {}).items()
@@ -593,8 +596,8 @@ class ClaudeAccountSwitcher:
                      acc.get("organizationUuid", "") == current_org_uuid),
                     None,
                 )
-                if old_num == account_num:
-                    old_num = None  # Same slot, no migration needed
+                if old_num and old_num != account_num:
+                    migrate_from = old_num
 
             # Check if target slot is occupied by a different account
             if account_num in data.get("accounts", {}):
@@ -608,8 +611,8 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationName", ""),
                         existing.get("organizationUuid", ""),
                     )
+                    warning(f"Slot {slot} already occupied")
                     print(
-                        f"{warning(f'Slot {slot} already occupied')}: "
                         f"{existing_email} {muted(f'[{existing_tag}]')}"
                     )
                     try:
@@ -620,33 +623,11 @@ class ClaudeAccountSwitcher:
                     if answer not in ("y", "yes"):
                         print(dimmed("Cancelled"))
                         return
-                    # Clean up the displaced account
-                    self._delete_account_credentials(account_num, existing_email)
-                    config_file = self.configs_dir / f".claude-config-{account_num}-{existing_email}.json"
-                    if config_file.exists():
-                        config_file.unlink()
-                    if int(account_num) in data["sequence"]:
-                        data["sequence"].remove(int(account_num))
-                    del data["accounts"][account_num]
-                    self._write_json(self.sequence_file, data)
-
-            # After all confirmations pass, clean up old slot (migration)
-            if old_num:
-                data = self._get_sequence_data()
-                old_email = data["accounts"][old_num].get("email", "")
-                self._delete_account_credentials(old_num, old_email)
-                old_cfg = self.configs_dir / f".claude-config-{old_num}-{old_email}.json"
-                if old_cfg.exists():
-                    old_cfg.unlink()
-                if int(old_num) in data["sequence"]:
-                    data["sequence"].remove(int(old_num))
-                del data["accounts"][old_num]
-                self._write_json(self.sequence_file, data)
-                print(f"{dimmed(f'Moved from slot {old_num} → {slot}')}")
+                    displace_slot = (account_num, existing_email)
         else:
             account_num = str(self._get_next_account_number())
 
-        # Backup current credentials and config
+        # Read new account credentials BEFORE any destructive operations
         current_creds = self._read_credentials()
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
@@ -667,6 +648,32 @@ class ClaudeAccountSwitcher:
         account_uuid = oauth_data.get("accountUuid", "")
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
+
+        # Now safe to perform destructive cleanup (new account data is in memory)
+        if displace_slot:
+            d_num, d_email = displace_slot
+            self._delete_account_credentials(d_num, d_email)
+            config_file = self.configs_dir / f".claude-config-{d_num}-{d_email}.json"
+            if config_file.exists():
+                config_file.unlink()
+            data = self._get_sequence_data()
+            if int(d_num) in data["sequence"]:
+                data["sequence"].remove(int(d_num))
+            del data["accounts"][d_num]
+            self._write_json(self.sequence_file, data)
+
+        if migrate_from:
+            data = self._get_sequence_data()
+            old_email = data["accounts"][migrate_from].get("email", "")
+            self._delete_account_credentials(migrate_from, old_email)
+            old_cfg = self.configs_dir / f".claude-config-{migrate_from}-{old_email}.json"
+            if old_cfg.exists():
+                old_cfg.unlink()
+            if int(migrate_from) in data["sequence"]:
+                data["sequence"].remove(int(migrate_from))
+            del data["accounts"][migrate_from]
+            self._write_json(self.sequence_file, data)
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
