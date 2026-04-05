@@ -19,10 +19,16 @@ def read_cache(path: Path, ttl: float, default=MISSING):
     callers can distinguish "no cache" from a cached ``None`` value.
     """
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
         if time.time() - raw["timestamp"] < ttl:
             return raw["data"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        KeyError,
+        TypeError,
+    ):
         pass
     return default
 
@@ -30,4 +36,7 @@ def read_cache(path: Path, ttl: float, default=MISSING):
 def write_cache(path: Path, data) -> None:
     """Write data to a cache file with a timestamp."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"timestamp": time.time(), "data": data}))
+    path.write_text(
+        json.dumps({"timestamp": time.time(), "data": data}),
+        encoding="utf-8",
+    )

@@ -164,6 +164,26 @@ class TestGetCurrentAccount:
         assert switcher._get_current_account() is None
 
 
+class TestGetClaudeConfigPathUtf8:
+    """Regression: Windows default encoding must not break UTF-8 Claude configs."""
+
+    def test_fallback_config_with_unicode_punctuation(self, temp_home: Path):
+        """~/.claude.json with non-ASCII (e.g. smart quotes) must be readable."""
+        config = {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "uuid-1",
+                "displayName": "Name with \u201csmart\u201d quotes",
+            }
+        }
+        fallback = temp_home / ".claude.json"
+        fallback.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+        switcher = ClaudeAccountSwitcher()
+        resolved = switcher._get_claude_config_path()
+        assert resolved == fallback
+
+
 class TestAccountExists:
     """Test account existence checking."""
 
