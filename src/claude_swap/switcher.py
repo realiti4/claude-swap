@@ -966,40 +966,47 @@ class ClaudeAccountSwitcher:
             target_email = data["accounts"][target_account]["email"]
             current_identity = self._get_current_account()
 
-            if current_identity is None:
-                raise SwitchError("No current account to switch from")
-            current_email, _ = current_identity
+            has_current = current_identity is not None
+            current_email = current_identity[0] if has_current else None
 
             config_path = self._get_claude_config_path()
 
-            # Create transaction for rollback capability
-            try:
-                original_creds = self._read_credentials()
-                if original_creds is None:
-                    raise CredentialReadError("Failed to read current credentials")
-                original_config = config_path.read_text()
-            except FileNotFoundError:
-                raise ConfigError("Claude config file not found")
-            except PermissionError:
-                raise ConfigError("Permission denied reading Claude config")
+            transaction = None
 
-            transaction = SwitchTransaction(
-                original_credentials=original_creds,
-                original_config=original_config,
-                original_account_num=current_account,
-                original_email=current_email,
-                config_path=config_path,
-            )
+            if has_current:
+                # Create transaction for rollback capability
+                try:
+                    original_creds = self._read_credentials()
+                    if original_creds is None:
+                        raise CredentialReadError("Failed to read current credentials")
+                    original_config = config_path.read_text()
+                except FileNotFoundError:
+                    raise ConfigError("Claude config file not found")
+                except PermissionError:
+                    raise ConfigError("Permission denied reading Claude config")
+
+                transaction = SwitchTransaction(
+                    original_credentials=original_creds,
+                    original_config=original_config,
+                    original_account_num=current_account,
+                    original_email=current_email,
+                    config_path=config_path,
+                )
+            else:
+                self._logger.info(
+                    "No current account detected, skipping backup"
+                )
 
             try:
-                # Step 1: Backup current account
-                self._write_account_credentials(
-                    current_account, current_email, original_creds
-                )
-                self._write_account_config(
-                    current_account, current_email, original_config
-                )
-                self._logger.info(f"Backed up account {current_account}")
+                # Step 1: Backup current account (skip if no current account)
+                if has_current:
+                    self._write_account_credentials(
+                        current_account, current_email, original_creds
+                    )
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
                 target_creds = self._read_account_credentials(
@@ -1014,7 +1021,8 @@ class ClaudeAccountSwitcher:
 
                 # Step 3: Activate target account - credentials
                 self._write_credentials(target_creds)
-                transaction.record_step("credentials_written")
+                if transaction:
+                    transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 
                 # Step 4: Update config with target oauthAccount
@@ -1028,14 +1036,16 @@ class ClaudeAccountSwitcher:
                 current_config_data["oauthAccount"] = oauth_section
 
                 self._write_json(config_path, current_config_data)
-                transaction.record_step("config_written")
+                if transaction:
+                    transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
                 # Step 5: Update sequence state
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
-                transaction.record_step("sequence_updated")
+                if transaction:
+                    transaction.record_step("sequence_updated")
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
@@ -1048,7 +1058,7 @@ class ClaudeAccountSwitcher:
 
             except Exception as e:
                 self._logger.error(f"Switch failed: {e}, attempting rollback")
-                if transaction.completed_steps:
+                if transaction and transaction.completed_steps:
                     success = transaction.rollback(self)
                     if success:
                         self._logger.info("Rollback successful")
