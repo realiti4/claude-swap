@@ -106,10 +106,10 @@ class ClaudeAccountSwitcher:
         for path in [primary_config, fallback_config]:
             if path.exists():
                 try:
-                    data = json.loads(path.read_text())
+                    data = json.loads(path.read_text(encoding="utf-8"))
                     if "oauthAccount" in data:
                         candidates.append(path)
-                except (json.JSONDecodeError, OSError):
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                     pass
 
         if not candidates:
@@ -136,8 +136,8 @@ class ClaudeAccountSwitcher:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._logger.warning(f"Invalid JSON in {path}")
             return None
 
@@ -147,11 +147,11 @@ class ClaudeAccountSwitcher:
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content)
+        temp_path.write_text(content, encoding="utf-8")
 
         # Validate written content
         try:
-            json.loads(temp_path.read_text())
+            json.loads(temp_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             temp_path.unlink()
             raise ConfigError("Generated invalid JSON")
@@ -198,7 +198,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.home / ".claude" / ".credentials.json"
             if cred_file.exists():
                 try:
-                    return cred_file.read_text()
+                    return cred_file.read_text(encoding="utf-8")
                 except Exception as e:
                     self._logger.error(f"Failed to read credentials file: {e}")
                     return None
@@ -242,7 +242,7 @@ class ClaudeAccountSwitcher:
                 import tempfile
                 fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
                 try:
-                    os.write(fd, credentials.encode())
+                    os.write(fd, credentials.encode("utf-8"))
                     os.close(fd)
                     fd = -1
                     os.replace(tmp_path, str(cred_file))
@@ -269,7 +269,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             if cred_file.exists():
                 try:
-                    encoded = cred_file.read_text()
+                    encoded = cred_file.read_text(encoding="utf-8")
                     return base64.b64decode(encoded).decode("utf-8")
                 except Exception as e:
                     self._logger.warning(f"Failed to read credentials file: {e}")
@@ -297,7 +297,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-                cred_file.write_text(encoded)
+                cred_file.write_text(encoded, encoding="utf-8")
                 os.chmod(cred_file, 0o600)
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials file: {e}")
@@ -336,7 +336,7 @@ class ClaudeAccountSwitcher:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
-            return config_file.read_text()
+            return config_file.read_text(encoding="utf-8")
         return ""
 
     def _write_account_config(
@@ -344,7 +344,7 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config)
+        config_file.write_text(config, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_file, 0o600)
 
@@ -549,7 +549,7 @@ class ClaudeAccountSwitcher:
 
             config_path = self._get_claude_config_path()
             try:
-                current_config = config_path.read_text()
+                current_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
@@ -582,7 +582,7 @@ class ClaudeAccountSwitcher:
 
         config_path = self._get_claude_config_path()
         try:
-            current_config = config_path.read_text()
+            current_config = config_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise ConfigError("Claude config file not found")
         except PermissionError:
@@ -977,7 +977,7 @@ class ClaudeAccountSwitcher:
                 original_creds = self._read_credentials()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
-                original_config = config_path.read_text()
+                original_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
