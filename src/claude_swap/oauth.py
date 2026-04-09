@@ -9,6 +9,8 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from claude_swap.printer import warning as print_warning
+
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -192,12 +194,12 @@ def fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
+    is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
 ) -> dict | None:
-    """Fetch usage for an account, refreshing expired OAuth tokens if needed.
+    """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
-    All accounts participate in the refresh flow when a valid refresh token is
-    available and the access token is expired or near expiry.
+    Active accounts are never refreshed — Claude Code owns those credentials.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -207,7 +209,8 @@ def fetch_usage_for_account(
     working_credentials = credentials
 
     if (
-        oauth.get("refreshToken")
+        not is_active
+        and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
         refreshed = refresh_oauth_credentials(working_credentials)
@@ -224,12 +227,13 @@ def fetch_usage_for_account(
         _logger.debug("Usage fetch failed: %r", e)
         if (
             e.code != 401
+            or is_active
             or not oauth
             or not oauth.get("refreshToken")
         ):
             return None
 
-        # Retry once after refreshing on 401.
+        # Retry once after refreshing on 401 (inactive accounts only).
         refreshed = refresh_oauth_credentials(working_credentials)
         if not refreshed:
             return None
@@ -258,14 +262,21 @@ def _persist(
     email: str,
     credentials: str,
 ) -> None:
-    """Call the persist callback, logging any errors."""
+    """Call the persist callback, warning loudly on failure."""
     if not callback:
         return
     try:
         callback(account_num, email, credentials)
     except Exception as e:
-        _logger.debug(
-            "Failed to persist refreshed credentials for account %s: %r",
+        _logger.warning(
+            "Refreshed OAuth token for account %s (%s) but failed to persist it: %r. "
+            "The refresh token on disk may now be stale; if the next refresh fails "
+            "with invalid_grant, re-run `cswap --add-account` after logging in.",
             account_num,
+            email,
             e,
+        )
+        print_warning(
+            f"Warning: failed to save refreshed token for account {account_num} ({email}). "
+            f"If the next refresh fails, re-run `cswap --add-account` after logging in."
         )

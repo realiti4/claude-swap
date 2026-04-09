@@ -301,6 +301,7 @@ class ClaudeAccountSwitcher:
                 os.chmod(cred_file, 0o600)
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials file: {e}")
+                raise
         else:
             # Use keyring for macOS/Windows
             username = f"account-{account_num}-{email}"
@@ -308,6 +309,7 @@ class ClaudeAccountSwitcher:
                 keyring.set_password(KEYRING_SERVICE, username, credentials)
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials to keyring: {e}")
+                raise
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
@@ -740,29 +742,11 @@ class ClaudeAccountSwitcher:
 
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
                 with FileLock(self.lock_file):
-                    if is_active:
-                        live = self._read_credentials()
-                        if live:
-                            try:
-                                live_data = json.loads(live)
-                                new_data = json.loads(new_creds)
-                                orig_data = json.loads(creds)
-                            except json.JSONDecodeError:
-                                return
-                            live_rt = live_data.get("claudeAiOauth", {}).get("refreshToken")
-                            orig_rt = orig_data.get("claudeAiOauth", {}).get("refreshToken")
-                            if live_rt != orig_rt:
-                                self._logger.debug("Refresh token changed on disk, skipping write")
-                                return
-                            live_data["claudeAiOauth"] = new_data.get("claudeAiOauth", {})
-                            self._write_credentials(json.dumps(live_data))
-                        else:
-                            self._logger.debug("Live credentials empty or unreadable, skipping write")
-                            return
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
+                is_active=is_active,
                 persist_credentials=persist,
             )
 
@@ -959,7 +943,11 @@ class ClaudeAccountSwitcher:
         self._perform_switch(target_account)
 
     def _perform_switch(self, target_account: str) -> None:
-        """Perform the actual account switch with transaction support."""
+        """Perform the actual account switch with transaction support.
+
+        The post-switch display runs after the lock releases so that persist
+        callbacks inside list_accounts() can re-acquire it.
+        """
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
             current_account = str(data.get("activeAccountNumber"))
@@ -1040,11 +1028,6 @@ class ClaudeAccountSwitcher:
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
                 )
-                print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
-                self.list_accounts()
-                print()
-                warning("Please restart Claude Code to use the new authentication.")
-                print()
 
             except Exception as e:
                 self._logger.error(f"Switch failed: {e}, attempting rollback")
@@ -1062,6 +1045,18 @@ class ClaudeAccountSwitcher:
                             f"Manual recovery may be needed."
                         )
                 raise
+
+        # Lock released. Safe to do network I/O and let persist callbacks
+        # re-acquire the lock from inside list_accounts().
+        print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+        try:
+            self.list_accounts()
+        except Exception as e:
+            self._logger.warning(f"Post-switch usage display failed: {e!r}")
+            print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
+        print()
+        warning("Please restart Claude Code to use the new authentication.")
+        print()
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.

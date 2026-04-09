@@ -441,73 +441,47 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         assert "no credentials" in output
 
-    def test_list_persist_merges_only_oauth_into_live_blob(
+    def test_list_persist_writes_only_backup_never_live(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """Persist callback re-reads live storage and merges only claudeAiOauth."""
-        sample_sequence_data["sequence"] = [1]
-        sample_sequence_data["accounts"] = {
-            "1": sample_sequence_data["accounts"]["1"],
-        }
+        """Inactive account refresh persists to backup only — never touches live.
+
+        Regression guard for the design drift where the persist closure used
+        to rewrite live credentials for the active account. Per
+        OAUTH_REFRESH_REDESIGN.md, cswap must never write to live creds — that
+        would race with Claude Code's own refresh (which coordinates via a
+        ~/.claude/ lockfile cswap doesn't honor).
+        """
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        orig_oauth = {"accessToken": "sk-active", "refreshToken": "rt-orig"}
-        active_creds = json.dumps({
-            "claudeAiOauth": orig_oauth,
-            "trustedDeviceToken": "device-abc",
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-orig"},
         })
-        new_oauth = {"accessToken": "sk-new", "refreshToken": "rt-new"}
-        refreshed_creds = json.dumps({"claudeAiOauth": new_oauth})
+        refreshed_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"},
+        })
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, persist_credentials):
-            persist_credentials(account_num, email, refreshed_creds)
+        def mock_fetch(account_num, email, credentials, is_active, persist_credentials):
+            # Simulate a refresh on the inactive account only.
+            if not is_active:
+                persist_credentials(account_num, email, refreshed_creds)
             return None
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
             switcher.list_accounts()
 
-        # Live write should merge oauth into fresh blob, preserving trustedDeviceToken
-        written = json.loads(write_live.call_args[0][0])
-        assert written["claudeAiOauth"]["accessToken"] == "sk-new"
-        assert written["trustedDeviceToken"] == "device-abc"
-        write_backup.assert_called_once_with("1", "test@example.com", refreshed_creds)
-
-    def test_list_persist_aborts_when_refresh_token_changed(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """Persist aborts both live and backup writes when refresh token changed on disk."""
-        sample_sequence_data["sequence"] = [1]
-        sample_sequence_data["accounts"] = {
-            "1": sample_sequence_data["accounts"]["1"],
-        }
-        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        # Original creds had rt-orig, but live storage now has rt-different (another process refreshed)
-        orig_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-orig"}})
-        live_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-other", "refreshToken": "rt-different"}})
-        refreshed_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"}})
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, sample_sequence_data)
-
-        def mock_fetch(account_num, email, credentials, persist_credentials):
-            persist_credentials(account_num, email, refreshed_creds)
-            return None
-
-        with patch.object(switcher, "_read_credentials", side_effect=[orig_creds, live_creds]), \
-             patch.object(switcher, "_write_credentials") as write_live, \
-             patch.object(switcher, "_write_account_credentials") as write_backup, \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
-            switcher.list_accounts()
-
+        # Live creds must never be written from list_accounts()
         write_live.assert_not_called()
-        write_backup.assert_not_called()
+        # Backup was written for the inactive account (2) only.
+        write_backup.assert_called_once_with("2", "account2@example.com", refreshed_creds)
 
     def test_list_shows_token_status_when_requested(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -597,6 +571,235 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         # Should show live data (10%), not cached data (25%)
         assert "10%" in output
+
+
+class TestPerformSwitchPostDisplay:
+    """Regression tests for the post-switch display running outside the lock."""
+
+    def _setup_two_accounts(
+        self,
+        temp_home: Path,
+        sample_sequence_data: dict,
+    ) -> tuple[ClaudeAccountSwitcher, dict, dict]:
+        """Set up a switcher with two managed accounts using in-memory
+        credential and config stores.
+
+        This bypasses the real macOS Keychain / Windows Credential Manager
+        completely so tests never prompt the user for "restore to defaults"
+        on macOS and never leak credentials into the developer's keyring.
+
+        Returns (switcher, creds_store, configs_store). Live credentials for
+        the active account are written to the temp-home credentials file
+        (safe — that file lives in the test's tmp_path).
+        """
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        # Live credentials for active account 1 (file under temp_home).
+        live_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
+
+        # Expired backup credentials for account 2 — forces refresh in
+        # list_accounts() proactive path.
+        expired_2 = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale-2",
+                "refreshToken": "rt-orig-2",
+                "expiresAt": 0,
+                "scopes": ["user:profile"],
+            },
+        })
+
+        # In-memory stores keyed by (num, email).
+        creds_store: dict[tuple[str, str], str] = {
+            ("2", "account2@example.com"): expired_2,
+        }
+        configs_store: dict[tuple[str, str], str] = {
+            ("2", "account2@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "account2@example.com",
+                    "accountUuid": "uuid-2",
+                },
+            }),
+        }
+        return switcher, creds_store, configs_store
+
+    @staticmethod
+    def _install_store_patches(
+        switcher: ClaudeAccountSwitcher,
+        creds_store: dict[tuple[str, str], str],
+        configs_store: dict[tuple[str, str], str],
+        live_state: dict,
+    ) -> list:
+        """Patch credential/config read/write to use in-memory stores.
+
+        Critically, this also stubs _read_credentials/_write_credentials so
+        nothing touches the real macOS Keychain (which would prompt the user
+        with "Claude wants to use the confidential information stored in your
+        keychain" during the test run).
+        """
+        def read_creds(num, email):
+            return creds_store.get((str(num), email), "")
+
+        def write_creds(num, email, creds):
+            creds_store[(str(num), email)] = creds
+
+        def read_cfg(num, email):
+            return configs_store.get((str(num), email), "")
+
+        def write_cfg(num, email, cfg):
+            configs_store[(str(num), email)] = cfg
+
+        def read_live():
+            return live_state.get("creds", "")
+
+        def write_live(creds):
+            live_state["creds"] = creds
+
+        patches = [
+            patch.object(switcher, "_read_account_credentials", side_effect=read_creds),
+            patch.object(switcher, "_write_account_credentials", side_effect=write_creds),
+            patch.object(switcher, "_read_account_config", side_effect=read_cfg),
+            patch.object(switcher, "_write_account_config", side_effect=write_cfg),
+            patch.object(switcher, "_read_credentials", side_effect=read_live),
+            patch.object(switcher, "_write_credentials", side_effect=write_live),
+        ]
+        for p in patches:
+            p.start()
+        return patches
+
+    def test_switch_persists_rotated_refresh_token_to_backup(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Regression: _perform_switch must persist refreshed credentials to backup.
+
+        Prior to the fix, _perform_switch held the outer FileLock around
+        list_accounts(). Inside list_accounts(), the persist closure tried to
+        re-acquire the same file lock (different FD, so fcntl.flock is NOT
+        re-entrant), spun to the 10s timeout, raised LockError, and the
+        refreshed credentials were silently dropped at debug level. If
+        Anthropic rotated the refresh token on that request, the backup
+        retained the old (now-invalid) refresh token and the only recovery
+        was a re-login.
+
+        This test exercises the full _perform_switch path with account 2
+        needing a refresh, and verifies the rotated refresh token actually
+        landed on disk. Against main this fails; against the fix it passes.
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        # The currently-active account 1's creds carry an expired expiresAt.
+        # After the swap, account 1 becomes *inactive* and its just-backed-up
+        # credentials are eligible for proactive refresh inside the
+        # post-switch list_accounts() call. This is the scenario that
+        # triggers the original deadlock bug.
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-orig-1",
+                "expiresAt": 0,
+                "scopes": ["user:profile"],
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        # Monkeypatch refresh_oauth_credentials to simulate a server-side
+        # refresh-token rotation (rt-orig-1 -> rt-rotated-1).
+        rotated_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-rotated-1",
+                "refreshToken": "rt-rotated-1",
+                "expiresAt": 9_999_999_999_000,
+                "scopes": ["user:profile"],
+            },
+        })
+
+        try:
+            with patch(
+                "claude_swap.oauth.refresh_oauth_credentials",
+                return_value=rotated_creds,
+            ), patch(
+                "claude_swap.oauth.request_usage_data",
+                return_value={
+                    "five_hour": {"utilization": 12.0, "resets_at": None},
+                    "seven_day": {"utilization": 34.0, "resets_at": None},
+                },
+            ):
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        # After switch, backup for account 1 (now inactive) must contain the
+        # rotated refresh token — confirming the persist inside list_accounts()
+        # actually fired and didn't hit the lock deadlock.
+        backup_after = creds_store.get(("1", "test@example.com"), "")
+        assert backup_after, "backup credentials for account 1 are missing"
+        backup_oauth = json.loads(backup_after)["claudeAiOauth"]
+        assert backup_oauth["refreshToken"] == "rt-rotated-1", (
+            f"Expected rotated refresh token on disk, got "
+            f"{backup_oauth.get('refreshToken')!r} — lock deadlock regression"
+        )
+        assert backup_oauth["accessToken"] == "sk-rotated-1"
+
+    def test_switch_survives_post_display_failure(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """Regression: a failure inside post-switch list_accounts() must not
+        propagate as a switch failure. The swap already committed; the display
+        is best-effort.
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(
+                switcher,
+                "list_accounts",
+                side_effect=RuntimeError("boom"),
+            ):
+                # Must not raise
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        # Switch actually committed: sequence now points at account 2.
+        data = switcher._get_sequence_data()
+        assert data is not None
+        assert data["activeAccountNumber"] == 2
+
+        output = capsys.readouterr().out
+        assert "Switched to" in output
+        assert "usage display unavailable" in output
+        assert "restart Claude Code" in output
 
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────

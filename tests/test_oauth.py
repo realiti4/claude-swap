@@ -305,6 +305,7 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                is_active=False,
                 persist_credentials=persist_mock,
             )
 
@@ -348,6 +349,7 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "2", "test@example.com", credentials,
+                is_active=False,
                 persist_credentials=persist_mock,
             )
 
@@ -374,6 +376,7 @@ class TestFetchUsageForAccount:
              patch("claude_swap.oauth.refresh_oauth_credentials") as refresh_mock:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                is_active=False,
             )
 
         refresh_mock.assert_not_called()
@@ -399,6 +402,7 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                is_active=False,
             )
 
         assert result is None
@@ -434,8 +438,102 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                is_active=False,
                 persist_credentials=persist_mock,
             )
 
         assert result is not None
         persist_mock.assert_called_once()
+
+    def test_active_account_skips_refresh_even_when_expired(self):
+        """Active account with expired token must NOT trigger a refresh POST.
+
+        Claude Code owns the active account's credentials and coordinates its
+        own refresh via a lockfile on ~/.claude/ that cswap doesn't honor, so
+        cswap must never touch the active account's tokens.
+        """
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+
+        persist_mock = MagicMock()
+        refresh_calls = 0
+
+        def mock_urlopen(req, timeout=0):
+            nonlocal refresh_calls
+            if "oauth/token" in req.full_url:
+                refresh_calls += 1
+                raise AssertionError(
+                    "Active account must not trigger a refresh POST"
+                )
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials,
+                is_active=True,
+                persist_credentials=persist_mock,
+            )
+
+        assert refresh_calls == 0
+        persist_mock.assert_not_called()
+        # Usage call 401'd and there's no retry-with-refresh for active, so None.
+        assert result is None
+
+    def test_active_account_401_does_not_retry_with_refresh(self):
+        """Active account that 401s returns None without attempting a refresh."""
+        credentials = self._make_credentials()
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise AssertionError(
+                    "Active account must not trigger a refresh POST on 401"
+                )
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        persist_mock = MagicMock()
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials,
+                is_active=True,
+                persist_credentials=persist_mock,
+            )
+
+        assert result is None
+        persist_mock.assert_not_called()
+
+    def test_persist_failure_logs_warning_with_recovery_hint(self, caplog, capsys):
+        """If the persist callback raises, _persist logs at WARNING level with
+        a recovery hint (re-run `cswap --add-account`), not debug, AND prints
+        a user-visible warning to stdout.
+        """
+        import logging
+
+        def boom(acct_num, acct_email, creds):
+            raise RuntimeError("disk exploded")
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            oauth._persist(boom, "1", "test@example.com", "{}")
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == "claude-swap"
+        ]
+        assert len(warning_records) == 1
+        msg = warning_records[0].getMessage()
+        assert "failed to persist" in msg
+        assert "cswap --add-account" in msg
+        assert "1" in msg
+        assert "test@example.com" in msg
+
+        # Also verify the user-visible printed warning
+        output = capsys.readouterr().out
+        assert "failed to save refreshed token" in output
+        assert "cswap --add-account" in output
