@@ -817,21 +817,31 @@ class ClaudeAccountSwitcher:
             sessions, ide_instances = get_running_instances()
 
             if sessions or ide_instances:
-                print()
-                print(bolded("Running instances:"))
+                # Group by (label, folder) to avoid repetitive lines
+                groups: dict[tuple[str, str], dict[str, int]] = {}
                 for session in sessions:
                     label = entrypoint_label(session.entrypoint)
                     cwd = abbreviate_path(session.cwd)
-                    age = format_age(session.started_at) if session.started_at else ""
-                    status = f" {session.status}" if session.status else ""
-                    parts = [f"pid {session.pid}"]
-                    if age:
-                        parts.append(age)
-                    print(f"  {dimmed('●')} {muted(f'{label}{status}')}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+                    key = (label, cwd)
+                    counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                    counts["sessions"] += 1
                 for ide in ide_instances:
                     name = ide_short_name(ide.ide_name)
-                    folders = ", ".join(abbreviate_path(f) for f in ide.workspace_folders)
-                    print(f"  {dimmed('●')} {muted(name)}   {muted(folders)}  {dimmed(f'(IDE, pid {ide.pid})')}")
+                    for folder in ide.workspace_folders:
+                        key = (name, abbreviate_path(folder))
+                        counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                        counts["ide"] += 1
+
+                print()
+                print(bolded("Running instances:"))
+                for (label, cwd), counts in groups.items():
+                    parts = []
+                    s = counts["sessions"]
+                    if s:
+                        parts.append(f"{s} session{'s' if s > 1 else ''}")
+                    if counts["ide"]:
+                        parts.append("IDE")
+                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
