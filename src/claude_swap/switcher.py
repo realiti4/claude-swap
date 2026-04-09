@@ -30,7 +30,20 @@ from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
-from claude_swap.printer import accent, bold_accent, bolded, dimmed, error, muted, warning
+from claude_swap.printer import (
+    abbreviate_path,
+    accent,
+    bold_accent,
+    bolded,
+    dimmed,
+    entrypoint_label,
+    error,
+    format_age,
+    ide_short_name,
+    muted,
+    warning,
+)
+from claude_swap.process_detection import get_running_instances
 
 # Service name for keyring storage
 KEYRING_SERVICE = "claude-code"
@@ -38,7 +51,6 @@ KEYRING_ACTIVE_USERNAME = "active-credentials"
 
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
-
 
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
@@ -799,6 +811,29 @@ class ClaudeAccountSwitcher:
                     print(f"     {dimmed('•')} {muted(token_status)}")
             if i < len(accounts_info) - 1:
                 print()
+
+        # Running instances
+        try:
+            sessions, ide_instances = get_running_instances()
+
+            if sessions or ide_instances:
+                print()
+                print(bolded("Running instances:"))
+                for session in sessions:
+                    label = entrypoint_label(session.entrypoint)
+                    cwd = abbreviate_path(session.cwd)
+                    age = format_age(session.started_at) if session.started_at else ""
+                    status = f" {session.status}" if session.status else ""
+                    parts = [f"pid {session.pid}"]
+                    if age:
+                        parts.append(age)
+                    print(f"  {dimmed('●')} {muted(f'{label}{status}')}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+                for ide in ide_instances:
+                    name = ide_short_name(ide.ide_name)
+                    folders = ", ".join(abbreviate_path(f) for f in ide.workspace_folders)
+                    print(f"  {dimmed('●')} {muted(name)}   {muted(folders)}  {dimmed(f'(IDE, pid {ide.pid})')}")
+        except Exception:
+            self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def status(self) -> None:
         """Display current account status."""

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+from pathlib import Path
 
 # ANSI escape codes
 _RESET = "\033[0m"
@@ -114,3 +116,52 @@ def error(msg: str) -> None:
 def warning(msg: str) -> None:
     """Print a warning message (yellow)."""
     print(_style(msg, _YELLOW))
+
+
+# --- Display helpers for process detection ---
+
+_ENTRYPOINT_LABELS: dict[str, str] = {
+    "cli": "CLI",
+    "claude-vscode": "VS Code",
+    "claude-desktop": "Desktop",
+    "sdk-cli": "SDK",
+    "sdk-ts": "SDK",
+    "sdk-py": "SDK",
+    "mcp": "MCP",
+    "local-agent": "Agent",
+    "remote": "Remote",
+}
+
+_IDE_SHORT_NAMES: dict[str, str] = {
+    "Visual Studio Code": "VS Code",
+}
+
+
+def entrypoint_label(entrypoint: str) -> str:
+    """Return a human-readable label for a Claude Code entrypoint."""
+    return _ENTRYPOINT_LABELS.get(entrypoint, entrypoint)
+
+
+def ide_short_name(ide_name: str) -> str:
+    """Return a short display name for an IDE."""
+    return _IDE_SHORT_NAMES.get(ide_name, ide_name)
+
+
+def abbreviate_path(path: str) -> str:
+    """Replace the user's home directory prefix with ~."""
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def format_age(started_at_ms: int) -> str:
+    """Format a millisecond epoch timestamp as a human-readable age."""
+    elapsed = int(time.time()) - (started_at_ms // 1000)
+    if elapsed < 60:
+        return "just now"
+    if elapsed < 3600:
+        return f"{elapsed // 60}m ago"
+    if elapsed < 86400:
+        return f"{elapsed // 3600}h ago"
+    return f"{elapsed // 86400}d ago"
