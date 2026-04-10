@@ -37,7 +37,7 @@ cswap --add-account
 
 ### Add more accounts
 
-Log out of Claude Code, log in with another account, then:
+Log in with another account, then:
 
 ```bash
 cswap --add-account
