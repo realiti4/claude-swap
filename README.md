@@ -70,6 +70,16 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
+### Add account to a specific slot
+
+By default, `--add-account` assigns the next available slot number. Use `--slot` to place the account in a specific slot:
+
+```bash
+cswap --add-account --slot 3
+```
+
+If the slot is already occupied by a different account, you'll be prompted to confirm before replacing it.
+
 ### Other commands
 
 ```bash
