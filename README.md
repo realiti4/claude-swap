@@ -70,23 +70,14 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
-### Add account to a specific slot
-
-By default, `--add-account` assigns the next available slot number. Use `--slot` to place the account in a specific slot:
-
-```bash
-cswap --add-account --slot 3
-```
-
-If the slot is already occupied by a different account, you'll be prompted to confirm before replacing it.
-
 ### Other commands
 
 ```bash
-cswap --list              # Show all accounts with 5h/7d usage and reset times
-cswap --status            # Show current account
-cswap --remove-account 2  # Remove an account
-cswap --purge             # Remove all claude-swap data
+cswap --list                    # Show all accounts with 5h/7d usage and reset times
+cswap --status                  # Show current account
+cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
+cswap --remove-account 2        # Remove an account
+cswap --purge                   # Remove all claude-swap data
 ```
 
 ## Tips
