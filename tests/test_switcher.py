@@ -147,7 +147,7 @@ class TestGetCurrentAccount:
 
     def test_config_without_oauth(self, temp_home: Path):
         """Test config file without oauthAccount."""
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({"other": "data"}))
 
         switcher = ClaudeAccountSwitcher()
@@ -155,7 +155,7 @@ class TestGetCurrentAccount:
 
     def test_config_with_empty_email(self, temp_home: Path):
         """Test config with empty email address."""
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(
             json.dumps({"oauthAccount": {"emailAddress": "", "accountUuid": "uuid"}})
         )
@@ -925,7 +925,7 @@ class TestAddAccountOrgFields:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
 
         config_path.write_text(json.dumps({
             "oauthAccount": {
@@ -960,7 +960,7 @@ class TestAddAccountOrgFields:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         org_config = {
             "oauthAccount": {
                 "emailAddress": "user@example.com",
@@ -993,7 +993,7 @@ class TestAddAccountOrgFields:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
                 "emailAddress": "user@example.com",
@@ -1059,7 +1059,7 @@ class TestListAccountsOrgDisplay:
         backup_dir.mkdir()
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
 
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
                 "emailAddress": "user@example.com",
@@ -1088,7 +1088,7 @@ class TestListAccountsOrgDisplay:
         backup_dir.mkdir()
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
 
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
                 "emailAddress": "user@example.com",
@@ -1118,7 +1118,7 @@ class TestBackwardCompatibility:
         backup_dir.mkdir()
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
 
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
                 "emailAddress": "account1@example.com",
@@ -1143,7 +1143,7 @@ class TestBackwardCompatibility:
         backup_dir.mkdir()
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
 
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
             "oauthAccount": {
                 "emailAddress": "account1@example.com",
@@ -1168,7 +1168,7 @@ class TestUpgradeMigration:
         backup_dir.mkdir(exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sequence_data))
 
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps(live_config))
 
     def test_status_after_upgrade_with_org_uuid(
@@ -1343,7 +1343,7 @@ class TestAddAccountSlot:
                 "organizationName": org_name,
             }
         }
-        config_path = temp_home / ".claude" / ".claude.json"
+        config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps(config))
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()

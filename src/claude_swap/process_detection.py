@@ -14,6 +14,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_swap.paths import get_claude_config_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,10 +44,7 @@ class IdeInstance:
 
 def get_claude_dir() -> Path:
     """Return the Claude config directory, respecting CLAUDE_CONFIG_DIR."""
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        return Path(env)
-    return Path.home() / ".claude"
+    return get_claude_config_home()
 
 
 def is_pid_alive(pid: int) -> bool:

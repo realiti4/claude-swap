@@ -43,6 +43,11 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.paths import (
+    get_claude_config_home,
+    get_credentials_path,
+    get_global_config_path,
+)
 from claude_swap.process_detection import get_running_instances
 
 # Service name for keyring storage
@@ -105,31 +110,8 @@ class ClaudeAccountSwitcher:
         return False
 
     def _get_claude_config_path(self) -> Path:
-        """Get the Claude configuration file path for the current session.
-
-        Claude Code may write to either ~/.claude/.claude.json or ~/.claude.json
-        depending on version or context. When both files exist with oauthAccount,
-        return the more recently modified one as it represents the active session.
-        """
-        primary_config = self.home / ".claude" / ".claude.json"
-        fallback_config = self.home / ".claude.json"
-
-        candidates = []
-        for path in [primary_config, fallback_config]:
-            if path.exists():
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                    if "oauthAccount" in data:
-                        candidates.append(path)
-                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-                    pass
-
-        if not candidates:
-            return fallback_config
-        if len(candidates) == 1:
-            return candidates[0]
-        # Both have oauthAccount — use the more recently modified one
-        return max(candidates, key=lambda p: p.stat().st_mtime)
+        """Get the Claude configuration file path, mirroring claude-code."""
+        return get_global_config_path()
 
     def _validate_email(self, email: str) -> bool:
         """Validate email format."""
@@ -207,7 +189,7 @@ class ClaudeAccountSwitcher:
                 self._logger.error(f"Unexpected error reading credentials: {e}")
                 return None
         else:  # Linux/WSL/Windows - credentials stored in file
-            cred_file = self.home / ".claude" / ".credentials.json"
+            cred_file = get_credentials_path()
             if cred_file.exists():
                 try:
                     return cred_file.read_text(encoding="utf-8")
@@ -247,7 +229,7 @@ class ClaudeAccountSwitcher:
                     f"Failed to write credentials: {result.stderr}"
                 )
         else:  # Linux/WSL/Windows - credentials stored in file
-            cred_dir = self.home / ".claude"
+            cred_dir = get_claude_config_home()
             cred_dir.mkdir(parents=True, exist_ok=True)
             cred_file = cred_dir / ".credentials.json"
             try:

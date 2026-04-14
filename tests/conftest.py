@@ -39,7 +39,7 @@ def mock_claude_config(temp_home: Path):
             "accountUuid": "test-uuid-1234",
         }
     }
-    config_path = temp_home / ".claude" / ".claude.json"
+    config_path = temp_home / ".claude.json"
     config_path.write_text(json.dumps(config))
     return config_path
 
@@ -88,7 +88,7 @@ def mock_org_claude_config(temp_home: Path):
             "displayName": "Test User",
         }
     }
-    config_path = temp_home / ".claude" / ".claude.json"
+    config_path = temp_home / ".claude.json"
     config_path.write_text(json.dumps(config))
     return config_path
 
@@ -102,7 +102,7 @@ def mock_personal_claude_config(temp_home: Path):
             "accountUuid": "user-uuid-1234",
         }
     }
-    config_path = temp_home / ".claude" / ".claude.json"
+    config_path = temp_home / ".claude.json"
     config_path.write_text(json.dumps(config))
     return config_path
 
