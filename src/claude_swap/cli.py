@@ -46,6 +46,12 @@ Examples:
         action="store_true",
         help="Show OAuth token expiry state (use with --list)",
     )
+    parser.add_argument(
+        "--slot",
+        type=int,
+        metavar="NUM",
+        help="Specify slot number when adding account (use with --add-account)",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -89,6 +95,9 @@ Examples:
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
 
+    if args.slot is not None and not args.add_account:
+        parser.error("--slot can only be used with --add-account")
+
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -100,7 +109,7 @@ Examples:
 
     try:
         if args.add_account:
-            switcher.add_account()
+            switcher.add_account(slot=args.slot)
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
