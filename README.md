@@ -1,6 +1,6 @@
 # claude-swap
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out.
+Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
 
@@ -58,7 +58,7 @@ cswap --switch-to 2
 cswap --switch-to user@example.com
 ```
 
-**Note:** Restart Claude Code after switching for the new account to take effect.
+**Note:** Restart Claude Code (or close and reopen the VS Code extension tab) after switching for the new account to take effect.
 
 ### Refresh expired tokens
 
@@ -82,7 +82,7 @@ cswap --purge                   # Remove all claude-swap data
 
 ## Tips
 
-- **Continuing sessions after switching:** You can resume the same Claude Code session after switching accounts. Close Claude Code (or the extension tab), run `cswap --switch`, then reopen and select your previous session. Note that the first message on the new account may use extra usage as the conversation cache rebuilds for that account.
+- **Continuing sessions after switching:** You can resume the same Claude Code session after switching accounts. Close Claude Code or the VS Code extension tab, run `cswap --switch` in any terminal, then reopen and select your previous session. Note that the first message on the new account may use extra usage as the conversation cache rebuilds for that account.
 
 ## How it works
 
