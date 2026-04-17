@@ -54,6 +54,16 @@ from claude_swap.process_detection import get_running_instances
 KEYRING_SERVICE = "claude-code"
 KEYRING_ACTIVE_USERNAME = "active-credentials"
 
+# macOS Keychain service names used by Claude Code.
+# OAuth tokens (browser /login) are stored under "Claude Code-credentials".
+# Managed API keys (/login with a key) are stored under "Claude Code".
+_KEYCHAIN_OAUTH_SERVICE = "Claude Code-credentials"
+_KEYCHAIN_MANAGED_SERVICE = "Claude Code"
+
+# Prefix stored in cswap's own backup keyring to mark managed-key accounts.
+# Backups without this prefix are assumed to be OAuth accounts.
+_CREDS_MANAGED_SOURCE_PREFIX = "SOURCE:managed:"
+
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
 
@@ -69,6 +79,7 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self.platform = Platform.detect()
         self._logger = setup_logging(self.backup_dir, debug=debug)
+        self._active_creds_source: str = "keychain"  # "keychain" or "file" (macOS only)
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -159,35 +170,34 @@ class ClaudeAccountSwitcher:
         """Read credentials from Claude Code's storage.
 
         Claude Code stores credentials in:
-        - macOS: Keychain with service "Claude Code-credentials"
+        - macOS OAuth login: Keychain service "Claude Code-credentials"
+        - macOS /login managed key: Keychain service "Claude Code"
         - Linux/WSL/Windows: File at ~/.claude/.credentials.json
+
+        Sets self._active_creds_source to "oauth" or "managed" on macOS.
 
         Returns:
             Credentials string if found, empty string if not found, None on error.
         """
         if self.platform == Platform.MACOS:
-            try:
-                result = subprocess.run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        "Claude Code-credentials",
-                        "-w",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                return result.stdout.strip()
-            except subprocess.CalledProcessError as e:
-                if e.returncode == 44:  # Item not found
-                    return ""
-                self._logger.error(f"Failed to read credentials: {e}")
+            # Try OAuth keychain entry first
+            creds = self._read_macos_keychain(_KEYCHAIN_OAUTH_SERVICE)
+            if creds is None:
+                return None  # unexpected error
+            if creds:
+                self._active_creds_source = "oauth"
+                return creds
+
+            # Fall back to managed-key keychain entry (/login API keys)
+            creds = self._read_macos_keychain(_KEYCHAIN_MANAGED_SERVICE)
+            if creds is None:
                 return None
-            except Exception as e:
-                self._logger.error(f"Unexpected error reading credentials: {e}")
-                return None
+            if creds:
+                self._active_creds_source = "managed"
+                return creds
+
+            self._active_creds_source = "oauth"
+            return ""
         else:  # Linux/WSL/Windows - credentials stored in file
             cred_file = get_credentials_path()
             if cred_file.exists():
@@ -198,24 +208,53 @@ class ClaudeAccountSwitcher:
                     return None
             return ""
 
+    def _read_macos_keychain(self, service: str) -> str | None:
+        """Read a generic-password entry from the macOS Keychain.
+
+        Returns the password string, "" if not found, or None on error.
+        """
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-w"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 44:  # item not found
+                return ""
+            self._logger.error(f"Failed to read keychain service '{service}': {e}")
+            return None
+        except Exception as e:
+            self._logger.error(f"Unexpected error reading keychain service '{service}': {e}")
+            return None
+
     def _write_credentials(self, credentials: str) -> None:
         """Write credentials to Claude Code's storage.
 
-        Claude Code stores credentials in:
-        - macOS: Keychain with service "Claude Code-credentials"
-        - Linux/WSL/Windows: File at ~/.claude/.credentials.json
+        On macOS, writes to the Keychain service that matches the account type
+        (oauth → "Claude Code-credentials", managed → "Claude Code") and clears
+        the other service so Claude Code doesn't pick up stale credentials.
 
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
         if self.platform == Platform.MACOS:
+            if self._active_creds_source == "managed":
+                write_service = _KEYCHAIN_MANAGED_SERVICE
+                clear_service = _KEYCHAIN_OAUTH_SERVICE
+            else:
+                write_service = _KEYCHAIN_OAUTH_SERVICE
+                clear_service = _KEYCHAIN_MANAGED_SERVICE
+
             result = subprocess.run(
                 [
                     "security",
                     "add-generic-password",
                     "-U",
                     "-s",
-                    "Claude Code-credentials",
+                    write_service,
                     "-a",
                     os.environ.get("USER", "user"),
                     "-w",
@@ -228,6 +267,13 @@ class ClaudeAccountSwitcher:
                 raise CredentialWriteError(
                     f"Failed to write credentials: {result.stderr}"
                 )
+            # Clear the other service so Claude Code doesn't use stale creds.
+            # returncode 44 (item not found) is fine — just means it wasn't there.
+            subprocess.run(
+                ["security", "delete-generic-password", "-s", clear_service],
+                capture_output=True,
+                text=True,
+            )
         else:  # Linux/WSL/Windows - credentials stored in file
             cred_dir = get_claude_config_home()
             cred_dir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +303,8 @@ class ClaudeAccountSwitcher:
         """Read account credentials from backup.
 
         On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On macOS/Windows: Uses system keyring. On macOS, also decodes the source
+        prefix so _write_credentials knows which Keychain service to restore to.
         """
         if self.platform in (Platform.LINUX, Platform.WSL):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
@@ -273,8 +320,16 @@ class ClaudeAccountSwitcher:
             # Use keyring for macOS/Windows
             username = f"account-{account_num}-{email}"
             try:
-                creds = keyring.get_password(KEYRING_SERVICE, username)
-                return creds if creds else ""
+                stored = keyring.get_password(KEYRING_SERVICE, username)
+                if not stored:
+                    self._active_creds_source = "oauth"
+                    return ""
+                # Decode source prefix written by _write_account_credentials
+                if stored.startswith(_CREDS_MANAGED_SOURCE_PREFIX):
+                    self._active_creds_source = "managed"
+                    return stored[len(_CREDS_MANAGED_SOURCE_PREFIX):]
+                self._active_creds_source = "oauth"
+                return stored
             except Exception as e:
                 self._logger.warning(f"Failed to read credentials from keyring: {e}")
                 return ""
@@ -285,7 +340,9 @@ class ClaudeAccountSwitcher:
         """Write account credentials to backup.
 
         On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On macOS/Windows: Uses system keyring. On macOS, prefixes the stored value
+        with _CREDS_MANAGED_SOURCE_PREFIX for managed-key accounts so the restore
+        path knows to write back to the "Claude Code" Keychain service.
         """
         if self.platform in (Platform.LINUX, Platform.WSL):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
@@ -297,10 +354,12 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Failed to write credentials file: {e}")
                 raise
         else:
-            # Use keyring for macOS/Windows
             username = f"account-{account_num}-{email}"
+            stored = credentials
+            if self.platform == Platform.MACOS and self._active_creds_source == "managed":
+                stored = _CREDS_MANAGED_SOURCE_PREFIX + credentials
             try:
-                keyring.set_password(KEYRING_SERVICE, username, credentials)
+                keyring.set_password(KEYRING_SERVICE, username, stored)
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials to keyring: {e}")
                 raise
