@@ -185,15 +185,16 @@ class ClaudeAccountSwitcher:
                 if e.returncode == 44:  # Item not found - fall back to file
                     pass
                 else:
+                    # Unexpected Keychain error (e.g. -25308 errSecInteractionNotAllowed)
+                    # — fall back to file rather than surfacing an unrecoverable error
                     self._logger.warning(
                         f"Keychain lookup failed (rc={e.returncode}), falling back to file"
                     )
             except Exception as e:
-                self._logger.warning(
-                    f"Unexpected Keychain error, falling back to file: {e}"
-                )
-            # Fall back to file-based credentials (Claude Code >= some versions
-            # or non-standard macOS setups store credentials in the file instead)
+                self._logger.error(f"Unexpected error reading credentials: {e}")
+                return None
+            # Claude Code may store credentials in the file instead of Keychain
+            # (observed on setups where Keychain interaction is restricted)
             cred_file = get_credentials_path()
             if cred_file.exists():
                 try:
@@ -273,7 +274,8 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         """Read account credentials from backup.
 
-        On Linux/WSL/macOS: Uses file-based storage.
+        On Linux/WSL/macOS: Uses file-based storage, with Keychain fallback on
+        macOS to migrate credentials stored by older versions of cswap.
         On Windows: Uses system keyring.
         """
         if self.platform in (Platform.LINUX, Platform.WSL, Platform.MACOS):
@@ -285,6 +287,20 @@ class ClaudeAccountSwitcher:
                 except Exception as e:
                     self._logger.warning(f"Failed to read credentials file: {e}")
                     return ""
+            # macOS: fall back to Keychain for accounts saved by older cswap versions
+            # and migrate them to file storage transparently
+            if self.platform == Platform.MACOS:
+                username = f"account-{account_num}-{email}"
+                try:
+                    creds = keyring.get_password(KEYRING_SERVICE, username)
+                    if creds:
+                        self._logger.info(
+                            f"Migrating account {email} credentials from Keychain to file"
+                        )
+                        self._write_account_credentials(account_num, email, creds)
+                        return creds
+                except Exception as e:
+                    self._logger.warning(f"Keychain fallback failed for {email}: {e}")
             return ""
         else:
             # Use keyring for Windows
