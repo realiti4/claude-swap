@@ -159,7 +159,8 @@ class ClaudeAccountSwitcher:
         """Read credentials from Claude Code's storage.
 
         Claude Code stores credentials in:
-        - macOS: Keychain with service "Claude Code-credentials"
+        - macOS: Keychain with service "Claude Code-credentials", falling back
+          to ~/.claude/.credentials.json when Keychain is unavailable
         - Linux/WSL/Windows: File at ~/.claude/.credentials.json
 
         Returns:
@@ -181,13 +182,26 @@ class ClaudeAccountSwitcher:
                 )
                 return result.stdout.strip()
             except subprocess.CalledProcessError as e:
-                if e.returncode == 44:  # Item not found
-                    return ""
-                self._logger.error(f"Failed to read credentials: {e}")
-                return None
+                if e.returncode == 44:  # Item not found - fall back to file
+                    pass
+                else:
+                    self._logger.warning(
+                        f"Keychain lookup failed (rc={e.returncode}), falling back to file"
+                    )
             except Exception as e:
-                self._logger.error(f"Unexpected error reading credentials: {e}")
-                return None
+                self._logger.warning(
+                    f"Unexpected Keychain error, falling back to file: {e}"
+                )
+            # Fall back to file-based credentials (Claude Code >= some versions
+            # or non-standard macOS setups store credentials in the file instead)
+            cred_file = get_credentials_path()
+            if cred_file.exists():
+                try:
+                    return cred_file.read_text(encoding="utf-8")
+                except Exception as e:
+                    self._logger.error(f"Failed to read credentials file: {e}")
+                    return None
+            return ""
         else:  # Linux/WSL/Windows - credentials stored in file
             cred_file = get_credentials_path()
             if cred_file.exists():
@@ -202,7 +216,8 @@ class ClaudeAccountSwitcher:
         """Write credentials to Claude Code's storage.
 
         Claude Code stores credentials in:
-        - macOS: Keychain with service "Claude Code-credentials"
+        - macOS: Keychain with service "Claude Code-credentials", falling back
+          to ~/.claude/.credentials.json when Keychain is unavailable
         - Linux/WSL/Windows: File at ~/.claude/.credentials.json
 
         Raises:
@@ -224,42 +239,44 @@ class ClaudeAccountSwitcher:
                 capture_output=True,
                 text=True,
             )
-            if result.returncode != 0:
-                raise CredentialWriteError(
-                    f"Failed to write credentials: {result.stderr}"
-                )
-        else:  # Linux/WSL/Windows - credentials stored in file
-            cred_dir = get_claude_config_home()
-            cred_dir.mkdir(parents=True, exist_ok=True)
-            cred_file = cred_dir / ".credentials.json"
+            if result.returncode == 0:
+                return
+            # Keychain write failed — fall back to file
+            self._logger.warning(
+                f"Keychain write failed, falling back to file: {result.stderr.strip()}"
+            )
+        # Linux/WSL/Windows — or macOS Keychain fallback
+        cred_dir = get_claude_config_home()
+        cred_dir.mkdir(parents=True, exist_ok=True)
+        cred_file = cred_dir / ".credentials.json"
+        try:
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
             try:
-                import tempfile
-                fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
-                try:
-                    os.write(fd, credentials.encode("utf-8"))
+                os.write(fd, credentials.encode("utf-8"))
+                os.close(fd)
+                fd = -1
+                os.replace(tmp_path, str(cred_file))
+                if sys.platform != "win32":
+                    os.chmod(str(cred_file), 0o600)
+            except BaseException:
+                if fd >= 0:
                     os.close(fd)
-                    fd = -1
-                    os.replace(tmp_path, str(cred_file))
-                    if sys.platform != "win32":
-                        os.chmod(str(cred_file), 0o600)
-                except BaseException:
-                    if fd >= 0:
-                        os.close(fd)
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
-            except Exception as e:
-                raise CredentialWriteError(f"Failed to write credentials: {e}")
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            raise CredentialWriteError(f"Failed to write credentials: {e}")
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         """Read account credentials from backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On Linux/WSL/macOS: Uses file-based storage.
+        On Windows: Uses system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.MACOS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             if cred_file.exists():
                 try:
@@ -270,7 +287,7 @@ class ClaudeAccountSwitcher:
                     return ""
             return ""
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for Windows
             username = f"account-{account_num}-{email}"
             try:
                 creds = keyring.get_password(KEYRING_SERVICE, username)
@@ -284,10 +301,10 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account credentials to backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On Linux/WSL/macOS: Uses file-based storage.
+        On Windows: Uses system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.MACOS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
@@ -297,7 +314,7 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Failed to write credentials file: {e}")
                 raise
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for Windows
             username = f"account-{account_num}-{email}"
             try:
                 keyring.set_password(KEYRING_SERVICE, username, credentials)
@@ -308,10 +325,10 @@ class ClaudeAccountSwitcher:
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
 
-        On Linux/WSL: Deletes file-based credential storage.
-        On macOS/Windows: Removes from system keyring.
+        On Linux/WSL/macOS: Deletes file-based credential storage.
+        On Windows: Removes from system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.MACOS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 if cred_file.exists():
@@ -319,7 +336,7 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.warning(f"Failed to delete credentials file: {e}")
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for Windows
             username = f"account-{account_num}-{email}"
             try:
                 keyring.delete_password(KEYRING_SERVICE, username)
