@@ -227,11 +227,11 @@ class ClaudeAccountSwitcher:
             CredentialWriteError: If writing credentials fails.
         """
         if self.platform == Platform.MACOS:
-            # Skip Keychain on macOS — the ACL on entries authored via
-            # `security add-generic-password` only grants decrypt rights to
-            # /usr/bin/security, so `claude` trips "User interaction is not
-            # allowed" when reading. Using the file path Claude Code already
-            # falls back to sidesteps the whole ACL story.
+            # Delete then recreate so the ACL gets reset. `-U` alone preserves
+            # the pre-existing ACL; entries authored via
+            # `security add-generic-password` grant decrypt rights only to
+            # /usr/bin/security, which makes `claude` trip "User interaction is
+            # not allowed" when reading. `-A` opens the ACL up to any app.
             subprocess.run(
                 [
                     "security",
@@ -243,6 +243,27 @@ class ClaudeAccountSwitcher:
                 ],
                 capture_output=True,
                 text=True,
+            )
+            result = subprocess.run(
+                [
+                    "security",
+                    "add-generic-password",
+                    "-U",
+                    "-A",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-a",
+                    "credentials",
+                    "-w",
+                    credentials,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return
+            self._logger.warning(
+                f"Keychain write failed, falling back to file: {result.stderr.strip()}"
             )
         # Linux/WSL/Windows — or macOS Keychain fallback
         cred_dir = get_claude_config_home()
