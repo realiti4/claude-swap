@@ -994,7 +994,45 @@ class ClaudeAccountSwitcher:
 
         self.add_account()
 
-    def switch(self) -> None:
+    def _check_running_instances(self, force: bool) -> None:
+        """Abort switch if other Claude Code processes could clobber .claude.json.
+
+        Live Claude Code sessions/IDEs hold oauthAccount in memory and flush it
+        back to .claude.json on their own schedule, which silently reverts a
+        switch. Detect them up front and refuse unless the caller passes --force.
+        """
+        try:
+            sessions, ide_instances = get_running_instances()
+        except Exception:
+            self._logger.debug("Running-instance detection failed", exc_info=True)
+            return
+
+        if not sessions and not ide_instances:
+            return
+
+        lines: list[str] = []
+        for s in sessions:
+            label = entrypoint_label(s.entrypoint)
+            lines.append(f"  {dimmed('●')} {muted(label)} pid {s.pid}   {muted(abbreviate_path(s.cwd))}")
+        for ide in ide_instances:
+            name = ide_short_name(ide.ide_name)
+            folders = ", ".join(abbreviate_path(f) for f in ide.workspace_folders) or "-"
+            lines.append(f"  {dimmed('●')} {muted(name)} pid {ide.pid}   {muted(folders)}")
+
+        if force:
+            warning("switching with other Claude Code instances running (forced):")
+            for line in lines:
+                print(line)
+            return
+
+        raise SwitchError(
+            "Other Claude Code instances are running and may overwrite "
+            ".claude.json after the switch, reverting it:\n"
+            + "\n".join(lines)
+            + "\nClose them and retry, or pass --force to switch anyway."
+        )
+
+    def switch(self, force: bool = False) -> None:
         """Switch to next account in sequence."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1035,9 +1073,9 @@ class ClaudeAccountSwitcher:
         next_index = (current_index + 1) % len(sequence)
         next_account = str(sequence[next_index])
 
-        self._perform_switch(next_account)
+        self._perform_switch(next_account, force=force)
 
-    def switch_to(self, identifier: str) -> None:
+    def switch_to(self, identifier: str, force: bool = False) -> None:
         """Switch to specific account."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1082,14 +1120,15 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-        self._perform_switch(target_account)
+        self._perform_switch(target_account, force=force)
 
-    def _perform_switch(self, target_account: str) -> None:
+    def _perform_switch(self, target_account: str, force: bool = False) -> None:
         """Perform the actual account switch with transaction support.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
+        self._check_running_instances(force)
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
             current_account = str(data.get("activeAccountNumber"))

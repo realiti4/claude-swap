@@ -52,6 +52,11 @@ Examples:
         metavar="NUM",
         help="Specify slot number when adding account (use with --add-account)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Switch even when other Claude Code instances are running",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -117,9 +122,9 @@ Examples:
                 show_token_status=args.token_status,
             )
         elif args.switch:
-            switcher.switch()
+            switcher.switch(force=args.force)
         elif args.switch_to:
-            switcher.switch_to(args.switch_to)
+            switcher.switch_to(args.switch_to, force=args.force)
         elif args.status:
             switcher.status()
         elif args.purge:
