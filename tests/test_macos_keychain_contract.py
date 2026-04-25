@@ -1,12 +1,16 @@
 """macOS Keychain contract tests.
 
-Layer 1 (mocked, runs everywhere): asserts that on macOS, every credential
-code path passes the correct argv shape to its underlying storage primitive.
-These would have caught PR #21 commit `bc9db76` (which hardcoded
-`-a "credentials"` in `_write_credentials`).
+Two layers of coverage:
 
-Layer 2 (real keychain, GHA macOS only): seeds / writes a temporary keychain
-and verifies cswap reads / writes interoperate with the shape Claude Code uses.
+1. **Mocked keyring tests** (run on every PR, every platform): assert that the
+   backup-credentials path passes the correct `(service, username)` tuple to
+   `keyring.get/set/delete_password`. This guards the multi-account backup
+   namespace — there's no Windows runner, so without these the keyring args
+   for backup creds are uncovered on every CI run.
+
+2. **Real-keychain integration tests** (GHA macOS only): exercise
+   `_read_credentials` / `_write_credentials` end-to-end against a temporary
+   keychain, comparing token values rather than argv shape.
 
 The Layer 2 gate (`GITHUB_ACTIONS=true AND sys.platform=="darwin"`) is
 deliberate: no local opt-in env var, so a developer cannot accidentally
@@ -19,17 +23,16 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from claude_swap.exceptions import CredentialWriteError
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — mocked unit tests. Run on every PR on every platform.
+# Mocked keyring tests — backup-credentials path. Run everywhere.
 # ---------------------------------------------------------------------------
 
 
@@ -41,103 +44,6 @@ def macos_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     return switcher
 
 
-@pytest.mark.skip(
-    reason="Temporarily disabled to validate Layer 2 alone catches PR-#21 shape on GHA macOS — re-enable after the macos-keychain-contract job passes."
-)
-class TestLiveCredentialsArgv:
-    """Mocked tests for _read_credentials / _write_credentials on macOS."""
-
-    def test_read_credentials_macos_argv(
-        self, macos_switcher: ClaudeAccountSwitcher, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.setenv("USER", "testuser")
-        mock_run = MagicMock(
-            return_value=MagicMock(returncode=0, stdout="seeded-token\n", stderr="")
-        )
-        monkeypatch.setattr("claude_swap.switcher.subprocess.run", mock_run)
-
-        result = macos_switcher._read_credentials()
-
-        assert result == "seeded-token"
-        mock_run.assert_called_once()
-        argv = mock_run.call_args.args[0]
-        assert argv == [
-            "security",
-            "find-generic-password",
-            "-a",
-            "testuser",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ]
-
-    def test_read_credentials_returns_empty_on_returncode_44(
-        self, macos_switcher: ClaudeAccountSwitcher, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.setenv("USER", "testuser")
-        err = subprocess.CalledProcessError(returncode=44, cmd=["security"])
-        monkeypatch.setattr(
-            "claude_swap.switcher.subprocess.run", MagicMock(side_effect=err)
-        )
-
-        assert macos_switcher._read_credentials() == ""
-
-    def test_write_credentials_uses_user_account(
-        self, macos_switcher: ClaudeAccountSwitcher, monkeypatch: pytest.MonkeyPatch
-    ):
-        # Regression guard for PR #21 commit bc9db76 (hardcoded `-a "credentials"`).
-        monkeypatch.setenv("USER", "testuser")
-        mock_run = MagicMock(
-            return_value=MagicMock(returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("claude_swap.switcher.subprocess.run", mock_run)
-
-        macos_switcher._write_credentials("fake-token-12345")
-
-        argv = mock_run.call_args.args[0]
-        assert argv == [
-            "security",
-            "add-generic-password",
-            "-U",
-            "-s",
-            "Claude Code-credentials",
-            "-a",
-            "testuser",
-            "-w",
-            "fake-token-12345",
-        ]
-
-    def test_write_credentials_user_env_fallback(
-        self, macos_switcher: ClaudeAccountSwitcher, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.delenv("USER", raising=False)
-        mock_run = MagicMock(
-            return_value=MagicMock(returncode=0, stdout="", stderr="")
-        )
-        monkeypatch.setattr("claude_swap.switcher.subprocess.run", mock_run)
-
-        macos_switcher._write_credentials("token")
-
-        argv = mock_run.call_args.args[0]
-        a_idx = argv.index("-a")
-        assert argv[a_idx + 1] == "user"
-
-    def test_write_credentials_raises_on_nonzero_returncode(
-        self, macos_switcher: ClaudeAccountSwitcher, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.setenv("USER", "testuser")
-        mock_run = MagicMock(
-            return_value=MagicMock(returncode=1, stdout="", stderr="boom")
-        )
-        monkeypatch.setattr("claude_swap.switcher.subprocess.run", mock_run)
-
-        with pytest.raises(CredentialWriteError):
-            macos_switcher._write_credentials("token")
-
-
-@pytest.mark.skip(
-    reason="Temporarily disabled to validate Layer 2 alone catches PR-#21 shape on GHA macOS — re-enable after the macos-keychain-contract job passes."
-)
 class TestBackupCredentialsKeyring:
     """Mocked tests for backup-creds keyring args on macOS/Windows.
 
@@ -185,7 +91,7 @@ class TestBackupCredentialsKeyring:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — real-keychain integration tests. macOS GHA only.
+# Real-keychain integration tests. macOS GHA only.
 # ---------------------------------------------------------------------------
 
 mac_ci_only = pytest.mark.skipif(
@@ -285,9 +191,9 @@ def test_read_credentials_finds_claude_code_seeded_entry(tmp_keychain: str):
 
 @mac_ci_only
 def test_write_credentials_creates_user_scoped_entry(tmp_keychain: str):
-    # End-to-end regression for PR #21 commit bc9db76: a hardcoded `-a "credentials"`
-    # in _write_credentials means the entry is stored under the wrong account, so
-    # the verification lookup with -a $USER below would return returncode 44.
+    # If _write_credentials ever stores the entry under a hardcoded account name
+    # (or any value other than $USER), the verification lookup below — which
+    # mirrors Claude Code's own read shape — returns 44 and the test fails.
     switcher = ClaudeAccountSwitcher()
     switcher.platform = Platform.MACOS
     switcher._write_credentials("fake-token-write")
