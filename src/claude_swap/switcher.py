@@ -171,6 +171,8 @@ class ClaudeAccountSwitcher:
                     [
                         "security",
                         "find-generic-password",
+                        "-a",
+                        os.environ.get("USER", "user"),
                         "-s",
                         "Claude Code-credentials",
                         "-w",
