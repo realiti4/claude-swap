@@ -25,3 +25,22 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+  macos-keychain-contract:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          pip install pytest
+
+      - name: Run macOS Keychain contract tests
+        run: pytest tests/test_macos_keychain_contract.py -v

@@ -215,7 +215,15 @@ class ClaudeAccountSwitcher:
         """
         try:
             result = subprocess.run(
-                ["security", "find-generic-password", "-s", service, "-w"],
+                [
+                    "security",
+                    "find-generic-password",
+                    "-a",
+                    os.environ.get("USER", "user"),
+                    "-s",
+                    service,
+                    "-w",
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
