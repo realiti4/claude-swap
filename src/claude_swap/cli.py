@@ -27,6 +27,8 @@ Examples:
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge
+  %(prog)s --export backup.cswap
+  %(prog)s --import backup.cswap
         """,
     )
 
@@ -51,6 +53,16 @@ Examples:
         type=int,
         metavar="NUM",
         help="Specify slot number when adding account (use with --add-account)",
+    )
+    parser.add_argument(
+        "--account",
+        metavar="NUM|EMAIL",
+        help="Limit export to one account (use with --export)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing accounts during import",
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -89,6 +101,17 @@ Examples:
         action="store_true",
         help="Remove all claude-swap data from the system",
     )
+    group.add_argument(
+        "--export",
+        metavar="PATH",
+        help="Export accounts to file (use '-' for stdout)",
+    )
+    group.add_argument(
+        "--import",
+        dest="import_",
+        metavar="PATH",
+        help="Import accounts from file (use '-' for stdin)",
+    )
 
     args = parser.parse_args()
 
@@ -97,6 +120,12 @@ Examples:
 
     if args.slot is not None and not args.add_account:
         parser.error("--slot can only be used with --add-account")
+
+    if args.account is not None and not args.export:
+        parser.error("--account can only be used with --export")
+
+    if args.force and not args.import_:
+        parser.error("--force can only be used with --import")
 
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -124,6 +153,14 @@ Examples:
             switcher.status()
         elif args.purge:
             switcher.purge()
+        elif args.export:
+            from claude_swap.transfer import export_accounts
+
+            export_accounts(switcher, args.export, account=args.account)
+        elif args.import_:
+            from claude_swap.transfer import import_accounts
+
+            import_accounts(switcher, args.import_, force=args.force)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

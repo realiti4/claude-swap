@@ -967,12 +967,25 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No accounts are managed yet")
 
         identity = self._get_current_account()
-        if identity is None:
-            raise ConfigError("No active Claude account found")
-        current_email, current_org_uuid = identity
 
         # Ensure org fields are migrated before checking composite key
         self._get_sequence_data_migrated()
+
+        # Fresh-machine path: no live Claude session, but we have managed accounts
+        # (e.g. right after cswap --import). Activate the recorded
+        # activeAccountNumber, or fall back to the first slot in sequence.
+        if identity is None:
+            data = self._get_sequence_data()
+            target = data.get("activeAccountNumber") if data else None
+            if not target:
+                sequence = (data or {}).get("sequence", [])
+                target = sequence[0] if sequence else None
+            if not target:
+                raise ConfigError("No accounts are managed yet")
+            self._perform_switch(str(target))
+            return
+
+        current_email, current_org_uuid = identity
 
         # Check if current account is managed
         if not self._account_exists(current_email, current_org_uuid):
@@ -1063,11 +1076,56 @@ class ClaudeAccountSwitcher:
             target_email = data["accounts"][target_account]["email"]
             current_identity = self._get_current_account()
 
-            if current_identity is None:
-                raise SwitchError("No current account to switch from")
-            current_email, _ = current_identity
-
             config_path = self._get_claude_config_path()
+
+            # Fresh-machine path: no live Claude session yet (e.g. right after
+            # cswap --import on a new machine). Skip the back-up-current step
+            # since there's nothing to back up, and install the target directly.
+            if current_identity is None:
+                target_creds = self._read_account_credentials(
+                    target_account, target_email
+                )
+                target_config = self._read_account_config(target_account, target_email)
+                if not target_creds or not target_config:
+                    raise SwitchError(
+                        f"Missing backup data for Account-{target_account}"
+                    )
+                try:
+                    target_config_data = json.loads(target_config)
+                except json.JSONDecodeError as exc:
+                    raise SwitchError(f"Invalid backup config: {exc}")
+                target_oauth = target_config_data.get("oauthAccount")
+                if not target_oauth:
+                    raise SwitchError("Invalid oauthAccount in backup")
+
+                self._write_credentials(target_creds)
+
+                # Mirror the normal switch path: preserve existing local
+                # settings/projects when ~/.claude.json already exists, only
+                # swapping in oauthAccount. Fall back to the full imported
+                # config when no usable local config exists.
+                existing_config = self._read_json(config_path) if config_path.exists() else None
+                if existing_config:
+                    existing_config["oauthAccount"] = target_oauth
+                    self._write_json(config_path, existing_config)
+                else:
+                    self._write_json(config_path, target_config_data)
+
+                data["activeAccountNumber"] = int(target_account)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                self._logger.info(
+                    f"Activated account {target_account} (no prior live account)"
+                )
+                print(
+                    f"{accent('Activated')} Account-{target_account} ({target_email})"
+                )
+                print()
+                warning("Please restart Claude Code to use the new authentication.")
+                print()
+                return
+
+            current_email, _ = current_identity
 
             # Create transaction for rollback capability
             try:
