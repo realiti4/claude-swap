@@ -41,7 +41,7 @@ wheels = [
 
 [[package]]
 name = "claude-swap"
-version = "0.8.1"
+version = "0.9.0b1"
 source = { editable = "." }
 dependencies = [
     { name = "keyring" },
