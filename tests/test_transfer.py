@@ -906,3 +906,101 @@ class TestCleanHomeActivation:
         assert final["accounts"]["7"]["email"] == "bob@example.com"
         # bob skipped → activeAccountNumber points at where bob lives (slot 7)
         assert final["activeAccountNumber"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Slim vs full config payload
+# ---------------------------------------------------------------------------
+
+
+_BLOATED_CONFIG = {
+    "oauthAccount": {
+        "emailAddress": "alice@example.com",
+        "accountUuid": "acct-uuid",
+        "organizationUuid": "org-a",
+        "organizationName": "Acme",
+    },
+    # Machine-local junk that must NOT cross machines by default
+    "userID": "host-machine-identity",
+    "anonymousId": "anon-host-id",
+    "projects": {"/Users/host/repo": {}},
+    "tipsHistory": {"welcome": 1, "shift-enter": 5},
+    "cachedGrowthBookFeatures": {"flag-a": True, "flag-b": False},
+    "appleTerminalBackupPath": "/Users/host/Library/Preferences/x.plist.bak",
+    "numStartups": 42,
+}
+
+
+class TestSlimVsFullConfig:
+    def test_default_export_strips_non_oauth_keys(self, temp_home: Path):
+        """Default export must contain only oauthAccount in config — no
+        machine identity (userID, anonymousId), local paths, or caches."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", config=_BLOATED_CONFIG)
+
+        out = temp_home / "slim.cswap"
+        export_accounts(s, str(out))
+        env = json.loads(out.read_text())
+
+        cfg = env["accounts"][0]["config"]
+        assert list(cfg.keys()) == ["oauthAccount"]
+        assert cfg["oauthAccount"]["emailAddress"] == "alice@example.com"
+        # Specifically verify the dangerous keys are gone
+        for leaked in ("userID", "anonymousId", "projects", "appleTerminalBackupPath"):
+            assert leaked not in cfg
+
+    def test_full_export_preserves_all_keys(self, temp_home: Path):
+        """`--full` opt-in keeps the entire ~/.claude.json — for same-PC
+        backups where machine state is intentional."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", config=_BLOATED_CONFIG)
+
+        out = temp_home / "full.cswap"
+        export_accounts(s, str(out), full=True)
+        env = json.loads(out.read_text())
+
+        cfg = env["accounts"][0]["config"]
+        assert cfg == _BLOATED_CONFIG
+
+    def test_export_missing_oauthAccount_raises(self, temp_home: Path):
+        """If the source config somehow lacks oauthAccount, slim export
+        must fail loudly — there's nothing to switch to without it."""
+        s = _linux_switcher(temp_home)
+        _seed_account(
+            s, 1, "alice@example.com", config={"projects": {}, "userID": "x"}
+        )
+
+        with pytest.raises(TransferError, match="missing oauthAccount"):
+            export_accounts(s, str(temp_home / "x.cswap"))
+
+    def test_slim_export_round_trip_to_fresh_machine(self, temp_home: Path):
+        """End-to-end: bloated source config → slim export → import on
+        clean home → switch_to → live ~/.claude.json contains oauthAccount,
+        and the source machine's userID/anonymousId did NOT cross over."""
+        src_home = temp_home.parent / "src"
+        src_home.mkdir()
+        with patch("pathlib.Path.home", return_value=src_home):
+            with patch.dict(os.environ, {"HOME": str(src_home)}):
+                src = _linux_switcher(src_home)
+                _seed_account(
+                    src, 1, "alice@example.com", "org-a", config=_BLOATED_CONFIG
+                )
+                export_path = src_home / "x.cswap"
+                export_accounts(src, str(export_path))
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(export_path))
+
+                with patch.object(dst, "list_accounts"):
+                    dst.switch_to("1")
+
+                live = json.loads(dst._get_claude_config_path().read_text())
+                assert live["oauthAccount"]["emailAddress"] == "alice@example.com"
+                # Source machine identity must NOT have leaked over
+                assert live.get("userID") != "host-machine-identity"
+                assert live.get("anonymousId") != "anon-host-id"
+                assert "appleTerminalBackupPath" not in live

@@ -185,7 +185,29 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         export_fn.assert_called_once_with(
-            switcher_cls.return_value, "/tmp/x", account="2"
+            switcher_cls.return_value, "/tmp/x", account="2", full=False
+        )
+
+    def test_full_flag_requires_export(self, capsys):
+        """--full should only be accepted alongside --export."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--full"]):
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main()
+        assert exc_info.value.code == 2
+        assert "--full can only be used with --export" in capsys.readouterr().err
+
+    def test_full_flag_dispatches_with_full_true(self):
+        """--export --full should pass full=True into export_accounts."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.export_accounts") as export_fn, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "--export", "/tmp/x", "--full"]
+             ), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        export_fn.assert_called_once_with(
+            switcher_cls.return_value, "/tmp/x", account=None, full=True
         )
 
     def test_import_dispatch_calls_transfer(self):

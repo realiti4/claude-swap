@@ -64,6 +64,11 @@ Examples:
         action="store_true",
         help="Overwrite existing accounts during import",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Include full ~/.claude.json in export (default: oauthAccount only)",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -127,6 +132,9 @@ Examples:
     if args.force and not args.import_:
         parser.error("--force can only be used with --import")
 
+    if args.full and not args.export:
+        parser.error("--full can only be used with --export")
+
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -156,7 +164,7 @@ Examples:
         elif args.export:
             from claude_swap.transfer import export_accounts
 
-            export_accounts(switcher, args.export, account=args.account)
+            export_accounts(switcher, args.export, account=args.account, full=args.full)
         elif args.import_:
             from claude_swap.transfer import import_accounts
 

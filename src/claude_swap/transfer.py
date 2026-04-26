@@ -110,10 +110,27 @@ def _atomic_write_file(path: Path, content: str) -> None:
         os.chmod(path, 0o600)
 
 
+def _slim_config(config_obj: dict, label: str) -> dict:
+    """Reduce a parsed ~/.claude.json to just the keys a switch will consume.
+
+    Today, only `oauthAccount` is read back during a switch. Stripping the
+    rest at export time keeps cross-machine transfers small and avoids
+    leaking source-machine identity (userID, anonymousId, absolute paths,
+    cached feature flags) into the destination.
+    """
+    oauth = config_obj.get("oauthAccount")
+    if not isinstance(oauth, dict):
+        raise TransferError(
+            f"{label} is missing oauthAccount — cannot export"
+        )
+    return {"oauthAccount": oauth}
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
     account: str | None = None,
+    full: bool = False,
 ) -> None:
     """Export accounts to a JSON file or stdout.
 
@@ -121,6 +138,8 @@ def export_accounts(
         switcher: Initialized ClaudeAccountSwitcher.
         destination: File path, or "-" for stdout.
         account: Optional NUM|EMAIL to limit export to a single account.
+        full: When True, include the entire ~/.claude.json snapshot per
+            account (same-PC backup). Default False writes only oauthAccount.
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -178,6 +197,10 @@ def export_accounts(
                     f"no backup config found for account {num} ({email})"
                 )
 
+        config_obj = _parse_payload(config_text, f"config for {email}")
+        if not full:
+            config_obj = _slim_config(config_obj, f"config for {email}")
+
         accounts_payload.append(
             {
                 "number": int(num),
@@ -187,7 +210,7 @@ def export_accounts(
                 "organizationName": record.get("organizationName", "") or "",
                 "added": record.get("added", ""),
                 "credentials": _parse_payload(creds_text, f"credentials for {email}"),
-                "config": _parse_payload(config_text, f"config for {email}"),
+                "config": config_obj,
             }
         )
 
