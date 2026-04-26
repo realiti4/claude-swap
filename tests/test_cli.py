@@ -126,6 +126,82 @@ class TestCLI:
         )
         assert "--slot" in result.stdout
 
+    def test_account_flag_requires_export(self, capsys):
+        """--account should only be accepted alongside --export."""
+        with patch.object(
+            sys, "argv", ["claude-swap", "--list", "--account", "1"]
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--account can only be used with --export" in capsys.readouterr().err
+
+    def test_force_flag_requires_import(self, capsys):
+        """--force should only be accepted alongside --import."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--force"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--force can only be used with --import" in capsys.readouterr().err
+
+    def test_export_and_import_are_mutually_exclusive(self):
+        """--export and --import cannot be combined."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "claude_swap",
+                "--export",
+                "/tmp/x",
+                "--import",
+                "/tmp/x",
+            ],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert result.returncode != 0
+        assert "not allowed" in result.stderr.lower()
+
+    def test_export_in_help(self):
+        """--export and --import should appear in help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "--export" in result.stdout
+        assert "--import" in result.stdout
+
+    def test_export_dispatch_calls_transfer(self):
+        """--export dispatches into transfer.export_accounts."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.export_accounts") as export_fn, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "--export", "/tmp/x", "--account", "2"]
+             ), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        export_fn.assert_called_once_with(
+            switcher_cls.return_value, "/tmp/x", account="2"
+        )
+
+    def test_import_dispatch_calls_transfer(self):
+        """--import dispatches into transfer.import_accounts."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.import_accounts") as import_fn, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "--import", "/tmp/x", "--force"]
+             ), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "/tmp/x", force=True
+        )
+
 
 class TestCLICommands:
     """Test individual CLI commands."""

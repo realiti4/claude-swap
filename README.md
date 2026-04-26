@@ -60,6 +60,20 @@ cswap --switch-to user@example.com
 
 **Note:** Restart Claude Code (or close and reopen the VS Code extension tab) after switching for the new account to take effect.
 
+### Export and import accounts
+
+Move account data between machines or back it up:
+
+```bash
+cswap --export backup.cswap                  # All accounts to a file
+cswap --export backup.cswap --account 2      # One account
+cswap --export -                             # To stdout (pipeable)
+cswap --import backup.cswap                  # Skips accounts that already exist
+cswap --import backup.cswap --force          # Overwrite existing
+```
+
+The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap --export - | gpg -c > backup.gpg`).
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:

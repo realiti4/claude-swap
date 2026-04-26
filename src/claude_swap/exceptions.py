@@ -53,3 +53,9 @@ class ValidationError(ClaudeSwitchError):
     """Validation error."""
 
     pass
+
+
+class TransferError(ClaudeSwitchError):
+    """Error during account export or import."""
+
+    pass
