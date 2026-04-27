@@ -1127,6 +1127,48 @@ class ClaudeAccountSwitcher:
 
             current_email, _ = current_identity
 
+            # Same-account reload path: current and target are the same account
+            # (identified by slot number and email). This happens in multi-container
+            # setups where one container refreshes the shared backup via
+            # --add-account and another container wants to pull the update via
+            # --switch-to. The normal flow would overwrite the just-refreshed backup
+            # with the local container's stale credentials before reading it back,
+            # losing the update. Skip the backup write and reload directly.
+            if current_account == target_account and current_email == target_email:
+                target_creds = self._read_account_credentials(
+                    target_account, target_email
+                )
+                target_config = self._read_account_config(target_account, target_email)
+
+                if not target_creds or not target_config:
+                    raise SwitchError(
+                        f"Missing backup data for Account-{target_account}"
+                    )
+
+                self._write_credentials(target_creds)
+                try:
+                    target_config_data = json.loads(target_config)
+                except json.JSONDecodeError as exc:
+                    raise SwitchError(f"Invalid backup config: {exc}")
+                oauth_section = target_config_data.get("oauthAccount")
+                if not oauth_section:
+                    raise SwitchError("Invalid oauthAccount in backup")
+                current_config_data = self._read_json(config_path) or {}
+                current_config_data["oauthAccount"] = oauth_section
+                self._write_json(config_path, current_config_data)
+
+                data["activeAccountNumber"] = int(target_account)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                self._logger.info(f"Reloaded account {target_account} from backup")
+                print(
+                    f"{accent('Reloaded')} Account-{target_account} ({target_email})"
+                )
+                print()
+                warning("Please restart Claude Code to use the new authentication.")
+                print()
+                return
+
             # Create transaction for rollback capability
             try:
                 original_creds = self._read_credentials()
