@@ -98,7 +98,7 @@ cswap --purge                   # Remove all claude-swap data
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux | File-based (`~/.claude-swap-backup/credentials/`) | `~/.claude-swap-backup/` |
 
-## Export and import accounts
+## Backup and migration
 
 Move account data between machines or back it up:
 
