@@ -6,7 +6,9 @@ import json
 import time
 from pathlib import Path
 
-CACHE_DIR = Path.home() / ".claude-swap-backup" / "cache"
+from claude_swap.paths import get_backup_root
+
+CACHE_DIR = get_backup_root() / "cache"
 
 MISSING = object()
 

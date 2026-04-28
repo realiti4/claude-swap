@@ -17,6 +17,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap.paths import get_backup_root
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -870,8 +871,8 @@ class TestAccountExistsCompositeKey:
     def test_distinguishes_org_and_personal(self, temp_home, mock_credentials_file):
         """Accounts with same email but different organizationUuid should be treated as distinct."""
         from claude_swap.switcher import ClaudeAccountSwitcher
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps({
             "activeAccountNumber": 1,
             "lastUpdated": "2024-01-01T00:00:00Z",
@@ -950,7 +951,7 @@ class TestAddAccountOrgFields:
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
-        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
         assert len(seq["accounts"]) == 2
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid-A"
         assert seq["accounts"]["2"]["organizationUuid"] == ""
@@ -985,7 +986,7 @@ class TestAddAccountOrgFields:
             switcher.add_account()
         assert "Updated credentials" in f.getvalue()
 
-        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
         assert len(seq["accounts"]) == 1
 
     def test_stores_org_name_in_sequence(self, temp_home):
@@ -1007,7 +1008,7 @@ class TestAddAccountOrgFields:
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
-        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
         assert seq["accounts"]["1"]["organizationName"] == "My Org"
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid"
 
@@ -1018,8 +1019,8 @@ class TestResolveIdentifierAmbiguity:
     def test_by_number_always_works(self, temp_home, sample_sequence_data_with_org):
         """Account number identifier should always resolve correctly."""
         from claude_swap.switcher import ClaudeAccountSwitcher
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
         switcher = ClaudeAccountSwitcher()
         assert switcher._resolve_account_identifier("1") == "1"
@@ -1029,8 +1030,8 @@ class TestResolveIdentifierAmbiguity:
         """Should raise ConfigError when email matches multiple accounts."""
         from claude_swap.switcher import ClaudeAccountSwitcher
         from claude_swap.exceptions import ConfigError
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
         switcher = ClaudeAccountSwitcher()
         with pytest.raises(ConfigError, match="ambiguous"):
@@ -1039,8 +1040,8 @@ class TestResolveIdentifierAmbiguity:
     def test_unique_email_still_works(self, temp_home, sample_sequence_data):
         """Unique email should still resolve to the correct account number."""
         from claude_swap.switcher import ClaudeAccountSwitcher
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
         switcher = ClaudeAccountSwitcher()
         assert switcher._resolve_account_identifier("account1@example.com") == "1"
@@ -1055,8 +1056,8 @@ class TestListAccountsOrgDisplay:
         from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
 
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
 
         config_path = temp_home / ".claude.json"
@@ -1084,8 +1085,8 @@ class TestListAccountsOrgDisplay:
         from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
 
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
 
         config_path = temp_home / ".claude.json"
@@ -1114,8 +1115,8 @@ class TestBackwardCompatibility:
         from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
 
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
 
         config_path = temp_home / ".claude.json"
@@ -1139,8 +1140,8 @@ class TestBackwardCompatibility:
         """status should display personal for old sequence.json entries."""
         from claude_swap.switcher import ClaudeAccountSwitcher
 
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir()
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
 
         config_path = temp_home / ".claude.json"
@@ -1164,8 +1165,8 @@ class TestUpgradeMigration:
 
     def _setup_pre_v06(self, temp_home, sequence_data, live_config):
         """Helper to set up pre-v0.6.0 state with a live config."""
-        backup_dir = temp_home / ".claude-swap-backup"
-        backup_dir.mkdir(exist_ok=True)
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sequence_data))
 
         config_path = temp_home / ".claude.json"
@@ -1293,7 +1294,7 @@ class TestUpgradeMigration:
         )
 
         switcher = ClaudeAccountSwitcher()
-        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir = get_backup_root()
         creds_dir = backup_dir / "credentials"
         creds_dir.mkdir(exist_ok=True)
         import base64
@@ -1509,3 +1510,85 @@ class TestAddAccountSlot:
 
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
+
+
+class TestPurgeLegacyCleanup:
+    """``purge`` must remove a stale legacy directory if it ever reappears.
+
+    Migration normally consumes the legacy path on init, but a partial
+    pre-migration state or external recreation could leave it behind.
+    Purge is the user's last-resort "remove everything" hammer, so it must
+    cover that case explicitly.
+    """
+
+    def _ensure_linux_layout(self, monkeypatch):
+        # Tests must observe the post-migration two-path world. On macOS in
+        # CI the backup root and the legacy root are the same directory, so
+        # there's nothing distinct to clean — pin to LINUX semantics.
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+
+    def _make_switcher_then_recreate_legacy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[ClaudeAccountSwitcher, Path, Path]:
+        """Construct a switcher with no legacy present, then recreate it.
+
+        Mirrors the realistic state where migration completed (or never had
+        anything to migrate) and a stale legacy directory subsequently
+        reappeared — e.g. a user manually backing up to the old path, or a
+        third-party tool restoring a snapshot.
+        """
+        from claude_swap.paths import get_backup_root, get_legacy_backup_root
+
+        self._ensure_linux_layout(monkeypatch)
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Instantiate while legacy is absent → init succeeds.
+        switcher = ClaudeAccountSwitcher()
+
+        # Now legacy reappears after init.
+        legacy = get_legacy_backup_root()
+        legacy.mkdir(parents=True, exist_ok=True)
+        return switcher, backup_dir, legacy
+
+    def test_purge_removes_stale_legacy_directory(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        switcher, backup_dir, legacy = self._make_switcher_then_recreate_legacy(monkeypatch)
+        (legacy / "ghost.txt").write_text("should be removed")
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not legacy.exists()
+        assert not backup_dir.exists()
+
+    def test_purge_prompt_lists_legacy_when_present(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        switcher, backup_dir, legacy = self._make_switcher_then_recreate_legacy(monkeypatch)
+
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert str(backup_dir) in out
+        assert str(legacy) in out
+
+    def test_purge_prompt_omits_legacy_when_absent(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        from claude_swap.paths import get_backup_root, get_legacy_backup_root
+
+        self._ensure_linux_layout(monkeypatch)
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        legacy = get_legacy_backup_root()
+        assert not legacy.exists()
+
+        switcher = ClaudeAccountSwitcher()
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert "Legacy backup directory" not in out

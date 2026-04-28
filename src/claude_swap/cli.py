@@ -135,16 +135,19 @@ Examples:
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
 
-    # Initialize switcher with debug mode
-    switcher = ClaudeAccountSwitcher(debug=args.debug)
-
-    # Check for root (unless in container) - POSIX only
-    if sys.platform != "win32":
-        if os.geteuid() == 0 and not switcher._is_running_in_container():
-            error("Error: Do not run this script as root (unless running in a container)")
-            sys.exit(1)
-
+    # Initialize switcher and dispatch under a single error handler so
+    # init-time failures (e.g. MigrationError on a backup-dir collision)
+    # are presented like every other ClaudeSwitchError: clean stderr line,
+    # exit 1, no traceback.
     try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+
+        # Check for root (unless in container) - POSIX only
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
         if args.add_account:
             switcher.add_account(slot=args.slot)
         elif args.remove_account:
