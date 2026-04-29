@@ -70,6 +70,22 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
+### Add an account from a raw OAuth token
+
+If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
+and you don't want to log in via the browser flow first — useful on headless
+servers or when receiving a token from another machine — register it directly:
+
+```bash
+cswap --add-token sk-ant-oat01-... --email user@example.com
+cswap --add-token sk-ant-oat01-... --email user@example.com --slot 3
+cswap --add-token - --email user@example.com           # read token from stdin
+cswap --add-token --email user@example.com             # prompt securely (no echo)
+```
+
+`--email` is required so cswap's metadata stays aligned with the rest of the
+accounts. No Anthropic API calls are made.
+
 ### Other commands
 
 ```bash

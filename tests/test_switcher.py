@@ -1509,3 +1509,131 @@ class TestAddAccountSlot:
 
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
+
+
+class TestAddAccountFromToken:
+    """Tests for add_account_from_token (--add-token flow)."""
+
+    def _make_switcher(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    def test_basic_add_stores_account(self, temp_home, capsys):
+        """A valid token + email should store the account and print 'Added'."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials") as mock_creds, \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("sk-ant-oat01-abc", "user@example.com")
+
+        data = switcher._get_sequence_data()
+        assert "1" in data["accounts"]
+        assert data["accounts"]["1"]["email"] == "user@example.com"
+        assert 1 in data["sequence"]
+        out = capsys.readouterr().out
+        assert "Added" in out
+        assert "user@example.com" in out
+
+    def test_credentials_blob_format(self, temp_home):
+        """Stored credentials must wrap the token in claudeAiOauth.accessToken."""
+        switcher = self._make_switcher(temp_home)
+        stored_creds = None
+
+        def capture_creds(num, email, creds):
+            nonlocal stored_creds
+            stored_creds = creds
+
+        with patch.object(switcher, "_write_account_credentials", side_effect=capture_creds), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("mytoken", "user@example.com")
+
+        blob = json.loads(stored_creds)
+        assert blob["claudeAiOauth"]["accessToken"] == "mytoken"
+
+    def test_config_blob_contains_email(self, temp_home):
+        """Stored config must contain oauthAccount.emailAddress."""
+        switcher = self._make_switcher(temp_home)
+        stored_config = None
+
+        def capture_config(num, email, cfg):
+            nonlocal stored_config
+            stored_config = cfg
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config", side_effect=capture_config):
+            switcher.add_account_from_token("mytoken", "user@example.com")
+
+        cfg = json.loads(stored_config)
+        assert cfg["oauthAccount"]["emailAddress"] == "user@example.com"
+
+    def test_explicit_slot(self, temp_home):
+        """--slot should place the account in the specified slot."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", "user@example.com", slot=7)
+
+        data = switcher._get_sequence_data()
+        assert "7" in data["accounts"]
+        assert "1" not in data["accounts"]
+        assert 7 in data["sequence"]
+
+    def test_update_in_place_same_email(self, temp_home, capsys):
+        """Calling add_account_from_token again for the same email refreshes in place."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "user@example.com")
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", "user@example.com")
+
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 1
+        out = capsys.readouterr().out
+        assert "Updated token" in out
+
+    def test_invalid_email_raises(self, temp_home):
+        """A malformed email should raise ValidationError."""
+        switcher = self._make_switcher(temp_home)
+        with pytest.raises(ValidationError, match="Invalid email"):
+            switcher.add_account_from_token("tok", "not-an-email")
+
+    def test_empty_token_raises(self, temp_home):
+        """An empty token string should raise ValidationError."""
+        switcher = self._make_switcher(temp_home)
+        with pytest.raises(ValidationError, match="empty"):
+            switcher.add_account_from_token("   ", "user@example.com")
+
+    def test_stdin_token(self, temp_home, capsys):
+        """Token='-' should read from stdin."""
+        switcher = self._make_switcher(temp_home)
+        import io
+        fake_stdin = io.StringIO("stdin-token\n")
+        with patch("sys.stdin", fake_stdin), \
+             patch.object(switcher, "_write_account_credentials") as mock_creds, \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("-", "user@example.com")
+
+        stored = mock_creds.call_args[0][2]
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "stdin-token"
+
+    def test_slot_zero_raises(self, temp_home):
+        """Slot 0 should raise ConfigError."""
+        switcher = self._make_switcher(temp_home)
+        with pytest.raises(ConfigError, match=">= 1"):
+            switcher.add_account_from_token("tok", "user@example.com", slot=0)
+
+    def test_sequence_sorted_after_add(self, temp_home):
+        """Sequence must remain sorted when using an explicit slot."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", "a@example.com", slot=5)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", "b@example.com", slot=2)
+
+        data = switcher._get_sequence_data()
+        assert data["sequence"] == [2, 5]

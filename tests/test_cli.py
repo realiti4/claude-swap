@@ -108,13 +108,13 @@ class TestCLI:
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
-        """--slot should only be accepted alongside --add-account."""
+        """--slot should only be accepted alongside --add-account or --add-token."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
 
         assert excinfo.value.code == 2
-        assert "--slot can only be used with --add-account" in capsys.readouterr().err
+        assert "--slot can only be used with --add-account or --add-token" in capsys.readouterr().err
 
     def test_slot_flag_in_help(self):
         """--slot should appear in help output."""
@@ -249,3 +249,54 @@ class TestCLICommands:
             env=_subprocess_env(HOME=str(temp_home)),
         )
         assert "No accounts" in result.stdout or "managed" in result.stdout.lower()
+
+    def test_add_token_requires_email(self, capsys):
+        """--add-token without --email should exit with an error."""
+        with patch.object(sys, "argv", ["claude-swap", "--add-token", "sk-ant-oat01-abc"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--email is required with --add-token" in capsys.readouterr().err
+
+    def test_add_token_dispatches_to_switcher(self, temp_home: Path, capsys):
+        """--add-token with --email should call add_account_from_token."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv",
+            ["claude-swap", "--add-token", "mytoken", "--email", "u@example.com"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(
+            token="mytoken", email="u@example.com", slot=None
+        )
+
+    def test_add_token_with_slot(self, temp_home: Path, capsys):
+        """--add-token --slot should forward slot to add_account_from_token."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv",
+            ["claude-swap", "--add-token", "tok", "--email", "u@example.com", "--slot", "3"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(
+            token="tok", email="u@example.com", slot=3
+        )
+
+    def test_add_token_in_help(self):
+        """--add-token should appear in help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "--add-token" in result.stdout
+        assert "--email" in result.stdout
