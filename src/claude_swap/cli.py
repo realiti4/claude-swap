@@ -29,6 +29,7 @@ Examples:
   %(prog)s --purge
   %(prog)s --export backup.cswap
   %(prog)s --import backup.cswap
+  %(prog)s --tui                              # interactive arrow-key menu
         """,
     )
 
@@ -117,6 +118,11 @@ Examples:
         metavar="PATH",
         help="Import accounts from file (use '-' for stdin)",
     )
+    group.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch interactive arrow-key menu (single-level)",
+    )
 
     args = parser.parse_args()
 
@@ -172,6 +178,16 @@ Examples:
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.tui:
+            try:
+                from claude_swap.tui import run as tui_run
+            except ImportError as e:
+                error(
+                    "TUI mode requires the 'curses' module. "
+                    "On Windows, install with: pip install windows-curses"
+                )
+                sys.exit(1)
+            sys.exit(tui_run(switcher))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
