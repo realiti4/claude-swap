@@ -14,6 +14,9 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 
 def main() -> None:
     """Main entry point for the CLI."""
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
