@@ -258,10 +258,11 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         """Read account credentials from backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On Linux/WSL/Windows: Uses file-based storage (Claude Code stores creds in a file
+        on these platforms, so the credential blob can exceed WCM's 2560-byte limit).
+        On macOS: Uses system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             if cred_file.exists():
                 try:
@@ -272,7 +273,7 @@ class ClaudeAccountSwitcher:
                     return ""
             return ""
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for macOS
             username = f"account-{account_num}-{email}"
             try:
                 creds = keyring.get_password(KEYRING_SERVICE, username)
@@ -286,20 +287,22 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account credentials to backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        On Linux/WSL/Windows: Uses file-based storage (Claude Code stores creds in a file
+        on these platforms, so the credential blob can exceed WCM's 2560-byte limit).
+        On macOS: Uses system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
                 cred_file.write_text(encoded, encoding="utf-8")
-                os.chmod(cred_file, 0o600)
+                if self.platform != Platform.WINDOWS:
+                    os.chmod(cred_file, 0o600)
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials file: {e}")
                 raise
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for macOS
             username = f"account-{account_num}-{email}"
             try:
                 keyring.set_password(KEYRING_SERVICE, username, credentials)
@@ -310,10 +313,10 @@ class ClaudeAccountSwitcher:
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
 
-        On Linux/WSL: Deletes file-based credential storage.
-        On macOS/Windows: Removes from system keyring.
+        On Linux/WSL/Windows: Deletes file-based credential storage.
+        On macOS: Removes from system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 if cred_file.exists():
@@ -321,7 +324,7 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.warning(f"Failed to delete credentials file: {e}")
         else:
-            # Use keyring for macOS/Windows
+            # Use keyring for macOS
             username = f"account-{account_num}-{email}"
             try:
                 keyring.delete_password(KEYRING_SERVICE, username)
