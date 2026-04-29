@@ -44,9 +44,12 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.paths import (
+    get_backup_root,
     get_claude_config_home,
     get_credentials_path,
     get_global_config_path,
+    get_legacy_backup_root,
+    migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
 
@@ -62,12 +65,25 @@ class ClaudeAccountSwitcher:
 
     def __init__(self, debug: bool = False):
         self.home = Path.home()
-        self.backup_dir = self.home / ".claude-swap-backup"
+        self.platform = Platform.detect()
+        self.backup_dir = get_backup_root()
+
+        # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
+        # before any logger or directory setup writes to the new location.
+        # Migration is a no-op on macOS/Windows where backup_dir already
+        # equals the legacy path. MigrationError on a genuine collision
+        # propagates as a ClaudeSwitchError and is caught by the CLI.
+        if migrate_legacy_backup_dir(self.backup_dir):
+            legacy = get_legacy_backup_root()
+            print(
+                f"claude-swap: migrated data from {legacy} to {self.backup_dir}",
+                file=sys.stderr,
+            )
+
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
-        self.platform = Platform.detect()
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
     def _is_running_in_container(self) -> bool:
@@ -1230,10 +1246,17 @@ class ClaudeAccountSwitcher:
 
         This removes:
         - All stored account credentials (files on Linux, keyring on macOS/Windows)
-        - The ~/.claude-swap-backup directory and all its contents
+        - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
+        - Any stale legacy ~/.claude-swap-backup directory left around from
+          before the XDG migration
         """
+        legacy = get_legacy_backup_root()
+        legacy_distinct = legacy != self.backup_dir
+
         warning("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
+        if legacy_distinct and legacy.exists():
+            print(f"  - Legacy backup directory: {legacy}")
         if self.platform in (Platform.LINUX, Platform.WSL):
             print("  - All stored account credential files")
         else:
@@ -1285,6 +1308,15 @@ class ClaudeAccountSwitcher:
 
             shutil.rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")
+
+        # Also clean a stale legacy directory if it somehow still exists
+        # (e.g. a partial pre-migration state, or files re-created after init).
+        if legacy_distinct and legacy.exists():
+            try:
+                shutil.rmtree(legacy)
+                removed_items.append(f"Legacy directory: {legacy}")
+            except OSError:
+                pass
 
         if removed_items:
             print(f"\n{accent('Removed:')}")

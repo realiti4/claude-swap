@@ -59,3 +59,9 @@ class TransferError(ClaudeSwitchError):
     """Error during account export or import."""
 
     pass
+
+
+class MigrationError(ClaudeSwitchError):
+    """Error migrating the backup directory between layouts (e.g. legacy → XDG)."""
+
+    pass
