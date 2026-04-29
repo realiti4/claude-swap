@@ -20,6 +20,9 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s --add-account
+  %(prog)s --add-token --email user@example.com
+  %(prog)s --add-token sk-ant-oat01-... --email user@example.com --slot 3
+  %(prog)s --add-token - --email user@example.com
   %(prog)s --list
   %(prog)s --switch
   %(prog)s --switch-to 2
@@ -52,7 +55,12 @@ Examples:
         "--slot",
         type=int,
         metavar="NUM",
-        help="Specify slot number when adding account (use with --add-account)",
+        help="Specify slot number when adding account (use with --add-account or --add-token)",
+    )
+    parser.add_argument(
+        "--email",
+        metavar="EMAIL",
+        help="Email address for the account (required with --add-token)",
     )
     parser.add_argument(
         "--account",
@@ -117,14 +125,28 @@ Examples:
         metavar="PATH",
         help="Import accounts from file (use '-' for stdin)",
     )
+    group.add_argument(
+        "--add-token",
+        metavar="TOKEN|-",
+        nargs="?",
+        const="",
+        help=(
+            "Register a raw OAuth setup-token as a new account. "
+            "Pass '-' to read from stdin or omit the value to be prompted securely. "
+            "Requires --email."
+        ),
+    )
 
     args = parser.parse_args()
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
 
-    if args.slot is not None and not args.add_account:
-        parser.error("--slot can only be used with --add-account")
+    if args.slot is not None and not (args.add_account or args.add_token is not None):
+        parser.error("--slot can only be used with --add-account or --add-token")
+
+    if args.add_token is not None and not args.email:
+        parser.error("--email is required with --add-token")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")
@@ -147,6 +169,12 @@ Examples:
     try:
         if args.add_account:
             switcher.add_account(slot=args.slot)
+        elif args.add_token is not None:
+            switcher.add_account_from_token(
+                token=args.add_token,
+                email=args.email,
+                slot=args.slot,
+            )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:

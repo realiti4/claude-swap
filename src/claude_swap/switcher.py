@@ -698,6 +698,166 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
+    def add_account_from_token(
+        self, token: str, email: str, slot: int | None = None
+    ) -> None:
+        """Register a raw OAuth setup-token as a new account.
+
+        Useful for headless servers or when the token is received from another
+        machine, without needing a prior Claude Code login on this machine.
+        No Anthropic API calls are made; ``email`` is taken as-is from the flag.
+
+        Args:
+            token: Raw OAuth access token, or ``"-"`` to read one line from
+                   stdin, or ``""`` to prompt securely via getpass.
+            email: Email address to associate with the account (required).
+            slot:  Slot number to use; auto-assigned when ``None``.
+        """
+        import getpass
+
+        if token == "-":
+            token = sys.stdin.readline().rstrip("\n")
+        elif not token:
+            token = getpass.getpass("Setup token: ")
+
+        token = token.strip()
+        if not token:
+            raise ValidationError("Token cannot be empty")
+
+        if not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        # If the account already exists (same email, personal), refresh in place.
+        if slot is None and self._account_exists(email, ""):
+            seq = self._get_sequence_data()
+            account_num = next(
+                (num for num, acc in seq.get("accounts", {}).items()
+                 if acc.get("email") == email
+                 and acc.get("organizationUuid", "") == ""),
+                None,
+            )
+            credentials = json.dumps({"claudeAiOauth": {"accessToken": token}})
+            config = json.dumps({
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            })
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config)
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
+            self._logger.info(f"Updated token for account {account_num}: {email}")
+            print(
+                f"{accent('Updated token')} for Account {account_num} "
+                f"({email} {muted('[personal]')})."
+            )
+            return
+
+        displace_slot = None
+        migrate_from = None
+
+        if slot is not None:
+            if slot < 1:
+                raise ConfigError("Slot number must be >= 1")
+            account_num = str(slot)
+            data = self._get_sequence_data()
+
+            if self._account_exists(email, ""):
+                old_num = next(
+                    (num for num, acc in data.get("accounts", {}).items()
+                     if acc.get("email") == email
+                     and acc.get("organizationUuid", "") == ""),
+                    None,
+                )
+                if old_num and old_num != account_num:
+                    migrate_from = old_num
+
+            if account_num in data.get("accounts", {}):
+                existing = data["accounts"][account_num]
+                existing_email = existing.get("email", "unknown")
+                is_same = (
+                    existing_email == email
+                    and existing.get("organizationUuid", "") == ""
+                )
+                if not is_same:
+                    existing_tag = self._get_display_tag(
+                        existing_email,
+                        existing.get("organizationName", ""),
+                        existing.get("organizationUuid", ""),
+                    )
+                    warning(f"Slot {slot} already occupied")
+                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    try:
+                        answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{dimmed('Cancelled')}")
+                        return
+                    if answer not in ("y", "yes"):
+                        print(dimmed("Cancelled"))
+                        return
+                    displace_slot = (account_num, existing_email)
+        else:
+            account_num = str(self._get_next_account_number())
+
+        credentials = json.dumps({"claudeAiOauth": {"accessToken": token}})
+        config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+
+        if displace_slot:
+            d_num, d_email = displace_slot
+            self._delete_account_files(d_num, d_email)
+            data = self._get_sequence_data()
+            if int(d_num) in data["sequence"]:
+                data["sequence"].remove(int(d_num))
+            del data["accounts"][d_num]
+            self._write_json(self.sequence_file, data)
+
+        if migrate_from:
+            data = self._get_sequence_data()
+            old_email = data["accounts"][migrate_from].get("email", "")
+            self._delete_account_files(migrate_from, old_email)
+            if int(migrate_from) in data["sequence"]:
+                data["sequence"].remove(int(migrate_from))
+            del data["accounts"][migrate_from]
+            self._write_json(self.sequence_file, data)
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+
+        self._write_account_credentials(account_num, email, credentials)
+        self._write_account_config(account_num, email, config)
+
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": email,
+            "uuid": "",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": get_timestamp(),
+        }
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Added account {account_num} from token: {email}")
+        print(
+            f"{accent('Added')} Account {account_num}: {email} "
+            f"{muted('[personal]')} {muted('(from token)')}"
+        )
+
     def remove_account(self, identifier: str) -> None:
         """Remove account from managed accounts."""
         if not self.sequence_file.exists():
