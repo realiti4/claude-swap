@@ -119,19 +119,19 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
         flag.unlink(missing_ok=True)
         return False
 
-    if flag.exists():
-        # Prior run was interrupted before completion. Discard any
-        # (potentially partial) target and retry the move from legacy.
-        if target.exists():
-            shutil.rmtree(target)
-    elif target.exists():
-        raise MigrationError(
-            f"Both legacy ({legacy}) and new ({target}) backup paths exist. "
-            f"Refusing to merge or overwrite — inspect both and remove the "
-            f"stale one manually before re-running."
-        )
-
     try:
+        if flag.exists():
+            # Prior run was interrupted before completion. Discard any
+            # (potentially partial) target and retry the move from legacy.
+            if target.exists():
+                shutil.rmtree(target)
+        elif target.exists():
+            raise MigrationError(
+                f"Both legacy ({legacy}) and new ({target}) backup paths exist. "
+                f"Refusing to merge or overwrite — inspect both and remove the "
+                f"stale one manually before re-running."
+            )
+
         target.parent.mkdir(parents=True, exist_ok=True)
         flag.touch()
         shutil.move(legacy, target)
