@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap.update_check import CACHE_TTL, _detect_install_method, check_for_update
+from claude_swap.update_check import (
+    CACHE_TTL,
+    _detect_install_method,
+    check_for_update,
+    run_self_upgrade,
+)
 
 
 def _make_pypi_response(version: str) -> MagicMock:
@@ -194,3 +199,53 @@ class TestCheckForUpdateMessage:
         assert "Consider upgrading" in result
         assert "uv tool upgrade" not in result
         assert "pipx upgrade" not in result
+
+
+class TestRunSelfUpgrade:
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+
+        assert run_self_upgrade() == 0
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "upgrade", "claude-swap"], check=False
+        )
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
+    def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+
+        assert run_self_upgrade() == 0
+        mock_run.assert_called_once_with(
+            ["pipx", "upgrade", "claude-swap"], check=False
+        )
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_propagates_nonzero_exit_code(self, mock_detect, mock_run):
+        mock_run.return_value = MagicMock(returncode=2)
+
+        assert run_self_upgrade() == 2
+
+    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check._detect_install_method", return_value=None)
+    def test_unknown_method_returns_1_and_prints_instructions(
+        self, mock_detect, mock_run, capsys
+    ):
+        assert run_self_upgrade() == 1
+        mock_run.assert_not_called()
+        err = capsys.readouterr().err
+        assert "uv tool upgrade claude-swap" in err
+        assert "pipx upgrade claude-swap" in err
+        assert "pip install --upgrade claude-swap" in err
+
+    @patch(
+        "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
+    )
+    @patch("claude_swap.update_check._detect_install_method", return_value="uv")
+    def test_filenotfound_returns_1(self, mock_detect, mock_run, capsys):
+        assert run_self_upgrade() == 1
+        err = capsys.readouterr().err
+        assert "PATH" in err

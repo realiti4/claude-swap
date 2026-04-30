@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -76,3 +77,40 @@ def check_for_update(current_version: str) -> str | None:
         return None
     except Exception:
         return None
+
+
+def run_self_upgrade() -> int:
+    """Run the appropriate upgrade command for the current install method.
+
+    Returns the subprocess exit code, or 1 if detection failed or the package
+    manager is missing from PATH.
+    """
+    from claude_swap.printer import error
+
+    method = _detect_install_method()
+    commands = {
+        "uv": ["uv", "tool", "upgrade", "claude-swap"],
+        "pipx": ["pipx", "upgrade", "claude-swap"],
+    }
+    cmd = commands.get(method or "")
+    if cmd is None:
+        error(
+            "Could not detect install method (looked for uv tool / pipx).\n"
+            f"  sys.prefix:     {sys.prefix}\n"
+            f"  sys.executable: {sys.executable}\n"
+            "To upgrade manually, run one of:\n"
+            "  uv tool upgrade claude-swap\n"
+            "  pipx upgrade claude-swap\n"
+            f"  {sys.executable} -m pip install --upgrade claude-swap\n"
+            "If you installed with `pip install -e .`, use `git pull` instead."
+        )
+        return 1
+    try:
+        result = subprocess.run(cmd, check=False)
+        return result.returncode
+    except FileNotFoundError:
+        error(
+            f"Detected {method} install but `{cmd[0]}` is not on PATH. "
+            "Run the upgrade manually from a shell where it is available."
+        )
+        return 1

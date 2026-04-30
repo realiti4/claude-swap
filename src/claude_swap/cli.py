@@ -30,6 +30,7 @@ Examples:
   %(prog)s --export backup.cswap
   %(prog)s --import backup.cswap
   %(prog)s --tui                              # interactive arrow-key menu
+  %(prog)s --upgrade                          # self-upgrade to latest version
         """,
     )
 
@@ -123,6 +124,11 @@ Examples:
         action="store_true",
         help="Launch interactive arrow-key menu (single-level)",
     )
+    group.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Upgrade claude-swap to the latest version on PyPI",
+    )
 
     args = parser.parse_args()
 
@@ -140,6 +146,17 @@ Examples:
 
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
+
+    # Self-upgrade runs before switcher init so we don't touch config/keychain
+    # just to upgrade the tool itself.
+    if args.upgrade:
+        from claude_swap.update_check import run_self_upgrade
+
+        try:
+            sys.exit(run_self_upgrade())
+        except KeyboardInterrupt:
+            print(f"\n{dimmed('Upgrade cancelled')}")
+            sys.exit(130)
 
     # Initialize switcher and dispatch under a single error handler so
     # init-time failures (e.g. MigrationError on a backup-dir collision)
@@ -197,8 +214,9 @@ Examples:
 
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
-    # the directory we just deleted.
-    if not args.purge:
+    # the directory we just deleted. Skipped after --upgrade as a safety guard
+    # in case the dispatch is later refactored to fall through.
+    if not args.purge and not args.upgrade:
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)
