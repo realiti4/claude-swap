@@ -195,12 +195,15 @@ Examples:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
 
-    # Passive update notification (never fails)
-    from claude_swap.update_check import check_for_update
+    # Passive update notification (never fails). Skipped after --purge so we
+    # don't immediately recreate <backup_root>/cache/update_check.json inside
+    # the directory we just deleted.
+    if not args.purge:
+        from claude_swap.update_check import check_for_update
 
-    msg = check_for_update(__version__)
-    if msg:
-        print(f"\n{muted(msg)}", file=sys.stderr)
+        msg = check_for_update(__version__)
+        if msg:
+            print(f"\n{muted(msg)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
