@@ -224,6 +224,30 @@ class TestCLI:
             switcher_cls.return_value, "/tmp/x", force=True
         )
 
+    def test_upgrade_in_help(self):
+        """--upgrade should appear in help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "--upgrade" in result.stdout
+
+    def test_upgrade_dispatches_without_constructing_switcher(self):
+        """--upgrade should call run_self_upgrade and skip switcher init."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch(
+                 "claude_swap.update_check.run_self_upgrade", return_value=0
+             ) as upgrade_fn, \
+             patch.object(sys, "argv", ["claude-swap", "--upgrade"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        upgrade_fn.assert_called_once_with()
+        switcher_cls.assert_not_called()
+
 
 class TestCLICommands:
     """Test individual CLI commands."""
