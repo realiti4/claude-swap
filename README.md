@@ -25,6 +25,14 @@ uv sync
 uv run cswap --help
 ```
 
+### Updating
+
+```bash
+uv tool upgrade claude-swap
+# or
+pipx upgrade claude-swap
+```
+
 ## Usage
 
 ### Add your first account
@@ -77,9 +85,6 @@ If you don't want to remember flags, launch the arrow-key menu:
 ```bash
 cswap --tui
 ```
-
-You get a single-level menu (Switch / Add / Remove / Refresh / List / Status / Quit).
-Pure stdlib `curses`, no extra dependencies. On Windows, install `windows-curses`.
 
 ### Other commands
 
