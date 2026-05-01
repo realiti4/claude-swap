@@ -17,7 +17,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, DEFAULT_OAUTH_SCOPES
 
 
 class TestEmailValidation:
@@ -1536,7 +1536,7 @@ class TestAddAccountFromToken:
         assert "user@example.com" in out
 
     def test_credentials_blob_format(self, temp_home):
-        """Stored credentials must wrap the token in claudeAiOauth.accessToken."""
+        """Stored credentials must wrap the token in claudeAiOauth and seed default scopes."""
         switcher = self._make_switcher(temp_home)
         stored_creds = None
 
@@ -1548,8 +1548,9 @@ class TestAddAccountFromToken:
              patch.object(switcher, "_write_account_config"):
             switcher.add_account_from_token("mytoken", "user@example.com")
 
-        blob = json.loads(stored_creds)
-        assert blob["claudeAiOauth"]["accessToken"] == "mytoken"
+        oauth_blob = json.loads(stored_creds)["claudeAiOauth"]
+        assert oauth_blob["accessToken"] == "mytoken"
+        assert oauth_blob["scopes"] == list(DEFAULT_OAUTH_SCOPES)
 
     def test_config_blob_contains_email(self, temp_home):
         """Stored config must contain oauthAccount.emailAddress."""
@@ -1594,6 +1595,27 @@ class TestAddAccountFromToken:
         out = capsys.readouterr().out
         assert "Updated token" in out
 
+    def test_update_in_place_writes_scopes(self, temp_home):
+        """Refreshing an existing account in place must also seed default scopes."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "user@example.com")
+
+        stored_creds = None
+
+        def capture_creds(num, email, creds):
+            nonlocal stored_creds
+            stored_creds = creds
+
+        with patch.object(switcher, "_write_account_credentials", side_effect=capture_creds), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", "user@example.com")
+
+        oauth_blob = json.loads(stored_creds)["claudeAiOauth"]
+        assert oauth_blob["accessToken"] == "token-v2"
+        assert oauth_blob["scopes"] == list(DEFAULT_OAUTH_SCOPES)
+
     def test_invalid_email_raises(self, temp_home):
         """A malformed email should raise ValidationError."""
         switcher = self._make_switcher(temp_home)
@@ -1617,7 +1639,9 @@ class TestAddAccountFromToken:
             switcher.add_account_from_token("-", "user@example.com")
 
         stored = mock_creds.call_args[0][2]
-        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "stdin-token"
+        oauth_blob = json.loads(stored)["claudeAiOauth"]
+        assert oauth_blob["accessToken"] == "stdin-token"
+        assert oauth_blob["scopes"] == list(DEFAULT_OAUTH_SCOPES)
 
     def test_slot_zero_raises(self, temp_home):
         """Slot 0 should raise ConfigError."""

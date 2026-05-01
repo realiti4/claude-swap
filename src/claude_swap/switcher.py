@@ -54,6 +54,16 @@ from claude_swap.process_detection import get_running_instances
 KEYRING_SERVICE = "claude-code"
 KEYRING_ACTIVE_USERNAME = "active-credentials"
 
+# Default OAuth scopes granted by Claude Code login. The refresh flow in
+# oauth.py overwrites this with whatever the server returns, so the value
+# is only used as a sensible default when seeding a credential blob from a
+# raw setup-token (which carries no scope metadata of its own).
+DEFAULT_OAUTH_SCOPES = (
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+)
+
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
 
@@ -740,7 +750,12 @@ class ClaudeAccountSwitcher:
                  and acc.get("organizationUuid", "") == ""),
                 None,
             )
-            credentials = json.dumps({"claudeAiOauth": {"accessToken": token}})
+            credentials = json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": token,
+                    "scopes": list(DEFAULT_OAUTH_SCOPES),
+                }
+            })
             config = json.dumps({
                 "oauthAccount": {
                     "emailAddress": email,
@@ -806,7 +821,12 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        credentials = json.dumps({"claudeAiOauth": {"accessToken": token}})
+        credentials = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": token,
+                "scopes": list(DEFAULT_OAUTH_SCOPES),
+            }
+        })
         config = json.dumps({
             "oauthAccount": {
                 "emailAddress": email,
