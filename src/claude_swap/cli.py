@@ -20,9 +20,10 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s --add-account
-  %(prog)s --add-token --email user@example.com
-  %(prog)s --add-token sk-ant-oat01-... --email user@example.com --slot 3
-  %(prog)s --add-token - --email user@example.com
+  %(prog)s --add-token sk-ant-oat01-...
+  %(prog)s --add-token sk-ant-oat01-... --slot 3
+  %(prog)s --add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s --add-token - --slot 3
   %(prog)s --list
   %(prog)s --switch
   %(prog)s --switch-to 2
@@ -62,7 +63,11 @@ Examples:
     parser.add_argument(
         "--email",
         metavar="EMAIL",
-        help="Email address for the account (required with --add-token)",
+        help=(
+            "Email address for the account. Optional with --add-token; "
+            "defaults to setup-token-{slot}@token.local since setup-tokens "
+            "carry no real email metadata."
+        ),
     )
     parser.add_argument(
         "--account",
@@ -157,8 +162,8 @@ Examples:
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with --add-account or --add-token")
 
-    if args.add_token is not None and not args.email:
-        parser.error("--email is required with --add-token")
+    if args.email is not None and args.add_token is None:
+        parser.error("--email can only be used with --add-token")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")

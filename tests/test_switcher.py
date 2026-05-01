@@ -2052,6 +2052,71 @@ class TestAddAccountFromToken:
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
 
+    def test_default_email_when_omitted(self, temp_home, capsys):
+        """Omitting email should synthesize setup-token-{slot}@token.local."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok")
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "setup-token-1@token.local"
+        out = capsys.readouterr().out
+        assert "setup-token-1@token.local" in out
+
+    def test_default_email_with_explicit_slot(self, temp_home):
+        """Default email should derive from explicit --slot when one is given."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", slot=7)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["7"]["email"] == "setup-token-7@token.local"
+
+    def test_default_email_writes_to_config_blob(self, temp_home):
+        """Defaulted email must propagate into the oauthAccount.emailAddress field."""
+        switcher = self._make_switcher(temp_home)
+        stored_config = None
+
+        def capture_config(num, email, cfg):
+            nonlocal stored_config
+            stored_config = cfg
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config", side_effect=capture_config):
+            switcher.add_account_from_token("tok", slot=3)
+
+        cfg = json.loads(stored_config)
+        assert cfg["oauthAccount"]["emailAddress"] == "setup-token-3@token.local"
+
+    def test_default_email_unique_per_slot(self, temp_home):
+        """Two default-email registrations to different slots must coexist."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok-a", slot=4)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok-b", slot=8)
+
+        data = switcher._get_sequence_data()
+        emails = {data["accounts"][n]["email"] for n in ("4", "8")}
+        assert emails == {
+            "setup-token-4@token.local",
+            "setup-token-8@token.local",
+        }
+
+    def test_explicit_email_not_overridden_by_default(self, temp_home):
+        """Explicit --email must win over the auto-default."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", email="me@example.com", slot=2)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "me@example.com"
+
 
 class TestPurge:
     """Tests for purge cleanup."""

@@ -274,13 +274,28 @@ class TestCLICommands:
         )
         assert "No accounts" in result.stdout or "managed" in result.stdout.lower()
 
-    def test_add_token_requires_email(self, capsys):
-        """--add-token without --email should exit with an error."""
-        with patch.object(sys, "argv", ["claude-swap", "--add-token", "sk-ant-oat01-abc"]):
+    def test_add_token_without_email_dispatches_with_none(self, temp_home: Path, capsys):
+        """--add-token without --email should dispatch with email=None (defaulted by switcher)."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv", ["claude-swap", "--add-token", "sk-ant-oat01-abc"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(
+            token="sk-ant-oat01-abc", email=None, slot=None
+        )
+
+    def test_email_without_add_token_errors(self, capsys):
+        """--email without --add-token should exit with a clear error."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--email", "u@x.com"]):
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
-        assert "--email is required with --add-token" in capsys.readouterr().err
+        assert "--email can only be used with --add-token" in capsys.readouterr().err
 
     def test_add_token_dispatches_to_switcher(self, temp_home: Path, capsys):
         """--add-token with --email should call add_account_from_token."""

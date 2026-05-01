@@ -725,18 +725,20 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
-        self, token: str, email: str, slot: int | None = None
+        self, token: str, email: str | None = None, slot: int | None = None
     ) -> None:
         """Register a raw OAuth setup-token as a new account.
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine.
-        No Anthropic API calls are made; ``email`` is taken as-is from the flag.
+        No Anthropic API calls are made.
 
         Args:
             token: Raw OAuth access token, or ``"-"`` to read one line from
                    stdin, or ``""`` to prompt securely via getpass.
-            email: Email address to associate with the account (required).
+            email: Email address to associate with the account. When omitted,
+                   defaults to ``setup-token-{slot}@token.local`` since
+                   setup-tokens carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
         """
         import getpass
@@ -750,12 +752,20 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        if not self._validate_email(email):
+        if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
 
         self._setup_directories()
         self._init_sequence_file()
         self._migrate_org_fields()
+
+        # Synthesize a placeholder email when one isn't provided. Setup-tokens
+        # have no real email metadata, so requiring users to invent one is
+        # noise; the slot number gives every default account a unique key.
+        if not email:
+            if slot is None:
+                slot = self._get_next_account_number()
+            email = f"setup-token-{slot}@token.local"
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
