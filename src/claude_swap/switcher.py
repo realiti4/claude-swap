@@ -89,6 +89,36 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
+        self._use_file_credentials = self._should_use_file_credentials()
+
+    def _should_use_file_credentials(self) -> bool:
+        """Whether to use file-based credential storage instead of keyring.
+
+        Returns True on Linux/WSL (where file storage is always used) or
+        when the Python keyring resolves to a null/dummy backend that
+        silently discards writes (e.g. PYTHON_KEYRING_BACKEND is set to
+        keyring.backends.null.Keyring).
+        """
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            return True
+        try:
+            from keyring.backends.null import Keyring as NullKeyring
+            backend = keyring.get_keyring()
+            if isinstance(backend, NullKeyring):
+                self._logger.warning(
+                    "Keyring resolved to null backend (PYTHON_KEYRING_BACKEND=%s); "
+                    "using file-based credential storage instead",
+                    os.environ.get("PYTHON_KEYRING_BACKEND", "<unset>"),
+                )
+                return True
+        except Exception:
+            self._logger.warning(
+                "Failed to detect keyring backend; "
+                "using file-based credential storage instead",
+                exc_info=True,
+            )
+            return True
+        return False
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -278,10 +308,10 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         """Read account credentials from backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        Uses file-based storage on Linux/WSL or when the system keyring is
+        unavailable (e.g. null backend). Otherwise uses the system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self._use_file_credentials:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             if cred_file.exists():
                 try:
@@ -306,10 +336,10 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account credentials to backup.
 
-        On Linux/WSL: Uses file-based storage to avoid keyring backend issues.
-        On macOS/Windows: Uses system keyring.
+        Uses file-based storage on Linux/WSL or when the system keyring is
+        unavailable (e.g. null backend). Otherwise uses the system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self._use_file_credentials:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
@@ -330,10 +360,10 @@ class ClaudeAccountSwitcher:
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
 
-        On Linux/WSL: Deletes file-based credential storage.
-        On macOS/Windows: Removes from system keyring.
+        Uses file-based storage on Linux/WSL or when the system keyring is
+        unavailable (e.g. null backend). Otherwise uses the system keyring.
         """
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self._use_file_credentials:
             cred_files = [self.credentials_dir / f".creds-{account_num}-{email}.enc"]
             if str(account_num) != "None":
                 cred_files.append(self.credentials_dir / f".creds-None-{email}.enc")
@@ -1584,7 +1614,7 @@ class ClaudeAccountSwitcher:
         print(f"  - Backup directory: {self.backup_dir}")
         if legacy_distinct and legacy.exists():
             print(f"  - Legacy backup directory: {legacy}")
-        if self.platform in (Platform.LINUX, Platform.WSL):
+        if self._use_file_credentials:
             print("  - All stored account credential files")
         else:
             print("  - All stored account credentials from the system keyring")
@@ -1604,8 +1634,8 @@ class ClaudeAccountSwitcher:
         if data:
             for account_num, account_info in data.get("accounts", {}).items():
                 email = account_info.get("email", "")
-                if self.platform in (Platform.LINUX, Platform.WSL):
-                    # Remove credential files on Linux
+                if self._use_file_credentials:
+                    # Remove credential files
                     cred_files = [
                         self.credentials_dir / f".creds-{account_num}-{email}.enc"
                     ]

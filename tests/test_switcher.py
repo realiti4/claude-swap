@@ -257,6 +257,60 @@ class TestDirectorySetup:
             assert stat.st_mode & 0o777 == 0o700
 
 
+class TestNullKeyringFallback:
+    """Test fallback to file-based credentials when keyring uses null backend."""
+
+    def test_null_backend_triggers_file_storage(self, temp_home: Path):
+        """When keyring resolves to null backend, _use_file_credentials should be True."""
+        from keyring.backends.null import Keyring as NullKeyring
+        null_backend = NullKeyring()
+        with patch("claude_swap.switcher.keyring.get_keyring", return_value=null_backend):
+            switcher = ClaudeAccountSwitcher()
+            assert switcher._use_file_credentials is True
+
+    def test_real_backend_uses_keyring(self, temp_home: Path):
+        """When keyring resolves to a real backend, _use_file_credentials should be False on macOS."""
+        from keyring.backends.macOS import Keyring as MacKeyring
+        real_backend = MacKeyring()
+        with patch.object(Platform, "detect", return_value=Platform.MACOS), \
+             patch("claude_swap.switcher.keyring.get_keyring", return_value=real_backend):
+            switcher = ClaudeAccountSwitcher()
+            assert switcher._use_file_credentials is False
+
+    def test_linux_always_uses_file_storage(self, temp_home: Path):
+        """Linux should always use file storage regardless of keyring backend."""
+        with patch.object(Platform, "detect", return_value=Platform.LINUX):
+            switcher = ClaudeAccountSwitcher()
+            assert switcher._use_file_credentials is True
+
+    def test_null_backend_credentials_roundtrip(self, temp_home: Path):
+        """Credentials written with null keyring fallback should be readable."""
+        from keyring.backends.null import Keyring as NullKeyring
+        null_backend = NullKeyring()
+        with patch("claude_swap.switcher.keyring.get_keyring", return_value=null_backend):
+            switcher = ClaudeAccountSwitcher()
+            switcher._setup_directories()
+
+            test_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+            switcher._write_account_credentials("1", "test@example.com", test_creds)
+            read_back = switcher._read_account_credentials("1", "test@example.com")
+            assert read_back == test_creds
+
+    def test_null_backend_credentials_delete(self, temp_home: Path):
+        """Deleting credentials should work with null keyring fallback."""
+        from keyring.backends.null import Keyring as NullKeyring
+        null_backend = NullKeyring()
+        with patch("claude_swap.switcher.keyring.get_keyring", return_value=null_backend):
+            switcher = ClaudeAccountSwitcher()
+            switcher._setup_directories()
+
+            test_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+            switcher._write_account_credentials("1", "test@example.com", test_creds)
+            switcher._delete_account_credentials("1", "test@example.com")
+            read_back = switcher._read_account_credentials("1", "test@example.com")
+            assert read_back == ""
+
+
 class TestAddAccountRefresh:
     """Test refreshing credentials for an existing account."""
 
@@ -2125,6 +2179,7 @@ class TestPurge:
         """Purge should clean account-None-* keyring entries from older buggy runs."""
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.MACOS
+        switcher._use_file_credentials = False
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, {
             "activeAccountNumber": 1,

@@ -41,6 +41,7 @@ def macos_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     """Switcher with platform forced to MACOS regardless of host OS."""
     switcher = ClaudeAccountSwitcher()
     switcher.platform = Platform.MACOS
+    switcher._use_file_credentials = False
     return switcher
 
 
