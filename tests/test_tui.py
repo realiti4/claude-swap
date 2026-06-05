@@ -299,7 +299,7 @@ class TestDoRemove:
 
 
 class TestCliIntegration:
-    def test_tui_in_help(self):
+    def test_tui_in_help(self, tmp_path):
         import os
         import subprocess
         import sys as _sys
@@ -310,6 +310,13 @@ class TestCliIntegration:
             + os.pathsep
             + env.get("PYTHONPATH", "")
         )
+        # Isolate the child from the developer's real home/config, consistent
+        # with test_cli._subprocess_env. ``--help`` exits in argparse before the
+        # switcher is built, so nothing is touched today — this just keeps the
+        # "no subprocess inherits the real HOME" invariant uniform.
+        env["HOME"] = env["USERPROFILE"] = str(tmp_path)
+        for _var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
+            env.pop(_var, None)
         result = subprocess.run(
             [_sys.executable, "-m", "claude_swap", "--help"],
             capture_output=True, text=True, env=env,

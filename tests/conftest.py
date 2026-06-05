@@ -12,6 +12,35 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_real_home(request, tmp_path_factory, monkeypatch):
+    """Safety net: no test may read or write the developer's real ``$HOME``.
+
+    Some tests (CLI/TUI argument tests that call ``main()``, etc.) construct a real
+    ``ClaudeAccountSwitcher`` without the ``temp_home`` fixture. Without isolation
+    that switcher resolves to the real ``~/.claude-swap-backup`` — running data
+    migrations and reading the real account list (and on macOS, shelling out to
+    ``security`` for the live login). Redirect ``$HOME`` to a throwaway dir unless
+    the test already uses ``temp_home`` (which sets its own). Runs first (autouse).
+
+    Always neutralize ``CLAUDE_CONFIG_DIR`` and ``XDG_DATA_HOME`` (even for
+    ``temp_home`` tests): both bypass ``$HOME`` in path resolution
+    (``paths.get_global_config_path``/``get_backup_root``), so a developer with
+    either exported could otherwise have tests read/write real Claude config or
+    backup paths — and on macOS that leads back to the real Keychain. Tests that
+    exercise those vars set them explicitly, overriding this.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    if "temp_home" in request.fixturenames:
+        return  # temp_home provides its own isolated home
+    safe_home = tmp_path_factory.mktemp("isolated_home")
+    (safe_home / ".claude").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(safe_home))
+    monkeypatch.setenv("USERPROFILE", str(safe_home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: safe_home)
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

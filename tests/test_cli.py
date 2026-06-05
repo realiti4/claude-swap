@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,11 +17,37 @@ from claude_swap import cli
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
+# A throwaway HOME for subprocesses. The in-process autouse HOME guard does NOT
+# reach child processes, so a spawned ``python -m claude_swap`` would otherwise
+# resolve to the developer's real ``~/.claude-swap-backup`` and run the data
+# migration against real accounts (touching the real Keychain on macOS). An empty,
+# isolated HOME has no ``sequence.json`` → the migration skips before any Keychain
+# access, and no ``.claude.json`` → no account to read.
+_ISOLATED_HOME = tempfile.mkdtemp(prefix="cswap-subproc-home-")
+
 
 def _subprocess_env(**extra: str) -> dict[str, str]:
-    """Build env dict with PYTHONPATH pointing at src/."""
+    """Build env dict with PYTHONPATH pointing at src/ and an isolated HOME.
+
+    HOME/USERPROFILE default to a throwaway dir so the spawned CLI never touches
+    the developer's real backup dir or Keychain; callers may still override HOME
+    explicitly (e.g. ``_subprocess_env(HOME=str(temp_home))``), in which case
+    USERPROFILE mirrors it unless the caller set USERPROFILE too.
+    """
     env = {**os.environ, **extra}
     env["PYTHONPATH"] = _SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    if "HOME" not in extra:
+        env["HOME"] = _ISOLATED_HOME
+        env["USERPROFILE"] = _ISOLATED_HOME
+    elif "USERPROFILE" not in extra:
+        env["USERPROFILE"] = extra["HOME"]
+    # CLAUDE_CONFIG_DIR / XDG_DATA_HOME bypass HOME in path resolution, so a
+    # developer with either exported would otherwise point the spawned CLI back
+    # at real config/backup paths (and on macOS, the real Keychain). Drop them
+    # unless a caller set them deliberately.
+    for var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
+        if var not in extra:
+            env.pop(var, None)
     return env
 
 

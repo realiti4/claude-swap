@@ -55,7 +55,6 @@ from claude_swap.process_detection import get_running_instances
 
 # Service name for keyring storage
 KEYRING_SERVICE = "claude-code"
-KEYRING_ACTIVE_USERNAME = "active-credentials"
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
