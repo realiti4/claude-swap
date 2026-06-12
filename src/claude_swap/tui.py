@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import curses
 import sys
+import time
+from datetime import datetime
 from typing import Callable
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -26,6 +28,9 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 # Minimum terminal size we render in. Below this, we bail to plain CLI advice.
 _MIN_ROWS = 12
 _MIN_COLS = 60
+
+# How often the auto-switch (Beta) monitor polls the active account's usage.
+_AUTO_POLL_SECONDS = 60
 
 
 def run(switcher: ClaudeAccountSwitcher) -> int:
@@ -66,6 +71,7 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
             ("Refresh credentials (current login, in-place)", "refresh"),
             ("List accounts (with usage)", "list"),
             ("Status", "status"),
+            ("Auto-switch at limit (Beta)", "auto"),
             ("Quit", "quit"),
         ]
         choice = _select_from(
@@ -90,6 +96,8 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
                 _shell_out(stdscr, lambda: switcher.list_accounts())
             elif choice == "status":
                 _shell_out(stdscr, switcher.status)
+            elif choice == "auto":
+                _do_auto_switch(stdscr, switcher)
         except ClaudeSwitchError as e:
             _show_message(stdscr, f"Error: {e}", is_error=True)
         except KeyboardInterrupt:
@@ -172,6 +180,174 @@ def _do_refresh(stdscr, switcher: ClaudeAccountSwitcher) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-switch (Beta)
+# ---------------------------------------------------------------------------
+
+
+def _should_auto_switch(pct: float | None, threshold: int) -> bool:
+    """Whether the active account's usage warrants an automatic switch."""
+    return pct is not None and pct >= threshold
+
+
+def _do_auto_switch(stdscr, switcher: ClaudeAccountSwitcher) -> None:
+    """Settings + launcher for auto-switch (Beta).
+
+    Lets the user toggle automatic rotation to the next account when the active
+    account's 5h/7d usage reaches a threshold, tune that threshold, and start
+    the foreground monitor. Settings persist in ``sequence.json``.
+
+    No Claude Code restart is needed for the switch to take effect — on
+    Linux/Windows the new credentials are picked up on the next message, and on
+    macOS once the Keychain cache expires.
+    """
+    while True:
+        cfg = switcher.get_auto_switch_config()
+        state = "ON" if cfg["enabled"] else "OFF"
+        subtitle = (
+            f"Beta · currently {state} · threshold {cfg['threshold']}%  ·  "
+            "rotates to the next account at the limit"
+        )
+        items: list[tuple[str, str | None]] = [
+            ("Disable" if cfg["enabled"] else "Enable", "toggle"),
+            (f"Set threshold (now {cfg['threshold']}%)", "threshold"),
+            ("Start monitor now", "start"),
+            ("-- Back --", None),
+        ]
+        choice = _select_from(
+            stdscr,
+            "Auto-switch at limit (Beta)",
+            items=items,
+            subtitle=subtitle,
+        )
+        if choice is None:
+            return
+
+        if choice == "toggle":
+            switcher.set_auto_switch_config(enabled=not cfg["enabled"])
+        elif choice == "threshold":
+            raw = _prompt_text(stdscr, "Switch when usage reaches (%): ")
+            if raw:
+                try:
+                    switcher.set_auto_switch_config(threshold=int(raw))
+                except ValueError:
+                    _show_message(
+                        stdscr, "Threshold must be a whole number.", is_error=True
+                    )
+                except ClaudeSwitchError as e:
+                    _show_message(stdscr, f"Invalid threshold: {e}", is_error=True)
+        elif choice == "start":
+            cfg = switcher.get_auto_switch_config()
+            if not cfg["enabled"]:
+                # Starting the monitor implies enabling the feature.
+                cfg = switcher.set_auto_switch_config(enabled=True)
+            _run_auto_monitor(stdscr, switcher, cfg["threshold"])
+
+
+def _run_auto_monitor(
+    stdscr, switcher: ClaudeAccountSwitcher, threshold: int
+) -> None:
+    """Foreground watcher loop: poll active usage and switch at the threshold.
+
+    Polls every ``_AUTO_POLL_SECONDS`` (press ``s`` to check immediately,
+    ``q``/Esc to stop). When the active account reaches ``threshold``%, it
+    shells out to ``switcher.switch()`` to rotate to the next account, then
+    keeps watching the new active account.
+    """
+    curses.curs_set(0)
+    stdscr.timeout(1000)  # getch() returns -1 after ~1s, driving the countdown
+    last_pct: float | None = None
+    last_checked = "never"
+    message = "Monitoring started."
+    seconds_to_next = 0  # poll immediately on entry
+    try:
+        while True:
+            if seconds_to_next <= 0:
+                last_pct = switcher.get_active_usage_pct()
+                last_checked = datetime.now().strftime("%H:%M:%S")
+                seconds_to_next = _AUTO_POLL_SECONDS
+                if _should_auto_switch(last_pct, threshold):
+                    switched = _auto_perform_switch(stdscr, switcher)
+                    message = (
+                        f"Reached {last_pct:.0f}% — switched account."
+                        if switched
+                        else f"Reached {last_pct:.0f}% — switch failed (see above)."
+                    )
+                    # Re-read the new active account's usage on the next tick.
+                    last_pct = None
+                else:
+                    message = "Monitoring active account."
+
+            _draw_monitor(
+                stdscr, threshold, last_pct, last_checked, seconds_to_next, message
+            )
+            key = stdscr.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return
+            if key in (ord("s"), ord("S")):
+                seconds_to_next = 0
+                continue
+            seconds_to_next -= 1
+    finally:
+        stdscr.timeout(-1)
+
+
+def _auto_perform_switch(stdscr, switcher: ClaudeAccountSwitcher) -> bool:
+    """Suspend curses, run ``switcher.switch()``, then resume. No Enter prompt."""
+    curses.def_prog_mode()
+    curses.endwin()
+    switched = True
+    try:
+        try:
+            switcher.switch()
+        except ClaudeSwitchError as e:
+            print(f"Auto-switch error: {e}")
+            switched = False
+        except KeyboardInterrupt:
+            print("\nOperation cancelled.")
+            switched = False
+        print()
+        time.sleep(2.5)  # brief pause so the output is readable
+    finally:
+        curses.reset_prog_mode()
+        stdscr.refresh()
+    return switched
+
+
+def _draw_monitor(
+    stdscr,
+    threshold: int,
+    pct: float | None,
+    last_checked: str,
+    seconds_to_next: int,
+    message: str,
+) -> None:
+    """Render the auto-switch monitor screen."""
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    _draw_header(
+        stdscr,
+        "Auto-switch monitor (Beta)",
+        f"threshold {threshold}%  ·  polling every {_AUTO_POLL_SECONDS}s",
+        cols,
+    )
+    pct_str = f"{pct:.0f}%" if pct is not None else "unavailable"
+    lines = [
+        f"Active account usage : {pct_str}",
+        f"Last checked         : {last_checked}",
+        f"Next check in        : {max(0, seconds_to_next)}s",
+        "",
+        message,
+    ]
+    for i, line in enumerate(lines):
+        if 4 + i >= rows - 2:
+            break
+        stdscr.addstr(4 + i, 2, line[: cols - 4])
+    footer = "[s] check now  [q/Esc] stop monitor"
+    stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
+    stdscr.refresh()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -187,7 +363,11 @@ def _status_line(switcher: ClaudeAccountSwitcher) -> str:
         email, org = identity
         tag = "personal" if not org else org[:8]
         active = f"{email} [{tag}]"
-    return f"Active: {active}  ·  {n} managed"
+    line = f"Active: {active}  ·  {n} managed"
+    cfg = switcher.get_auto_switch_config()
+    if cfg["enabled"]:
+        line += f"  ·  auto-switch ON ({cfg['threshold']}%)"
+    return line
 
 
 def _account_items(switcher: ClaudeAccountSwitcher) -> list[tuple[str, str]]:
