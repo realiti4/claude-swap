@@ -1555,7 +1555,7 @@ class ClaudeAccountSwitcher:
         return _max_usage_pct(usage)
 
     # ------------------------------------------------------------------ #
-    # Load balancer (Beta) — config, priority, profile seeding
+    # Auto-swap + multi-session load balancer (beta) — config, priority, seeding
     # ------------------------------------------------------------------ #
 
     def get_auto_balance_config(self) -> dict:
@@ -1850,7 +1850,10 @@ class ClaudeAccountSwitcher:
         )
         if paused:
             summary += f" · {paused} paused"
-        print(f"{bolded('Load balancer (Beta):')} {state} {dimmed('· ' + summary)}")
+        print(
+            f"{bolded('Auto-swap + multi-session load balancer (beta):')} "
+            f"{state} {dimmed('· ' + summary)}"
+        )
 
         health = embed.embed_health(self)
         if health["ok"]:
