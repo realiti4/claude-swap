@@ -107,6 +107,16 @@ instead and **auto-resumes** it (via `claude --resume`) the moment the limit
 window resets — your in-flight, dynamic workflow survives the limit instead of
 being thrown away.
 
+By default the balancer is **subscription-only**: it never spends tokens billed at
+pay-as-you-go API rates. When *every* subscription account is exhausted it pauses
+(as above) rather than spilling into extra-usage / an API account. If you'd rather
+keep working than wait for a reset, turn **Only use subscription tokens** off in
+`cswap --balance`: cswap then treats extra-usage–enabled and API/console accounts as
+a **last-resort tier** — consulted only after all subscription headroom is gone, and
+ordered by most monthly extra-usage budget remaining. A session already on an
+extra-usage account stays put (it spills into pay-as-you-go) instead of pausing. It's
+**off by default** so you never get a surprise API bill.
+
 It's fully **event-driven**: the in-session statusline reports usage on each
 message, which is what triggers a rebalance. There's no polling loop and no
 background daemon. It's also credential-safe — each session's supervisor owns its
@@ -159,7 +169,8 @@ cswap --balance                 # settings + live dashboard (enable/disable, tun
 
 The dashboard shows which sessions are on which accounts, live, and is where you
 **enable** the balancer (it's opt-in/off by default), set the threshold and target
-safety, and edit priorities.
+safety, edit priorities, and toggle **Only use subscription tokens** (default on —
+pause rather than bill at API rates).
 
 The live view lists **every** managed account — not just the ones currently in
 use — with, per account:
