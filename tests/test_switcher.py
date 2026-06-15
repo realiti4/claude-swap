@@ -2475,3 +2475,181 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(ConfigError, match="No managed accounts have valid"):
             s.switch()
+
+
+class TestSeedProfileCredentialsAtomic:
+    """BUG 015: profile seeds must be atomic (no truncate+write race)."""
+
+    def _switcher(self):
+        return ClaudeAccountSwitcher()
+
+    def test_seed_writes_both_files_atomically(self, temp_home: Path):
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok", "refreshToken": "ref"})
+        config_json = json.dumps(
+            {"oauthAccount": {"emailAddress": "a@x.com"}, "theme": "light"}
+        )
+        profile_dir = temp_home / "managed" / "m1"
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+
+        creds_path = profile_dir / ".credentials.json"
+        config_path = profile_dir / ".claude.json"
+        # Contents are correct and verbatim for credentials.
+        assert creds_path.read_text(encoding="utf-8") == creds_json
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        assert cfg["oauthAccount"] == {"emailAddress": "a@x.com"}
+        assert cfg["hasCompletedOnboarding"] is True
+        assert cfg["theme"] == "light"
+        # 0600 perms on both (skip the perm check on Windows).
+        if sys.platform != "win32":
+            assert (creds_path.stat().st_mode & 0o777) == 0o600
+            assert (config_path.stat().st_mode & 0o777) == 0o600
+
+    def test_seed_uses_atomic_rename_not_truncating_write(self, temp_home: Path):
+        """The credential write must go through os.replace (a rename), never a
+        plain truncate+write that a live reader could observe mid-write."""
+        sw = self._switcher()
+        profile_dir = temp_home / "managed" / "m2"
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+
+        replaces: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            replaces.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json), \
+             patch("claude_swap.switcher.os.replace", side_effect=spy_replace):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+
+        # .credentials.json was committed via an atomic rename onto its final path.
+        creds_path = str(profile_dir / ".credentials.json")
+        assert any(dst == creds_path for _, dst in replaces)
+        assert (profile_dir / ".credentials.json").exists()
+        # No leftover temp files in the profile dir.
+        assert not list(profile_dir.glob("*.tmp"))
+
+
+class TestRefreshAccountAndReseed:
+    """401 auto-recovery: refresh an account's token + re-seed a managed profile.
+
+    Exercises ``refresh_account_and_reseed`` without real network I/O — the OAuth
+    refresh + expiry helpers are mocked and ``seed_profile_credentials`` is spied.
+    """
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX  # file-backed backup creds (no Keychain)
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed_account(
+        self, s: ClaudeAccountSwitcher, num: int, email: str, *, expires_at: int
+    ) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                    "expiresAt": expires_at,
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        s._write_json(s.sequence_file, data)
+
+    def test_fresh_token_reseeds_without_refreshing(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=False), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials") as refresh, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is True
+        refresh.assert_not_called()  # token already fresh -> no network refresh
+        seed.assert_called_once_with(profile_dir, "1", "a@x.com")
+
+    def test_expired_token_refreshes_persists_and_reseeds(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+        refreshed = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-new",
+                "refreshToken": "rt-new",
+                "expiresAt": 9_999_999_999_000,
+            }
+        })
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=True), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials", return_value=refreshed), \
+             patch.object(s, "_write_account_credentials") as write_creds, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is True
+        # Fresh creds persisted to the canonical backup, then profile re-seeded.
+        write_creds.assert_called_once_with("1", "a@x.com", refreshed)
+        seed.assert_called_once_with(profile_dir, "1", "a@x.com")
+
+    def test_refresh_returns_none_returns_false_no_reseed(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=True), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials", return_value=None), \
+             patch.object(s, "_write_account_credentials") as write_creds, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is False  # refresh token dead -> account logged out
+        write_creds.assert_not_called()
+        seed.assert_not_called()
+
+    def test_no_backup_creds_returns_false(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        # Register the account in sequence.json but write NO backup credentials.
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "uuid-1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        s._write_json(s.sequence_file, data)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is False
+        seed.assert_not_called()
