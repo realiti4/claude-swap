@@ -88,6 +88,19 @@ def _patch_keyring(fake: FakeKeyring):
     return patch.dict(sys.modules, {"keyring": fake})
 
 
+def _applied_migrations(switcher: ClaudeAccountSwitcher) -> dict:
+    """Return the recorded {migration_id: ts} map, {} if the state file is absent.
+
+    Used instead of asserting the state file's *absence*: an unrelated migration
+    (e.g. install_balancer_v1) may legitimately complete and create the file, so
+    a precise check is "this specific migration is not marked".
+    """
+    path = switcher.backup_dir / ".migrations.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text()).get("applied", {})
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -294,7 +307,7 @@ class TestFailures:
         # Source entry preserved, migration not recorded → retried next run.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.store
         assert fake.deleted == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied_migrations(switcher)
         # The bad/partial file must not shadow the intact keyring entry.
         assert not (
             switcher.credentials_dir / ".creds-1-a@example.com.enc"
@@ -323,7 +336,7 @@ class TestFailures:
         # The healthy account migrated; the failed one is untouched + unmarked.
         assert switcher._read_account_credentials("1", "ok@example.com") == "good"
         assert (KEYRING_SERVICE, "account-2-bad@example.com") in fake.store
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied_migrations(switcher)
 
     def test_partial_failure_raises_from_migration_fn(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -344,7 +357,7 @@ class TestFailures:
         # Runner swallows it and leaves it unmarked.
         with patch.dict(sys.modules, {"keyring": None}):
             run_migrations(switcher)
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied_migrations(switcher)
 
 
 # ---------------------------------------------------------------------------

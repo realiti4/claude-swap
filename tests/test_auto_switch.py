@@ -146,44 +146,25 @@ class TestActiveUsagePct:
 
 
 # --------------------------------------------------------------------------- #
-# TUI decision helper                                                         #
+# Load balancer TUI sub-flows                                                 #
 # --------------------------------------------------------------------------- #
 
 
-class TestShouldAutoSwitch:
-    def test_below_threshold(self):
-        assert tui._should_auto_switch(94, 95) is False
-
-    def test_at_threshold(self):
-        assert tui._should_auto_switch(95, 95) is True
-
-    def test_above_threshold(self):
-        assert tui._should_auto_switch(99.5, 95) is True
-
-    def test_none_pct(self):
-        assert tui._should_auto_switch(None, 95) is False
-
-
-# --------------------------------------------------------------------------- #
-# TUI settings sub-flow                                                       #
-# --------------------------------------------------------------------------- #
-
-
-class TestDoAutoSwitch:
+class TestDoBalancer:
     def test_toggle_enables(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         screen = _stub_screen()
         # Enter on "Enable" (idx 0), then Esc to leave the settings screen.
         screen.getch.side_effect = [10, 27]
-        tui._do_auto_switch(screen, switcher)
-        assert switcher.get_auto_switch_config()["enabled"] is True
+        tui._do_balancer(screen, switcher)
+        assert switcher.get_auto_balance_config()["enabled"] is True
 
     def test_back_does_nothing(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         screen = _stub_screen()
         screen.getch.side_effect = [27]  # Esc immediately
-        tui._do_auto_switch(screen, switcher)
-        assert switcher.get_auto_switch_config()["enabled"] is False
+        tui._do_balancer(screen, switcher)
+        assert switcher.get_auto_balance_config()["enabled"] is False
 
     def test_set_threshold_via_prompt(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -194,34 +175,25 @@ class TestDoAutoSwitch:
         keys += [27]
         screen.getch.side_effect = keys
         with patch("claude_swap.tui.curses.curs_set"):
-            tui._do_auto_switch(screen, switcher)
-        assert switcher.get_auto_switch_config()["threshold"] == 80
+            tui._do_balancer(screen, switcher)
+        assert switcher.get_auto_balance_config()["threshold"] == 80
 
 
-# --------------------------------------------------------------------------- #
-# TUI monitor loop                                                            #
-# --------------------------------------------------------------------------- #
+class TestEditPriorities:
+    def _seed_account(self, switcher: ClaudeAccountSwitcher) -> None:
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {"email": "a@x.com"}
+        data["sequence"] = [1]
+        switcher._write_json(switcher.sequence_file, data)
 
-
-class TestRunAutoMonitor:
-    def test_quits_without_switching_below_threshold(self, temp_home: Path):
+    def test_set_priority_via_prompt(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
+        self._seed_account(switcher)
         screen = _stub_screen()
-        screen.getch.side_effect = [ord("q")]
-        with patch.object(switcher, "get_active_usage_pct", return_value=10.0), \
-             patch("claude_swap.tui._auto_perform_switch") as mock_switch, \
-             patch("claude_swap.tui.curses.curs_set"):
-            tui._run_auto_monitor(screen, switcher, threshold=95)
-        mock_switch.assert_not_called()
-
-    def test_switches_when_threshold_reached(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        screen = _stub_screen()
-        screen.getch.side_effect = [ord("q")]
-        with patch.object(switcher, "get_active_usage_pct", return_value=96.0), \
-             patch(
-                 "claude_swap.tui._auto_perform_switch", return_value=True
-             ) as mock_switch, \
-             patch("claude_swap.tui.curses.curs_set"):
-            tui._run_auto_monitor(screen, switcher, threshold=95)
-        mock_switch.assert_called_once()
+        # Select account 1 (idx 0, Enter), type "7" + Enter, then Back.
+        screen.getch.side_effect = [10, ord("7"), 10, tui.curses.KEY_DOWN, 10]
+        with patch("claude_swap.tui.curses.curs_set"):
+            tui._edit_priorities(screen, switcher)
+        assert switcher.get_account_priority("1") == 7

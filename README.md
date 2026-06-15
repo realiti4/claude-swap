@@ -82,32 +82,87 @@ cswap run 2 --no-share          # don't share your ~/.claude customizations
 
 Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
 
-### Auto-switch at usage limit (Beta)
+### Load balancer (Beta)
 
-Launch the interactive menu and open **Auto-switch at limit (Beta)**:
+Run several Claude Code sessions across all your accounts and let cswap keep them
+fed. When a session's account nears its usage limit, cswap migrates that session
+to a higher-priority account that still has headroom — concentrating load on your
+top accounts and only spilling to the next tier when one fills up. Migrations are
+minimized (each one re-bills the context window), so a session only moves when its
+account is actually exhausted, never for a marginal gain.
+
+Only one subscription? There's nowhere to migrate, so cswap **pauses** the session
+instead and **auto-resumes** it (via `claude --resume`) the moment the limit
+window resets — your in-flight, dynamic workflow survives the limit instead of
+being thrown away.
+
+It's fully **event-driven**: the in-session statusline reports usage on each
+message, which is what triggers a rebalance. There's no polling loop and no
+background daemon. It's also credential-safe — each session's supervisor owns its
+own profile and only ever re-points its own credentials.
+
+#### Setup
 
 ```bash
-cswap --tui
+cswap --install                 # embed cswap into Claude Code (one-time, idempotent)
+cswap --status                  # shows load-balancer state + embed health
 ```
 
-From there you can:
+`--install` installs the statusline and QoL layer via a non-shared
+`settings.local.json` inside each managed profile, so plain `claude` and
+`cswap run` stay completely vanilla. It also runs automatically on upgrade.
 
-- **Enable/Disable** automatic switching (the setting persists across runs).
-- **Set threshold** — the usage percentage that triggers a switch (default `95%`).
-- **Start monitor now** — runs a foreground watcher that polls the active
-  account's 5h/7d usage every 60 seconds. When usage reaches the threshold, it
-  rotates to the next managed account (same rotation as `cswap --switch`), then
-  keeps watching the new account. Press `s` to check immediately, or `q`/`Esc`
-  to stop.
+#### Launch a managed session
 
-Because switching doesn't require a Claude Code restart (see the note above),
-the new account takes effect on your next message — on macOS once the Keychain
-cache expires. The monitor runs only while its screen is open in the TUI; there
-is no background daemon.
+```bash
+cswap launch                    # start a load-balanced session in this terminal
+cswap launch -- --resume        # everything after '--' is forwarded to claude
+cswap launch --no-share         # bare profile (don't share ~/.claude items)
+```
 
-> **Beta:** this feature is new and runs as a foreground watcher. The usage
-> percentages come from the same API as `cswap --list`. Please report any rough
-> edges via [Issues](https://github.com/realiti4/claude-swap/issues).
+`cswap launch` picks the best account (highest priority with headroom), then
+supervises claude until it exits — migrating or pausing/auto-resuming as limits
+are reached. Managed sessions get QoL defaults: the latest model,
+`--dangerously-skip-permissions`, and high effort (any flag you pass yourself
+wins). Plain `claude` and `cswap run` are unaffected.
+
+#### Priorities
+
+Higher priority = burned through first.
+
+```bash
+cswap --set-priority 2:5        # set Account-2's priority to 5
+```
+
+Priorities are also editable in the `cswap --balance` TUI.
+
+#### Dashboard
+
+```bash
+cswap --balance                 # settings + live dashboard (enable/disable, tune, priorities)
+```
+
+The dashboard shows which sessions are on which accounts, live, and is where you
+**enable** the balancer (it's opt-in/off by default), set the threshold/target/
+cooldown, and edit priorities.
+
+#### Statusline
+
+Each managed session renders a compact one-liner, updated on every message:
+
+```
+⇄ a2 ▕███▁▁▏88% · s2/5          # on Account-2, 88% used, session 2 of 5
+→a5 ▕███▁▁▏88% · s2/5           # migration to Account-5 pending
+⏸ a2 1h12m · s2/5               # paused, auto-resuming in 1h12m
+```
+
+It falls back to ASCII (`>a2 [###-----] 88% s2/5`) on terminals that can't render
+the box-drawing glyphs.
+
+> **Beta:** this is new. Migrations re-bill the context window, and the in-session
+> "ultracode" effort can't be persisted — the managed `xhigh` effort level is the
+> closest you can set outside a session. Please report rough edges via
+> [Issues](https://github.com/realiti4/claude-swap/issues).
 
 ### Refresh expired tokens
 
@@ -123,11 +178,15 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap launch                    # Start a load-balanced managed session (Beta)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
-cswap --status                  # Show current account
+cswap --status                  # Show current account + load-balancer/embed health
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
 cswap --remove-account 2        # Remove an account
-cswap --tui                     # Launch the interactive arrow-key menu (incl. auto-switch, Beta)
+cswap --install                 # Embed cswap into Claude Code for load balancing (Beta)
+cswap --balance                 # Load-balancer dashboard + settings (Beta)
+cswap --set-priority 2:5        # Set an account's balancing priority (Beta)
+cswap --tui                     # Launch the interactive arrow-key menu
 cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
 ```

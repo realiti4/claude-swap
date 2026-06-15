@@ -18,9 +18,9 @@ from __future__ import annotations
 import curses
 import sys
 import time
-from datetime import datetime
 from typing import Callable
 
+from claude_swap import registry
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -28,9 +28,6 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 # Minimum terminal size we render in. Below this, we bail to plain CLI advice.
 _MIN_ROWS = 12
 _MIN_COLS = 60
-
-# How often the auto-switch (Beta) monitor polls the active account's usage.
-_AUTO_POLL_SECONDS = 60
 
 
 def run(switcher: ClaudeAccountSwitcher) -> int:
@@ -71,7 +68,7 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
             ("Refresh credentials (current login, in-place)", "refresh"),
             ("List accounts (with usage)", "list"),
             ("Status", "status"),
-            ("Auto-switch at limit (Beta)", "auto"),
+            ("Load balancer (Beta)", "balance"),
             ("Quit", "quit"),
         ]
         choice = _select_from(
@@ -96,8 +93,8 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
                 _shell_out(stdscr, lambda: switcher.list_accounts())
             elif choice == "status":
                 _shell_out(stdscr, switcher.status)
-            elif choice == "auto":
-                _do_auto_switch(stdscr, switcher)
+            elif choice == "balance":
+                _do_balancer(stdscr, switcher)
         except ClaudeSwitchError as e:
             _show_message(stdscr, f"Error: {e}", is_error=True)
         except KeyboardInterrupt:
@@ -180,171 +177,217 @@ def _do_refresh(stdscr, switcher: ClaudeAccountSwitcher) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto-switch (Beta)
+# Load balancer (Beta)
 # ---------------------------------------------------------------------------
 
 
-def _should_auto_switch(pct: float | None, threshold: int) -> bool:
-    """Whether the active account's usage warrants an automatic switch."""
-    return pct is not None and pct >= threshold
+def run_balance(switcher: ClaudeAccountSwitcher) -> int:
+    """Entry point for ``cswap --balance``. Opens the balancer page directly."""
+    try:
+        return curses.wrapper(_balance_entry, switcher)
+    except _ExitRequested:
+        return 0
 
 
-def _do_auto_switch(stdscr, switcher: ClaudeAccountSwitcher) -> None:
-    """Settings + launcher for auto-switch (Beta).
+def _balance_entry(stdscr, switcher: ClaudeAccountSwitcher) -> int:
+    rows, cols = stdscr.getmaxyx()
+    if rows < _MIN_ROWS or cols < _MIN_COLS:
+        curses.endwin()
+        sys.stderr.write(
+            f"Terminal too small ({rows}x{cols}, need at least "
+            f"{_MIN_ROWS}x{_MIN_COLS}).\n"
+        )
+        return 2
+    curses.curs_set(0)
+    _do_balancer(stdscr, switcher)
+    return 0
 
-    Lets the user toggle automatic rotation to the next account when the active
-    account's 5h/7d usage reaches a threshold, tune that threshold, and start
-    the foreground monitor. Settings persist in ``sequence.json``.
 
-    No Claude Code restart is needed for the switch to take effect — on
-    Linux/Windows the new credentials are picked up on the next message, and on
-    macOS once the Keychain cache expires.
+def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
+    """Settings + live dashboard for the event-driven load balancer (Beta).
+
+    The balancer is driven entirely by each managed session's statusline — there
+    is no polling loop and no daemon. When an account crosses the threshold, its
+    sessions migrate to a higher-priority account with headroom, or pause until
+    the limit resets. This page only configures it and shows a read-only view;
+    it never performs migrations itself (the per-session supervisors do).
     """
     while True:
-        cfg = switcher.get_auto_switch_config()
+        cfg = switcher.get_auto_balance_config()
         state = "ON" if cfg["enabled"] else "OFF"
         subtitle = (
-            f"Beta · currently {state} · threshold {cfg['threshold']}%  ·  "
-            "rotates to the next account at the limit"
+            f"Beta · {state} · threshold {cfg['threshold']}% · "
+            f"target {cfg['targetSafety']}% · cooldown {cfg['cooldownSeconds']}s"
         )
         items: list[tuple[str, str | None]] = [
             ("Disable" if cfg["enabled"] else "Enable", "toggle"),
             (f"Set threshold (now {cfg['threshold']}%)", "threshold"),
-            ("Start monitor now", "start"),
+            (f"Set target safety (now {cfg['targetSafety']}%)", "target"),
+            (f"Set cooldown (now {cfg['cooldownSeconds']}s)", "cooldown"),
+            ("Edit account priorities", "priorities"),
+            ("Live dashboard", "dashboard"),
             ("-- Back --", None),
         ]
         choice = _select_from(
-            stdscr,
-            "Auto-switch at limit (Beta)",
-            items=items,
-            subtitle=subtitle,
+            stdscr, "Load balancer (Beta)", items=items, subtitle=subtitle
         )
         if choice is None:
             return
-
         if choice == "toggle":
-            switcher.set_auto_switch_config(enabled=not cfg["enabled"])
+            switcher.set_auto_balance_config(enabled=not cfg["enabled"])
         elif choice == "threshold":
-            raw = _prompt_text(stdscr, "Switch when usage reaches (%): ")
-            if raw:
-                try:
-                    switcher.set_auto_switch_config(threshold=int(raw))
-                except ValueError:
-                    _show_message(
-                        stdscr, "Threshold must be a whole number.", is_error=True
-                    )
-                except ClaudeSwitchError as e:
-                    _show_message(stdscr, f"Invalid threshold: {e}", is_error=True)
-        elif choice == "start":
-            cfg = switcher.get_auto_switch_config()
-            if not cfg["enabled"]:
-                # Starting the monitor implies enabling the feature.
-                cfg = switcher.set_auto_switch_config(enabled=True)
-            _run_auto_monitor(stdscr, switcher, cfg["threshold"])
+            _set_balance_int(stdscr, switcher, "threshold", "Migrate when usage reaches (%): ")
+        elif choice == "target":
+            _set_balance_int(stdscr, switcher, "target_safety", "Target safety ceiling (%): ")
+        elif choice == "cooldown":
+            _set_balance_int(stdscr, switcher, "cooldown_seconds", "Min seconds between migrations: ")
+        elif choice == "priorities":
+            _edit_priorities(stdscr, switcher)
+        elif choice == "dashboard":
+            _balancer_dashboard(stdscr, switcher)
 
 
-def _run_auto_monitor(
-    stdscr, switcher: ClaudeAccountSwitcher, threshold: int
-) -> None:
-    """Foreground watcher loop: poll active usage and switch at the threshold.
+def _set_balance_int(stdscr, switcher: ClaudeAccountSwitcher, field: str, label: str) -> None:
+    raw = _prompt_text(stdscr, label)
+    if not raw:
+        return
+    try:
+        value = int(raw)
+    except ValueError:
+        _show_message(stdscr, "Please enter a whole number.", is_error=True)
+        return
+    try:
+        switcher.set_auto_balance_config(**{field: value})
+    except ClaudeSwitchError as e:
+        _show_message(stdscr, f"Invalid value: {e}", is_error=True)
 
-    Polls every ``_AUTO_POLL_SECONDS`` (press ``s`` to check immediately,
-    ``q``/Esc to stop). When the active account reaches ``threshold``%, it
-    shells out to ``switcher.switch()`` to rotate to the next account, then
-    keeps watching the new active account.
+
+def _edit_priorities(stdscr, switcher: ClaudeAccountSwitcher) -> None:
+    """Set per-account balancing priority (higher = burned through first)."""
+    while True:
+        seq = switcher._get_sequence_data_migrated() or {}
+        accounts = seq.get("accounts", {})
+        if not accounts:
+            _show_message(stdscr, "No managed accounts.")
+            return
+        items: list[tuple[str, str | None]] = []
+        for num in sorted(seq.get("sequence", []), key=int):
+            acc = accounts.get(str(num), {})
+            email = acc.get("email", "?")
+            pri = switcher.get_account_priority(str(num))
+            items.append((f"{num}  {email:<28.28}  priority {pri}", str(num)))
+        items.append(("-- Back --", None))
+        choice = _select_from(
+            stdscr,
+            "Edit priorities — pick an account",
+            items=items,
+            subtitle="Higher priority is burned through first",
+        )
+        if choice is None:
+            return
+        raw = _prompt_text(stdscr, f"New priority for account {choice}: ")
+        if not raw:
+            continue
+        try:
+            switcher.set_account_priority(choice, int(raw))
+        except ValueError:
+            _show_message(stdscr, "Priority must be a whole number.", is_error=True)
+        except ClaudeSwitchError as e:
+            _show_message(stdscr, f"Error: {e}", is_error=True)
+
+
+def _balancer_dashboard(stdscr, switcher: ClaudeAccountSwitcher) -> None:
+    """Read-only live view of managed sessions and accounts (event-driven).
+
+    Refreshes on a timer for liveness; performs NO migrations (the supervisors
+    do). Idle-account usage is shown only from the shared cache — no network in
+    the UI loop — so the view stays snappy.
     """
     curses.curs_set(0)
-    stdscr.timeout(1000)  # getch() returns -1 after ~1s, driving the countdown
-    last_pct: float | None = None
-    last_checked = "never"
-    message = "Monitoring started."
-    seconds_to_next = 0  # poll immediately on entry
+    stdscr.timeout(2000)
     try:
         while True:
-            if seconds_to_next <= 0:
-                last_pct = switcher.get_active_usage_pct()
-                last_checked = datetime.now().strftime("%H:%M:%S")
-                seconds_to_next = _AUTO_POLL_SECONDS
-                if _should_auto_switch(last_pct, threshold):
-                    switched = _auto_perform_switch(stdscr, switcher)
-                    message = (
-                        f"Reached {last_pct:.0f}% — switched account."
-                        if switched
-                        else f"Reached {last_pct:.0f}% — switch failed (see above)."
-                    )
-                    # Re-read the new active account's usage on the next tick.
-                    last_pct = None
-                else:
-                    message = "Monitoring active account."
-
-            _draw_monitor(
-                stdscr, threshold, last_pct, last_checked, seconds_to_next, message
-            )
+            reg = registry.read_registry(switcher)
+            sessions = registry.live_sessions(reg)
+            acct_views, _ = registry.build_world(switcher, reg, fetch_idle=False)
+            _draw_dashboard(stdscr, switcher, sessions, acct_views)
             key = stdscr.getch()
             if key in (27, ord("q"), ord("Q")):
                 return
-            if key in (ord("s"), ord("S")):
-                seconds_to_next = 0
-                continue
-            seconds_to_next -= 1
     finally:
         stdscr.timeout(-1)
 
 
-def _auto_perform_switch(stdscr, switcher: ClaudeAccountSwitcher) -> bool:
-    """Suspend curses, run ``switcher.switch()``, then resume. No Enter prompt."""
-    curses.def_prog_mode()
-    curses.endwin()
-    switched = True
-    try:
-        try:
-            switcher.switch()
-        except ClaudeSwitchError as e:
-            print(f"Auto-switch error: {e}")
-            switched = False
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.")
-            switched = False
-        print()
-        time.sleep(2.5)  # brief pause so the output is readable
-    finally:
-        curses.reset_prog_mode()
-        stdscr.refresh()
-    return switched
-
-
-def _draw_monitor(
-    stdscr,
-    threshold: int,
-    pct: float | None,
-    last_checked: str,
-    seconds_to_next: int,
-    message: str,
-) -> None:
-    """Render the auto-switch monitor screen."""
+def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
+    cfg = switcher.get_auto_balance_config()
+    state = "ON" if cfg["enabled"] else "OFF"
     _draw_header(
         stdscr,
-        "Auto-switch monitor (Beta)",
-        f"threshold {threshold}%  ·  polling every {_AUTO_POLL_SECONDS}s",
+        "Load balancer dashboard (Beta)",
+        f"{state} · threshold {cfg['threshold']}% · {len(sessions)} managed session(s)",
         cols,
     )
-    pct_str = f"{pct:.0f}%" if pct is not None else "unavailable"
-    lines = [
-        f"Active account usage : {pct_str}",
-        f"Last checked         : {last_checked}",
-        f"Next check in        : {max(0, seconds_to_next)}s",
-        "",
-        message,
-    ]
-    for i, line in enumerate(lines):
-        if 4 + i >= rows - 2:
-            break
-        stdscr.addstr(4 + i, 2, line[: cols - 4])
-    footer = "[s] check now  [q/Esc] stop monitor"
+    y = 4
+    if not sessions:
+        stdscr.addstr(y, 2, "No managed sessions. Start one with `cswap launch`."[: cols - 4])
+        y += 2
+    else:
+        stdscr.addstr(y, 2, "Sessions:"[: cols - 4], curses.A_BOLD)
+        y += 1
+        now = time.time()
+        for i, e in enumerate(sessions):
+            if y >= rows - 3:
+                break
+            acct = e.get("account_num", "?")
+            av = acct_views.get(str(acct))
+            pct = av.max_pct if av else None
+            paused = e.get("paused_until")
+            intent = e.get("migration")
+            if isinstance(paused, (int, float)) and paused > now:
+                state_s = f"paused {_short_countdown(paused - now)}"
+            elif isinstance(intent, dict) and intent.get("to"):
+                state_s = f"-> a{intent['to']}"
+            else:
+                state_s = _ascii_bar(pct)
+            line = f"  s{i + 1:<2} a{acct:<3} {state_s:<16} {_abbrev(e.get('cwd', ''))}"
+            stdscr.addstr(y, 2, line[: cols - 4])
+            y += 1
+        y += 1
+
+    if acct_views and y < rows - 2:
+        stdscr.addstr(y, 2, "Accounts:"[: cols - 4], curses.A_BOLD)
+        y += 1
+        for num in sorted(acct_views, key=lambda n: (-acct_views[n].priority, n)):
+            if y >= rows - 2:
+                break
+            av = acct_views[num]
+            pct_s = f"{av.max_pct:.0f}%" if av.max_pct is not None else "  —"
+            stdscr.addstr(y, 2, f"  a{num:<3} pri {av.priority:<3} {pct_s:>5}"[: cols - 4])
+            y += 1
+
+    footer = "[q/Esc] back  ·  refreshes automatically"
     stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
     stdscr.refresh()
+
+
+def _ascii_bar(pct: float | None, width: int = 8) -> str:
+    if pct is None:
+        return "[--------] —"
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {pct:.0f}%"
+
+
+def _short_countdown(secs: float) -> str:
+    secs = max(0, int(secs))
+    hours, rem = divmod(secs, 3600)
+    mins = rem // 60
+    return f"{hours}h{mins:02d}m" if hours else f"{mins}m"
+
+
+def _abbrev(path: str, maxlen: int = 28) -> str:
+    return path if len(path) <= maxlen else "..." + path[-(maxlen - 3):]
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +407,9 @@ def _status_line(switcher: ClaudeAccountSwitcher) -> str:
         tag = "personal" if not org else org[:8]
         active = f"{email} [{tag}]"
     line = f"Active: {active}  ·  {n} managed"
-    cfg = switcher.get_auto_switch_config()
+    cfg = switcher.get_auto_balance_config()
     if cfg["enabled"]:
-        line += f"  ·  auto-switch ON ({cfg['threshold']}%)"
+        line += f"  ·  balancer ON ({cfg['threshold']}%)"
     return line
 
 

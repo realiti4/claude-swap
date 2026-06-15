@@ -478,10 +478,48 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+def migrate_install_balancer(switcher: "ClaudeAccountSwitcher") -> bool:
+    """One-time setup for the load balancer (Beta) — runs on upgrade.
+
+    Backfills ``priority: 0`` onto existing accounts and installs the managed-
+    session settings template (so ``cswap launch`` works and ``cswap --status``
+    reports embed health) without any user action after upgrading from a version
+    that predates the feature. Idempotent and self-guarded:
+
+    * skip (``False``) when there is no readable sequence yet (a fresh install or
+      a corrupt file) — a later restore still triggers it,
+    * complete (``True``) once priorities are backfilled and the template is
+      written; re-running is a cheap no-op.
+
+    Never touches live profiles or credentials — only ``sequence.json`` and the
+    template file.
+    """
+    if not switcher.sequence_file.exists():
+        return False
+    data = switcher._get_sequence_data()
+    if data is None:
+        return False  # corrupt/unparseable — never mark; retry after repair.
+
+    changed = False
+    for info in data.get("accounts", {}).values():
+        if isinstance(info, dict) and "priority" not in info:
+            info["priority"] = 0
+            changed = True
+    if changed:
+        data["lastUpdated"] = get_timestamp()
+        switcher._write_json(switcher.sequence_file, data)
+
+    from claude_swap import embed  # noqa: PLC0415 - only needed on this path
+
+    embed.write_managed_template(switcher)
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
+    ("install_balancer_v1", migrate_install_balancer),
 ]
 
 

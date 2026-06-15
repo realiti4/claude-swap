@@ -50,6 +50,11 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
+from claude_swap.balancer import (
+    DEFAULT_HYSTERESIS_BAND,
+    DEFAULT_MIGRATION_COOLDOWN,
+    DEFAULT_TARGET_SAFETY,
+)
 
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -166,6 +171,10 @@ class ClaudeAccountSwitcher:
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
+        # Per-session profiles for the load balancer (cswap launch). A SEPARATE
+        # root from the per-account `cswap run` profiles under sessions/, so the
+        # per-account guards keyed on session_dir_for never fire on these.
+        self.managed_dir = self.backup_dir / "managed"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
@@ -1291,11 +1300,16 @@ class ClaudeAccountSwitcher:
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
             tag = self._get_display_tag(email, org_name, org_uuid)
+            try:
+                pri = int(data.get("accounts", {}).get(str(num), {}).get("priority", 0))
+            except (TypeError, ValueError):
+                pri = 0
+            pri_tag = f" {dimmed(f'· pri {pri}')}" if pri else ""
             if is_active:
                 marker = f" {bold_accent('(active)')}"
-                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}{pri_tag}")
             else:
-                print(f"  {num}: {email} {muted(f'[{tag}]')}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{pri_tag}")
             if isinstance(usage, str):
                 print(f"     {dimmed(usage)}")
             elif usage is None:
@@ -1351,12 +1365,14 @@ class ClaudeAccountSwitcher:
         identity = self._get_current_account()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
+            self._print_balancer_status()
             return
         current_email, current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            self._print_balancer_status()
             return
 
         account_num = None
@@ -1402,6 +1418,8 @@ class ClaudeAccountSwitcher:
                         print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+
+        self._print_balancer_status()
 
     # ------------------------------------------------------------------ #
     # Auto-switch (Beta)
@@ -1506,6 +1524,230 @@ class ClaudeAccountSwitcher:
                 write_cache(usage_cache_path, existing)
 
         return _max_usage_pct(usage)
+
+    # ------------------------------------------------------------------ #
+    # Load balancer (Beta) — config, priority, profile seeding
+    # ------------------------------------------------------------------ #
+
+    def get_auto_balance_config(self) -> dict:
+        """Return the persisted load-balancer (Beta) settings.
+
+        Stored in ``sequence.json`` under ``autoBalance`` (alongside the legacy
+        ``autoSwitch``). All fields default to sane values; ``targetSafety`` is
+        the projected-usage ceiling a migration target must stay under, kept
+        below ``threshold`` so a move never immediately re-exhausts the target.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("autoBalance") or {}
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(cfg.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        threshold = _int("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        if not 1 <= threshold <= 100:
+            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
+        target_safety = _int("targetSafety", DEFAULT_TARGET_SAFETY)
+        if not 1 <= target_safety <= 100:
+            target_safety = DEFAULT_TARGET_SAFETY
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "threshold": threshold,
+            "targetSafety": min(target_safety, threshold - 1),
+            "hysteresisBand": max(0, _int("hysteresisBand", DEFAULT_HYSTERESIS_BAND)),
+            "cooldownSeconds": max(0, _int("cooldownSeconds", DEFAULT_MIGRATION_COOLDOWN)),
+            "model": str(cfg.get("model") or "opus"),
+            "effortLevel": str(cfg.get("effortLevel") or "xhigh"),
+        }
+
+    def set_auto_balance_config(
+        self,
+        *,
+        enabled: bool | None = None,
+        threshold: int | None = None,
+        target_safety: int | None = None,
+        hysteresis_band: int | None = None,
+        cooldown_seconds: int | None = None,
+        model: str | None = None,
+        effort_level: str | None = None,
+    ) -> dict:
+        """Persist load-balancer (Beta) settings, returning the merged config.
+
+        Only provided fields change. ``targetSafety`` is clamped below
+        ``threshold`` so the stored config is always self-consistent.
+
+        Raises:
+            ValidationError: if ``threshold``/``target_safety`` is outside 1-100.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("autoBalance") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if threshold is not None:
+            t = int(threshold)
+            if not 1 <= t <= 100:
+                raise ValidationError("Threshold must be between 1 and 100")
+            cfg["threshold"] = t
+        if target_safety is not None:
+            ts = int(target_safety)
+            if not 1 <= ts <= 100:
+                raise ValidationError("Target safety must be between 1 and 100")
+            cfg["targetSafety"] = ts
+        if hysteresis_band is not None:
+            cfg["hysteresisBand"] = max(0, int(hysteresis_band))
+        if cooldown_seconds is not None:
+            cfg["cooldownSeconds"] = max(0, int(cooldown_seconds))
+        if model is not None:
+            cfg["model"] = str(model)
+        if effort_level is not None:
+            cfg["effortLevel"] = str(effort_level)
+
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        cfg.setdefault("targetSafety", DEFAULT_TARGET_SAFETY)
+        cfg.setdefault("hysteresisBand", DEFAULT_HYSTERESIS_BAND)
+        cfg.setdefault("cooldownSeconds", DEFAULT_MIGRATION_COOLDOWN)
+        cfg.setdefault("model", "opus")
+        cfg.setdefault("effortLevel", "xhigh")
+        # Keep targetSafety strictly below threshold (self-heals an odd combo).
+        cfg["targetSafety"] = min(int(cfg["targetSafety"]), int(cfg["threshold"]) - 1)
+        if cfg["targetSafety"] < 1:
+            cfg["targetSafety"] = 1
+
+        data["autoBalance"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return cfg
+
+    def get_account_priority(self, account_num: str) -> int:
+        """Return an account's balancing priority (higher = burned first; default 0)."""
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(str(account_num), {})
+        try:
+            return int(info.get("priority", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_account_priority(self, account_num: str, priority: int) -> None:
+        """Set an account's balancing priority (higher = burned through first).
+
+        Raises:
+            AccountNotFoundError: the account number is not managed.
+        """
+        data = self._get_sequence_data()
+        if not data or str(account_num) not in data.get("accounts", {}):
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        data["accounts"][str(account_num)]["priority"] = int(priority)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Set priority of account {account_num} to {priority}")
+
+    def seed_profile_credentials(
+        self, profile_dir: Path, account_num: str, email: str
+    ) -> None:
+        """Point a managed session profile at an account's stored credentials.
+
+        Used to migrate a live managed session to a different account WITHOUT a
+        relaunch: claude re-reads the profile's credentials on its keychain-cache
+        / 401 cycle (the same contract the global switch relies on).
+
+        Seeds the stored credentials VERBATIM. Deliberately does NOT refresh the
+        token or write back to the account backup via ``_write_account_credentials``
+        — that path fires the live-session stale-marking side-effect against the
+        per-account dir and multiplies refresh-token drift. claude refreshes the
+        access token in-process.
+        """
+        profile_dir = Path(profile_dir)
+        creds = self._read_account_credentials(str(account_num), email)
+        if not creds:
+            raise SwitchError(
+                f"Account-{account_num} has no stored credentials. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+        config_text = self._read_account_config(str(account_num), email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = config_data.get("oauthAccount")
+        if not oauth_account:
+            raise SwitchError(
+                f"Account-{account_num} has no stored config backup. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+
+        from claude_swap.session import delete_macos_keychain_entry
+
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(profile_dir, 0o700)
+        # A stale hashed keychain entry would shadow the fresh plaintext seed.
+        delete_macos_keychain_entry(profile_dir)
+
+        creds_path = profile_dir / ".credentials.json"
+        creds_path.write_text(creds, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(creds_path, 0o600)
+
+        # Merge identity into any existing profile config so projects/history
+        # survive a re-point (mirrors session._bootstrap's merge).
+        config_path = profile_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", config_data.get("theme") or "dark")
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_path, 0o600)
+        self._logger.info(
+            f"Seeded managed profile {profile_dir.name} -> account {account_num} ({email})"
+        )
+
+    def _print_balancer_status(self) -> None:
+        """Print the load-balancer (Beta) + embed-health section for ``status()``."""
+        from claude_swap import embed, registry
+
+        bcfg = self.get_auto_balance_config()
+        reg = registry.read_registry(self)
+        # Reap ghost rows (crashed supervisors) on this read path.
+        if registry.reap_dead(reg):
+            try:
+                with FileLock(self.lock_file):
+                    fresh = registry.read_registry(self)
+                    registry.reap_dead(fresh)
+                    registry.write_registry(self, fresh)
+                reg = fresh
+            except Exception:
+                self._logger.debug("registry reap on status failed", exc_info=True)
+        sessions = registry.live_sessions(reg)
+        paused = sum(1 for s in sessions if s.get("paused_until"))
+
+        print()
+        state = bold_accent("ON") if bcfg["enabled"] else dimmed("OFF")
+        summary = (
+            f"threshold {bcfg['threshold']}% · {len(sessions)} managed session(s)"
+        )
+        if paused:
+            summary += f" · {paused} paused"
+        print(f"{bolded('Load balancer (Beta):')} {state} {dimmed('· ' + summary)}")
+
+        health = embed.embed_health(self)
+        if health["ok"]:
+            print(f"  {dimmed('└')} {muted('Embedded in Claude Code — new managed sessions auto-balance')}")
+        else:
+            print(f"  {dimmed('├')} {accent('Not embedded in Claude Code')}")
+            for issue in health["issues"]:
+                print(f"  {dimmed('│')}   {muted(issue)}")
+            print(f"  {dimmed('└')} {muted('Run `cswap --install` to embed cswap into Claude Code')}")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
