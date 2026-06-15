@@ -72,6 +72,30 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
 
+# Auto-switch (Beta): when the active account's 5h/7d usage reaches this
+# percentage, the TUI monitor rotates to the next managed account.
+DEFAULT_AUTO_SWITCH_THRESHOLD = 95
+
+
+def _max_usage_pct(usage: dict | None) -> float | None:
+    """Return the highest 5h/7d utilization percentage in a usage dict.
+
+    Only the rate-limit windows (``five_hour``/``seven_day``) are considered —
+    the dollar-denominated ``spend`` entry is intentionally ignored, since it is
+    not the limit that blocks Claude Code sessions. Returns ``None`` when no
+    usable percentage is present.
+    """
+    if not isinstance(usage, dict):
+        return None
+    pcts: list[float] = []
+    for key in ("five_hour", "seven_day"):
+        entry = usage.get(key)
+        if isinstance(entry, dict):
+            pct = entry.get("pct")
+            if isinstance(pct, (int, float)):
+                pcts.append(float(pct))
+    return max(pcts) if pcts else None
+
 
 def _format_usage_lines(usage: dict) -> list[str]:
     lines: list[str] = []
@@ -1378,6 +1402,110 @@ class ClaudeAccountSwitcher:
                         print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+
+    # ------------------------------------------------------------------ #
+    # Auto-switch (Beta)
+    # ------------------------------------------------------------------ #
+
+    def get_auto_switch_config(self) -> dict:
+        """Return the persisted auto-switch (Beta) settings.
+
+        Auto-switch is opt-in and stored in ``sequence.json`` under the
+        ``autoSwitch`` key. Defaults to disabled at
+        ``DEFAULT_AUTO_SWITCH_THRESHOLD``%.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("autoSwitch") or {}
+        try:
+            threshold = int(cfg.get("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD))
+        except (TypeError, ValueError):
+            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "threshold": threshold,
+        }
+
+    def set_auto_switch_config(
+        self, *, enabled: bool | None = None, threshold: int | None = None
+    ) -> dict:
+        """Persist auto-switch (Beta) settings, returning the merged config.
+
+        Only the provided fields are updated; the rest keep their stored (or
+        default) values.
+
+        Raises:
+            ValidationError: if ``threshold`` is outside the 1-100 range.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("autoSwitch") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if threshold is not None:
+            t = int(threshold)
+            if not 1 <= t <= 100:
+                raise ValidationError("Threshold must be between 1 and 100")
+            cfg["threshold"] = t
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        data["autoSwitch"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return {"enabled": cfg["enabled"], "threshold": cfg["threshold"]}
+
+    def get_active_usage_pct(self) -> float | None:
+        """Return the highest 5h/7d utilization pct for the active account.
+
+        Used by the auto-switch monitor. Returns ``None`` when there is no
+        active login, no usable credentials, or the usage API is unreachable.
+
+        Reuses the same short-lived usage cache as ``list_accounts()`` /
+        ``status()`` so repeated polling stays cheap and consistent. The active
+        account is never refreshed (``is_active=True``) — Claude Code owns those
+        credentials.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        current_email, current_org_uuid = identity
+
+        creds = self._read_credentials() or ""
+        if not creds or not oauth.extract_access_token(creds):
+            return None
+
+        # Resolve the active account number for cache keying (best-effort).
+        account_num = None
+        data = self._get_sequence_data() or {}
+        for num, account in data.get("accounts", {}).items():
+            if (account.get("email") == current_email and
+                    account.get("organizationUuid", "") == current_org_uuid):
+                account_num = num
+                break
+
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        usage = None
+        if account_num is not None:
+            cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+            if (cached is not MISSING and isinstance(cached, dict)
+                    and account_num in cached):
+                usage = cached[account_num]
+
+        if usage is None:
+            usage = oauth.fetch_usage_for_account(
+                account_num or "active", current_email, creds, is_active=True,
+            )
+            if account_num is not None and isinstance(usage, dict):
+                existing = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+                existing = (
+                    existing
+                    if (existing is not MISSING and isinstance(existing, dict))
+                    else {}
+                )
+                existing[account_num] = usage
+                write_cache(usage_cache_path, existing)
+
+        return _max_usage_pct(usage)
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""

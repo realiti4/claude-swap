@@ -82,6 +82,33 @@ cswap run 2 --no-share          # don't share your ~/.claude customizations
 
 Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
 
+### Auto-switch at usage limit (Beta)
+
+Launch the interactive menu and open **Auto-switch at limit (Beta)**:
+
+```bash
+cswap --tui
+```
+
+From there you can:
+
+- **Enable/Disable** automatic switching (the setting persists across runs).
+- **Set threshold** — the usage percentage that triggers a switch (default `95%`).
+- **Start monitor now** — runs a foreground watcher that polls the active
+  account's 5h/7d usage every 60 seconds. When usage reaches the threshold, it
+  rotates to the next managed account (same rotation as `cswap --switch`), then
+  keeps watching the new account. Press `s` to check immediately, or `q`/`Esc`
+  to stop.
+
+Because switching doesn't require a Claude Code restart (see the note above),
+the new account takes effect on your next message — on macOS once the Keychain
+cache expires. The monitor runs only while its screen is open in the TUI; there
+is no background daemon.
+
+> **Beta:** this feature is new and runs as a foreground watcher. The usage
+> percentages come from the same API as `cswap --list`. Please report any rough
+> edges via [Issues](https://github.com/realiti4/claude-swap/issues).
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -100,7 +127,7 @@ cswap --list                    # Show all accounts with 5h/7d usage and reset t
 cswap --status                  # Show current account
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
 cswap --remove-account 2        # Remove an account
-cswap --tui                     # Launch the interactive arrow-key menu
+cswap --tui                     # Launch the interactive arrow-key menu (incl. auto-switch, Beta)
 cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
 ```
