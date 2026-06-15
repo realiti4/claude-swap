@@ -164,6 +164,29 @@ the box-drawing glyphs.
 > closest you can set outside a session. Please report rough edges via
 > [Issues](https://github.com/realiti4/claude-swap/issues).
 
+#### Rate-limit safety net
+
+The balancer migrates **proactively**, the moment the statusline reports an
+account crossing the threshold. If a turn still hits a hard **rate limit**
+(HTTP 429 — the "Retrying… attempt N/10" storm), a `StopFailure` safety net kicks
+in: when the turn fails after Claude exhausts its retries and the session's
+account is genuinely rate-limited, cswap auto-switches the session to a fresh
+account so the **next** turn recovers — no manual switching. The failed turn
+itself is lost (no hook can rescue an in-flight turn — a Claude Code limitation),
+so this is a backstop, not a substitute for the proactive migration.
+
+Want more margin? Lower the threshold in `cswap --balance` so the balancer
+migrates earlier and rarely reaches a hard limit.
+
+An **overload** (HTTP 529 "Overloaded") is different: it's server/model-side, so
+every account hits the same overloaded model — switching accounts wouldn't help.
+Managed sessions instead auto-fall-back to a secondary model via Claude's native
+`--fallback-model` (default `sonnet`). Override it per launch:
+
+```bash
+cswap launch -- --fallback-model haiku   # your flag wins; cswap won't double-add
+```
+
 #### cmux integration (Beta, macOS)
 
 If you use [cmux](https://cmux.com), wire the balancer into it:

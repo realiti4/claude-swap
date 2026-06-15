@@ -124,6 +124,39 @@ def _statusline_command() -> None:
     sys.exit(0)
 
 
+def _statusfailure_command() -> None:
+    """Handle `cswap statusfailure` — internal: Claude Code's ``StopFailure`` hook.
+
+    Pre-dispatched (like `statusline`) and kept bulletproof. Claude Code pipes
+    the failed-turn JSON on stdin and ignores our exit code, but we still mirror
+    ``_statusline_command``'s flush+devnull guard so a broken stdout pipe can
+    never turn into a non-zero exit + traceback. Side-effect-only: at most it
+    records a migration *intent* into the registry so the next turn lands on a
+    fresh account; it never writes credentials and always exits 0.
+    """
+    try:
+        stdin_text = sys.stdin.read()
+    except BaseException:
+        stdin_text = ""
+    try:
+        from claude_swap.statusline import run_statusfailure
+
+        switcher = ClaudeAccountSwitcher()
+        run_statusfailure(switcher, stdin_text)
+    except BaseException:
+        pass
+    finally:
+        try:
+            sys.stdout.flush()
+        except BaseException:
+            pass
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except BaseException:
+            pass
+    sys.exit(0)
+
+
 def _launch_command(argv: list[str]) -> None:
     """Handle `cswap launch [--no-share] [--debug] [-- <claude args>]`.
 
@@ -145,6 +178,12 @@ def _launch_command(argv: list[str]) -> None:
             "the session automatically as usage limits are reached."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap launch
+  cswap launch -- --resume <id>             # forward args after '--' to claude
+  cswap launch --no-share                   # bare profile (don't share ~/.claude)
+        """,
     )
     parser.add_argument(
         "--no-share",
@@ -197,6 +236,13 @@ def _cmux_command(argv: list[str]) -> None:
             "different account."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap cmux setup                          # install the "Balanced Claude (cswap)" surface
+  cswap cmux 3                              # fan out 3 balancer-managed workspaces
+  cswap cmux fanout 3                       # explicit fanout form
+  cswap cmux 3 -- --resume <id>            # forward args after '--' to each claude
+        """,
     )
     parser.add_argument(
         "target",
@@ -312,6 +358,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "statusline":
         _statusline_command()
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "statusfailure":
+        _statusfailure_command()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "launch":
         _launch_command(sys.argv[2:])
         return
@@ -342,6 +391,13 @@ Examples:
   %(prog)s --import backup.cswap
   %(prog)s --tui                              # interactive arrow-key menu
   %(prog)s --upgrade                          # self-upgrade to latest version
+  %(prog)s --install                          # embed cswap for load balancing (Beta)
+  %(prog)s --balance                          # load-balancer dashboard + settings (Beta)
+  %(prog)s --set-priority 2:5                 # set Account-2's balancing priority (Beta)
+  %(prog)s launch                             # start a load-balanced session (Beta)
+  %(prog)s launch -- --resume <id>            # forward args after '--' to claude
+  %(prog)s cmux setup                         # add a balanced-Claude command to cmux (macOS)
+  %(prog)s cmux 3                             # fan out 3 managed sessions, one per workspace
         """,
     )
 
@@ -467,7 +523,7 @@ Examples:
     group.add_argument(
         "--balance",
         action="store_true",
-        help="Open the load-balancer dashboard / settings (Beta)",
+        help="Open the load-balancer dashboard + settings: enable, tune, set priorities (Beta)",
     )
     group.add_argument(
         "--set-priority",

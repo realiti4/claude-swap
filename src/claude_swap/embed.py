@@ -34,24 +34,83 @@ EFFORT_LEVEL = "xhigh"
 TEMPLATE_DIRNAME = "_template"
 
 
-def cswap_statusline_command() -> str:
-    """Return the shell command Claude Code should run as the statusLine.
+def _cswap_command(subcommand: str) -> str:
+    """Return the shell command Claude Code should run for ``cswap <subcommand>``.
 
     Prefers a resolvable ``cswap`` on PATH; otherwise falls back to invoking the
-    package with the current interpreter (``python -m claude_swap statusline``),
+    package with the current interpreter (``python -m claude_swap <subcommand>``),
     which always works for the installed environment.
     """
     if shutil.which("cswap"):
-        return "cswap statusline"
-    return f'"{sys.executable}" -m claude_swap statusline'
+        return f"cswap {subcommand}"
+    return f'"{sys.executable}" -m claude_swap {subcommand}'
+
+
+def cswap_statusline_command() -> str:
+    """Return the shell command Claude Code should run as the statusLine."""
+    return _cswap_command("statusline")
+
+
+def cswap_statusfailure_command() -> str:
+    """Return the command Claude Code should run for the ``StopFailure`` hook.
+
+    Resolved like the statusLine command (PATH or interpreter fallback).
+    """
+    return _cswap_command("statusfailure")
 
 
 def build_managed_settings() -> dict:
-    """The cswap-owned settings merged into every managed profile."""
+    """The cswap-owned settings merged into every managed profile.
+
+    Carries the statusLine (the balancer's event-driven trigger + display), the
+    effort QoL default, and a ``StopFailure`` hook: a next-turn safety net that
+    fires when a turn fails after claude exhausts its API retries (e.g. a hard
+    rate limit) and migrates the session to a fresh account so the NEXT turn
+    recovers without the user switching manually.
+    """
     return {
         "statusLine": {"type": "command", "command": cswap_statusline_command()},
         "effortLevel": EFFORT_LEVEL,
+        "hooks": {
+            "StopFailure": [
+                {"hooks": [{"type": "command", "command": cswap_statusfailure_command()}]}
+            ]
+        },
     }
+
+
+def _merge_hooks(base_hooks: object, managed_hooks: object) -> dict:
+    """Merge the user's ``hooks`` block with cswap's managed hooks (per event).
+
+    Claude Code's ``hooks`` is ``{event_name: [matcher_group, ...]}``. We keep
+    every event the user defines and append our matcher groups for the events we
+    own (currently ``StopFailure``), so a user with their own ``StopFailure``
+    hook keeps it and ours runs alongside it. Tolerant of a non-dict base.
+    """
+    merged: dict = dict(base_hooks) if isinstance(base_hooks, dict) else {}
+    if not isinstance(managed_hooks, dict):
+        return merged
+    for event, groups in managed_hooks.items():
+        existing = merged.get(event)
+        if isinstance(existing, list):
+            merged[event] = existing + list(groups)
+        else:
+            merged[event] = list(groups)
+    return merged
+
+
+def _has_stopfailure_hook(settings: dict) -> bool:
+    """Whether ``settings`` carries a ``StopFailure`` -> ``statusfailure`` hook."""
+    hooks = settings.get("hooks")
+    groups = hooks.get("StopFailure") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        for hook in (group or {}).get("hooks", []) if isinstance(group, dict) else []:
+            cmd = hook.get("command", "") if isinstance(hook, dict) else ""
+            if "statusfailure" in cmd:
+                return True
+    return False
 
 
 def managed_template_path(switcher) -> Path:
@@ -128,7 +187,12 @@ def install_into_profile(switcher, profile_dir: Path) -> None:
     if isinstance(env, dict):
         base["env"] = {k: v for k, v in env.items() if k not in AUTH_OVERRIDE_ENV_VARS}
 
-    merged = {**base, **build_managed_settings()}
+    managed = build_managed_settings()
+    merged = {**base, **managed}
+    # Shallow-merging ``hooks`` would clobber the user's own hooks. Deep-merge
+    # per event so the user keeps their hooks and our StopFailure safety net is
+    # added (or, for StopFailure, appended) rather than replacing them.
+    merged["hooks"] = _merge_hooks(base.get("hooks"), managed.get("hooks"))
 
     dest = profile_dir / "settings.json"
     # Never write through the share symlink (that would mutate ~/.claude).
@@ -158,6 +222,7 @@ def embed_health(switcher) -> dict:
                 isinstance(sl, dict)
                 and sl.get("command")
                 and t.get("effortLevel") == EFFORT_LEVEL
+                and _has_stopfailure_hook(t)
             ):
                 template_ok = True
     except (OSError, json.JSONDecodeError):

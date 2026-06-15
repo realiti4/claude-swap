@@ -20,6 +20,48 @@ class TestManagedSettings:
         cmd = embed.cswap_statusline_command()
         assert isinstance(cmd, str) and "statusline" in cmd
 
+    def test_statusfailure_command_is_a_string(self):
+        cmd = embed.cswap_statusfailure_command()
+        assert isinstance(cmd, str) and "statusfailure" in cmd
+
+    def test_build_managed_settings_carries_stopfailure_hook(self):
+        s = embed.build_managed_settings()
+        groups = s["hooks"]["StopFailure"]
+        cmd = groups[0]["hooks"][0]["command"]
+        assert groups[0]["hooks"][0]["type"] == "command"
+        assert "statusfailure" in cmd
+
+    def test_install_into_profile_keeps_user_hooks_and_adds_stopfailure(
+        self, temp_home: Path
+    ):
+        # A user with their own hooks (incl. a StopFailure hook) must keep them,
+        # with cswap's StopFailure safety net added alongside (not clobbering).
+        user_settings = Path.home() / ".claude" / "settings.json"
+        user_settings.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [{"hooks": [{"type": "command", "command": "mine"}]}],
+                        "StopFailure": [{"hooks": [{"type": "command", "command": "theirs"}]}],
+                    }
+                }
+            )
+        )
+        sw = ClaudeAccountSwitcher()
+        profile = sw.managed_dir / "abc123"
+        embed.install_into_profile(sw, profile)
+        data = json.loads((profile / "settings.json").read_text())
+        # User's unrelated hook survives.
+        assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "mine"
+        # User's StopFailure hook survives AND ours is appended.
+        cmds = [
+            h["command"]
+            for g in data["hooks"]["StopFailure"]
+            for h in g["hooks"]
+        ]
+        assert "theirs" in cmds
+        assert any("statusfailure" in c for c in cmds)
+
 
 class TestTemplate:
     def test_write_template_then_idempotent(self, temp_home: Path):
@@ -65,5 +107,16 @@ class TestEmbedHealth:
         path = embed.managed_template_path(sw)
         data = json.loads(path.read_text())
         data["effortLevel"] = "low"
+        path.write_text(json.dumps(data))
+        assert embed.embed_health(sw)["ok"] is False
+
+    def test_health_flags_template_missing_stopfailure_hook(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        embed.install(sw)
+        # An older template (no StopFailure hook) must read as unhealthy so the
+        # upgrade migration refreshes it.
+        path = embed.managed_template_path(sw)
+        data = json.loads(path.read_text())
+        data.pop("hooks", None)
         path.write_text(json.dumps(data))
         assert embed.embed_health(sw)["ok"] is False

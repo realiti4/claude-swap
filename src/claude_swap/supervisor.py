@@ -41,6 +41,13 @@ _TERMINATE_GRACE_S = 5.0
 # the registry for an intent/pause (only re-reads when the file's mtime moved).
 _WATCH_TICK_S = 1.0
 
+# Secondary model managed sessions auto-fall-back to when the primary model is
+# overloaded (HTTP 529). Unlike a 429 rate limit (which is account-specific and
+# triggers a migration), a 529 is server/model-side — every account hits the same
+# overloaded model — so the fix is claude's NATIVE ``--fallback-model``, not an
+# account switch. Override per-launch with ``cswap launch -- --fallback-model X``.
+_DEFAULT_FALLBACK_MODEL = "sonnet"
+
 
 def launch(
     switcher, claude_args: list[str], *, cwd: str | None = None, share: bool = True
@@ -541,6 +548,11 @@ class Supervisor:
             prefix += ["--model", bcfg["model"]]
         if "--dangerously-skip-permissions" not in joined and "--permission-mode" not in joined:
             prefix += ["--dangerously-skip-permissions"]
+        # Auto-fall-back to a secondary model on a 529 Overloaded (server/model-
+        # side; an account switch wouldn't help). User-supplied --fallback-model
+        # wins, so only add ours when they didn't pass one.
+        if "--fallback-model" not in args:
+            prefix += ["--fallback-model", _DEFAULT_FALLBACK_MODEL]
         return prefix + args
 
     def _terminate(self, proc: subprocess.Popen) -> None:

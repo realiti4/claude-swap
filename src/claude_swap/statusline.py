@@ -18,6 +18,14 @@ and performs the actual re-point (the credential-ownership invariant). The
 statusline must always succeed fast and print exactly one line, so the whole
 body is defensive: any error prints an empty line and exits 0 rather than
 breaking Claude's render.
+
+This module also hosts :func:`run_statusfailure` — the ``cswap statusfailure``
+handler behind Claude Code's ``StopFailure`` hook. It is a *next-turn* safety
+net layered under the statusline's proactive threshold migration: when a turn
+fails after claude exhausts its API retries because the session's ACCOUNT is
+rate-limited, it records a migration intent so the next turn lands on a fresh
+account. Like the statusline it only ever writes registry state, never raises,
+and always exits 0.
 """
 
 from __future__ import annotations
@@ -170,6 +178,112 @@ def _run(switcher, stdin_text: str) -> int:
         total,
     )
     print(render_line(render_row, own_max, total, index))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# StopFailure safety net
+# --------------------------------------------------------------------------- #
+
+# Error types that are plainly NOT account-specific: switching accounts won't
+# help (it's a server-side / overload failure), so the StopFailure safety net
+# leaves them to claude's own retry / ``--fallback-model``.
+_SERVER_SIDE_ERROR_TYPES = frozenset({"overloaded", "server_error"})
+
+
+def run_statusfailure(switcher, stdin_text: str) -> int:
+    """Entry point for ``cswap statusfailure`` (the ``StopFailure`` hook).
+
+    A *next-turn* safety net layered under the statusline's proactive
+    threshold migration. Claude Code fires ``StopFailure`` when a turn ends due
+    to an API error after retries are exhausted (the "Retrying … attempt N/10"
+    storm). We can't rescue the failed turn — no hook can block a turn and claude
+    doesn't re-read creds on a 429 — but when the session's account is genuinely
+    rate-limited we record a migration *intent* so the owning supervisor
+    re-points it and the NEXT turn lands on a fresh account.
+
+    Side-effect-only and bulletproof: never raises, always returns 0, and (like
+    the statusline) only ever writes registry state — never credentials.
+    """
+    try:
+        return _run_failure(switcher, stdin_text)
+    except Exception:  # noqa: BLE001 - the StopFailure hook must never raise
+        try:
+            switcher._logger.debug("statusfailure failed", exc_info=True)
+        except Exception:
+            pass
+        return 0
+
+
+def _run_failure(switcher, stdin_text: str) -> int:
+    try:
+        payload = json.loads(stdin_text)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+
+    profile_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    managed_id = Path(profile_dir).name if profile_dir else ""
+    if not managed_id:
+        return 0  # not a managed session
+
+    error_type = payload.get("error_type")
+    error_type = error_type if isinstance(error_type, str) else ""
+
+    reg0 = registry.read_registry(switcher)
+    row0 = reg0.get("sessions", {}).get(managed_id)
+    if not isinstance(row0, dict):
+        return 0  # no registry row for this session
+    own_account = str(row0.get("account_num", "") or "")
+    if not own_account:
+        return 0
+
+    # (b) Skip plainly-not-account-specific failures: switching accounts can't
+    # help an overload / server error (claude's retry / --fallback-model owns
+    # those). An absent/unknown error_type falls through to the usage check (a).
+    if error_type in _SERVER_SIDE_ERROR_TYPES:
+        return 0
+
+    bcfg = switcher.get_auto_balance_config()
+    cfg = balancer.config_from_dict(bcfg)
+    now = time.time()
+
+    # (a) Only migrate when this session's account is ACTUALLY rate-limited
+    # (at/over the exhaust threshold). Build the world OUTSIDE the lock — it may
+    # do network I/O for idle accounts.
+    acct_views, _ = registry.build_world(switcher, reg0, fetch_idle=True)
+    if not balancer._exhausted(acct_views.get(own_account), cfg):
+        return 0
+
+    # Build this session's SessionView from its registry row (mirrors the
+    # statusline's session_views shape; include ctx_tokens so the target's
+    # headroom reserve is sized correctly) and pick a migration target.
+    sv = balancer.SessionView(
+        session_id=managed_id,
+        account_num=own_account,
+        ctx_tokens=int(row0.get("ctx_tokens") or 0),
+        last_seen=float(row0.get("last_seen") or 0.0),
+        paused_until=row0.get("paused_until"),
+        last_migrated_at=float(row0.get("last_migrated_at") or 0.0),
+        pinned_account=row0.get("pinned_account"),
+    )
+    target = balancer.choose_migration_target(sv, acct_views, {}, cfg)
+    if not target:
+        return 0  # nothing has headroom -> leave it; the statusline will pause
+
+    # Record the migration intent under the lock (mirror the statusline's
+    # set_intent path). The owning supervisor consumes it and re-points; we
+    # never touch credentials here.
+    lock = FileLock(switcher.lock_file, timeout=5)
+    if lock.acquire():
+        try:
+            reg = registry.read_registry(switcher)
+            if managed_id in reg.get("sessions", {}):
+                registry.set_intent(reg, managed_id, target, now)
+                registry.write_registry(switcher, reg)
+        finally:
+            lock.release()
     return 0
 
 

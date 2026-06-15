@@ -165,6 +165,31 @@ class TestShareHistory:
         assert not (real_dest / "from_home.txt").exists()
 
 
+class TestQolArgs:
+    """QoL launch flags: model, skip-permissions, and the 529 fallback model."""
+
+    def _sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        return Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+
+    def test_default_launch_adds_fallback_model_sonnet(self, temp_home):
+        sup = self._sup(temp_home)
+        args = sup._qol_args([])
+        assert "--fallback-model" in args
+        assert args[args.index("--fallback-model") + 1] == "sonnet"
+        # Sanity: the other QoL defaults are still there.
+        assert "--model" in args
+        assert "--dangerously-skip-permissions" in args
+
+    def test_user_fallback_model_wins_no_double_add(self, temp_home):
+        sup = self._sup(temp_home)
+        args = sup._qol_args(["--fallback-model", "haiku"])
+        # Exactly one occurrence, and it's the user's value.
+        assert args.count("--fallback-model") == 1
+        assert args[args.index("--fallback-model") + 1] == "haiku"
+
+
 class TestSelfSessionView:
     """BUG 009: recovery paths must size the view with this session's ctx_tokens."""
 
