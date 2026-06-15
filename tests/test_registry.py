@@ -145,9 +145,13 @@ class TestBuildWorld:
         )
         registry.write_registry(sw, reg)
         acct_views, sess_views = registry.build_world(sw, reg, fetch_idle=False)
-        assert acct_views["1"].max_pct == 88.0
-        assert acct_views["1"].signal == "live"
-        assert acct_views["1"].priority == 5
+        av = acct_views["1"]
+        assert av.max_pct == 88.0
+        assert av.signal == "live"
+        assert av.priority == 5
+        # Per-window breakdown carried for the dashboard (max_pct is only the max).
+        assert (av.five_hour_pct, av.five_hour_reset) == (88.0, 2000)
+        assert (av.seven_day_pct, av.seven_day_reset) == (40.0, 9000)
         assert [s.session_id for s in sess_views] == ["m1"]
 
     def test_idle_account_uses_cache(self, temp_home: Path):
@@ -159,8 +163,12 @@ class TestBuildWorld:
         )
         reg = registry.read_registry(sw)
         acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
-        assert acct_views["2"].max_pct == 40.0
-        assert acct_views["2"].signal == "cache"
+        av = acct_views["2"]
+        assert av.max_pct == 40.0
+        assert av.signal == "cache"
+        # Both windows surface; no resets_at in this cache entry -> resets None.
+        assert (av.five_hour_pct, av.five_hour_reset) == (40.0, None)
+        assert (av.seven_day_pct, av.seven_day_reset) == (10.0, None)
 
     def test_unknown_account_has_no_usage(self, temp_home: Path):
         sw = ClaudeAccountSwitcher()

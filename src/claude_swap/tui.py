@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import curses
 import sys
+import threading
 import time
 from typing import Callable
 
-from claude_swap import registry
+from claude_swap import balancer, registry
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import DEFAULT_QUICK_START_COMMAND, ClaudeAccountSwitcher
 
@@ -343,25 +344,60 @@ def _do_quick_start(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             switcher.set_quick_start_config(command=DEFAULT_QUICK_START_COMMAND)
 
 
+# How often the background worker refreshes idle-account usage into the shared
+# cache. The UI thread itself never fetches (it would block on network I/O and
+# freeze the quit key); it only ever reads the worker-warmed cache + live signals.
+_IDLE_REFRESH_S = 15
+_DASH_TICK_MS = 2000
+
+
+def _idle_usage_refresher(switcher: ClaudeAccountSwitcher, stop: threading.Event) -> None:
+    """Background worker that keeps the shared usage cache warm for the dashboard.
+
+    Each pass calls ``build_world(fetch_idle=True)``, which fetches every idle
+    (no live session) account's usage on a cache miss and writes it into the 15s
+    usage cache the UI loop reads. Runs OFF the curses thread so the (per-account,
+    possibly-slow) network reads never block rendering or the quit key. Best-effort
+    — a failed pass is swallowed and retried next cycle; exits when ``stop`` is set.
+    """
+    while not stop.is_set():
+        try:
+            reg = registry.read_registry(switcher)
+            registry.build_world(switcher, reg, fetch_idle=True)
+        except Exception:  # noqa: BLE001 - usage is best-effort; keep the worker alive
+            switcher._logger.debug("dashboard idle-usage refresh failed", exc_info=True)
+        stop.wait(_IDLE_REFRESH_S)
+
+
 def _balancer_dashboard(stdscr, switcher: ClaudeAccountSwitcher) -> None:
     """Read-only live view of managed sessions and accounts (event-driven).
 
     Refreshes on a timer for liveness; performs NO migrations (the supervisors
-    do). Idle-account usage is shown only from the shared cache — no network in
-    the UI loop — so the view stays snappy.
+    do). Idle-account usage (for accounts not hosting a live session) is fetched
+    by a background worker that warms the shared usage cache, so every account
+    shows its 5h/weekly consumption without the network read ever blocking the UI
+    thread (the quit key stays responsive even when an account is slow/unreachable).
     """
     curses.curs_set(0)
-    stdscr.timeout(2000)
+    stdscr.timeout(_DASH_TICK_MS)
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=_idle_usage_refresher, args=(switcher, stop), daemon=True
+    )
+    worker.start()
     try:
         while True:
             reg = registry.read_registry(switcher)
             sessions = registry.live_sessions(reg)
+            # UI thread NEVER hits the network — it reads the worker-warmed cache
+            # and live session signals only, so rendering can't stall.
             acct_views, _ = registry.build_world(switcher, reg, fetch_idle=False)
             _draw_dashboard(stdscr, switcher, sessions, acct_views)
             key = stdscr.getch()
             if key in (27, ord("q"), ord("Q")):
                 return
     finally:
+        stop.set()
         stdscr.timeout(-1)
 
 
@@ -370,20 +406,30 @@ def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
     rows, cols = stdscr.getmaxyx()
     cfg = switcher.get_auto_balance_config()
     state = "ON" if cfg["enabled"] else "OFF"
+    prime_on = bool(cfg.get("primeIdleWindows"))
+    now = time.time()
     _draw_header(
         stdscr,
         "Auto-swap + multi-session load balancer — dashboard (beta)",
-        f"{state} · threshold {cfg['threshold']}% · {len(sessions)} managed session(s)",
+        f"{state} · threshold {cfg['threshold']}% · {len(sessions)} session(s) · "
+        f"warming {'ON' if prime_on else 'OFF'}",
         cols,
     )
+
+    # How many live sessions are pinned to each account (shown per account, so
+    # even idle accounts read as "0 sess").
+    sess_by_account: dict[str, int] = {}
+    for e in sessions:
+        acct = str(e.get("account_num", ""))
+        sess_by_account[acct] = sess_by_account.get(acct, 0) + 1
+
     y = 4
     if not sessions:
-        stdscr.addstr(y, 2, "No managed sessions. Start one with `cswap launch`."[: cols - 4])
+        stdscr.addstr(y, 2, "No active sessions. Start one with `cswap launch`."[: cols - 4])
         y += 2
     else:
         stdscr.addstr(y, 2, "Sessions:"[: cols - 4], curses.A_BOLD)
         y += 1
-        now = time.time()
         for i, e in enumerate(sessions):
             if y >= rows - 3:
                 break
@@ -404,19 +450,69 @@ def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
         y += 1
 
     if acct_views and y < rows - 2:
-        stdscr.addstr(y, 2, "Accounts:"[: cols - 4], curses.A_BOLD)
+        header = "Accounts:  (usage% · resets-in, per 5h and 7d window)"
+        stdscr.addstr(y, 2, header[: cols - 4], curses.A_BOLD)
         y += 1
-        for num in sorted(acct_views, key=lambda n: (-acct_views[n].priority, n)):
+        for num in sorted(acct_views, key=lambda n: (-acct_views[n].priority, _num_key(n))):
             if y >= rows - 2:
                 break
             av = acct_views[num]
-            pct_s = f"{av.max_pct:.0f}%" if av.max_pct is not None else "  —"
-            stdscr.addstr(y, 2, f"  a{num:<3} pri {av.priority:<3} {pct_s:>5}"[: cols - 4])
+            stdscr.addstr(
+                y, 2,
+                _account_row(av, sess_by_account.get(num, 0), now, prime_on)[: cols - 4],
+            )
             y += 1
 
     footer = "[q/Esc] back  ·  refreshes automatically"
     stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
     stdscr.refresh()
+
+
+def _num_key(num: str):
+    """Order numeric account ids numerically, others lexically (stable display)."""
+    return (0, int(num)) if str(num).isdigit() else (1, str(num))
+
+
+def _account_row(av, sess_count: int, now: float, show_warm: bool) -> str:
+    """One Accounts-section line: priority, session count, 5h + 7d usage/reset.
+
+    Idle accounts (no live session) still render their cached/fetched usage, so
+    the view covers every account. ``signal == "none"`` means usage is unknown
+    (logged out or a failed read) — shown explicitly rather than as a fake 0%.
+    """
+    head = f"  a{av.num:<3} P{av.priority:<2} {sess_count} sess"
+    if av.signal == "none":
+        return f"{head}  usage unavailable"
+    # Fixed-width reset field so the 7d column lines up across rows regardless of
+    # whether a window shows a countdown or "(no reset)".
+    h5 = f"5h {_fmt_pct(av.five_hour_pct)} {_fmt_reset(av.five_hour_reset, now):<14}"
+    d7 = f"7d {_fmt_pct(av.seven_day_pct)} {_fmt_reset(av.seven_day_reset, now):<14}"
+    row = f"{head}  {h5} {d7}"
+    if show_warm:
+        warm = balancer.five_hour_warm(av)
+        row += f" {'warm' if warm else 'cold' if warm is False else '?'}"
+    return row
+
+
+def _fmt_pct(pct: float | None) -> str:
+    return f"{pct:3.0f}%" if isinstance(pct, (int, float)) else "  — "
+
+
+def _fmt_reset(reset: int | None, now: float) -> str:
+    """``(resets 2h13m)`` / ``(resets 4d05h)`` for a future reset.
+
+    ``(no reset)`` means the window has no clock running (unstarted/cold — what
+    ``balancer.five_hour_warm`` reports as cold), reserved for ``reset is None``.
+    A reset epoch that has just elapsed (the window is rolling over but the ~15s
+    usage cache hasn't refreshed yet) reads ``(resetting)`` rather than
+    ``(no reset)``, so the 5h column can't contradict a ``warm`` token derived
+    from the same still-present reset timestamp.
+    """
+    if not isinstance(reset, (int, float)):
+        return "(no reset)"
+    if reset <= now:
+        return "(resetting)"
+    return f"(resets {_short_countdown(reset - now)})"
 
 
 def _ascii_bar(pct: float | None, width: int = 8) -> str:
@@ -427,9 +523,14 @@ def _ascii_bar(pct: float | None, width: int = 8) -> str:
 
 
 def _short_countdown(secs: float) -> str:
+    """Compact countdown: ``4d05h`` for multi-day (weekly) resets, ``2h13m`` for
+    hours, ``42m`` under an hour."""
     secs = max(0, int(secs))
-    hours, rem = divmod(secs, 3600)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
     mins = rem // 60
+    if days:
+        return f"{days}d{hours:02d}h"
     return f"{hours}h{mins:02d}m" if hours else f"{mins}m"
 
 

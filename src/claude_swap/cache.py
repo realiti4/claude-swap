@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,9 +38,24 @@ def read_cache(path: Path, ttl: float, default=MISSING):
 
 
 def write_cache(path: Path, data) -> None:
-    """Write data to a cache file with a timestamp."""
+    """Write data to a cache file with a timestamp.
+
+    Commits via a temp file + ``os.replace`` (atomic rename) so a concurrent
+    reader — another cswap process, a statusline, or the dashboard's idle-usage
+    refresher thread — never observes a half-written file (it sees the old
+    contents or the new ones, whole).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"timestamp": time.time(), "data": data}),
-        encoding="utf-8",
-    )
+    payload = json.dumps({"timestamp": time.time(), "data": data})
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        # Best-effort cache: clean up the temp file and move on rather than
+        # raising into the caller (usage rendering, balancing, etc.).
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass

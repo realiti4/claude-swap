@@ -314,6 +314,26 @@ def _five_hour_signal(usage: dict | None) -> tuple[float | None, int | None]:
     return pct, reset
 
 
+def _seven_day_signal(usage: dict | None) -> tuple[float | None, int | None]:
+    """Return ``(seven_day_pct, seven_day_reset)`` from a normalized usage dict.
+
+    Mirror of :func:`_five_hour_signal` for the weekly window. Expects the
+    ``{window: {pct, resets_at}}`` shape; either element is ``None`` when absent.
+    Surfaced on :class:`AccountView` so the dashboard can show the 5h and weekly
+    caps independently of ``max_pct`` (which is only their max).
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    entry = usage.get("seven_day")
+    if not isinstance(entry, dict):
+        return None, None
+    pct = entry.get("pct")
+    pct = float(pct) if isinstance(pct, (int, float)) else None
+    reset = entry.get("resets_at")
+    reset = int(reset) if isinstance(reset, (int, float)) else None
+    return pct, reset
+
+
 def soonest_blocking_reset(usage: dict | None) -> int | None:
     """Return the epoch reset of the window that is *currently capping* an account.
 
@@ -442,6 +462,7 @@ def build_world(
         if live_rl is not None:
             usage = _rl_to_usage(live_rl)
             h5_pct, h5_reset = _five_hour_signal(usage)
+            d7_pct, d7_reset = _seven_day_signal(usage)
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,
@@ -450,6 +471,8 @@ def build_world(
                 signal="live",
                 five_hour_pct=h5_pct,
                 five_hour_reset=h5_reset,
+                seven_day_pct=d7_pct,
+                seven_day_reset=d7_reset,
             )
             continue
 
@@ -460,6 +483,7 @@ def build_world(
 
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
+        d7_pct, d7_reset = _seven_day_signal(usage) if is_usage else (None, None)
         acct_views[num] = AccountView(
             num=num,
             priority=priority,
@@ -468,6 +492,8 @@ def build_world(
             signal="cache" if is_usage else "none",
             five_hour_pct=h5_pct,
             five_hour_reset=h5_reset,
+            seven_day_pct=d7_pct,
+            seven_day_reset=d7_reset,
         )
 
     # Persist any freshly-fetched idle usages back into the shared cache so the

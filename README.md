@@ -135,7 +135,11 @@ cswap launch --no-share         # bare profile (don't share ~/.claude items)
 supervises claude until it exits — migrating or pausing/auto-resuming as limits
 are reached. Managed sessions get QoL defaults: the latest model,
 `--dangerously-skip-permissions`, and high effort (any flag you pass yourself
-wins). Plain `claude` and `cswap run` are unaffected.
+wins); these launch-flag defaults don't apply to plain `claude` or `cswap run`.
+Both `cswap launch` and `cswap run` pre-trust their launch directory in the
+session's isolated profile, so the spawned session skips Claude Code's "do you
+trust this folder?" prompt — managed sessions use a fresh profile per launch, so
+it would otherwise appear every time. Plain `claude` is unaffected.
 
 #### Priorities
 
@@ -156,6 +160,19 @@ cswap --balance                 # settings + live dashboard (enable/disable, tun
 The dashboard shows which sessions are on which accounts, live, and is where you
 **enable** the balancer (it's opt-in/off by default), set the threshold and target
 safety, and edit priorities.
+
+The live view lists **every** managed account — not just the ones currently in
+use — with, per account:
+
+- how many sessions are running on it,
+- its **5h** and **weekly (7d)** usage percentages and how long until each window
+  resets, and
+- when **Keep 5h sessions warm** is enabled, whether the account's 5h window is
+  `warm` (clock running) or `cold` (unstarted — a priming candidate).
+
+Idle-account usage is fetched in the background (and cached) so the numbers stay
+current without slowing the view. An account that's logged out or unreadable shows
+`usage unavailable`.
 
 #### Statusline
 

@@ -16,6 +16,7 @@ from claude_swap.balancer import (
     accounts_needing_prime,
     assign_new_session,
     config_from_dict,
+    five_hour_warm,
     rebalance,
 )
 
@@ -427,3 +428,30 @@ class TestAccountsNeedingPrime:
             "5": AV("5", max_pct=0.0, signal="cache", h5_pct=0.0),     # candidate
         }
         assert accounts_needing_prime(accts, CFG) == ["1", "5"]
+
+
+class TestFiveHourWarm:
+    """``five_hour_warm`` reports the dashboard's warm/cold/unknown 5h state —
+    the exact inverse of priming candidacy (a primeable window reads cold)."""
+
+    def test_running_reset_is_warm(self):
+        assert five_hour_warm(AV("1", h5_pct=0.0, h5_reset=99999)) is True
+
+    def test_pct_above_epsilon_is_warm(self):
+        assert five_hour_warm(AV("1", h5_pct=8.0, h5_reset=None)) is True
+
+    def test_zero_pct_no_reset_is_cold(self):
+        # The unstarted clock — exactly what idle-window priming targets.
+        assert five_hour_warm(AV("1", h5_pct=0.0, h5_reset=None)) is False
+
+    def test_unknown_usage_is_none(self):
+        assert five_hour_warm(AV("1", h5_pct=None, h5_reset=None)) is None
+
+    def test_inverse_of_prime_candidacy(self):
+        # An account flagged for priming must read cold; one left alone reads warm.
+        cold = AV("1", max_pct=0.0, signal="cache", h5_pct=0.0, h5_reset=None)
+        warm = AV("2", max_pct=12.0, signal="cache", h5_pct=12.0, h5_reset=None)
+        assert accounts_needing_prime({"1": cold}, CFG) == ["1"]
+        assert five_hour_warm(cold) is False
+        assert accounts_needing_prime({"2": warm}, CFG) == []
+        assert five_hour_warm(warm) is True

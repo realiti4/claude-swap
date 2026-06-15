@@ -137,14 +137,19 @@ class AccountView:
     # resets (the window equal to ``max_pct``); ``None`` if unknown.
     soonest_reset: int | None = None
     signal: str = "none"  # "live" (statusline) | "cache" (usage API) | "none"
-    # The 5h-window-specific utilization + reset, used ONLY by the idle-window
-    # priming detection (:func:`accounts_needing_prime`). ``five_hour_pct`` is the
-    # 5h utilization percent (distinct from ``max_pct``, which is max(5h, 7d));
-    # ``five_hour_reset`` is the 5h window's reset epoch when the clock is running
-    # (``None`` when the window is unstarted — the signal we prime on). Both are
-    # ``None`` when usage is unknown.
+    # The 5h-window-specific utilization + reset, used by the idle-window priming
+    # detection (:func:`accounts_needing_prime`) and surfaced in the dashboard.
+    # ``five_hour_pct`` is the 5h utilization percent (distinct from ``max_pct``,
+    # which is max(5h, 7d)); ``five_hour_reset`` is the 5h window's reset epoch when
+    # the clock is running (``None`` when the window is unstarted — the signal we
+    # prime on). Both are ``None`` when usage is unknown.
     five_hour_pct: float | None = None
     five_hour_reset: int | None = None
+    # The 7d-window-specific utilization + reset, for the dashboard's per-window
+    # breakdown. Carried separately from ``max_pct`` so the view can show the 5h
+    # and weekly caps independently. ``None`` when usage is unknown.
+    seven_day_pct: float | None = None
+    seven_day_reset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -335,6 +340,23 @@ def _five_hour_unstarted(av: AccountView, cfg: BalancerConfig) -> bool:
     if av.five_hour_reset is not None:
         return False  # a concrete reset timestamp means the clock is already running
     return av.five_hour_pct <= PRIME_FIVE_HOUR_EPSILON
+
+
+def five_hour_warm(av: AccountView) -> bool | None:
+    """Tri-state: is the account's 5h window started (warm)? ``None`` if unknown.
+
+    The inverse of the priming clock-check (:func:`_five_hour_unstarted`): a window
+    with a concrete future reset, or pct above the epsilon, is already running
+    (warm); a ~0% window with no reset is cold (unstarted — exactly what the
+    idle-window priming targets). ``None`` when 5h usage is unknown (no signal), so
+    a view can show "?" rather than a misleading "cold". Used by the dashboard to
+    report whether each account's 5h window has been warmed.
+    """
+    if av.five_hour_pct is None:
+        return None
+    if av.five_hour_reset is not None:
+        return True
+    return av.five_hour_pct > PRIME_FIVE_HOUR_EPSILON
 
 
 def accounts_needing_prime(
