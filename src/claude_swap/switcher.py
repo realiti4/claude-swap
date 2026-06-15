@@ -80,6 +80,15 @@ _USAGE_CACHE_TTL = 15  # seconds
 # percentage, the TUI monitor rotates to the next managed account.
 DEFAULT_AUTO_SWITCH_THRESHOLD = 95
 
+# Default command for the Quick-start alias (bare ``cswap`` when enabled): launch
+# a load-balanced session with the QoL defaults baked in. Extra args the user
+# passes on the command line are appended to this verbatim.
+DEFAULT_QUICK_START_COMMAND = (
+    "cswap launch -- --dangerously-skip-permissions "
+    "--model claude-opus-4-8 "
+    "--settings '{\"ultracode\": true}'"
+)
+
 
 def _max_usage_pct(usage: dict | None) -> float | None:
     """Return the highest 5h/7d utilization percentage in a usage dict.
@@ -1652,6 +1661,57 @@ class ClaudeAccountSwitcher:
             cfg["targetSafety"] = 1
 
         data["autoBalance"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return cfg
+
+    def get_quick_start_config(self) -> dict:
+        """Return the persisted Quick-start settings (the bare-``cswap`` default).
+
+        Stored in ``sequence.json`` under ``quickStart``. Default OFF; when on,
+        running ``cswap`` with no recognized subcommand/flag runs ``command``
+        (with any extra args appended), acting like a configurable alias. A blank
+        or missing command falls back to :data:`DEFAULT_QUICK_START_COMMAND`.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("quickStart") or {}
+        command = cfg.get("command")
+        if not isinstance(command, str) or not command.strip():
+            command = DEFAULT_QUICK_START_COMMAND
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "command": command,
+        }
+
+    def set_quick_start_config(
+        self, *, enabled: bool | None = None, command: str | None = None
+    ) -> dict:
+        """Persist Quick-start settings, returning the merged config.
+
+        Only provided fields change. To reset the command, pass
+        :data:`DEFAULT_QUICK_START_COMMAND` explicitly (as the TUI's "Reset"
+        action does); a *provided* blank/whitespace command is rejected rather
+        than silently reset. A missing/blank *persisted* value still falls back
+        to the default on read.
+
+        Raises:
+            ValidationError: if ``command`` is provided but empty/whitespace.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("quickStart") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if command is not None:
+            stripped = command.strip()
+            if not stripped:
+                raise ValidationError("Quick-start command cannot be empty")
+            cfg["command"] = stripped
+        cfg.setdefault("enabled", False)
+        if not isinstance(cfg.get("command"), str) or not cfg["command"].strip():
+            cfg["command"] = DEFAULT_QUICK_START_COMMAND
+        data["quickStart"] = cfg
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
         return cfg

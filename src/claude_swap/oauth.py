@@ -38,6 +38,36 @@ def extract_oauth_data(credentials: str) -> dict | None:
     return oauth if isinstance(oauth, dict) else None
 
 
+# Subscription tiers that have a 5-hour usage window worth "warming". An account
+# authenticated some other way — pay-as-you-go API / console billing, or a tier
+# we don't recognize — is deliberately excluded so idle-window priming never
+# spends real money on an account with no subscription window to anchor.
+PRIMABLE_SUBSCRIPTION_TYPES = frozenset({"pro", "max", "team", "enterprise"})
+
+
+def extract_subscription_type(credentials: str) -> str | None:
+    """Return the Claude subscription type (lowercased) from a credentials string.
+
+    ``None`` when the credentials carry no OAuth subscription payload (e.g. an
+    API-key / console account) or can't be parsed.
+    """
+    oauth = extract_oauth_data(credentials)
+    if not isinstance(oauth, dict):
+        return None
+    sub = oauth.get("subscriptionType")
+    return sub.lower() if isinstance(sub, str) and sub.strip() else None
+
+
+def is_primable_subscription(subscription_type: str | None) -> bool:
+    """Whether an account's subscription tier has a primeable 5h window.
+
+    Conservative by design: only recognized Claude *subscription* tiers qualify.
+    An API-credit / console account, or any unrecognized/missing type, returns
+    ``False`` so priming never bills a pay-as-you-go account.
+    """
+    return bool(subscription_type) and subscription_type.lower() in PRIMABLE_SUBSCRIPTION_TYPES
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):

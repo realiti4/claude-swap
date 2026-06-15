@@ -4,12 +4,73 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.printer import accent, dimmed, error, muted, warning
 from claude_swap.switcher import ClaudeAccountSwitcher
+
+# First-token values that are genuine cswap subcommands or flags. Quick-start
+# (the configurable bare-`cswap` alias) only fires when the first arg is NOT one
+# of these, so every existing command keeps its normal behaviour. Kept in sync
+# with the subcommands dispatched in ``main`` and the flags registered on its
+# parser; an unknown token (or no args at all) is treated as quick-start input.
+_RESERVED_FIRST_TOKENS = frozenset({
+    # positional subcommands
+    "run", "statusline", "statusfailure", "launch", "cmux",
+    # help / version
+    "-h", "--help", "--version",
+    # modifier + action flags
+    "--debug", "--token-status", "--slot", "--email", "--account",
+    "--force", "--full", "--add-account", "--remove-account", "--list",
+    "--switch", "--switch-to", "--status", "--purge", "--export", "--import",
+    "--tui", "--upgrade", "--add-token", "--install", "--balance",
+    "--set-priority",
+})
+
+
+def _maybe_quick_start(rest: list[str]) -> bool:
+    """Run the user's Quick-start command if it applies; return whether it fired.
+
+    Fires only when (a) the first token isn't a recognized cswap subcommand/flag
+    and (b) Quick-start is enabled in config. The configured command is parsed
+    with shell rules, any leading ``cswap``/``claude-swap`` is dropped, the user's
+    extra args are appended (alias-with-args), and the result is re-dispatched
+    through ``main`` exactly once (quick-start disabled on the re-entry to rule
+    out loops).
+    """
+    if rest:
+        first = rest[0].split("=", 1)[0]
+        if first in _RESERVED_FIRST_TOKENS:
+            return False
+    try:
+        config = ClaudeAccountSwitcher().get_quick_start_config()
+    except Exception:  # noqa: BLE001 - never let config issues block normal CLI use
+        return False
+    if not config.get("enabled"):
+        return False
+    try:
+        tokens = shlex.split(config["command"])
+    except ValueError:
+        error("Quick-start command is not valid shell syntax; fix it in the TUI.")
+        sys.exit(1)
+    if tokens and os.path.basename(tokens[0]) in ("cswap", "claude-swap"):
+        tokens = tokens[1:]
+    # `cswap -- <args>` is the explicit "everything after -- is extra args" form;
+    # drop that one leading separator so we don't forward a stray `--` on top of
+    # the configured command's own `--` (which would make claude treat the args
+    # as a positional prompt instead of flags).
+    extra = list(rest)
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    new_argv = tokens + extra
+    if not new_argv:
+        return False
+    sys.argv = ["cswap"] + new_argv
+    main(_allow_quick_start=False)
+    return True
 
 
 def _run_command(argv: list[str]) -> None:
@@ -350,7 +411,7 @@ def _parse_set_priority(value: str) -> tuple[str, int]:
     return num, priority
 
 
-def main() -> None:
+def main(_allow_quick_start: bool = True) -> None:
     """Main entry point for the CLI."""
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         _run_command(sys.argv[2:])
@@ -368,9 +429,22 @@ def main() -> None:
         _cmux_command(sys.argv[2:])
         return
 
+    # Quick start: a configurable default command for an alias-style `cswap`
+    # invocation. Runs only when enabled AND the first token isn't a recognized
+    # subcommand/flag — so `cswap`, `cswap --resume X`, etc. launch the default,
+    # while `cswap --status`, `cswap run 2`, ... keep working unchanged.
+    if _allow_quick_start and _maybe_quick_start(sys.argv[1:]):
+        return
+
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # Disable prefix-abbreviation so a token is a real cswap flag iff it is an
+        # exact full spelling — keeping argparse's matching in lockstep with the
+        # exact-match _RESERVED_FIRST_TOKENS check that gates Quick start. Without
+        # this, `cswap --stat` would mean --status to argparse but be hijacked as
+        # quick-start input (the two paths would disagree on the same token).
+        allow_abbrev=False,
         epilog="""
 Examples:
   %(prog)s --add-account

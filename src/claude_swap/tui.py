@@ -22,7 +22,7 @@ from typing import Callable
 
 from claude_swap import registry
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import DEFAULT_QUICK_START_COMMAND, ClaudeAccountSwitcher
 
 
 # Minimum terminal size we render in. Below this, we bail to plain CLI advice.
@@ -69,6 +69,7 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
             ("List accounts (with usage)", "list"),
             ("Status", "status"),
             ("Auto-swap + multi-session load balancer (beta)", "balance"),
+            ("Quick start (default `cswap` command)", "quickstart"),
             ("Quit", "quit"),
         ]
         choice = _select_from(
@@ -95,6 +96,8 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
                 _shell_out(stdscr, switcher.status)
             elif choice == "balance":
                 _do_balancer(stdscr, switcher)
+            elif choice == "quickstart":
+                _do_quick_start(stdscr, switcher)
         except ClaudeSwitchError as e:
             _show_message(stdscr, f"Error: {e}", is_error=True)
         except KeyboardInterrupt:
@@ -224,7 +227,7 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             ("Disable" if cfg["enabled"] else "Enable", "toggle"),
             (f"Set threshold (now {cfg['threshold']}%)", "threshold"),
             (f"Set target safety (now {cfg['targetSafety']}%)", "target"),
-            (f"Prime idle 5h windows: {prime_state} (spends credits)", "prime"),
+            (f"Keep 5h sessions warm (spends a very small amount of credits): {prime_state}", "prime"),
             ("Edit account priorities", "priorities"),
             ("Live dashboard", "dashboard"),
             ("-- Back --", None),
@@ -302,6 +305,42 @@ def _edit_priorities(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             _show_message(stdscr, "Priority must be a whole number.", is_error=True)
         except ClaudeSwitchError as e:
             _show_message(stdscr, f"Error: {e}", is_error=True)
+
+
+def _do_quick_start(stdscr, switcher: ClaudeAccountSwitcher) -> None:
+    """Configure Quick start: the default command a bare ``cswap`` runs.
+
+    Default OFF. When on, running ``cswap`` with no recognized subcommand/flag
+    runs the configured command (extra args appended), like a configurable alias.
+    """
+    while True:
+        cfg = switcher.get_quick_start_config()
+        state = "ON" if cfg["enabled"] else "OFF"
+        items: list[tuple[str, str | None]] = [
+            ("Disable" if cfg["enabled"] else "Enable", "toggle"),
+            ("Edit command", "edit"),
+            ("Reset command to default", "reset"),
+            ("-- Back --", None),
+        ]
+        choice = _select_from(
+            stdscr,
+            "Quick start",
+            items=items,
+            subtitle=f"{state} · runs on bare `cswap` · {cfg['command']}",
+        )
+        if choice is None:
+            return
+        if choice == "toggle":
+            switcher.set_quick_start_config(enabled=not cfg["enabled"])
+        elif choice == "edit":
+            raw = _prompt_text(stdscr, "Quick-start command: ")
+            if raw:
+                try:
+                    switcher.set_quick_start_config(command=raw)
+                except ClaudeSwitchError as e:
+                    _show_message(stdscr, f"Invalid command: {e}", is_error=True)
+        elif choice == "reset":
+            switcher.set_quick_start_config(command=DEFAULT_QUICK_START_COMMAND)
 
 
 def _balancer_dashboard(stdscr, switcher: ClaudeAccountSwitcher) -> None:

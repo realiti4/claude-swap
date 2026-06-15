@@ -16,6 +16,7 @@ from claude_swap import tui
 from claude_swap.exceptions import ValidationError
 from claude_swap.switcher import (
     DEFAULT_AUTO_SWITCH_THRESHOLD,
+    DEFAULT_QUICK_START_COMMAND,
     ClaudeAccountSwitcher,
     _max_usage_pct,
 )
@@ -233,3 +234,69 @@ class TestEditPriorities:
         with patch("claude_swap.tui.curses.curs_set"):
             tui._edit_priorities(screen, switcher)
         assert switcher.get_account_priority("1") == 7
+
+
+class TestQuickStartConfig:
+    """The Quick-start alias config is default-OFF, round-trips, and self-heals."""
+
+    def test_defaults_off_with_default_command(self, temp_home: Path):
+        cfg = ClaudeAccountSwitcher().get_quick_start_config()
+        assert cfg["enabled"] is False
+        assert cfg["command"] == DEFAULT_QUICK_START_COMMAND
+
+    def test_default_command_is_the_documented_one(self):
+        assert DEFAULT_QUICK_START_COMMAND == (
+            "cswap launch -- --dangerously-skip-permissions "
+            "--model claude-opus-4-8 "
+            "--settings '{\"ultracode\": true}'"
+        )
+
+    def test_enable_and_persist(self, temp_home: Path):
+        ClaudeAccountSwitcher().set_quick_start_config(enabled=True)
+        assert ClaudeAccountSwitcher().get_quick_start_config()["enabled"] is True
+
+    def test_set_custom_command_round_trips(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        sw.set_quick_start_config(command="cswap launch -- --model opus")
+        assert sw.get_quick_start_config()["command"] == "cswap launch -- --model opus"
+
+    def test_partial_update_keeps_other_field(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        sw.set_quick_start_config(enabled=True, command="cswap launch")
+        sw.set_quick_start_config(enabled=False)
+        cfg = sw.get_quick_start_config()
+        assert cfg == {"enabled": False, "command": "cswap launch"}
+
+    def test_blank_command_rejected(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        with pytest.raises(ValidationError):
+            sw.set_quick_start_config(command="   ")
+
+    def test_does_not_clobber_accounts(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._init_sequence_file()
+        data = sw._get_sequence_data()
+        data["accounts"]["1"] = {"email": "a@x.com"}
+        sw._write_json(sw.sequence_file, data)
+        sw.set_quick_start_config(enabled=True)
+        assert "1" in sw._get_sequence_data()["accounts"]
+
+
+class TestDoQuickStart:
+    def test_toggle_enables(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+        # Enter on "Enable" (idx 0), then Esc to leave.
+        screen.getch.side_effect = [10, 27]
+        tui._do_quick_start(screen, switcher)
+        assert switcher.get_quick_start_config()["enabled"] is True
+
+    def test_reset_restores_default_command(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher.set_quick_start_config(command="cswap launch")
+        screen = _stub_screen()
+        # Down to "Reset command to default" (idx 2) + Enter, then Esc.
+        screen.getch.side_effect = [tui.curses.KEY_DOWN, tui.curses.KEY_DOWN, 10, 27]
+        tui._do_quick_start(screen, switcher)
+        assert switcher.get_quick_start_config()["command"] == DEFAULT_QUICK_START_COMMAND

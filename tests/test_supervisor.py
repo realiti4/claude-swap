@@ -551,6 +551,7 @@ class TestPrimeOneAccount:
                 "accessToken": "tok-2",
                 "refreshToken": "ref-2",
                 "expiresAt": int((_time.time() + 3600) * 1000),
+                "subscriptionType": "max",
             }
         })
         with FileLock(sw.lock_file):
@@ -564,6 +565,30 @@ class TestPrimeOneAccount:
             ok = sup._prime_one_account("2")
         assert ok is True
         m.assert_called_once_with("tok-2")
+
+    def test_skips_api_credit_account_without_billing_it(self, temp_home):
+        # An account authenticated without a recognized subscription tier (e.g.
+        # API / console billing) must never be primed — no prime POST at all.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5), "2": ("b@x.com", 5)})
+        import json as _json
+        import time as _time
+        from claude_swap.locking import FileLock
+        creds = _json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "tok-2",
+                "refreshToken": "ref-2",
+                "expiresAt": int((_time.time() + 3600) * 1000),
+                # No subscriptionType -> treated as a non-subscription account.
+            }
+        })
+        with FileLock(sw.lock_file):
+            sw.write_account_credentials("2", "b@x.com", creds)
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+        with patch("claude_swap.supervisor.oauth.prime_account", return_value=True) as m:
+            ok = sup._prime_one_account("2")
+        assert ok is False
+        m.assert_not_called()
 
     def test_missing_credentials_returns_false_without_calling(self, temp_home):
         sup = self._sup_with_creds(temp_home)

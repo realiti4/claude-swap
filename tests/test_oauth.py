@@ -669,3 +669,33 @@ class TestPrimeAccount:
     def test_network_error_returns_false_never_raises(self):
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError("boom")):
             assert oauth.prime_account("tok-abc") is False
+
+
+class TestSubscriptionType:
+    """Subscription-tier detection gates idle-window priming away from API accounts."""
+
+    def test_extracts_lowercased_type(self):
+        creds = json.dumps({"claudeAiOauth": {"subscriptionType": "Max"}})
+        assert oauth.extract_subscription_type(creds) == "max"
+
+    def test_none_when_absent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "t"}})
+        assert oauth.extract_subscription_type(creds) is None
+
+    def test_none_when_no_oauth_payload(self):
+        # An API-key / console account carries no claudeAiOauth block.
+        assert oauth.extract_subscription_type(json.dumps({"apiKey": "sk-x"})) is None
+        assert oauth.extract_subscription_type("not json") is None
+
+    def test_blank_type_is_none(self):
+        creds = json.dumps({"claudeAiOauth": {"subscriptionType": "   "}})
+        assert oauth.extract_subscription_type(creds) is None
+
+    def test_primable_subscription_tiers(self):
+        for sub in ("pro", "max", "team", "enterprise", "MAX", "Team"):
+            assert oauth.is_primable_subscription(sub) is True, sub
+
+    def test_non_primable_types(self):
+        # None / blank / API / console / unrecognized must never be primed.
+        for sub in (None, "", "api", "console", "free", "unknown"):
+            assert oauth.is_primable_subscription(sub) is False, sub

@@ -214,7 +214,7 @@ connection glitch is never mistaken for bad credentials or an exhausted account.
 The one limitation: a turn that still fails after all retries can't be auto-re-run
 (a Claude Code limitation), so that single message is re-sent manually.
 
-#### Idle-window priming (Beta, experimental — default OFF, opt-in)
+#### Keep 5h sessions warm (Beta, experimental — default OFF, opt-in)
 
 > **Unverified premise — opt-in only.** This feature assumes a Claude
 > subscription's 5-hour limit window is *fixed-from-first-use* (it starts counting
@@ -224,7 +224,7 @@ The one limitation: a turn that still fails after all retries can't be auto-re-r
 > priming is useless and should be removed. Because priming spends real credits,
 > it ships **disabled by default** behind a dedicated opt-in — independent of the
 > balancer's own enable — and must be turned on explicitly:
-> `Set up cswap` → `Auto-swap + multi-session load balancer (beta)` → `Prime idle 5h windows`.
+> `Set up cswap` → `Auto-swap + multi-session load balancer (beta)` → `Keep 5h sessions warm`.
 
 If the fixed-from-first-use premise holds, an account you haven't used yet this
 window has an *unstarted* clock that won't reset for a full 5 hours after you
@@ -238,6 +238,10 @@ It is conservative and credit-frugal:
 - Only accounts whose 5h window is genuinely **unstarted** (read via the usage
   API, which itself doesn't bill) are primed — never an account already running
   a window, already weekly-capped, in active use, or whose usage is unknown.
+- Only recognized Claude **subscription** accounts (Pro / Max / Team / Enterprise)
+  are ever primed. A pay-as-you-go **API / console** account is skipped entirely —
+  it has no 5h subscription window to warm, and priming it would spend real API
+  credits.
 - Each account is primed **at most once per window**; a per-account guard plus a
   shared once-per-interval sweep stamp mean that even with several managed
   sessions running, exactly one of them primes each account per interval (no
@@ -277,6 +281,30 @@ hook (the balancer's triggers) live in that profile and use events cmux
 doesn't touch, so both run side by side and your `CLAUDE_CONFIG_DIR` pin is
 preserved. With it **off**, cmux passes `claude` through untouched and cswap's
 profile settings drive everything. Nothing to configure either way.
+
+### Quick start (configurable default command)
+
+Tired of typing the same launch command? Turn on **Quick start** and a bare
+`cswap` becomes a configurable alias — it runs whatever command you set, with any
+extra args you pass appended to it:
+
+```bash
+cswap                       # runs your Quick-start command
+cswap -- --resume <id>      # ...with extra args appended (forwarded to claude)
+```
+
+Enable and edit it in `Set up cswap` → `Quick start`. It's **default OFF**, and
+the default command launches a load-balanced session with the QoL defaults baked
+in:
+
+```
+cswap launch -- --dangerously-skip-permissions --model claude-opus-4-8 --settings '{"ultracode": true}'
+```
+
+Quick start only fires when the first argument **isn't** a recognized cswap
+subcommand or flag — so `cswap --status`, `cswap run 2`, `cswap launch …`, and
+every other command keep working exactly as before. Only a bare/unrecognized
+invocation is treated as Quick-start input.
 
 ### Refresh expired tokens
 

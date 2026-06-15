@@ -386,6 +386,14 @@ class Supervisor:
             return False
         if not creds:
             return False
+        # Never prime a pay-as-you-go API / console account (or an unrecognized
+        # auth type): priming bills real money and there is no 5h subscription
+        # window to warm. Only recognized Claude subscription tiers qualify.
+        if not oauth.is_primable_subscription(oauth.extract_subscription_type(creds)):
+            self._logger.debug(
+                "prime: skipping %s — not a primeable subscription account", num
+            )
+            return False
         token = oauth.extract_access_token(creds)
         if not token:
             return False
