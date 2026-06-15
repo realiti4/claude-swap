@@ -261,6 +261,14 @@ class TestBootstrap:
         assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
         assert config["hasCompletedOnboarding"] is True
         assert config["theme"] == "light"  # carried over from backup config
+        # The directory `cswap run` execs claude in (inherited cwd) is
+        # pre-trusted so claude skips the folder trust dialog.
+        assert (
+            config["projects"][os.path.realpath(os.getcwd())][
+                "hasTrustDialogAccepted"
+            ]
+            is True
+        )
 
         # Rotated refresh token persisted back to backup storage.
         assert (
@@ -423,7 +431,12 @@ class TestBootstrap:
         manager.setup_session("2", share=False)
 
         merged = json.loads((session_dir / ".claude.json").read_text())
-        assert merged["projects"] == {"/some/project": {"history": ["x"]}}
+        # Existing per-project history survives the re-bootstrap...
+        assert merged["projects"]["/some/project"] == {"history": ["x"]}
+        # ...alongside the launch cwd's pre-seeded folder-trust entry.
+        assert merged["projects"][os.path.realpath(os.getcwd())][
+            "hasTrustDialogAccepted"
+        ]
         assert merged["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
 
 

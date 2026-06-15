@@ -47,6 +47,7 @@ from claude_swap.paths import (
     get_credentials_path,
     get_global_config_path,
     get_legacy_backup_root,
+    mark_cwd_trusted,
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
@@ -1740,7 +1741,12 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Set priority of account {account_num} to {priority}")
 
     def seed_profile_credentials(
-        self, profile_dir: Path, account_num: str, email: str
+        self,
+        profile_dir: Path,
+        account_num: str,
+        email: str,
+        *,
+        cwd: str | Path | None = None,
     ) -> None:
         """Point a managed session profile at an account's stored credentials.
 
@@ -1753,6 +1759,9 @@ class ClaudeAccountSwitcher:
         — that path fires the live-session stale-marking side-effect against the
         per-account dir and multiplies refresh-token drift. claude refreshes the
         access token in-process.
+
+        ``cwd`` (the session's launch directory) is pre-trusted so the spawned
+        claude skips the folder trust dialog — see ``paths.mark_cwd_trusted``.
         """
         profile_dir = Path(profile_dir)
         creds = self._read_account_credentials(str(account_num), email)
@@ -1799,6 +1808,7 @@ class ClaudeAccountSwitcher:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
+        mark_cwd_trusted(existing, cwd)
         # ``_write_json`` commits via an atomic rename (+ chmod 0600), so claude's
         # live read of ``.claude.json`` likewise never races a truncate+write.
         self._write_json(config_path, existing)

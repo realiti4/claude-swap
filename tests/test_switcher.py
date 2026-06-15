@@ -2507,6 +2507,64 @@ class TestSeedProfileCredentialsAtomic:
             assert (creds_path.stat().st_mode & 0o777) == 0o600
             assert (config_path.stat().st_mode & 0o777) == 0o600
 
+    def test_seed_trusts_launch_cwd(self, temp_home: Path):
+        """Passing ``cwd`` pre-accepts the folder trust dialog for that dir so
+        the spawned claude doesn't stop on the workspace-trust prompt."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m3"
+        workspace = temp_home / "Projects" / "IAMBot"
+        workspace.mkdir(parents=True)
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(
+                profile_dir, "1", "a@x.com", cwd=str(workspace)
+            )
+        cfg = json.loads((profile_dir / ".claude.json").read_text(encoding="utf-8"))
+        projects = cfg["projects"]
+        # The directory claude will run in is marked trusted (under its
+        # realpath — what the child's process.cwd() resolves to).
+        assert projects[os.path.realpath(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_seed_without_cwd_adds_no_projects(self, temp_home: Path):
+        """Backward compat: no cwd → no projects map is fabricated."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m4"
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+        cfg = json.loads((profile_dir / ".claude.json").read_text(encoding="utf-8"))
+        assert "projects" not in cfg
+
+    def test_seed_trust_preserves_existing_project_metadata(self, temp_home: Path):
+        """Re-seeding keeps a project's existing history/allowedTools intact and
+        only flips trust on — projects/history survive a re-point."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m5"
+        workspace = temp_home / "ws"
+        workspace.mkdir()
+        key = os.path.realpath(workspace)
+        profile_dir.mkdir(parents=True)
+        (profile_dir / ".claude.json").write_text(
+            json.dumps({"projects": {key: {"allowedTools": ["Bash"]}}}),
+            encoding="utf-8",
+        )
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(
+                profile_dir, "1", "a@x.com", cwd=str(workspace)
+            )
+        entry = json.loads(
+            (profile_dir / ".claude.json").read_text(encoding="utf-8")
+        )["projects"][key]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["allowedTools"] == ["Bash"]
+
     def test_seed_uses_atomic_rename_not_truncating_write(self, temp_home: Path):
         """The credential write must go through os.replace (a rename), never a
         plain truncate+write that a live reader could observe mid-write."""

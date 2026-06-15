@@ -441,7 +441,9 @@ class Supervisor:
         except Exception:
             self._logger.warning("migrate: cannot resolve account %s", to_account)
             return
-        self.switcher.seed_profile_credentials(self.profile_dir, num, email)
+        self.switcher.seed_profile_credentials(
+            self.profile_dir, num, email, cwd=self.cwd
+        )
         lock = FileLock(self.switcher.lock_file, timeout=10)
         if lock.acquire():
             try:
@@ -591,7 +593,10 @@ class Supervisor:
         num, email, _ = self.switcher.resolve_account(self.account)
         # Verbatim seed (no refresh side-effects), share ~/.claude items, then
         # install the non-shared statusline + effort layer over the symlink.
-        self.switcher.seed_profile_credentials(self.profile_dir, num, email)
+        # Pre-trust the launch cwd so claude skips the folder trust dialog.
+        self.switcher.seed_profile_credentials(
+            self.profile_dir, num, email, cwd=self.cwd
+        )
         SessionManager(self.switcher)._sync_sharing(self.profile_dir, self.share)
         embed.install_into_profile(self.switcher, self.profile_dir)
         if self.share:
