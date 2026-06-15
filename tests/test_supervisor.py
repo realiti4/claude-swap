@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from claude_swap import balancer, registry
 from claude_swap.supervisor import Supervisor
@@ -223,3 +224,97 @@ class TestSelfSessionView:
         assert sv.paused_until == 12345
         assert sv.last_migrated_at == 99.0
         assert sv.pinned_account == "2"
+
+
+class TestRecoverAuth:
+    """401 auto-recovery: refresh+re-seed the same account, else migrate."""
+
+    def _sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5), "2": ("b@x.com", 5)})
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+        sup._register()
+        return sup
+
+    def test_refresh_success_does_not_migrate(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        monkeypatch.setattr(
+            sup.switcher, "refresh_account_and_reseed", lambda acct, pdir: True
+        )
+        migrated: list[str] = []
+        monkeypatch.setattr(sup, "_migrate", lambda to: migrated.append(to))
+
+        sup._recover_auth()
+
+        assert migrated == []  # same-account refresh worked -> no migration
+
+    def test_refresh_fail_with_target_migrates(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        monkeypatch.setattr(
+            sup.switcher, "refresh_account_and_reseed", lambda acct, pdir: False
+        )
+        migrated: list[str] = []
+        monkeypatch.setattr(sup, "_migrate", lambda to: migrated.append(to))
+        with patch("claude_swap.supervisor.registry.build_world", return_value=({}, {})), \
+             patch("claude_swap.supervisor.balancer.choose_migration_target", return_value="2"):
+            sup._recover_auth()
+
+        assert migrated == ["2"]  # account logged out -> migrate to healthy target
+
+    def test_refresh_fail_no_target_does_not_crash(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        monkeypatch.setattr(
+            sup.switcher, "refresh_account_and_reseed", lambda acct, pdir: False
+        )
+        migrated: list[str] = []
+        monkeypatch.setattr(sup, "_migrate", lambda to: migrated.append(to))
+        with patch("claude_swap.supervisor.registry.build_world", return_value=({}, {})), \
+             patch("claude_swap.supervisor.balancer.choose_migration_target", return_value=None):
+            # No target anywhere -> warn the user, no migration, no crash.
+            sup._recover_auth()
+
+        assert migrated == []
+
+    def test_consume_state_routes_recent_auth_flag_and_clears_it(
+        self, temp_home, monkeypatch
+    ):
+        import time
+        from claude_swap.locking import FileLock
+
+        sup = self._sup(temp_home)
+        reg = registry.read_registry(sup.switcher)
+        reg["sessions"]["mid"]["auth_recover"] = time.time()
+        with FileLock(sup.switcher.lock_file):
+            registry.write_registry(sup.switcher, reg)
+
+        calls: list[int] = []
+        monkeypatch.setattr(sup, "_recover_auth", lambda: calls.append(1))
+
+        decision = sup._consume_own_state()
+
+        assert decision == "auth"
+        assert calls == [1]
+        # The flag is cleared so the next tick doesn't re-recover.
+        reg2 = registry.read_registry(sup.switcher)
+        assert reg2["sessions"]["mid"].get("auth_recover") is None
+
+    def test_consume_state_ignores_stale_auth_flag(self, temp_home, monkeypatch):
+        import time
+        from claude_swap.locking import FileLock
+
+        sup = self._sup(temp_home)
+        reg = registry.read_registry(sup.switcher)
+        # A flag older than the TTL was left by a crash -> cleared, not acted on.
+        reg["sessions"]["mid"]["auth_recover"] = time.time() - 10_000
+        with FileLock(sup.switcher.lock_file):
+            registry.write_registry(sup.switcher, reg)
+
+        calls: list[int] = []
+        monkeypatch.setattr(sup, "_recover_auth", lambda: calls.append(1))
+
+        decision = sup._consume_own_state()
+
+        assert decision is None
+        assert calls == []
+        reg2 = registry.read_registry(sup.switcher)
+        assert reg2["sessions"]["mid"].get("auth_recover") is None

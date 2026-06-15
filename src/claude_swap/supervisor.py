@@ -41,6 +41,11 @@ _TERMINATE_GRACE_S = 5.0
 # the registry for an intent/pause (only re-reads when the file's mtime moved).
 _WATCH_TICK_S = 1.0
 
+# How recent an ``auth_recover`` flag must be to act on it. A 401 the statusfailure
+# hook flags should be consumed on the very next supervisor tick; a flag older than
+# this was left by a crash and is ignored (cleared without recovering).
+_AUTH_RECOVER_TTL_S = 300.0
+
 # Secondary model managed sessions auto-fall-back to when the primary model is
 # overloaded (HTTP 529). Unlike a 429 rate limit (which is account-specific and
 # triggers a migration), a 529 is server/model-side — every account hits the same
@@ -194,10 +199,11 @@ class Supervisor:
             if decision == "pause":
                 self._terminate(proc)
                 return ("pause", None)
-            # "migrate" was applied in place (no relaunch); keep watching.
+            # "migrate"/"auth" recovery was applied in place (no relaunch); the
+            # session recovers on its next turn. Keep watching.
 
     def _consume_own_state(self) -> str | None:
-        """Act on this session's own registry row: migration intent or pause.
+        """Act on this session's own registry row: auth recovery, migration, pause.
 
         Degrades gracefully under lock contention — a tick we can't lock is
         simply skipped and retried on the next registry change, never an error
@@ -213,14 +219,28 @@ class Supervisor:
                 return None
             intent = row.get("migration")
             paused_until = row.get("paused_until")
+            # A 401 the statusfailure hook flagged: refresh+re-seed this account
+            # (or migrate if it's logged out). Only honour a RECENT flag so a
+            # stale one left by a crash can't trigger a spurious recovery.
+            auth_recover = row.get("auth_recover")
+            do_auth_recover = (
+                isinstance(auth_recover, (int, float))
+                and (time.time() - auth_recover) <= _AUTH_RECOVER_TTL_S
+            )
+            if auth_recover is not None:
+                row["auth_recover"] = None  # clear it whether or not it's recent
             if intent and intent.get("to"):
                 to_account = str(intent["to"])
                 registry.clear_intent(reg, self.managed_id)
-                registry.write_registry(self.switcher, reg)
             else:
                 to_account = None
+            if do_auth_recover or to_account is not None or auth_recover is not None:
+                registry.write_registry(self.switcher, reg)
         finally:
             lock.release()
+        if do_auth_recover:
+            self._recover_auth()
+            return "auth"
         if to_account is not None:
             self._migrate(to_account)
             return "migrate"
@@ -228,6 +248,35 @@ class Supervisor:
             self._pending_resume_at = int(paused_until)
             return "pause"
         return None
+
+    def _recover_auth(self) -> None:
+        """Recover this session from a 401 so the NEXT turn re-authenticates.
+
+        First try to refresh + re-seed the SAME account's credentials in place
+        (``refresh_account_and_reseed`` owns the credential work). If that fails
+        the account is logged out: build the world (OUTSIDE the lock — it may do
+        network I/O), pick a healthy migration target, and re-point to it via the
+        existing credential-owning ``_migrate``. If no account has headroom either,
+        warn the user that every account needs a re-login and leave the session as
+        is — no crash, no relaunch loop.
+        """
+        if self.switcher.refresh_account_and_reseed(self.account, self.profile_dir):
+            print(f"\n{accent('Re-authenticated')} Account-{self.account}")
+            return
+        # Same-account refresh impossible (refresh token dead / logged out) ->
+        # migrate to a healthy account.
+        cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
+        reg = registry.read_registry(self.switcher)
+        acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+        sv = self._self_session_view()
+        target = balancer.choose_migration_target(sv, acct_views, {}, cfg)
+        if target:
+            self._migrate(target)
+        else:
+            warning(
+                "Managed session's account is logged out and no other account has "
+                "headroom. Re-login on one account (e.g. `cswap --add-account`)."
+            )
 
     # -- actions ----------------------------------------------------------
 

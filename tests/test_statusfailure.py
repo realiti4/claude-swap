@@ -89,6 +89,11 @@ def _intent(sw, managed_id: str):
     return (reg["sessions"][managed_id].get("migration") or {}).get("to")
 
 
+def _auth_recover(sw, managed_id: str):
+    reg = registry.read_registry(sw)
+    return reg["sessions"][managed_id].get("auth_recover")
+
+
 class TestStopFailureSafetyNet:
     def test_rate_limit_over_threshold_with_target_writes_intent(
         self, temp_home, monkeypatch
@@ -102,6 +107,37 @@ class TestStopFailureSafetyNet:
         statusline.run_statusfailure(sw, _stdin("rate_limit"))
 
         assert _intent(sw, managed_id) == "2"
+
+    def test_authentication_failed_sets_auth_recover_not_intent_under_threshold(
+        self, temp_home, monkeypatch
+    ):
+        # A 401 auth failure flags ``auth_recover`` on the row and records NO
+        # migration intent — even when the account is comfortably UNDER the
+        # exhaust threshold (auth isn't usage-driven).
+        sw = ClaudeAccountSwitcher()
+        profile_dir = sw.managed_dir / "auth-under"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile_dir))
+        managed_id = _setup(sw, profile_dir, own_pct=20.0, target_headroom=True)
+
+        statusline.run_statusfailure(sw, _stdin("authentication_failed"))
+
+        assert isinstance(_auth_recover(sw, managed_id), (int, float))
+        assert _intent(sw, managed_id) is None
+
+    def test_auth_variant_casing_sets_auth_recover(self, temp_home, monkeypatch):
+        # Tolerant matching: any error_type CONTAINING "auth" (any casing) flags
+        # an auth recovery, not a migration intent.
+        sw = ClaudeAccountSwitcher()
+        profile_dir = sw.managed_dir / "auth-variant"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile_dir))
+        managed_id = _setup(sw, profile_dir, own_pct=97.0, target_headroom=True)
+
+        statusline.run_statusfailure(sw, _stdin("Authentication_Error"))
+
+        assert isinstance(_auth_recover(sw, managed_id), (int, float))
+        assert _intent(sw, managed_id) is None
 
     def test_overloaded_writes_no_intent_even_over_threshold(
         self, temp_home, monkeypatch

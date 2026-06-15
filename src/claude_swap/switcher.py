@@ -1743,6 +1743,84 @@ class ClaudeAccountSwitcher:
             f"Seeded managed profile {profile_dir.name} -> account {account_num} ({email})"
         )
 
+    def refresh_account_and_reseed(self, account_num, profile_dir) -> bool:
+        """Refresh an account's OAuth token and re-seed a managed profile with it.
+
+        The 401 auto-recovery for a managed (``cswap launch``) session: when a
+        turn fails with a 401 the seeded creds are invalid/expired, so refresh the
+        account's BACKUP credentials and re-point the managed profile at the fresh
+        token, in place (claude re-reads them on its keychain-cache / 401 cycle).
+
+        Returns ``True`` when the profile now holds usable, fresh credentials and
+        ``False`` when the account can't be recovered (no backup creds, or its
+        refresh token is dead — i.e. the account is logged out and the caller
+        should migrate to a healthy account instead). Never raises.
+
+        Concurrency: the whole read-refresh-write-reseed runs under
+        ``FileLock(self.lock_file)`` so two managed sessions on the same account
+        serialize. The expiry re-check makes the second one a cheap reseed (the
+        first sibling already refreshed the shared backup). No network I/O races
+        the registry because this method touches credentials only — callers
+        (the supervisor's ``_recover_auth``) build the world OUTSIDE the lock.
+        """
+        account_num = str(account_num)
+        try:
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                self._logger.warning(
+                    "refresh_account_and_reseed: account %s not found", account_num
+                )
+                return False
+            email = record.get("email", "")
+
+            with FileLock(self.lock_file):
+                creds = self._read_account_credentials(account_num, email)
+                if not creds:
+                    self._logger.warning(
+                        "refresh_account_and_reseed: account %s has no backup creds",
+                        account_num,
+                    )
+                    return False
+
+                # A concurrent sibling on the same account may have already
+                # refreshed the shared backup. If the stored access token is
+                # still fresh, skip the network refresh and just re-seed.
+                oauth_data = oauth.extract_oauth_data(creds)
+                expires_at = oauth_data.get("expiresAt") if oauth_data else None
+                if not oauth.is_oauth_token_expired(expires_at):
+                    self.seed_profile_credentials(profile_dir, account_num, email)
+                    return True
+
+                refreshed = oauth.refresh_oauth_credentials(creds)
+                if not refreshed:
+                    # Refresh token is dead -> the account is logged out.
+                    self._logger.warning(
+                        "refresh_account_and_reseed: refresh failed for account %s "
+                        "(logged out?)",
+                        account_num,
+                    )
+                    return False
+
+                # Persist the fresh creds to the canonical backup, then re-seed the
+                # managed profile with them. ``_write_account_credentials`` is the
+                # existing canonical writer (its live-session stale-marking side
+                # effect is acceptable here).
+                self._write_account_credentials(account_num, email, refreshed)
+                self.seed_profile_credentials(profile_dir, account_num, email)
+                self._logger.info(
+                    "Re-authenticated account %s (%s) and re-seeded managed profile",
+                    account_num,
+                    email,
+                )
+                return True
+        except Exception:
+            self._logger.warning(
+                "refresh_account_and_reseed failed for account %s", account_num,
+                exc_info=True,
+            )
+            return False
+
     def _print_balancer_status(self) -> None:
         """Print the load-balancer (Beta) + embed-health section for ``status()``."""
         from claude_swap import embed, registry

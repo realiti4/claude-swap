@@ -191,6 +191,18 @@ def _run(switcher, stdin_text: str) -> int:
 _SERVER_SIDE_ERROR_TYPES = frozenset({"overloaded", "server_error"})
 
 
+def _is_auth_error(error_type: str) -> bool:
+    """Whether ``error_type`` indicates an authentication failure (a 401).
+
+    Documented values include ``"authentication_failed"``, but be tolerant of
+    casing/variants — any ``error_type`` *containing* ``"auth"`` is treated as
+    an auth failure (e.g. a "Please run /login · API Error: 401 Invalid
+    authentication credentials" turn). An absent/unknown ``error_type`` is NOT
+    auth (it falls through to the usage-driven 429 path).
+    """
+    return "auth" in error_type.lower()
+
+
 def run_statusfailure(switcher, stdin_text: str) -> int:
     """Entry point for ``cswap statusfailure`` (the ``StopFailure`` hook).
 
@@ -198,9 +210,14 @@ def run_statusfailure(switcher, stdin_text: str) -> int:
     threshold migration. Claude Code fires ``StopFailure`` when a turn ends due
     to an API error after retries are exhausted (the "Retrying … attempt N/10"
     storm). We can't rescue the failed turn — no hook can block a turn and claude
-    doesn't re-read creds on a 429 — but when the session's account is genuinely
-    rate-limited we record a migration *intent* so the owning supervisor
-    re-points it and the NEXT turn lands on a fresh account.
+    doesn't re-read creds on a 429/401 — but we record the owning supervisor's
+    *intent* so the NEXT turn recovers:
+
+    * a **429 rate limit** on an at/over-threshold account -> a migration intent
+      (the supervisor re-points the session to a fresh account); and
+    * a **401 auth failure** -> an ``auth_recover`` flag (the supervisor refreshes
+      and re-seeds this account's credentials, or migrates if the account is
+      logged out). Auth isn't usage-driven, so it is NOT gated on the threshold.
 
     Side-effect-only and bulletproof: never raises, always returns 0, and (like
     the statusline) only ever writes registry state — never credentials.
@@ -237,6 +254,24 @@ def _run_failure(switcher, stdin_text: str) -> int:
         return 0  # no registry row for this session
     own_account = str(row0.get("account_num", "") or "")
     if not own_account:
+        return 0
+
+    # (c) AUTH failure (a 401 "Please run /login"): the account's seeded creds are
+    # invalid/expired. This is NOT usage-driven, so don't gate it on the exhaust
+    # threshold and don't write a migration intent — flag ``auth_recover`` and let
+    # the owning supervisor refresh+re-seed the SAME account (or migrate if it's
+    # logged out). Credential work is the supervisor's job; we only flag intent.
+    if _is_auth_error(error_type):
+        lock = FileLock(switcher.lock_file, timeout=5)
+        if lock.acquire():
+            try:
+                reg = registry.read_registry(switcher)
+                row = reg.get("sessions", {}).get(managed_id)
+                if isinstance(row, dict):
+                    row["auth_recover"] = time.time()
+                    registry.write_registry(switcher, reg)
+            finally:
+                lock.release()
         return 0
 
     # (b) Skip plainly-not-account-specific failures: switching accounts can't

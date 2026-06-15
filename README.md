@@ -175,6 +175,11 @@ account so the **next** turn recovers — no manual switching. The failed turn
 itself is lost (no hook can rescue an in-flight turn — a Claude Code limitation),
 so this is a backstop, not a substitute for the proactive migration.
 
+A **401 auth failure** (a "Please run /login · API Error: 401" turn) auto-recovers
+the same way: cswap refreshes the account's token and re-seeds the session, and if
+the account is logged out it migrates the session to a healthy account (re-login on
+one account if they're all dead) — so the **next** turn re-authenticates.
+
 Want more margin? Lower the threshold in `cswap --balance` so the balancer
 migrates earlier and rarely reaches a hard limit.
 
