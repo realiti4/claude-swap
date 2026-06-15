@@ -68,7 +68,7 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
             ("Refresh credentials (current login, in-place)", "refresh"),
             ("List accounts (with usage)", "list"),
             ("Status", "status"),
-            ("Load balancer (Beta)", "balance"),
+            ("Auto-swap + multi-session load balancer (beta)", "balance"),
             ("Quit", "quit"),
         ]
         choice = _select_from(
@@ -177,7 +177,7 @@ def _do_refresh(stdscr, switcher: ClaudeAccountSwitcher) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Load balancer (Beta)
+# Auto-swap + multi-session load balancer (beta)
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +230,10 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             ("-- Back --", None),
         ]
         choice = _select_from(
-            stdscr, "Load balancer (Beta)", items=items, subtitle=subtitle
+            stdscr,
+            "Auto-swap + multi-session load balancer (beta)",
+            items=items,
+            subtitle=subtitle,
         )
         if choice is None:
             return
@@ -330,7 +333,7 @@ def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
     state = "ON" if cfg["enabled"] else "OFF"
     _draw_header(
         stdscr,
-        "Load balancer dashboard (Beta)",
+        "Auto-swap + multi-session load balancer — dashboard (beta)",
         f"{state} · threshold {cfg['threshold']}% · {len(sessions)} managed session(s)",
         cols,
     )

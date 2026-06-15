@@ -82,7 +82,7 @@ cswap run 2 --no-share          # don't share your ~/.claude customizations
 
 Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
 
-### Load balancer (Beta)
+### Auto-swap + multi-session load balancer (beta)
 
 Run several Claude Code sessions across all your accounts and let cswap keep them
 fed. When a session's account nears its usage limit, cswap migrates that session
@@ -224,7 +224,7 @@ The one limitation: a turn that still fails after all retries can't be auto-re-r
 > priming is useless and should be removed. Because priming spends real credits,
 > it ships **disabled by default** behind a dedicated opt-in — independent of the
 > balancer's own enable — and must be turned on explicitly:
-> `Set up cswap` → `Load balancer (Beta)` → `Prime idle 5h windows`.
+> `Set up cswap` → `Auto-swap + multi-session load balancer (beta)` → `Prime idle 5h windows`.
 
 If the fixed-from-first-use premise holds, an account you haven't used yet this
 window has an *unstarted* clock that won't reset for a full 5 hours after you
@@ -268,6 +268,15 @@ palette / plus-button.
 balancer's online reservation spreads them, so each pane **lands on a different
 account** — and each renders the same compact statusline as above. cswap pins
 every pane to its own profile, surviving cmux's `claude` wrapper.
+
+cswap works alongside cmux's **Claude Code Integration** toggle in either
+setting. With it **on**, cmux injects its session-tracking/notification hooks
+via the `--settings` flag, which Claude Code merges *additively* with each
+managed profile's `settings.json`; cswap's `statusLine` and `StopFailure`
+hook (the balancer's triggers) live in that profile and use events cmux
+doesn't touch, so both run side by side and your `CLAUDE_CONFIG_DIR` pin is
+preserved. With it **off**, cmux passes `claude` through untouched and cswap's
+profile settings drive everything. Nothing to configure either way.
 
 ### Refresh expired tokens
 
