@@ -191,6 +191,29 @@ class TestQolArgs:
         assert args[args.index("--fallback-model") + 1] == "haiku"
 
 
+class TestSessionEnv:
+    """The managed-session env: transient-resilience retry knob."""
+
+    def _sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        return Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+
+    def test_sets_default_max_retries(self, temp_home, monkeypatch):
+        # Extra in-turn retries so transient errors self-heal before failing a turn.
+        monkeypatch.delenv("CLAUDE_CODE_MAX_RETRIES", raising=False)
+        sup = self._sup(temp_home)
+        env = sup._session_env()
+        assert env["CLAUDE_CODE_MAX_RETRIES"] == "20"
+
+    def test_respects_user_set_max_retries(self, temp_home, monkeypatch):
+        # An explicit user override is never clobbered.
+        monkeypatch.setenv("CLAUDE_CODE_MAX_RETRIES", "3")
+        sup = self._sup(temp_home)
+        env = sup._session_env()
+        assert env["CLAUDE_CODE_MAX_RETRIES"] == "3"
+
+
 class TestSelfSessionView:
     """BUG 009: recovery paths must size the view with this session's ctx_tokens."""
 

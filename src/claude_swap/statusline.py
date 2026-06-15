@@ -190,6 +190,61 @@ def _run(switcher, stdin_text: str) -> int:
 # leaves them to claude's own retry / ``--fallback-model``.
 _SERVER_SIDE_ERROR_TYPES = frozenset({"overloaded", "server_error"})
 
+# Case-insensitive substrings that mark a TRANSIENT / network failure (a dropped
+# socket, connection reset, timeout, a brief 5xx / overload). These are not
+# account-level problems: switching accounts or refreshing creds wouldn't help
+# and could actively HARM (a "401 The socket connection was closed unexpectedly"
+# is a closed socket, not bad credentials). Extra in-turn retries
+# (``CLAUDE_CODE_MAX_RETRIES``) absorb these; the safety net deliberately ignores
+# them so it never misreacts to a connection glitch.
+_TRANSIENT_PATTERNS = (
+    "socket",
+    "connection",
+    "closed",
+    "timeout",
+    "timed out",
+    "econnreset",
+    "econnrefused",
+    "epipe",
+    "network",
+    "fetch failed",
+    "overloaded",
+    "server_error",
+    "503",
+    "502",
+    "504",
+)
+
+# StopFailure stdin field names that MAY carry a human-readable error message.
+# Claude Code's exact schema for this hook is unverified, so be tolerant: check a
+# few likely keys and stringify whatever is present.
+_MESSAGE_FIELDS = ("message", "error", "reason", "detail")
+
+
+def _failure_signal(payload: dict) -> str:
+    """All available error text from a StopFailure payload, lowercased.
+
+    Concatenates the ``error_type`` with any message-ish field (the field name is
+    unverified, so several likely keys are tried and stringified). Used purely for
+    transient/connection classification — never raises.
+    """
+    parts: list[str] = []
+    for key in ("error_type", *_MESSAGE_FIELDS):
+        val = payload.get(key)
+        if val is not None:
+            parts.append(str(val))
+    return " ".join(parts).lower()
+
+
+def _is_transient_error(signal: str) -> bool:
+    """Whether ``signal`` looks like a transient/network failure (case-insensitive).
+
+    ``signal`` is the already-lowercased concatenation of the error_type and any
+    message field (see :func:`_failure_signal`). A transient error is left entirely
+    alone by the safety net — no migration, no auth recovery.
+    """
+    return any(pat in signal for pat in _TRANSIENT_PATTERNS)
+
 
 def _is_auth_error(error_type: str) -> bool:
     """Whether ``error_type`` indicates an authentication failure (a 401).
@@ -213,6 +268,11 @@ def run_statusfailure(switcher, stdin_text: str) -> int:
     doesn't re-read creds on a 429/401 — but we record the owning supervisor's
     *intent* so the NEXT turn recovers:
 
+    * a **transient / connection failure** (dropped socket, reset, timeout, brief
+      5xx) -> NOTHING. This takes precedence over every other branch: it's not an
+      account-level problem (a "401 socket closed" is a closed socket, not bad
+      creds), so the extra in-turn retries (``CLAUDE_CODE_MAX_RETRIES``) absorb it
+      and the safety net leaves it strictly alone — no migration, no auth recovery;
     * a **429 rate limit** on an at/over-threshold account -> a migration intent
       (the supervisor re-points the session to a fresh account); and
     * a **401 auth failure** -> an ``auth_recover`` flag (the supervisor refreshes
@@ -248,12 +308,25 @@ def _run_failure(switcher, stdin_text: str) -> int:
     error_type = payload.get("error_type")
     error_type = error_type if isinstance(error_type, str) else ""
 
+    # Gather every available signal (error_type + any message-ish field, the field
+    # name is unverified so we're tolerant) for the transient/connection check.
+    signal = _failure_signal(payload)
+
     reg0 = registry.read_registry(switcher)
     row0 = reg0.get("sessions", {}).get(managed_id)
     if not isinstance(row0, dict):
         return 0  # no registry row for this session
     own_account = str(row0.get("account_num", "") or "")
     if not own_account:
+        return 0
+
+    # (0) TRANSIENT / connection failure (dropped socket, reset, timeout, brief
+    # 5xx). This is NOT an account-level problem — switching accounts or refreshing
+    # creds wouldn't help and a "401 socket closed" is a closed socket, not bad
+    # credentials — so do NOTHING and let claude's extra in-turn retries
+    # (CLAUDE_CODE_MAX_RETRIES) absorb it. This check takes PRECEDENCE over the auth
+    # and rate-limit branches so we never misreact to a connection glitch.
+    if _is_transient_error(signal):
         return 0
 
     # (c) AUTH failure (a 401 "Please run /login"): the account's seeded creds are

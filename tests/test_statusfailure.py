@@ -39,8 +39,10 @@ def _seed_accounts(switcher, accounts: dict) -> None:
     switcher._write_json(switcher.sequence_file, data)
 
 
-def _stdin(error_type: str | None, sid: str = "claude-sid") -> str:
-    """A StopFailure stdin payload with the given ``error_type``."""
+def _stdin(
+    error_type: str | None, sid: str = "claude-sid", *, message: str | None = None
+) -> str:
+    """A StopFailure stdin payload with the given ``error_type`` (+ optional message)."""
     payload = {
         "session_id": sid,
         "cwd": "/work",
@@ -48,6 +50,8 @@ def _stdin(error_type: str | None, sid: str = "claude-sid") -> str:
     }
     if error_type is not None:
         payload["error_type"] = error_type
+    if message is not None:
+        payload["message"] = message
     return json.dumps(payload)
 
 
@@ -107,6 +111,46 @@ class TestStopFailureSafetyNet:
         statusline.run_statusfailure(sw, _stdin("rate_limit"))
 
         assert _intent(sw, managed_id) == "2"
+
+    def test_transient_socket_message_is_a_no_op_even_with_auth_error_type(
+        self, temp_home, monkeypatch
+    ):
+        # The headline failure mode: error_type says "authentication_failed" but
+        # the message reveals it's a closed socket ("API Error: 401 The socket
+        # connection was closed unexpectedly"). Transient wins over auth -> NO
+        # auth_recover flag and NO migration intent. Even over threshold.
+        sw = ClaudeAccountSwitcher()
+        profile_dir = sw.managed_dir / "transient-auth"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile_dir))
+        managed_id = _setup(sw, profile_dir, own_pct=97.0, target_headroom=True)
+
+        rc = statusline.run_statusfailure(
+            sw,
+            _stdin(
+                "authentication_failed",
+                message="API Error: 401 The socket connection was closed unexpectedly",
+            ),
+        )
+
+        assert rc == 0
+        assert _auth_recover(sw, managed_id) is None
+        assert _intent(sw, managed_id) is None
+
+    def test_pure_connection_error_type_is_a_no_op(self, temp_home, monkeypatch):
+        # A plain connection error_type (no message) over threshold -> no-op:
+        # neither migration nor auth recovery, exits 0.
+        sw = ClaudeAccountSwitcher()
+        profile_dir = sw.managed_dir / "transient-conn"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile_dir))
+        managed_id = _setup(sw, profile_dir, own_pct=97.0, target_headroom=True)
+
+        rc = statusline.run_statusfailure(sw, _stdin("connection_error"))
+
+        assert rc == 0
+        assert _auth_recover(sw, managed_id) is None
+        assert _intent(sw, managed_id) is None
 
     def test_authentication_failed_sets_auth_recover_not_intent_under_threshold(
         self, temp_home, monkeypatch

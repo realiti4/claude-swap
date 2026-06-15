@@ -192,6 +192,17 @@ Managed sessions instead auto-fall-back to a secondary model via Claude's native
 cswap launch -- --fallback-model haiku   # your flag wins; cswap won't double-add
 ```
 
+**Transient/network errors** (a dropped socket, connection reset, timeout, a brief
+`502`/`503`/overload — e.g. "API Error: 401 The socket connection was closed
+unexpectedly") are handled separately from account problems. Managed sessions raise
+`CLAUDE_CODE_MAX_RETRIES` (default `20`, respecting your own override) so these get
+more in-turn retry-with-backoff and usually self-heal before the turn ever fails.
+The safety net deliberately **leaves them alone** — account migration is only for
+real rate limits, and credential refresh only for genuinely expired creds — so a
+connection glitch is never mistaken for bad credentials or an exhausted account.
+The one limitation: a turn that still fails after all retries can't be auto-re-run
+(a Claude Code limitation), so that single message is re-sent manually.
+
 #### cmux integration (Beta, macOS)
 
 If you use [cmux](https://cmux.com), wire the balancer into it:

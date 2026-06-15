@@ -53,6 +53,15 @@ _AUTH_RECOVER_TTL_S = 300.0
 # account switch. Override per-launch with ``cswap launch -- --fallback-model X``.
 _DEFAULT_FALLBACK_MODEL = "sonnet"
 
+# How many times claude retries a turn's API call before giving up. Managed
+# sessions raise this well above claude's default so TRANSIENT failures (a
+# dropped socket, connection reset, timeout, a brief 502/503/overload) get more
+# native retry-with-backoff and are far more likely to self-heal WITHIN the turn
+# — rather than failing the turn and bothering the StopFailure safety net (which
+# only handles account-level problems like 429/401, not transient network glitches).
+# Only applied when the user hasn't set ``CLAUDE_CODE_MAX_RETRIES`` themselves.
+_DEFAULT_MAX_RETRIES = "20"
+
 
 def launch(
     switcher, claude_args: list[str], *, cwd: str | None = None, share: bool = True
@@ -577,6 +586,11 @@ class Supervisor:
         effort = self.switcher.get_auto_balance_config()["effortLevel"]
         if effort:
             env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        # Transient resilience: give managed turns more native retry-with-backoff
+        # so a dropped socket / connection reset / timeout / brief 5xx self-heals
+        # within the turn instead of failing it. Respect an explicit user override.
+        if "CLAUDE_CODE_MAX_RETRIES" not in env:
+            env["CLAUDE_CODE_MAX_RETRIES"] = _DEFAULT_MAX_RETRIES
         # When launched inside a cmux workspace, the cmux-claude-wrapper strips
         # auth-selection env before exec'ing the real claude — which would drop
         # our CLAUDE_CONFIG_DIR profile pin. cmux honours an allow-list env key;
