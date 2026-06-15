@@ -317,6 +317,25 @@ def _validate(cli: str) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 
 
+def _unique_backup_path(path: Path) -> Path:
+    """A non-colliding ``.bak`` path for ``path``'s timestamped backup (BUG 013).
+
+    ``time.strftime`` has 1-second resolution and ``shutil.copy2`` overwrites, so
+    two setups in the same second would destroy the first backup. If the base
+    timestamped name already exists, append ``-1`` / ``-2`` / … until the path is
+    free, so every backup is preserved.
+    """
+    base = path.with_name(f"cmux.json.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        candidate = base.with_name(f"{base.name}-{n}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def setup(switcher) -> dict:
     """Install the "Balanced Claude (cswap)" surface into cmux.json.
 
@@ -342,7 +361,7 @@ def setup(switcher) -> dict:
     messages: list[str] = []
     backup_path: str | None = None
     if path.exists() and path.stat().st_size > 0:
-        backup = path.with_name(f"cmux.json.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+        backup = _unique_backup_path(path)
         try:
             shutil.copy2(path, backup)
             backup_path = str(backup)
@@ -421,15 +440,18 @@ def _list_workspace_count(cli: str) -> int:
 
 
 def _open_one_workspace(cli: str, cwd: str, command: str, name: str) -> bool:
-    """Create one workspace running ``command``, verifying it appeared.
+    """Create one workspace running ``command``.
 
     Uses ``cmux new-workspace --cwd … --command …`` — the documented headless
-    path (the command is sent to the new workspace's terminal). To defend against
-    the known "typed command silently dropped when unfocused" race, we verify the
-    workspace count grew and retry the create on failure.
+    path (the command is sent to the new workspace's terminal). A ``rc==0`` from
+    ``new-workspace`` is AUTHORITATIVE that the workspace was created, so we
+    return success immediately on it (BUG 010): the previous create→verify→retry
+    loop re-ran ``new-workspace`` whenever ``list-workspaces`` lagged behind the
+    create, producing DUPLICATE workspaces. We only retry on a subprocess error
+    or a non-zero exit; the post-create workspace count is read as a non-gating
+    debug signal, never a re-create trigger.
     """
     for attempt in range(1, _CREATE_VERIFY_RETRIES + 1):
-        before = _list_workspace_count(cli)
         try:
             cp = _run_cli(
                 cli,
@@ -447,11 +469,7 @@ def _open_one_workspace(cli: str, cwd: str, command: str, name: str) -> bool:
             time.sleep(_CREATE_VERIFY_DELAY_S)
             continue
         if cp.returncode == 0:
-            # Verify a new workspace actually appeared before declaring success.
-            time.sleep(_CREATE_VERIFY_DELAY_S)
-            after = _list_workspace_count(cli)
-            if before < 0 or after < 0 or after > before:
-                return True
+            return True
         time.sleep(_CREATE_VERIFY_DELAY_S)
     return False
 

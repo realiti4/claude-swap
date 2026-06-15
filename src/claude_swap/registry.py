@@ -34,9 +34,10 @@ Two layers live here on purpose:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from claude_swap.balancer import AccountView, SessionView
+from claude_swap.balancer import AccountView, SessionView, _pct_cost
 from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.models import get_timestamp
 from claude_swap.process_detection import is_pid_alive
@@ -47,6 +48,12 @@ REGISTRY_VERSION = 1
 # Drop a migration intent that has sat unconsumed for this long (its owning
 # supervisor is gone or wedged); the next rising edge re-derives it.
 _INTENT_TTL_S = 1800
+
+# A just-placed session (``rate_limits is None``) counts as synthetic load on its
+# account for this long after its ``reserved_at`` stamp, so concurrent launchers
+# don't all pile onto the same account before real usage lands. The reservation
+# naturally stops the moment real ``rate_limits`` arrive or the TTL expires.
+_RESERVE_TTL_S = 90
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +257,46 @@ def _max_pct(usage: dict | None) -> float | None:
     return _max_usage_pct(usage)
 
 
+def _reserve_load_by_account(rows: list[dict], now: float) -> dict[str, float]:
+    """Synthetic placement-reservation load per account (BUG 003).
+
+    A just-placed managed session has ``rate_limits=None`` (no usage reported
+    yet), so ``build_world`` would otherwise see zero load for it and every
+    concurrent launcher would pick the same account. To spread concurrent
+    ``cswap launch`` processes, each such not-yet-reported session counts as a
+    reservation worth :func:`balancer._pct_cost` of its context size, but only
+    while its ``reserved_at`` stamp is within :data:`_RESERVE_TTL_S`. The
+    reservation evaporates the moment real ``rate_limits`` arrive or the TTL
+    lapses, so it never lingers as phantom load.
+    """
+    reserve: dict[str, float] = {}
+    for e in rows:
+        if e.get("rate_limits") is not None:
+            continue
+        reserved_at = e.get("reserved_at")
+        if not isinstance(reserved_at, (int, float)):
+            continue
+        if (now - float(reserved_at)) > _RESERVE_TTL_S:
+            continue
+        acct = str(e.get("account_num", ""))
+        if not acct:
+            continue
+        reserve[acct] = reserve.get(acct, 0.0) + _pct_cost(int(e.get("ctx_tokens") or 0))
+    return reserve
+
+
+def _with_reserve(max_pct: float | None, reserve: float) -> float | None:
+    """Raise a known ``max_pct`` by the reservation load (clamped to 100).
+
+    Unknown usage (``max_pct is None``) is left as-is — an account with no usage
+    signal already has zero headroom and is never a target, so there is nothing
+    to reserve against.
+    """
+    if max_pct is None or reserve <= 0.0:
+        return max_pct
+    return min(100.0, max_pct + reserve)
+
+
 def build_world(
     switcher, reg: dict, *, fetch_idle: bool = True
 ) -> tuple[dict[str, AccountView], list[SessionView]]:
@@ -271,6 +318,11 @@ def build_world(
 
     rows = live_sessions(reg)
     sess_views = session_views(reg)
+
+    # Synthetic placement-reservation load (BUG 003): a just-placed session not
+    # yet reporting usage counts as load on its account so concurrent launchers
+    # spread instead of stacking. Folded into each account's max_pct below.
+    reserve = _reserve_load_by_account(rows, time.time())
 
     # Best live rate_limits per account (most-recently-seen wins).
     live_rl_by_account: dict[str, dict] = {}
@@ -294,13 +346,15 @@ def build_world(
         priority = _priority_of(info)
         email = info.get("email", "")
 
+        resv = reserve.get(num, 0.0)
+
         live_rl = live_rl_by_account.get(num)
         if live_rl is not None:
             usage = _rl_to_usage(live_rl)
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,
-                max_pct=_max_pct(usage),
+                max_pct=_with_reserve(_max_pct(usage), resv),
                 soonest_reset=soonest_blocking_reset(usage),
                 signal="live",
             )
@@ -314,7 +368,7 @@ def build_world(
         acct_views[num] = AccountView(
             num=num,
             priority=priority,
-            max_pct=_max_pct(usage) if isinstance(usage, dict) else None,
+            max_pct=_with_reserve(_max_pct(usage), resv) if isinstance(usage, dict) else None,
             soonest_reset=soonest_blocking_reset(usage) if isinstance(usage, dict) else None,
             signal="cache" if isinstance(usage, dict) else "none",
         )

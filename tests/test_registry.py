@@ -178,3 +178,74 @@ class TestBuildWorld:
         with FileLock(sw.lock_file):
             acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
         assert "1" in acct_views
+
+
+class TestPlacementReservation:
+    """BUG 003: a just-placed session not yet reporting usage counts as load."""
+
+    def test_reservation_raises_max_pct_for_fresh_session(self, temp_home: Path):
+        from claude_swap import balancer
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        now = time.time()
+        reg = registry.read_registry(sw)
+        # A reporting session establishes account "1" at 20%.
+        registry.upsert_session(
+            reg, "reporting", account_num="1", supervisor_pid=os.getpid(),
+            rate_limits={
+                "five_hour": {"used_percentage": 20.0, "resets_at": 2000},
+                "seven_day": {"used_percentage": 5.0, "resets_at": 9000},
+            },
+            last_seen=now,
+        )
+        # A freshly-placed session: no rate_limits yet, reserved just now, with a
+        # non-trivial context so _pct_cost is strictly positive.
+        registry.upsert_session(
+            reg, "fresh", account_num="1", supervisor_pid=os.getpid(),
+            reserved_at=now, ctx_tokens=100_000, last_seen=now,
+        )
+        registry.write_registry(sw, reg)
+
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        expected_reserve = balancer._pct_cost(100_000)
+        assert expected_reserve > 0
+        # max_pct of "1" is the live 20% raised by the reservation load.
+        assert acct_views["1"].max_pct == 20.0 + expected_reserve
+        assert acct_views["1"].signal == "live"
+
+    def test_reservation_expires_after_ttl(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        now = time.time()
+        reg = registry.read_registry(sw)
+        registry.upsert_session(
+            reg, "reporting", account_num="1", supervisor_pid=os.getpid(),
+            rate_limits={"five_hour": {"used_percentage": 20.0, "resets_at": 2000}},
+            last_seen=now,
+        )
+        # reserved_at is older than the TTL -> no synthetic load is added.
+        registry.upsert_session(
+            reg, "stale", account_num="1", supervisor_pid=os.getpid(),
+            reserved_at=now - registry._RESERVE_TTL_S - 1, ctx_tokens=100_000,
+            last_seen=now,
+        )
+        registry.write_registry(sw, reg)
+
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["1"].max_pct == 20.0  # unchanged
+
+    def test_reservation_left_alone_when_usage_unknown(self, temp_home: Path):
+        # An account with no usage signal stays max_pct=None even with a reserve.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        now = time.time()
+        reg = registry.read_registry(sw)
+        registry.upsert_session(
+            reg, "fresh", account_num="1", supervisor_pid=os.getpid(),
+            reserved_at=now, ctx_tokens=100_000, last_seen=now,
+        )
+        registry.write_registry(sw, reg)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["1"].max_pct is None
+        assert acct_views["1"].signal == "none"

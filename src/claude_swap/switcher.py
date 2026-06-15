@@ -346,6 +346,36 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
 
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically with 0600 perms.
+
+        Same mkstemp + ``os.write`` + ``os.close`` + ``os.replace`` + chmod
+        pattern as :meth:`_write_credentials` (the file-backup branch): the
+        rename is atomic, so a concurrent reader (e.g. a live claude reading a
+        managed profile's ``.credentials.json``) sees the old or the new file
+        whole, never a truncated one. Cleans up the temp file on any failure.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.close(fd)
+            fd = -1
+            os.replace(tmp_path, str(path))
+            if sys.platform != "win32":
+                os.chmod(str(path), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup credentials live in files vs. the Keychain.
 
@@ -1688,10 +1718,11 @@ class ClaudeAccountSwitcher:
         # A stale hashed keychain entry would shadow the fresh plaintext seed.
         delete_macos_keychain_entry(profile_dir)
 
+        # Write ATOMICALLY (mkstemp + os.replace) so a live claude reading the
+        # profile during a migrate-without-relaunch never observes a truncated
+        # file — it sees either the old credentials or the new ones, whole.
         creds_path = profile_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        self._atomic_write_text(creds_path, creds)
 
         # Merge identity into any existing profile config so projects/history
         # survive a re-point (mirrors session._bootstrap's merge).
@@ -1705,9 +1736,9 @@ class ClaudeAccountSwitcher:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        # ``_write_json`` commits via an atomic rename (+ chmod 0600), so claude's
+        # live read of ``.claude.json`` likewise never races a truncate+write.
+        self._write_json(config_path, existing)
         self._logger.info(
             f"Seeded managed profile {profile_dir.name} -> account {account_num} ({email})"
         )

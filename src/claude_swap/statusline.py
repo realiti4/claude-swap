@@ -91,14 +91,25 @@ def _run(switcher, stdin_text: str) -> int:
     row0 = reg0.get("sessions", {}).get(managed_id) or {}
     own_account = str(row0.get("account_num", "") or "")
     prev_max = row0.get("_prev_max_pct")
-    rising = (
+    # Plan when the account is at/over the exhaust threshold and not paused — on
+    # the rising EDGE (first crossing) OR, as a level-based re-arm, whenever the
+    # account is over threshold with no migration intent pending on the row (BUG
+    # 012). Without the re-arm, ``_prev_max_pct`` stays >= threshold every tick
+    # once crossed, so a migration intent that fails to consume (e.g. its target
+    # account vanished mid-flight) would never re-fire and the session would be
+    # stranded over-threshold until claude hard-exits.
+    over_threshold = (
         enabled
         and bool(own_account)
         and own_max is not None
         and own_max >= cfg.exhaust_threshold
-        and not (isinstance(prev_max, (int, float)) and prev_max >= cfg.exhaust_threshold)
         and not row0.get("paused_until")
     )
+    rising_edge = not (isinstance(prev_max, (int, float)) and prev_max >= cfg.exhaust_threshold)
+    no_pending_intent = not (
+        isinstance(row0.get("migration"), dict) and row0["migration"].get("to")
+    )
+    rising = over_threshold and (rising_edge or no_pending_intent)
 
     # Build the world OUTSIDE the lock only when we actually need to plan
     # (it may do network I/O for idle accounts). Prefer this tick's fresh usage

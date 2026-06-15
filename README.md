@@ -109,7 +109,7 @@ cswap --status                  # shows load-balancer state + embed health
 ```
 
 `--install` installs the statusline and QoL layer via a non-shared
-`settings.local.json` inside each managed profile, so plain `claude` and
+`settings.json` inside each managed profile, so plain `claude` and
 `cswap run` stay completely vanilla. It also runs automatically on upgrade.
 
 #### Launch a managed session

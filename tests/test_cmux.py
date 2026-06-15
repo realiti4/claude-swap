@@ -313,6 +313,80 @@ class TestSetup:
         with pytest.raises(SessionError, match="macOS-only"):
             cmux.setup(sw)
 
+    def test_two_setups_same_second_keep_distinct_backups(
+        self, temp_home, _macos_with_fake_cmux, monkeypatch
+    ):
+        """BUG 013: same-second backups must not overwrite each other."""
+        # Freeze the 1-second-resolution timestamp so both backups would collide
+        # under the old naming scheme.
+        monkeypatch.setattr(cmux.time, "strftime", lambda fmt: "20240101-120000")
+
+        cfg_path = cmux.config_path()
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text('{"commands": [{"name": "Mine", "command": "v1"}]}')
+
+        sw = ClaudeAccountSwitcher()
+        first = cmux.setup(sw)
+        assert first["backup_path"] is not None
+
+        # Mutate the live config so the second backup captures different bytes,
+        # then run setup again within the same (frozen) second.
+        cfg_path.write_text('{"commands": [{"name": "Mine", "command": "v2"}]}')
+        second = cmux.setup(sw)
+        assert second["backup_path"] is not None
+
+        # Distinct backup paths, both still on disk (the original is preserved).
+        assert first["backup_path"] != second["backup_path"]
+        assert Path(first["backup_path"]).exists()
+        assert Path(second["backup_path"]).exists()
+
+
+# --------------------------------------------------------------------------- #
+# _open_one_workspace — rc==0 is authoritative (no duplicate creates)
+# --------------------------------------------------------------------------- #
+
+
+class TestOpenWorkspace:
+    def test_rc_zero_returns_true_without_re_creating(self, monkeypatch):
+        """BUG 010: a single rc==0 new-workspace must not trigger a re-create."""
+        calls: list[tuple] = []
+
+        def fake_run_cli(cli, *args, **kwargs):
+            import subprocess
+
+            calls.append(args)
+            return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+
+        monkeypatch.setattr(cmux, "_run_cli", fake_run_cli)
+        ok = cmux._open_one_workspace("/fake/cmux", "/cwd", "cmd", "ws")
+        assert ok is True
+        # Exactly ONE new-workspace call — no verify-by-count re-create even if
+        # a list-workspaces read would have lagged.
+        new_ws_calls = [a for a in calls if a and a[0] == "new-workspace"]
+        assert len(new_ws_calls) == 1
+
+    def test_retries_on_nonzero_then_succeeds(self, monkeypatch):
+        rcs = iter([1, 0])
+
+        def fake_run_cli(cli, *args, **kwargs):
+            import subprocess
+
+            return subprocess.CompletedProcess(list(args), next(rcs), stdout="", stderr="")
+
+        monkeypatch.setattr(cmux, "_run_cli", fake_run_cli)
+        monkeypatch.setattr(cmux.time, "sleep", lambda *_: None)
+        assert cmux._open_one_workspace("/fake/cmux", "/cwd", "cmd", "ws") is True
+
+    def test_gives_up_after_all_nonzero(self, monkeypatch):
+        def fake_run_cli(cli, *args, **kwargs):
+            import subprocess
+
+            return subprocess.CompletedProcess(list(args), 2, stdout="", stderr="")
+
+        monkeypatch.setattr(cmux, "_run_cli", fake_run_cli)
+        monkeypatch.setattr(cmux.time, "sleep", lambda *_: None)
+        assert cmux._open_one_workspace("/fake/cmux", "/cwd", "cmd", "ws") is False
+
 
 # --------------------------------------------------------------------------- #
 # supervisor env: CMUX preserve-key wiring

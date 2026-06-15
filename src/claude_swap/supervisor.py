@@ -127,7 +127,14 @@ class Supervisor:
         proc = None  # stays None if Ctrl-C lands during the first Popen
         try:
             while True:
-                args = (["--resume", self._claude_session_id] if resume and self._claude_session_id
+                # Re-read claude's own session id from the registry row right
+                # before each Popen. The cached ``_claude_session_id`` is only
+                # refreshed in ``_set_pids`` (just AFTER the previous Popen,
+                # before the new claude has rendered its statusline), so relying
+                # on it would launch the first auto-resume fresh and leave later
+                # ones off-by-one. The authoritative value lives in the row.
+                sid = self._current_claude_session_id()
+                args = (["--resume", sid] if resume and sid
                         else list(base_args))
                 proc = subprocess.Popen([claude_bin, *args], env=env, cwd=self.cwd)
                 self._set_pids(proc.pid)
@@ -287,7 +294,7 @@ class Supervisor:
         is no tight relaunch loop. Interruptible via Ctrl-C.
         """
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
-        sv = balancer.SessionView(self.managed_id, self.account)
+        sv = self._self_session_view()
         while True:
             reg = registry.read_registry(self.switcher)
             acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
@@ -309,7 +316,7 @@ class Supervisor:
         """
         resume_at = getattr(self, "_pending_resume_at", int(time.time()))
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
-        sv = balancer.SessionView(self.managed_id, self.account)
+        sv = self._self_session_view()
         while True:
             now = time.time()
             remaining = int(resume_at - now)
@@ -339,7 +346,7 @@ class Supervisor:
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
         reg = registry.read_registry(self.switcher)
         acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
-        sv = balancer.SessionView(self.managed_id, self.account)
+        sv = self._self_session_view()
         if not balancer._usable(acct_views.get(self.account), cfg):
             target = balancer.choose_migration_target(sv, acct_views, {}, cfg)
             if target and target != self.account:
@@ -372,6 +379,12 @@ class Supervisor:
                 cwd=self.cwd,
                 supervisor_pid=os.getpid(),
                 last_seen=time.time(),
+                # Mark the moment this session was placed so concurrent launchers
+                # count it as load until its real usage lands (BUG 003): a
+                # freshly-registered row has ``rate_limits=None`` (zero apparent
+                # load), so without a reservation every parallel `cswap launch`
+                # picks the same account and breaks the `cmux N` spread.
+                reserved_at=time.time(),
             )
             registry.write_registry(self.switcher, reg)
 
@@ -418,6 +431,47 @@ class Supervisor:
         reg = registry.read_registry(self.switcher)
         acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
         return acct_views.get(self.account)
+
+    def _current_claude_session_id(self) -> str:
+        """Read claude's own session id for ``--resume`` from this session's row.
+
+        The statusline records ``claude_session_id`` once claude has rendered at
+        least once, so this is the authoritative value for an auto-resume — read
+        it fresh under the lock right before each (re)launch rather than trusting
+        the cached ``_claude_session_id`` (which lags by one Popen). Degrades to
+        ``""`` (launch fresh) when the lock can't be acquired or the row is gone.
+        """
+        lock = FileLock(self.switcher.lock_file, timeout=5)
+        if not lock.acquire():
+            return ""
+        try:
+            reg = registry.read_registry(self.switcher)
+            row = reg.get("sessions", {}).get(self.managed_id)
+            if row is None:
+                return ""
+            return row.get("claude_session_id", "") or ""
+        finally:
+            lock.release()
+
+    def _self_session_view(self) -> balancer.SessionView:
+        """Build this session's :class:`balancer.SessionView` from its registry row.
+
+        The recovery paths (pause/resume/reassign) feed the pure balancer a view
+        of *this* session. Reading the live row keeps ``ctx_tokens`` (and the
+        pause/migration/pin fields) accurate so the per-session cost reserve
+        (``_pct_cost``) and the placement gate aren't undersized by defaulting
+        everything to zero. Falls back to a bare view when the row is absent.
+        """
+        reg = registry.read_registry(self.switcher)
+        row = reg.get("sessions", {}).get(self.managed_id) or {}
+        return balancer.SessionView(
+            self.managed_id,
+            self.account,
+            ctx_tokens=int(row.get("ctx_tokens") or 0),
+            paused_until=row.get("paused_until"),
+            last_migrated_at=float(row.get("last_migrated_at") or 0.0),
+            pinned_account=row.get("pinned_account"),
+        )
 
     def _registry_mtime(self) -> float:
         try:
