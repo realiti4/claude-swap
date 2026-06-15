@@ -355,6 +355,15 @@ class Supervisor:
 
     # -- profile + registry helpers --------------------------------------
 
+    # Session-history items symlinked from the default ~/.claude into a managed
+    # profile so a balanced session is continuous with the user's normal claude
+    # history: `cswap launch -- --resume <id>` / `--continue` can resume sessions
+    # started with plain claude, and a managed session's own transcript shows up
+    # in the user's regular history. (Unlike `cswap run`, a balanced session is
+    # account-agnostic — it migrates across accounts — so per-account history is
+    # not wanted here. Credentials stay isolated; only history is shared.)
+    _SHARED_HISTORY = ("projects", "todos", "shell-snapshots")
+
     def _bootstrap_profile(self) -> None:
         self.switcher.managed_dir.mkdir(parents=True, exist_ok=True)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +375,31 @@ class Supervisor:
         self.switcher.seed_profile_credentials(self.profile_dir, num, email)
         SessionManager(self.switcher)._sync_sharing(self.profile_dir, self.share)
         embed.install_into_profile(self.switcher, self.profile_dir)
+        if self.share:
+            self._share_history()
+
+    def _share_history(self) -> None:
+        """Symlink the default profile's session history into this managed profile.
+
+        Makes ``--resume``/``--continue`` of externally-started sessions work and
+        unifies history. POSIX only (symlinks); on Windows a managed profile keeps
+        isolated history, so resuming a session started outside cswap is
+        unsupported there. Best-effort: a failure just leaves that item unshared.
+        """
+        if sys.platform == "win32":
+            return
+        source_root = Path.home() / ".claude"
+        for name in self._SHARED_HISTORY:
+            src = source_root / name
+            dest = self.profile_dir / name
+            if not src.exists() or dest.exists() or dest.is_symlink():
+                continue
+            try:
+                dest.symlink_to(src)
+            except OSError:
+                self._logger.debug(
+                    "could not share %s into managed profile", name, exc_info=True
+                )
 
     def _register(self) -> None:
         with FileLock(self.switcher.lock_file):

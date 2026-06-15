@@ -100,6 +100,71 @@ class TestAutoResumeSessionId:
         assert sup._current_claude_session_id() == ""
 
 
+class TestShareHistory:
+    """A shared balanced profile symlinks ~/.claude session history so
+    --resume/--continue can reach sessions started with plain ``claude``."""
+
+    def _make_sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        profile = temp_home / "managed_profile"
+        profile.mkdir()
+        return Supervisor(
+            sw, "mid", profile, "1", cwd=str(temp_home), share=True
+        )
+
+    def test_symlinks_existing_history_items(self, temp_home):
+        claude = temp_home / ".claude"
+        # Seed each shared item in the default ~/.claude with a sentinel inside.
+        for name in Supervisor._SHARED_HISTORY:
+            src = claude / name
+            src.mkdir()
+            (src / "marker.txt").write_text(name)
+
+        sup = self._make_sup(temp_home)
+        sup._share_history()
+
+        for name in Supervisor._SHARED_HISTORY:
+            dest = sup.profile_dir / name
+            assert dest.is_symlink(), f"{name} should be a symlink"
+            assert dest.resolve() == (claude / name).resolve()
+            # The shared content is reachable through the symlink.
+            assert (dest / "marker.txt").read_text() == name
+
+    def test_missing_source_items_are_skipped(self, temp_home):
+        claude = temp_home / ".claude"
+        # Only "projects" exists in the default home; the others are absent.
+        (claude / "projects").mkdir()
+
+        sup = self._make_sup(temp_home)
+        sup._share_history()
+
+        assert (sup.profile_dir / "projects").is_symlink()
+        for name in ("todos", "shell-snapshots"):
+            dest = sup.profile_dir / name
+            assert not dest.exists()
+            assert not dest.is_symlink()
+
+    def test_existing_real_dest_is_not_clobbered(self, temp_home):
+        claude = temp_home / ".claude"
+        (claude / "projects").mkdir()
+        (claude / "projects" / "from_home.txt").write_text("home")
+
+        sup = self._make_sup(temp_home)
+        # A real (non-symlink) dir already lives in the managed profile.
+        real_dest = sup.profile_dir / "projects"
+        real_dest.mkdir()
+        (real_dest / "local.txt").write_text("local")
+
+        sup._share_history()
+
+        # Left untouched: still a real directory, still holds its own content,
+        # and was not replaced by a symlink to ~/.claude.
+        assert real_dest.is_dir() and not real_dest.is_symlink()
+        assert (real_dest / "local.txt").read_text() == "local"
+        assert not (real_dest / "from_home.txt").exists()
+
+
 class TestSelfSessionView:
     """BUG 009: recovery paths must size the view with this session's ctx_tokens."""
 
