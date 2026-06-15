@@ -164,6 +164,26 @@ the box-drawing glyphs.
 > closest you can set outside a session. Please report rough edges via
 > [Issues](https://github.com/realiti4/claude-swap/issues).
 
+#### cmux integration (Beta, macOS)
+
+If you use [cmux](https://cmux.com), wire the balancer into it:
+
+```bash
+cswap cmux setup                # add a "Balanced Claude (cswap)" command to cmux
+cswap cmux 2                    # fan out 2 managed sessions, one per workspace
+cswap cmux 2 -- --resume        # forward args after '--' to each session's claude
+```
+
+`setup` backs up `~/.config/cmux/cmux.json` to a timestamped `.bak`, merges the
+surface idempotently (your other config is preserved), then validates and
+reloads. Afterwards you can spawn a load-balanced session from cmux's command
+palette / plus-button.
+
+`cswap cmux N` opens N cmux workspaces, each running `cswap launch`. The
+balancer's online reservation spreads them, so each pane **lands on a different
+account** — and each renders the same compact statusline as above. cswap pins
+every pane to its own profile, surviving cmux's `claude` wrapper.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -179,6 +199,8 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap launch                    # Start a load-balanced managed session (Beta)
+cswap cmux setup                # Add a balanced-Claude command to cmux (Beta, macOS)
+cswap cmux 2                    # Fan out 2 managed sessions across accounts in cmux
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --status                  # Show current account + load-balancer/embed health
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)

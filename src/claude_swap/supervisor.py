@@ -433,6 +433,14 @@ class Supervisor:
         effort = self.switcher.get_auto_balance_config()["effortLevel"]
         if effort:
             env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        # When launched inside a cmux workspace, the cmux-claude-wrapper strips
+        # auth-selection env before exec'ing the real claude — which would drop
+        # our CLAUDE_CONFIG_DIR profile pin. cmux honours an allow-list env key;
+        # ensure CLAUDE_CONFIG_DIR is on it (appending, never clobbering).
+        if env.get("CMUX_SURFACE_ID"):
+            from claude_swap.cmux import PRESERVE_KEYS_ENV, merge_preserve_keys
+
+            env[PRESERVE_KEYS_ENV] = merge_preserve_keys(env.get(PRESERVE_KEYS_ENV))
         return env
 
     def _qol_args(self, claude_args: list[str]) -> list[str]:

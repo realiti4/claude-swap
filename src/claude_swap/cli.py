@@ -171,6 +171,126 @@ def _launch_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _cmux_command(argv: list[str]) -> None:
+    """Handle ``cswap cmux <setup | [fanout] N> [-- <claude args>]``.
+
+    Pre-dispatched (like ``run``/``launch``): a positional subcommand can't coexist
+    with main()'s required mutually-exclusive group. macOS-only; emits a clean
+    error (no traceback) when cmux isn't installed or the host isn't macOS.
+
+      cswap cmux setup           install the "Balanced Claude (cswap)" surface
+      cswap cmux 2               fanout: open 2 balancer-managed workspaces
+      cswap cmux fanout 2        explicit fanout form
+      cswap cmux 2 -- --resume   forward args after '--' to each session's claude
+    """
+    if "--" in argv:
+        split = argv.index("--")
+        head, tail = argv[:split], argv[split + 1 :]
+    else:
+        head, tail = argv, []
+
+    parser = argparse.ArgumentParser(
+        prog="cswap cmux",
+        description=(
+            "[BETA] cmux integration (macOS). Install a balancer-managed Claude "
+            "surface into cmux, or fan out N workspaces that each land on a "
+            "different account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "target",
+        metavar="setup | [fanout] N",
+        help="'setup' to install the surface, or a count N to fan out N sessions",
+    )
+    parser.add_argument(
+        "count",
+        nargs="?",
+        metavar="N",
+        help="Number of workspaces (with the explicit 'fanout' form)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(head)
+
+    # Resolve the (subcommand, n) intent from the two positionals.
+    sub = args.target.lower()
+    if sub == "setup":
+        if args.count is not None:
+            parser.error("`cswap cmux setup` takes no count")
+        n = None
+    elif sub == "fanout":
+        if args.count is None:
+            parser.error("`cswap cmux fanout` requires a count, e.g. `cswap cmux fanout 2`")
+        n = _parse_positive_int(parser, args.count)
+    else:
+        # Bare `cswap cmux N` shorthand for fanout.
+        if args.count is not None:
+            parser.error(f"unexpected argument '{args.count}'")
+        n = _parse_positive_int(parser, args.target)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+        from claude_swap import cmux
+
+        if n is None:
+            status = cmux.setup(switcher)
+            _print_cmux_setup(status)
+        else:
+            status = cmux.fanout(switcher, n, tail)
+            _print_cmux_fanout(status)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _parse_positive_int(parser: argparse.ArgumentParser, value: str) -> int:
+    if not value.isdigit() or int(value) < 1:
+        parser.error(f"expected a positive integer count, got '{value}'")
+    return int(value)
+
+
+def _print_cmux_setup(status: dict) -> None:
+    """Render the result of ``cswap cmux setup``."""
+    if status["ok"]:
+        verb = "Updated" if status["changed"] else "Verified"
+        print(accent(f"{verb} the cswap surface in cmux."))
+        print(dimmed(
+            "Open it from cmux's command palette / plus-button as "
+            '"Balanced Claude (cswap)".'
+        ))
+        if status.get("backup_path"):
+            print(muted(f"Backed up cmux.json to {status['backup_path']}"))
+        if not status["reloaded"]:
+            warning("cmux did not reload automatically; run `cmux reload-config`.")
+    else:
+        error("cmux did not accept the config.")
+        for msg in status.get("messages", []):
+            warning(msg)
+        sys.exit(1)
+
+
+def _print_cmux_fanout(status: dict) -> None:
+    """Render the result of a ``cswap cmux N`` fanout."""
+    opened, requested = status["opened"], status["requested"]
+    print(accent(f"Opened {opened}/{requested} balancer-managed cmux workspace(s)."))
+    print(muted(f"Each runs: {status['command']}"))
+    accts = [a for a in status.get("accounts", []) if a]
+    if accts:
+        spread = (
+            "distinct accounts" if status["distinct_accounts"] > 1 else "account"
+        )
+        print(dimmed(f"Landed on {spread}: " + ", ".join(f"Account-{a}" for a in accts)))
+    for msg in status.get("messages", []):
+        warning(msg)
+
+
 def _parse_set_priority(value: str) -> tuple[str, int]:
     """Parse a ``NUM:PRIORITY`` argument for ``--set-priority``."""
     num, sep, pri = value.partition(":")
@@ -194,6 +314,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "launch":
         _launch_command(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "cmux":
+        _cmux_command(sys.argv[2:])
         return
 
     parser = argparse.ArgumentParser(
