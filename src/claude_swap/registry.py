@@ -483,9 +483,16 @@ def build_world(
             usage = _rl_to_usage(live_rl)
             h5_pct, h5_reset = _five_hour_signal(usage)
             d7_pct, d7_reset = _seven_day_signal(usage)
-            # Pay-as-you-go info isn't in the live signal — read it from the
-            # cached usage-API result for this account (best-effort).
-            extra_usage, spend_pct = _spend_signal(cached.get(num))
+            # Pay-as-you-go info isn't in the live statusline signal — it only
+            # comes from the usage API. Read it from the cached usage result; on a
+            # cold cache, fetch once (best-effort) so a live account's extra-usage
+            # capability isn't silently lost — which would otherwise wrongly PAUSE
+            # an API-rate-tier session instead of letting it spill to API rates.
+            spend_src = cached.get(num)
+            if spend_src is None and fetch_idle:
+                spend_src = _fetch_idle_usage(switcher, num, email)
+                fetched[num] = spend_src
+            extra_usage, spend_pct = _spend_signal(spend_src)
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,

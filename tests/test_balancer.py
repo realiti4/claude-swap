@@ -544,3 +544,47 @@ class TestApiRateLastResort:
             "3": AV("3", max_pct=None, extra_usage=True, spend_pct=20.0),   # most budget left
         }
         assert assign_new_session(accts, 0, NOW, CFG_API) == "3"
+
+    def test_pause_when_all_api_accounts_monthly_budget_exhausted(self):
+        # Every account is extra-usage-capable but all monthly budgets are maxed
+        # (spend_pct == cap) — nothing can serve, so the session pauses.
+        accts = {
+            "1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=100.0),  # current, exhausted + maxed
+            "2": AV("2", max_pct=99.0, extra_usage=True, spend_pct=100.0),  # other, maxed
+        }
+        assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, CFG_API)) == {"s1": "PAUSE"}
+
+    def test_expired_pause_keeps_on_current_extra_usage_when_api_enabled(self):
+        # A paused session whose timer has elapsed, stranded on an exhausted
+        # account that still has pay-as-you-go capacity, KEEPs (spills to API)
+        # rather than re-pausing — the resume path's API-tier interaction.
+        accts = {
+            "1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0),  # current, exhausted, extra-usage
+            "2": AV("2", max_pct=99.0),                                   # other subscription, exhausted
+        }
+        plan = rebalance(accts, [SV("s1", "1", paused=5000)], NOW, CFG_API)
+        assert _kinds(plan) == {"s1": "KEEP"}
+
+    def test_multiple_stranded_sessions_rank_api_by_budget(self):
+        # Two sessions stranded on an exhausted, non-extra-usage account both pick
+        # the lowest-spend API account. _rank_api_accounts ignores `projected` by
+        # design (spend_pct is server-side monthly tracking), so they may stack.
+        accts = {
+            "1": AV("1", max_pct=99.0),                                    # exhausted, no extra-usage
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=60.0),
+            "3": AV("3", max_pct=None, extra_usage=True, spend_pct=20.0),  # most budget left
+        }
+        plan = rebalance(accts, [SV("s1", "1"), SV("s2", "1")], NOW, CFG_API)
+        targets = {a.session_id: a.to_account for a in plan.actions if a.kind == "MIGRATE"}
+        assert targets == {"s1": "3", "s2": "3"}
+
+    def test_fresh_config_defaults_to_subscription_only(self):
+        # The critical default-safe guarantee, end-to-end through config parsing:
+        # a fresh install (no autoBalance / empty dict) is subscription-only, so
+        # an exhausted account with extra-usage never spills to API rates.
+        for raw in (None, {}):
+            cfg = config_from_dict(raw)
+            assert cfg.only_subscription is True
+            accts = {"1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0)}
+            assert assign_new_session(accts, 0, NOW, cfg) is None
+            assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, cfg)) == {"s1": "PAUSE"}

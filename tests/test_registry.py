@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from claude_swap import registry
 from claude_swap.cache import write_cache
@@ -186,6 +187,45 @@ class TestBuildWorld:
         with FileLock(sw.lock_file):
             acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
         assert "1" in acct_views
+
+    def _seed_live_session(self, sw):
+        reg = registry.read_registry(sw)
+        registry.upsert_session(
+            reg, "m1", account_num="1", supervisor_pid=os.getpid(),
+            rate_limits={"five_hour": {"used_percentage": 98.0, "resets_at": 2000}},
+            last_seen=time.time(),
+        )
+        registry.write_registry(sw, reg)
+        return reg
+
+    def test_live_account_fetches_spend_on_cold_cache(self, temp_home: Path):
+        # Regression: a LIVE account's pay-as-you-go capability must NOT be lost
+        # when the usage cache is cold. build_world fetches it once; the live
+        # signal still wins for the rate-limit numbers.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        reg = self._seed_live_session(sw)
+        fetched = {"extra_usage_enabled": True, "spend": {"pct": 12.0},
+                   "five_hour": {"pct": 5.0}}  # usage-API view; live signal wins for limits
+        with patch("claude_swap.registry._fetch_idle_usage", return_value=fetched) as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        av = acct_views["1"]
+        assert av.signal == "live"
+        assert av.max_pct == 98.0           # from the LIVE signal, not the fetch
+        assert av.extra_usage is True       # recovered from the cold-cache fetch
+        assert av.spend_pct == 12.0
+        m.assert_called_once()
+
+    def test_live_account_no_fetch_when_idle_disabled(self, temp_home: Path):
+        # With fetch_idle=False the cold-cache live account stays best-effort: no
+        # network, extra_usage unknown (False).
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        reg = self._seed_live_session(sw)
+        with patch("claude_swap.registry._fetch_idle_usage") as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["1"].extra_usage is False
+        m.assert_not_called()
 
 
 class TestPlacementReservation:
