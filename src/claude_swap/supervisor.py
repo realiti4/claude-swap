@@ -499,9 +499,16 @@ class Supervisor:
         account that is below the loose ``_usable`` line but still too full to
         actually host the session — the asymmetry that would otherwise cause a
         relaunch livelock.
+
+        When the API-rate last-resort tier is enabled (``not only_subscription``),
+        the current account staying runnable via its own pay-as-you-go capacity
+        also counts — ``choose_migration_target`` returns ``None`` in that case
+        (it keeps the session put rather than thrashing), so check it explicitly.
         """
+        cur = acct_views.get(self.account)
         return (
-            balancer._usable(acct_views.get(self.account), cfg)
+            balancer._usable(cur, cfg)
+            or (not cfg.only_subscription and balancer._api_capable(cur, cfg))
             or balancer.choose_migration_target(sv, acct_views, {}, cfg) is not None
         )
 

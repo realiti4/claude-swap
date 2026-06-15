@@ -224,10 +224,12 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             f"target {cfg['targetSafety']}%"
         )
         prime_state = "ON" if cfg.get("primeIdleWindows") else "OFF"
+        sub_only_state = "ON" if cfg.get("onlySubscriptionTokens", True) else "OFF"
         items: list[tuple[str, str | None]] = [
             ("Disable" if cfg["enabled"] else "Enable", "toggle"),
             (f"Set threshold (now {cfg['threshold']}%)", "threshold"),
             (f"Set target safety (now {cfg['targetSafety']}%)", "target"),
+            (f"Only use subscription tokens (pause rather than bill at API rates): {sub_only_state}", "sub_only"),
             (f"Keep 5h sessions warm (spends a very small amount of credits): {prime_state}", "prime"),
             ("Edit account priorities", "priorities"),
             ("Live dashboard", "dashboard"),
@@ -247,6 +249,13 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             _set_balance_int(stdscr, switcher, "threshold", "Migrate when usage reaches (%): ")
         elif choice == "target":
             _set_balance_int(stdscr, switcher, "target_safety", "Target safety ceiling (%): ")
+        elif choice == "sub_only":
+            # Default-ON cost guard: when on, a session pauses once every
+            # subscription account is exhausted instead of spilling into
+            # pay-as-you-go extra-usage / an API account. Off => API-rate tier.
+            switcher.set_auto_balance_config(
+                only_subscription_tokens=not cfg.get("onlySubscriptionTokens", True)
+            )
         elif choice == "prime":
             # Default-OFF, credit-spending opt-in (feature #3): toggle the
             # dedicated primeIdleWindows flag, independent of the balancer enable.

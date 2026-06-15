@@ -283,6 +283,12 @@ def build_usage_result(data: dict) -> dict | None:
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
+        # Record that pay-as-you-go / extra-usage is enabled REGARDLESS of whether
+        # the dollar-denominated spend line below can be built (it can't when
+        # ``monthly_limit`` is None = unlimited). The balancer's API-rate last-resort
+        # tier keys off this flag, so it must reflect capability, not just billing
+        # display. See ``balancer._api_capable``.
+        result["extra_usage_enabled"] = True
         # Claude Code returns nullable used_credits, monthly_limit, and utilization
         # (monthly_limit=None = unlimited). All three are needed to render the spend
         # line, so when any is null skip just the spend entry; five_hour/seven_day

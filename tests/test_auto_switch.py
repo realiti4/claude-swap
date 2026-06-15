@@ -180,16 +180,28 @@ class TestDoBalancer:
         assert switcher.get_auto_balance_config()["threshold"] == 80
 
     def test_toggle_prime_idle_windows(self, temp_home: Path):
-        # The "Prime idle 5h windows" item is at idx 3 (after Enable/threshold/
-        # target). Default OFF; one toggle turns it ON.
+        # The "Keep 5h sessions warm" item is at idx 4 (after Enable/threshold/
+        # target/only-subscription). Default OFF; one toggle turns it ON.
         switcher = ClaudeAccountSwitcher()
         assert switcher.get_auto_balance_config()["primeIdleWindows"] is False
+        screen = _stub_screen()
+        keys = [tui.curses.KEY_DOWN] * 4 + [10, 27]
+        screen.getch.side_effect = keys
+        with patch("claude_swap.tui.curses.curs_set"):
+            tui._do_balancer(screen, switcher)
+        assert switcher.get_auto_balance_config()["primeIdleWindows"] is True
+
+    def test_toggle_only_subscription_tokens(self, temp_home: Path):
+        # The "Only use subscription tokens" item is at idx 3 (after Enable/
+        # threshold/target). Default ON; one toggle turns it OFF.
+        switcher = ClaudeAccountSwitcher()
+        assert switcher.get_auto_balance_config()["onlySubscriptionTokens"] is True
         screen = _stub_screen()
         keys = [tui.curses.KEY_DOWN] * 3 + [10, 27]
         screen.getch.side_effect = keys
         with patch("claude_swap.tui.curses.curs_set"):
             tui._do_balancer(screen, switcher)
-        assert switcher.get_auto_balance_config()["primeIdleWindows"] is True
+        assert switcher.get_auto_balance_config()["onlySubscriptionTokens"] is False
 
 
 class TestPrimeIdleWindowsConfig:
@@ -214,6 +226,29 @@ class TestPrimeIdleWindowsConfig:
         cfg = sw.get_auto_balance_config()
         assert cfg["enabled"] is True
         assert cfg["primeIdleWindows"] is False
+
+
+class TestOnlySubscriptionTokensConfig:
+    """`onlySubscriptionTokens` defaults ON (never bill at API rates) and
+    round-trips through set/get."""
+
+    def test_defaults_on(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        assert sw.get_auto_balance_config()["onlySubscriptionTokens"] is True
+
+    def test_set_and_round_trip(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        sw.set_auto_balance_config(only_subscription_tokens=False)
+        assert sw.get_auto_balance_config()["onlySubscriptionTokens"] is False
+        sw.set_auto_balance_config(only_subscription_tokens=True)
+        assert sw.get_auto_balance_config()["onlySubscriptionTokens"] is True
+
+    def test_other_writes_preserve_it(self, temp_home: Path):
+        # Flipping it off must survive an unrelated config write.
+        sw = ClaudeAccountSwitcher()
+        sw.set_auto_balance_config(only_subscription_tokens=False)
+        sw.set_auto_balance_config(threshold=80)
+        assert sw.get_auto_balance_config()["onlySubscriptionTokens"] is False
 
 
 class TestEditPriorities:

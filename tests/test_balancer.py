@@ -24,10 +24,12 @@ CFG = BalancerConfig()  # exhaust 95, target 90, band 3 (no time cooldown)
 NOW = 10_000.0
 
 
-def AV(num, priority=0, max_pct=None, reset=None, signal="live", h5_pct=None, h5_reset=None):
+def AV(num, priority=0, max_pct=None, reset=None, signal="live", h5_pct=None, h5_reset=None,
+       extra_usage=False, spend_pct=None):
     return AccountView(
         num=num, priority=priority, max_pct=max_pct, soonest_reset=reset, signal=signal,
         five_hour_pct=h5_pct, five_hour_reset=h5_reset,
+        extra_usage=extra_usage, spend_pct=spend_pct,
     )
 
 
@@ -455,3 +457,90 @@ class TestFiveHourWarm:
         assert five_hour_warm(cold) is False
         assert accounts_needing_prime({"2": warm}, CFG) == []
         assert five_hour_warm(warm) is True
+
+
+# A config with the API-rate last-resort tier enabled (only_subscription off).
+CFG_API = BalancerConfig(only_subscription=False)
+
+
+class TestApiRateLastResort:
+    """Subscription accounts are always preferred; pay-as-you-go / API-rate
+    accounts (and exhausted-subscription-with-extra-usage) are a last resort,
+    gated behind ``only_subscription``."""
+
+    # -- default (only_subscription=True): API tier is never touched ---------
+
+    def test_default_never_places_new_session_on_api(self):
+        accts = {
+            "1": AV("1", max_pct=98.0),                                   # exhausted subscription
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=0.0),  # API-capable
+        }
+        # Subscription-only: no headroom => None (caller starts paused), never a2.
+        assert assign_new_session(accts, 0, NOW, CFG) is None
+
+    def test_default_pauses_rather_than_spill_into_extra_usage(self):
+        accts = {"1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0)}
+        assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, CFG)) == {"s1": "PAUSE"}
+
+    # -- API tier enabled: subscription STILL strictly preferred -------------
+
+    def test_subscription_preferred_over_api_even_at_lower_priority(self):
+        accts = {
+            "1": AV("1", priority=0, max_pct=50.0),                       # subscription headroom
+            "2": AV("2", priority=9, max_pct=None, extra_usage=True),     # API, higher priority
+        }
+        assert assign_new_session(accts, 0, NOW, CFG_API) == "1"
+
+    def test_api_used_only_when_no_subscription_headroom(self):
+        accts = {
+            "1": AV("1", max_pct=98.0),                                    # exhausted, no extra-usage
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=10.0),  # API-capable
+        }
+        assert assign_new_session(accts, 0, NOW, CFG_API) == "2"
+
+    def test_migrate_exhausted_to_subscription_not_api(self):
+        accts = {
+            "1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0),   # current, exhausted, extra-usage
+            "2": AV("2", max_pct=40.0),                                    # subscription headroom
+            "3": AV("3", max_pct=None, extra_usage=True, spend_pct=0.0),   # API
+        }
+        # Migrating to the subscription account saves money — preferred over API/stay.
+        assert _acts(rebalance(accts, [SV("s1", "1")], NOW, CFG_API)) == [("MIGRATE", "s1", "2")]
+
+    def test_keep_on_current_extra_usage_when_no_subscription_left(self):
+        accts = {
+            "1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0),   # current, exhausted, extra-usage
+            "2": AV("2", max_pct=99.0),                                    # other subscription, exhausted, no extra-usage
+        }
+        # Keep working on the current account's pay-as-you-go capacity — don't pause,
+        # don't thrash to a different API account.
+        assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, CFG_API)) == {"s1": "KEEP"}
+
+    def test_dead_current_migrates_to_api_elsewhere(self):
+        accts = {
+            "1": AV("1", max_pct=99.0),                                    # current exhausted, NO extra-usage
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=0.0),   # API-capable elsewhere
+        }
+        assert _acts(rebalance(accts, [SV("s1", "1")], NOW, CFG_API)) == [("MIGRATE", "s1", "2")]
+
+    def test_pause_when_neither_subscription_nor_api_can_serve(self):
+        accts = {
+            "1": AV("1", max_pct=99.0),  # exhausted, no extra-usage
+            "2": AV("2", max_pct=99.0),  # exhausted, no extra-usage
+        }
+        assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, CFG_API)) == {"s1": "PAUSE"}
+
+    def test_api_over_monthly_cap_is_not_usable(self):
+        accts = {
+            "1": AV("1", max_pct=98.0),                                      # exhausted subscription
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=100.0),   # API maxed monthly budget
+        }
+        assert assign_new_session(accts, 0, NOW, CFG_API) is None
+
+    def test_api_least_monthly_spend_chosen_first(self):
+        accts = {
+            "1": AV("1", max_pct=98.0),                                     # exhausted subscription
+            "2": AV("2", max_pct=None, extra_usage=True, spend_pct=60.0),
+            "3": AV("3", max_pct=None, extra_usage=True, spend_pct=20.0),   # most budget left
+        }
+        assert assign_new_session(accts, 0, NOW, CFG_API) == "3"

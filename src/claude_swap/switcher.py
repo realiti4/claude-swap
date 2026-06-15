@@ -1601,6 +1601,12 @@ class ClaudeAccountSwitcher:
             # premise (the 5h window being fixed-from-first-use, not rolling), so
             # it stays gated behind its own explicit opt-in until confirmed.
             "primeIdleWindows": bool(cfg.get("primeIdleWindows", False)),
+            # Default True: never spend tokens billed at API rates. A session
+            # whose subscription accounts are all exhausted pauses until a window
+            # resets rather than spilling into pay-as-you-go extra-usage / an API
+            # account. Set False to let those become a last-resort tier so work
+            # continues instead of stopping.
+            "onlySubscriptionTokens": bool(cfg.get("onlySubscriptionTokens", True)),
             "model": str(cfg.get("model") or "opus"),
             "effortLevel": str(cfg.get("effortLevel") or "xhigh"),
         }
@@ -1613,6 +1619,7 @@ class ClaudeAccountSwitcher:
         target_safety: int | None = None,
         hysteresis_band: int | None = None,
         prime_idle_windows: bool | None = None,
+        only_subscription_tokens: bool | None = None,
         model: str | None = None,
         effort_level: str | None = None,
     ) -> dict:
@@ -1644,6 +1651,8 @@ class ClaudeAccountSwitcher:
             cfg["hysteresisBand"] = max(0, int(hysteresis_band))
         if prime_idle_windows is not None:
             cfg["primeIdleWindows"] = bool(prime_idle_windows)
+        if only_subscription_tokens is not None:
+            cfg["onlySubscriptionTokens"] = bool(only_subscription_tokens)
         if model is not None:
             cfg["model"] = str(model)
         if effort_level is not None:
@@ -1654,6 +1663,7 @@ class ClaudeAccountSwitcher:
         cfg.setdefault("targetSafety", DEFAULT_TARGET_SAFETY)
         cfg.setdefault("hysteresisBand", DEFAULT_HYSTERESIS_BAND)
         cfg.setdefault("primeIdleWindows", False)
+        cfg.setdefault("onlySubscriptionTokens", True)
         cfg.setdefault("model", "opus")
         cfg.setdefault("effortLevel", "xhigh")
         # Keep targetSafety strictly below threshold (self-heals an odd combo).

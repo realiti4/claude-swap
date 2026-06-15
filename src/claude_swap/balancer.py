@@ -86,6 +86,13 @@ class BalancerConfig:
     target_safety: int = DEFAULT_TARGET_SAFETY
     hysteresis_band: int = DEFAULT_HYSTERESIS_BAND
     pause_fallback_s: int = DEFAULT_PAUSE_FALLBACK_S
+    # When True (the default), the balancer NEVER spends tokens billed at API
+    # rates: a session whose every *subscription* account is exhausted is paused
+    # until a window resets rather than spilling into pay-as-you-go extra-usage or
+    # an API/console account. When False, such accounts become a last-resort tier
+    # (used only after all subscription headroom is gone) so work continues instead
+    # of stopping. See :func:`_api_capable` / :func:`_rank_api_accounts`.
+    only_subscription: bool = True
 
 
 def config_from_dict(auto_balance: dict | None) -> BalancerConfig:
@@ -111,11 +118,15 @@ def config_from_dict(auto_balance: dict | None) -> BalancerConfig:
     if safety < 1:
         safety = 1
     band = max(0, _int("hysteresisBand", DEFAULT_HYSTERESIS_BAND))
+    # Default True: stay subscription-only (pause rather than bill at API rates)
+    # unless the user has explicitly opted into the API-rate last-resort tier.
+    only_subscription = bool(cfg.get("onlySubscriptionTokens", True))
     return BalancerConfig(
         exhaust_threshold=exhaust,
         target_safety=safety,
         hysteresis_band=band,
         pause_fallback_s=DEFAULT_PAUSE_FALLBACK_S,
+        only_subscription=only_subscription,
     )
 
 
@@ -150,6 +161,15 @@ class AccountView:
     # and weekly caps independently. ``None`` when usage is unknown.
     seven_day_pct: float | None = None
     seven_day_reset: int | None = None
+    # Pay-as-you-go capacity. ``extra_usage`` is True when the account can serve
+    # tokens past its subscription window at API rates (extra-usage / overflow
+    # billing enabled, or a pure API/console account). ``spend_pct`` is the monthly
+    # extra-usage budget utilization (0-100), used to skip an account that has
+    # maxed its monthly cap. Both feed the API-rate last-resort tier
+    # (:func:`_api_capable`), which is only ever consulted when
+    # ``cfg.only_subscription`` is False.
+    extra_usage: bool = False
+    spend_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +292,51 @@ def _fits(av: AccountView, projected: dict[str, float], cost: float, cfg: Balanc
 
 
 # --------------------------------------------------------------------------- #
+# API-rate last-resort tier (only consulted when ``cfg.only_subscription`` is
+# False) — accounts that can keep work going past their subscription window by
+# billing at pay-as-you-go / API rates.
+# --------------------------------------------------------------------------- #
+
+# Monthly extra-usage budget is a HARD cap (unlike the soft subscription
+# threshold): once spend hits 100% there is no pay-as-you-go capacity left.
+_SPEND_CAP_PCT = 100.0
+
+
+def _api_capable(av: AccountView | None, cfg: BalancerConfig) -> bool:
+    """Whether ``av`` can serve tokens at API rates right now (last resort).
+
+    True when the account has pay-as-you-go capacity — extra-usage / overflow
+    billing enabled (or a pure API/console account) — and its monthly extra-usage
+    budget is not maxed. Independent of the subscription window: an account with
+    subscription headroom is handled by the preferred tier (:func:`_rank_accounts`)
+    and only falls through to here once that window is exhausted. ``spend_pct``
+    unknown (``None``) is treated as having budget. Never True under
+    ``cfg.only_subscription`` callers (they don't consult this tier at all).
+    """
+    return (
+        av is not None
+        and av.extra_usage
+        and (av.spend_pct is None or av.spend_pct < _SPEND_CAP_PCT)
+    )
+
+
+def _rank_api_accounts(
+    acct_views: dict[str, AccountView], cfg: BalancerConfig
+) -> list[AccountView]:
+    """API-rate-capable accounts, best last-resort target first.
+
+    Ordering: least monthly extra-usage spent first (most pay-as-you-go budget
+    left, so we don't immediately hit a cap), then higher priority, then lowest
+    account number for a deterministic final tiebreak.
+    """
+    capable = [a for a in acct_views.values() if _api_capable(a, cfg)]
+    return sorted(
+        capable,
+        key=lambda a: (a.spend_pct if a.spend_pct is not None else 0.0, -a.priority, _num_key(a.num)),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Decisions
 # --------------------------------------------------------------------------- #
 
@@ -297,6 +362,12 @@ def assign_new_session(
     for a in _rank_accounts(acct_views, projected, cfg):
         if _fits(a, projected, cost, cfg):
             return a.num
+    # No subscription account has headroom. Unless we're subscription-only, fall
+    # back to the API-rate tier (last resort) so the session starts working
+    # instead of starting paused.
+    if not cfg.only_subscription:
+        for a in _rank_api_accounts(acct_views, cfg):
+            return a.num
     return None
 
 
@@ -320,6 +391,18 @@ def choose_migration_target(
             continue
         if _fits(a, projected, cost, cfg):
             return a.num
+    if cfg.only_subscription:
+        return None
+    # No subscription headroom. If the session's CURRENT account can keep going at
+    # API rates (extra-usage), stay put — don't thrash between API-rate accounts;
+    # ``None`` here tells the caller to KEEP it. Otherwise migrate to the
+    # best-budget API-rate account so work continues instead of pausing.
+    if _api_capable(acct_views.get(s.account_num), cfg):
+        return None
+    for a in _rank_api_accounts(acct_views, cfg):
+        if a.num == s.account_num:
+            continue
+        return a.num
     return None
 
 
@@ -491,7 +574,14 @@ def rebalance(
     for s in stranded:
         tgt = choose_migration_target(s, acct_views, projected, cfg)
         if tgt is None:
-            actions.append(pause_decision(s, acct_views, now, cfg))
+            # No subscription target. When the API-rate tier is enabled and the
+            # current account can still serve at API rates (extra-usage), KEEP the
+            # session there (it spills into pay-as-you-go) rather than pausing —
+            # "do anything besides stopping work". Otherwise pause until reset.
+            if not cfg.only_subscription and _api_capable(acct_views.get(s.account_num), cfg):
+                actions.append(Action("KEEP", s.session_id, s.account_num, s.account_num))
+            else:
+                actions.append(pause_decision(s, acct_views, now, cfg))
         elif tgt == s.account_num:  # defensive; choose_migration_target excludes current
             actions.append(Action("KEEP", s.session_id, s.account_num, s.account_num))
         else:

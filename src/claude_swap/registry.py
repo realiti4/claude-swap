@@ -334,6 +334,26 @@ def _seven_day_signal(usage: dict | None) -> tuple[float | None, int | None]:
     return pct, reset
 
 
+def _spend_signal(usage: dict | None) -> tuple[bool, float | None]:
+    """Return ``(extra_usage_enabled, spend_pct)`` from a usage-API result dict.
+
+    Only the usage API result (``oauth.build_usage_result``) carries pay-as-you-go
+    info — ``extra_usage_enabled`` and the dollar-denominated ``spend`` entry; the
+    live statusline ``rate_limits`` signal does NOT. So ``build_world`` reads this
+    from the cached usage even for a live account. ``spend_pct`` is the monthly
+    extra-usage budget utilization (0-100), or ``None`` when absent/unlimited.
+    Feeds the balancer's API-rate last-resort tier (:func:`balancer._api_capable`).
+    """
+    if not isinstance(usage, dict):
+        return False, None
+    enabled = bool(usage.get("extra_usage_enabled"))
+    spend = usage.get("spend")
+    pct = None
+    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+        pct = float(spend["pct"])
+    return enabled, pct
+
+
 def soonest_blocking_reset(usage: dict | None) -> int | None:
     """Return the epoch reset of the window that is *currently capping* an account.
 
@@ -463,6 +483,9 @@ def build_world(
             usage = _rl_to_usage(live_rl)
             h5_pct, h5_reset = _five_hour_signal(usage)
             d7_pct, d7_reset = _seven_day_signal(usage)
+            # Pay-as-you-go info isn't in the live signal — read it from the
+            # cached usage-API result for this account (best-effort).
+            extra_usage, spend_pct = _spend_signal(cached.get(num))
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,
@@ -473,6 +496,8 @@ def build_world(
                 five_hour_reset=h5_reset,
                 seven_day_pct=d7_pct,
                 seven_day_reset=d7_reset,
+                extra_usage=extra_usage,
+                spend_pct=spend_pct,
             )
             continue
 
@@ -484,6 +509,7 @@ def build_world(
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
         d7_pct, d7_reset = _seven_day_signal(usage) if is_usage else (None, None)
+        extra_usage, spend_pct = _spend_signal(usage) if is_usage else (False, None)
         acct_views[num] = AccountView(
             num=num,
             priority=priority,
@@ -494,6 +520,8 @@ def build_world(
             five_hour_reset=h5_reset,
             seven_day_pct=d7_pct,
             seven_day_reset=d7_reset,
+            extra_usage=extra_usage,
+            spend_pct=spend_pct,
         )
 
     # Persist any freshly-fetched idle usages back into the shared cache so the
