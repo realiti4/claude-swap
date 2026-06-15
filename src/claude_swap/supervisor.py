@@ -29,7 +29,7 @@ import time
 import uuid
 from pathlib import Path
 
-from claude_swap import balancer, embed, registry
+from claude_swap import balancer, embed, oauth, registry
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.printer import accent, dimmed, muted, warning
@@ -45,6 +45,12 @@ _WATCH_TICK_S = 1.0
 # hook flags should be consumed on the very next supervisor tick; a flag older than
 # this was left by a crash and is ignored (cleared without recovering).
 _AUTH_RECOVER_TTL_S = 300.0
+
+# Idle-5h-window priming (feature #3): the resident supervisor attempts a prime
+# sweep at most this often *per process* (a cheap local clock that avoids building
+# the world every tick); the cross-process gate (one sweep per interval across ALL
+# supervisors) is the registry ``last_primed_sweep_at`` stamp claimed under the lock.
+_PRIME_LOCAL_INTERVAL_S = 300.0
 
 # Secondary model managed sessions auto-fall-back to when the primary model is
 # overloaded (HTTP 529). Unlike a 429 rate limit (which is account-specific and
@@ -200,6 +206,11 @@ class Supervisor:
                 return ("exit", rc)
             except subprocess.TimeoutExpired:
                 pass
+            # Idle-5h-window priming rides this resident loop (NO new daemon): a
+            # best-effort sweep that self-gates to once per interval (locally and
+            # cross-process) and does its network I/O outside the lock, so it can't
+            # stall the tick on the common path or block any render.
+            self._maybe_prime_idle_windows()
             mtime = self._registry_mtime()
             if mtime == last_mtime:
                 continue
@@ -287,6 +298,128 @@ class Supervisor:
                 "headroom. Re-login on one account (e.g. `cswap --add-account`)."
             )
 
+    # -- idle-5h-window priming (feature #3) ------------------------------
+
+    def _maybe_prime_idle_windows(self) -> None:
+        """Best-effort prime sweep of idle managed accounts; never raises/blocks long.
+
+        Rides the resident watch loop (no new daemon). Self-gates three ways so it
+        is cheap and safe:
+
+        * a per-process local clock (skip most ticks without any I/O);
+        * the balancer must be enabled (priming only matters while balancing);
+        * a cross-process registry claim (``claim_prime_sweep`` under the lock) so
+          exactly ONE supervisor sweeps per interval — no thundering herd.
+
+        The decision of WHICH accounts to prime is the pure
+        ``balancer.accounts_needing_prime`` (built from a world snapshot OUTSIDE
+        the lock); each prime POST also runs OUTSIDE the lock. Only the sweep
+        claim and the per-account guard stamps touch the registry, under the lock.
+        Active accounts are never primed — only idle/inactive ones (we never touch
+        an in-use account's credentials).
+        """
+        try:
+            now = time.time()
+            if (now - getattr(self, "_last_prime_attempt", 0.0)) < _PRIME_LOCAL_INTERVAL_S:
+                return
+            self._last_prime_attempt = now
+            # Priming requires BOTH the balancer being enabled AND the dedicated,
+            # default-OFF ``primeIdleWindows`` opt-in: it spends real credits on the
+            # as-yet-unverified fixed-from-first-use 5h-window premise, so it must
+            # never run by default. (Kept after the cheap local-interval check so a
+            # disabled flag still costs ~nothing per tick.)
+            bcfg = self.switcher.get_auto_balance_config()
+            if not (bcfg["enabled"] and bcfg.get("primeIdleWindows")):
+                return
+
+            # (1) Claim the cross-process sweep under the lock (cheap, no network).
+            lock = FileLock(self.switcher.lock_file, timeout=5)
+            if not lock.acquire():
+                return
+            try:
+                reg = registry.read_registry(self.switcher)
+                if not registry.claim_prime_sweep(reg, now):
+                    return  # another supervisor owns this interval
+                registry.prune_primed(reg, now)
+                guarded = {
+                    num for num in reg.get("primed", {})
+                    if registry.prime_guarded(reg, num, now)
+                }
+                registry.write_registry(self.switcher, reg)
+            finally:
+                lock.release()
+
+            # (2) Build the world + decide candidates OUTSIDE the lock (network I/O).
+            cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
+            reg = registry.read_registry(self.switcher)
+            acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+            candidates = [
+                num for num in balancer.accounts_needing_prime(acct_views, cfg)
+                if num != self.account and num not in guarded
+            ]
+            if not candidates:
+                return
+
+            # (3) Prime each candidate OUTSIDE the lock; stamp successes under it.
+            for num in candidates:
+                if self._prime_one_account(num):
+                    self._stamp_primed(num)
+        except Exception:  # noqa: BLE001 - priming is strictly best-effort
+            self._logger.debug("prime sweep failed", exc_info=True)
+
+    def _prime_one_account(self, num: str) -> bool:
+        """Send one minimal credit-consuming call to start ``num``'s 5h window.
+
+        Best-effort, never raises. Reads the INACTIVE account's stored credentials,
+        refreshes an expired token (inactive accounts only — never an active one,
+        whose creds Claude Code owns) persisting under the lock, then performs the
+        prime POST OUTSIDE the lock. Returns whether the clock was started.
+        """
+        try:
+            num, email, _ = self.switcher.resolve_account(num)
+        except Exception:
+            return False
+        try:
+            creds = self.switcher.read_account_credentials(num, email)
+        except Exception:
+            self._logger.debug("prime: cannot read creds for %s", num, exc_info=True)
+            return False
+        if not creds:
+            return False
+        token = oauth.extract_access_token(creds)
+        if not token:
+            return False
+
+        # Refresh an expired token for this INACTIVE account, persisting under the
+        # lock via the same callback shape the usage path uses. A live session on
+        # this account => treat as active (don't rotate its refresh token).
+        data = oauth.extract_oauth_data(creds) or {}
+        if (
+            not self.switcher._live_session_pids(num, email)
+            and data.get("refreshToken")
+            and oauth.is_oauth_token_expired(data.get("expiresAt"))
+        ):
+            refreshed = oauth.refresh_oauth_credentials(creds)
+            if refreshed:
+                token = oauth.extract_access_token(refreshed) or token
+                try:
+                    with FileLock(self.switcher.lock_file, timeout=5):
+                        self.switcher._write_account_credentials(num, email, refreshed)
+                except Exception:
+                    self._logger.debug("prime: persist refreshed creds failed for %s", num, exc_info=True)
+        return oauth.prime_account(token)
+
+    def _stamp_primed(self, num: str) -> None:
+        lock = FileLock(self.switcher.lock_file, timeout=5)
+        if not lock.acquire():
+            return
+        try:
+            reg = registry.read_registry(self.switcher)
+            registry.stamp_primed(reg, num, time.time())
+            registry.write_registry(self.switcher, reg)
+        finally:
+            lock.release()
+
     # -- actions ----------------------------------------------------------
 
     def _migrate(self, to_account: str) -> None:
@@ -307,10 +440,23 @@ class Supervisor:
                 reg = registry.read_registry(self.switcher)
                 row = reg.get("sessions", {}).get(self.managed_id)
                 if row is not None:
+                    now = time.time()
                     row["account_num"] = num
-                    row["last_migrated_at"] = time.time()
+                    row["last_migrated_at"] = now
                     row["migration_count"] = int(row.get("migration_count", 0)) + 1
                     row["rate_limits"] = None    # don't judge the new account by old numbers
+                    # Re-arm the cross-process headroom reservation on the NEW account
+                    # (BUG-003): a just-migrated session is not yet reporting real
+                    # usage, so without this it would contribute ZERO synthetic load
+                    # and a second, independently-stranded session's separate
+                    # build_world pass would see this target as ~empty and stack onto
+                    # it, co-exhausting it. Stamping reserved_at makes
+                    # _reserve_load_by_account attribute _pct_cost(ctx_tokens) of load
+                    # to the new account for _RESERVE_TTL_S (exactly like a freshly
+                    # launched session) until the real rate_limits land — so the
+                    # second session sees the target as full and pauses/spreads
+                    # instead of stacking. Closes the co-exhaust race with no timer.
+                    row["reserved_at"] = now
                     row["_prev_max_pct"] = None   # fresh rising-edge basis on next tick
                     row["paused_until"] = None    # re-pointed to a fresh account -> running, not paused
                     row["migration"] = None

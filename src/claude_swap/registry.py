@@ -55,6 +55,18 @@ _INTENT_TTL_S = 1800
 # naturally stops the moment real ``rate_limits`` arrive or the TTL expires.
 _RESERVE_TTL_S = 90
 
+# Idle-5h-window priming (feature #3): a prime sweep runs at most once per this
+# interval across ALL resident supervisors (gated by the ``last_primed_sweep_at``
+# registry stamp under the lock — only one supervisor wins each interval, so N
+# supervisors never fire N redundant billable calls).
+_PRIME_SWEEP_INTERVAL_S = 300
+# After an account is primed, suppress re-priming it for this long. The prime POST
+# starts the window immediately, but the usage cache (which feeds the "started"
+# detection) can lag by its TTL; this per-account guard bridges that gap so a
+# second sweep can't double-bill before the started-window signal propagates. Once
+# the window shows started, the pure detection rejects it regardless of the guard.
+_PRIME_ACCOUNT_GUARD_S = 1800
+
 
 # --------------------------------------------------------------------------- #
 # State store (operates on a plain reg dict)
@@ -160,6 +172,62 @@ def clear_intent(reg: dict, session_id: str) -> None:
         entry["migration"] = None
 
 
+# --------------------------------------------------------------------------- #
+# Idle-5h-window prime guards (feature #3) — all operate on the reg dict under
+# the lock; the network prime itself runs OUTSIDE the lock in the supervisor.
+# --------------------------------------------------------------------------- #
+
+
+def claim_prime_sweep(reg: dict, now: float) -> bool:
+    """Claim the once-per-interval prime sweep; stamp it. Returns True if claimed.
+
+    Exactly one resident supervisor wins the claim per :data:`_PRIME_SWEEP_INTERVAL_S`
+    (the others see a recent stamp and bow out), so concurrent supervisors don't
+    each run a redundant sweep. The CALLER must hold the lock and persist ``reg``.
+    """
+    last = reg.get("last_primed_sweep_at", 0.0)
+    if isinstance(last, (int, float)) and (now - float(last)) < _PRIME_SWEEP_INTERVAL_S:
+        return False
+    reg["last_primed_sweep_at"] = now
+    return True
+
+
+def prime_guarded(reg: dict, num: str, now: float) -> bool:
+    """Whether account ``num`` was primed too recently to prime again (per-account guard).
+
+    Bridges the lag between a successful prime POST and the started-window signal
+    landing in the usage cache, so a second sweep can't double-bill the same
+    account in that gap.
+    """
+    primed = reg.get("primed")
+    if not isinstance(primed, dict):
+        return False
+    at = primed.get(str(num))
+    return isinstance(at, (int, float)) and (now - float(at)) < _PRIME_ACCOUNT_GUARD_S
+
+
+def stamp_primed(reg: dict, num: str, now: float) -> None:
+    """Record that account ``num`` was just primed. Caller holds the lock + persists."""
+    primed = reg.setdefault("primed", {})
+    if isinstance(primed, dict):
+        primed[str(num)] = now
+
+
+def prune_primed(reg: dict, now: float) -> bool:
+    """Drop per-account prime stamps older than the guard window. True if changed."""
+    primed = reg.get("primed")
+    if not isinstance(primed, dict):
+        return False
+    stale = [
+        num
+        for num, at in primed.items()
+        if not isinstance(at, (int, float)) or (now - float(at)) >= _PRIME_ACCOUNT_GUARD_S
+    ]
+    for num in stale:
+        primed.pop(num, None)
+    return bool(stale)
+
+
 def session_is_live(entry: dict) -> bool:
     pid = entry.get("supervisor_pid")
     return not isinstance(pid, int) or is_pid_alive(pid)
@@ -222,6 +290,28 @@ def _rl_to_usage(rate_limits: dict | None) -> dict | None:
                     norm["resets_at"] = int(resets)
                 out[window] = norm
     return out or None
+
+
+def _five_hour_signal(usage: dict | None) -> tuple[float | None, int | None]:
+    """Return ``(five_hour_pct, five_hour_reset)`` from a normalized usage dict.
+
+    Expects the ``{window: {pct, resets_at}}`` shape (the output of
+    :func:`_rl_to_usage` and of ``oauth.build_usage_result``). ``pct`` is the 5h
+    utilization percent; ``resets_at`` is the 5h reset epoch when present (the API
+    only emits one once the window is running). Either element is ``None`` when
+    absent — the idle-window priming detection treats a missing reset + ~0 pct as
+    an unstarted clock (see :func:`balancer.accounts_needing_prime`).
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    entry = usage.get("five_hour")
+    if not isinstance(entry, dict):
+        return None, None
+    pct = entry.get("pct")
+    pct = float(pct) if isinstance(pct, (int, float)) else None
+    reset = entry.get("resets_at")
+    reset = int(reset) if isinstance(reset, (int, float)) else None
+    return pct, reset
 
 
 def soonest_blocking_reset(usage: dict | None) -> int | None:
@@ -351,12 +441,15 @@ def build_world(
         live_rl = live_rl_by_account.get(num)
         if live_rl is not None:
             usage = _rl_to_usage(live_rl)
+            h5_pct, h5_reset = _five_hour_signal(usage)
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,
                 max_pct=_with_reserve(_max_pct(usage), resv),
                 soonest_reset=soonest_blocking_reset(usage),
                 signal="live",
+                five_hour_pct=h5_pct,
+                five_hour_reset=h5_reset,
             )
             continue
 
@@ -365,12 +458,16 @@ def build_world(
             usage = _fetch_idle_usage(switcher, num, email)
             fetched[num] = usage
 
+        is_usage = isinstance(usage, dict)
+        h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
         acct_views[num] = AccountView(
             num=num,
             priority=priority,
-            max_pct=_with_reserve(_max_pct(usage), resv) if isinstance(usage, dict) else None,
-            soonest_reset=soonest_blocking_reset(usage) if isinstance(usage, dict) else None,
-            signal="cache" if isinstance(usage, dict) else "none",
+            max_pct=_with_reserve(_max_pct(usage), resv) if is_usage else None,
+            soonest_reset=soonest_blocking_reset(usage) if is_usage else None,
+            signal="cache" if is_usage else "none",
+            five_hour_pct=h5_pct,
+            five_hour_reset=h5_reset,
         )
 
     # Persist any freshly-fetched idle usages back into the shared cache so the

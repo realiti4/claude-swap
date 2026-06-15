@@ -619,3 +619,53 @@ class TestFetchUsageForAccount:
         output = capsys.readouterr().out
         assert "failed to save refreshed token" in output
         assert "cswap --add-account" in output
+
+
+class TestPrimeAccount:
+    """The minimal credit-consuming call that starts an idle 5h window.
+
+    Every test MOCKS urllib — NO real prime call is ever made.
+    """
+
+    @staticmethod
+    def _resp(status: int):
+        resp = MagicMock()
+        resp.status = status
+        resp.read.return_value = b"{}"
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_2xx_starts_clock_returns_true(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=self._resp(200)) as m:
+            assert oauth.prime_account("tok-abc") is True
+        # Verify the request shape: POST /v1/messages with the OAuth beta header.
+        req = m.call_args[0][0]
+        assert req.full_url == "https://api.anthropic.com/v1/messages"
+        assert req.get_method() == "POST"
+        assert req.get_header("Authorization") == "Bearer tok-abc"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        body = json.loads(req.data.decode())
+        assert body["model"] == oauth.PRIME_MODEL
+        assert body["max_tokens"] == 1
+        assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+    def test_429_is_treated_as_already_started(self):
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=429, msg="Too Many Requests", hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.prime_account("tok-abc") is True  # window already running
+
+    def test_401_returns_false(self):
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=401, msg="Unauthorized", hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.prime_account("tok-abc") is False
+
+    def test_network_error_returns_false_never_raises(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError("boom")):
+            assert oauth.prime_account("tok-abc") is False

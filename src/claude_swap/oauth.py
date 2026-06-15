@@ -116,6 +116,14 @@ def build_token_status(credentials: str) -> str | None:
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
+def _epoch_seconds(resets_at: str) -> int | None:
+    """Parse an ISO-8601 reset timestamp to epoch seconds; ``None`` if unparseable."""
+    try:
+        return int(datetime.fromisoformat(resets_at).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
@@ -145,7 +153,12 @@ def format_reset(resets_at: str) -> tuple[str, str]:
 
 
 def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+    """Request raw utilization data from the Anthropic usage API.
+
+    Note: this is a READ and does NOT consume credits, so it does NOT start an
+    account's 5-hour rate-limit window. Use :func:`prime_account` to start the
+    clock on an idle window.
+    """
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -155,6 +168,60 @@ def request_usage_data(access_token: str) -> dict:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
+
+
+# The cheapest possible credit-consuming turn: Haiku 4.5, a 1-token prompt, and
+# max_tokens=1. One trivial billable turn is enough to START the account's 5h
+# rate-limit window (the window is anchored to the first credit-consuming call of
+# a cycle) so idle accounts' windows stay staggered and fresh capacity keeps
+# cycling online — see the priming feature in the README / supervisor.
+PRIME_MODEL = "claude-haiku-4-5"
+_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+
+
+def prime_account(access_token: str) -> bool:
+    """Send ONE minimal credit-consuming message to start the 5h window. Best-effort.
+
+    Uses the same subscription OAuth auth shape as :func:`request_usage_data`
+    (Bearer access token + the ``anthropic-beta: oauth-2025-04-20`` header). A
+    2xx response (even ``stop_reason: max_tokens``) means the clock started ->
+    ``True``. A 429 means the account is already rate-limited (its window is
+    already running) -> treated as a no-op success (``True``). Any other failure
+    (401 logged out, network error) -> ``False``. NEVER raises.
+
+    The caller MUST only pass an INACTIVE/idle account's token (an active account's
+    credentials are owned by Claude Code and must never be touched) and MUST make
+    this call OUTSIDE the registry FileLock (it is network I/O).
+    """
+    body = json.dumps({
+        "model": PRIME_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        _MESSAGES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        # 429: already rate-limited => the window is already started => no-op done.
+        if e.code == 429:
+            return True
+        _logger.debug("prime call failed: %r", e)
+        return False
+    except Exception as e:  # noqa: BLE001 - priming is best-effort, never fatal
+        _logger.debug("prime call failed: %r", e)
+        return False
 
 
 
@@ -169,6 +236,11 @@ def build_usage_result(data: dict) -> dict | None:
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
+            # Preserve the raw epoch reset alongside the formatted strings so the
+            # idle-window priming detection (which needs to tell a STARTED 5h
+            # window from an unstarted one) and ``soonest_blocking_reset`` work on
+            # cached usage too — not just on the live statusline signal.
+            h5_entry["resets_at"] = _epoch_seconds(h5["resets_at"])
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
@@ -176,6 +248,7 @@ def build_usage_result(data: dict) -> dict | None:
         d7_entry = {"pct": d7["utilization"]}
         if d7.get("resets_at"):
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
+            d7_entry["resets_at"] = _epoch_seconds(d7["resets_at"])
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")

@@ -249,3 +249,84 @@ class TestPlacementReservation:
         acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
         assert acct_views["1"].max_pct is None
         assert acct_views["1"].signal == "none"
+
+
+class TestFiveHourSignal:
+    """build_world populates the 5h-specific fields the prime detection needs."""
+
+    def test_live_account_carries_five_hour_fields(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        reg = registry.read_registry(sw)
+        registry.upsert_session(
+            reg, "m1", account_num="1", supervisor_pid=os.getpid(),
+            rate_limits={
+                "five_hour": {"used_percentage": 12.0, "resets_at": 2000},
+                "seven_day": {"used_percentage": 40.0, "resets_at": 9000},
+            },
+            last_seen=time.time(),
+        )
+        registry.write_registry(sw, reg)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["1"].five_hour_pct == 12.0
+        assert acct_views["1"].five_hour_reset == 2000
+
+    def test_idle_cache_account_unstarted_window(self, temp_home: Path):
+        # Cached usage with a 0% five_hour and no resets_at -> unstarted clock.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 10.0}}},
+        )
+        reg = registry.read_registry(sw)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["2"].five_hour_pct == 0.0
+        assert acct_views["2"].five_hour_reset is None  # no reset => unstarted
+        assert acct_views["2"].signal == "cache"
+
+    def test_unknown_account_has_no_five_hour_fields(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"3": ("c@x.com", 0)})
+        reg = registry.read_registry(sw)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+        assert acct_views["3"].five_hour_pct is None
+        assert acct_views["3"].five_hour_reset is None
+
+    def test_five_hour_signal_helper(self):
+        assert registry._five_hour_signal(None) == (None, None)
+        assert registry._five_hour_signal({}) == (None, None)
+        assert registry._five_hour_signal({"five_hour": {"pct": 5.0}}) == (5.0, None)
+        assert registry._five_hour_signal(
+            {"five_hour": {"pct": 5.0, "resets_at": 1234}}
+        ) == (5.0, 1234)
+
+
+class TestPrimeGuards:
+    """The registry-side prime sweep + per-account guards (feature #3)."""
+
+    def test_claim_prime_sweep_once_per_interval(self):
+        reg = registry._skeleton()
+        now = 1000.0
+        assert registry.claim_prime_sweep(reg, now) is True   # first claim wins
+        assert registry.claim_prime_sweep(reg, now + 1) is False  # too soon
+        later = now + registry._PRIME_SWEEP_INTERVAL_S + 1
+        assert registry.claim_prime_sweep(reg, later) is True  # interval elapsed
+
+    def test_prime_guard_blocks_recent_then_clears(self):
+        reg = registry._skeleton()
+        now = 1000.0
+        assert registry.prime_guarded(reg, "1", now) is False  # never primed
+        registry.stamp_primed(reg, "1", now)
+        assert registry.prime_guarded(reg, "1", now + 1) is True
+        assert registry.prime_guarded(reg, "1", now + registry._PRIME_ACCOUNT_GUARD_S + 1) is False
+
+    def test_prune_primed_drops_stale_stamps(self):
+        reg = registry._skeleton()
+        now = 1000.0
+        registry.stamp_primed(reg, "1", now)
+        registry.stamp_primed(reg, "2", now - registry._PRIME_ACCOUNT_GUARD_S - 1)
+        changed = registry.prune_primed(reg, now)
+        assert changed is True
+        assert "1" in reg["primed"]
+        assert "2" not in reg["primed"]

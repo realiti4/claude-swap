@@ -87,9 +87,20 @@ Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, comma
 Run several Claude Code sessions across all your accounts and let cswap keep them
 fed. When a session's account nears its usage limit, cswap migrates that session
 to a higher-priority account that still has headroom — concentrating load on your
-top accounts and only spilling to the next tier when one fills up. Migrations are
-minimized (each one re-bills the context window), so a session only moves when its
-account is actually exhausted, never for a marginal gain.
+top accounts and only spilling to the next tier when one fills up. Among accounts
+of the same priority, load spreads to the least-used one, so equal-priority
+accounts stay evenly used. Migrations are minimized (each one re-bills the context
+window), so a session only moves when its account is actually exhausted, never for
+a marginal gain.
+
+There's **no fixed cooldown timer** holding back a needed switch — a session
+stranded on a freshly-exhausted account moves immediately. Thrashing is instead
+prevented *algorithmically*: cswap acts only on the moment an account crosses the
+threshold (a rising edge, not every message), only picks a target that will stay
+under its safety ceiling after the move (so it can't immediately re-exhaust), and
+won't treat an exhausted account as a valid target again until it recovers past a
+hysteresis band. A concurrent online reservation keeps two sessions from landing
+on the same account at once.
 
 Only one subscription? There's nowhere to migrate, so cswap **pauses** the session
 instead and **auto-resumes** it (via `claude --resume`) the moment the limit
@@ -143,8 +154,8 @@ cswap --balance                 # settings + live dashboard (enable/disable, tun
 ```
 
 The dashboard shows which sessions are on which accounts, live, and is where you
-**enable** the balancer (it's opt-in/off by default), set the threshold/target/
-cooldown, and edit priorities.
+**enable** the balancer (it's opt-in/off by default), set the threshold and target
+safety, and edit priorities.
 
 #### Statusline
 
@@ -202,6 +213,41 @@ real rate limits, and credential refresh only for genuinely expired creds — so
 connection glitch is never mistaken for bad credentials or an exhausted account.
 The one limitation: a turn that still fails after all retries can't be auto-re-run
 (a Claude Code limitation), so that single message is re-sent manually.
+
+#### Idle-window priming (Beta, experimental — default OFF, opt-in)
+
+> **Unverified premise — opt-in only.** This feature assumes a Claude
+> subscription's 5-hour limit window is *fixed-from-first-use* (it starts counting
+> on the first credit-consuming request of a cycle and resets a fixed 5 hours
+> later), rather than a rolling trailing-5h window. That assumption has **not yet
+> been confirmed against a live account**. If the window turns out to be rolling,
+> priming is useless and should be removed. Because priming spends real credits,
+> it ships **disabled by default** behind a dedicated opt-in — independent of the
+> balancer's own enable — and must be turned on explicitly:
+> `Set up cswap` → `Load balancer (Beta)` → `Prime idle 5h windows`.
+
+If the fixed-from-first-use premise holds, an account you haven't used yet this
+window has an *unstarted* clock that won't reset for a full 5 hours after you
+first touch it. To keep fresh 5h capacity cycling online, when priming is enabled
+cswap sends one minimal, cheapest-model request (Haiku, a 1-token prompt,
+`max_tokens: 1`) to each idle managed account to start its clock, so windows stay
+staggered instead of all starting at once.
+
+It is conservative and credit-frugal:
+
+- Only accounts whose 5h window is genuinely **unstarted** (read via the usage
+  API, which itself doesn't bill) are primed — never an account already running
+  a window, already weekly-capped, in active use, or whose usage is unknown.
+- Each account is primed **at most once per window**; a per-account guard plus a
+  shared once-per-interval sweep stamp mean that even with several managed
+  sessions running, exactly one of them primes each account per interval (no
+  duplicate billable calls).
+- Priming rides the **resident session supervisor** — there is still no daemon and
+  no polling loop, and it never blocks the statusline render. The tiny prime
+  requests run in the background of an already-running managed session.
+
+Priming stages fresh **5-hour** capacity; it does not create weekly (7-day)
+capacity, so an account whose 7d cap is the binding limit is left alone.
 
 #### cmux integration (Beta, macOS)
 

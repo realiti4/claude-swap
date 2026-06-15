@@ -16,12 +16,21 @@ plumbing.
 The model in one paragraph: new sessions are placed on the **highest-priority**
 account that has headroom, so load naturally *concentrates* on high-priority
 accounts and only spills to the next tier when one fills up (you "burn through"
-high-priority accounts first). A session is **migrated only when its current
-account is exhausted** — never for a marginal gain — and three independent
-brakes (a rising-edge trigger applied by the caller, a per-session cooldown, and
-a hysteresis band) stop a session from bouncing between accounts. When nothing
+high-priority accounts first). Among accounts of the *same* priority, placement
+prefers the **least-used** (most projected headroom) so equal-priority accounts
+stay evenly used over time. A session is **migrated only when its current
+account is exhausted** — never for a marginal gain — and three independent,
+*algorithmic* brakes (no timers) stop a session from bouncing between accounts:
+a rising-edge trigger applied by the caller (act only on the not-exhausted ->
+exhausted transition), the ``target_safety`` ceiling (a target's projected usage
+after placement must leave headroom, so a move never immediately re-exhausts it),
+and a hysteresis band (an exhausted account isn't a valid target until it
+recovers below ``threshold - band``). An online headroom reservation keeps two
+concurrently-stranded sessions from co-exhausting the same target. When nothing
 has headroom, sessions are **paused** until the soonest rate-limit window
-resets, and resumed automatically.
+resets, and resumed automatically. There is deliberately **no fixed time
+cooldown** — a genuinely-needed switch (a session stranded on a freshly-exhausted
+account) is never blocked by a timer.
 """
 
 from __future__ import annotations
@@ -44,11 +53,17 @@ DEFAULT_TARGET_SAFETY = 90
 # points below the exhaust threshold — absorbs the chunky, API-call-only jitter
 # of the statusline's ``used_percentage`` so accounts don't flap at the boundary.
 DEFAULT_HYSTERESIS_BAND = 3
-# Minimum seconds between migrations of the same session — the hard rate limit
-# that prevents A->B->A thrashing (each migration re-bills the context window).
-DEFAULT_MIGRATION_COOLDOWN = 600
 # Pause horizon when no reset time is known anywhere (defensive fallback).
 DEFAULT_PAUSE_FALLBACK_S = 3600
+
+# A 5h window is treated as UNSTARTED (a priming candidate) when its utilization
+# is at or below this many points. The Claude subscription 5h window is anchored
+# to the first credit-consuming call of a cycle: an account that has sent nothing
+# this window reports ~0% with no concrete reset timestamp. The small epsilon
+# absorbs the chunky, API-rounded ``utilization`` so a genuinely-idle window isn't
+# missed (and a started one — pct above this, or a real future reset — is left
+# alone so we never burn a credit re-priming an already-running clock).
+PRIME_FIVE_HOUR_EPSILON = 0.5
 
 # Per-session headroom reserve, in utilization points, debited from a target
 # when a session is (re)placed within a single balancing pass. A fixed base plus
@@ -70,7 +85,6 @@ class BalancerConfig:
     exhaust_threshold: int = DEFAULT_EXHAUST_THRESHOLD
     target_safety: int = DEFAULT_TARGET_SAFETY
     hysteresis_band: int = DEFAULT_HYSTERESIS_BAND
-    migration_cooldown: int = DEFAULT_MIGRATION_COOLDOWN
     pause_fallback_s: int = DEFAULT_PAUSE_FALLBACK_S
 
 
@@ -97,12 +111,10 @@ def config_from_dict(auto_balance: dict | None) -> BalancerConfig:
     if safety < 1:
         safety = 1
     band = max(0, _int("hysteresisBand", DEFAULT_HYSTERESIS_BAND))
-    cooldown = max(0, _int("cooldownSeconds", DEFAULT_MIGRATION_COOLDOWN))
     return BalancerConfig(
         exhaust_threshold=exhaust,
         target_safety=safety,
         hysteresis_band=band,
-        migration_cooldown=cooldown,
         pause_fallback_s=DEFAULT_PAUSE_FALLBACK_S,
     )
 
@@ -125,6 +137,14 @@ class AccountView:
     # resets (the window equal to ``max_pct``); ``None`` if unknown.
     soonest_reset: int | None = None
     signal: str = "none"  # "live" (statusline) | "cache" (usage API) | "none"
+    # The 5h-window-specific utilization + reset, used ONLY by the idle-window
+    # priming detection (:func:`accounts_needing_prime`). ``five_hour_pct`` is the
+    # 5h utilization percent (distinct from ``max_pct``, which is max(5h, 7d));
+    # ``five_hour_reset`` is the 5h window's reset epoch when the clock is running
+    # (``None`` when the window is unstarted — the signal we prime on). Both are
+    # ``None`` when usage is unknown.
+    five_hour_pct: float | None = None
+    five_hour_reset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +156,9 @@ class SessionView:
     ctx_tokens: int = 0
     last_seen: float = 0.0
     paused_until: int | None = None
+    # Telemetry only (timestamp of the last migration). NOTHING in the balancer
+    # gates on this — anti-thrash is purely algorithmic (rising-edge + target
+    # safety + hysteresis + online reservation), never a time cooldown.
     last_migrated_at: float = 0.0
     pinned_account: str | None = None  # user hard-pin; never migrated/paused
 
@@ -192,8 +215,15 @@ def _usable(av: AccountView | None, cfg: BalancerConfig) -> bool:
     )
 
 
-def _in_cooldown(s: SessionView, now: float, cfg: BalancerConfig) -> bool:
-    return (now - s.last_migrated_at) < cfg.migration_cooldown
+def _projected_headroom(av: AccountView, projected: dict[str, float]) -> float:
+    """Headroom remaining after the in-pass online reservation is debited.
+
+    ``100 - (current usage + reserved load)``. Higher = less-used = a better
+    target for an equal-priority tiebreak (keeps same-priority accounts evenly
+    used over time). Unknown-usage accounts never reach here (``_usable`` filters
+    them out), so ``max_pct`` is always a number.
+    """
+    return 100.0 - (av.max_pct + projected.get(av.num, 0.0))
 
 
 def _rank_accounts(
@@ -203,16 +233,25 @@ def _rank_accounts(
 ) -> list[AccountView]:
     """Usable accounts, best target first.
 
-    Ordered by: highest priority (burn high-priority first), then most
-    projected headroom within a priority tier, then lowest account number for
-    determinism.
+    Ordering (a single deterministic sort key):
+
+    1. **highest priority first** — load concentrates on / burns through
+       high-priority accounts before spilling to the next tier;
+    2. **least-used first within a priority tier** — most projected headroom
+       (current usage plus the in-pass online reservation) wins, so accounts of
+       *equal* priority are filled evenly rather than always hammering the same
+       one (EQUAL-PRIORITY EVEN USAGE). This governs *where* a session lands; the
+       only-switch-when-exhausted rule still governs *whether* it switches at all;
+    3. **lowest account number** — a deterministic final tiebreak so two
+       equal-priority, equal-headroom accounts always order the same way
+       regardless of dict iteration order.
     """
     usable = [a for a in acct_views.values() if _usable(a, cfg)]
     return sorted(
         usable,
         key=lambda a: (
             -a.priority,
-            -(100.0 - (a.max_pct + projected.get(a.num, 0.0))),
+            -_projected_headroom(a, projected),
             _num_key(a.num),
         ),
     )
@@ -242,8 +281,11 @@ def assign_new_session(
     """Pick the account a brand-new managed session should launch on.
 
     The highest-priority usable account whose projected utilization stays within
-    ``target_safety`` after placing this session. Returns the account number, or
-    ``None`` when nothing has room (the caller then starts the session paused).
+    ``target_safety`` after placing this session. Among accounts of the *same*
+    priority the **least-used** (most projected headroom) is chosen, so repeated
+    placements spread evenly across equal-priority accounts instead of stacking
+    on one (see :func:`_rank_accounts`). Returns the account number, or ``None``
+    when nothing has room (the caller then starts the session paused).
     """
     projected = projected if projected is not None else {num: 0.0 for num in acct_views}
     cost = _pct_cost(ctx_tokens)
@@ -261,9 +303,11 @@ def choose_migration_target(
 ) -> str | None:
     """Best account to migrate ``s`` to, excluding its current account.
 
-    Highest priority first; only an account whose projected utilization stays
-    within ``target_safety`` qualifies (so a move never immediately re-exhausts
-    the target — the move-then-exhaust trap). ``None`` => the caller pauses.
+    Highest priority first, then the **least-used** account within that priority
+    tier (most projected headroom — keeps equal-priority accounts evenly used);
+    only an account whose projected utilization stays within ``target_safety``
+    qualifies (so a move never immediately re-exhausts the target — the
+    move-then-exhaust trap). ``None`` => the caller pauses.
     """
     cost = _pct_cost(s.ctx_tokens)
     for a in _rank_accounts(acct_views, projected, cfg):
@@ -272,6 +316,67 @@ def choose_migration_target(
         if _fits(a, projected, cost, cfg):
             return a.num
     return None
+
+
+def _five_hour_unstarted(av: AccountView, cfg: BalancerConfig) -> bool:
+    """Whether ``av``'s 5h window has not started this cycle (an idle clock).
+
+    The Claude subscription 5h window only begins counting on the first
+    credit-consuming call of a cycle. An unstarted window reports ~0% utilization
+    with no concrete reset timestamp; a *running* window reports pct above the
+    epsilon and/or a real future reset. Defensive against all three observed
+    zero-state shapes (5h omitted, pct:0 with no reset, pct:0 with a reset): a
+    real future ``five_hour_reset`` always means started, regardless of pct.
+    """
+    if av.five_hour_pct is None:
+        return False  # unknown 5h usage -> not a confirmed-idle candidate
+    if av.five_hour_pct > cfg.exhaust_threshold:  # paranoia; a full window is "started"
+        return False
+    if av.five_hour_reset is not None:
+        return False  # a concrete reset timestamp means the clock is already running
+    return av.five_hour_pct <= PRIME_FIVE_HOUR_EPSILON
+
+
+def accounts_needing_prime(
+    acct_views: dict[str, AccountView],
+    cfg: BalancerConfig,
+) -> list[str]:
+    """Managed accounts whose 5h window is UNSTARTED and should be primed.
+
+    Pure and I/O-free (table-testable): the caller (the supervisor) performs the
+    actual network prime OUTSIDE the registry lock. An account is a candidate
+    when ALL hold:
+
+    * its usage signal is ``"cache"`` — a real idle-account usage read. ``"live"``
+      means it already hosts an in-use session (its clock is started), and
+      ``"none"`` means usage is unknown (skip rather than blind-prime a possibly
+      logged-out account);
+    * its 5h window is unstarted (:func:`_five_hour_unstarted`); and
+    * it is not already exhausted on its *other* (7d) window — priming a fresh 5h
+      window can't help an account whose weekly cap is the binding constraint, so
+      don't waste a credit on it.
+
+    Returned in deterministic account-number order so concurrent supervisors that
+    happen to prime in the same pass agree on ordering.
+    """
+    candidates = [
+        a.num
+        for a in acct_views.values()
+        if a.signal == "cache"
+        and _five_hour_unstarted(a, cfg)
+        and not _seven_day_exhausted(a, cfg)
+    ]
+    return sorted(candidates, key=_num_key)
+
+
+def _seven_day_exhausted(av: AccountView, cfg: BalancerConfig) -> bool:
+    """Whether the account's *non-5h* cap (its 7d window) is already exhausting it.
+
+    ``max_pct`` is max(5h, 7d). When the 5h window is unstarted (~0%), an exhausted
+    ``max_pct`` can only come from the 7d window, so ``max_pct >= threshold`` here
+    means the weekly cap is binding — priming a fresh 5h window wouldn't help.
+    """
+    return av.max_pct is not None and av.max_pct >= cfg.exhaust_threshold
 
 
 def pause_decision(
@@ -305,8 +410,10 @@ def rebalance(
 
     Phase A (resume): paused sessions whose timer elapsed *or* whose account
     recovered below the hysteresis line.
-    Phase B (strand): non-pinned, non-paused, non-cooldown sessions whose
-    current account is exhausted.
+    Phase B (strand): non-pinned, non-paused sessions whose current account is
+    exhausted. There is no time cooldown — a session stranded on a freshly
+    exhausted account is always eligible to move; rapid re-migration is prevented
+    by the caller's rising-edge gate plus target-safety + hysteresis, not a timer.
     Phase C (order): least-active / cheapest-context first, so a partial set of
     moves stops early and the fewest expensive sessions are disturbed.
     Phase D (place): greedily assign each stranded session a target with an
@@ -340,8 +447,10 @@ def rebalance(
             return False
         if s.paused_until is not None:  # paused sessions handled in Phase A
             return False
-        if _in_cooldown(s, now, cfg):
-            return False
+        # No time cooldown: a session whose account is exhausted is always
+        # eligible to move. Anti-thrash is algorithmic (the caller's rising-edge
+        # gate + target_safety + hysteresis + the online reservation), so a
+        # genuinely-needed switch is never blocked by a timer.
         return _exhausted(acct_views.get(s.account_num), cfg)
 
     stranded = [s for s in sess_views if is_stranded(s)]

@@ -178,6 +178,42 @@ class TestDoBalancer:
             tui._do_balancer(screen, switcher)
         assert switcher.get_auto_balance_config()["threshold"] == 80
 
+    def test_toggle_prime_idle_windows(self, temp_home: Path):
+        # The "Prime idle 5h windows" item is at idx 3 (after Enable/threshold/
+        # target). Default OFF; one toggle turns it ON.
+        switcher = ClaudeAccountSwitcher()
+        assert switcher.get_auto_balance_config()["primeIdleWindows"] is False
+        screen = _stub_screen()
+        keys = [tui.curses.KEY_DOWN] * 3 + [10, 27]
+        screen.getch.side_effect = keys
+        with patch("claude_swap.tui.curses.curs_set"):
+            tui._do_balancer(screen, switcher)
+        assert switcher.get_auto_balance_config()["primeIdleWindows"] is True
+
+
+class TestPrimeIdleWindowsConfig:
+    """The primeIdleWindows opt-in is default-OFF, round-trips, and is independent
+    of `enabled` (review fix #3)."""
+
+    def test_defaults_off(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        assert sw.get_auto_balance_config()["primeIdleWindows"] is False
+
+    def test_set_and_round_trip(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        sw.set_auto_balance_config(prime_idle_windows=True)
+        assert sw.get_auto_balance_config()["primeIdleWindows"] is True
+        sw.set_auto_balance_config(prime_idle_windows=False)
+        assert sw.get_auto_balance_config()["primeIdleWindows"] is False
+
+    def test_independent_of_enabled(self, temp_home: Path):
+        # Enabling the balancer must NOT turn priming on.
+        sw = ClaudeAccountSwitcher()
+        sw.set_auto_balance_config(enabled=True)
+        cfg = sw.get_auto_balance_config()
+        assert cfg["enabled"] is True
+        assert cfg["primeIdleWindows"] is False
+
 
 class TestEditPriorities:
     def _seed_account(self, switcher: ClaudeAccountSwitcher) -> None:

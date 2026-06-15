@@ -52,7 +52,6 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap.balancer import (
     DEFAULT_HYSTERESIS_BAND,
-    DEFAULT_MIGRATION_COOLDOWN,
     DEFAULT_TARGET_SAFETY,
 )
 
@@ -1587,7 +1586,11 @@ class ClaudeAccountSwitcher:
             "threshold": threshold,
             "targetSafety": min(target_safety, threshold - 1),
             "hysteresisBand": max(0, _int("hysteresisBand", DEFAULT_HYSTERESIS_BAND)),
-            "cooldownSeconds": max(0, _int("cooldownSeconds", DEFAULT_MIGRATION_COOLDOWN)),
+            # Idle-5h-window priming (feature #3). Default OFF and independent of
+            # ``enabled``: priming spends real credits on an as-yet-unverified
+            # premise (the 5h window being fixed-from-first-use, not rolling), so
+            # it stays gated behind its own explicit opt-in until confirmed.
+            "primeIdleWindows": bool(cfg.get("primeIdleWindows", False)),
             "model": str(cfg.get("model") or "opus"),
             "effortLevel": str(cfg.get("effortLevel") or "xhigh"),
         }
@@ -1599,7 +1602,7 @@ class ClaudeAccountSwitcher:
         threshold: int | None = None,
         target_safety: int | None = None,
         hysteresis_band: int | None = None,
-        cooldown_seconds: int | None = None,
+        prime_idle_windows: bool | None = None,
         model: str | None = None,
         effort_level: str | None = None,
     ) -> dict:
@@ -1629,8 +1632,8 @@ class ClaudeAccountSwitcher:
             cfg["targetSafety"] = ts
         if hysteresis_band is not None:
             cfg["hysteresisBand"] = max(0, int(hysteresis_band))
-        if cooldown_seconds is not None:
-            cfg["cooldownSeconds"] = max(0, int(cooldown_seconds))
+        if prime_idle_windows is not None:
+            cfg["primeIdleWindows"] = bool(prime_idle_windows)
         if model is not None:
             cfg["model"] = str(model)
         if effort_level is not None:
@@ -1640,7 +1643,7 @@ class ClaudeAccountSwitcher:
         cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
         cfg.setdefault("targetSafety", DEFAULT_TARGET_SAFETY)
         cfg.setdefault("hysteresisBand", DEFAULT_HYSTERESIS_BAND)
-        cfg.setdefault("cooldownSeconds", DEFAULT_MIGRATION_COOLDOWN)
+        cfg.setdefault("primeIdleWindows", False)
         cfg.setdefault("model", "opus")
         cfg.setdefault("effortLevel", "xhigh")
         # Keep targetSafety strictly below threshold (self-heals an odd combo).

@@ -217,13 +217,14 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
         state = "ON" if cfg["enabled"] else "OFF"
         subtitle = (
             f"Beta · {state} · threshold {cfg['threshold']}% · "
-            f"target {cfg['targetSafety']}% · cooldown {cfg['cooldownSeconds']}s"
+            f"target {cfg['targetSafety']}%"
         )
+        prime_state = "ON" if cfg.get("primeIdleWindows") else "OFF"
         items: list[tuple[str, str | None]] = [
             ("Disable" if cfg["enabled"] else "Enable", "toggle"),
             (f"Set threshold (now {cfg['threshold']}%)", "threshold"),
             (f"Set target safety (now {cfg['targetSafety']}%)", "target"),
-            (f"Set cooldown (now {cfg['cooldownSeconds']}s)", "cooldown"),
+            (f"Prime idle 5h windows: {prime_state} (spends credits)", "prime"),
             ("Edit account priorities", "priorities"),
             ("Live dashboard", "dashboard"),
             ("-- Back --", None),
@@ -239,8 +240,12 @@ def _do_balancer(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             _set_balance_int(stdscr, switcher, "threshold", "Migrate when usage reaches (%): ")
         elif choice == "target":
             _set_balance_int(stdscr, switcher, "target_safety", "Target safety ceiling (%): ")
-        elif choice == "cooldown":
-            _set_balance_int(stdscr, switcher, "cooldown_seconds", "Min seconds between migrations: ")
+        elif choice == "prime":
+            # Default-OFF, credit-spending opt-in (feature #3): toggle the
+            # dedicated primeIdleWindows flag, independent of the balancer enable.
+            switcher.set_auto_balance_config(
+                prime_idle_windows=not cfg.get("primeIdleWindows")
+            )
         elif choice == "priorities":
             _edit_priorities(stdscr, switcher)
         elif choice == "dashboard":
