@@ -198,34 +198,51 @@ class TestBuildWorld:
         registry.write_registry(sw, reg)
         return reg
 
-    def test_live_account_fetches_spend_on_cold_cache(self, temp_home: Path):
-        # Regression: a LIVE account's pay-as-you-go capability must NOT be lost
-        # when the usage cache is cold. build_world fetches it once; the live
-        # signal still wins for the rate-limit numbers.
+    def test_live_account_reads_spend_from_cache_no_fetch(self, temp_home: Path):
+        # A live account reads pay-as-you-go info from the cache when present and
+        # NEVER triggers a usage fetch (avoids extra usage-API load + token churn).
         sw = ClaudeAccountSwitcher()
         _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        write_cache(sw.backup_dir / "cache" / "usage.json",
+                    {"1": {"extra_usage_enabled": True, "spend": {"pct": 12.0}}})
         reg = self._seed_live_session(sw)
-        fetched = {"extra_usage_enabled": True, "spend": {"pct": 12.0},
-                   "five_hour": {"pct": 5.0}}  # usage-API view; live signal wins for limits
-        with patch("claude_swap.registry._fetch_idle_usage", return_value=fetched) as m:
+        with patch("claude_swap.registry._fetch_idle_usage") as m:
             acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
         av = acct_views["1"]
         assert av.signal == "live"
-        assert av.max_pct == 98.0           # from the LIVE signal, not the fetch
-        assert av.extra_usage is True       # recovered from the cold-cache fetch
-        assert av.spend_pct == 12.0
-        m.assert_called_once()
+        assert av.max_pct == 98.0                       # from the live signal
+        assert (av.extra_usage, av.spend_pct) == (True, 12.0)  # from cache
+        m.assert_not_called()                           # never fetch for a live acct
 
-    def test_live_account_no_fetch_when_idle_disabled(self, temp_home: Path):
-        # With fetch_idle=False the cold-cache live account stays best-effort: no
-        # network, extra_usage unknown (False).
+    def test_live_account_cold_cache_extra_usage_unknown_no_fetch(self, temp_home: Path):
+        # Cold cache: a live account's extra-usage is simply unknown (False); we
+        # still never fetch for it.
         sw = ClaudeAccountSwitcher()
         _seed_accounts(sw, {"1": ("a@x.com", 5)})
         reg = self._seed_live_session(sw)
         with patch("claude_swap.registry._fetch_idle_usage") as m:
-            acct_views, _ = registry.build_world(sw, reg, fetch_idle=False)
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
         assert acct_views["1"].extra_usage is False
         m.assert_not_called()
+
+    def test_failed_idle_fetch_is_cached_to_throttle_retries(self, temp_home: Path):
+        # A failed idle fetch (e.g. usage-API 429 -> None) is recorded as an
+        # "_unavailable" marker so the cache TTL throttles retries instead of
+        # refetching every pass — the fix for the all-accounts 429 feedback loop.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._fetch_idle_usage", return_value=None) as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+            assert acct_views["2"].signal == "none"
+            assert m.call_count == 1
+            # The marker is now cached -> a second pass does NOT refetch.
+            acct_views2, _ = registry.build_world(sw, reg, fetch_idle=True)
+            assert acct_views2["2"].signal == "none"
+            assert m.call_count == 1
+        from claude_swap.cache import read_cache
+        cp = sw.backup_dir / "cache" / "usage.json"
+        assert read_cache(cp, 10**9).get("2", {}).get("_unavailable") is True
 
 
 class TestPlacementReservation:

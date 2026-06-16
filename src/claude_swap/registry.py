@@ -483,16 +483,14 @@ def build_world(
             usage = _rl_to_usage(live_rl)
             h5_pct, h5_reset = _five_hour_signal(usage)
             d7_pct, d7_reset = _seven_day_signal(usage)
-            # Pay-as-you-go info isn't in the live statusline signal — it only
-            # comes from the usage API. Read it from the cached usage result; on a
-            # cold cache, fetch once (best-effort) so a live account's extra-usage
-            # capability isn't silently lost — which would otherwise wrongly PAUSE
-            # an API-rate-tier session instead of letting it spill to API rates.
-            spend_src = cached.get(num)
-            if spend_src is None and fetch_idle:
-                spend_src = _fetch_idle_usage(switcher, num, email)
-                fetched[num] = spend_src
-            extra_usage, spend_pct = _spend_signal(spend_src)
+            # Pay-as-you-go info isn't in the live statusline signal — read it
+            # from the cached usage-API result (best-effort). We deliberately do
+            # NOT fetch it for a live account: that adds usage-API load (which can
+            # trip the endpoint's rate limit) and could refresh an active account's
+            # token. On a cold cache extra-usage is simply unknown until an idle
+            # fetch / ``cswap --status`` populates it — acceptable since the
+            # API-rate tier is opt-in and off by default.
+            extra_usage, spend_pct = _spend_signal(cached.get(num))
             acct_views[num] = AccountView(
                 num=num,
                 priority=priority,
@@ -508,10 +506,25 @@ def build_world(
             )
             continue
 
-        usage = cached.get(num) if isinstance(cached, dict) else None
-        if usage is None and fetch_idle:
+        cached_entry = cached.get(num) if isinstance(cached, dict) else None
+        if isinstance(cached_entry, dict) and cached_entry.get("_unavailable"):
+            # A cached fetch FAILURE (e.g. usage-API 429). Treat as no signal and
+            # do NOT refetch: the marker holds the cache slot for the TTL, so a
+            # failing / rate-limited fetch is throttled to once per cache TTL
+            # instead of being retried every supervise tick — the feedback loop
+            # that otherwise pins every account at "usage unavailable" once the
+            # usage endpoint starts returning 429. The shared cache file
+            # coordinates this across all supervisor processes.
+            usage = None
+        elif cached_entry is not None:
+            usage = cached_entry
+        elif fetch_idle:
             usage = _fetch_idle_usage(switcher, num, email)
-            fetched[num] = usage
+            # Persist the outcome either way — real usage, or a failure marker so
+            # the TTL throttles retries (see above).
+            fetched[num] = usage if usage is not None else {"_unavailable": True}
+        else:
+            usage = None
 
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
