@@ -79,7 +79,7 @@ _USAGE_CACHE_TTL = 15  # seconds
 
 # Auto-switch (Beta): when the active account's 5h/7d usage reaches this
 # percentage, the TUI monitor rotates to the next managed account.
-DEFAULT_AUTO_SWITCH_THRESHOLD = 95
+DEFAULT_AUTO_SWITCH_THRESHOLD = 90
 
 # Default command for the Quick-start alias (bare ``cswap`` when enabled): launch
 # a load-balanced session with the QoL defaults baked in. Extra args the user

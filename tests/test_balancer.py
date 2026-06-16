@@ -158,7 +158,7 @@ class TestRebalance:
         # expensive one can't fit after the online reservation -> pauses.
         accts = {
             "1": AV("1", max_pct=96.0, reset=2000),
-            "2": AV("2", max_pct=86.0),
+            "2": AV("2", max_pct=80.0),  # room for the cheap session, not both (target 85)
         }
         sessions = [SV("cheap", "1", ctx=0), SV("expensive", "1", ctx=300_000)]
         plan = rebalance(accts, sessions, NOW, CFG)

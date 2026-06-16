@@ -44,11 +44,11 @@ from dataclasses import dataclass, field
 
 # An account is "exhausted" once max(5h, 7d) utilization reaches this percent.
 # Shares the default with the legacy auto-switch threshold.
-DEFAULT_EXHAUST_THRESHOLD = 95
+DEFAULT_EXHAUST_THRESHOLD = 90
 # A migration target's *projected* utilization (after placing the session) must
 # stay at or below this. The gap to the exhaust threshold absorbs the per-session
 # headroom reserve so a move never immediately re-exhausts the target.
-DEFAULT_TARGET_SAFETY = 90
+DEFAULT_TARGET_SAFETY = 85
 # An exhausted account only re-enters the usable pool once it drops this many
 # points below the exhaust threshold — absorbs the chunky, API-call-only jitter
 # of the statusline's ``used_percentage`` so accounts don't flap at the boundary.
