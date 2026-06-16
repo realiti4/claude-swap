@@ -255,6 +255,78 @@ def prime_account(access_token: str) -> bool:
 
 
 
+def probe_messages_headroom(access_token: str, failure_out: dict | None = None) -> bool | None:
+    """Probe whether an account can serve a turn RIGHT NOW via the messages endpoint.
+
+    The messages endpoint (``/v1/messages``) is a SEPARATE rate-limit bucket from
+    the usage endpoint (``/api/oauth/usage``), so this answers "can this account
+    work now?" even while the usage API is 429-backed-off and reporting no signal.
+    Sends the SAME minimal turn :func:`prime_account` does (Haiku 4.5, a 1-token
+    prompt, ``max_tokens=1``), so it COSTS one trivial billable Haiku turn and,
+    like priming, STARTS the 5h window — acceptable only because the caller probes
+    an account it is about to place/resume a session onto.
+
+    Returns:
+      * ``True``  — 2xx (incl. ``stop_reason: max_tokens``): NOT 5h/7d capped =>
+                    the account has headroom now.
+      * ``False`` — 429: capped (out of usage). When ``failure_out`` is not None
+                    the server's ``Retry-After`` (seconds, via
+                    :func:`_retry_after_seconds`, clamped to
+                    :data:`_MAX_USAGE_BACKOFF_S`) is written as
+                    ``failure_out["retry_after"]`` so the caller can carry it into
+                    a backoff marker.
+      * ``None``  — 401 / network / other: UNKNOWN (logged out / offline). Distinct
+                    from ``False`` so the caller never caches a false "capped"
+                    verdict for a transient failure.
+
+    Best-effort, NEVER raises. The tri-state return (vs :func:`prime_account`'s
+    bool, which folds 429 into ``True`` because "window already running" is success
+    for priming) is deliberate: for a HEADROOM probe the three outcomes are
+    semantically distinct and the caller caches each differently.
+
+    The caller MUST pass only an INACTIVE/idle account's token (an active account's
+    credentials are owned by Claude Code and must never be touched) and MUST make
+    this call OUTSIDE the registry FileLock (it is network I/O).
+    """
+    body = json.dumps({
+        "model": PRIME_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        _MESSAGES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            return None
+    except urllib.error.HTTPError as e:
+        # 429: capped (out of usage on the messages bucket). Surface the server's
+        # Retry-After so the caller can refresh its backoff marker.
+        if e.code == 429:
+            if failure_out is not None:
+                ra = _retry_after_seconds(e)
+                if ra is not None:
+                    failure_out["retry_after"] = ra
+            return False
+        # 401 (logged out) / any other code: unknown, not a "capped" verdict.
+        _logger.debug("headroom probe failed: %r", e)
+        return None
+    except Exception as e:  # noqa: BLE001 - probing is best-effort, never fatal
+        _logger.debug("headroom probe failed: %r", e)
+        return None
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -323,16 +395,41 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+# Hard ceiling on a server-supplied ``Retry-After``. A single 429 must never be
+# able to blackhole an account's usage for hours (a buggy/huge header would
+# otherwise pin it at "rate-limited" / no-headroom until the marker elapsed).
+_MAX_USAGE_BACKOFF_S = 3600
+
+
+def _retry_after_seconds(e: urllib.error.HTTPError) -> int | None:
+    """Parse a ``Retry-After`` (seconds) header from a 429, clamped to a sane max."""
+    try:
+        val = int(e.headers.get("Retry-After"))  # type: ignore[union-attr]
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if val <= 0:
+        return None
+    return min(val, _MAX_USAGE_BACKOFF_S)
+
+
 def fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    failure_out: dict | None = None,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
-    Active accounts are never refreshed — Claude Code owns those credentials.
+    Active accounts are never refreshed — Claude Code owns those credentials, and
+    refreshing rotates the single-use refresh token out from under the live login
+    (forcing a re-login). The caller MUST pass ``is_active=True`` for the current
+    default login and for any account with a live session.
+
+    ``failure_out`` (optional): on a usage-endpoint 429 the server's requested
+    backoff is written as ``failure_out["retry_after"]`` (seconds) so the caller
+    can cache a throttle marker and stop hammering the rate-limited endpoint.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -358,6 +455,13 @@ def fetch_usage_for_account(
         return build_usage_result(data)
     except urllib.error.HTTPError as e:
         _logger.debug("Usage fetch failed: %r", e)
+        if e.code == 429 and failure_out is not None:
+            # Rate-limited by the usage endpoint (client-wide, not token-specific):
+            # surface the server's Retry-After so the caller backs off instead of
+            # re-hitting it every TTL. Refreshing/retrying here would only amplify it.
+            ra = _retry_after_seconds(e)
+            if ra is not None:
+                failure_out["retry_after"] = ra
         if (
             e.code != 401
             or is_active
@@ -381,6 +485,13 @@ def fetch_usage_for_account(
         try:
             data = request_usage_data(new_token)
             return build_usage_result(data)
+        except urllib.error.HTTPError as retry_error:
+            _logger.debug("Usage fetch failed after refresh: %r", retry_error)
+            if retry_error.code == 429 and failure_out is not None:
+                ra = _retry_after_seconds(retry_error)
+                if ra is not None:
+                    failure_out["retry_after"] = ra
+            return None
         except Exception as retry_error:
             _logger.debug("Usage fetch failed after refresh: %r", retry_error)
             return None

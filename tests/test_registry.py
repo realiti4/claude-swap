@@ -244,6 +244,337 @@ class TestBuildWorld:
         cp = sw.backup_dir / "cache" / "usage.json"
         assert read_cache(cp, 10**9).get("2", {}).get("_unavailable") is True
 
+    def test_active_default_account_is_never_refreshed(self, temp_home: Path):
+        # Credential-invalidation fix: the idle usage path MUST mark the active
+        # default login (the account Claude Code owns right now) is_active=True so
+        # it is never refreshed/rotated out from under the live login — the bug
+        # that forced spontaneous re-logins. A genuinely-idle account still may.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 0), "2": ("b@x.com", 0)})
+        reg = registry.read_registry(sw)
+        seen: dict[str, bool] = {}
+
+        def fake_fetch(switcher, num, email, *, is_active=False, failure_out=None):
+            seen[num] = is_active
+            return None
+
+        with patch("claude_swap.registry._fetch_idle_usage", side_effect=fake_fetch), \
+             patch.object(ClaudeAccountSwitcher, "active_account_num", return_value="1"):
+            registry.build_world(sw, reg, fetch_idle=True)
+
+        assert seen == {"1": True, "2": False}
+
+    def test_live_session_account_is_never_refreshed(self, temp_home: Path):
+        # An account with a live (cswap run / vanilla) session is also is_active=True
+        # — refreshing it would rotate the token out from under that live session.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 0), "2": ("b@x.com", 0)})
+        reg = registry.read_registry(sw)
+        seen: dict[str, bool] = {}
+
+        def fake_fetch(switcher, num, email, *, is_active=False, failure_out=None):
+            seen[num] = is_active
+            return None
+
+        with patch("claude_swap.registry._fetch_idle_usage", side_effect=fake_fetch), \
+             patch.object(ClaudeAccountSwitcher, "active_account_num", return_value=None), \
+             patch.object(ClaudeAccountSwitcher, "has_live_session",
+                          side_effect=lambda num, email: num == "2"):
+            registry.build_world(sw, reg, fetch_idle=True)
+
+        assert seen == {"1": False, "2": True}
+
+    def test_retry_after_backoff_marker_suppresses_refetch_past_ttl(self, temp_home: Path):
+        # A 429 backoff marker (retry_until in the future) suppresses refetch even
+        # after the freshness TTL elapses (here TTL=0), so a rate-limited usage
+        # endpoint is not re-hit every TTL — the persistent "usage unavailable" loop.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True, "retry_until": time.time() + 3600}},
+        )
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._usage_ttl", return_value=0), \
+             patch("claude_swap.registry._fetch_idle_usage") as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        assert acct_views["2"].signal == "none"
+        m.assert_not_called()
+
+    def test_expired_backoff_marker_allows_refetch(self, temp_home: Path):
+        # Once the server's Retry-After window elapses, the account is refetched.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True, "retry_until": time.time() - 10}},
+        )
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._usage_ttl", return_value=0), \
+             patch("claude_swap.registry._fetch_idle_usage", return_value=None) as m:
+            registry.build_world(sw, reg, fetch_idle=True)
+        m.assert_called_once()
+
+    def test_429_retry_after_is_recorded_as_backoff_marker(self, temp_home: Path):
+        # A usage-endpoint 429 records a backoff marker carrying the server's
+        # Retry-After so subsequent passes honor it (see the suppress test above).
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = registry.read_registry(sw)
+
+        def fake_fetch(switcher, num, email, *, is_active=False, failure_out=None):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        with patch("claude_swap.registry._fetch_idle_usage", side_effect=fake_fetch):
+            registry.build_world(sw, reg, fetch_idle=True)
+        from claude_swap.cache import read_cache, usage_backoff_active
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert usage_backoff_active(entry) is True
+
+
+class TestProbeUnavailable:
+    """The messages-API headroom probe fallback (default OFF). A usage-429-backed-off
+    idle account is probed only when ``probe_unavailable=True``; a 2xx synthesizes a
+    ``signal="probe"`` view so a stranded session can resume onto it."""
+
+    def _backed_off(self, sw):
+        # Account "2" has a usage-429 backoff marker active (retry_until future).
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True, "retry_until": time.time() + 3600}},
+        )
+        return registry.read_registry(sw)
+
+    def test_probe_default_off_never_probes(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        with patch("claude_swap.registry._probe_idle_headroom") as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)  # default off
+        assert acct_views["2"].signal == "none"
+        m.assert_not_called()
+
+    def test_probe_confirms_headroom(self, temp_home: Path):
+        from claude_swap import balancer
+        from claude_swap.cache import probe_ok, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=True):
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        av = acct_views["2"]
+        assert av.signal == "probe"
+        assert av.max_pct == balancer.PROBE_CONFIRMED_PCT
+        # The OK verdict is cached so the next pass reuses it without re-probing.
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert probe_ok(entry) is True
+
+    def test_probe_ok_verdict_reused_on_second_pass_without_reprobing(self, temp_home: Path):
+        # Regression for the resume-path blocker: a cached probe-OK verdict carries no
+        # _unavailable/retry_until, so without an explicit reuse branch the SECOND
+        # build_world pass (the one _reassign_for_resume runs) would fall through to
+        # signal="cache"/max_pct=None — a zero-headroom account that is never a
+        # migration target — silently un-pausing the stranded session onto its still-
+        # exhausted account. Drive build_world TWICE in-process and assert the second
+        # pass STILL yields signal="probe" with NO second network probe.
+        from claude_swap import balancer
+        from claude_swap.cache import PROBE_VERDICT_TTL_S
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=True) as m:
+            first, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+            assert first["2"].signal == "probe"
+            assert m.call_count == 1
+
+            # Second pass: reuse the cached _probe_ok verdict WITHOUT re-probing.
+            second, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+            assert second["2"].signal == "probe"
+            assert second["2"].max_pct == balancer.PROBE_CONFIRMED_PCT
+            assert m.call_count == 1  # NOT re-probed
+
+        # The verdict is read off the persisted (inf-TTL) slot, so it survives the
+        # 60s freshness TTL through the full PROBE_VERDICT_TTL_S cadence. Confirm the
+        # cadence helper still considers it fresh well past the freshness window.
+        assert PROBE_VERDICT_TTL_S > 60
+
+    def test_probe_429_refreshes_backoff(self, temp_home: Path):
+        from claude_swap.cache import read_cache, usage_backoff_active
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+
+        def fake_probe(switcher, num, email, *, is_active=False, failure_out=None):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return False
+
+        with patch("claude_swap.registry._probe_idle_headroom", side_effect=fake_probe):
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        assert acct_views["2"].signal == "none"
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert usage_backoff_active(entry) is True          # retry_until in the future
+        assert isinstance(entry.get("_probed_at"), (int, float))  # probe stamped
+
+    def test_probe_unknown_throttles_then_reprobes_when_stale(self, temp_home: Path):
+        from claude_swap.cache import PROBE_VERDICT_TTL_S, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+
+        cp = sw.backup_dir / "cache" / "usage.json"
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=None) as m:
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+            assert acct_views["2"].signal == "none"
+            assert m.call_count == 1
+            # Marker stamped, NO retry_until (elapses on the usage TTL normally).
+            entry = read_cache(cp, 10**9).get("2")
+            assert entry.get("_unavailable") is True
+            assert "retry_until" not in entry
+            assert isinstance(entry.get("_probed_at"), (int, float))
+
+            # A SECOND pass within the cadence does NOT re-probe (probe_recent gate).
+            registry.build_world(sw, reg, fetch_idle=True, probe_unavailable=True)
+            assert m.call_count == 1
+
+            # Backdate the stamp past the cadence -> the next pass DOES re-probe.
+            stale = dict(read_cache(cp, 10**9))
+            stale["2"] = dict(stale["2"])
+            stale["2"]["_probed_at"] = time.time() - (PROBE_VERDICT_TTL_S + 1)
+            write_cache(cp, stale)
+            registry.build_world(sw, reg, fetch_idle=True, probe_unavailable=True)
+            assert m.call_count == 2
+
+    def test_probe_stamps_claim_under_lock_before_network(self, temp_home: Path):
+        # Cross-process herd guard (finding #4): before the (out-of-lock) network
+        # probe fires, build_world must compare-and-set a provisional claim stamp
+        # under the lock so a concurrently-waking supervisor that re-reads the slot
+        # sees a fresh verdict and bows out instead of also probing. We assert the
+        # slot is stamped fresh AT THE MOMENT the probe runs (inside the patched
+        # _probe_idle_headroom), proving the claim landed before the network call.
+        from claude_swap.cache import probe_recent, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        cp = sw.backup_dir / "cache" / "usage.json"
+        observed: dict = {}
+
+        def fake_probe(switcher, num, email, *, is_active=False, failure_out=None):
+            # At this point the claim must already be persisted: a second supervisor
+            # re-reading now would see a fresh stamp and skip its own probe.
+            entry = read_cache(cp, 10**9).get(num)
+            observed["claim_recent"] = probe_recent(entry)
+            return True
+
+        with patch("claude_swap.registry._probe_idle_headroom", side_effect=fake_probe):
+            registry.build_world(sw, reg, fetch_idle=True, probe_unavailable=True)
+        assert observed.get("claim_recent") is True
+
+    def test_probe_never_touches_active_account(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        with patch("claude_swap.registry._probe_idle_headroom") as m, \
+             patch.object(ClaudeAccountSwitcher, "active_account_num", return_value="2"):
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        # The active default's creds are owned by Claude Code -> never probed.
+        assert acct_views["2"].signal == "none"
+        m.assert_not_called()
+
+    def test_probe_never_touches_live_session_account(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        with patch("claude_swap.registry._probe_idle_headroom") as m, \
+             patch.object(ClaudeAccountSwitcher, "active_account_num", return_value=None), \
+             patch.object(ClaudeAccountSwitcher, "has_live_session",
+                          side_effect=lambda num, email: num == "2"):
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        assert acct_views["2"].signal == "none"
+        m.assert_not_called()
+
+    def test_probe_skips_non_subscription_account(self, temp_home: Path):
+        # Credential-safety: the probe sends the same billable /v1/messages turn as
+        # priming, so it MUST carry priming's subscription-tier gate. A pay-as-you-go
+        # / API / console account (no primeable subscriptionType) must NOT be probed —
+        # a billed 2xx there would be misread as ~80% subscription headroom and charge
+        # real dollars, defeating onlySubscriptionTokens. The network probe must never
+        # be reached; the verdict is "unknown" (None) -> signal stays "none".
+        import json
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = self._backed_off(sw)
+        # API/console-style creds: no subscriptionType (is_primable_subscription False).
+        api_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-api"}})
+        with patch.object(
+            ClaudeAccountSwitcher, "read_account_credentials", return_value=api_creds
+        ), patch.object(
+            ClaudeAccountSwitcher, "active_account_num", return_value=None
+        ), patch.object(
+            ClaudeAccountSwitcher, "has_live_session", return_value=False
+        ), patch("claude_swap.oauth.probe_messages_headroom") as net:
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        assert acct_views["2"].signal == "none"   # never a target -> no billing
+        net.assert_not_called()                    # the billable turn never fired
+
+    def test_probe_idle_headroom_gates_non_subscription(self, temp_home: Path):
+        # Unit-level: the real _probe_idle_headroom returns None (unknown) for a
+        # non-subscription account and never calls the billable messages endpoint.
+        import json
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        api_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-api"}})
+        with patch.object(
+            ClaudeAccountSwitcher, "read_account_credentials", return_value=api_creds
+        ), patch("claude_swap.oauth.probe_messages_headroom") as net:
+            verdict = registry._probe_idle_headroom(sw, "2", "b@x.com")
+        assert verdict is None
+        net.assert_not_called()
+
+    def test_probe_on_within_ttl_failure_marker(self, temp_home: Path):
+        # A plain (non-429) "_unavailable" marker within the freshness TTL is also a
+        # probe candidate when probe_unavailable=True.
+        from claude_swap import balancer
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True}},  # no retry_until -> within-TTL failure
+        )
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=True):
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        assert acct_views["2"].signal == "probe"
+        assert acct_views["2"].max_pct == balancer.PROBE_CONFIRMED_PCT
+
 
 class TestPlacementReservation:
     """BUG 003: a just-placed session not yet reporting usage counts as load."""

@@ -56,6 +56,23 @@ DEFAULT_HYSTERESIS_BAND = 3
 # Pause horizon when no reset time is known anywhere (defensive fallback).
 DEFAULT_PAUSE_FALLBACK_S = 3600
 
+# The synthesized utilization assigned to an account a messages-API headroom
+# probe confirmed runnable RIGHT NOW (``signal="probe"``; see
+# ``registry.build_world`` / ``oauth.probe_messages_headroom``). A 2xx probe proves
+# only that "a turn works now", NOT an exact percentage, so we assume the account
+# is conservatively ~this full. The value is chosen against the default tunables:
+#   * < exhaust_threshold - hysteresis_band (90-3=87) so a probe-confirmed account
+#     is ``_usable`` => a stranded session CAN resume/migrate onto it (the point —
+#     beating an hour-long pause);
+#   * leaves room under target_safety (85) for exactly ONE zero-ctx session
+#     (80 + BASE_RESERVE=3 = 83 <= 85 fits) but NOT a second (after the first lands,
+#     the online reservation makes the second see 80+3+3=86 > 85 => does not fit),
+#     so two stranded sessions don't co-exhaust the same probe-confirmed account;
+#   * deliberately pessimistic so a probe (a guess) ranks BELOW any account with
+#     KNOWN real headroom below 80% — ``_rank_accounts`` sorts on projected headroom,
+#     and most genuinely-usable real accounts sit well under 80%.
+PROBE_CONFIRMED_PCT = 80.0
+
 # A 5h window is treated as UNSTARTED (a priming candidate) when its utilization
 # is at or below this many points. The Claude subscription 5h window is anchored
 # to the first credit-consuming call of a cycle: an account that has sent nothing
@@ -147,7 +164,10 @@ class AccountView:
     # Epoch seconds when the window that is *currently capping* this account
     # resets (the window equal to ``max_pct``); ``None`` if unknown.
     soonest_reset: int | None = None
-    signal: str = "none"  # "live" (statusline) | "cache" (usage API) | "none"
+    # "live" (statusline) | "cache" (usage API) | "probe" (messages-API headroom
+    # fallback — a 2xx confirmed runnable-now; max_pct is the synthesized
+    # PROBE_CONFIRMED_PCT, all per-window fields None) | "none" (unknown usage).
+    signal: str = "none"
     # The 5h-window-specific utilization + reset, used by the idle-window priming
     # detection (:func:`accounts_needing_prime`) and surfaced in the dashboard.
     # ``five_hour_pct`` is the 5h utilization percent (distinct from ``max_pct``,

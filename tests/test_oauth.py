@@ -465,6 +465,78 @@ class TestFetchUsageForAccount:
         assert result is not None
         assert result["five_hour"]["pct"] == 10.0
 
+    def test_429_populates_failure_out_with_retry_after(self):
+        """A usage-endpoint 429 surfaces the server's Retry-After for backoff.
+
+        The endpoint rate-limits the whole client (not a specific token); honoring
+        Retry-After is what stops the 'usage unavailable' refetch-every-TTL loop.
+        """
+        credentials = self._make_credentials()  # fresh token -> no refresh attempt
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many Requests",
+                    hdrs={"Retry-After": "1800"}, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        failure: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials,
+                is_active=False, failure_out=failure,
+            )
+
+        assert result is None
+        assert failure.get("retry_after") == 1800
+
+    def test_retry_after_is_clamped_to_a_sane_max(self):
+        """A huge/buggy Retry-After can't blackhole an account for hours."""
+        from claude_swap.oauth import _MAX_USAGE_BACKOFF_S
+
+        credentials = self._make_credentials()
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many Requests",
+                    hdrs={"Retry-After": "999999999"}, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        failure: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials,
+                is_active=False, failure_out=failure,
+            )
+        assert failure.get("retry_after") == _MAX_USAGE_BACKOFF_S
+
+    def test_active_account_is_never_refreshed(self):
+        """is_active=True (active default / live session) must skip refresh entirely,
+        even with an expired token — refreshing rotates the live login's token out."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)  # expired
+
+        usage_resp = self._make_usage_response(h5_pct=5.0, d7_pct=6.0)
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise AssertionError("active account must NOT refresh its token")
+            if "oauth/usage" in req.full_url:
+                return usage_resp
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen), \
+             patch("claude_swap.oauth.refresh_oauth_credentials") as refresh_mock:
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=True,
+            )
+
+        refresh_mock.assert_not_called()
+        assert result is not None
+
     def test_refresh_failure_returns_none_gracefully(self):
         """If token refresh fails (e.g. revoked), usage returns None."""
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -669,6 +741,84 @@ class TestPrimeAccount:
     def test_network_error_returns_false_never_raises(self):
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError("boom")):
             assert oauth.prime_account("tok-abc") is False
+
+
+class TestProbeMessagesHeadroom:
+    """The messages-API headroom probe — the backup signal when the usage endpoint
+    is 429-backed-off. Every test MOCKS urllib — NO real call is ever made.
+    """
+
+    @staticmethod
+    def _resp(status: int):
+        resp = MagicMock()
+        resp.status = status
+        resp.read.return_value = b"{}"
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_2xx_returns_true_and_sends_correct_shape(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=self._resp(200)) as m:
+            assert oauth.probe_messages_headroom("tok-abc") is True
+        # Same request shape as a prime call: POST /v1/messages with the OAuth beta.
+        req = m.call_args[0][0]
+        assert req.full_url == "https://api.anthropic.com/v1/messages"
+        assert req.get_method() == "POST"
+        assert req.get_header("Authorization") == "Bearer tok-abc"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        assert req.get_header("Anthropic-version") == "2023-06-01"
+        body = json.loads(req.data.decode())
+        assert body["model"] == oauth.PRIME_MODEL
+        assert body["max_tokens"] == 1
+        assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+    def test_429_returns_false_and_records_retry_after(self):
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=429, msg="Too Many Requests",
+            hdrs={"Retry-After": "1800"}, fp=None,
+        )
+        failure: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.probe_messages_headroom("tok-abc", failure_out=failure) is False
+        assert failure["retry_after"] == 1800
+
+    def test_429_retry_after_is_clamped(self):
+        from claude_swap.oauth import _MAX_USAGE_BACKOFF_S
+
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=429, msg="Too Many Requests",
+            hdrs={"Retry-After": "999999999"}, fp=None,
+        )
+        failure: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.probe_messages_headroom("tok-abc", failure_out=failure) is False
+        assert failure["retry_after"] == _MAX_USAGE_BACKOFF_S
+
+    def test_429_without_header_returns_false_no_retry_after(self):
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=429, msg="Too Many Requests", hdrs=None, fp=None,
+        )
+        failure: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.probe_messages_headroom("tok-abc", failure_out=failure) is False
+        assert "retry_after" not in failure
+
+    def test_401_returns_none_not_false(self):
+        # Logged out is UNKNOWN, not "capped" — the caller must not cache a false
+        # capped verdict for a transient/auth failure.
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=401, msg="Unauthorized", hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.probe_messages_headroom("tok-abc") is None
+
+    def test_network_error_returns_none_never_raises(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=OSError("boom")):
+            assert oauth.probe_messages_headroom("tok-abc") is None
 
 
 class TestSubscriptionType:

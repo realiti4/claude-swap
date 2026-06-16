@@ -37,8 +37,15 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from claude_swap.balancer import AccountView, SessionView, _pct_cost
-from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.balancer import PROBE_CONFIRMED_PCT, AccountView, SessionView, _pct_cost
+from claude_swap.cache import (
+    MISSING,
+    probe_ok,
+    probe_recent,
+    read_cache,
+    usage_backoff_active,
+    write_cache,
+)
 from claude_swap.models import get_timestamp
 from claude_swap.process_detection import is_pid_alive
 
@@ -428,7 +435,7 @@ def _with_reserve(max_pct: float | None, reserve: float) -> float | None:
 
 
 def build_world(
-    switcher, reg: dict, *, fetch_idle: bool = True
+    switcher, reg: dict, *, fetch_idle: bool = True, probe_unavailable: bool = False
 ) -> tuple[dict[str, AccountView], list[SessionView]]:
     """Build the immutable snapshot the pure balancer consumes.
 
@@ -438,10 +445,21 @@ def build_world(
       last-reported ``rate_limits`` (free, no network);
     * **cache** — an idle account uses the shared 15s usage cache, fetching via
       the usage API on a miss only when ``fetch_idle`` is set;
-    * **none** — unknown usage (no signal / fetch failed) => ``max_pct=None`` =>
-      zero headroom, so the account is never chosen as a migration target.
+    * **probe** — an idle account whose usage signal is UNAVAILABLE (the usage
+      endpoint is 429-backed-off, or a within-TTL fetch failure) is probed via the
+      messages endpoint (a SEPARATE rate-limit bucket) ONLY when ``probe_unavailable``
+      is set. A 2xx confirms the account can serve a turn now; it enters the model
+      with a conservative synthesized ``max_pct=PROBE_CONFIRMED_PCT`` so a stranded
+      session can resume onto it instead of stalling for the whole backoff window.
+      Costs one billable Haiku turn, throttled cross-process to once per
+      ``PROBE_VERDICT_TTL_S`` and NEVER run for the active default / a live-session
+      account. Default OFF: only the supervisor's strand/resume/placement paths
+      request it; render paths (statusline, dashboard, ``cswap --list``) never do;
+    * **none** — unknown usage (no signal / fetch failed / probe capped-or-unknown)
+      => ``max_pct=None`` => zero headroom, so the account is never a migration target.
 
-    Must be called OUTSIDE ``switcher.lock_file`` (the idle fetch is network I/O).
+    Must be called OUTSIDE ``switcher.lock_file`` (the idle fetch + probe are
+    network I/O).
     """
     seq = switcher._get_sequence_data() or {}
     accounts = seq.get("accounts", {})
@@ -468,6 +486,21 @@ def build_world(
     usage_cache_path = switcher.backup_dir / "cache" / "usage.json"
     cached = read_cache(usage_cache_path, _usage_ttl())
     cached = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+    # Persisted markers survive the freshness TTL: a 429 backoff marker holds the
+    # cache slot until its server-requested Retry-After elapses, so a rate-limited
+    # usage endpoint isn't re-hit every TTL (the "usage unavailable" feedback loop).
+    persisted = read_cache(usage_cache_path, float("inf"))
+    persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+
+    # The active default login (current ~/.claude identity). Its OAuth token — and
+    # that of any account with a live session — must NEVER be refreshed by the idle
+    # usage path NOR probed via the messages endpoint: refreshing rotates the
+    # single-use refresh token out from under the live login and forces a re-login,
+    # and probing would touch credentials Claude Code owns. This mirrors the guard
+    # `list_accounts` applies; threading it here closes the asymmetry that was
+    # logging users out. Resolved whenever we may fetch idle usage OR probe — both
+    # need the active/live guard.
+    active_num = switcher.active_account_num() if (fetch_idle or probe_unavailable) else None
 
     acct_views: dict[str, AccountView] = {}
     fetched: dict[str, dict | None] = {}
@@ -507,24 +540,86 @@ def build_world(
             continue
 
         cached_entry = cached.get(num) if isinstance(cached, dict) else None
-        if isinstance(cached_entry, dict) and cached_entry.get("_unavailable"):
-            # A cached fetch FAILURE (e.g. usage-API 429). Treat as no signal and
-            # do NOT refetch: the marker holds the cache slot for the TTL, so a
-            # failing / rate-limited fetch is throttled to once per cache TTL
-            # instead of being retried every supervise tick — the feedback loop
-            # that otherwise pins every account at "usage unavailable" once the
-            # usage endpoint starts returning 429. The shared cache file
-            # coordinates this across all supervisor processes.
+        persisted_entry = persisted.get(num) if isinstance(persisted, dict) else None
+        # A no-signal account whose usage is UNAVAILABLE (429-backed-off endpoint or
+        # a within-TTL failure) is a candidate for the messages-API headroom probe.
+        # The probe view (a synthesized ``"probe"`` AccountView), when produced,
+        # short-circuits the usual usage->AccountView mapping below.
+        probe_view: AccountView | None = None
+        if probe_unavailable and probe_ok(persisted_entry) and probe_recent(persisted_entry):
+            # A fresh cached probe-OK verdict ({"_probe_ok": True, ...}). It carries
+            # no usage windows and no _unavailable marker, so neither the backoff
+            # branch nor the within-TTL-failure branch below would catch it — it
+            # would fall through to ``elif cached_entry is not None`` and become a
+            # signal="cache" view with max_pct=None (zero headroom, never a target),
+            # silently defeating the whole resume-onto-a-probed-account feature on
+            # every build_world pass after the one that fired the live probe. Reuse
+            # the verdict WITHOUT a network call instead. Read from ``persisted_entry``
+            # (inf TTL), not ``cached_entry``: the verdict carries no retry_until, so
+            # it would expire from the 60s freshness cache at half the documented
+            # PROBE_VERDICT_TTL_S cadence — the persisted read keeps it alive for the
+            # full window so the cross-process cadence cap actually holds for OK
+            # verdicts (it already does for the 429/None markers via retry_until).
             usage = None
+            probe_view = _maybe_probe(
+                switcher, num, email, priority, resv,
+                persisted_entry, active_num, probe_unavailable, fetched,
+            )
+        elif usage_backoff_active(persisted_entry):
+            # Under a server-requested 429 backoff: the usage endpoint is no signal
+            # and must NOT be refetched. Fall back to a messages probe (a separate
+            # rate-limit bucket) when asked — THE fix for the hour-long resume stall.
+            usage = None
+            probe_view = _maybe_probe(
+                switcher, num, email, priority, resv,
+                persisted_entry, active_num, probe_unavailable, fetched,
+            )
+            if probe_view is None:
+                # No probe (disabled / active / throttled-and-not-OK): keep the
+                # backoff marker so it survives this write.
+                fetched.setdefault(num, persisted_entry)
+        elif isinstance(cached_entry, dict) and cached_entry.get("_unavailable"):
+            # A cached fetch FAILURE within the freshness TTL. No signal, do NOT
+            # refetch the usage endpoint — but a messages probe can still confirm
+            # headroom (throttled cross-process by the ``_probed_at`` stamp).
+            usage = None
+            probe_view = _maybe_probe(
+                switcher, num, email, priority, resv,
+                cached_entry, active_num, probe_unavailable, fetched,
+            )
         elif cached_entry is not None:
             usage = cached_entry
         elif fetch_idle:
-            usage = _fetch_idle_usage(switcher, num, email)
+            # Never refresh/rotate the token of the active default login or an
+            # account with a live session — that is the credential-invalidation
+            # bug. With is_active=True the fetch skips refresh; a 401 then simply
+            # yields no usage (max_pct=None), which the balancer already treats as
+            # zero headroom — far better than logging the user out.
+            acct_is_active = (
+                (active_num is not None and num == str(active_num))
+                or switcher.has_live_session(num, email)
+            )
+            fail: dict = {}
+            usage = _fetch_idle_usage(
+                switcher, num, email, is_active=acct_is_active, failure_out=fail
+            )
             # Persist the outcome either way — real usage, or a failure marker so
-            # the TTL throttles retries (see above).
-            fetched[num] = usage if usage is not None else {"_unavailable": True}
+            # retries are throttled. On a 429 the marker carries the server's
+            # Retry-After so we back off for as long as it asked, not just one TTL.
+            if usage is not None:
+                fetched[num] = usage
+            else:
+                marker: dict = {"_unavailable": True}
+                ra = fail.get("retry_after")
+                if isinstance(ra, (int, float)) and ra > 0:
+                    marker["retry_until"] = time.time() + ra
+                fetched[num] = marker
         else:
             usage = None
+
+        if probe_view is not None:
+            acct_views[num] = probe_view
+            continue
 
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
@@ -554,6 +649,168 @@ def build_world(
     return acct_views, sess_views
 
 
+def _probe_view(num: str, priority: int, resv: float, entry: dict | None) -> AccountView:
+    """A synthesized ``"probe"`` :class:`AccountView` for a confirmed-runnable account.
+
+    Built only after a messages probe (or a fresh cached OK verdict) confirms the
+    account can serve a turn now. ``max_pct`` is the conservative
+    :data:`~claude_swap.balancer.PROBE_CONFIRMED_PCT`, folded through
+    :func:`_with_reserve` so a just-placed online reservation still stacks (keeping
+    two stranded sessions from co-exhausting it). Per-window pct/reset are ``None``
+    (a probe yields no window data); ``soonest_reset`` is ``None`` (unknown).
+    extra-usage/spend are read best-effort from ``entry`` (usually absent on a
+    backoff/probe marker, so typically ``(False, None)``).
+    """
+    extra_usage, spend_pct = _spend_signal(entry)
+    return AccountView(
+        num=num,
+        priority=priority,
+        max_pct=_with_reserve(PROBE_CONFIRMED_PCT, resv),
+        soonest_reset=None,
+        signal="probe",
+        five_hour_pct=None,
+        five_hour_reset=None,
+        seven_day_pct=None,
+        seven_day_reset=None,
+        extra_usage=extra_usage,
+        spend_pct=spend_pct,
+    )
+
+
+def _claim_probe_slot(switcher, num: str):
+    """Compare-and-set a provisional probe claim for ``num`` under the lock.
+
+    The lock-free freshness re-read in :func:`_maybe_probe` leaves a herd window: N
+    supervisors waking together can all see a stale stamp and all probe before any
+    stamp lands. This closes it. Under :attr:`switcher.lock_file`, re-read the
+    account's ``usage.json`` slot and re-check :func:`cache.probe_recent`:
+
+    * if a FRESH verdict raced in (another process already probed), return that
+      entry so the caller reuses it (when OK) or stays no-signal — no probe fires;
+    * otherwise stamp a provisional ``{"_unavailable": True, "_probed_at": now}``
+      placeholder (so every other supervisor now sees a fresh verdict and bows out)
+      and return ``None`` to signal "you won the claim, go probe". The caller's real
+      verdict overwrites this placeholder after the (out-of-lock) network probe.
+
+    Returns ``None`` (go probe) when the slot was claimed OR when the lock could not
+    be acquired — best-effort: a missed claim degrades to the old lock-free behaviour
+    (a possible duplicate probe), never to a crash or a dropped probe.
+    """
+    from claude_swap.locking import FileLock
+
+    usage_cache_path = switcher.backup_dir / "cache" / "usage.json"
+    lock = FileLock(switcher.lock_file, timeout=5)
+    if not lock.acquire():
+        return None
+    try:
+        latest = read_cache(usage_cache_path, float("inf"))
+        latest = latest if (latest is not MISSING and isinstance(latest, dict)) else {}
+        current = latest.get(num)
+        if probe_recent(current):
+            # Another supervisor stamped a fresh verdict in the race -> reuse it.
+            return current
+        merged = dict(latest)
+        merged[num] = {"_unavailable": True, "_probed_at": time.time()}
+        write_cache(usage_cache_path, merged)
+        return None
+    finally:
+        lock.release()
+
+
+def _maybe_probe(
+    switcher,
+    num: str,
+    email: str,
+    priority: int,
+    resv: float,
+    entry: dict | None,
+    active_num,
+    probe_unavailable: bool,
+    fetched: dict[str, dict | None],
+) -> AccountView | None:
+    """Messages-API headroom fallback for a no-signal idle account.
+
+    Returns a ``"probe"`` :class:`AccountView` when the account is confirmed
+    runnable now (via a fresh cached OK verdict, reused WITHOUT a network call, or a
+    live probe that returned ``True``); otherwise ``None`` (probing disabled,
+    account active/live, throttle gate not OK, or the probe came back capped/unknown).
+
+    Gating (ALL must hold to fire a live probe):
+
+    * ``probe_unavailable`` is set (opt-in; only the supervisor's strand/resume
+      paths request it — render paths never do);
+    * the account is NOT the active default login and has NO live session (hard
+      credential-safety invariant — never touch creds Claude Code owns);
+    * no fresh verdict is cached for it (``cache.probe_recent`` — the cross-process
+      cadence cap; while a recent verdict exists every supervisor REUSES it instead
+      of re-probing, so N supervisors never each fire a billable probe).
+
+    Each verdict is written into ``fetched[num]`` (the same shared ``usage.json``
+    slot the 429 marker uses) so the cadence is enforced cross-process:
+      * True  -> ``{"_probe_ok": True, "_probed_at": now}`` + a probe AccountView;
+      * False (429) -> ``{"_unavailable": True, "retry_until": now+Retry-After,
+                          "_probed_at": now}`` (refresh the backoff with the messages
+                          bucket's Retry-After);
+      * None (unknown) -> ``{"_unavailable": True, "_probed_at": now}`` (no
+                          retry_until, so it elapses on the usage TTL; the stamp
+                          still throttles a re-probe for the cadence window).
+
+    Best-effort, never raises (``_probe_idle_headroom`` swallows its own errors).
+    """
+    if not probe_unavailable:
+        return None
+    # Reuse a fresh cached verdict without a network call (cross-process throttle).
+    if probe_recent(entry):
+        if probe_ok(entry):
+            fetched.setdefault(num, entry)
+            return _probe_view(num, priority, resv, entry)
+        # A recent capped/unknown verdict: stay no-signal, no re-probe yet.
+        return None
+    # Never probe the active default login or an account with a live session.
+    acct_is_active = (
+        (active_num is not None and num == str(active_num))
+        or switcher.has_live_session(num, email)
+    )
+    if acct_is_active:
+        return None
+
+    # Close the cross-process herd window (TOCTOU): the freshness re-read above is
+    # lock-free, so N supervisors waking on the same ~30s pause cadence could all
+    # observe a stale stamp and all fire a billable probe before any stamp lands.
+    # Compare-and-set a provisional claim UNDER THE LOCK — re-read this account's
+    # cache slot, re-check probe_recent, and if it is still stale stamp a placeholder
+    # so every other supervisor now sees a fresh verdict and bows out. The billable
+    # probe itself still runs OUTSIDE the lock (it is network I/O) and overwrites the
+    # placeholder with the real verdict below. A reuse-able fresh verdict that landed
+    # in the race is honoured here. Best-effort: if the lock can't be taken we fall
+    # through and probe anyway (degrades to the old behaviour, never worse).
+    raced = _claim_probe_slot(switcher, num)
+    if raced is not None:
+        if probe_ok(raced):
+            fetched.setdefault(num, raced)
+            return _probe_view(num, priority, resv, raced)
+        return None
+
+    fail: dict = {}
+    verdict = _probe_idle_headroom(
+        switcher, num, email, is_active=acct_is_active, failure_out=fail
+    )
+    now = time.time()
+    if verdict is True:
+        fetched[num] = {"_probe_ok": True, "_probed_at": now}
+        return _probe_view(num, priority, resv, entry)
+    if verdict is False:
+        marker: dict = {"_unavailable": True, "_probed_at": now}
+        ra = fail.get("retry_after")
+        if isinstance(ra, (int, float)) and ra > 0:
+            marker["retry_until"] = now + ra
+        fetched[num] = marker
+        return None
+    # Unknown (None): stamp so the re-probe is throttled, but no retry_until.
+    fetched[num] = {"_unavailable": True, "_probed_at": now}
+    return None
+
+
 def _priority_of(info: dict) -> int:
     try:
         return int(info.get("priority", 0))
@@ -567,15 +824,109 @@ def _usage_ttl() -> int:
     return _USAGE_CACHE_TTL
 
 
-def _fetch_idle_usage(switcher, num: str, email: str) -> dict | None:
-    """Fetch one idle account's usage via the usage API. Best-effort, never raises."""
+def _fetch_idle_usage(
+    switcher, num: str, email: str, *, is_active: bool = False, failure_out: dict | None = None
+) -> dict | None:
+    """Fetch one idle account's usage via the usage API. Best-effort, never raises.
+
+    ``is_active`` MUST be True for the active default login or any account with a
+    live session: with it set, the usage path never refreshes/rotates the OAuth
+    token (Claude Code owns those credentials). For a genuinely-idle account whose
+    expired token IS refreshed, the rotated token is persisted back to the canonical
+    backup under the lock — so cswap never leaves its own backup holding a dead
+    (single-use, already-rotated) refresh token, which would otherwise log the
+    account out on its next refresh.
+    """
     from claude_swap import oauth
+    from claude_swap.locking import FileLock
 
     try:
         creds = switcher.read_account_credentials(str(num), email)
         if not creds or not oauth.extract_access_token(creds):
             return None
-        return oauth.fetch_usage_for_account(str(num), email, creds, is_active=False)
+
+        def _persist(acct_num: str, acct_email: str, new_creds: str) -> None:
+            with FileLock(switcher.lock_file):
+                switcher.write_account_credentials(acct_num, acct_email, new_creds)
+
+        return oauth.fetch_usage_for_account(
+            str(num), email, creds,
+            is_active=is_active,
+            persist_credentials=None if is_active else _persist,
+            failure_out=failure_out,
+        )
     except Exception:  # noqa: BLE001 - usage is best-effort; unknown => not a target
         switcher._logger.debug("idle usage fetch failed for %s", num, exc_info=True)
+        return None
+
+
+def _probe_idle_headroom(
+    switcher, num: str, email: str, *, is_active: bool = False, failure_out: dict | None = None
+) -> bool | None:
+    """Probe one idle account's headroom via the messages endpoint. Best-effort.
+
+    Structurally identical to :func:`_fetch_idle_usage` (creds read + the optional
+    expired-token refresh-and-persist happen here; the network probe runs OUTSIDE
+    the lock), but it answers a different question — "can this account serve a turn
+    NOW?" — using the messages bucket, which is unaffected by a 429 on the usage
+    endpoint. Returns the tri-state of :func:`oauth.probe_messages_headroom`
+    (``True``/``False``/``None``); on any local failure, ``None`` (unknown).
+
+    ``is_active`` MUST be True for the active default login / a live-session account
+    (the caller's gate already refuses to probe those); with it set the expired-token
+    refresh is skipped so Claude Code's single-use refresh token is never rotated.
+    For a genuinely-idle account whose token IS refreshed, the rotated token is
+    persisted back under the lock — never leaving cswap holding a dead refresh token.
+
+    Only a recognized Claude *subscription* account is probed. The probe sends the
+    exact same billable ``/v1/messages`` turn as priming, so it MUST carry priming's
+    subscription-tier guard (``oauth.is_primable_subscription``): without it, a
+    pay-as-you-go / API / console account — or a subscription-exhausted account with
+    extra-usage enabled — returns a billed 2xx that the balancer would misread as
+    ~80% subscription headroom, silently charging real dollars and defeating
+    ``onlySubscriptionTokens``. A non-subscription account returns ``None`` (unknown
+    => no headroom, never a target), mirroring the prime invariant exactly.
+    """
+    from claude_swap import oauth
+    from claude_swap.locking import FileLock
+
+    try:
+        creds = switcher.read_account_credentials(str(num), email)
+        if not creds:
+            return None
+        # Never probe a non-subscription account: the messages turn bills real money
+        # and a 2xx can't distinguish "subscription has room" from "PAYG just charged
+        # me". Mirrors supervisor._prime_one_account's guard so the probe never bills
+        # a pay-as-you-go account, regardless of cfg.only_subscription.
+        if not oauth.is_primable_subscription(oauth.extract_subscription_type(creds)):
+            switcher._logger.debug(
+                "probe: skipping %s — not a primeable subscription account", num
+            )
+            return None
+        oauth_data = oauth.extract_oauth_data(creds) or {}
+        token = oauth_data.get("accessToken")
+        if not token:
+            return None
+
+        # Refresh an expired token for this INACTIVE account, persisting under the
+        # lock (mirrors the usage path); never refresh an active/live account.
+        if (
+            not is_active
+            and oauth_data.get("refreshToken")
+            and oauth.is_oauth_token_expired(oauth_data.get("expiresAt"))
+        ):
+            refreshed = oauth.refresh_oauth_credentials(creds)
+            if refreshed:
+                token = oauth.extract_access_token(refreshed) or token
+                try:
+                    with FileLock(switcher.lock_file):
+                        switcher.write_account_credentials(str(num), email, refreshed)
+                except Exception:
+                    switcher._logger.debug(
+                        "probe: persist refreshed creds failed for %s", num, exc_info=True
+                    )
+
+        return oauth.probe_messages_headroom(token, failure_out=failure_out)
+    except Exception:  # noqa: BLE001 - probing is best-effort; unknown => not a target
+        switcher._logger.debug("idle headroom probe failed for %s", num, exc_info=True)
         return None

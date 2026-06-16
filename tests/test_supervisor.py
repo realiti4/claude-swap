@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_swap import balancer, registry
-from claude_swap.supervisor import Supervisor
+from claude_swap.supervisor import _MAX_AUTH_RECOVER_ATTEMPTS, Supervisor
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -214,6 +214,22 @@ class TestSessionEnv:
         env = sup._session_env()
         assert env["CLAUDE_CODE_MAX_RETRIES"] == "3"
 
+    def test_forces_session_persistence_by_default(self, temp_home, monkeypatch):
+        # cmux sets CLAUDE_CODE_CHILD_SESSION=1, which makes Claude Code skip writing
+        # the main <sessionId>.jsonl transcript; a managed session must force it on so
+        # auto-resume / `cswap launch -- --resume <id>` works and no history is lost.
+        monkeypatch.delenv("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", raising=False)
+        sup = self._sup(temp_home)
+        env = sup._session_env()
+        assert env["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] == "1"
+
+    def test_respects_user_set_session_persistence(self, temp_home, monkeypatch):
+        # An explicit user override is never clobbered.
+        monkeypatch.setenv("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "0")
+        sup = self._sup(temp_home)
+        env = sup._session_env()
+        assert env["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] == "0"
+
 
 class TestSelfSessionView:
     """BUG 009: recovery paths must size the view with this session's ctx_tokens."""
@@ -248,6 +264,103 @@ class TestSelfSessionView:
         assert sv.paused_until == 12345
         assert sv.last_migrated_at == 99.0
         assert sv.pinned_account == "2"
+
+
+class TestProbeWiring:
+    """The strand/resume paths opt into the messages-API headroom probe
+    (``probe_unavailable=True``); render/limit-detection paths NEVER do."""
+
+    def _sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5), "2": ("b@x.com", 5)})
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+        sup._register()
+        return sup
+
+    def test_pause_and_resume_probes_and_migrates(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        # Current account "1" exhausted; "2" is a probe-confirmed runnable target.
+        world = (
+            {
+                "1": balancer.AccountView(num="1", priority=5, max_pct=99.0, signal="cache"),
+                "2": balancer.AccountView(
+                    num="2", priority=5, max_pct=balancer.PROBE_CONFIRMED_PCT, signal="probe"
+                ),
+            },
+            [],
+        )
+        seen_kwargs: list[dict] = []
+
+        def fake_build_world(switcher, reg, **kwargs):
+            seen_kwargs.append(kwargs)
+            return world
+
+        migrated: list[str] = []
+        monkeypatch.setattr(sup, "_migrate", lambda to: migrated.append(to))
+        monkeypatch.setattr(sup, "_mark_paused", lambda until: None)
+        with patch("claude_swap.supervisor.registry.build_world", side_effect=fake_build_world):
+            sup._pause_and_resume()
+
+        # The pause/resume decision path opted into probing, and the probe-confirmed
+        # account is migrated onto instead of pausing an hour.
+        assert all(kw.get("probe_unavailable") is True for kw in seen_kwargs)
+        assert migrated == ["2"]
+
+    def test_pause_and_resume_migrates_via_real_build_world(self, temp_home, monkeypatch):
+        # End-to-end over the REAL build_world (NOT a static stub), so the multi-pass
+        # cache-reuse seam that the resume-path blocker lived in is actually exercised:
+        # _pause_and_resume's gate pass probes account "2" and confirms headroom; the
+        # immediately-following _reassign_for_resume pass must REUSE that cached
+        # probe-OK verdict (signal="probe") and migrate onto "2" — not see it as
+        # signal="cache"/max_pct=None and un-pause the session onto exhausted "1".
+        from claude_swap.cache import write_cache
+        from claude_swap.locking import FileLock
+
+        sup = self._sup(temp_home)
+        # Current account "1" is exhausted via this session's live rate_limits (99%).
+        reg = registry.read_registry(sup.switcher)
+        reg["sessions"]["mid"]["rate_limits"] = {
+            "five_hour": {"used_percentage": 99.0, "resets_at": int(time.time()) + 3600},
+        }
+        reg["sessions"]["mid"]["last_seen"] = time.time()
+        with FileLock(sup.switcher.lock_file):
+            registry.write_registry(sup.switcher, reg)
+        # Account "2" is usage-429-backed-off -> a probe candidate.
+        write_cache(
+            sup.switcher.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True, "retry_until": time.time() + 3600}},
+        )
+        reg = registry.read_registry(sup.switcher)
+
+        migrated: list[str] = []
+        monkeypatch.setattr(sup, "_migrate", lambda to: migrated.append(to))
+        monkeypatch.setattr(sup, "_mark_paused", lambda until: None)
+        # The probe confirms account "2" can serve a turn now (no real network).
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=True):
+            sup._pause_and_resume()
+
+        # The stranded session resumes onto the probe-confirmed account.
+        assert migrated == ["2"]
+
+    def test_render_and_limit_detection_paths_do_not_probe(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        seen_kwargs: list[dict] = []
+
+        def fake_build_world(switcher, reg, **kwargs):
+            seen_kwargs.append(kwargs)
+            return ({"1": balancer.AccountView(num="1", priority=5, max_pct=10.0, signal="cache")}, [])
+
+        monkeypatch.setattr(
+            sup.switcher, "get_auto_balance_config",
+            lambda: {"enabled": True, "model": "sonnet", "effortLevel": "",
+                     "threshold": 90, "targetSafety": 85},
+        )
+        with patch("claude_swap.supervisor.registry.build_world", side_effect=fake_build_world):
+            sup._account_view()            # render of current account's pct
+            sup._should_handle_limit_exit()  # limit-exit detection
+        # Neither path requests a probe (default OFF) — no accidental billing.
+        assert seen_kwargs  # build_world was called
+        assert all(kw.get("probe_unavailable", False) is False for kw in seen_kwargs)
 
 
 class TestMigrateReservation:
@@ -400,6 +513,239 @@ class TestRecoverAuth:
         assert calls == []
         reg2 = registry.read_registry(sup.switcher)
         assert reg2["sessions"]["mid"].get("auth_recover") is None
+
+
+class TestAuthExitRecovery:
+    """A child that hard-exits on invalid credentials recovers, bounded — instead
+    of the exit being mistaken for a clean quit and the session silently ending."""
+
+    def _sup(self, temp_home, share=False):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5), "2": ("b@x.com", 5)})
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=share)
+        sup._register()
+        return sup
+
+    def _set_row(self, sup, **fields):
+        from claude_swap.locking import FileLock
+
+        reg = registry.read_registry(sup.switcher)
+        reg["sessions"]["mid"].update(fields)
+        with FileLock(sup.switcher.lock_file):
+            registry.write_registry(sup.switcher, reg)
+
+    def test_clean_exit_is_never_an_auth_exit(self, temp_home):
+        sup = self._sup(temp_home)
+        with patch.object(sup, "_profile_auth_invalid") as probe:
+            assert sup._should_recover_auth_exit(0) is False  # rc 0 -> clean quit
+        probe.assert_not_called()  # clean quits pay no probe cost
+
+    def test_recent_auth_flag_triggers_recovery_and_is_cleared(self, temp_home):
+        sup = self._sup(temp_home)
+        self._set_row(sup, auth_recover=time.time())
+        with patch.object(sup, "_profile_auth_invalid") as probe:
+            assert sup._should_recover_auth_exit(1) is True
+            probe.assert_not_called()  # the flag is enough; no probe needed
+        reg = registry.read_registry(sup.switcher)
+        assert reg["sessions"]["mid"].get("auth_recover") is None  # cleared
+
+    def test_probe_runs_only_on_launch_time_failure(self, temp_home):
+        # No flag, no recorded session id => claude exited before rendering =>
+        # the credit-free auth probe decides.
+        sup = self._sup(temp_home)
+        with patch.object(sup, "_profile_auth_invalid", return_value=True) as probe:
+            assert sup._should_recover_auth_exit(1) is True
+            probe.assert_called_once()
+
+    def test_no_probe_once_session_rendered(self, temp_home):
+        # A non-zero exit AFTER claude rendered (has a session id) is a quit/crash,
+        # not a launch-time auth failure -> no probe, not treated as an auth exit.
+        sup = self._sup(temp_home)
+        self._set_row(sup, claude_session_id="sid-1")
+        with patch.object(sup, "_profile_auth_invalid", return_value=True) as probe:
+            assert sup._should_recover_auth_exit(1) is False
+            probe.assert_not_called()
+
+    def test_signal_killed_child_is_not_an_auth_exit(self, temp_home):
+        # A negative rc means claude was killed by a signal (e.g. -11 SIGSEGV),
+        # not an authentication problem -> never enter auth recovery.
+        sup = self._sup(temp_home)
+        with patch.object(sup, "_profile_auth_invalid", return_value=True) as probe:
+            assert sup._should_recover_auth_exit(-11) is False
+            probe.assert_not_called()
+
+    def test_run_stops_after_cap_exhausted(self, temp_home, monkeypatch):
+        # Repeated auth-failure exits are bounded: once the per-launch cap is hit
+        # the supervisor stops relaunching (no spin) and returns the child's code.
+        sup = self._sup(temp_home)
+        sup._auth_recover_attempts = _MAX_AUTH_RECOVER_ATTEMPTS  # already exhausted
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "claude_swap.supervisor.subprocess.Popen",
+            lambda cmd, **kw: (popen_calls.append(list(cmd)) or _FakeProc()),
+        )
+        monkeypatch.setattr(sup, "_bootstrap_profile", lambda: None)
+        monkeypatch.setattr(sup, "_register", lambda: None)
+        monkeypatch.setattr(sup, "_set_pids", lambda pid: None)
+        monkeypatch.setattr(sup, "_should_handle_limit_exit", lambda: False)
+        monkeypatch.setattr(sup, "_should_recover_auth_exit", lambda rc: True)
+        recovered: list[int] = []
+        monkeypatch.setattr(sup, "_recover_auth", lambda: recovered.append(1) or True)
+        monkeypatch.setattr(sup, "_supervise", lambda proc: ("exit", 1))
+
+        rc = sup.run([], "/usr/bin/claude")
+        assert rc == 1
+        assert recovered == []        # cap already hit -> never attempts recovery
+        assert len(popen_calls) == 1  # no relaunch / spin
+
+    def test_run_recovers_then_relaunches(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "claude_swap.supervisor.subprocess.Popen",
+            lambda cmd, **kw: (popen_calls.append(list(cmd)) or _FakeProc()),
+        )
+        monkeypatch.setattr(sup, "_bootstrap_profile", lambda: None)
+        monkeypatch.setattr(sup, "_register", lambda: None)
+        monkeypatch.setattr(sup, "_set_pids", lambda pid: None)
+        monkeypatch.setattr(sup, "_should_handle_limit_exit", lambda: False)
+        auth_flags = iter([True, False])
+        monkeypatch.setattr(sup, "_should_recover_auth_exit", lambda rc: next(auth_flags))
+        recovered: list[int] = []
+        monkeypatch.setattr(sup, "_recover_auth", lambda: (recovered.append(1) or True))
+        outcomes = iter([("exit", 1), ("exit", 0)])
+        monkeypatch.setattr(sup, "_supervise", lambda proc: next(outcomes))
+
+        rc = sup.run([], "/usr/bin/claude")
+        assert rc == 0
+        assert recovered == [1]        # recovered once
+        assert len(popen_calls) == 2   # relaunched after recovery
+
+    def test_run_gives_up_when_recovery_fails(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "claude_swap.supervisor.subprocess.Popen",
+            lambda cmd, **kw: (popen_calls.append(list(cmd)) or _FakeProc()),
+        )
+        monkeypatch.setattr(sup, "_bootstrap_profile", lambda: None)
+        monkeypatch.setattr(sup, "_register", lambda: None)
+        monkeypatch.setattr(sup, "_set_pids", lambda pid: None)
+        monkeypatch.setattr(sup, "_should_handle_limit_exit", lambda: False)
+        monkeypatch.setattr(sup, "_should_recover_auth_exit", lambda rc: True)
+        monkeypatch.setattr(sup, "_recover_auth", lambda: False)  # logged out, no target
+        monkeypatch.setattr(sup, "_supervise", lambda proc: ("exit", 7))
+        deregistered: list[int] = []
+        monkeypatch.setattr(sup, "_deregister", lambda: deregistered.append(1))
+
+        rc = sup.run([], "/usr/bin/claude")
+        assert rc == 7                 # returns the child's code, no spin
+        assert len(popen_calls) == 1   # did NOT relaunch into dead creds
+        assert deregistered == [1]
+
+
+class TestSignalAndResumeHint:
+    """Ctrl-C must reach claude (so it prints its own resume hint), and the
+    supervisor prints a balancer-aware resume hint on a clean quit."""
+
+    def _sup(self, temp_home, share=True):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5)})
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=share)
+        sup._register()
+        return sup
+
+    def _set_session_id(self, sup, sid):
+        from claude_swap.locking import FileLock
+
+        reg = registry.read_registry(sup.switcher)
+        reg["sessions"]["mid"]["claude_session_id"] = sid
+        with FileLock(sup.switcher.lock_file):
+            registry.write_registry(sup.switcher, reg)
+
+    def test_passive_sigint_installs_noop_and_restores(self, temp_home):
+        import signal
+
+        sup = self._sup(temp_home)
+        original = signal.getsignal(signal.SIGINT)
+        prev = sup._install_passive_sigint()
+        try:
+            installed = signal.getsignal(signal.SIGINT)
+            assert callable(installed) and installed is not original
+        finally:
+            sup._restore_sigint(prev)
+        assert signal.getsignal(signal.SIGINT) is original
+
+    def test_resume_hint_printed_with_share_and_session_id(self, temp_home, capsys):
+        sup = self._sup(temp_home, share=True)
+        self._set_session_id(sup, "sess-123")
+        sup._print_resume_hint()
+        assert "cswap launch -- --resume sess-123" in capsys.readouterr().out
+
+    def test_resume_hint_suppressed_without_share(self, temp_home, capsys):
+        sup = self._sup(temp_home, share=False)
+        self._set_session_id(sup, "sess-123")
+        sup._print_resume_hint()
+        assert capsys.readouterr().out == ""
+
+    def test_sigint_restored_before_pause_wait(self, temp_home, monkeypatch):
+        # Regression: the passive (no-op) SIGINT handler must be installed ONLY
+        # while claude is the live foreground process. During the child-less
+        # pause/auto-resume countdown the original handler must be back so Ctrl-C
+        # stays interruptible (otherwise a user is stuck in the countdown).
+        import signal
+
+        sup = self._sup(temp_home, share=False)
+        monkeypatch.setattr(
+            "claude_swap.supervisor.subprocess.Popen", lambda cmd, **kw: _FakeProc()
+        )
+        monkeypatch.setattr(sup, "_bootstrap_profile", lambda: None)
+        monkeypatch.setattr(sup, "_register", lambda: None)
+        monkeypatch.setattr(sup, "_set_pids", lambda pid: None)
+
+        seen: dict[str, object] = {}
+
+        def fake_pause():
+            seen["handler"] = signal.getsignal(signal.SIGINT)
+
+        monkeypatch.setattr(sup, "_pause_and_resume", fake_pause)
+        limit_flags = iter([True, False])
+        monkeypatch.setattr(sup, "_should_handle_limit_exit", lambda: next(limit_flags))
+        outcomes = iter([("exit", 1), ("exit", 0)])
+        monkeypatch.setattr(sup, "_supervise", lambda proc: next(outcomes))
+
+        original = signal.getsignal(signal.SIGINT)
+        sup.run([], "/usr/bin/claude")
+        # The handler active during the (child-less) pause wait is the ORIGINAL,
+        # not the supervisor's passive no-op installed around the live child.
+        assert seen["handler"] is original
+
+    def test_keyboardinterrupt_reaps_not_kills_and_prints_hint(
+        self, temp_home, monkeypatch, capsys
+    ):
+        sup = self._sup(temp_home, share=True)
+        self._set_session_id(sup, "sess-9")
+        monkeypatch.setattr(sup, "_bootstrap_profile", lambda: None)
+        monkeypatch.setattr(sup, "_register", lambda: None)  # keep the seeded row
+        monkeypatch.setattr(sup, "_set_pids", lambda pid: None)
+        monkeypatch.setattr(
+            "claude_swap.supervisor.subprocess.Popen", lambda cmd, **kw: _FakeProc()
+        )
+
+        def boom(proc):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(sup, "_supervise", boom)
+        reaped: list[int] = []
+        terminated: list[int] = []
+        monkeypatch.setattr(sup, "_reap_or_terminate", lambda proc: reaped.append(1))
+        monkeypatch.setattr(sup, "_terminate", lambda proc: terminated.append(1))
+
+        rc = sup.run([], "/usr/bin/claude")
+        assert rc == 130
+        assert reaped == [1]       # reaped (let claude finish its quit), not killed
+        assert terminated == []
+        assert "cswap launch -- --resume sess-9" in capsys.readouterr().out
 
 
 class TestPrimeIdleWindows:

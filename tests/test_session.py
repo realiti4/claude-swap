@@ -902,7 +902,8 @@ class TestGuards:
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
-        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
+        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None,
+                       failure_out=None):
             seen[num] = is_active
             return None
 

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth
-from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.cache import MISSING, read_cache, usage_backoff_active, write_cache
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -138,6 +139,27 @@ def _format_usage_lines(usage: dict) -> list[str]:
         else:
             lines.append(f"7d: {d7['pct']:>3.0f}%")
     return lines
+
+
+def _usage_status_line(usage) -> str | None:
+    """Render the one-line text for a usage *failure* entry, or None for real usage.
+
+    A 429 backoff marker (``{"_unavailable": True, "retry_until": <epoch>}``) is a
+    dict but carries no usage windows, so it would otherwise fall through to
+    :func:`_format_usage_lines` and render a BLANK line. Returns the user-facing
+    "rate-limited … / unavailable" text for a marker or ``None`` usage; returns
+    ``None`` (the sentinel) for real usage so the caller formats it normally.
+    Shared by ``list_accounts`` and ``status`` so the two render paths can't drift.
+    """
+    if usage is None:
+        return "usage unavailable"
+    if isinstance(usage, dict) and usage.get("_unavailable"):
+        until = usage.get("retry_until")
+        if isinstance(until, (int, float)) and until > time.time():
+            mins = max(1, int((until - time.time()) / 60))
+            return f"usage rate-limited — retry in ~{mins}m"
+        return "usage unavailable"
+    return None
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -703,6 +725,39 @@ class ClaudeAccountSwitcher:
 
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
+
+    def active_account_num(self) -> str | None:
+        """Account number whose identity matches the current ``~/.claude`` login.
+
+        The "active default" account — the one Claude Code owns credentials for
+        right now (whatever vanilla ``claude`` or the last ``cswap <num>`` switch
+        points at). ``None`` when no managed account matches the current identity.
+
+        Used to keep the balancer's idle-usage path (``registry.build_world``) and
+        idle-window priming from ever refreshing/rotating this account's OAuth
+        token: doing so rotates the single-use refresh token out from under the
+        live login and forces a re-login. Mirrors the guard ``list_accounts``
+        already applies; centralized here so the two paths can't drift.
+
+        Reads the org-field-migrated sequence so a legacy account (added before
+        ``organizationUuid`` was stored) still matches the current login — without
+        the backfill the org comparison would fail and the active account would be
+        left unguarded (the credential-rotation bug would re-open for it).
+        """
+        ident = self._get_current_account()
+        if ident is None:
+            return None
+        email, org_uuid = ident
+        data = self._get_sequence_data_migrated() or {}
+        for num, account in data.get("accounts", {}).items():
+            if (account.get("email") == email and
+                    (account.get("organizationUuid", "") or "") == org_uuid):
+                return str(num)
+        return None
+
+    def has_live_session(self, account_num: str, email: str) -> bool:
+        """Whether a session-mode (``cswap run``) claude is live for this account."""
+        return bool(self._live_session_pids(str(account_num), email))
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
@@ -1274,17 +1329,10 @@ class ClaudeAccountSwitcher:
             return
 
         data = self._get_sequence_data_migrated()
-        current_identity = self._get_current_account()
 
-        # Find active account number by (email, organizationUuid) composite key
-        active_num = None
-        if current_identity is not None:
-            current_email, current_org_uuid = current_identity
-            for num, account in data.get("accounts", {}).items():
-                if (account.get("email") == current_email and
-                        account.get("organizationUuid", "") == current_org_uuid):
-                    active_num = num
-                    break
+        # The active default account (current ~/.claude identity). Shared with
+        # registry.build_world via active_account_num() so the two never drift.
+        active_num = self.active_account_num()
 
         accounts_info = []
         for num in data.get("sequence", []):
@@ -1320,20 +1368,40 @@ class ClaudeAccountSwitcher:
             # unavailable until the session exits.
             has_live_session = bool(self._live_session_pids(str(num), email))
 
-            return oauth.fetch_usage_for_account(
+            fail: dict = {}
+            result = oauth.fetch_usage_for_account(
                 str(num), email, creds,
                 is_active=is_active or has_live_session,
                 persist_credentials=persist,
+                failure_out=fail,
             )
+            # On a usage-endpoint 429, cache a backoff marker carrying the
+            # server's Retry-After so we stop re-hitting the rate-limited
+            # endpoint every invocation (the "usage unavailable" feedback loop).
+            if result is None and fail.get("retry_after"):
+                return {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+            return result
 
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        # Persisted backoff markers survive the freshness TTL until their
+        # server-requested Retry-After elapses, so a rate-limited account is not
+        # refetched every `cswap --list` while the endpoint asked for silence.
+        persisted = read_cache(usage_cache_path, float("inf"))
+        persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+
+        def fetch_or_skip(account_info):
+            num = str(account_info[0])
+            if usage_backoff_active(persisted.get(num)):
+                return persisted.get(num)
+            return fetch(account_info)
+
         cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
         account_keys = {str(info[0]) for info in accounts_info}
         if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
             usages = [cached.get(str(info[0])) for info in accounts_info]
         else:
             with ThreadPoolExecutor() as executor:
-                usages = list(executor.map(fetch, accounts_info))
+                usages = list(executor.map(fetch_or_skip, accounts_info))
             write_cache(usage_cache_path, {
                 str(info[0]): usage
                 for info, usage in zip(accounts_info, usages)
@@ -1353,9 +1421,9 @@ class ClaudeAccountSwitcher:
             else:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}{pri_tag}")
             if isinstance(usage, str):
-                print(f"     {dimmed(usage)}")
-            elif usage is None:
-                print(f"     {dimmed('usage unavailable')}")
+                print(f"     {dimmed(usage)}")  # e.g. "no credentials"
+            elif (status_line := _usage_status_line(usage)) is not None:
+                print(f"     {dimmed(status_line)}")  # unavailable / rate-limited
             else:
                 lines = _format_usage_lines(usage)
                 for j, line in enumerate(lines):
@@ -1453,7 +1521,12 @@ class ClaudeAccountSwitcher:
                     existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
                     existing[account_num] = usage
                     write_cache(usage_cache_path, existing)
-                if isinstance(usage, dict):
+                status_line = _usage_status_line(usage)
+                if status_line is not None:
+                    # None usage or a 429 backoff marker -> a clear line, never a
+                    # blank one (a marker would otherwise format to nothing).
+                    print(f"  {dimmed(status_line)}")
+                elif isinstance(usage, dict):
                     lines = _format_usage_lines(usage)
                     for j, line in enumerate(lines):
                         connector = "└" if j == len(lines) - 1 else "├"

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -67,6 +68,18 @@ _DEFAULT_FALLBACK_MODEL = "sonnet"
 # only handles account-level problems like 429/401, not transient network glitches).
 # Only applied when the user hasn't set ``CLAUDE_CODE_MAX_RETRIES`` themselves.
 _DEFAULT_MAX_RETRIES = "20"
+
+# Bounded auth-failure recovery on a child EXIT (distinct from the in-session
+# StopFailure path, which recovers while claude stays alive). When claude hard-
+# exits on invalid/expired credentials, the exit branch recovers and relaunches —
+# but ``choose_migration_target`` has no auth-health filter, so an unbounded
+# relaunch could hop between logged-out accounts forever. Cap total attempts per
+# launch, then surface the re-login guidance instead of spinning.
+_MAX_AUTH_RECOVER_ATTEMPTS = 2
+
+# Sentinel: the passive-SIGINT install didn't run (e.g. off the main thread), so
+# there is nothing to restore in ``finally``.
+_NO_SIGNAL = object()
 
 
 def launch(
@@ -137,6 +150,7 @@ class Supervisor:
         self.share = share
         self._logger = switcher._logger
         self._claude_session_id = ""
+        self._auth_recover_attempts = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -163,22 +177,66 @@ class Supervisor:
                 sid = self._current_claude_session_id()
                 args = (["--resume", sid] if resume and sid
                         else list(base_args))
-                proc = subprocess.Popen([claude_bin, *args], env=env, cwd=self.cwd)
-                self._set_pids(proc.pid)
-                outcome, rc = self._supervise(proc)
+                # Let claude own Ctrl-C — but ONLY while it is the live foreground
+                # process. The supervisor shares the foreground process group + TTY
+                # with the child, so a kernel-delivered SIGINT (Ctrl-C in a cooked-
+                # mode window) would otherwise raise KeyboardInterrupt here and tear
+                # the session down, killing claude via SIGTERM before it can run its
+                # own interrupt/quit handling and print its resume hint. A no-op
+                # handler (NOT SIG_IGN, which the child would inherit across exec)
+                # keeps the parent passive while claude is alive — just like the
+                # exec'd `cswap run` path. It is restored the instant the child is
+                # gone so the pause/auto-resume countdown below stays Ctrl-C-
+                # interruptible (no child owns Ctrl-C then).
+                prev_sigint = self._install_passive_sigint()
+                try:
+                    proc = subprocess.Popen([claude_bin, *args], env=env, cwd=self.cwd)
+                    self._set_pids(proc.pid)
+                    outcome, rc = self._supervise(proc)
+                finally:
+                    self._restore_sigint(prev_sigint)
 
                 if outcome == "exit":
-                    if not self._should_handle_limit_exit():
-                        self._deregister()  # clean user quit on a healthy account
+                    if self._should_handle_limit_exit():
+                        self._pause_and_resume()  # migrate now, or pause + auto-resume
+                    elif self._should_recover_auth_exit(rc):
+                        # An auth-failure exit: claude hard-exited on invalid/expired
+                        # login credentials (the in-session StopFailure path only
+                        # helps while claude stays alive). Recover — refresh+reseed
+                        # this account, or migrate to a healthy one — then relaunch.
+                        # Bounded so a permanently-dead login can never spin.
+                        if self._auth_recover_attempts >= _MAX_AUTH_RECOVER_ATTEMPTS:
+                            warning(
+                                f"Managed session keeps failing to authenticate "
+                                f"(Account-{self.account}). Re-login on an account "
+                                f"(e.g. `cswap --add-account`)."
+                            )
+                            self._deregister()
+                            return rc
+                        self._auth_recover_attempts += 1
+                        if self._recover_auth():
+                            resume = True
+                            continue
+                        self._deregister()  # logged out, no target -> guidance printed
                         return rc
-                    self._pause_and_resume()  # migrate now, or pause + auto-resume
+                    else:
+                        # Clean user quit on a healthy account.
+                        self._print_resume_hint()  # before deregister (reads the row)
+                        self._deregister()
+                        return rc
                 else:
                     # outcome == "pause": child was SIGTERM'd to honour a pause.
                     self._pause_and_resume()
                 resume = True
         except KeyboardInterrupt:
+            # Ctrl-C while the child was live (a SIGINT that slipped through the
+            # passive handler's install window) OR during the pause/auto-resume
+            # countdown (default handler restored). Reap claude if it is still
+            # exiting on its own rather than killing it, so its quit/hint path can
+            # finish; an already-exited child returns immediately.
             if proc is not None:
-                self._terminate(proc)
+                self._reap_or_terminate(proc)
+            self._print_resume_hint()
             self._deregister()
             print(f"\n{dimmed('Managed session stopped')}")
             return 130
@@ -269,7 +327,7 @@ class Supervisor:
             return "pause"
         return None
 
-    def _recover_auth(self) -> None:
+    def _recover_auth(self) -> bool:
         """Recover this session from a 401 so the NEXT turn re-authenticates.
 
         First try to refresh + re-seed the SAME account's credentials in place
@@ -279,24 +337,110 @@ class Supervisor:
         existing credential-owning ``_migrate``. If no account has headroom either,
         warn the user that every account needs a re-login and leave the session as
         is — no crash, no relaunch loop.
+
+        Returns whether the profile now holds (or has been pointed at) usable
+        credentials — ``True`` after a successful refresh/migrate, ``False`` when
+        the account is logged out and no healthy target exists. The exit-driven
+        caller uses this to decide between relaunching and giving up.
         """
         if self.switcher.refresh_account_and_reseed(self.account, self.profile_dir):
             print(f"\n{accent('Re-authenticated')} Account-{self.account}")
-            return
+            return True
         # Same-account refresh impossible (refresh token dead / logged out) ->
         # migrate to a healthy account.
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
         reg = registry.read_registry(self.switcher)
-        acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+        # A logged-out account's session benefits from a probe-confirmed idle
+        # target: spend one credit to land on a runnable account rather than fail.
+        acct_views, _ = registry.build_world(
+            self.switcher, reg, fetch_idle=True, probe_unavailable=True
+        )
         sv = self._self_session_view()
         target = balancer.choose_migration_target(sv, acct_views, {}, cfg)
         if target:
             self._migrate(target)
-        else:
-            warning(
-                "Managed session's account is logged out and no other account has "
-                "headroom. Re-login on one account (e.g. `cswap --add-account`)."
+            return True
+        warning(
+            "Managed session's account is logged out and no other account has "
+            "headroom. Re-login on one account (e.g. `cswap --add-account`)."
+        )
+        return False
+
+    def _should_recover_auth_exit(self, rc: int | None) -> bool:
+        """Whether a child EXIT looks like an auth failure we should recover from.
+
+        Claude Code hard-exits when its credentials are invalid/expired and it
+        cannot start a turn (e.g. a revoked/logged-out login at launch). That exit
+        is NOT a rate-limit exit (a 401 doesn't raise usage), so without this it
+        would be treated as a clean user quit and the session would silently end.
+
+        Detection, in order (the per-launch attempt cap is enforced by the
+        caller in :meth:`run`, which prints re-login guidance once exhausted):
+
+        * a clean (rc 0/None) exit, or a signal-killed child (negative rc, e.g.
+          ``-11`` SIGSEGV / ``-9`` SIGKILL), is never an auth failure;
+        * a RECENT ``auth_recover`` flag the StopFailure hook left (precise for an
+          in-session 401 that then exited) — read-and-cleared under the lock;
+        * otherwise, only when claude exited BEFORE its statusline ever recorded a
+          session id (a launch-time / pre-render failure), pay for a credit-free
+          local auth probe. A normal interactive session has a session id and is
+          covered by the flag path above, so clean quits never pay the probe cost.
+        """
+        if not rc or rc < 0:  # None/0 (clean) or signal-killed -> not auth
+            return False
+        if self._consume_recent_auth_flag():
+            return True
+        if self._current_claude_session_id():
+            return False
+        return self._profile_auth_invalid()
+
+    def _consume_recent_auth_flag(self) -> bool:
+        """Read-and-clear this session's ``auth_recover`` flag; True if it was recent.
+
+        Mirrors the in-session consumption in :meth:`_consume_own_state` so the exit
+        path can act on a 401 the StopFailure hook flagged just before claude died.
+        Double-consumption with the alive-loop is benign (whichever clears it first
+        wins; the other branch falls through to the probe, which passes post-reseed).
+        """
+        lock = FileLock(self.switcher.lock_file, timeout=5)
+        if not lock.acquire():
+            return False
+        try:
+            reg = registry.read_registry(self.switcher)
+            row = reg.get("sessions", {}).get(self.managed_id)
+            if row is None:
+                return False
+            flag = row.get("auth_recover")
+            if flag is None:
+                return False
+            row["auth_recover"] = None
+            registry.write_registry(self.switcher, reg)
+            return (
+                isinstance(flag, (int, float))
+                and (time.time() - flag) <= _AUTH_RECOVER_TTL_S
             )
+        finally:
+            lock.release()
+
+    def _profile_auth_invalid(self) -> bool:
+        """Credit-free probe: does claude see this managed profile as logged-out?
+
+        Uses ``claude auth status --json`` (a local check that makes NO API call,
+        so it costs no credits) against the managed profile. Best-effort: a server-
+        revoked-but-unexpired token can still pass the probe, so this may miss —
+        the bounded attempt cap keeps that safe. Never raises.
+        """
+        try:
+            _, email, org = self.switcher.resolve_account(self.account)
+        except Exception:
+            return False
+        try:
+            return not SessionManager(self.switcher)._is_session_valid(
+                self.profile_dir, email, org
+            )
+        except Exception:
+            self._logger.debug("auth probe failed", exc_info=True)
+            return False
 
     # -- idle-5h-window priming (feature #3) ------------------------------
 
@@ -378,6 +522,12 @@ class Supervisor:
         try:
             num, email, _ = self.switcher.resolve_account(num)
         except Exception:
+            return False
+        # Never prime/refresh the active default login: rotating its single-use
+        # refresh token would force a re-login (same invariant build_world now
+        # enforces). Its 5h window is anyway warmed by the user's own usage.
+        if num == str(self.switcher.active_account_num() or ""):
+            self._logger.debug("prime: skipping active-default account %s", num)
             return False
         try:
             creds = self.switcher.read_account_credentials(num, email)
@@ -525,7 +675,12 @@ class Supervisor:
         sv = self._self_session_view()
         while True:
             reg = registry.read_registry(self.switcher)
-            acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+            # THE incident fix: probe a usage-429-backed-off idle account so a
+            # stranded session discovers it has headroom and migrates instead of
+            # pausing an hour. A credit is worth avoiding the stall.
+            acct_views, _ = registry.build_world(
+                self.switcher, reg, fetch_idle=True, probe_unavailable=True
+            )
             if self._resumable(acct_views, sv, cfg):
                 break
             action = balancer.pause_decision(sv, acct_views, time.time(), cfg)
@@ -551,7 +706,11 @@ class Supervisor:
             if remaining <= 0:
                 break
             reg = registry.read_registry(self.switcher)
-            acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+            # Probe a usage-backed-off idle target so the wait wakes the instant a
+            # probe confirms headroom, rather than sleeping out the whole timer.
+            acct_views, _ = registry.build_world(
+                self.switcher, reg, fetch_idle=True, probe_unavailable=True
+            )
             if self._resumable(acct_views, sv, cfg):
                 break
             mins, secs = divmod(remaining, 60)
@@ -573,7 +732,11 @@ class Supervisor:
         """
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
         reg = registry.read_registry(self.switcher)
-        acct_views, _ = registry.build_world(self.switcher, reg, fetch_idle=True)
+        # Probe on wake so this pass agrees with the _resumable gate that let it
+        # proceed (it must see the same probe-confirmed account to migrate onto).
+        acct_views, _ = registry.build_world(
+            self.switcher, reg, fetch_idle=True, probe_unavailable=True
+        )
         sv = self._self_session_view()
         if not balancer._usable(acct_views.get(self.account), cfg):
             target = balancer.choose_migration_target(sv, acct_views, {}, cfg)
@@ -757,6 +920,18 @@ class Supervisor:
         # within the turn instead of failing it. Respect an explicit user override.
         if "CLAUDE_CODE_MAX_RETRIES" not in env:
             env["CLAUDE_CODE_MAX_RETRIES"] = _DEFAULT_MAX_RETRIES
+        # Force main-transcript persistence. cmux sets ``CLAUDE_CODE_CHILD_SESSION=1``
+        # in the surface env a managed launch inherits; Claude Code treats that — for
+        # an INTERACTIVE, non-subagent session with no ``TMUX`` marker — as a throwaway
+        # child session and SKIPS writing the ``<sessionId>.jsonl`` transcript (the file
+        # ``claude --resume`` loads), while still writing aux artifacts. A managed
+        # session is first-class and its transcript MUST persist so the auto-resume /
+        # ``cswap launch -- --resume <id>`` contract works and no chat history is lost.
+        # ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` re-enables it (verified against
+        # Claude Code 2.1.178; the cmux wrapper passes this key through untouched).
+        # Respect an explicit user override.
+        if "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE" not in env:
+            env["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
         # When launched inside a cmux workspace, the cmux-claude-wrapper strips
         # auth-selection env before exec'ing the real claude — which would drop
         # our CLAUDE_CONFIG_DIR profile pin. cmux honours an allow-list env key;
@@ -795,3 +970,59 @@ class Supervisor:
                 proc.kill()
         except Exception:
             self._logger.debug("terminate failed", exc_info=True)
+
+    def _reap_or_terminate(self, proc: subprocess.Popen) -> None:
+        """Wait briefly for a child exiting on its own, force-terminate if wedged.
+
+        On Ctrl-C the child received the same SIGINT and is running its own quit
+        path (printing its resume hint); give it the grace period to finish before
+        escalating, so we don't SIGTERM it out from under its own clean exit.
+        """
+        try:
+            proc.wait(timeout=_TERMINATE_GRACE_S)
+        except subprocess.TimeoutExpired:
+            self._terminate(proc)
+        except Exception:
+            self._terminate(proc)
+
+    def _install_passive_sigint(self):
+        """Make the parent ignore SIGINT so the child (claude) owns Ctrl-C.
+
+        A no-op *function* handler — deliberately not ``SIG_IGN``: a caught handler
+        is reset to the default on the child's ``exec`` (POSIX), so claude still
+        receives SIGINT and handles it itself, whereas ``SIG_IGN`` would be
+        inherited and leave claude unable to react to Ctrl-C. Returns the previous
+        handler to restore, or ``_NO_SIGNAL`` when signals can't be set here (e.g.
+        not the main thread).
+        """
+        try:
+            return signal.signal(signal.SIGINT, lambda *_: None)
+        except (ValueError, OSError):
+            return _NO_SIGNAL
+
+    def _restore_sigint(self, prev) -> None:
+        if prev is _NO_SIGNAL or prev is None:
+            return
+        try:
+            signal.signal(signal.SIGINT, prev)
+        except (ValueError, OSError, TypeError):
+            self._logger.debug("restore SIGINT failed", exc_info=True)
+
+    def _print_resume_hint(self) -> None:
+        """Print a balancer-aware resume hint on a clean user quit.
+
+        claude prints its own ``claude --resume <id>`` hint, but resuming that way
+        escapes the balancer (no managed profile, no migration). Point the user at
+        the managed resume instead. Only meaningful when history is shared (the
+        default): with ``--no-share`` the managed transcript is isolated, so the
+        hint is suppressed. Must be called BEFORE ``_deregister`` (it reads the row).
+        """
+        if not self.share:
+            return
+        sid = self._current_claude_session_id()
+        if not sid:
+            return
+        print(
+            f"{dimmed('Resume this balanced session with:')} "
+            f"{accent(f'cswap launch -- --resume {sid}')}"
+        )

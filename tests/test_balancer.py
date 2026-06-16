@@ -10,6 +10,7 @@ from __future__ import annotations
 from claude_swap import balancer
 from claude_swap.balancer import (
     BASE_RESERVE,
+    PROBE_CONFIRMED_PCT,
     BalancerConfig,
     AccountView,
     SessionView,
@@ -588,3 +589,66 @@ class TestApiRateLastResort:
             accts = {"1": AV("1", max_pct=98.0, extra_usage=True, spend_pct=0.0)}
             assert assign_new_session(accts, 0, NOW, cfg) is None
             assert _kinds(rebalance(accts, [SV("s1", "1")], NOW, cfg)) == {"s1": "PAUSE"}
+
+
+# --------------------------------------------------------------------------- #
+# Probe-confirmed accounts (signal="probe")
+# --------------------------------------------------------------------------- #
+
+
+class TestProbeConfirmedAccount:
+    """A messages-API headroom probe enters the pure model as a conservative
+    synthesized ``max_pct=PROBE_CONFIRMED_PCT`` with ``signal="probe"``. It must:
+    (a) be usable so a stranded session can resume onto it, (b) admit exactly one
+    zero-ctx session but reject a second (no co-exhaust), (c) rank below KNOWN
+    real headroom, and (d) never be a prime candidate.
+    """
+
+    def test_probe_value_respects_the_invariants(self):
+        # The numeric choice is defended against the default tunables.
+        assert PROBE_CONFIRMED_PCT < CFG.exhaust_threshold - CFG.hysteresis_band  # usable
+        assert PROBE_CONFIRMED_PCT + BASE_RESERVE <= CFG.target_safety            # one fits
+        assert PROBE_CONFIRMED_PCT + 2 * BASE_RESERVE > CFG.target_safety         # two don't
+
+    def test_probe_account_is_usable(self):
+        av = AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe")
+        assert balancer._usable(av, CFG) is True
+
+    def test_one_session_fits_second_does_not(self):
+        av = AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe")
+        projected: dict[str, float] = {"2": 0.0}
+        cost = balancer._pct_cost(0)  # zero-ctx session
+        # First zero-ctx session fits (80 + 3 <= 85).
+        assert balancer._fits(av, projected, cost, CFG) is True
+        # Debit the online reservation as Phase D would, then a second does NOT fit.
+        projected["2"] += cost
+        assert balancer._fits(av, projected, cost, CFG) is False
+
+    def test_two_stranded_sessions_do_not_co_stack(self):
+        # End-to-end through rebalance: both stranded on an exhausted account; only
+        # one lands on the probe-confirmed target, the other pauses (no co-exhaust).
+        accts = {
+            "1": AV("1", max_pct=99.0),                          # current, exhausted
+            "2": AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe", reset=None),
+        }
+        plan = rebalance(accts, [SV("s1", "1"), SV("s2", "1")], NOW, CFG)
+        kinds = _kinds(plan)
+        migrated = [a for a in plan.actions if a.kind == "MIGRATE" and a.to_account == "2"]
+        assert len(migrated) == 1                                # exactly one moves to "2"
+        assert "PAUSE" in kinds.values()                         # the other can't co-stack
+
+    def test_real_headroom_outranks_probe(self):
+        # A real cache account at 50% (known headroom) is preferred over the
+        # synthesized probe at 80% (a guess) — KNOWN real headroom always wins.
+        accts = {
+            "real": AV("1", max_pct=50.0, signal="cache"),
+            "probe": AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe"),
+        }
+        ranked = balancer._rank_accounts(accts, {"1": 0.0, "2": 0.0}, CFG)
+        assert [a.num for a in ranked] == ["1", "2"]
+
+    def test_probe_account_is_not_a_prime_candidate(self):
+        # accounts_needing_prime keys on signal == "cache"; a probe view must never
+        # trigger a redundant prime double-bill.
+        probe = AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe", h5_pct=None, h5_reset=None)
+        assert accounts_needing_prime({"2": probe}, CFG) == []
