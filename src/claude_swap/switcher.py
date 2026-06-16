@@ -75,7 +75,10 @@ CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # Usage cache
-_USAGE_CACHE_TTL = 15  # seconds
+_USAGE_CACHE_TTL = 60  # seconds — idle-account usage changes over hours, not
+# seconds, and the live statusline signal covers active accounts in real time. A
+# longer TTL keeps usage-API fetches (and 429-failure retries, which reuse this
+# same cache slot) gentle so the endpoint's own rate limit is never tripped.
 
 # Auto-switch (Beta): when the active account's 5h/7d usage reaches this
 # percentage, the TUI monitor rotates to the next managed account.
