@@ -388,6 +388,7 @@ def _balancer_dashboard(stdscr, switcher: ClaudeAccountSwitcher) -> None:
     thread (the quit key stays responsive even when an account is slow/unreachable).
     """
     curses.curs_set(0)
+    _init_colors()
     stdscr.timeout(_DASH_TICK_MS)
     stop = threading.Event()
     worker = threading.Thread(
@@ -434,10 +435,10 @@ def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
 
     y = 4
     if not sessions:
-        stdscr.addstr(y, 2, "No active sessions. Start one with `cswap launch`."[: cols - 4])
+        _safe_addstr(stdscr, y, 2, "No active sessions. Start one with `cswap launch`."[: cols - 4])
         y += 2
     else:
-        stdscr.addstr(y, 2, "Sessions:"[: cols - 4], curses.A_BOLD)
+        _safe_addstr(stdscr, y, 2, "Sessions:"[: cols - 4], curses.A_BOLD)
         y += 1
         for i, e in enumerate(sessions):
             if y >= rows - 3:
@@ -454,26 +455,35 @@ def _draw_dashboard(stdscr, switcher, sessions, acct_views) -> None:
             else:
                 state_s = _ascii_bar(pct)
             line = f"  s{i + 1:<2} a{acct:<3} {state_s:<16} {_abbrev(e.get('cwd', ''))}"
-            stdscr.addstr(y, 2, line[: cols - 4])
+            _safe_addstr(stdscr, y, 2, line[: cols - 4])
             y += 1
         y += 1
 
     if acct_views and y < rows - 2:
-        header = "Accounts:  (usage% · resets-in, per 5h and 7d window)"
-        stdscr.addstr(y, 2, header[: cols - 4], curses.A_BOLD)
+        _safe_addstr(stdscr, y, 2, "Accounts:"[: cols - 4], curses.A_BOLD)
         y += 1
-        for num in sorted(acct_views, key=lambda n: (-acct_views[n].priority, _num_key(n))):
-            if y >= rows - 2:
-                break
-            av = acct_views[num]
-            stdscr.addstr(
-                y, 2,
-                _account_row(av, sess_by_account.get(num, 0), now, prime_on)[: cols - 4],
+        meta = _accounts_meta(switcher)
+        order = sorted(acct_views, key=lambda n: (-acct_views[n].priority, _num_key(n)))
+        for idx, num in enumerate(order):
+            email, tag, is_active = meta.get(num, (num, "", False))
+            block = _account_block(
+                acct_views[num], email, tag, is_active,
+                sess_by_account.get(num, 0), now, prime_on,
             )
-            y += 1
+            # Only start a block if the WHOLE thing fits — never paint a header
+            # with no tree rows beneath it (a dangling fragment `cswap --list`
+            # never shows). Lower-priority accounts that don't fit are dropped.
+            if y + len(block) > rows - 2:
+                break
+            for segments in block:
+                _draw_segments(stdscr, y, 2, segments, cols - 4)
+                y += 1
+            # Blank separator between account blocks (matches `cswap --list`).
+            if idx < len(order) - 1 and y < rows - 2:
+                y += 1
 
     footer = "[q/Esc] back  ·  refreshes automatically"
-    stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
+    _safe_addstr(stdscr, rows - 1, 2, footer[: cols - 4], curses.A_DIM)
     stdscr.refresh()
 
 
@@ -482,46 +492,253 @@ def _num_key(num: str):
     return (0, int(num)) if str(num).isdigit() else (1, str(num))
 
 
-def _account_row(av, sess_count: int, now: float, show_warm: bool) -> str:
-    """One Accounts-section line: priority, session count, 5h + 7d usage/reset.
+Segment = tuple[str, int]  # (text, curses attribute)
 
-    Idle accounts (no live session) still render their cached/fetched usage, so
-    the view covers every account. ``signal == "none"`` means usage is unknown
-    (logged out or a failed read) — shown explicitly rather than as a fake 0%.
+
+def _accounts_meta(switcher) -> dict[str, tuple[str, str, bool]]:
+    """Map account number -> (email, org tag, is_active) for dashboard headers.
+
+    Mirrors ``list_accounts``' active detection (the ``(email, organizationUuid)``
+    composite key) so the dashboard marks the same account ``(active)`` as
+    ``cswap --list``. Pure-local reads only (no network); best-effort — any
+    failure yields an empty map and each header falls back to a bare number.
     """
-    head = f"  a{av.num:<3} P{av.priority:<2} {sess_count} sess"
+    try:
+        seq = switcher._get_sequence_data_migrated() or {}
+        accounts = seq.get("accounts", {})
+        identity = switcher._get_current_account()
+        active_email, active_uuid = identity if identity else (None, None)
+        meta: dict[str, tuple[str, str, bool]] = {}
+        for num, acc in accounts.items():
+            email = acc.get("email", "?")
+            org_name = acc.get("organizationName", "") or ""
+            org_uuid = acc.get("organizationUuid", "") or ""
+            tag = switcher._get_display_tag(email, org_name, org_uuid)
+            is_active = email == active_email and org_uuid == active_uuid
+            meta[str(num)] = (email, tag, is_active)
+        return meta
+    except Exception:  # noqa: BLE001 - headers are cosmetic; never break the dashboard
+        return {}
+
+
+def _account_block(
+    av,
+    email: str,
+    tag: str,
+    is_active: bool,
+    sess_count: int,
+    now: float,
+    show_warm: bool,
+) -> list[list[Segment]]:
+    """Render one account as a ``cswap --list``-style block of styled rows.
+
+    Returns a list of rows, each a list of ``(text, attribute)`` segments, so the
+    caller paints per-segment styling. The layout mirrors
+    ``switcher._format_usage_lines`` / ``list_accounts`` — an identity header
+    (``num: email [tag] (active) · pri N``) over a tree of the 5h and 7d windows
+    (usage% · reset clock · countdown) — with the live session count added as the
+    final tree row (the dashboard-specific third row). Idle accounts still render
+    their cached usage; ``signal == "none"`` (logged out / failed read) shows
+    ``usage unavailable`` rather than a fake 0%.
+    """
+    dim = _sty("dim")
+    muted = _sty("muted")
+
+    header: list[Segment] = [
+        (f"{av.num}: ", _sty("accent")),
+        (email or "?", _sty("bold")),
+    ]
+    if tag:
+        header.append((f" [{tag}]", muted))
+    if is_active:
+        header.append((" (active)", _sty("accent")))
+    if av.priority:
+        header.append((f" · pri {av.priority}", dim))
+
+    # Tree children: usage windows (only those with data), then the session count.
     if av.signal == "none":
-        return f"{head}  usage unavailable"
-    # Fixed-width reset field so the 7d column lines up across rows regardless of
-    # whether a window shows a countdown or "(no reset)".
-    h5 = f"5h {_fmt_pct(av.five_hour_pct)} {_fmt_reset(av.five_hour_reset, now):<14}"
-    d7 = f"7d {_fmt_pct(av.seven_day_pct)} {_fmt_reset(av.seven_day_reset, now):<14}"
-    row = f"{head}  {h5} {d7}"
+        children: list[list[Segment]] = [[("usage unavailable", muted)]]
+    else:
+        # Mirror ``_format_usage_lines``: render a window only when it has a
+        # percentage. A 0% window with no reset is still data (a cold/unstarted
+        # 5h window -> "not started"); a ``None`` pct is *absent* data and is
+        # omitted, exactly as ``cswap --list`` omits the missing window.
+        children = []
+        if av.five_hour_pct is not None:
+            children.append(_usage_row("5h", av.five_hour_pct, av.five_hour_reset, now, muted))
+        if av.seven_day_pct is not None:
+            children.append(_usage_row("7d", av.seven_day_pct, av.seven_day_reset, now, muted))
+
+    sess_seg: list[Segment] = [
+        (f"{sess_count} session{'' if sess_count == 1 else 's'}", _sty("normal")),
+    ]
+    # Warm/cold reflects the 5h window state. ``five_hour_warm`` is tri-state;
+    # ``None`` means unknown 5h usage (logged out, or a signal carrying no 5h
+    # pct), which we leave unannotated rather than print a meaningless bare "?".
     if show_warm:
         warm = balancer.five_hour_warm(av)
-        row += f" {'warm' if warm else 'cold' if warm is False else '?'}"
-    return row
+        if warm is not None:
+            sess_seg.append((f"  · {'warm' if warm else 'cold'}", dim))
+    children.append(sess_seg)
+
+    rows: list[list[Segment]] = [header]
+    for i, child in enumerate(children):
+        connector = "└" if i == len(children) - 1 else "├"
+        rows.append([(f"   {connector} ", dim), *child])
+    return rows
+
+
+def _usage_row(
+    label: str, pct: float | None, reset: int | None, now: float, attr: int
+) -> list[Segment]:
+    """One window row's segments: ``5h:  27%   resets 21:09         in 2h 58m``."""
+    text = f"{label}: {_fmt_pct(pct)}"
+    clause = _reset_clause(reset, now)
+    if clause:
+        text += f"   {clause}"
+    return [(text, attr)]
 
 
 def _fmt_pct(pct: float | None) -> str:
     return f"{pct:3.0f}%" if isinstance(pct, (int, float)) else "  — "
 
 
-def _fmt_reset(reset: int | None, now: float) -> str:
-    """``(resets 2h13m)`` / ``(resets 4d05h)`` for a future reset.
+def _reset_clause(reset: int | None, now: float) -> str:
+    """``cswap --list``-style reset clause for a window's reset epoch.
 
-    ``(no reset)`` means the window has no clock running (unstarted/cold — what
-    ``balancer.five_hour_warm`` reports as cold), reserved for ``reset is None``.
-    A reset epoch that has just elapsed (the window is rolling over but the ~15s
-    usage cache hasn't refreshed yet) reads ``(resetting)`` rather than
-    ``(no reset)``, so the 5h column can't contradict a ``warm`` token derived
-    from the same still-present reset timestamp.
+    A future reset reads ``resets 21:09         in 2h 58m`` — local wall-clock
+    time plus a countdown, matching ``oauth.format_reset``'s wording and column
+    widths so the dashboard and plain ``--list`` align. ``reset is None`` is an
+    unstarted/cold 5h window (what ``balancer.five_hour_warm`` reports as cold)
+    -> ``not started``; an already-elapsed epoch is a window rolling over before
+    the usage cache refreshes -> ``resetting`` (never ``not started``, so the row
+    can't contradict a ``warm`` token derived from the same timestamp). Anchored
+    to the passed ``now`` (not wall-clock) so rendering stays deterministic.
     """
     if not isinstance(reset, (int, float)):
-        return "(no reset)"
+        return "not started"
     if reset <= now:
-        return "(resetting)"
-    return f"(resets {_short_countdown(reset - now)})"
+        return "resetting"
+    return f"resets {_reset_clock(int(reset), now):<12}  in {_list_countdown(reset - now)}"
+
+
+def _reset_clock(reset: int, now: float) -> str:
+    """Local clock for a reset epoch: ``21:09`` today, ``Jun 18 05:59`` otherwise.
+
+    Mirrors ``oauth.format_reset``'s clock format but anchored to the passed
+    ``now`` rather than wall-clock, keeping the dashboard deterministic.
+    """
+    from datetime import datetime
+
+    reset_dt = datetime.fromtimestamp(reset)
+    now_dt = datetime.fromtimestamp(now)
+    if reset_dt.date() == now_dt.date():
+        return reset_dt.strftime("%H:%M")
+    return reset_dt.strftime(f"%b {reset_dt.day} %H:%M")
+
+
+def _list_countdown(secs: float) -> str:
+    """``cswap --list``-style countdown: ``2d 11h`` / ``2h 58m`` / ``42m``.
+
+    Matches ``oauth.format_reset``'s spacing (distinct from :func:`_short_countdown`,
+    which is the compact, space-free ``2h58m`` used in the Sessions section).
+    """
+    secs = max(0, int(secs))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def _safe_addstr(stdscr, y: int, x: int, s: str, attr: int = 0) -> None:
+    """``addstr`` that swallows ``curses.error``.
+
+    The dashboard re-renders on a 2s timer, so a terminal resized below the
+    minimum size *after* entry would otherwise let an out-of-bounds write raise
+    out of the render loop and crash the TUI. Used for the dashboard's header /
+    section / footer lines (the per-account rows already go through the equally
+    guarded :func:`_draw_segments`).
+    """
+    try:
+        stdscr.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def _draw_segments(stdscr, y: int, x: int, segments: list[Segment], maxw: int) -> None:
+    """Paint ``(text, attr)`` segments left-to-right on row ``y``, clipped to ``maxw``.
+
+    Lets one rendered line carry several styles (a bold header next to a dim tag)
+    without the caller juggling column math. Each ``addstr`` is guarded so a stray
+    ``curses.error`` at a screen edge can never crash the dashboard loop.
+    """
+    cur = x
+    budget = maxw
+    for text, attr in segments:
+        if budget <= 0:
+            break
+        chunk = text[:budget]
+        if chunk:
+            try:
+                stdscr.addstr(y, cur, chunk, attr)
+            except curses.error:
+                pass
+            cur += len(chunk)
+            budget -= len(chunk)
+
+
+# Color attributes resolved once inside curses (best-effort). 0 means "not set",
+# so :func:`_sty` falls back to a monochrome attribute — the dashboard renders
+# fine without 256-color support and stays deterministic under test (where the
+# curses screen, and thus colors, are never initialized).
+_C_ACCENT = 0
+_C_MUTED = 0
+
+
+def _init_colors() -> None:
+    """Set up the dashboard's accent/muted color pairs if the terminal supports them.
+
+    Mirrors ``printer.py``'s palette (warm salmon accent #173, soft gray #250) so
+    the in-curses dashboard reads like the ANSI ``cswap --list`` output. Purely
+    cosmetic and fully guarded: any failure (no color, no 256-color, no
+    default-bg support) leaves the globals at 0 and the UI falls back to
+    bold/dim attributes.
+    """
+    global _C_ACCENT, _C_MUTED
+    try:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = 0
+        if curses.COLORS >= 256:
+            curses.init_pair(1, 173, bg)
+            curses.init_pair(2, 250, bg)
+            _C_ACCENT = curses.color_pair(1)
+            _C_MUTED = curses.color_pair(2)
+    except Exception:  # noqa: BLE001 - color is cosmetic; never break the dashboard
+        pass
+
+
+def _sty(kind: str) -> int:
+    """Curses attribute for a style role, with a monochrome fallback when color
+    isn't available: ``accent`` -> salmon+bold / bold, ``muted`` -> gray / dim."""
+    if kind == "accent":
+        return (_C_ACCENT | curses.A_BOLD) if _C_ACCENT else curses.A_BOLD
+    if kind == "muted":
+        return _C_MUTED or curses.A_DIM
+    if kind == "dim":
+        return curses.A_DIM
+    if kind == "bold":
+        return curses.A_BOLD
+    return curses.A_NORMAL
 
 
 def _ascii_bar(pct: float | None, width: int = 8) -> str:
@@ -704,9 +921,9 @@ def _show_message(stdscr, msg: str, is_error: bool = False) -> None:
 
 
 def _draw_header(stdscr, title: str, subtitle: str, cols: int) -> None:
-    stdscr.addstr(1, 2, title[: cols - 4], curses.A_BOLD)
+    _safe_addstr(stdscr, 1, 2, title[: max(0, cols - 4)], curses.A_BOLD)
     if subtitle:
-        stdscr.addstr(2, 2, subtitle[: cols - 4], curses.A_DIM)
+        _safe_addstr(stdscr, 2, 2, subtitle[: max(0, cols - 4)], curses.A_DIM)
 
 
 def _shell_out(stdscr, fn: Callable[[], None]) -> None:
