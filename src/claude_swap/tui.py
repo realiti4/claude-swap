@@ -554,6 +554,11 @@ def _account_block(
         header.append((" (active)", _sty("accent")))
     if av.priority:
         header.append((f" · pri {av.priority}", dim))
+    # An optimistic stale view: the usage endpoint is backed off, so these numbers
+    # are the last-known reading (possibly out of date), not a live signal. Flag it
+    # so the percentages aren't mistaken for current.
+    if av.signal == "stale":
+        header.append((" · cached", dim))
 
     # Tree children: usage windows (only those with data), then the session count.
     if av.signal == "none":

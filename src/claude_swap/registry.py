@@ -40,6 +40,9 @@ from pathlib import Path
 from claude_swap.balancer import PROBE_CONFIRMED_PCT, AccountView, SessionView, _pct_cost
 from claude_swap.cache import (
     MISSING,
+    STALE_USAGE_MAX_AGE_S,
+    last_known_usage,
+    merge_last_known,
     probe_ok,
     probe_recent,
     read_cache,
@@ -613,6 +616,9 @@ def build_world(
                 ra = fail.get("retry_after")
                 if isinstance(ra, (int, float)) and ra > 0:
                     marker["retry_until"] = time.time() + ra
+                # Remember the last healthy reading so the optimistic stale view can
+                # keep this account a no-credit target through the backoff window.
+                merge_last_known(marker, persisted_entry)
                 fetched[num] = marker
         else:
             usage = None
@@ -620,6 +626,30 @@ def build_world(
         if probe_view is not None:
             acct_views[num] = probe_view
             continue
+
+        # Optimistic stale fallback: an account whose usage endpoint is backed off
+        # (so ``usage is None``) but which carries a still-recent last-known-good
+        # reading enters the model with THAT reading (``signal="stale"``) instead of
+        # zero headroom — so a stranded session can migrate onto a was-healthy
+        # account without spending a probe credit. The reading may be out of date
+        # (the account could be capped now); if so the session hits a real limit and
+        # recovers again, which is the accepted optimistic-use tradeoff. The balancer
+        # still gates placement on ``target_safety``, so a stale reading near the cap
+        # is ``_usable`` but won't be picked as a target.
+        signal = "cache" if isinstance(usage, dict) else "none"
+        if usage is None:
+            stale_src = fetched.get(num) if num in fetched else persisted_entry
+            # A FRESH probe verdict is authoritative and must trump an older
+            # last-known reading: if a live probe JUST confirmed this account is
+            # capped/unknown (``probe_recent`` and not ``probe_ok``), do NOT resurrect
+            # it as a usable stale target — otherwise the session migrates straight
+            # back onto an account the probe (a paid call) already said is exhausted,
+            # the migrate->limit->migrate loop this feature exists to avoid.
+            fresh_negative_probe = probe_recent(stale_src) and not probe_ok(stale_src)
+            stale = None if fresh_negative_probe else last_known_usage(stale_src, STALE_USAGE_MAX_AGE_S)
+            if stale is not None:
+                usage = stale
+                signal = "stale"
 
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
@@ -630,7 +660,7 @@ def build_world(
             priority=priority,
             max_pct=_with_reserve(_max_pct(usage), resv) if is_usage else None,
             soonest_reset=soonest_blocking_reset(usage) if is_usage else None,
-            signal="cache" if is_usage else "none",
+            signal=signal,
             five_hour_pct=h5_pct,
             five_hour_reset=h5_reset,
             seven_day_pct=d7_pct,
@@ -710,7 +740,11 @@ def _claim_probe_slot(switcher, num: str):
             # Another supervisor stamped a fresh verdict in the race -> reuse it.
             return current
         merged = dict(latest)
-        merged[num] = {"_unavailable": True, "_probed_at": time.time()}
+        # Carry last-known-good onto the provisional placeholder so a claim that
+        # races in doesn't drop the stale-view snapshot before the real verdict.
+        merged[num] = merge_last_known(
+            {"_unavailable": True, "_probed_at": time.time()}, current
+        )
         write_cache(usage_cache_path, merged)
         return None
     finally:
@@ -797,17 +831,23 @@ def _maybe_probe(
     )
     now = time.time()
     if verdict is True:
-        fetched[num] = {"_probe_ok": True, "_probed_at": now}
+        # Thread last-known-good forward even on an OK verdict (mirrors the other
+        # marker writes): once this verdict goes un-fresh, a later 429 marker can
+        # inherit the snapshot instead of collapsing the account to zero headroom.
+        fetched[num] = merge_last_known({"_probe_ok": True, "_probed_at": now}, entry, now)
         return _probe_view(num, priority, resv, entry)
     if verdict is False:
         marker: dict = {"_unavailable": True, "_probed_at": now}
         ra = fail.get("retry_after")
         if isinstance(ra, (int, float)) and ra > 0:
             marker["retry_until"] = now + ra
+        # Preserve last-known-good across the probe rewrite (a probe must not wipe
+        # the stale-view snapshot the 429 marker was carrying).
+        merge_last_known(marker, entry, now)
         fetched[num] = marker
         return None
     # Unknown (None): stamp so the re-probe is throttled, but no retry_until.
-    fetched[num] = {"_unavailable": True, "_probed_at": now}
+    fetched[num] = merge_last_known({"_unavailable": True, "_probed_at": now}, entry, now)
     return None
 
 

@@ -2712,3 +2712,127 @@ class TestRefreshAccountAndReseed:
 
         assert ok is False
         seed.assert_not_called()
+
+
+class TestUsageBackoffThrottle:
+    """status() and get_active_usage_pct honor the shared 429 backoff marker rather
+    than re-hitting a rate-limited usage endpoint once the freshness cache lapses."""
+
+    def _setup(self, sample_sequence_data):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = "org-1"
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        path = sw.backup_dir / "cache" / "usage.json"
+        return sw, creds, path, time, write_cache
+
+    def test_status_honors_active_backoff_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys
+    ):
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+        write_cache(path, {"1": {"_unavailable": True, "retry_until": time.time() + 3600}})
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as m:
+            sw.status()
+        m.assert_not_called()  # backoff active -> no refetch
+        assert "rate-limited" in capsys.readouterr().out
+
+    def test_status_429_caches_backoff_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.cache import read_cache, usage_backoff_active
+
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+
+        def fake_fetch(*a, failure_out=None, **k):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=fake_fetch):
+            sw.status()
+        entry = read_cache(path, 10**9)["1"]
+        assert usage_backoff_active(entry) is True  # marker persisted, not a bare None
+
+    def test_get_active_usage_pct_honors_backoff(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+        write_cache(path, {"1": {"_unavailable": True, "retry_until": time.time() + 3600}})
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as m:
+            pct = sw.get_active_usage_pct()
+        m.assert_not_called()
+        assert pct is None  # unknown during backoff -> auto-switch won't act on a guess
+
+    def test_get_active_usage_pct_429_caches_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.cache import read_cache, usage_backoff_active
+
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+
+        def fake_fetch(*a, failure_out=None, **k):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        with patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=fake_fetch):
+            pct = sw.get_active_usage_pct()
+        assert pct is None
+        entry = read_cache(path, 10**9)["1"]
+        assert usage_backoff_active(entry) is True
+
+
+class TestStaleUsageRender:
+    """A backed-off account with a recent last-known reading renders the cached
+    numbers (flagged) instead of a bare "usage unavailable"."""
+
+    def test_list_shows_last_known_instead_of_unavailable(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys
+    ):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        seq = sw._get_sequence_data()
+        stale_num = str(seq["sequence"][0])
+        # Seed a full cache (all sequence keys) so list_accounts takes the cache-hit
+        # path (no fetch, no creds needed): the first account is 429-backed-off with
+        # a recent last-known reading; the rest get a trivial usage entry.
+        cache = {
+            str(n): {"five_hour": {"pct": 5}}
+            for n in seq["sequence"]
+        }
+        cache[stale_num] = {
+            "_unavailable": True,
+            "retry_until": time.time() + 1800,
+            "_last_known": {"five_hour": {"pct": 62}, "seven_day": {"pct": 30}},
+            "_last_known_at": time.time(),
+        }
+        write_cache(sw.backup_dir / "cache" / "usage.json", cache)
+        with patch.object(sw, "_read_credentials", return_value=""), \
+             patch.object(sw, "_read_account_credentials", return_value=""):
+            sw.list_accounts()
+        out = capsys.readouterr().out
+        assert "last-known" in out and "cached" in out
+        assert "62%" in out
+        assert "usage unavailable" not in out

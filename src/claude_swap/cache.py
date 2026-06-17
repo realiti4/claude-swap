@@ -25,6 +25,13 @@ MISSING = object()
 # a confirmed account is rediscovered quickly while still capping the billable rate.
 PROBE_VERDICT_TTL_S = 120
 
+# How old a last-known-good usage reading may be and still back an optimistic
+# ``signal="stale"`` view (see ``merge_last_known`` / ``last_known_usage``).
+# Comfortably exceeds the 1h max usage-endpoint backoff so a reading taken when a
+# 429 first hit stays usable for the whole window; an idle account's usage drifts
+# over hours, not minutes, so a reading this fresh is a sound optimistic estimate.
+STALE_USAGE_MAX_AGE_S = 2 * 3600
+
 
 def usage_backoff_active(entry, now: float | None = None) -> bool:
     """Whether a cached usage entry is a still-active 429 backoff marker.
@@ -70,6 +77,65 @@ def probe_ok(entry) -> bool:
     (real usage, no-signal/429 markers, non-dicts).
     """
     return isinstance(entry, dict) and entry.get("_probe_ok") is True
+
+
+def is_real_usage(entry) -> bool:
+    """Whether a cached entry holds REAL usage windows (not a failure/probe marker).
+
+    Real usage is a dict carrying the usage-API result; a failure marker carries
+    ``_unavailable`` and a probe verdict carries ``_probe_ok``. Used to decide when a
+    failure marker should snapshot the prior reading as last-known-good.
+    """
+    return (
+        isinstance(entry, dict)
+        and not entry.get("_unavailable")
+        and not entry.get("_probe_ok")
+    )
+
+
+def merge_last_known(marker: dict, prev, now: float | None = None) -> dict:
+    """Carry a last-known-good usage snapshot onto a failure ``marker``.
+
+    Optimistic-headroom support: a failure/backoff marker remembers the most recent
+    REAL usage reading so :func:`registry.build_world` can keep an idle account that
+    was healthy-when-last-seen as a (no-credit) migration target through the backoff
+    window, instead of treating its unknown usage as zero headroom. If ``prev`` is
+    itself real usage, snapshot it now; if ``prev`` is an earlier marker already
+    carrying ``_last_known`` (a chain of markers across the window), inherit it.
+    Returns ``marker`` (mutated in place).
+    """
+    if not isinstance(marker, dict):
+        return marker
+    if is_real_usage(prev):
+        marker["_last_known"] = prev
+        marker["_last_known_at"] = now if now is not None else time.time()
+    elif isinstance(prev, dict) and isinstance(prev.get("_last_known"), dict):
+        marker["_last_known"] = prev["_last_known"]
+        at = prev.get("_last_known_at")
+        if isinstance(at, (int, float)):
+            marker["_last_known_at"] = at
+    return marker
+
+
+def last_known_usage(entry, max_age: float, now: float | None = None):
+    """A still-recent last-known-good usage snapshot carried on a failure marker.
+
+    Returns the snapshotted usage dict when ``entry`` carries ``_last_known`` and its
+    ``_last_known_at`` is within ``max_age`` seconds; otherwise ``None``. Lets
+    :func:`registry.build_world` synthesize an optimistic ``signal="stale"`` view for
+    an account whose usage endpoint is 429-backed-off but which was below the safety
+    line when last read — so a stranded session can migrate onto it without spending
+    a probe credit, accepting that it may turn out capped (then it recovers again).
+    """
+    if not isinstance(entry, dict):
+        return None
+    lk = entry.get("_last_known")
+    at = entry.get("_last_known_at")
+    if not (isinstance(lk, dict) and isinstance(at, (int, float))):
+        return None
+    if (now if now is not None else time.time()) - at >= max_age:
+        return None
+    return lk
 
 
 def read_cache(path: Path, ttl: float, default=MISSING):

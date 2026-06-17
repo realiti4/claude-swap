@@ -81,6 +81,140 @@ _MAX_AUTH_RECOVER_ATTEMPTS = 2
 # there is nothing to restore in ``finally``.
 _NO_SIGNAL = object()
 
+# Injected as the first turn whenever the supervisor AUTO-resumes a session after a
+# rate-limit or auth interruption. Without it, ``claude --resume`` reloads the
+# transcript and then idles at a blank prompt waiting for the user — so the
+# "auto-resume" never actually continues the work. This nudge makes the recovered
+# session pick up where it left off. The session's ``/goal``, model, and effort ride
+# along automatically (the goal + model live in the resumed transcript; effort is in
+# ``CLAUDE_CODE_EFFORT_LEVEL`` on the env), and the launch FLAGS below are re-passed.
+_RECOVERY_PROMPT = "Sorry for the interruption, please gracefully recover and continue."
+
+# claude launch flags that consume EXACTLY the next token as their value (from
+# ``claude --help``). Used to walk an argv the way claude's own parser does so the
+# trailing positional prompt can be told apart from a flag value.
+_VALUE_FLAGS = frozenset({
+    "--agent", "--agents", "--append-system-prompt", "--append-system-prompt-file",
+    "--debug-file", "--effort", "--fallback-model", "--json-schema",
+    "--max-budget-usd", "--max-turns", "--model", "-m", "--name", "-n",
+    "--output-format", "--input-format", "--permission-mode",
+    "--permission-prompt-tool", "--session-id", "--settings", "--setting-sources",
+    "--system-prompt", "--system-prompt-file",
+})
+# Variadic launch flags: greedily consume following non-flag tokens as values
+# (matches commander's parsing in claude).
+_VARIADIC_FLAGS = frozenset({
+    "--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools",
+    "--disallowed-tools", "--betas", "--file", "--mcp-config",
+})
+# Optional-value flags: a following non-flag token is their value (a session id,
+# PR ref, debug filter), but they are also valid bare. They must be recognized so a
+# value like ``--resume <sid>`` isn't mistaken for the positional prompt.
+_OPTVALUE_FLAGS = frozenset({"--resume", "--from-pr", "--debug", "-d"})
+# Resume-control flags stripped from the preserved set when the supervisor supplies
+# its OWN ``--resume <sid>`` — re-passing the user's would double-resume / conflict.
+# ``--print``/``-p`` is dropped too: an auto-resume MUST be interactive (the injected
+# recovery prompt is a first turn the user then continues), and ``-p`` would relaunch
+# headless and exit after one response.
+_DROP_ON_RESUME_NOVALUE = frozenset({"--continue", "-c", "--fork-session", "--print", "-p"})
+_DROP_ON_RESUME_OPTVALUE = frozenset({"--resume", "--from-pr"})  # optional trailing value
+_DROP_ON_RESUME_VALUE = frozenset({"--session-id"})  # required trailing value
+
+
+def _flag_name(tok: str) -> str:
+    """The flag name without an inline ``=value`` (``--model=opus`` -> ``--model``)."""
+    return tok.split("=", 1)[0]
+
+
+def _strip_trailing_prompt(args: list[str]) -> list[str]:
+    """Return ``args`` with a trailing positional prompt removed.
+
+    Walks left-to-right consuming flags and their values exactly as claude's parser
+    does; the first bare token (not a flag and not consumed as a flag value) is the
+    positional prompt — it and everything after it are dropped. A flags-only argv
+    (the managed-launch norm) is returned unchanged.
+    """
+    out: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        tok = args[i]
+        if not tok.startswith("-"):
+            break  # first bare positional == the prompt; drop it and the rest
+        out.append(tok)
+        name = _flag_name(tok)
+        if "=" in tok:
+            i += 1
+            continue
+        if name in _VALUE_FLAGS:
+            if i + 1 < n:
+                out.append(args[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if name in _VARIADIC_FLAGS:
+            i += 1
+            while i < n and not args[i].startswith("-"):
+                out.append(args[i])
+                i += 1
+            continue
+        if name in _OPTVALUE_FLAGS:
+            if i + 1 < n and not args[i + 1].startswith("-"):
+                out.append(args[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        i += 1
+    return out
+
+
+def _resume_launch_args(base_args: list[str], sid: str, prompt: str) -> list[str]:
+    """Build the argv for an auto-resume relaunch.
+
+    ``["--resume", <sid>]`` + the original launch FLAGS (model / settings /
+    skip-permissions / fallback-model / add-dir / … so the recovered session keeps
+    them) + ``prompt`` as the first turn. The user's original positional prompt is
+    dropped (it already lives in the resumed transcript) and any resume-control
+    flags they passed are dropped (the supervisor supplies its own ``--resume``).
+    Each flag is kept or dropped together with the value tokens it consumes, so a
+    dropped flag never strands a value and a kept flag's value is never re-read as a
+    flag.
+    """
+    flags = _strip_trailing_prompt(base_args)
+    out: list[str] = []
+    i, n = 0, len(flags)
+    while i < n:
+        tok = flags[i]
+        name = _flag_name(tok)
+        group = [tok]
+        i += 1
+        if "=" not in tok:
+            if name in _VALUE_FLAGS or name in _DROP_ON_RESUME_VALUE:
+                if i < n:
+                    group.append(flags[i])
+                    i += 1
+            elif name in _VARIADIC_FLAGS:
+                while i < n and not flags[i].startswith("-"):
+                    group.append(flags[i])
+                    i += 1
+            elif name in _DROP_ON_RESUME_OPTVALUE:
+                if i < n and not flags[i].startswith("-"):
+                    group.append(flags[i])
+                    i += 1
+        if (
+            name in _DROP_ON_RESUME_NOVALUE
+            or name in _DROP_ON_RESUME_OPTVALUE
+            or name in _DROP_ON_RESUME_VALUE
+        ):
+            continue  # drop the flag and any value(s) it consumed
+        out.extend(group)
+    # Terminate options with ``--`` so the recovery prompt is ALWAYS the positional
+    # prompt — never swallowed as the value of a trailing variadic (``--add-dir``…)
+    # or optional-value (``--debug``…) flag, which would leave the resumed session
+    # idling at a blank prompt instead of continuing its work.
+    return ["--resume", sid, *out, "--", prompt]
+
 
 def launch(
     switcher, claude_args: list[str], *, cwd: str | None = None, share: bool = True
@@ -175,7 +309,14 @@ class Supervisor:
                 # on it would launch the first auto-resume fresh and leave later
                 # ones off-by-one. The authoritative value lives in the row.
                 sid = self._current_claude_session_id()
-                args = (["--resume", sid] if resume and sid
+                # An auto-resume after a rate-limit / auth interruption: resume the
+                # session, re-pass the launch flags so model/settings/permissions
+                # survive the account switch, and inject the recovery prompt so the
+                # session actually continues its work instead of idling at a blank
+                # prompt. A fresh launch (no session id recorded yet) falls back to
+                # the original args verbatim.
+                args = (_resume_launch_args(base_args, sid, _RECOVERY_PROMPT)
+                        if resume and sid
                         else list(base_args))
                 # Let claude own Ctrl-C — but ONLY while it is the live foreground
                 # process. The supervisor shares the foreground process group + TTY
@@ -198,6 +339,11 @@ class Supervisor:
 
                 if outcome == "exit":
                     if self._should_handle_limit_exit():
+                        # The child launched and RAN (it hit a usage limit), so its
+                        # credentials were fine — reset the consecutive-auth-failure
+                        # counter so a long-lived session that recovered from earlier
+                        # auth blips isn't torn down on a later, unrelated one.
+                        self._auth_recover_attempts = 0
                         self._pause_and_resume()  # migrate now, or pause + auto-resume
                     elif self._should_recover_auth_exit(rc):
                         # An auth-failure exit: claude hard-exited on invalid/expired
@@ -226,6 +372,8 @@ class Supervisor:
                         return rc
                 else:
                     # outcome == "pause": child was SIGTERM'd to honour a pause.
+                    # It ran fine up to the pause, so its creds were good -> reset.
+                    self._auth_recover_attempts = 0
                     self._pause_and_resume()
                 resume = True
         except KeyboardInterrupt:

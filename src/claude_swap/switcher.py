@@ -25,7 +25,15 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth
-from claude_swap.cache import MISSING, read_cache, usage_backoff_active, write_cache
+from claude_swap.cache import (
+    MISSING,
+    STALE_USAGE_MAX_AGE_S,
+    last_known_usage,
+    merge_last_known,
+    read_cache,
+    usage_backoff_active,
+    write_cache,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -160,6 +168,37 @@ def _usage_status_line(usage) -> str | None:
             return f"usage rate-limited — retry in ~{mins}m"
         return "usage unavailable"
     return None
+
+
+def _stale_usage_render(usage, now: float | None = None) -> tuple[str, list[str]] | None:
+    """Render a backed-off account from its last-known-good reading, if recent.
+
+    When ``usage`` is an ``_unavailable`` marker carrying a still-recent
+    ``_last_known`` snapshot (see ``cache.merge_last_known``), surface the cached
+    numbers instead of a bare "usage unavailable" — the same optimistic reading the
+    balancer treats as headroom. Returns ``(note, lines)`` where ``note`` flags the
+    data as cached (and how long the endpoint is backed off), or ``None`` when there
+    is no fresh last-known reading (the caller then falls back to
+    :func:`_usage_status_line`).
+    """
+    if not (isinstance(usage, dict) and usage.get("_unavailable")):
+        return None
+    now = now if now is not None else time.time()
+    lk = last_known_usage(usage, STALE_USAGE_MAX_AGE_S, now)
+    if lk is None:
+        return None
+    lines = _format_usage_lines(lk)
+    if not lines:
+        # No renderable windows (e.g. only extra-usage data) -> don't print a
+        # contentless header; let the caller fall back to _usage_status_line.
+        return None
+    until = usage.get("retry_until")
+    if isinstance(until, (int, float)) and until > now:
+        mins = max(1, int((until - now) / 60))
+        note = f"last-known usage (cached — endpoint rate-limited, retry in ~{mins}m)"
+    else:
+        note = "last-known usage (cached — endpoint unavailable)"
+    return note, lines
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -1378,8 +1417,11 @@ class ClaudeAccountSwitcher:
             # On a usage-endpoint 429, cache a backoff marker carrying the
             # server's Retry-After so we stop re-hitting the rate-limited
             # endpoint every invocation (the "usage unavailable" feedback loop).
+            # Carry the last healthy reading forward so the optimistic stale view
+            # survives (mirrors build_world's marker write).
             if result is None and fail.get("retry_after"):
-                return {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                return merge_last_known(marker, persisted.get(str(num)))
             return result
 
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
@@ -1422,6 +1464,12 @@ class ClaudeAccountSwitcher:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}{pri_tag}")
             if isinstance(usage, str):
                 print(f"     {dimmed(usage)}")  # e.g. "no credentials"
+            elif (stale := _stale_usage_render(usage)) is not None:
+                note, lines = stale  # backed off, but a recent last-known reading
+                print(f"     {dimmed(note)}")
+                for j, line in enumerate(lines):
+                    connector = "└" if j == len(lines) - 1 else "├"
+                    print(f"     {dimmed(connector)} {muted(line)}")
             elif (status_line := _usage_status_line(usage)) is not None:
                 print(f"     {dimmed(status_line)}")  # unavailable / rate-limited
             else:
@@ -1509,20 +1557,39 @@ class ClaudeAccountSwitcher:
                 # cswap must not refresh them) and merge into existing entries so
                 # other accounts' rows survive.
                 usage_cache_path = self.backup_dir / "cache" / "usage.json"
+                # Persisted backoff markers survive the freshness TTL until their
+                # Retry-After elapses, so `cswap --status` doesn't re-hit a
+                # rate-limited endpoint once the 60s cache expires (the gap that
+                # re-armed the "usage unavailable" loop on this path).
+                persisted = read_cache(usage_cache_path, float("inf"))
+                persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
                 cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
                 if (cached is not MISSING and isinstance(cached, dict)
                         and account_num in cached):
                     usage = cached[account_num]
+                elif usage_backoff_active(persisted.get(account_num)):
+                    usage = persisted.get(account_num)  # honor the backoff, no refetch
                 else:
+                    fail: dict = {}
                     usage = oauth.fetch_usage_for_account(
                         account_num, current_email, creds,
-                        is_active=True,
+                        is_active=True, failure_out=fail,
                     )
-                    existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+                    if usage is None and fail.get("retry_after"):
+                        marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                        usage = merge_last_known(marker, persisted.get(account_num))
+                    existing = dict(persisted)
                     existing[account_num] = usage
                     write_cache(usage_cache_path, existing)
-                status_line = _usage_status_line(usage)
-                if status_line is not None:
+                stale = _stale_usage_render(usage)
+                if stale is not None:
+                    # Backed off, but a recent last-known reading exists -> show it.
+                    note, lines = stale
+                    print(f"  {dimmed(note)}")
+                    for j, line in enumerate(lines):
+                        connector = "└" if j == len(lines) - 1 else "├"
+                        print(f"  {dimmed(connector)} {muted(line)}")
+                elif (status_line := _usage_status_line(usage)) is not None:
                     # None usage or a 429 backoff marker -> a clear line, never a
                     # blank one (a marker would otherwise format to nothing).
                     print(f"  {dimmed(status_line)}")
@@ -1617,27 +1684,40 @@ class ClaudeAccountSwitcher:
                 break
 
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        # Persisted backoff markers (inf TTL) gate the refetch so a 429-backed-off
+        # active account isn't re-polled every call once the freshness cache lapses.
+        persisted = read_cache(usage_cache_path, float("inf"))
+        persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
         usage = None
+        backed_off = False
         if account_num is not None:
             cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
             if (cached is not MISSING and isinstance(cached, dict)
                     and account_num in cached):
                 usage = cached[account_num]
+            elif usage_backoff_active(persisted.get(account_num)):
+                usage = persisted.get(account_num)  # honor the backoff, no refetch
+                backed_off = True
 
-        if usage is None:
+        if usage is None and not backed_off:
+            fail: dict = {}
             usage = oauth.fetch_usage_for_account(
-                account_num or "active", current_email, creds, is_active=True,
+                account_num or "active", current_email, creds,
+                is_active=True, failure_out=fail,
             )
+            if usage is None and fail.get("retry_after") and account_num is not None:
+                # Cache the backoff so the next poll honors it instead of re-hitting
+                # the rate-limited endpoint (the throttle gap on this path).
+                marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                usage = merge_last_known(marker, persisted.get(account_num))
             if account_num is not None and isinstance(usage, dict):
-                existing = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-                existing = (
-                    existing
-                    if (existing is not MISSING and isinstance(existing, dict))
-                    else {}
-                )
+                existing = dict(persisted)
                 existing[account_num] = usage
                 write_cache(usage_cache_path, existing)
 
+        # A backoff/failure marker has no windows -> _max_usage_pct returns None
+        # (unknown), so the auto-switch monitor won't act on a stale guess — the
+        # session keeps running until a real limit, matching run-until-limit intent.
         return _max_usage_pct(usage)
 
     # ------------------------------------------------------------------ #

@@ -374,6 +374,30 @@ class TestProbeUnavailable:
         entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
         assert probe_ok(entry) is True
 
+    def test_probe_ok_verdict_carries_last_known_forward(self, temp_home: Path):
+        # A probe-OK verdict must thread _last_known forward (like every other marker
+        # write) so a later 429 can inherit it instead of collapsing to zero headroom.
+        from claude_swap.cache import probe_ok, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        last_known = {"five_hour": {"pct": 55}}
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {
+                "_unavailable": True,
+                "retry_until": time.time() + 3600,
+                "_last_known": last_known,
+                "_last_known_at": time.time(),
+            }},
+        )
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._probe_idle_headroom", return_value=True):
+            registry.build_world(sw, reg, fetch_idle=True, probe_unavailable=True)
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert probe_ok(entry) is True
+        assert entry["_last_known"] == last_known  # snapshot survives the OK verdict
+
     def test_probe_ok_verdict_reused_on_second_pass_without_reprobing(self, temp_home: Path):
         # Regression for the resume-path blocker: a cached probe-OK verdict carries no
         # _unavailable/retry_until, so without an explicit reuse branch the SECOND
@@ -726,3 +750,101 @@ class TestPrimeGuards:
         assert changed is True
         assert "1" in reg["primed"]
         assert "2" not in reg["primed"]
+
+
+class TestStaleOptimisticView:
+    """A usage-backed-off account that was healthy when last read enters the model
+    with an optimistic ``signal="stale"`` view (its last-known usage), so a stranded
+    session can migrate onto it WITHOUT spending a probe credit."""
+
+    LAST_KNOWN = {
+        "five_hour": {"pct": 62.0, "resets_at": 9_999_999_999},
+        "seven_day": {"pct": 30.0, "resets_at": 9_999_999_999},
+    }
+
+    def test_fresh_last_known_yields_stale_view(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {
+                "_unavailable": True,
+                "retry_until": time.time() + 3600,
+                "_last_known": self.LAST_KNOWN,
+                "_last_known_at": time.time(),
+            }},
+        )
+        reg = registry.read_registry(sw)
+        # Backoff is active -> must NOT fetch; the stale reading backs the view.
+        with patch("claude_swap.registry._fetch_idle_usage") as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        m.assert_not_called()
+        av = acct_views["2"]
+        assert av.signal == "stale"
+        assert av.max_pct == 62.0  # max(5h=62, 7d=30), no reserve
+        assert av.five_hour_pct == 62.0
+
+    def test_fresh_negative_probe_suppresses_stale_view(self, temp_home: Path):
+        # A live probe just confirmed the account is capped/unknown NOW (a recent
+        # _probed_at, no _probe_ok). That authoritative verdict must trump the older
+        # last-known reading -> NO stale view (else migrate->limit->migrate).
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {
+                "_unavailable": True,
+                "retry_until": time.time() + 3600,
+                "_probed_at": time.time(),  # fresh negative probe verdict
+                "_last_known": self.LAST_KNOWN,
+                "_last_known_at": time.time(),
+            }},
+        )
+        reg = registry.read_registry(sw)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        av = acct_views["2"]
+        assert av.signal == "none"  # not "stale" — the probe said capped
+        assert av.max_pct is None
+
+    def test_old_last_known_falls_back_to_none(self, temp_home: Path):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {
+                "_unavailable": True,
+                "retry_until": time.time() + 3600,
+                "_last_known": self.LAST_KNOWN,
+                "_last_known_at": time.time() - registry.STALE_USAGE_MAX_AGE_S - 1,
+            }},
+        )
+        reg = registry.read_registry(sw)
+        acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        av = acct_views["2"]
+        assert av.signal == "none"
+        assert av.max_pct is None
+
+    def test_fresh_fetch_failure_records_last_known_from_prior_usage(self, temp_home: Path):
+        # Prior cache holds REAL usage that has aged out of the fresh TTL; a fetch
+        # that then 429s must snapshot that reading into the new backoff marker so
+        # the next pass can serve a stale view.
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(sw.backup_dir / "cache" / "usage.json", {"2": self.LAST_KNOWN})
+        reg = registry.read_registry(sw)
+
+        def fake_fetch(switcher, num, email, *, is_active=False, failure_out=None):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        # TTL=0 forces the prior real usage to be "stale" so build_world refetches.
+        with patch("claude_swap.registry._usage_ttl", return_value=0), \
+             patch("claude_swap.registry._fetch_idle_usage", side_effect=fake_fetch):
+            registry.build_world(sw, reg, fetch_idle=True)
+
+        from claude_swap.cache import read_cache
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert entry["_unavailable"] is True
+        assert entry["_last_known"] == self.LAST_KNOWN
+        assert isinstance(entry["_last_known_at"], (int, float))

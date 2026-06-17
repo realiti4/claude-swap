@@ -14,7 +14,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_swap import balancer, registry
-from claude_swap.supervisor import _MAX_AUTH_RECOVER_ATTEMPTS, Supervisor
+from claude_swap.supervisor import (
+    _MAX_AUTH_RECOVER_ATTEMPTS,
+    _RECOVERY_PROMPT,
+    Supervisor,
+    _resume_launch_args,
+    _strip_trailing_prompt,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -93,7 +99,12 @@ class TestAutoResumeSessionId:
         first_args = popen_calls[0][1:]  # strip the claude binary
         second_args = popen_calls[1][1:]
         assert "--resume" not in first_args  # fresh start, no stale resume
-        assert second_args == ["--resume", "sid-1"]
+        # The resume reads the CURRENT session id (BUG 007) and, since this is an
+        # auto-recovery, re-passes the launch flags and injects the recovery prompt.
+        assert second_args[:2] == ["--resume", "sid-1"]
+        assert second_args.count("--resume") == 1
+        assert second_args[-1] == _RECOVERY_PROMPT
+        assert "--dangerously-skip-permissions" in second_args  # QoL flag preserved
 
     def test_current_session_id_empty_when_row_missing(self, temp_home):
         sw = ClaudeAccountSwitcher()
@@ -943,3 +954,101 @@ class TestPrimeOneAccount:
             ok = sup._prime_one_account("1")
         assert ok is False
         m.assert_not_called()
+
+
+class TestStripTrailingPrompt:
+    """The pure argv splitter that finds (and drops) a trailing positional prompt."""
+
+    def test_flags_only_unchanged(self):
+        # The managed-launch norm (quickStart): all flags + flag values, no prompt.
+        args = [
+            "--fallback-model", "sonnet", "--dangerously-skip-permissions",
+            "--model", "claude-opus-4-8", "--settings", '{"ultracode": true}',
+        ]
+        assert _strip_trailing_prompt(args) == args
+
+    def test_drops_bare_trailing_prompt(self):
+        assert _strip_trailing_prompt(["--model", "opus", "do the task"]) == ["--model", "opus"]
+
+    def test_value_flag_value_is_not_a_prompt(self):
+        # The settings JSON does not start with '-' but is --settings' value.
+        args = ["--settings", '{"ultracode": true}']
+        assert _strip_trailing_prompt(args) == args
+
+    def test_boolean_flag_then_prompt(self):
+        assert _strip_trailing_prompt(
+            ["--dangerously-skip-permissions", "fix the bug"]
+        ) == ["--dangerously-skip-permissions"]
+
+    def test_variadic_consumes_then_stops_at_flag(self):
+        args = ["--add-dir", "/a", "/b", "--model", "opus"]
+        assert _strip_trailing_prompt(args) == args
+
+    def test_inline_equals_value(self):
+        assert _strip_trailing_prompt(["--model=opus", "go"]) == ["--model=opus"]
+
+    def test_empty(self):
+        assert _strip_trailing_prompt([]) == []
+
+    def test_bare_prompt_first(self):
+        assert _strip_trailing_prompt(["just a prompt"]) == []
+
+
+class TestResumeLaunchArgs:
+    """Building the auto-resume argv: --resume + preserved flags + recovery prompt."""
+
+    def test_quickstart_flags_preserved_and_prompt_injected(self):
+        base = [
+            "--fallback-model", "sonnet", "--dangerously-skip-permissions",
+            "--model", "claude-opus-4-8", "--settings", '{"ultracode": true}',
+        ]
+        out = _resume_launch_args(base, "sid-123", _RECOVERY_PROMPT)
+        assert out[:2] == ["--resume", "sid-123"]
+        # prompt is the final positional, fenced from the flags by ``--``
+        assert out[-2:] == ["--", _RECOVERY_PROMPT]
+        for tok in base:
+            assert tok in out
+        assert out.count("--resume") == 1
+
+    def test_original_positional_prompt_dropped(self):
+        base = ["--model", "opus", "original task"]
+        out = _resume_launch_args(base, "sid", _RECOVERY_PROMPT)
+        assert "original task" not in out
+        assert out == ["--resume", "sid", "--model", "opus", "--", _RECOVERY_PROMPT]
+
+    def test_user_resume_flag_dropped_no_double_resume(self):
+        base = ["--resume", "old-sid", "--model", "opus"]
+        out = _resume_launch_args(base, "new-sid", _RECOVERY_PROMPT)
+        assert out.count("--resume") == 1
+        assert "old-sid" not in out
+        assert out == ["--resume", "new-sid", "--model", "opus", "--", _RECOVERY_PROMPT]
+
+    def test_continue_fork_print_dropped(self):
+        base = ["--continue", "--fork-session", "-p", "--model", "opus"]
+        out = _resume_launch_args(base, "sid", _RECOVERY_PROMPT)
+        for dropped in ("--continue", "--fork-session", "-p"):
+            assert dropped not in out  # resume is interactive, never headless
+        assert out == ["--resume", "sid", "--model", "opus", "--", _RECOVERY_PROMPT]
+
+    def test_session_id_flag_and_value_dropped(self):
+        base = ["--session-id", "abc", "--settings", '{"x": 1}']
+        out = _resume_launch_args(base, "sid", _RECOVERY_PROMPT)
+        assert "--session-id" not in out and "abc" not in out
+        assert out == ["--resume", "sid", "--settings", '{"x": 1}', "--", _RECOVERY_PROMPT]
+
+    def test_trailing_variadic_does_not_swallow_prompt(self):
+        # The bug the review caught: a trailing variadic flag (--add-dir) would
+        # eat a bare final prompt. The ``--`` terminator keeps the prompt positional.
+        base = ["--dangerously-skip-permissions", "--add-dir", "/a", "/b"]
+        out = _resume_launch_args(base, "sid", _RECOVERY_PROMPT)
+        assert out == [
+            "--resume", "sid", "--dangerously-skip-permissions",
+            "--add-dir", "/a", "/b", "--", _RECOVERY_PROMPT,
+        ]
+        # ``--`` sits immediately before the prompt, after the variadic value-run.
+        assert out.index("--") == len(out) - 2
+
+    def test_trailing_optvalue_debug_does_not_swallow_prompt(self):
+        base = ["--model", "opus", "-d"]
+        out = _resume_launch_args(base, "sid", _RECOVERY_PROMPT)
+        assert out == ["--resume", "sid", "--model", "opus", "-d", "--", _RECOVERY_PROMPT]
