@@ -45,6 +45,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.oauth import refresh_oauth_credentials
+from claude_swap.paths import mark_cwd_trusted
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
 
@@ -379,6 +380,10 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
+        # Pre-trust the directory this session will launch in (inherited cwd —
+        # `cswap run` execs claude without changing cwd) so claude skips the
+        # folder trust dialog. See paths.mark_cwd_trusted.
+        mark_cwd_trusted(existing, os.getcwd())
         config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_path, 0o600)

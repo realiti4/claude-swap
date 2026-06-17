@@ -38,6 +38,36 @@ def extract_oauth_data(credentials: str) -> dict | None:
     return oauth if isinstance(oauth, dict) else None
 
 
+# Subscription tiers that have a 5-hour usage window worth "warming". An account
+# authenticated some other way — pay-as-you-go API / console billing, or a tier
+# we don't recognize — is deliberately excluded so idle-window priming never
+# spends real money on an account with no subscription window to anchor.
+PRIMABLE_SUBSCRIPTION_TYPES = frozenset({"pro", "max", "team", "enterprise"})
+
+
+def extract_subscription_type(credentials: str) -> str | None:
+    """Return the Claude subscription type (lowercased) from a credentials string.
+
+    ``None`` when the credentials carry no OAuth subscription payload (e.g. an
+    API-key / console account) or can't be parsed.
+    """
+    oauth = extract_oauth_data(credentials)
+    if not isinstance(oauth, dict):
+        return None
+    sub = oauth.get("subscriptionType")
+    return sub.lower() if isinstance(sub, str) and sub.strip() else None
+
+
+def is_primable_subscription(subscription_type: str | None) -> bool:
+    """Whether an account's subscription tier has a primeable 5h window.
+
+    Conservative by design: only recognized Claude *subscription* tiers qualify.
+    An API-credit / console account, or any unrecognized/missing type, returns
+    ``False`` so priming never bills a pay-as-you-go account.
+    """
+    return bool(subscription_type) and subscription_type.lower() in PRIMABLE_SUBSCRIPTION_TYPES
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):
@@ -116,6 +146,14 @@ def build_token_status(credentials: str) -> str | None:
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
+def _epoch_seconds(resets_at: str) -> int | None:
+    """Parse an ISO-8601 reset timestamp to epoch seconds; ``None`` if unparseable."""
+    try:
+        return int(datetime.fromisoformat(resets_at).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
@@ -145,7 +183,12 @@ def format_reset(resets_at: str) -> tuple[str, str]:
 
 
 def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+    """Request raw utilization data from the Anthropic usage API.
+
+    Note: this is a READ and does NOT consume credits, so it does NOT start an
+    account's 5-hour rate-limit window. Use :func:`prime_account` to start the
+    clock on an idle window.
+    """
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -156,6 +199,132 @@ def request_usage_data(access_token: str) -> dict:
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
+
+# The cheapest possible credit-consuming turn: Haiku 4.5, a 1-token prompt, and
+# max_tokens=1. One trivial billable turn is enough to START the account's 5h
+# rate-limit window (the window is anchored to the first credit-consuming call of
+# a cycle) so idle accounts' windows stay staggered and fresh capacity keeps
+# cycling online — see the priming feature in the README / supervisor.
+PRIME_MODEL = "claude-haiku-4-5"
+_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+
+
+def prime_account(access_token: str) -> bool:
+    """Send ONE minimal credit-consuming message to start the 5h window. Best-effort.
+
+    Uses the same subscription OAuth auth shape as :func:`request_usage_data`
+    (Bearer access token + the ``anthropic-beta: oauth-2025-04-20`` header). A
+    2xx response (even ``stop_reason: max_tokens``) means the clock started ->
+    ``True``. A 429 means the account is already rate-limited (its window is
+    already running) -> treated as a no-op success (``True``). Any other failure
+    (401 logged out, network error) -> ``False``. NEVER raises.
+
+    The caller MUST only pass an INACTIVE/idle account's token (an active account's
+    credentials are owned by Claude Code and must never be touched) and MUST make
+    this call OUTSIDE the registry FileLock (it is network I/O).
+    """
+    body = json.dumps({
+        "model": PRIME_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        _MESSAGES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        # 429: already rate-limited => the window is already started => no-op done.
+        if e.code == 429:
+            return True
+        _logger.debug("prime call failed: %r", e)
+        return False
+    except Exception as e:  # noqa: BLE001 - priming is best-effort, never fatal
+        _logger.debug("prime call failed: %r", e)
+        return False
+
+
+
+def probe_messages_headroom(access_token: str, failure_out: dict | None = None) -> bool | None:
+    """Probe whether an account can serve a turn RIGHT NOW via the messages endpoint.
+
+    The messages endpoint (``/v1/messages``) is a SEPARATE rate-limit bucket from
+    the usage endpoint (``/api/oauth/usage``), so this answers "can this account
+    work now?" even while the usage API is 429-backed-off and reporting no signal.
+    Sends the SAME minimal turn :func:`prime_account` does (Haiku 4.5, a 1-token
+    prompt, ``max_tokens=1``), so it COSTS one trivial billable Haiku turn and,
+    like priming, STARTS the 5h window — acceptable only because the caller probes
+    an account it is about to place/resume a session onto.
+
+    Returns:
+      * ``True``  — 2xx (incl. ``stop_reason: max_tokens``): NOT 5h/7d capped =>
+                    the account has headroom now.
+      * ``False`` — 429: capped (out of usage). When ``failure_out`` is not None
+                    the server's ``Retry-After`` (seconds, via
+                    :func:`_retry_after_seconds`, clamped to
+                    :data:`_MAX_USAGE_BACKOFF_S`) is written as
+                    ``failure_out["retry_after"]`` so the caller can carry it into
+                    a backoff marker.
+      * ``None``  — 401 / network / other: UNKNOWN (logged out / offline). Distinct
+                    from ``False`` so the caller never caches a false "capped"
+                    verdict for a transient failure.
+
+    Best-effort, NEVER raises. The tri-state return (vs :func:`prime_account`'s
+    bool, which folds 429 into ``True`` because "window already running" is success
+    for priming) is deliberate: for a HEADROOM probe the three outcomes are
+    semantically distinct and the caller caches each differently.
+
+    The caller MUST pass only an INACTIVE/idle account's token (an active account's
+    credentials are owned by Claude Code and must never be touched) and MUST make
+    this call OUTSIDE the registry FileLock (it is network I/O).
+    """
+    body = json.dumps({
+        "model": PRIME_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        _MESSAGES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            return None
+    except urllib.error.HTTPError as e:
+        # 429: capped (out of usage on the messages bucket). Surface the server's
+        # Retry-After so the caller can refresh its backoff marker.
+        if e.code == 429:
+            if failure_out is not None:
+                ra = _retry_after_seconds(e)
+                if ra is not None:
+                    failure_out["retry_after"] = ra
+            return False
+        # 401 (logged out) / any other code: unknown, not a "capped" verdict.
+        _logger.debug("headroom probe failed: %r", e)
+        return None
+    except Exception as e:  # noqa: BLE001 - probing is best-effort, never fatal
+        _logger.debug("headroom probe failed: %r", e)
+        return None
 
 
 def build_usage_result(data: dict) -> dict | None:
@@ -169,6 +338,11 @@ def build_usage_result(data: dict) -> dict | None:
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
+            # Preserve the raw epoch reset alongside the formatted strings so the
+            # idle-window priming detection (which needs to tell a STARTED 5h
+            # window from an unstarted one) and ``soonest_blocking_reset`` work on
+            # cached usage too — not just on the live statusline signal.
+            h5_entry["resets_at"] = _epoch_seconds(h5["resets_at"])
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
@@ -176,10 +350,17 @@ def build_usage_result(data: dict) -> dict | None:
         d7_entry = {"pct": d7["utilization"]}
         if d7.get("resets_at"):
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
+            d7_entry["resets_at"] = _epoch_seconds(d7["resets_at"])
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
+        # Record that pay-as-you-go / extra-usage is enabled REGARDLESS of whether
+        # the dollar-denominated spend line below can be built (it can't when
+        # ``monthly_limit`` is None = unlimited). The balancer's API-rate last-resort
+        # tier keys off this flag, so it must reflect capability, not just billing
+        # display. See ``balancer._api_capable``.
+        result["extra_usage_enabled"] = True
         # Claude Code returns nullable used_credits, monthly_limit, and utilization
         # (monthly_limit=None = unlimited). All three are needed to render the spend
         # line, so when any is null skip just the spend entry; five_hour/seven_day
@@ -214,16 +395,41 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+# Hard ceiling on a server-supplied ``Retry-After``. A single 429 must never be
+# able to blackhole an account's usage for hours (a buggy/huge header would
+# otherwise pin it at "rate-limited" / no-headroom until the marker elapsed).
+_MAX_USAGE_BACKOFF_S = 3600
+
+
+def _retry_after_seconds(e: urllib.error.HTTPError) -> int | None:
+    """Parse a ``Retry-After`` (seconds) header from a 429, clamped to a sane max."""
+    try:
+        val = int(e.headers.get("Retry-After"))  # type: ignore[union-attr]
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if val <= 0:
+        return None
+    return min(val, _MAX_USAGE_BACKOFF_S)
+
+
 def fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    failure_out: dict | None = None,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
-    Active accounts are never refreshed — Claude Code owns those credentials.
+    Active accounts are never refreshed — Claude Code owns those credentials, and
+    refreshing rotates the single-use refresh token out from under the live login
+    (forcing a re-login). The caller MUST pass ``is_active=True`` for the current
+    default login and for any account with a live session.
+
+    ``failure_out`` (optional): on a usage-endpoint 429 the server's requested
+    backoff is written as ``failure_out["retry_after"]`` (seconds) so the caller
+    can cache a throttle marker and stop hammering the rate-limited endpoint.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -249,6 +455,13 @@ def fetch_usage_for_account(
         return build_usage_result(data)
     except urllib.error.HTTPError as e:
         _logger.debug("Usage fetch failed: %r", e)
+        if e.code == 429 and failure_out is not None:
+            # Rate-limited by the usage endpoint (client-wide, not token-specific):
+            # surface the server's Retry-After so the caller backs off instead of
+            # re-hitting it every TTL. Refreshing/retrying here would only amplify it.
+            ra = _retry_after_seconds(e)
+            if ra is not None:
+                failure_out["retry_after"] = ra
         if (
             e.code != 401
             or is_active
@@ -272,6 +485,13 @@ def fetch_usage_for_account(
         try:
             data = request_usage_data(new_token)
             return build_usage_result(data)
+        except urllib.error.HTTPError as retry_error:
+            _logger.debug("Usage fetch failed after refresh: %r", retry_error)
+            if retry_error.code == 429 and failure_out is not None:
+                ra = _retry_after_seconds(retry_error)
+                if ra is not None:
+                    failure_out["retry_after"] = ra
+            return None
         except Exception as retry_error:
             _logger.debug("Usage fetch failed after refresh: %r", retry_error)
             return None

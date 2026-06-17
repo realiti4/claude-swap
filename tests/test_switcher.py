@@ -559,7 +559,8 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, persist_credentials):
+        def mock_fetch(account_num, email, credentials, is_active, persist_credentials,
+                       failure_out=None):
             # Simulate a refresh on the inactive account only.
             if not is_active:
                 persist_credentials(account_num, email, refreshed_creds)
@@ -2475,3 +2476,363 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(ConfigError, match="No managed accounts have valid"):
             s.switch()
+
+
+class TestSeedProfileCredentialsAtomic:
+    """BUG 015: profile seeds must be atomic (no truncate+write race)."""
+
+    def _switcher(self):
+        return ClaudeAccountSwitcher()
+
+    def test_seed_writes_both_files_atomically(self, temp_home: Path):
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok", "refreshToken": "ref"})
+        config_json = json.dumps(
+            {"oauthAccount": {"emailAddress": "a@x.com"}, "theme": "light"}
+        )
+        profile_dir = temp_home / "managed" / "m1"
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+
+        creds_path = profile_dir / ".credentials.json"
+        config_path = profile_dir / ".claude.json"
+        # Contents are correct and verbatim for credentials.
+        assert creds_path.read_text(encoding="utf-8") == creds_json
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        assert cfg["oauthAccount"] == {"emailAddress": "a@x.com"}
+        assert cfg["hasCompletedOnboarding"] is True
+        assert cfg["theme"] == "light"
+        # 0600 perms on both (skip the perm check on Windows).
+        if sys.platform != "win32":
+            assert (creds_path.stat().st_mode & 0o777) == 0o600
+            assert (config_path.stat().st_mode & 0o777) == 0o600
+
+    def test_seed_trusts_launch_cwd(self, temp_home: Path):
+        """Passing ``cwd`` pre-accepts the folder trust dialog for that dir so
+        the spawned claude doesn't stop on the workspace-trust prompt."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m3"
+        workspace = temp_home / "Projects" / "IAMBot"
+        workspace.mkdir(parents=True)
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(
+                profile_dir, "1", "a@x.com", cwd=str(workspace)
+            )
+        cfg = json.loads((profile_dir / ".claude.json").read_text(encoding="utf-8"))
+        projects = cfg["projects"]
+        # The directory claude will run in is marked trusted (under its
+        # realpath — what the child's process.cwd() resolves to).
+        assert projects[os.path.realpath(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_seed_without_cwd_adds_no_projects(self, temp_home: Path):
+        """Backward compat: no cwd → no projects map is fabricated."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m4"
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+        cfg = json.loads((profile_dir / ".claude.json").read_text(encoding="utf-8"))
+        assert "projects" not in cfg
+
+    def test_seed_trust_preserves_existing_project_metadata(self, temp_home: Path):
+        """Re-seeding keeps a project's existing history/allowedTools intact and
+        only flips trust on — projects/history survive a re-point."""
+        sw = self._switcher()
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+        profile_dir = temp_home / "managed" / "m5"
+        workspace = temp_home / "ws"
+        workspace.mkdir()
+        key = os.path.realpath(workspace)
+        profile_dir.mkdir(parents=True)
+        (profile_dir / ".claude.json").write_text(
+            json.dumps({"projects": {key: {"allowedTools": ["Bash"]}}}),
+            encoding="utf-8",
+        )
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json):
+            sw.seed_profile_credentials(
+                profile_dir, "1", "a@x.com", cwd=str(workspace)
+            )
+        entry = json.loads(
+            (profile_dir / ".claude.json").read_text(encoding="utf-8")
+        )["projects"][key]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["allowedTools"] == ["Bash"]
+
+    def test_seed_uses_atomic_rename_not_truncating_write(self, temp_home: Path):
+        """The credential write must go through os.replace (a rename), never a
+        plain truncate+write that a live reader could observe mid-write."""
+        sw = self._switcher()
+        profile_dir = temp_home / "managed" / "m2"
+        creds_json = json.dumps({"accessToken": "tok"})
+        config_json = json.dumps({"oauthAccount": {"emailAddress": "a@x.com"}})
+
+        replaces: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            replaces.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with patch.object(sw, "_read_account_credentials", return_value=creds_json), \
+             patch.object(sw, "_read_account_config", return_value=config_json), \
+             patch("claude_swap.switcher.os.replace", side_effect=spy_replace):
+            sw.seed_profile_credentials(profile_dir, "1", "a@x.com")
+
+        # .credentials.json was committed via an atomic rename onto its final path.
+        creds_path = str(profile_dir / ".credentials.json")
+        assert any(dst == creds_path for _, dst in replaces)
+        assert (profile_dir / ".credentials.json").exists()
+        # No leftover temp files in the profile dir.
+        assert not list(profile_dir.glob("*.tmp"))
+
+
+class TestRefreshAccountAndReseed:
+    """401 auto-recovery: refresh an account's token + re-seed a managed profile.
+
+    Exercises ``refresh_account_and_reseed`` without real network I/O — the OAuth
+    refresh + expiry helpers are mocked and ``seed_profile_credentials`` is spied.
+    """
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX  # file-backed backup creds (no Keychain)
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed_account(
+        self, s: ClaudeAccountSwitcher, num: int, email: str, *, expires_at: int
+    ) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                    "expiresAt": expires_at,
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        s._write_json(s.sequence_file, data)
+
+    def test_fresh_token_reseeds_without_refreshing(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=False), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials") as refresh, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is True
+        refresh.assert_not_called()  # token already fresh -> no network refresh
+        seed.assert_called_once_with(profile_dir, "1", "a@x.com")
+
+    def test_expired_token_refreshes_persists_and_reseeds(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+        refreshed = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-new",
+                "refreshToken": "rt-new",
+                "expiresAt": 9_999_999_999_000,
+            }
+        })
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=True), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials", return_value=refreshed), \
+             patch.object(s, "_write_account_credentials") as write_creds, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is True
+        # Fresh creds persisted to the canonical backup, then profile re-seeded.
+        write_creds.assert_called_once_with("1", "a@x.com", refreshed)
+        seed.assert_called_once_with(profile_dir, "1", "a@x.com")
+
+    def test_refresh_returns_none_returns_false_no_reseed(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        self._seed_account(s, 1, "a@x.com", expires_at=0)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch("claude_swap.switcher.oauth.is_oauth_token_expired", return_value=True), \
+             patch("claude_swap.switcher.oauth.refresh_oauth_credentials", return_value=None), \
+             patch.object(s, "_write_account_credentials") as write_creds, \
+             patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is False  # refresh token dead -> account logged out
+        write_creds.assert_not_called()
+        seed.assert_not_called()
+
+    def test_no_backup_creds_returns_false(self, temp_home: Path):
+        s = self._switcher(temp_home)
+        # Register the account in sequence.json but write NO backup credentials.
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "uuid-1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        s._write_json(s.sequence_file, data)
+        profile_dir = s.managed_dir / "m1"
+
+        with patch.object(s, "seed_profile_credentials") as seed:
+            ok = s.refresh_account_and_reseed("1", profile_dir)
+
+        assert ok is False
+        seed.assert_not_called()
+
+
+class TestUsageBackoffThrottle:
+    """status() and get_active_usage_pct honor the shared 429 backoff marker rather
+    than re-hitting a rate-limited usage endpoint once the freshness cache lapses."""
+
+    def _setup(self, sample_sequence_data):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = "org-1"
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        path = sw.backup_dir / "cache" / "usage.json"
+        return sw, creds, path, time, write_cache
+
+    def test_status_honors_active_backoff_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys
+    ):
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+        write_cache(path, {"1": {"_unavailable": True, "retry_until": time.time() + 3600}})
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as m:
+            sw.status()
+        m.assert_not_called()  # backoff active -> no refetch
+        assert "rate-limited" in capsys.readouterr().out
+
+    def test_status_429_caches_backoff_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.cache import read_cache, usage_backoff_active
+
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+
+        def fake_fetch(*a, failure_out=None, **k):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=fake_fetch):
+            sw.status()
+        entry = read_cache(path, 10**9)["1"]
+        assert usage_backoff_active(entry) is True  # marker persisted, not a bare None
+
+    def test_get_active_usage_pct_honors_backoff(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+        write_cache(path, {"1": {"_unavailable": True, "retry_until": time.time() + 3600}})
+        with patch("claude_swap.switcher._USAGE_CACHE_TTL", 0), \
+             patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as m:
+            pct = sw.get_active_usage_pct()
+        m.assert_not_called()
+        assert pct is None  # unknown during backoff -> auto-switch won't act on a guess
+
+    def test_get_active_usage_pct_429_caches_marker(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.cache import read_cache, usage_backoff_active
+
+        sw, creds, path, time, write_cache = self._setup(sample_sequence_data)
+
+        def fake_fetch(*a, failure_out=None, **k):
+            if failure_out is not None:
+                failure_out["retry_after"] = 1800
+            return None
+
+        with patch.object(sw, "_get_current_account", return_value=("test@example.com", "org-1")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=fake_fetch):
+            pct = sw.get_active_usage_pct()
+        assert pct is None
+        entry = read_cache(path, 10**9)["1"]
+        assert usage_backoff_active(entry) is True
+
+
+class TestStaleUsageRender:
+    """A backed-off account with a recent last-known reading renders the cached
+    numbers (flagged) instead of a bare "usage unavailable"."""
+
+    def test_list_shows_last_known_instead_of_unavailable(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys
+    ):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        seq = sw._get_sequence_data()
+        stale_num = str(seq["sequence"][0])
+        # Seed a full cache (all sequence keys) so list_accounts takes the cache-hit
+        # path (no fetch, no creds needed): the first account is 429-backed-off with
+        # a recent last-known reading; the rest get a trivial usage entry.
+        cache = {
+            str(n): {"five_hour": {"pct": 5}}
+            for n in seq["sequence"]
+        }
+        cache[stale_num] = {
+            "_unavailable": True,
+            "retry_until": time.time() + 1800,
+            "_last_known": {"five_hour": {"pct": 62}, "seven_day": {"pct": 30}},
+            "_last_known_at": time.time(),
+        }
+        write_cache(sw.backup_dir / "cache" / "usage.json", cache)
+        with patch.object(sw, "_read_credentials", return_value=""), \
+             patch.object(sw, "_read_account_credentials", return_value=""):
+            sw.list_accounts()
+        out = capsys.readouterr().out
+        assert "last-known" in out and "cached" in out
+        assert "62%" in out
+        assert "usage unavailable" not in out

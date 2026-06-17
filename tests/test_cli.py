@@ -13,6 +13,7 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -460,3 +461,93 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
+
+
+class TestQuickStart:
+    """The configurable bare-`cswap` alias (quickStart): default OFF, alias-with-args."""
+
+    def _run_launch(self, argv: list[str]) -> dict:
+        """Invoke main() and capture the argv that reaches the launch handler."""
+        captured: dict = {}
+
+        def fake_launch(a):
+            captured["argv"] = list(a)
+
+        with patch("claude_swap.cli._launch_command", side_effect=fake_launch), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return captured
+
+    def test_disabled_by_default_bare_cswap_errors(self, temp_home, capsys):
+        # No quickStart config => bare `cswap` falls through to argparse's
+        # required-argument error, exactly as before the feature existed.
+        with patch.object(sys, "argv", ["claude-swap"]):
+            with pytest.raises(SystemExit) as e:
+                cli.main()
+        assert e.value.code == 2
+
+    def test_bare_runs_default_command_when_enabled(self, temp_home):
+        ClaudeAccountSwitcher().set_quick_start_config(enabled=True)
+        cap = self._run_launch([])
+        # `cswap launch -- <claude args>` => launch handler sees everything after
+        # the subcommand, i.e. starting at the `--` separator.
+        assert cap["argv"][0] == "--"
+        assert "--dangerously-skip-permissions" in cap["argv"]
+        assert cap["argv"][-2:] == ["--settings", '{"ultracode": true}']
+
+    def test_extra_args_are_appended(self, temp_home):
+        ClaudeAccountSwitcher().set_quick_start_config(enabled=True)
+        cap = self._run_launch(["--resume", "abc123"])
+        assert "--dangerously-skip-permissions" in cap["argv"]
+        assert cap["argv"][-2:] == ["--resume", "abc123"]
+
+    def test_reserved_flag_is_not_hijacked(self, temp_home):
+        ClaudeAccountSwitcher().set_quick_start_config(enabled=True)
+        with patch("claude_swap.cli._launch_command") as launch, \
+             patch("claude_swap.switcher.ClaudeAccountSwitcher.status") as status, \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap", "--status"]):
+            cli.main()
+        launch.assert_not_called()
+        status.assert_called_once()
+
+    def test_custom_command_can_target_another_subcommand(self, temp_home):
+        calls: list = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, share=True):
+                calls.append((identifier, claude_args, share))
+
+        sw = ClaudeAccountSwitcher()
+        sw.set_quick_start_config(enabled=True, command="cswap run 2")
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap"]):
+            cli.main()
+        assert calls == [("2", [], True)]
+
+    def test_double_dash_separator_is_stripped(self, temp_home):
+        # `cswap -- <args>` means "everything after -- is extra" — it must NOT
+        # leave a stray `--` on top of the default command's own separator (which
+        # would make claude treat --resume as a positional prompt).
+        ClaudeAccountSwitcher().set_quick_start_config(enabled=True)
+        cap = self._run_launch(["--", "--resume", "abc123"])
+        assert cap["argv"][-2:] == ["--resume", "abc123"]
+        # Only the configured command's own leading `--` survives (no stray one).
+        assert cap["argv"].count("--") == 1
+
+    def test_abbreviated_flag_is_rejected_not_silently_expanded(self, temp_home):
+        # allow_abbrev=False keeps argparse's matching in lockstep with the
+        # exact-match reserved set: an abbreviated flag is no longer silently
+        # expanded (and so can never mean one thing with quick-start off and
+        # another with it on). Quick-start is OFF here (the default).
+        with patch("claude_swap.cli._launch_command") as launch, \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap", "--lis"]):
+            with pytest.raises(SystemExit) as e:
+                cli.main()
+        assert e.value.code == 2
+        launch.assert_not_called()

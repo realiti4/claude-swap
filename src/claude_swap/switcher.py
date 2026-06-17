@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -24,7 +25,15 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth
-from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.cache import (
+    MISSING,
+    STALE_USAGE_MAX_AGE_S,
+    last_known_usage,
+    merge_last_known,
+    read_cache,
+    usage_backoff_active,
+    write_cache,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -47,9 +56,14 @@ from claude_swap.paths import (
     get_credentials_path,
     get_global_config_path,
     get_legacy_backup_root,
+    mark_cwd_trusted,
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
+from claude_swap.balancer import (
+    DEFAULT_HYSTERESIS_BAND,
+    DEFAULT_TARGET_SAFETY,
+)
 
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -70,7 +84,43 @@ CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # Usage cache
-_USAGE_CACHE_TTL = 15  # seconds
+_USAGE_CACHE_TTL = 60  # seconds — idle-account usage changes over hours, not
+# seconds, and the live statusline signal covers active accounts in real time. A
+# longer TTL keeps usage-API fetches (and 429-failure retries, which reuse this
+# same cache slot) gentle so the endpoint's own rate limit is never tripped.
+
+# Auto-switch (Beta): when the active account's 5h/7d usage reaches this
+# percentage, the TUI monitor rotates to the next managed account.
+DEFAULT_AUTO_SWITCH_THRESHOLD = 90
+
+# Default command for the Quick-start alias (bare ``cswap`` when enabled): launch
+# a load-balanced session with the QoL defaults baked in. Extra args the user
+# passes on the command line are appended to this verbatim.
+DEFAULT_QUICK_START_COMMAND = (
+    "cswap launch -- --dangerously-skip-permissions "
+    "--model claude-opus-4-8 "
+    "--settings '{\"ultracode\": true}'"
+)
+
+
+def _max_usage_pct(usage: dict | None) -> float | None:
+    """Return the highest 5h/7d utilization percentage in a usage dict.
+
+    Only the rate-limit windows (``five_hour``/``seven_day``) are considered —
+    the dollar-denominated ``spend`` entry is intentionally ignored, since it is
+    not the limit that blocks Claude Code sessions. Returns ``None`` when no
+    usable percentage is present.
+    """
+    if not isinstance(usage, dict):
+        return None
+    pcts: list[float] = []
+    for key in ("five_hour", "seven_day"):
+        entry = usage.get(key)
+        if isinstance(entry, dict):
+            pct = entry.get("pct")
+            if isinstance(pct, (int, float)):
+                pcts.append(float(pct))
+    return max(pcts) if pcts else None
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -97,6 +147,58 @@ def _format_usage_lines(usage: dict) -> list[str]:
         else:
             lines.append(f"7d: {d7['pct']:>3.0f}%")
     return lines
+
+
+def _usage_status_line(usage) -> str | None:
+    """Render the one-line text for a usage *failure* entry, or None for real usage.
+
+    A 429 backoff marker (``{"_unavailable": True, "retry_until": <epoch>}``) is a
+    dict but carries no usage windows, so it would otherwise fall through to
+    :func:`_format_usage_lines` and render a BLANK line. Returns the user-facing
+    "rate-limited … / unavailable" text for a marker or ``None`` usage; returns
+    ``None`` (the sentinel) for real usage so the caller formats it normally.
+    Shared by ``list_accounts`` and ``status`` so the two render paths can't drift.
+    """
+    if usage is None:
+        return "usage unavailable"
+    if isinstance(usage, dict) and usage.get("_unavailable"):
+        until = usage.get("retry_until")
+        if isinstance(until, (int, float)) and until > time.time():
+            mins = max(1, int((until - time.time()) / 60))
+            return f"usage rate-limited — retry in ~{mins}m"
+        return "usage unavailable"
+    return None
+
+
+def _stale_usage_render(usage, now: float | None = None) -> tuple[str, list[str]] | None:
+    """Render a backed-off account from its last-known-good reading, if recent.
+
+    When ``usage`` is an ``_unavailable`` marker carrying a still-recent
+    ``_last_known`` snapshot (see ``cache.merge_last_known``), surface the cached
+    numbers instead of a bare "usage unavailable" — the same optimistic reading the
+    balancer treats as headroom. Returns ``(note, lines)`` where ``note`` flags the
+    data as cached (and how long the endpoint is backed off), or ``None`` when there
+    is no fresh last-known reading (the caller then falls back to
+    :func:`_usage_status_line`).
+    """
+    if not (isinstance(usage, dict) and usage.get("_unavailable")):
+        return None
+    now = now if now is not None else time.time()
+    lk = last_known_usage(usage, STALE_USAGE_MAX_AGE_S, now)
+    if lk is None:
+        return None
+    lines = _format_usage_lines(lk)
+    if not lines:
+        # No renderable windows (e.g. only extra-usage data) -> don't print a
+        # contentless header; let the caller fall back to _usage_status_line.
+        return None
+    until = usage.get("retry_until")
+    if isinstance(until, (int, float)) and until > now:
+        mins = max(1, int((until - now) / 60))
+        note = f"last-known usage (cached — endpoint rate-limited, retry in ~{mins}m)"
+    else:
+        note = "last-known usage (cached — endpoint unavailable)"
+    return note, lines
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -142,6 +244,10 @@ class ClaudeAccountSwitcher:
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
+        # Per-session profiles for the load balancer (cswap launch). A SEPARATE
+        # root from the per-account `cswap run` profiles under sessions/, so the
+        # per-account guards keyed on session_dir_for never fire on these.
+        self.managed_dir = self.backup_dir / "managed"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
@@ -312,6 +418,36 @@ class ClaudeAccountSwitcher:
                     raise
             except Exception as e:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
+
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically with 0600 perms.
+
+        Same mkstemp + ``os.write`` + ``os.close`` + ``os.replace`` + chmod
+        pattern as :meth:`_write_credentials` (the file-backup branch): the
+        rename is atomic, so a concurrent reader (e.g. a live claude reading a
+        managed profile's ``.credentials.json``) sees the old or the new file
+        whole, never a truncated one. Cleans up the temp file on any failure.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.close(fd)
+            fd = -1
+            os.replace(tmp_path, str(path))
+            if sys.platform != "win32":
+                os.chmod(str(path), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup credentials live in files vs. the Keychain.
@@ -628,6 +764,39 @@ class ClaudeAccountSwitcher:
 
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
+
+    def active_account_num(self) -> str | None:
+        """Account number whose identity matches the current ``~/.claude`` login.
+
+        The "active default" account — the one Claude Code owns credentials for
+        right now (whatever vanilla ``claude`` or the last ``cswap <num>`` switch
+        points at). ``None`` when no managed account matches the current identity.
+
+        Used to keep the balancer's idle-usage path (``registry.build_world``) and
+        idle-window priming from ever refreshing/rotating this account's OAuth
+        token: doing so rotates the single-use refresh token out from under the
+        live login and forces a re-login. Mirrors the guard ``list_accounts``
+        already applies; centralized here so the two paths can't drift.
+
+        Reads the org-field-migrated sequence so a legacy account (added before
+        ``organizationUuid`` was stored) still matches the current login — without
+        the backfill the org comparison would fail and the active account would be
+        left unguarded (the credential-rotation bug would re-open for it).
+        """
+        ident = self._get_current_account()
+        if ident is None:
+            return None
+        email, org_uuid = ident
+        data = self._get_sequence_data_migrated() or {}
+        for num, account in data.get("accounts", {}).items():
+            if (account.get("email") == email and
+                    (account.get("organizationUuid", "") or "") == org_uuid):
+                return str(num)
+        return None
+
+    def has_live_session(self, account_num: str, email: str) -> bool:
+        """Whether a session-mode (``cswap run``) claude is live for this account."""
+        return bool(self._live_session_pids(str(account_num), email))
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
@@ -1199,17 +1368,10 @@ class ClaudeAccountSwitcher:
             return
 
         data = self._get_sequence_data_migrated()
-        current_identity = self._get_current_account()
 
-        # Find active account number by (email, organizationUuid) composite key
-        active_num = None
-        if current_identity is not None:
-            current_email, current_org_uuid = current_identity
-            for num, account in data.get("accounts", {}).items():
-                if (account.get("email") == current_email and
-                        account.get("organizationUuid", "") == current_org_uuid):
-                    active_num = num
-                    break
+        # The active default account (current ~/.claude identity). Shared with
+        # registry.build_world via active_account_num() so the two never drift.
+        active_num = self.active_account_num()
 
         accounts_info = []
         for num in data.get("sequence", []):
@@ -1245,20 +1407,43 @@ class ClaudeAccountSwitcher:
             # unavailable until the session exits.
             has_live_session = bool(self._live_session_pids(str(num), email))
 
-            return oauth.fetch_usage_for_account(
+            fail: dict = {}
+            result = oauth.fetch_usage_for_account(
                 str(num), email, creds,
                 is_active=is_active or has_live_session,
                 persist_credentials=persist,
+                failure_out=fail,
             )
+            # On a usage-endpoint 429, cache a backoff marker carrying the
+            # server's Retry-After so we stop re-hitting the rate-limited
+            # endpoint every invocation (the "usage unavailable" feedback loop).
+            # Carry the last healthy reading forward so the optimistic stale view
+            # survives (mirrors build_world's marker write).
+            if result is None and fail.get("retry_after"):
+                marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                return merge_last_known(marker, persisted.get(str(num)))
+            return result
 
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        # Persisted backoff markers survive the freshness TTL until their
+        # server-requested Retry-After elapses, so a rate-limited account is not
+        # refetched every `cswap --list` while the endpoint asked for silence.
+        persisted = read_cache(usage_cache_path, float("inf"))
+        persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+
+        def fetch_or_skip(account_info):
+            num = str(account_info[0])
+            if usage_backoff_active(persisted.get(num)):
+                return persisted.get(num)
+            return fetch(account_info)
+
         cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
         account_keys = {str(info[0]) for info in accounts_info}
         if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
             usages = [cached.get(str(info[0])) for info in accounts_info]
         else:
             with ThreadPoolExecutor() as executor:
-                usages = list(executor.map(fetch, accounts_info))
+                usages = list(executor.map(fetch_or_skip, accounts_info))
             write_cache(usage_cache_path, {
                 str(info[0]): usage
                 for info, usage in zip(accounts_info, usages)
@@ -1267,15 +1452,26 @@ class ClaudeAccountSwitcher:
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
             tag = self._get_display_tag(email, org_name, org_uuid)
+            try:
+                pri = int(data.get("accounts", {}).get(str(num), {}).get("priority", 0))
+            except (TypeError, ValueError):
+                pri = 0
+            pri_tag = f" {dimmed(f'· pri {pri}')}" if pri else ""
             if is_active:
                 marker = f" {bold_accent('(active)')}"
-                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}{pri_tag}")
             else:
-                print(f"  {num}: {email} {muted(f'[{tag}]')}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{pri_tag}")
             if isinstance(usage, str):
-                print(f"     {dimmed(usage)}")
-            elif usage is None:
-                print(f"     {dimmed('usage unavailable')}")
+                print(f"     {dimmed(usage)}")  # e.g. "no credentials"
+            elif (stale := _stale_usage_render(usage)) is not None:
+                note, lines = stale  # backed off, but a recent last-known reading
+                print(f"     {dimmed(note)}")
+                for j, line in enumerate(lines):
+                    connector = "└" if j == len(lines) - 1 else "├"
+                    print(f"     {dimmed(connector)} {muted(line)}")
+            elif (status_line := _usage_status_line(usage)) is not None:
+                print(f"     {dimmed(status_line)}")  # unavailable / rate-limited
             else:
                 lines = _format_usage_lines(usage)
                 for j, line in enumerate(lines):
@@ -1327,12 +1523,14 @@ class ClaudeAccountSwitcher:
         identity = self._get_current_account()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
+            self._print_balancer_status()
             return
         current_email, current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            self._print_balancer_status()
             return
 
         account_num = None
@@ -1359,25 +1557,548 @@ class ClaudeAccountSwitcher:
                 # cswap must not refresh them) and merge into existing entries so
                 # other accounts' rows survive.
                 usage_cache_path = self.backup_dir / "cache" / "usage.json"
+                # Persisted backoff markers survive the freshness TTL until their
+                # Retry-After elapses, so `cswap --status` doesn't re-hit a
+                # rate-limited endpoint once the 60s cache expires (the gap that
+                # re-armed the "usage unavailable" loop on this path).
+                persisted = read_cache(usage_cache_path, float("inf"))
+                persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
                 cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
                 if (cached is not MISSING and isinstance(cached, dict)
                         and account_num in cached):
                     usage = cached[account_num]
+                elif usage_backoff_active(persisted.get(account_num)):
+                    usage = persisted.get(account_num)  # honor the backoff, no refetch
                 else:
+                    fail: dict = {}
                     usage = oauth.fetch_usage_for_account(
                         account_num, current_email, creds,
-                        is_active=True,
+                        is_active=True, failure_out=fail,
                     )
-                    existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+                    if usage is None and fail.get("retry_after"):
+                        marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                        usage = merge_last_known(marker, persisted.get(account_num))
+                    existing = dict(persisted)
                     existing[account_num] = usage
                     write_cache(usage_cache_path, existing)
-                if isinstance(usage, dict):
+                stale = _stale_usage_render(usage)
+                if stale is not None:
+                    # Backed off, but a recent last-known reading exists -> show it.
+                    note, lines = stale
+                    print(f"  {dimmed(note)}")
+                    for j, line in enumerate(lines):
+                        connector = "└" if j == len(lines) - 1 else "├"
+                        print(f"  {dimmed(connector)} {muted(line)}")
+                elif (status_line := _usage_status_line(usage)) is not None:
+                    # None usage or a 429 backoff marker -> a clear line, never a
+                    # blank one (a marker would otherwise format to nothing).
+                    print(f"  {dimmed(status_line)}")
+                elif isinstance(usage, dict):
                     lines = _format_usage_lines(usage)
                     for j, line in enumerate(lines):
                         connector = "└" if j == len(lines) - 1 else "├"
                         print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+
+        self._print_balancer_status()
+
+    # ------------------------------------------------------------------ #
+    # Auto-switch (Beta)
+    # ------------------------------------------------------------------ #
+
+    def get_auto_switch_config(self) -> dict:
+        """Return the persisted auto-switch (Beta) settings.
+
+        Auto-switch is opt-in and stored in ``sequence.json`` under the
+        ``autoSwitch`` key. Defaults to disabled at
+        ``DEFAULT_AUTO_SWITCH_THRESHOLD``%.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("autoSwitch") or {}
+        try:
+            threshold = int(cfg.get("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD))
+        except (TypeError, ValueError):
+            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "threshold": threshold,
+        }
+
+    def set_auto_switch_config(
+        self, *, enabled: bool | None = None, threshold: int | None = None
+    ) -> dict:
+        """Persist auto-switch (Beta) settings, returning the merged config.
+
+        Only the provided fields are updated; the rest keep their stored (or
+        default) values.
+
+        Raises:
+            ValidationError: if ``threshold`` is outside the 1-100 range.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("autoSwitch") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if threshold is not None:
+            t = int(threshold)
+            if not 1 <= t <= 100:
+                raise ValidationError("Threshold must be between 1 and 100")
+            cfg["threshold"] = t
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        data["autoSwitch"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return {"enabled": cfg["enabled"], "threshold": cfg["threshold"]}
+
+    def get_active_usage_pct(self) -> float | None:
+        """Return the highest 5h/7d utilization pct for the active account.
+
+        Used by the auto-switch monitor. Returns ``None`` when there is no
+        active login, no usable credentials, or the usage API is unreachable.
+
+        Reuses the same short-lived usage cache as ``list_accounts()`` /
+        ``status()`` so repeated polling stays cheap and consistent. The active
+        account is never refreshed (``is_active=True``) — Claude Code owns those
+        credentials.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        current_email, current_org_uuid = identity
+
+        creds = self._read_credentials() or ""
+        if not creds or not oauth.extract_access_token(creds):
+            return None
+
+        # Resolve the active account number for cache keying (best-effort).
+        account_num = None
+        data = self._get_sequence_data() or {}
+        for num, account in data.get("accounts", {}).items():
+            if (account.get("email") == current_email and
+                    account.get("organizationUuid", "") == current_org_uuid):
+                account_num = num
+                break
+
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        # Persisted backoff markers (inf TTL) gate the refetch so a 429-backed-off
+        # active account isn't re-polled every call once the freshness cache lapses.
+        persisted = read_cache(usage_cache_path, float("inf"))
+        persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+        usage = None
+        backed_off = False
+        if account_num is not None:
+            cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+            if (cached is not MISSING and isinstance(cached, dict)
+                    and account_num in cached):
+                usage = cached[account_num]
+            elif usage_backoff_active(persisted.get(account_num)):
+                usage = persisted.get(account_num)  # honor the backoff, no refetch
+                backed_off = True
+
+        if usage is None and not backed_off:
+            fail: dict = {}
+            usage = oauth.fetch_usage_for_account(
+                account_num or "active", current_email, creds,
+                is_active=True, failure_out=fail,
+            )
+            if usage is None and fail.get("retry_after") and account_num is not None:
+                # Cache the backoff so the next poll honors it instead of re-hitting
+                # the rate-limited endpoint (the throttle gap on this path).
+                marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                usage = merge_last_known(marker, persisted.get(account_num))
+            if account_num is not None and isinstance(usage, dict):
+                existing = dict(persisted)
+                existing[account_num] = usage
+                write_cache(usage_cache_path, existing)
+
+        # A backoff/failure marker has no windows -> _max_usage_pct returns None
+        # (unknown), so the auto-switch monitor won't act on a stale guess — the
+        # session keeps running until a real limit, matching run-until-limit intent.
+        return _max_usage_pct(usage)
+
+    # ------------------------------------------------------------------ #
+    # Auto-swap + multi-session load balancer (beta) — config, priority, seeding
+    # ------------------------------------------------------------------ #
+
+    def get_auto_balance_config(self) -> dict:
+        """Return the persisted load-balancer (Beta) settings.
+
+        Stored in ``sequence.json`` under ``autoBalance`` (alongside the legacy
+        ``autoSwitch``). All fields default to sane values; ``targetSafety`` is
+        the projected-usage ceiling a migration target must stay under, kept
+        below ``threshold`` so a move never immediately re-exhausts the target.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("autoBalance") or {}
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(cfg.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        threshold = _int("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        if not 1 <= threshold <= 100:
+            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
+        target_safety = _int("targetSafety", DEFAULT_TARGET_SAFETY)
+        if not 1 <= target_safety <= 100:
+            target_safety = DEFAULT_TARGET_SAFETY
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "threshold": threshold,
+            "targetSafety": min(target_safety, threshold - 1),
+            "hysteresisBand": max(0, _int("hysteresisBand", DEFAULT_HYSTERESIS_BAND)),
+            # Idle-5h-window priming (feature #3). Default OFF and independent of
+            # ``enabled``: priming spends real credits on an as-yet-unverified
+            # premise (the 5h window being fixed-from-first-use, not rolling), so
+            # it stays gated behind its own explicit opt-in until confirmed.
+            "primeIdleWindows": bool(cfg.get("primeIdleWindows", False)),
+            # Default True: never spend tokens billed at API rates. A session
+            # whose subscription accounts are all exhausted pauses until a window
+            # resets rather than spilling into pay-as-you-go extra-usage / an API
+            # account. Set False to let those become a last-resort tier so work
+            # continues instead of stopping.
+            "onlySubscriptionTokens": bool(cfg.get("onlySubscriptionTokens", True)),
+            "model": str(cfg.get("model") or "opus"),
+            "effortLevel": str(cfg.get("effortLevel") or "xhigh"),
+        }
+
+    def set_auto_balance_config(
+        self,
+        *,
+        enabled: bool | None = None,
+        threshold: int | None = None,
+        target_safety: int | None = None,
+        hysteresis_band: int | None = None,
+        prime_idle_windows: bool | None = None,
+        only_subscription_tokens: bool | None = None,
+        model: str | None = None,
+        effort_level: str | None = None,
+    ) -> dict:
+        """Persist load-balancer (Beta) settings, returning the merged config.
+
+        Only provided fields change. ``targetSafety`` is clamped below
+        ``threshold`` so the stored config is always self-consistent.
+
+        Raises:
+            ValidationError: if ``threshold``/``target_safety`` is outside 1-100.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("autoBalance") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if threshold is not None:
+            t = int(threshold)
+            if not 1 <= t <= 100:
+                raise ValidationError("Threshold must be between 1 and 100")
+            cfg["threshold"] = t
+        if target_safety is not None:
+            ts = int(target_safety)
+            if not 1 <= ts <= 100:
+                raise ValidationError("Target safety must be between 1 and 100")
+            cfg["targetSafety"] = ts
+        if hysteresis_band is not None:
+            cfg["hysteresisBand"] = max(0, int(hysteresis_band))
+        if prime_idle_windows is not None:
+            cfg["primeIdleWindows"] = bool(prime_idle_windows)
+        if only_subscription_tokens is not None:
+            cfg["onlySubscriptionTokens"] = bool(only_subscription_tokens)
+        if model is not None:
+            cfg["model"] = str(model)
+        if effort_level is not None:
+            cfg["effortLevel"] = str(effort_level)
+
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
+        cfg.setdefault("targetSafety", DEFAULT_TARGET_SAFETY)
+        cfg.setdefault("hysteresisBand", DEFAULT_HYSTERESIS_BAND)
+        cfg.setdefault("primeIdleWindows", False)
+        cfg.setdefault("onlySubscriptionTokens", True)
+        cfg.setdefault("model", "opus")
+        cfg.setdefault("effortLevel", "xhigh")
+        # Keep targetSafety strictly below threshold (self-heals an odd combo).
+        cfg["targetSafety"] = min(int(cfg["targetSafety"]), int(cfg["threshold"]) - 1)
+        if cfg["targetSafety"] < 1:
+            cfg["targetSafety"] = 1
+
+        data["autoBalance"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return cfg
+
+    def get_quick_start_config(self) -> dict:
+        """Return the persisted Quick-start settings (the bare-``cswap`` default).
+
+        Stored in ``sequence.json`` under ``quickStart``. Default OFF; when on,
+        running ``cswap`` with no recognized subcommand/flag runs ``command``
+        (with any extra args appended), acting like a configurable alias. A blank
+        or missing command falls back to :data:`DEFAULT_QUICK_START_COMMAND`.
+        """
+        data = self._get_sequence_data() or {}
+        cfg = data.get("quickStart") or {}
+        command = cfg.get("command")
+        if not isinstance(command, str) or not command.strip():
+            command = DEFAULT_QUICK_START_COMMAND
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "command": command,
+        }
+
+    def set_quick_start_config(
+        self, *, enabled: bool | None = None, command: str | None = None
+    ) -> dict:
+        """Persist Quick-start settings, returning the merged config.
+
+        Only provided fields change. To reset the command, pass
+        :data:`DEFAULT_QUICK_START_COMMAND` explicitly (as the TUI's "Reset"
+        action does); a *provided* blank/whitespace command is rejected rather
+        than silently reset. A missing/blank *persisted* value still falls back
+        to the default on read.
+
+        Raises:
+            ValidationError: if ``command`` is provided but empty/whitespace.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data() or {}
+        cfg = dict(data.get("quickStart") or {})
+        if enabled is not None:
+            cfg["enabled"] = bool(enabled)
+        if command is not None:
+            stripped = command.strip()
+            if not stripped:
+                raise ValidationError("Quick-start command cannot be empty")
+            cfg["command"] = stripped
+        cfg.setdefault("enabled", False)
+        if not isinstance(cfg.get("command"), str) or not cfg["command"].strip():
+            cfg["command"] = DEFAULT_QUICK_START_COMMAND
+        data["quickStart"] = cfg
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return cfg
+
+    def get_account_priority(self, account_num: str) -> int:
+        """Return an account's balancing priority (higher = burned first; default 0)."""
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(str(account_num), {})
+        try:
+            return int(info.get("priority", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_account_priority(self, account_num: str, priority: int) -> None:
+        """Set an account's balancing priority (higher = burned through first).
+
+        Raises:
+            AccountNotFoundError: the account number is not managed.
+        """
+        data = self._get_sequence_data()
+        if not data or str(account_num) not in data.get("accounts", {}):
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        data["accounts"][str(account_num)]["priority"] = int(priority)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Set priority of account {account_num} to {priority}")
+
+    def seed_profile_credentials(
+        self,
+        profile_dir: Path,
+        account_num: str,
+        email: str,
+        *,
+        cwd: str | Path | None = None,
+    ) -> None:
+        """Point a managed session profile at an account's stored credentials.
+
+        Used to migrate a live managed session to a different account WITHOUT a
+        relaunch: claude re-reads the profile's credentials on its keychain-cache
+        / 401 cycle (the same contract the global switch relies on).
+
+        Seeds the stored credentials VERBATIM. Deliberately does NOT refresh the
+        token or write back to the account backup via ``_write_account_credentials``
+        — that path fires the live-session stale-marking side-effect against the
+        per-account dir and multiplies refresh-token drift. claude refreshes the
+        access token in-process.
+
+        ``cwd`` (the session's launch directory) is pre-trusted so the spawned
+        claude skips the folder trust dialog — see ``paths.mark_cwd_trusted``.
+        """
+        profile_dir = Path(profile_dir)
+        creds = self._read_account_credentials(str(account_num), email)
+        if not creds:
+            raise SwitchError(
+                f"Account-{account_num} has no stored credentials. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+        config_text = self._read_account_config(str(account_num), email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = config_data.get("oauthAccount")
+        if not oauth_account:
+            raise SwitchError(
+                f"Account-{account_num} has no stored config backup. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+
+        from claude_swap.session import delete_macos_keychain_entry
+
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(profile_dir, 0o700)
+        # A stale hashed keychain entry would shadow the fresh plaintext seed.
+        delete_macos_keychain_entry(profile_dir)
+
+        # Write ATOMICALLY (mkstemp + os.replace) so a live claude reading the
+        # profile during a migrate-without-relaunch never observes a truncated
+        # file — it sees either the old credentials or the new ones, whole.
+        creds_path = profile_dir / ".credentials.json"
+        self._atomic_write_text(creds_path, creds)
+
+        # Merge identity into any existing profile config so projects/history
+        # survive a re-point (mirrors session._bootstrap's merge).
+        config_path = profile_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", config_data.get("theme") or "dark")
+        mark_cwd_trusted(existing, cwd)
+        # ``_write_json`` commits via an atomic rename (+ chmod 0600), so claude's
+        # live read of ``.claude.json`` likewise never races a truncate+write.
+        self._write_json(config_path, existing)
+        self._logger.info(
+            f"Seeded managed profile {profile_dir.name} -> account {account_num} ({email})"
+        )
+
+    def refresh_account_and_reseed(self, account_num, profile_dir) -> bool:
+        """Refresh an account's OAuth token and re-seed a managed profile with it.
+
+        The 401 auto-recovery for a managed (``cswap launch``) session: when a
+        turn fails with a 401 the seeded creds are invalid/expired, so refresh the
+        account's BACKUP credentials and re-point the managed profile at the fresh
+        token, in place (claude re-reads them on its keychain-cache / 401 cycle).
+
+        Returns ``True`` when the profile now holds usable, fresh credentials and
+        ``False`` when the account can't be recovered (no backup creds, or its
+        refresh token is dead — i.e. the account is logged out and the caller
+        should migrate to a healthy account instead). Never raises.
+
+        Concurrency: the whole read-refresh-write-reseed runs under
+        ``FileLock(self.lock_file)`` so two managed sessions on the same account
+        serialize. The expiry re-check makes the second one a cheap reseed (the
+        first sibling already refreshed the shared backup). No network I/O races
+        the registry because this method touches credentials only — callers
+        (the supervisor's ``_recover_auth``) build the world OUTSIDE the lock.
+        """
+        account_num = str(account_num)
+        try:
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                self._logger.warning(
+                    "refresh_account_and_reseed: account %s not found", account_num
+                )
+                return False
+            email = record.get("email", "")
+
+            with FileLock(self.lock_file):
+                creds = self._read_account_credentials(account_num, email)
+                if not creds:
+                    self._logger.warning(
+                        "refresh_account_and_reseed: account %s has no backup creds",
+                        account_num,
+                    )
+                    return False
+
+                # A concurrent sibling on the same account may have already
+                # refreshed the shared backup. If the stored access token is
+                # still fresh, skip the network refresh and just re-seed.
+                oauth_data = oauth.extract_oauth_data(creds)
+                expires_at = oauth_data.get("expiresAt") if oauth_data else None
+                if not oauth.is_oauth_token_expired(expires_at):
+                    self.seed_profile_credentials(profile_dir, account_num, email)
+                    return True
+
+                refreshed = oauth.refresh_oauth_credentials(creds)
+                if not refreshed:
+                    # Refresh token is dead -> the account is logged out.
+                    self._logger.warning(
+                        "refresh_account_and_reseed: refresh failed for account %s "
+                        "(logged out?)",
+                        account_num,
+                    )
+                    return False
+
+                # Persist the fresh creds to the canonical backup, then re-seed the
+                # managed profile with them. ``_write_account_credentials`` is the
+                # existing canonical writer (its live-session stale-marking side
+                # effect is acceptable here).
+                self._write_account_credentials(account_num, email, refreshed)
+                self.seed_profile_credentials(profile_dir, account_num, email)
+                self._logger.info(
+                    "Re-authenticated account %s (%s) and re-seeded managed profile",
+                    account_num,
+                    email,
+                )
+                return True
+        except Exception:
+            self._logger.warning(
+                "refresh_account_and_reseed failed for account %s", account_num,
+                exc_info=True,
+            )
+            return False
+
+    def _print_balancer_status(self) -> None:
+        """Print the load-balancer (Beta) + embed-health section for ``status()``."""
+        from claude_swap import embed, registry
+
+        bcfg = self.get_auto_balance_config()
+        reg = registry.read_registry(self)
+        # Reap ghost rows (crashed supervisors) on this read path.
+        if registry.reap_dead(reg):
+            try:
+                with FileLock(self.lock_file):
+                    fresh = registry.read_registry(self)
+                    registry.reap_dead(fresh)
+                    registry.write_registry(self, fresh)
+                reg = fresh
+            except Exception:
+                self._logger.debug("registry reap on status failed", exc_info=True)
+        sessions = registry.live_sessions(reg)
+        paused = sum(1 for s in sessions if s.get("paused_until"))
+
+        print()
+        state = bold_accent("ON") if bcfg["enabled"] else dimmed("OFF")
+        summary = (
+            f"threshold {bcfg['threshold']}% · {len(sessions)} managed session(s)"
+        )
+        if paused:
+            summary += f" · {paused} paused"
+        print(
+            f"{bolded('Auto-swap + multi-session load balancer (beta):')} "
+            f"{state} {dimmed('· ' + summary)}"
+        )
+
+        health = embed.embed_health(self)
+        if health["ok"]:
+            print(f"  {dimmed('└')} {muted('Embedded in Claude Code — new managed sessions auto-balance')}")
+        else:
+            print(f"  {dimmed('├')} {accent('Not embedded in Claude Code')}")
+            for issue in health["issues"]:
+                print(f"  {dimmed('│')}   {muted(issue)}")
+            print(f"  {dimmed('└')} {muted('Run `cswap --install` to embed cswap into Claude Code')}")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""

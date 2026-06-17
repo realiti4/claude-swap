@@ -58,6 +58,49 @@ def get_credentials_path() -> Path:
     return get_claude_config_home() / ".credentials.json"
 
 
+def mark_cwd_trusted(config: dict, cwd: str | os.PathLike | None) -> bool:
+    """Record ``cwd`` as a trusted project in a profile's ``.claude.json`` dict.
+
+    Claude Code shows the interactive "Is this a project you created or one you
+    trust?" dialog on startup whenever the working directory has no
+    ``projects[<abs cwd>].hasTrustDialogAccepted == true`` entry. There is no
+    global "trust everything" key, and ``--dangerously-skip-permissions`` is a
+    SEPARATE boundary (tool permissions) that does NOT suppress it. A managed /
+    balanced launch is already user-authorized — and already auto-prepends
+    ``--dangerously-skip-permissions`` — so pre-seeding trust for the launch
+    directory keeps the spawned session from stopping on that gate. Each managed
+    profile is single-use, so without this the dialog fires on every launch.
+
+    Seeds BOTH the abspath and the symlink-resolved realpath: claude keys the
+    projects map by the child's ``process.cwd()`` (kernel-canonical, symlinks
+    resolved), while a caller-supplied ``--cwd`` may still carry symlink
+    components. Mutates ``config`` in place; existing per-project metadata is
+    preserved.
+
+    Returns True when a trust entry was written, False when ``cwd`` is falsy.
+    """
+    if not cwd:
+        return False
+    projects = config.get("projects")
+    if not isinstance(projects, dict):
+        # A missing or malformed map shadowing the expected shape — (re)create
+        # it rather than crash; the profile is cswap-managed and disposable.
+        projects = {}
+        config["projects"] = projects
+    raw = os.fspath(cwd)
+    variants: list[str] = []
+    for variant in (os.path.abspath(raw), os.path.realpath(raw)):
+        if variant not in variants:
+            variants.append(variant)
+    for variant in variants:
+        entry = projects.get(variant)
+        if not isinstance(entry, dict):
+            entry = {}
+            projects[variant] = entry
+        entry["hasTrustDialogAccepted"] = True
+    return True
+
+
 def get_legacy_backup_root() -> Path:
     """Return the legacy (pre-XDG) backup root: ``~/.claude-swap-backup``."""
     return Path.home() / LEGACY_BACKUP_DIRNAME

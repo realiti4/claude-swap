@@ -22,6 +22,7 @@ from claude_swap.paths import (
     get_credentials_path,
     get_global_config_path,
     get_legacy_backup_root,
+    mark_cwd_trusted,
     migrate_legacy_backup_dir,
 )
 
@@ -314,3 +315,48 @@ class TestMigrateLegacyBackupDir:
         moved = target / "credentials" / ".creds-1-user@example.com.enc"
         assert moved.stat().st_mode & 0o777 == 0o600
         assert (target / "credentials").stat().st_mode & 0o777 == 0o700
+
+
+class TestMarkCwdTrusted:
+    def test_falsy_cwd_is_noop(self):
+        config: dict = {}
+        assert mark_cwd_trusted(config, None) is False
+        assert mark_cwd_trusted(config, "") is False
+        assert config == {}
+
+    def test_marks_abspath_trusted(self, tmp_path: Path):
+        config: dict = {}
+        assert mark_cwd_trusted(config, str(tmp_path)) is True
+        key = os.path.realpath(tmp_path)
+        assert config["projects"][key]["hasTrustDialogAccepted"] is True
+
+    def test_normalizes_relative_and_dotdot(self):
+        config: dict = {}
+        mark_cwd_trusted(config, "/tmp/foo/../bar")
+        assert os.path.abspath("/tmp/foo/../bar") in config["projects"]
+
+    def test_seeds_realpath_variant_for_symlinked_cwd(self, tmp_path: Path):
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        config: dict = {}
+        mark_cwd_trusted(config, str(link))
+        # claude keys the map by the child's resolved process.cwd(), so the
+        # realpath MUST be present even though we were handed the symlink.
+        assert config["projects"][str(real)]["hasTrustDialogAccepted"] is True
+
+    def test_preserves_existing_entry_metadata(self):
+        key = os.path.abspath("/x/y")
+        config = {"projects": {key: {"allowedTools": ["Bash"], "history": [1]}}}
+        mark_cwd_trusted(config, "/x/y")
+        entry = config["projects"][key]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["allowedTools"] == ["Bash"]
+        assert entry["history"] == [1]
+
+    def test_replaces_malformed_projects_map(self):
+        config = {"projects": "corrupt"}
+        mark_cwd_trusted(config, "/a/b")
+        assert isinstance(config["projects"], dict)
+        assert config["projects"][os.path.abspath("/a/b")]["hasTrustDialogAccepted"]

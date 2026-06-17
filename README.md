@@ -82,6 +82,258 @@ cswap run 2 --no-share          # don't share your ~/.claude customizations
 
 Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
 
+### Auto-swap + multi-session load balancer (beta)
+
+Run several Claude Code sessions across all your accounts and let cswap keep them
+fed. When a session's account nears its usage limit, cswap migrates that session
+to a higher-priority account that still has headroom — concentrating load on your
+top accounts and only spilling to the next tier when one fills up. Among accounts
+of the same priority, load spreads to the least-used one, so equal-priority
+accounts stay evenly used. Migrations are minimized (each one re-bills the context
+window), so a session only moves when its account is actually exhausted, never for
+a marginal gain.
+
+There's **no fixed cooldown timer** holding back a needed switch — a session
+stranded on a freshly-exhausted account moves immediately. Thrashing is instead
+prevented *algorithmically*: cswap acts only on the moment an account crosses the
+threshold (a rising edge, not every message), only picks a target that will stay
+under its safety ceiling after the move (so it can't immediately re-exhaust), and
+won't treat an exhausted account as a valid target again until it recovers past a
+hysteresis band. A concurrent online reservation keeps two sessions from landing
+on the same account at once.
+
+Only one subscription? There's nowhere to migrate, so cswap **pauses** the session
+instead and **auto-resumes** it (via `claude --resume`) the moment the limit
+window resets — your in-flight, dynamic workflow survives the limit instead of
+being thrown away.
+
+By default the balancer is **subscription-only**: it never spends tokens billed at
+pay-as-you-go API rates. When *every* subscription account is exhausted it pauses
+(as above) rather than spilling into extra-usage / an API account. If you'd rather
+keep working than wait for a reset, turn **Only use subscription tokens** off in
+`cswap --balance`: cswap then treats extra-usage–enabled and API/console accounts as
+a **last-resort tier** — consulted only after all subscription headroom is gone, and
+ordered by most monthly extra-usage budget remaining. A session already on an
+extra-usage account stays put (it spills into pay-as-you-go) instead of pausing. It's
+**off by default** so you never get a surprise API bill.
+
+It's fully **event-driven**: the in-session statusline reports usage on each
+message, which is what triggers a rebalance. There's no polling loop and no
+background daemon. It's also credential-safe — each session's supervisor owns its
+own profile and only ever re-points its own credentials.
+
+#### Setup
+
+```bash
+cswap --install                 # embed cswap into Claude Code (one-time, idempotent)
+cswap --status                  # shows load-balancer state + embed health
+```
+
+`--install` installs the statusline and QoL layer via a non-shared
+`settings.json` inside each managed profile, so plain `claude` and
+`cswap run` stay completely vanilla. It also runs automatically on upgrade.
+
+#### Launch a managed session
+
+```bash
+cswap launch                    # start a load-balanced session in this terminal
+cswap launch -- --resume        # everything after '--' is forwarded to claude
+cswap launch --no-share         # bare profile (don't share ~/.claude items)
+```
+
+`cswap launch` picks the best account (highest priority with headroom), then
+supervises claude until it exits — migrating or pausing/auto-resuming as limits
+are reached. Managed sessions get QoL defaults: the latest model,
+`--dangerously-skip-permissions`, and high effort (any flag you pass yourself
+wins); these launch-flag defaults don't apply to plain `claude` or `cswap run`.
+Both `cswap launch` and `cswap run` pre-trust their launch directory in the
+session's isolated profile, so the spawned session skips Claude Code's "do you
+trust this folder?" prompt — managed sessions use a fresh profile per launch, so
+it would otherwise appear every time. Plain `claude` is unaffected.
+
+#### Priorities
+
+Higher priority = burned through first.
+
+```bash
+cswap --set-priority 2:5        # set Account-2's priority to 5
+```
+
+Priorities are also editable in the `cswap --balance` TUI.
+
+#### Dashboard
+
+```bash
+cswap --balance                 # settings + live dashboard (enable/disable, tune, priorities)
+```
+
+The dashboard shows which sessions are on which accounts, live, and is where you
+**enable** the balancer (it's opt-in/off by default), set the threshold and target
+safety, edit priorities, and toggle **Only use subscription tokens** (default on —
+pause rather than bill at API rates).
+
+The live view lists **every** managed account — not just the ones currently in
+use — with, per account:
+
+- how many sessions are running on it,
+- its **5h** and **weekly (7d)** usage percentages and how long until each window
+  resets, and
+- when **Keep 5h sessions warm** is enabled, whether the account's 5h window is
+  `warm` (clock running) or `cold` (unstarted — a priming candidate).
+
+Idle-account usage is fetched in the background (and cached) so the numbers stay
+current without slowing the view. An account that's logged out or unreadable shows
+`usage unavailable`.
+
+#### Statusline
+
+Each managed session renders a compact one-liner, updated on every message:
+
+```
+⇄ a2 ▕███▁▁▏88% · s2/5          # on Account-2, 88% used, session 2 of 5
+→a5 ▕███▁▁▏88% · s2/5           # migration to Account-5 pending
+⏸ a2 1h12m · s2/5               # paused, auto-resuming in 1h12m
+```
+
+It falls back to ASCII (`>a2 [###-----] 88% s2/5`) on terminals that can't render
+the box-drawing glyphs.
+
+> **Beta:** this is new. Migrations re-bill the context window, and the in-session
+> "ultracode" effort can't be persisted — the managed `xhigh` effort level is the
+> closest you can set outside a session. Please report rough edges via
+> [Issues](https://github.com/realiti4/claude-swap/issues).
+
+#### Rate-limit safety net
+
+The balancer migrates **proactively**, the moment the statusline reports an
+account crossing the threshold. If a turn still hits a hard **rate limit**
+(HTTP 429 — the "Retrying… attempt N/10" storm), a `StopFailure` safety net kicks
+in: when the turn fails after Claude exhausts its retries and the session's
+account is genuinely rate-limited, cswap auto-switches the session to a fresh
+account so the **next** turn recovers — no manual switching. The failed turn
+itself is lost (no hook can rescue an in-flight turn — a Claude Code limitation),
+so this is a backstop, not a substitute for the proactive migration.
+
+A **401 auth failure** (a "Please run /login · API Error: 401" turn) auto-recovers
+the same way: cswap refreshes the account's token and re-seeds the session, and if
+the account is logged out it migrates the session to a healthy account (re-login on
+one account if they're all dead) — so the **next** turn re-authenticates.
+
+Want more margin? Lower the threshold in `cswap --balance` so the balancer
+migrates earlier and rarely reaches a hard limit.
+
+An **overload** (HTTP 529 "Overloaded") is different: it's server/model-side, so
+every account hits the same overloaded model — switching accounts wouldn't help.
+Managed sessions instead auto-fall-back to a secondary model via Claude's native
+`--fallback-model` (default `sonnet`). Override it per launch:
+
+```bash
+cswap launch -- --fallback-model haiku   # your flag wins; cswap won't double-add
+```
+
+**Transient/network errors** (a dropped socket, connection reset, timeout, a brief
+`502`/`503`/overload — e.g. "API Error: 401 The socket connection was closed
+unexpectedly") are handled separately from account problems. Managed sessions raise
+`CLAUDE_CODE_MAX_RETRIES` (default `20`, respecting your own override) so these get
+more in-turn retry-with-backoff and usually self-heal before the turn ever fails.
+The safety net deliberately **leaves them alone** — account migration is only for
+real rate limits, and credential refresh only for genuinely expired creds — so a
+connection glitch is never mistaken for bad credentials or an exhausted account.
+The one limitation: a turn that still fails after all retries can't be auto-re-run
+(a Claude Code limitation), so that single message is re-sent manually.
+
+#### Keep 5h sessions warm (Beta, experimental — default OFF, opt-in)
+
+> **Unverified premise — opt-in only.** This feature assumes a Claude
+> subscription's 5-hour limit window is *fixed-from-first-use* (it starts counting
+> on the first credit-consuming request of a cycle and resets a fixed 5 hours
+> later), rather than a rolling trailing-5h window. That assumption has **not yet
+> been confirmed against a live account**. If the window turns out to be rolling,
+> priming is useless and should be removed. Because priming spends real credits,
+> it ships **disabled by default** behind a dedicated opt-in — independent of the
+> balancer's own enable — and must be turned on explicitly:
+> `Set up cswap` → `Auto-swap + multi-session load balancer (beta)` → `Keep 5h sessions warm`.
+
+If the fixed-from-first-use premise holds, an account you haven't used yet this
+window has an *unstarted* clock that won't reset for a full 5 hours after you
+first touch it. To keep fresh 5h capacity cycling online, when priming is enabled
+cswap sends one minimal, cheapest-model request (Haiku, a 1-token prompt,
+`max_tokens: 1`) to each idle managed account to start its clock, so windows stay
+staggered instead of all starting at once.
+
+It is conservative and credit-frugal:
+
+- Only accounts whose 5h window is genuinely **unstarted** (read via the usage
+  API, which itself doesn't bill) are primed — never an account already running
+  a window, already weekly-capped, in active use, or whose usage is unknown.
+- Only recognized Claude **subscription** accounts (Pro / Max / Team / Enterprise)
+  are ever primed. A pay-as-you-go **API / console** account is skipped entirely —
+  it has no 5h subscription window to warm, and priming it would spend real API
+  credits.
+- Each account is primed **at most once per window**; a per-account guard plus a
+  shared once-per-interval sweep stamp mean that even with several managed
+  sessions running, exactly one of them primes each account per interval (no
+  duplicate billable calls).
+- Priming rides the **resident session supervisor** — there is still no daemon and
+  no polling loop, and it never blocks the statusline render. The tiny prime
+  requests run in the background of an already-running managed session.
+
+Priming stages fresh **5-hour** capacity; it does not create weekly (7-day)
+capacity, so an account whose 7d cap is the binding limit is left alone.
+
+#### cmux integration (Beta, macOS)
+
+If you use [cmux](https://cmux.com), wire the balancer into it:
+
+```bash
+cswap cmux setup                # add a "Balanced Claude (cswap)" command to cmux
+cswap cmux 2                    # fan out 2 managed sessions, one per workspace
+cswap cmux 2 -- --resume        # forward args after '--' to each session's claude
+```
+
+`setup` backs up `~/.config/cmux/cmux.json` to a timestamped `.bak`, merges the
+surface idempotently (your other config is preserved), then validates and
+reloads. Afterwards you can spawn a load-balanced session from cmux's command
+palette / plus-button.
+
+`cswap cmux N` opens N cmux workspaces, each running `cswap launch`. The
+balancer's online reservation spreads them, so each pane **lands on a different
+account** — and each renders the same compact statusline as above. cswap pins
+every pane to its own profile, surviving cmux's `claude` wrapper.
+
+cswap works alongside cmux's **Claude Code Integration** toggle in either
+setting. With it **on**, cmux injects its session-tracking/notification hooks
+via the `--settings` flag, which Claude Code merges *additively* with each
+managed profile's `settings.json`; cswap's `statusLine` and `StopFailure`
+hook (the balancer's triggers) live in that profile and use events cmux
+doesn't touch, so both run side by side and your `CLAUDE_CONFIG_DIR` pin is
+preserved. With it **off**, cmux passes `claude` through untouched and cswap's
+profile settings drive everything. Nothing to configure either way.
+
+### Quick start (configurable default command)
+
+Tired of typing the same launch command? Turn on **Quick start** and a bare
+`cswap` becomes a configurable alias — it runs whatever command you set, with any
+extra args you pass appended to it:
+
+```bash
+cswap                       # runs your Quick-start command
+cswap -- --resume <id>      # ...with extra args appended (forwarded to claude)
+```
+
+Enable and edit it in `Set up cswap` → `Quick start`. It's **default OFF**, and
+the default command launches a load-balanced session with the QoL defaults baked
+in:
+
+```
+cswap launch -- --dangerously-skip-permissions --model claude-opus-4-8 --settings '{"ultracode": true}'
+```
+
+Quick start only fires when the first argument **isn't** a recognized cswap
+subcommand or flag — so `cswap --status`, `cswap run 2`, `cswap launch …`, and
+every other command keep working exactly as before. Only a bare/unrecognized
+invocation is treated as Quick-start input.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -96,10 +348,16 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap launch                    # Start a load-balanced managed session (Beta)
+cswap cmux setup                # Add a balanced-Claude command to cmux (Beta, macOS)
+cswap cmux 2                    # Fan out 2 managed sessions across accounts in cmux
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
-cswap --status                  # Show current account
+cswap --status                  # Show current account + load-balancer/embed health
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
 cswap --remove-account 2        # Remove an account
+cswap --install                 # Embed cswap into Claude Code for load balancing (Beta)
+cswap --balance                 # Load-balancer dashboard + settings (Beta)
+cswap --set-priority 2:5        # Set an account's balancing priority (Beta)
 cswap --tui                     # Launch the interactive arrow-key menu
 cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
