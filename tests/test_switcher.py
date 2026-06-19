@@ -2479,7 +2479,9 @@ class TestSwitchSkipsBrokenSlots:
 
 class TestUsageAwareSwitch:
     """--switch --strategy best / next-available pick targets by remaining 5h/7d
-    quota, and always fall back to plain rotation rather than blocking."""
+    quota. `best` only switches when another account is provably better and
+    otherwise stays put; `next-available` rotates, skipping accounts at their
+    limit (and anchors on the live account)."""
 
     def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
         s = ClaudeAccountSwitcher()
@@ -2584,19 +2586,89 @@ class TestUsageAwareSwitch:
         assert "staying on Account-1" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
 
-    def test_best_usage_unavailable_rotates_normally(self, temp_home: Path, capsys):
+    def test_best_current_usage_unavailable_stays(self, temp_home: Path, capsys):
+        """Current account's usage is unknown → can't prove any target is better,
+        so stay even if a candidate has known headroom (never auto-rotate)."""
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
         self._make_live(temp_home, "a@example.com", 1)
 
-        # No usage data for any account → unknown → fall back to rotation.
-        with patch.object(s, "_usage_by_account", return_value={"1": None, "2": None}), \
-             patch.object(s, "list_accounts"):
+        # Current (1) usage unknown; candidate 2 looks good (90% headroom).
+        usage = {"1": None, "2": self._usage(10)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
-        assert "Usage data unavailable" in capsys.readouterr().out
-        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert "Current account usage is unavailable" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
+        mock_list.assert_not_called()
+
+    def test_best_no_candidate_usage_stays(self, temp_home: Path, capsys):
+        """Current known but no other account has usage data → no comparison is
+        possible → stay (not rotation, not 'all exhausted')."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(50), "2": None}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="best")
+
+        out = capsys.readouterr().out
+        assert "No other account has usage data to compare" in out
+        assert "All accounts are at their 5h/7d limit" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_best_incomplete_comparison_stays(self, temp_home: Path, capsys):
+        """Current known + a known *worse* candidate + an unknown candidate →
+        stay, without claiming 'most remaining quota' or 'all exhausted' (the
+        unknown one can't be ruled better)."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # Current (1) 50% headroom; 2 worse (10%); 3 unknown.
+        usage = {"1": self._usage(50), "2": self._usage(90), "3": None}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="best")
+
+        out = capsys.readouterr().out
+        assert "some usage is unavailable" in out
+        assert "most remaining quota" not in out
+        assert "All accounts are at their 5h/7d limit" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_best_current_exhausted_with_unknown_candidate_stays(
+        self, temp_home: Path, capsys
+    ):
+        """Current known & exhausted + a known (also-exhausted) candidate + an
+        unknown candidate → stay, but must NOT claim 'all exhausted' since the
+        unknown account might have room."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # Current (1) exhausted; 2 also exhausted (known, not better); 3 unknown.
+        usage = {"1": self._usage(100), "2": self._usage(100), "3": None}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="best")
+
+        out = capsys.readouterr().out
+        assert "some usage is unavailable" in out
+        assert "All accounts are at their 5h/7d limit" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
 
     def test_skip_exhausted_skips_limited_account(self, temp_home: Path, capsys):
         s = self._setup(temp_home)
@@ -2644,3 +2716,29 @@ class TestUsageAwareSwitch:
             s.switch(strategy="next-available")
 
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_next_available_anchors_on_live_account_under_drift(
+        self, temp_home: Path
+    ):
+        """Item 3: when the live login has drifted from activeAccountNumber,
+        next-available rotates relative to the LIVE account (current_num), not
+        the stale record — so it never no-ops onto the account you're already
+        on."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        # Recorded active is 1, but the user is actually live on account 2.
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        # All healthy, so nothing is skipped for being at its limit.
+        usage = {"1": self._usage(0), "2": self._usage(0), "3": self._usage(0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        # Anchored on the live account (2) → next is 3, not 2 (a no-op).
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
