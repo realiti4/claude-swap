@@ -390,7 +390,12 @@ def run(switcher) -> int:
         def _make_interval(self, secs):
             def cb(_sender):
                 self.settings.refresh_interval = secs
+                # rumps 0.4.0's Timer.interval setter is a no-op while running
+                # unless a full interval has elapsed; stop/start forces the new
+                # cadence to take effect immediately.
+                self.refresh_timer.stop()
                 self.refresh_timer.interval = secs
+                self.refresh_timer.start()
                 self._save_and_rebuild()
             return cb
 
