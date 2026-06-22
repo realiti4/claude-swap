@@ -16,7 +16,6 @@ import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
 
 ICON = "⇄"
@@ -338,7 +337,7 @@ def run(switcher) -> int:
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
-                    if self._guard(lambda: self.switcher.remove_account(str(num))):
+                    if self._guard(lambda: self.switcher.remove_account(str(num), force=True)):
                         self.refresh_async()
             return cb
 

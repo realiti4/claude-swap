@@ -2821,3 +2821,91 @@ class TestUsageAwareSwitch:
 
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+
+class TestRemoveAccountForce:
+    """Tests for remove_account force flag (Finding 1: GUI stdin fix)."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({"claudeAiOauth": {"accessToken": f"sk-{num}"}}),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {"emailAddress": email}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None,
+            "lastUpdated": "",
+            "sequence": [],
+            "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def test_force_true_removes_without_calling_input(self, temp_home: Path):
+        """force=True must skip input() entirely and delete the account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        import builtins
+
+        def _no_input(prompt=""):
+            raise AssertionError("input() must not be called when force=True")
+
+        with patch.object(builtins, "input", _no_input), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2", force=True)
+
+        data = s._get_sequence_data()
+        assert "2" not in data["accounts"]
+        assert 2 not in data["sequence"]
+
+    def test_default_prompt_cancel_does_not_remove(self, temp_home: Path):
+        """Default (force=False): answering 'n' cancels removal."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        with patch("builtins.input", return_value="n"), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2")
+
+        data = s._get_sequence_data()
+        assert "2" in data["accounts"]
+
+    def test_default_prompt_confirm_removes(self, temp_home: Path):
+        """Default (force=False): answering 'y' completes removal."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        with patch("builtins.input", return_value="y"), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2")
+
+        data = s._get_sequence_data()
+        assert "2" not in data["accounts"]
+        assert 2 not in data["sequence"]
