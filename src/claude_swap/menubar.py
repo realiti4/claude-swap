@@ -62,6 +62,41 @@ class MenuBarSettings:
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
 
+@dataclass
+class MenuBarState:
+    """Cooldown/notification timestamps for the auto-switcher, persisted as JSON.
+
+    Separate from MenuBarSettings: settings are user choices, state is runtime
+    bookkeeping. Persisting across restarts means a relaunch respects the
+    cooldown instead of swapping immediately.
+    """
+
+    last_switch_at: float = 0.0
+    last_noswap_notify_at: float = 0.0
+
+    @classmethod
+    def load(cls, path: Path) -> "MenuBarState":
+        """Load state; defaults on missing/corrupt. Int timestamps coerce to float."""
+        defaults = cls()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return defaults
+        if not isinstance(raw, dict):
+            return defaults
+        kwargs = {}
+        for f in fields(cls):
+            val = raw.get(f.name)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                kwargs[f.name] = float(val)
+        return cls(**kwargs)
+
+    def save(self, path: Path) -> None:
+        """Write state as pretty JSON, creating parent directories."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
 def tightest_pct(usage: dict | str | None) -> float | None:
     """Highest 5h/7d utilization percentage, or None if unknown.
 

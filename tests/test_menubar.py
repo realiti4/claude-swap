@@ -171,3 +171,31 @@ def test_settings_auto_switch_round_trip(tmp_path: Path):
     )
     orig.save(path)
     assert menubar.MenuBarSettings.load(path) == orig
+
+
+def test_state_defaults(tmp_path: Path):
+    st = menubar.MenuBarState.load(tmp_path / "missing.json")
+    assert st.last_switch_at == 0.0
+    assert st.last_noswap_notify_at == 0.0
+
+
+def test_state_round_trip(tmp_path: Path):
+    path = tmp_path / "state.json"
+    st = menubar.MenuBarState(last_switch_at=1750000000.5, last_noswap_notify_at=1750000123.0)
+    st.save(path)
+    assert menubar.MenuBarState.load(path) == st
+
+
+def test_state_corrupt_falls_back(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text("not json {", encoding="utf-8")
+    assert menubar.MenuBarState.load(path) == menubar.MenuBarState()
+
+
+def test_state_accepts_int_timestamps(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"last_switch_at": 1750000000, "last_noswap_notify_at": 0}),
+                    encoding="utf-8")
+    st = menubar.MenuBarState.load(path)
+    assert st.last_switch_at == 1750000000.0
+    assert isinstance(st.last_switch_at, float)
