@@ -13,6 +13,7 @@ import json
 import plistlib
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -20,6 +21,9 @@ from claude_swap.exceptions import ClaudeSwitchError
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
+AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
+AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
+AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
 
 
 @dataclass
@@ -306,6 +310,7 @@ def run(switcher) -> int:
     import rumps  # lazy: optional dependency, imported only when launching
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
+    state_path = switcher.backup_dir / "menubar_state.json"
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -314,6 +319,10 @@ def run(switcher) -> int:
             self.settings = MenuBarSettings.load(settings_path)
             self.snapshot = {"accounts": [], "active_email": None, "active_usage": None}
             self._dirty = False
+            self.state = MenuBarState.load(state_path)
+            self._snapshot_at = 0.0
+            self._last_auto_eval = 0.0
+            self._refreshing = False
             self.rebuild_menu()
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.
@@ -325,12 +334,19 @@ def run(switcher) -> int:
 
         # ---- refresh plumbing -------------------------------------------------
         def refresh_async(self):
+            if self._refreshing:
+                return  # in-flight guard: one worker at a time
+            self._refreshing = True
             threading.Thread(target=self._worker, daemon=True).start()
 
         def _worker(self):
-            snap = _snapshot(self.switcher)
-            self.snapshot = snap
-            self._dirty = True  # picked up by on_sync_tick on the main thread
+            try:
+                snap = _snapshot(self.switcher)
+                self.snapshot = snap
+                self._snapshot_at = time.time()
+                self._dirty = True  # picked up by on_sync_tick on the main thread
+            finally:
+                self._refreshing = False
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
@@ -339,6 +355,55 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
+            if self.settings.auto_switch_enabled:
+                self._auto_tick()
+
+        def _auto_tick(self):
+            now = time.time()
+            cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
+            if now - self._last_auto_eval < cadence:
+                return
+            # Mode B: if the snapshot is staler than the cadence, fetch fresh and
+            # evaluate on a later tick so we never act on stale usage.
+            if now - self._snapshot_at > cadence and not self._refreshing:
+                self.refresh_async()
+                return
+            self._last_auto_eval = now
+            self._maybe_auto_switch(now)
+
+        def _maybe_auto_switch(self, now):
+            decision = decide_auto_switch(
+                self.snapshot["accounts"], self.settings.auto_switch_threshold
+            )
+            action, num = plan_auto_switch(decision, self.state, self.settings, now)
+            if action == "switch":
+                try:
+                    self.switcher.switch_to(str(num))
+                except ClaudeSwitchError as e:
+                    self.switcher._logger.warning("auto-switch failed: %s", e)
+                    rumps.notification("claude-swap", "Auto-switch failed", str(e))
+                    return
+                self.state.last_switch_at = now
+                self.state.save(state_path)
+                self._notify_autoswitch(num)
+                self.refresh_async()
+            elif action == "notify_noswap":
+                self.state.last_noswap_notify_at = now
+                self.state.save(state_path)
+                rumps.notification(
+                    "claude-swap", "Claude limit — no fresh account",
+                    f"Active account is at its limit (≥{self.settings.auto_switch_threshold}%) "
+                    "but no other account has headroom.",
+                )
+
+        def _notify_autoswitch(self, num):
+            email = next(
+                (e for n, e, _a, _u in self.snapshot["accounts"] if n == num), str(num)
+            )
+            rumps.notification(
+                "claude-swap", "Auto-switched account",
+                f"Switched to {email} — restart Claude Code to apply (active within ~30s).",
+            )
 
         # ---- menu construction ------------------------------------------------
         def rebuild_menu(self):
@@ -407,6 +472,35 @@ def run(switcher) -> int:
             login_item = rumps.MenuItem("Launch at login", callback=self.on_toggle_login)
             login_item.state = 1 if self.settings.launch_at_login else 0
             menu.add(login_item)
+
+            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
+            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
+            menu.add(auto_item)
+
+            threshold_menu = rumps.MenuItem("Auto-switch threshold")
+            for pct in AUTO_THRESHOLD_CHOICES:
+                ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
+                ch.state = 1 if self.settings.auto_switch_threshold == pct else 0
+                threshold_menu.add(ch)
+            menu.add(threshold_menu)
+
+            cooldown_menu = rumps.MenuItem("Auto-switch cooldown")
+            cd_labels = {300: "5 minutes", 600: "10 minutes", 1800: "30 minutes"}
+            for secs in AUTO_COOLDOWN_CHOICES:
+                ch = rumps.MenuItem(cd_labels[secs], callback=self._make_cooldown(secs))
+                ch.state = 1 if self.settings.auto_switch_cooldown == secs else 0
+                cooldown_menu.add(ch)
+            menu.add(cooldown_menu)
+
+            check_menu = rumps.MenuItem("Auto-switch check")
+            ck_labels = {0: "With display refresh", 60: "Every 1 minute",
+                         180: "Every 3 minutes", 300: "Every 5 minutes"}
+            for secs in AUTO_CHECK_CHOICES:
+                ch = rumps.MenuItem(ck_labels[secs], callback=self._make_check(secs))
+                ch.state = 1 if self.settings.auto_switch_interval == secs else 0
+                check_menu.add(ch)
+            menu.add(check_menu)
+
             return menu
 
         # ---- callbacks --------------------------------------------------------
@@ -435,6 +529,8 @@ def run(switcher) -> int:
         def _make_switch_to(self, num):
             def cb(_sender):
                 if self._guard(lambda: self.switcher.switch_to(str(num))):
+                    self.state.last_switch_at = time.time()
+                    self.state.save(state_path)
                     self._notify_switched()
                     self.refresh_async()
             return cb
@@ -442,6 +538,8 @@ def run(switcher) -> int:
         def _switch(self, strategy):
             def cb(_sender):
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                    self.state.last_switch_at = time.time()
+                    self.state.save(state_path)
                     self._notify_switched()
                     self.refresh_async()
             return cb
@@ -524,6 +622,30 @@ def run(switcher) -> int:
                 return
             self.settings.launch_at_login = enabled
             self._save_and_rebuild()
+
+        def on_toggle_autoswitch(self, _sender):
+            self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
+            self._last_auto_eval = 0.0  # let it evaluate on the next tick when enabling
+            self._save_and_rebuild()
+
+        def _make_threshold(self, pct):
+            def cb(_sender):
+                self.settings.auto_switch_threshold = pct
+                self._save_and_rebuild()
+            return cb
+
+        def _make_cooldown(self, secs):
+            def cb(_sender):
+                self.settings.auto_switch_cooldown = secs
+                self._save_and_rebuild()
+            return cb
+
+        def _make_check(self, secs):
+            def cb(_sender):
+                self.settings.auto_switch_interval = secs
+                self._last_auto_eval = 0.0
+                self._save_and_rebuild()
+            return cb
 
     MenuBarApp().run()
     return 0
