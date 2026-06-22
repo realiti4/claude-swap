@@ -452,6 +452,176 @@ class TestStatusCache:
         assert cached["2"] == {"five_hour": {"pct": 80}}
 
 
+class TestEnsureFreshInactiveCredentials:
+    """The locked, double-checked refresh chokepoint that stops the single-use
+    refresh-token reuse race (concurrent processes revoking the token family ->
+    idle accounts silently logging out)."""
+
+    @staticmethod
+    def _creds(access="acc", refresh="rt", expires_at=1000):
+        payload = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh}}
+        if expires_at is not None:
+            payload["claudeAiOauth"]["expiresAt"] = expires_at
+        return json.dumps(payload)
+
+    def _switcher(self):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        return sw
+
+    def test_fresh_token_returns_unchanged_without_refresh(self, temp_home: Path):
+        sw = self._switcher()
+        future = int((__import__("time").time() + 3600) * 1000)
+        creds = self._creds(expires_at=future)
+        with patch("claude_swap.oauth.refresh_oauth_credentials") as rmock:
+            out = sw.ensure_fresh_inactive_credentials("2", "a@b.com", creds)
+        assert out == creds
+        rmock.assert_not_called()
+
+    def test_no_refresh_token_returns_unchanged(self, temp_home: Path):
+        # A --add-token account (no refresh token) must never hit the network.
+        sw = self._switcher()
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "acc", "expiresAt": 1000}})
+        with patch("claude_swap.oauth.refresh_oauth_credentials") as rmock:
+            out = sw.ensure_fresh_inactive_credentials("2", "a@b.com", creds)
+        assert out == creds
+        rmock.assert_not_called()
+
+    def test_expired_token_refreshes_and_persists_to_backup(self, temp_home: Path):
+        sw = self._switcher()
+        expired = self._creds(access="old", expires_at=1000)
+        refreshed = self._creds(access="new", refresh="rt-new", expires_at=None)
+        with patch.object(sw, "_read_account_credentials", return_value=expired), \
+             patch.object(sw, "_write_account_credentials") as wb, \
+             patch("claude_swap.oauth.refresh_oauth_credentials", return_value=refreshed):
+            out = sw.ensure_fresh_inactive_credentials("2", "a@b.com", expired)
+        assert out == refreshed
+        wb.assert_called_once_with("2", "a@b.com", refreshed)
+
+    def test_double_check_reuses_winner_token_without_posting(self, temp_home: Path):
+        # A concurrent winner already refreshed + persisted: the loser must reuse the
+        # fresh on-disk token and NOT POST the (now consumed) refresh token again.
+        sw = self._switcher()
+        caller_expired = self._creds(access="old", expires_at=1000)
+        future = int((__import__("time").time() + 3600) * 1000)
+        disk_fresh = self._creds(access="winner", refresh="rt-new", expires_at=future)
+        with patch.object(sw, "_read_account_credentials", return_value=disk_fresh), \
+             patch.object(sw, "_write_account_credentials") as wb, \
+             patch("claude_swap.oauth.refresh_oauth_credentials") as rmock:
+            out = sw.ensure_fresh_inactive_credentials("2", "a@b.com", caller_expired)
+        assert out == disk_fresh
+        rmock.assert_not_called()
+        wb.assert_not_called()
+
+    def test_invalid_grant_flags_logged_out(self, temp_home: Path):
+        sw = self._switcher()
+        expired = self._creds(access="old", expires_at=1000)
+
+        def fake_refresh(base, failure_out=None):
+            if failure_out is not None:
+                failure_out["invalid_grant"] = True
+            return None
+
+        fail: dict = {}
+        with patch.object(sw, "_read_account_credentials", return_value=expired), \
+             patch.object(sw, "_write_account_credentials") as wb, \
+             patch("claude_swap.oauth.refresh_oauth_credentials", side_effect=fake_refresh):
+            out = sw.ensure_fresh_inactive_credentials("2", "a@b.com", expired, failure_out=fail)
+        assert fail.get("logged_out") is True
+        assert out == expired  # unchanged base, never live creds
+        wb.assert_not_called()
+
+
+class TestRefreshAccountAndReseedSerialization:
+    """The managed-session 401 recovery must serialize its single-use-token POST on
+    the per-account refresh lock (before the global lock) so it can't race an idle
+    build_world refresh of the same account's token."""
+
+    def test_acquires_per_account_refresh_lock_before_global(self, temp_home: Path):
+        from claude_swap.locking import FileLock as RealLock
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._init_sequence_file()
+        data = sw._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "b@x.com", "uuid": "", "organizationUuid": "",
+            "organizationName": "", "priority": 0, "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        sw._write_json(sw.sequence_file, data)
+
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt", "expiresAt": 1000}})
+        refreshed = json.dumps({"claudeAiOauth": {
+            "accessToken": "new", "refreshToken": "rt2"}})
+
+        seen: list[str] = []
+
+        class SpyLock:
+            def __init__(self, path, timeout=10.0):
+                seen.append(path.name)
+                self._inner = RealLock(path, timeout)
+
+            def __enter__(self):
+                return self._inner.__enter__()
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        with patch("claude_swap.switcher.FileLock", SpyLock), \
+             patch.object(sw, "_read_account_credentials", return_value=expired), \
+             patch.object(sw, "_write_account_credentials"), \
+             patch.object(sw, "seed_profile_credentials"), \
+             patch("claude_swap.oauth.refresh_oauth_credentials", return_value=refreshed):
+            ok = sw.refresh_account_and_reseed("2", temp_home / "profile")
+
+        assert ok is True
+        assert ".refresh-2.lock" in seen
+        assert ".lock" in seen
+        assert seen.index(".refresh-2.lock") < seen.index(".lock")
+
+
+class TestClearLoggedOutMarkerOnRelogin:
+    """Writing fresh backup credentials drops a stale logged-out usage marker so a
+    re-login shows real usage immediately, not 'logged out' for LOGGED_OUT_RECHECK_S."""
+
+    def test_cred_write_clears_logged_out_marker(self, temp_home: Path):
+        from claude_swap.cache import logged_out_marker, read_cache, write_cache
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        path = sw.backup_dir / "cache" / "usage.json"
+        write_cache(path, {"2": logged_out_marker(), "3": {"five_hour": {"pct": 5}}})
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        with patch.object(sw, "_live_session_pids", return_value=[]), \
+             patch.object(sw, "_invalidate_session_credentials"):
+            sw._write_account_credentials("2", "b@x.com", creds)
+
+        cached = read_cache(path, 10**9)
+        assert "2" not in cached  # logged-out marker dropped
+        assert cached["3"] == {"five_hour": {"pct": 5}}  # other accounts untouched
+
+    def test_cred_write_preserves_real_usage_marker(self, temp_home: Path):
+        # A routine refresh-token rotation also lands in _write_account_credentials;
+        # it must NOT wipe good cached usage (only logged-out markers are cleared).
+        from claude_swap.cache import read_cache, write_cache
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        path = sw.backup_dir / "cache" / "usage.json"
+        real = {"five_hour": {"pct": 42}}
+        write_cache(path, {"2": real})
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "rotated"}})
+        with patch.object(sw, "_live_session_pids", return_value=[]), \
+             patch.object(sw, "_invalidate_session_credentials"):
+            sw._write_account_credentials("2", "b@x.com", creds)
+
+        assert read_cache(path, 10**9)["2"] == real
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -544,12 +714,19 @@ class TestListAccountsUsage:
         to rewrite live credentials for the active account. Per
         OAUTH_REFRESH_REDESIGN.md, cswap must never write to live creds — that
         would race with Claude Code's own refresh (which coordinates via a
-        ~/.claude/ lockfile cswap doesn't honor).
+        ~/.claude/ lockfile cswap doesn't honor). The inactive-account refresh now
+        runs through ``ensure_fresh_inactive_credentials`` (the locked, double-checked
+        chokepoint), which persists via ``_write_account_credentials`` (backup only).
         """
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        # Backup token is EXPIRED so the chokepoint actually refreshes it.
         backup_creds = json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-orig"},
+            "claudeAiOauth": {
+                "accessToken": "sk-backup",
+                "refreshToken": "rt-orig",
+                "expiresAt": 1000,
+            },
         })
         refreshed_creds = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"},
@@ -559,18 +736,12 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, persist_credentials,
-                       failure_out=None):
-            # Simulate a refresh on the inactive account only.
-            if not is_active:
-                persist_credentials(account_num, email, refreshed_creds)
-            return None
-
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
-             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch):
+             patch("claude_swap.oauth.refresh_oauth_credentials", return_value=refreshed_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             switcher.list_accounts()
 
         # Live creds must never be written from list_accounts()
@@ -666,6 +837,225 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         # Should show live data (10%), not cached data (25%)
         assert "10%" in output
+
+
+class TestLiveSignalDisplay:
+    """The display/poll paths reuse the registry's free, never-rate-limited live
+    ``rate_limits`` signal for any account hosting a live managed session.
+
+    Root cause of the recurring "usage rate-limited — retry in ~Nm": ``list_accounts``
+    / ``status`` / ``get_active_usage_pct`` hit the (per-client-rate-limited) usage
+    API even for an account the registry already has a fresh live reading for — so
+    the active account showed "rate-limited" while a perfectly good reading sat in
+    the registry, and the redundant calls fed the 429 loop. These tests pin the fix:
+    live reading wins, NO usage-API call, and live-derived values are never persisted
+    to the shared cache (they lack the API's spend/extra-usage)."""
+
+    def _seed_live_session(self, sw, account_num, h5=88.0, d7=40.0):
+        import os
+        import time
+
+        from claude_swap import registry
+
+        reg = registry.read_registry(sw)
+        registry.upsert_session(
+            reg,
+            f"m{account_num}",
+            account_num=str(account_num),
+            supervisor_pid=os.getpid(),
+            rate_limits={
+                "five_hour": {"used_percentage": h5, "resets_at": int(time.time()) + 3600},
+                "seven_day": {"used_percentage": d7, "resets_at": int(time.time()) + 100000},
+            },
+            last_seen=time.time(),
+        )
+        registry.write_registry(sw, reg)
+
+    def test_list_prefers_live_signal_no_fetch_for_live_account(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"  # active
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+
+        # Live managed session on the INACTIVE account 2, reporting fresh usage.
+        self._seed_live_session(sw, "2", h5=88.0, d7=40.0)
+        # The usage endpoint is 429-backed-off for account 2: WITHOUT the live path
+        # this renders "usage rate-limited" for it.
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"2": {"_unavailable": True, "retry_until": time.time() + 3000}},
+        )
+
+        def fake_fetch(num, *a, **k):
+            # account 1 (active, no live session) still fetches normally.
+            return {"five_hour": {"pct": 12.0}, "seven_day": {"pct": 20.0}}
+
+        with patch.object(sw, "_read_credentials", return_value=active_creds), \
+             patch.object(sw, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=fake_fetch) as mock_fetch:
+            sw.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "88%" in out  # live reading shown for the live account
+        assert "rate-limited" not in out  # never the backoff line for a live account
+        called_nums = [c.args[0] for c in mock_fetch.call_args_list]
+        assert "2" not in called_nums  # the live account never hit the usage API
+
+    def test_list_does_not_persist_live_derived_usage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        import time
+
+        from claude_swap.cache import read_cache, write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        self._seed_live_session(sw, "2", h5=88.0)
+        path = sw.backup_dir / "cache" / "usage.json"
+        write_cache(path, {"2": {"_unavailable": True, "retry_until": time.time() + 3000}})
+
+        with patch.object(sw, "_read_credentials", return_value=active_creds), \
+             patch.object(sw, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account",
+                   return_value={"five_hour": {"pct": 12.0}}):
+            sw.list_accounts()
+
+        # The cache must keep account 2's marker — NOT the live-derived reading (it
+        # lacks spend/extra-usage and would mislead build_world / other readers).
+        entry = read_cache(path, 10**9)["2"]
+        assert entry.get("_unavailable") is True
+        assert "five_hour" not in entry  # the live 88% was not written through
+
+    def test_list_merges_spend_from_cache_onto_live_reading(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        self._seed_live_session(sw, "2", h5=88.0)
+        # Fresh, complete cache (both keys) -> cache-fast-path, no fetch. Account 2's
+        # cached entry is a REAL reading carrying spend; the live overlay must keep
+        # the live 5h/7d but merge the pay-as-you-go line the live signal lacks.
+        write_cache(sw.backup_dir / "cache" / "usage.json", {
+            "1": {"five_hour": {"pct": 5}},
+            "2": {
+                "five_hour": {"pct": 3},
+                "extra_usage_enabled": True,
+                "spend": {"used": 1.0, "limit": 10.0, "pct": 10.0, "currency": "USD"},
+            },
+        })
+
+        with patch.object(sw, "_read_credentials", return_value=active_creds), \
+             patch.object(sw, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+            sw.list_accounts()
+
+        out = capsys.readouterr().out
+        mock_fetch.assert_not_called()  # fresh complete cache -> no API hit
+        assert "88%" in out  # live 5h (not the cached 3%)
+        assert "$1.00" in out  # spend merged from the cached real reading
+
+    def test_status_prefers_live_signal_over_backoff(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = ""
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        self._seed_live_session(sw, "1", h5=88.0, d7=40.0)
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"1": {"_unavailable": True, "retry_until": time.time() + 3000}},
+        )
+
+        with patch.object(sw, "_get_current_account", return_value=("test@example.com", "")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+            sw.status()
+
+        out = capsys.readouterr().out
+        mock_fetch.assert_not_called()  # live signal -> no usage-API call
+        assert "88%" in out
+        assert "rate-limited" not in out
+
+    def test_get_active_usage_pct_prefers_live_signal(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        import time
+
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = ""
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        self._seed_live_session(sw, "1", h5=88.0, d7=40.0)
+        # Backed off: WITHOUT the live path get_active_usage_pct returns None (the
+        # auto-switch monitor then can't act). With it, the live max (88) is returned.
+        write_cache(
+            sw.backup_dir / "cache" / "usage.json",
+            {"1": {"_unavailable": True, "retry_until": time.time() + 3000}},
+        )
+
+        with patch.object(sw, "_get_current_account", return_value=("test@example.com", "")), \
+             patch.object(sw, "_read_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+            pct = sw.get_active_usage_pct()
+
+        mock_fetch.assert_not_called()
+        assert pct == 88.0
+
+    def test_no_live_session_falls_back_to_usage_api(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """No live managed session -> the live map is empty and the usage API is
+        used exactly as before (regression guard that idle accounts still fetch)."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)  # no registry sessions
+
+        with patch.object(sw, "_read_credentials", return_value=active_creds), \
+             patch.object(sw, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account",
+                   return_value={"five_hour": {"pct": 33.0}}) as mock_fetch:
+            sw.list_accounts()
+
+        assert mock_fetch.called  # idle accounts still fetch via the usage API
+        assert "33%" in capsys.readouterr().out
 
 
 class TestPerformSwitchPostDisplay:
@@ -2797,6 +3187,49 @@ class TestUsageBackoffThrottle:
         assert pct is None
         entry = read_cache(path, 10**9)["1"]
         assert usage_backoff_active(entry) is True
+
+
+class TestLoggedOutRender:
+    """A logged-out account (dead refresh token) shows an actionable re-login hint,
+    never the ambiguous 'usage unavailable' nor optimistic stale numbers."""
+
+    def test_list_shows_logged_out_hint(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys
+    ):
+        from claude_swap.cache import logged_out_marker, write_cache
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        seq = sw._get_sequence_data()
+        out_num = str(seq["sequence"][0])
+        # Full cache (all sequence keys) -> cache-hit path, no fetch/creds needed.
+        cache = {str(n): {"five_hour": {"pct": 5}} for n in seq["sequence"]}
+        cache[out_num] = logged_out_marker()
+        write_cache(sw.backup_dir / "cache" / "usage.json", cache)
+        with patch.object(sw, "_read_credentials", return_value=""), \
+             patch.object(sw, "_read_account_credentials", return_value=""):
+            sw.list_accounts()
+        out = capsys.readouterr().out
+        assert "logged out" in out
+        assert "re-login" in out
+        # Never the generic line for a logged-out account.
+        assert "usage unavailable" not in out
+
+    def test_logged_out_marker_does_not_render_stale_numbers(self):
+        # Even if a logged-out marker somehow carried a last-known reading, it must
+        # never be shown as optimistic usage (the account can't authenticate).
+        from claude_swap.switcher import _stale_usage_render, _usage_status_line
+
+        marker = {
+            "_unavailable": True,
+            "_logged_out": True,
+            "retry_until": __import__("time").time() + 300,
+            "_last_known": {"five_hour": {"pct": 62}},
+            "_last_known_at": __import__("time").time(),
+        }
+        assert _stale_usage_render(marker) is None
+        assert "re-login" in _usage_status_line(marker)
 
 
 class TestStaleUsageRender:

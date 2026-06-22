@@ -652,3 +652,14 @@ class TestProbeConfirmedAccount:
         # trigger a redundant prime double-bill.
         probe = AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe", h5_pct=None, h5_reset=None)
         assert accounts_needing_prime({"2": probe}, CFG) == []
+
+    def test_probe_with_real_low_reading_fits_large_session(self):
+        # When build_world backs a probe view with a real near-idle reading (e.g. 27%
+        # — registry._probe_view uses min(80, real)), a large-context session that
+        # would NOT fit the flat-80 probe DOES fit, so it migrates instead of pausing
+        # for hours (the "auto-resuming in 2h55m while an account was available" bug).
+        cost = balancer._pct_cost(150_000)  # >100k ctx -> 6.0
+        real = AV("2", max_pct=27.0, signal="probe")
+        assert balancer._fits(real, {"2": 0.0}, cost, CFG) is True   # 27+6 <= 85
+        flat = AV("2", max_pct=PROBE_CONFIRMED_PCT, signal="probe")
+        assert balancer._fits(flat, {"2": 0.0}, cost, CFG) is False  # 80+6 > 85

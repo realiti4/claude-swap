@@ -22,6 +22,7 @@ owning supervisor consumes its own intent and re-points its own profile via
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -33,7 +34,7 @@ from pathlib import Path
 from claude_swap import balancer, embed, oauth, registry
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
-from claude_swap.printer import accent, dimmed, muted, warning
+from claude_swap.printer import accent, bold_accent, dimmed, muted, warning
 from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, SessionManager
 
 # How long to wait for a SIGTERM'd child to exit before force-killing it.
@@ -696,23 +697,14 @@ class Supervisor:
         if not token:
             return False
 
-        # Refresh an expired token for this INACTIVE account, persisting under the
-        # lock via the same callback shape the usage path uses. A live session on
-        # this account => treat as active (don't rotate its refresh token).
-        data = oauth.extract_oauth_data(creds) or {}
-        if (
-            not self.switcher._live_session_pids(num, email)
-            and data.get("refreshToken")
-            and oauth.is_oauth_token_expired(data.get("expiresAt"))
-        ):
-            refreshed = oauth.refresh_oauth_credentials(creds)
-            if refreshed:
-                token = oauth.extract_access_token(refreshed) or token
-                try:
-                    with FileLock(self.switcher.lock_file, timeout=5):
-                        self.switcher._write_account_credentials(num, email, refreshed)
-                except Exception:
-                    self._logger.debug("prime: persist refreshed creds failed for %s", num, exc_info=True)
+        # Refresh an expired token for this INACTIVE account through the locked,
+        # double-checked chokepoint so two concurrent supervisors/renders never both
+        # POST the single-use refresh token (which would revoke the family and log the
+        # account out). A live session on this account => treat as active (claude owns
+        # its credentials; don't rotate its refresh token).
+        if not self.switcher._live_session_pids(num, email):
+            creds = self.switcher.ensure_fresh_inactive_credentials(num, email, creds)
+            token = oauth.extract_access_token(creds) or token
         return oauth.prime_account(token)
 
     def _stamp_primed(self, num: str) -> None:
@@ -837,39 +829,211 @@ class Supervisor:
             self._wait_for_reset()
         self._reassign_for_resume()
 
+    def _pause_status_lines(self, acct_views: dict, cfg) -> list[str]:
+        """Compact per-account usage lines shown beneath the pause countdown.
+
+        Uses the best-available signal already in ``acct_views`` (live / cache /
+        probe / stale) and, for an account whose usage endpoint is 429-backed-off so
+        it has NO signal (``max_pct is None``), falls back to the last-known cached
+        reading — so an idle account that is really at ~27% shows that number rather
+        than a bare "unknown" while the usage API is rate-limited. Tags the session's
+        current account and any account usable as a resume target right now, so when
+        the balancer pauses despite a healthy account the discrepancy is visible (and
+        the user can press Enter to re-check). Best-effort: never raises.
+        """
+        from claude_swap.cache import (
+            MISSING,
+            STALE_USAGE_MAX_AGE_S,
+            last_known_usage,
+            read_cache,
+        )
+
+        try:
+            data = self.switcher._get_sequence_data() or {}
+            accounts = data.get("accounts", {})
+            order = [str(n) for n in data.get("sequence", [])]
+            for num in accounts:
+                if str(num) not in order:
+                    order.append(str(num))
+            persisted = read_cache(
+                self.switcher.backup_dir / "cache" / "usage.json", float("inf")
+            )
+            persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+
+            lines: list[str] = []
+            for num in order:
+                av = acct_views.get(num)
+                email = accounts.get(num, {}).get("email", "") or "?"
+                # Usage / status text from the best signal available.
+                if av is not None and av.signal == "logged_out":
+                    usage = dimmed("logged out — re-login")
+                elif av is not None and av.max_pct is not None:
+                    h5, d7 = av.five_hour_pct, av.seven_day_pct
+                    if h5 is not None or d7 is not None:
+                        parts = []
+                        if h5 is not None:
+                            parts.append(f"5h {h5:>3.0f}%")
+                        if d7 is not None:
+                            parts.append(f"7d {d7:>3.0f}%")
+                        usage = muted("  ".join(parts))
+                    else:
+                        usage = muted(f"~{av.max_pct:>3.0f}%")
+                    if av.signal == "probe":
+                        usage += dimmed(" (probe-ok)")
+                    elif av.signal == "stale":
+                        usage += dimmed(" (cached)")
+                else:
+                    lk = last_known_usage(persisted.get(num), STALE_USAGE_MAX_AGE_S)
+                    pcts = [
+                        w["pct"]
+                        for w in (lk.values() if isinstance(lk, dict) else [])
+                        if isinstance(w, dict) and isinstance(w.get("pct"), (int, float))
+                    ]
+                    usage = (
+                        muted(f"~{max(pcts):>3.0f}% (cached)") if pcts else dimmed("checking…")
+                    )
+                # Tag: current session account, else a usable resume target.
+                if str(num) == str(self.account):
+                    tag = "  " + bold_accent("(current)")
+                elif balancer._usable(av, cfg):
+                    tag = "  " + muted("available")
+                else:
+                    tag = ""
+                lines.append(f"  {dimmed('a' + str(num))} {email:<28} {usage}{tag}")
+            return lines
+        except Exception:  # noqa: BLE001 - the pause display is best-effort
+            self._logger.debug("pause status render failed", exc_info=True)
+            return []
+
     def _wait_for_reset(self) -> None:
         """Foreground wait until the pause horizon OR the session becomes resumable.
 
-        Interruptible (Ctrl-C propagates). Renders a countdown so the wait is
-        always visible — never a hidden background sleep. The early break uses the
-        same ``_resumable`` gate as placement, so it can't wake into a still-full
-        account.
+        Interruptible (Ctrl-C propagates). Renders a live countdown PLUS a compact
+        per-account usage list (so the user can see which account has headroom), and
+        lets the user press **Enter** to force an immediate re-check instead of
+        waiting out the up-to-30s tick. The early break uses the same ``_resumable``
+        gate as placement, so it can't wake into a still-full account.
+
+        Rendering degrades gracefully off a TTY (printed once, no ANSI, no per-tick
+        spam); the Enter shortcut is POSIX-tty only (falls back to a plain sleep on
+        Windows / piped stdin). Ctrl-C is never swallowed — it propagates to
+        :meth:`run`'s handler.
         """
         resume_at = getattr(self, "_pending_resume_at", int(time.time()))
         cfg = balancer.config_from_dict(self.switcher.get_auto_balance_config())
         sv = self._self_session_view()
-        while True:
-            now = time.time()
-            remaining = int(resume_at - now)
-            if remaining <= 0:
-                break
-            reg = registry.read_registry(self.switcher)
-            # Probe a usage-backed-off idle target so the wait wakes the instant a
-            # probe confirms headroom, rather than sleeping out the whole timer.
-            acct_views, _ = registry.build_world(
-                self.switcher, reg, fetch_idle=True, probe_unavailable=True
-            )
-            if self._resumable(acct_views, sv, cfg):
-                break
-            mins, secs = divmod(remaining, 60)
-            hours, mins = divmod(mins, 60)
-            cd = f"{hours}h{mins:02d}m" if hours else f"{mins}m{secs:02d}s"
-            sys.stdout.write(
-                f"\r{dimmed('Usage limit reached — auto-resuming in ' + cd + '  ')}"
-            )
-            sys.stdout.flush()
-            time.sleep(min(30.0, max(1.0, remaining)))
-        sys.stdout.write("\r" + " " * 60 + "\r")
+        is_tty = self._stdout_isatty()
+        # Enter-to-recheck only when we can poll a real stdin tty (not Windows, not a
+        # pipe). EOF on stdin disables it mid-wait to avoid a busy-loop (see below).
+        can_select = (
+            sys.platform != "win32"
+            and hasattr(sys.stdin, "isatty")
+            and self._safe_isatty(sys.stdin)
+        )
+        prev_lines = 0
+        try:
+            while True:
+                now = time.time()
+                remaining = int(resume_at - now)
+                if remaining <= 0:
+                    break
+                reg = registry.read_registry(self.switcher)
+                # Probe a usage-backed-off idle target so the wait wakes the instant a
+                # probe confirms headroom, rather than sleeping out the whole timer.
+                acct_views, _ = registry.build_world(
+                    self.switcher, reg, fetch_idle=True, probe_unavailable=True
+                )
+                if self._resumable(acct_views, sv, cfg):
+                    break
+                mins, secs = divmod(remaining, 60)
+                hours, mins = divmod(mins, 60)
+                cd = f"{hours}h{mins:02d}m" if hours else f"{mins}m{secs:02d}s"
+                hint = "  (press Enter to re-check now)" if (can_select and is_tty) else ""
+                head = dimmed(f"Usage limit reached — auto-resuming in {cd}{hint}")
+                block = self._pause_status_lines(acct_views, cfg)
+                prev_lines = self._render_pause_frame(head, block, prev_lines, is_tty)
+
+                timeout = min(30.0, max(1.0, remaining))
+                if can_select:
+                    try:
+                        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+                    except (OSError, ValueError):
+                        # stdin not selectable after all -> stop trying, sleep instead.
+                        can_select = False
+                        time.sleep(timeout)
+                    else:
+                        if readable:
+                            line = self._consume_stdin_line()
+                            if line == "":
+                                # EOF (Ctrl-D / closed pipe): select would report it
+                                # readable forever -> disable to avoid a busy-loop.
+                                can_select = False
+                            # Enter (or any input) pressed -> loop now for an
+                            # immediate re-check, skipping the rest of the wait.
+                else:
+                    time.sleep(timeout)
+        finally:
+            self._clear_pause_frame(prev_lines, is_tty)
+
+    @staticmethod
+    def _stdout_isatty() -> bool:
+        try:
+            return bool(sys.stdout.isatty())
+        except Exception:  # noqa: BLE001 - non-tty / closed stream
+            return False
+
+    @staticmethod
+    def _safe_isatty(stream) -> bool:
+        try:
+            return bool(stream.isatty())
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _consume_stdin_line() -> str:
+        """Read one pending line from stdin (the Enter press). ``""`` on EOF/error."""
+        try:
+            return sys.stdin.readline()
+        except (OSError, ValueError):
+            return ""
+
+    def _render_pause_frame(
+        self, head: str, block: list[str], prev_lines: int, is_tty: bool
+    ) -> int:
+        """Draw the countdown + account block, returning the line count drawn.
+
+        On a TTY each tick moves the cursor back to the top of the previous frame
+        and clears to end-of-screen (``\\033[J``) before redrawing, so a frame that
+        grows or shrinks (an account logging out / a probe landing) never smears.
+        Off a TTY the frame is printed exactly ONCE (when ``prev_lines == 0``) with no
+        ANSI, so a piped/redirected stdout isn't spammed every tick.
+        """
+        lines = [head, *block]
+        if not is_tty:
+            if prev_lines == 0:
+                sys.stdout.write("\n".join(lines) + "\n")
+                sys.stdout.flush()
+                return len(lines)
+            return prev_lines
+        out = []
+        if prev_lines:
+            out.append(f"\033[{prev_lines}A")  # cursor up to the top of the frame
+        out.append("\r\033[J")  # clear from here to end of screen
+        # Trailing newline leaves the cursor on the line BELOW the block, so the
+        # next tick's cursor-up count is exactly the line count drawn here.
+        out.append("\n".join(lines) + "\n")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        return len(lines)
+
+    def _clear_pause_frame(self, prev_lines: int, is_tty: bool) -> None:
+        """Erase the rendered pause frame so the next message starts clean."""
+        if not prev_lines:
+            return
+        if is_tty:
+            sys.stdout.write(f"\033[{prev_lines}A\r\033[J")
+        else:
+            sys.stdout.write("\n")
         sys.stdout.flush()
 
     def _reassign_for_resume(self) -> None:

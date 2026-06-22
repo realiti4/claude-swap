@@ -561,8 +561,11 @@ def _account_block(
         header.append((" · cached", dim))
 
     # Tree children: usage windows (only those with data), then the session count.
-    if av.signal == "none":
-        children: list[list[Segment]] = [[("usage unavailable", muted)]]
+    if av.signal == "logged_out":
+        # A dead refresh token: actionable, distinct from a transient no-signal read.
+        children: list[list[Segment]] = [[("logged out — re-login", muted)]]
+    elif av.signal == "none":
+        children = [[("usage unavailable", muted)]]
     else:
         # Mirror ``_format_usage_lines``: render a window only when it has a
         # percentage. A 0% window with no reset is still data (a cold/unstarted

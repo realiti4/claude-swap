@@ -374,6 +374,132 @@ class TestProbeWiring:
         assert all(kw.get("probe_unavailable", False) is False for kw in seen_kwargs)
 
 
+class TestWaitForResetUX:
+    """The pause screen: a per-account usage block beside the countdown, and an
+    Enter shortcut to force an immediate re-check instead of waiting out the tick."""
+
+    def _sup(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"1": ("a@x.com", 5), "2": ("b@x.com", 5), "3": ("c@x.com", 5)})
+        sup = Supervisor(sw, "mid", temp_home / "p", "1", cwd=str(temp_home), share=False)
+        sup._pending_resume_at = int(time.time()) + 100  # remaining > 0
+        return sup
+
+    def test_enter_short_circuits_the_wait(self, temp_home, monkeypatch):
+        # Enter (stdin readable) forces an immediate re-check: build_world runs again
+        # without sleeping out the up-to-30s tick.
+        sup = self._sup(temp_home)
+        calls = {"n": 0}
+
+        def fake_build_world(switcher, reg, **kwargs):
+            calls["n"] += 1
+            return ({}, [])
+
+        # Not resumable on the first pass, resumable on the second.
+        monkeypatch.setattr(sup, "_resumable", lambda av, sv, cfg: calls["n"] >= 2)
+        monkeypatch.setattr(sup, "_pause_status_lines", lambda av, cfg: [])
+        # Force the select path on (pytest stdin isn't a tty) and report Enter ready.
+        monkeypatch.setattr(Supervisor, "_safe_isatty", staticmethod(lambda s: True))
+        monkeypatch.setattr(sup, "_consume_stdin_line", lambda: "\n")
+        sleep = patch("claude_swap.supervisor.time.sleep")
+        with patch("claude_swap.supervisor.registry.build_world", side_effect=fake_build_world), \
+             patch("claude_swap.supervisor.select.select", return_value=([1], [], [])), \
+             sleep as sleep_mock:
+            sup._wait_for_reset()
+        assert calls["n"] == 2          # re-checked immediately after Enter
+        sleep_mock.assert_not_called()  # Enter path never sleeps
+
+    def test_eof_disables_select_to_avoid_busy_loop(self, temp_home, monkeypatch):
+        # EOF on stdin (readline -> "") must disable the select path so the loop
+        # falls back to sleeping instead of spinning (select would report EOF
+        # readable forever).
+        sup = self._sup(temp_home)
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "claude_swap.supervisor.registry.build_world",
+            lambda switcher, reg, **kw: ({}, []),
+        )
+        monkeypatch.setattr(sup, "_resumable", lambda av, sv, cfg: calls["n"] >= 2)
+        monkeypatch.setattr(sup, "_pause_status_lines", lambda av, cfg: [])
+        monkeypatch.setattr(Supervisor, "_safe_isatty", staticmethod(lambda s: True))
+        monkeypatch.setattr(sup, "_consume_stdin_line", lambda: "")  # EOF
+
+        def count_and_resume(*a, **k):
+            calls["n"] += 1
+
+        with patch("claude_swap.supervisor.select.select", return_value=([1], [], [])) as sel, \
+             patch("claude_swap.supervisor.time.sleep", side_effect=count_and_resume) as slp:
+            sup._wait_for_reset()
+        # First tick: select fires, hits EOF, disables select. Second tick: sleeps.
+        assert sel.call_count == 1
+        assert slp.called
+
+    def test_non_tty_falls_back_to_sleep_never_selects(self, temp_home, monkeypatch):
+        sup = self._sup(temp_home)
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "claude_swap.supervisor.registry.build_world",
+            lambda switcher, reg, **kw: ({}, []),
+        )
+        monkeypatch.setattr(sup, "_resumable", lambda av, sv, cfg: calls["n"] >= 2)
+        monkeypatch.setattr(sup, "_pause_status_lines", lambda av, cfg: [])
+        monkeypatch.setattr(Supervisor, "_safe_isatty", staticmethod(lambda s: False))
+
+        def count(*a, **k):
+            calls["n"] += 1
+
+        with patch("claude_swap.supervisor.select.select") as sel, \
+             patch("claude_swap.supervisor.time.sleep", side_effect=count) as slp:
+            sup._wait_for_reset()
+        sel.assert_not_called()  # stdin not a tty -> never poll it
+        assert slp.called
+
+    def test_renders_account_block_with_tags(self, temp_home, monkeypatch, capsys):
+        from claude_swap.cache import write_cache
+
+        sup = self._sup(temp_home)
+        _seed_accounts(sup.switcher, {"4": ("d@x.com", 5)})  # extra no-signal account
+        # A no-signal (429-backed-off) account with a recent last-known reading: the
+        # render must fall back to the cached number, NOT show "unknown" (exercises
+        # the cache-fallback branch — the one the STALE_USAGE_MAX_AGE_S import bug hid).
+        write_cache(
+            sup.switcher.backup_dir / "cache" / "usage.json",
+            {"4": {
+                "_unavailable": True,
+                "retry_until": time.time() + 3600,
+                "_last_known": {"five_hour": {"pct": 33.0}, "seven_day": {"pct": 12.0}},
+                "_last_known_at": time.time(),
+            }},
+        )
+        # Current account "1" exhausted, "2" usable target, "3" logged out, "4" cached.
+        world = {
+            "1": balancer.AccountView(num="1", priority=5, max_pct=99.0, signal="live",
+                                      five_hour_pct=99.0, seven_day_pct=40.0),
+            "2": balancer.AccountView(num="2", priority=5, max_pct=20.0, signal="cache",
+                                      five_hour_pct=20.0, seven_day_pct=10.0),
+            "3": balancer.AccountView(num="3", priority=5, max_pct=None, signal="logged_out"),
+            "4": balancer.AccountView(num="4", priority=5, max_pct=None, signal="none"),
+        }
+        calls = {"n": 0}
+
+        def fake_build_world(switcher, reg, **kwargs):
+            calls["n"] += 1
+            return (world, [])
+
+        monkeypatch.setattr(sup, "_resumable", lambda av, sv, cfg: calls["n"] >= 2)
+        monkeypatch.setattr(Supervisor, "_safe_isatty", staticmethod(lambda s: False))
+        with patch("claude_swap.supervisor.registry.build_world", side_effect=fake_build_world), \
+             patch("claude_swap.supervisor.time.sleep"):
+            sup._wait_for_reset()
+        out = capsys.readouterr().out
+        assert "auto-resuming in" in out
+        assert "a@x.com" in out and "b@x.com" in out and "c@x.com" in out
+        assert "(current)" in out      # the session's own account
+        assert "available" in out      # the usable target
+        assert "logged out" in out     # the dead account
+        assert "33% (cached)" in out   # no-signal account -> last-known fallback
+
+
 class TestMigrateReservation:
     """BUG 003 (migrate path): _migrate must re-arm the cross-process headroom
     reservation on the NEW account so a second, independently-stranded session's

@@ -32,6 +32,16 @@ PROBE_VERDICT_TTL_S = 120
 # over hours, not minutes, so a reading this fresh is a sound optimistic estimate.
 STALE_USAGE_MAX_AGE_S = 2 * 3600
 
+# How long a confirmed logged-out account is left alone before cswap re-attempts a
+# refresh. When an inactive account's refresh returns ``invalid_grant`` the stored
+# refresh token is dead (revoked / already-rotated / expired) and NOTHING short of a
+# manual re-login can recover it — so re-POSTing the dead token on every render and
+# every balancer tick (across several concurrent processes) is pure waste. The
+# logged-out marker carries a ``retry_until`` this far out so the existing
+# :func:`usage_backoff_active` gate throttles re-attempts, while still re-checking
+# often enough that a fresh re-login is picked up without restarting anything.
+LOGGED_OUT_RECHECK_S = 300
+
 
 def usage_backoff_active(entry, now: float | None = None) -> bool:
     """Whether a cached usage entry is a still-active 429 backoff marker.
@@ -77,6 +87,40 @@ def probe_ok(entry) -> bool:
     (real usage, no-signal/429 markers, non-dicts).
     """
     return isinstance(entry, dict) and entry.get("_probe_ok") is True
+
+
+def logged_out(entry) -> bool:
+    """Whether a cached entry is a confirmed logged-out marker.
+
+    Written when an inactive account's OAuth refresh returns ``invalid_grant`` — the
+    stored refresh token is revoked / already-rotated / expired, so the account is
+    logged out and only a manual re-login can recover it. Carried as
+    ``{"_unavailable": True, "_logged_out": True, "retry_until": <epoch>}``:
+    ``_unavailable`` so every "no real usage" path treats it as zero headroom (never
+    a migration target), ``retry_until`` so :func:`usage_backoff_active` throttles
+    pointless re-POSTs of the dead token, and ``_logged_out`` so the render layer can
+    show an actionable "logged out — re-login" instead of a generic "usage
+    unavailable". ``False`` for real usage, plain/429 ``_unavailable`` markers, probe
+    verdicts, and non-dicts.
+    """
+    return isinstance(entry, dict) and entry.get("_logged_out") is True
+
+
+def logged_out_marker(now: float | None = None) -> dict:
+    """Build a fresh logged-out cache marker (see :func:`logged_out`).
+
+    Deliberately carries NO ``_last_known`` snapshot: a logged-out account must never
+    be resurrected as an optimistic ``signal="stale"`` migration target (it cannot
+    even authenticate), so — unlike a 429 backoff marker — it does not thread the
+    prior reading forward. The ``retry_until`` is :data:`LOGGED_OUT_RECHECK_S` out so
+    :func:`usage_backoff_active` throttles re-POSTs of the now-dead refresh token.
+    """
+    now = now if now is not None else time.time()
+    return {
+        "_unavailable": True,
+        "_logged_out": True,
+        "retry_until": now + LOGGED_OUT_RECHECK_S,
+    }
 
 
 def is_real_usage(entry) -> bool:

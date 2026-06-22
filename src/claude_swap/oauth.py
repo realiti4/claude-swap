@@ -77,8 +77,33 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
-    """Refresh an OAuth access token via direct token endpoint POST."""
+def _is_invalid_grant(body: str) -> bool:
+    """Whether a refresh-token POST failed with a definitive ``invalid_grant``.
+
+    The provider returns this (HTTP 400, ``{"error": "invalid_grant"}``) when the
+    stored refresh token is revoked, already-rotated (single-use reuse), or expired
+    — i.e. the account is logged out and no retry recovers it without a fresh login.
+    Distinguished from transient failures (5xx, timeouts, non-JSON bodies) so the
+    caller can mark the account logged-out (actionable) rather than generically
+    unavailable; anything we can't positively identify as ``invalid_grant`` stays a
+    transient failure.
+    """
+    try:
+        return json.loads(body).get("error") == "invalid_grant"
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
+
+
+def refresh_oauth_credentials(
+    credentials: str, failure_out: dict | None = None
+) -> str | None:
+    """Refresh an OAuth access token via direct token endpoint POST.
+
+    ``failure_out`` (optional): on a definitive ``invalid_grant`` (the refresh token
+    is dead — revoked / already-rotated / expired) sets ``failure_out["invalid_grant"]
+    = True`` so the caller can surface a "logged out — re-login" state instead of a
+    generic "usage unavailable". Transient failures leave it unset.
+    """
     try:
         data = json.loads(credentials)
         oauth = data.get("claudeAiOauth")
@@ -120,6 +145,8 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        if failure_out is not None and _is_invalid_grant(body):
+            failure_out["invalid_grant"] = True
         return None
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)

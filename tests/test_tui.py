@@ -558,6 +558,18 @@ class TestDashboardFormatters:
         # warm/cold suppressed when usage is unknown (no bare "· ?").
         assert "· warm" not in flat and "· cold" not in flat and "· ?" not in flat
 
+    def test_account_block_logged_out_signal(self):
+        from claude_swap.balancer import AccountView
+
+        av = AccountView(num="9", priority=1, signal="logged_out")
+        flat = self._flatten(
+            tui._account_block(av, "c@x.com", "personal", False, 0, 0.0, show_warm=True)
+        )
+        assert "logged out — re-login" in flat
+        # Distinct from a transient no-signal read.
+        assert "usage unavailable" not in flat
+        assert "0 sessions" in flat
+
     def test_account_block_session_pluralization(self):
         from claude_swap.balancer import AccountView
 

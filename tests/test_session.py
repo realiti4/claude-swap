@@ -9,6 +9,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -303,6 +304,35 @@ class TestBootstrap:
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
+
+    def test_bootstrap_serializes_refresh_on_per_account_lock(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+    ):
+        # The bootstrap's single-use-token refresh must take the PER-ACCOUNT refresh
+        # lock BEFORE the global lock (the same lock+ordering the idle path uses), so
+        # it can't race a concurrent idle build_world refresh of the same token.
+        from claude_swap.locking import FileLock as RealLock
+
+        seen: list[str] = []
+
+        class SpyLock:
+            def __init__(self, path, timeout=10.0):
+                seen.append(path.name)
+                self._inner = RealLock(path, timeout)
+
+            def __enter__(self):
+                return self._inner.__enter__()
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        with patch("claude_swap.session.FileLock", SpyLock):
+            manager.setup_session("2", share=False)
+
+        assert f".refresh-{ACCOUNT_NUM}.lock" in seen
+        assert ".lock" in seen
+        # per-account refresh lock acquired before the global lock (consistent order)
+        assert seen.index(f".refresh-{ACCOUNT_NUM}.lock") < seen.index(".lock")
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys

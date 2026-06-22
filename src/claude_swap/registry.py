@@ -42,6 +42,8 @@ from claude_swap.cache import (
     MISSING,
     STALE_USAGE_MAX_AGE_S,
     last_known_usage,
+    logged_out,
+    logged_out_marker,
     merge_last_known,
     probe_ok,
     probe_recent,
@@ -611,6 +613,12 @@ def build_world(
             # Retry-After so we back off for as long as it asked, not just one TTL.
             if usage is not None:
                 fetched[num] = usage
+            elif fail.get("logged_out"):
+                # Dead refresh token -> the account is logged out. A distinct marker
+                # (carrying NO last-known snapshot — a logged-out account can't
+                # authenticate, so it must never be resurrected as an optimistic
+                # stale target) so the render layer shows an actionable "re-login".
+                fetched[num] = logged_out_marker()
             else:
                 marker: dict = {"_unavailable": True}
                 ra = fail.get("retry_after")
@@ -651,6 +659,13 @@ def build_world(
                 usage = stale
                 signal = "stale"
 
+        # A confirmed logged-out account (dead refresh token): surface a distinct
+        # signal so the dashboard shows "logged out — re-login" rather than the
+        # generic "usage unavailable". Checked against the freshly-written marker and
+        # the prior cache so it persists across passes within the recheck throttle.
+        if logged_out(fetched.get(num)) or logged_out(cached_entry) or logged_out(persisted_entry):
+            signal = "logged_out"
+
         is_usage = isinstance(usage, dict)
         h5_pct, h5_reset = _five_hour_signal(usage) if is_usage else (None, None)
         d7_pct, d7_reset = _seven_day_signal(usage) if is_usage else (None, None)
@@ -684,18 +699,33 @@ def _probe_view(num: str, priority: int, resv: float, entry: dict | None) -> Acc
 
     Built only after a messages probe (or a fresh cached OK verdict) confirms the
     account can serve a turn now. ``max_pct`` is the conservative
-    :data:`~claude_swap.balancer.PROBE_CONFIRMED_PCT`, folded through
-    :func:`_with_reserve` so a just-placed online reservation still stacks (keeping
-    two stranded sessions from co-exhausting it). Per-window pct/reset are ``None``
+    :data:`~claude_swap.balancer.PROBE_CONFIRMED_PCT` — UNLESS ``entry`` still carries
+    a fresh last-known REAL reading (the 429 backoff marker / OK verdict threads it
+    via :func:`cache.merge_last_known`), in which case we use ``min(PROBE_CONFIRMED_PCT,
+    real)`` as the base: a probe at an account that was genuinely near-idle (e.g. 27%)
+    really is that available, so pinning it at the pessimistic 80 would wrongly fail
+    ``target_safety`` for a large-context session and strand it on an hour-long pause
+    even though the account is wide open (the observed "auto-resuming in 2h55m while an
+    account was available" bug). We only ever LOWER the value (``min``), never raise it
+    above the conservative probe number — a stale reading could be near-capped and the
+    probe only proves "a turn works now". When ``entry`` has no fresh last-known reading
+    the base stays ``PROBE_CONFIRMED_PCT`` (byte-for-byte the prior behaviour).
+
+    The base is folded through :func:`_with_reserve` so a just-placed online
+    reservation still stacks — THAT (not the flat 80) is what keeps two stranded
+    sessions from co-exhausting the same target. Per-window pct/reset are ``None``
     (a probe yields no window data); ``soonest_reset`` is ``None`` (unknown).
     extra-usage/spend are read best-effort from ``entry`` (usually absent on a
     backoff/probe marker, so typically ``(False, None)``).
     """
     extra_usage, spend_pct = _spend_signal(entry)
+    stale = last_known_usage(entry, STALE_USAGE_MAX_AGE_S)
+    real = _max_pct(stale) if stale is not None else None
+    base = min(PROBE_CONFIRMED_PCT, real) if real is not None else PROBE_CONFIRMED_PCT
     return AccountView(
         num=num,
         priority=priority,
-        max_pct=_with_reserve(PROBE_CONFIRMED_PCT, resv),
+        max_pct=_with_reserve(base, resv),
         soonest_reset=None,
         signal="probe",
         five_hour_pct=None,
@@ -793,6 +823,15 @@ def _maybe_probe(
     """
     if not probe_unavailable:
         return None
+    # A logged-out account (dead refresh token) can't be refreshed and a messages
+    # probe would only 401 — never probe it. Without this the resume/strand path
+    # (build_world(probe_unavailable=True), ~30s cadence) would re-POST the dead
+    # token and re-attempt a billable Haiku turn every pass for the whole strand,
+    # defeating the LOGGED_OUT_RECHECK_S throttle. build_world keeps the logged-out
+    # marker (its usage_backoff_active branch does fetched.setdefault) so the
+    # "logged out" signal and throttle survive.
+    if logged_out(entry):
+        return None
     # Reuse a fresh cached verdict without a network call (cross-process throttle).
     if probe_recent(entry):
         if probe_ok(entry):
@@ -846,6 +885,11 @@ def _maybe_probe(
         merge_last_known(marker, entry, now)
         fetched[num] = marker
         return None
+    # Logged out (the refresh surfaced a dead token): a distinct marker so the
+    # dashboard shows "re-login" and the dead token isn't re-POSTed every tick.
+    if fail.get("logged_out"):
+        fetched[num] = logged_out_marker(now)
+        return None
     # Unknown (None): stamp so the re-probe is throttled, but no retry_until.
     fetched[num] = merge_last_known({"_unavailable": True, "_probed_at": now}, entry, now)
     return None
@@ -878,21 +922,27 @@ def _fetch_idle_usage(
     account out on its next refresh.
     """
     from claude_swap import oauth
-    from claude_swap.locking import FileLock
 
     try:
         creds = switcher.read_account_credentials(str(num), email)
         if not creds or not oauth.extract_access_token(creds):
             return None
 
-        def _persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-            with FileLock(switcher.lock_file):
-                switcher.write_account_credentials(acct_num, acct_email, new_creds)
+        if not is_active:
+            # Refresh the inactive account's single-use OAuth token through the
+            # locked, double-checked chokepoint so concurrent build_world callers
+            # (every statusline migration-plan / balancer tick / `cswap --list`, each
+            # a separate process) can't both POST it and trigger the provider's
+            # token-reuse revocation — the silent-logout root cause. ``failure_out``
+            # carries ``logged_out`` back to the caller on a dead refresh token. Then
+            # fetch with is_active=True so the usage path never refreshes again.
+            creds = switcher.ensure_fresh_inactive_credentials(
+                str(num), email, creds, failure_out=failure_out
+            )
 
         return oauth.fetch_usage_for_account(
             str(num), email, creds,
-            is_active=is_active,
-            persist_credentials=None if is_active else _persist,
+            is_active=True,
             failure_out=failure_out,
         )
     except Exception:  # noqa: BLE001 - usage is best-effort; unknown => not a target
@@ -928,7 +978,6 @@ def _probe_idle_headroom(
     => no headroom, never a target), mirroring the prime invariant exactly.
     """
     from claude_swap import oauth
-    from claude_swap.locking import FileLock
 
     try:
         creds = switcher.read_account_credentials(str(num), email)
@@ -948,23 +997,17 @@ def _probe_idle_headroom(
         if not token:
             return None
 
-        # Refresh an expired token for this INACTIVE account, persisting under the
-        # lock (mirrors the usage path); never refresh an active/live account.
-        if (
-            not is_active
-            and oauth_data.get("refreshToken")
-            and oauth.is_oauth_token_expired(oauth_data.get("expiresAt"))
-        ):
-            refreshed = oauth.refresh_oauth_credentials(creds)
-            if refreshed:
-                token = oauth.extract_access_token(refreshed) or token
-                try:
-                    with FileLock(switcher.lock_file):
-                        switcher.write_account_credentials(str(num), email, refreshed)
-                except Exception:
-                    switcher._logger.debug(
-                        "probe: persist refreshed creds failed for %s", num, exc_info=True
-                    )
+        # Refresh an expired token for this INACTIVE account through the locked,
+        # double-checked chokepoint (mirrors the usage path): two concurrent
+        # supervisors must never both POST the single-use refresh token, or the
+        # provider revokes the whole family and logs the account out. Never refresh
+        # an active/live account. ``failure_out`` carries ``logged_out`` back on a
+        # dead refresh token so the caller can stamp the right marker.
+        if not is_active:
+            creds = switcher.ensure_fresh_inactive_credentials(
+                str(num), email, creds, failure_out=failure_out
+            )
+            token = oauth.extract_access_token(creds) or token
 
         return oauth.probe_messages_headroom(token, failure_out=failure_out)
     except Exception:  # noqa: BLE001 - probing is best-effort; unknown => not a target

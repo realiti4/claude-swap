@@ -29,6 +29,8 @@ from claude_swap.cache import (
     MISSING,
     STALE_USAGE_MAX_AGE_S,
     last_known_usage,
+    logged_out,
+    logged_out_marker,
     merge_last_known,
     read_cache,
     usage_backoff_active,
@@ -161,6 +163,10 @@ def _usage_status_line(usage) -> str | None:
     """
     if usage is None:
         return "usage unavailable"
+    if logged_out(usage):
+        # A dead refresh token: actionable, and checked BEFORE the rate-limited
+        # branch because a logged-out marker also carries a (throttle) retry_until.
+        return "logged out — re-login with `cswap --add-account`"
     if isinstance(usage, dict) and usage.get("_unavailable"):
         until = usage.get("retry_until")
         if isinstance(until, (int, float)) and until > time.time():
@@ -183,6 +189,10 @@ def _stale_usage_render(usage, now: float | None = None) -> tuple[str, list[str]
     """
     if not (isinstance(usage, dict) and usage.get("_unavailable")):
         return None
+    if logged_out(usage):
+        # A logged-out account can't authenticate at all — never resurrect it as an
+        # optimistic stale reading; show the actionable status line instead.
+        return None
     now = now if now is not None else time.time()
     lk = last_known_usage(usage, STALE_USAGE_MAX_AGE_S, now)
     if lk is None:
@@ -199,6 +209,56 @@ def _stale_usage_render(usage, now: float | None = None) -> tuple[str, list[str]
     else:
         note = "last-known usage (cached — endpoint unavailable)"
     return note, lines
+
+
+def _enrich_reset_strings(usage: dict) -> None:
+    """Add (countdown, clock) display strings to live-derived usage windows in place.
+
+    The live statusline ``rate_limits`` signal carries only the reset epoch
+    (``resets_at``); a real usage-API reading also carries the formatted
+    ``countdown``/``clock`` that :func:`_format_usage_lines` renders. Format them
+    here from the epoch so an account rendered from its live signal shows the same
+    ``resets HH:MM in Nh Nm`` line a real reading would, instead of dropping the
+    reset time. Best-effort per window — a missing/zero reset just leaves that
+    window's strings absent (rendered as a bare ``5h: N%``).
+    """
+    from datetime import datetime, timezone
+
+    for window in ("five_hour", "seven_day"):
+        entry = usage.get(window)
+        if not isinstance(entry, dict):
+            continue
+        reset = entry.get("resets_at")
+        if not isinstance(reset, (int, float)) or reset <= 0:
+            continue
+        try:
+            iso = datetime.fromtimestamp(int(reset), tz=timezone.utc).isoformat()
+            entry["countdown"], entry["clock"] = oauth.format_reset(iso)
+        except Exception:  # noqa: BLE001 - display enrichment is best-effort
+            pass
+
+
+def _merge_spend_from_cache(usage: dict, cached_entry) -> None:
+    """Carry pay-as-you-go (extra-usage/spend) from a real cached reading onto a
+    live-derived usage dict, in place.
+
+    The live statusline signal never carries the dollar-denominated ``spend`` /
+    ``extra_usage_enabled`` info (only the usage API does — see
+    ``oauth.build_usage_result``), so an account rendered from its live signal
+    would drop the ``$$`` line. When the shared usage cache still holds a REAL
+    prior reading for the account, copy its extra-usage info forward so the line
+    survives. No-op when the cache holds no real reading (a marker / None / probe
+    verdict) — then ``$$`` is simply omitted, which ``_format_usage_lines`` handles.
+    """
+    from claude_swap.cache import is_real_usage
+
+    if not is_real_usage(cached_entry):
+        return
+    if cached_entry.get("extra_usage_enabled"):
+        usage["extra_usage_enabled"] = True
+    spend = cached_entry.get("spend")
+    if isinstance(spend, dict):
+        usage["spend"] = spend
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -528,6 +588,34 @@ class ClaudeAccountSwitcher:
             mark_session_stale(self._session_dir(account_num, email))
         else:
             self._invalidate_session_credentials(account_num, email)
+        # Fresh credentials supersede any cached logged-out verdict: drop a stale
+        # logged-out marker so a re-login (--add-account / --import) shows real usage
+        # on the next read instead of telling the user to re-login for up to
+        # LOGGED_OUT_RECHECK_S after they already did. Guarded so a routine
+        # refresh-token rotation (which also lands here) never wipes good cached usage.
+        self._clear_logged_out_usage_marker(account_num)
+
+    def _clear_logged_out_usage_marker(self, account_num: str) -> None:
+        """Drop a logged-out usage marker for an account after its creds change.
+
+        Best-effort and guarded: only removes the cache entry when it is a
+        logged-out marker (see :func:`cache.logged_out`); real usage and 429 backoff
+        markers are left intact, so a refresh-token rotation can't erase good cached
+        usage. The next render/balancer pass re-fetches with the fresh credentials.
+        """
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        try:
+            cached = read_cache(usage_cache_path, float("inf"))
+            if not (isinstance(cached, dict) and logged_out(cached.get(str(account_num)))):
+                return
+            write_cache(
+                usage_cache_path,
+                {k: v for k, v in cached.items() if k != str(account_num)},
+            )
+        except Exception:
+            self._logger.debug(
+                "clear logged-out marker failed for %s", account_num, exc_info=True
+            )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
@@ -653,6 +741,103 @@ class ClaudeAccountSwitcher:
         process (see the v0.7.3 deadlock history).
         """
         self._write_account_credentials(account_num, email, credentials)
+
+    def _refresh_lock_path(self, account_num: str) -> Path:
+        """Per-account lock that serializes OAuth refreshes of one slot's token.
+
+        Distinct from ``self.lock_file`` (the global credential-store lock) so two
+        DIFFERENT accounts still refresh in parallel — only refreshes of the SAME
+        single-use refresh token serialize (see
+        :meth:`ensure_fresh_inactive_credentials`).
+        """
+        return self.backup_dir / f".refresh-{account_num}.lock"
+
+    def ensure_fresh_inactive_credentials(
+        self,
+        account_num: str,
+        email: str,
+        credentials: str,
+        *,
+        failure_out: dict | None = None,
+    ) -> str:
+        """Non-expired credentials for an INACTIVE account, refreshed race-free.
+
+        The OAuth refresh token is SINGLE-USE: a successful refresh rotates it, and the
+        provider treats a second POST of the now-consumed token as token reuse and
+        revokes the WHOLE family — so every cswap copy goes dead and the account logs
+        itself out until a manual re-login. Many cswap code paths refresh the same idle
+        account concurrently — every balancer tick, every ``cswap --list``, and a
+        statusline migration-plan all call ``build_world(fetch_idle=True)``, and a user
+        commonly has several Claude sessions open at once — so that reuse race is easy
+        to hit and is the root cause of idle accounts silently logging out.
+
+        This is the single chokepoint that makes the read→refresh→persist atomic per
+        account: it serializes refreshes of ONE account across processes (a per-account
+        :meth:`_refresh_lock_path`) and double-checks the on-disk token after taking the
+        lock, so exactly one process POSTs the refresh while the losers reuse the
+        freshly-persisted token instead of re-POSTing a consumed one. Different accounts
+        still refresh in parallel.
+
+        The caller MUST pass only an INACTIVE account's credentials — never the active
+        default login or a live-session account (Claude Code owns those; rotating their
+        token forces a re-login). Returns fresh credentials (refreshed here, the
+        winner's already-fresh token, or the unchanged input when it was not expired).
+        On a definitive ``invalid_grant`` sets ``failure_out["logged_out"] = True`` (when
+        provided) and returns the unchanged credentials so the caller can surface a
+        "logged out — re-login" state instead of hammering a dead token.
+        """
+        oauth_data = oauth.extract_oauth_data(credentials)
+        if not oauth_data or not oauth_data.get("refreshToken"):
+            return credentials  # nothing to refresh (e.g. a --add-token account)
+        if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            return credentials  # still fresh -> no network POST, no lock needed
+
+        # Bounded to the render budget (statusline/list use a 5s lock budget): the
+        # winner holds this lock across its refresh POST, and this runs on render
+        # paths (build_world from a statusline migration-plan / `cswap --list`), so a
+        # loser must not stall the prompt for the POST's full 10s. On timeout it
+        # degrades gracefully (stored creds -> no usage this tick, fixed next pass).
+        lock = FileLock(self._refresh_lock_path(account_num), timeout=5.0)
+        if not lock.acquire():
+            # Couldn't serialize in time: skip the refresh rather than risk a racing
+            # POST that could revoke the family. The caller then fetches with the
+            # expired token -> no usage this tick (recovered on the next pass).
+            self._logger.debug(
+                "refresh lock busy for account %s; using stored creds", account_num
+            )
+            return credentials
+        try:
+            # Double-check under the lock: a concurrent winner may have just refreshed
+            # and persisted, in which case reuse its fresh token with NO POST.
+            disk = self._read_account_credentials(account_num, email) or credentials
+            disk_oauth = oauth.extract_oauth_data(disk)
+            if (
+                disk_oauth
+                and disk_oauth.get("accessToken")
+                and not oauth.is_oauth_token_expired(disk_oauth.get("expiresAt"))
+            ):
+                return disk
+            # Refresh from the freshest token on disk (the winner may have rotated it
+            # even if it then expired again); fall back to the caller's copy.
+            base = disk if (disk_oauth and disk_oauth.get("refreshToken")) else credentials
+            refresh_fail: dict = {}
+            refreshed = oauth.refresh_oauth_credentials(base, failure_out=refresh_fail)
+            if refreshed:
+                try:
+                    with FileLock(self.lock_file):
+                        self._write_account_credentials(account_num, email, refreshed)
+                except Exception:
+                    self._logger.debug(
+                        "persist refreshed creds failed for account %s",
+                        account_num,
+                        exc_info=True,
+                    )
+                return refreshed
+            if failure_out is not None and refresh_fail.get("invalid_grant"):
+                failure_out["logged_out"] = True
+            return base
+        finally:
+            lock.release()
 
     def read_account_config(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
@@ -797,6 +982,72 @@ class ClaudeAccountSwitcher:
     def has_live_session(self, account_num: str, email: str) -> bool:
         """Whether a session-mode (``cswap run``) claude is live for this account."""
         return bool(self._live_session_pids(str(account_num), email))
+
+    def _live_usage_by_account(self) -> dict[str, dict]:
+        """Most-recent live usage per account, derived from the registry (lock-free).
+
+        A *managed* session's statusline writes its account's live ``rate_limits``
+        into the registry on every render (see :mod:`claude_swap.statusline`). That
+        signal is FREE and is NEVER subject to the usage endpoint's 429 rate limit —
+        unlike the usage API. The display/poll paths (:meth:`list_accounts`,
+        :meth:`status`, :meth:`get_active_usage_pct`) reuse it here so that:
+
+        * an account hosting a live session (typically the active account, where
+          managed sessions run) shows its REAL consumption instead of
+          "usage rate-limited — retry in ~Nm" whenever the usage endpoint is
+          429-backed-off, and
+        * those paths stop hitting (and being blocked by) the rate-limited usage
+          endpoint for an account the registry already has a fresh reading for —
+          which is the dominant unnecessary call source feeding the 429 loop.
+
+        Mirrors ``registry.build_world``'s live-signal selection exactly so the
+        display and the balancer never disagree: only sessions whose supervisor
+        process is still alive count (``registry.live_sessions``), the
+        most-recently-seen session wins per account (``last_seen``), and the live
+        ``rate_limits`` shape is normalized via ``registry._rl_to_usage``. The reset
+        epoch is formatted to the same countdown/clock a real reading carries
+        (:func:`_enrich_reset_strings`), and pay-as-you-go/spend — absent from the
+        live signal — is merged best-effort from the fresh usage cache
+        (:func:`_merge_spend_from_cache`), exactly as ``build_world`` does for a
+        live account.
+
+        Returns ``{account_num: usage_dict}`` for accounts with a usable live
+        reading; accounts without one are absent (the caller falls back to the
+        cache / usage API). Never raises — any failure yields an empty map.
+        """
+        from claude_swap import registry
+        from claude_swap.cache import MISSING, read_cache
+
+        try:
+            reg = registry.read_registry(self)
+            live_rl: dict[str, dict] = {}
+            seen_at: dict[str, float] = {}
+            for e in registry.live_sessions(reg):
+                rl = e.get("rate_limits")
+                acct = str(e.get("account_num", ""))
+                seen = float(e.get("last_seen") or 0.0)
+                if isinstance(rl, dict) and acct and seen >= seen_at.get(acct, -1.0):
+                    live_rl[acct] = rl
+                    seen_at[acct] = seen
+            if not live_rl:
+                return {}
+
+            usage_cache_path = self.backup_dir / "cache" / "usage.json"
+            cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+            cached = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+
+            out: dict[str, dict] = {}
+            for acct, rl in live_rl.items():
+                usage = registry._rl_to_usage(rl)
+                if not usage:
+                    continue
+                _enrich_reset_strings(usage)
+                _merge_spend_from_cache(usage, cached.get(acct))
+                out[acct] = usage
+            return out
+        except Exception:  # noqa: BLE001 - best-effort; caller fetches as before
+            self._logger.debug("live usage map build failed", exc_info=True)
+            return {}
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
@@ -1395,24 +1646,28 @@ class ClaudeAccountSwitcher:
             if not creds or not oauth.extract_access_token(creds):
                 return "no credentials"
 
-            def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-                with FileLock(self.lock_file):
-                    self._write_account_credentials(acct_num, acct_email, new_creds)
-
             # An account running in session mode is "inactive" here but live
             # in its own config dir, where claude manages the token. Treat it
-            # like the active account (no proactive refresh / 401-retry):
-            # refreshing the backup copy could rotate the refresh token out
-            # from under the live session. Worst case its usage shows as
-            # unavailable until the session exits.
+            # like the active account (no proactive refresh): refreshing the
+            # backup copy could rotate the refresh token out from under the live
+            # session. Worst case its usage shows as unavailable until it exits.
             has_live_session = bool(self._live_session_pids(str(num), email))
+            treat_active = is_active or has_live_session
 
             fail: dict = {}
+            if not treat_active:
+                # A genuinely-idle account: refresh its single-use OAuth token through
+                # the locked, double-checked chokepoint so two concurrent cswap
+                # processes can't both POST it and get the family revoked (the
+                # silent-logout root cause). Then fetch with is_active=True so the
+                # usage path never refreshes again.
+                creds = self.ensure_fresh_inactive_credentials(
+                    str(num), email, creds, failure_out=fail
+                )
+                if fail.get("logged_out"):
+                    return logged_out_marker()
             result = oauth.fetch_usage_for_account(
-                str(num), email, creds,
-                is_active=is_active or has_live_session,
-                persist_credentials=persist,
-                failure_out=fail,
+                str(num), email, creds, is_active=True, failure_out=fail,
             )
             # On a usage-endpoint 429, cache a backoff marker carrying the
             # server's Retry-After so we stop re-hitting the rate-limited
@@ -1431,8 +1686,22 @@ class ClaudeAccountSwitcher:
         persisted = read_cache(usage_cache_path, float("inf"))
         persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
 
+        # The registry's free, never-rate-limited live signal for any account
+        # hosting a live managed session (typically the active account). Built once
+        # and used to (a) skip the usage-API fetch for those accounts below and
+        # (b) overlay their real reading for display — so `cswap --list` never shows
+        # "usage rate-limited" for an account the registry already has a reading for.
+        live_usage = self._live_usage_by_account()
+
         def fetch_or_skip(account_info):
             num = str(account_info[0])
+            if num in live_usage:
+                # Don't fetch a live account — the registry already has its reading
+                # (overlaid for display below). Return the PERSISTED entry so the
+                # cache write keeps its existing value (e.g. a real reading with
+                # spend) and never stores a live-derived value (which lacks the
+                # usage-API's spend/extra-usage and would mislead other readers).
+                return persisted.get(num)
             if usage_backoff_active(persisted.get(num)):
                 return persisted.get(num)
             return fetch(account_info)
@@ -1448,6 +1717,16 @@ class ClaudeAccountSwitcher:
                 str(info[0]): usage
                 for info, usage in zip(accounts_info, usages)
             })
+
+        # Overlay the live reading LAST (after any cache write) for accounts with a
+        # live managed session: it is the freshest signal and is never 429-blocked,
+        # and is deliberately kept out of the persisted cache above (it lacks the
+        # usage-API's spend/extra-usage and would pollute the shared slot).
+        if live_usage:
+            usages = [
+                live_usage.get(str(info[0]), usage)
+                for info, usage in zip(accounts_info, usages)
+            ]
 
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
@@ -1552,35 +1831,45 @@ class ClaudeAccountSwitcher:
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             creds = self._read_credentials() or ""
             if creds and oauth.extract_access_token(creds):
-                # Reuse the cache list_accounts writes (cache-first). On miss,
-                # fetch with is_active=True (Claude Code owns active credentials,
-                # cswap must not refresh them) and merge into existing entries so
-                # other accounts' rows survive.
-                usage_cache_path = self.backup_dir / "cache" / "usage.json"
-                # Persisted backoff markers survive the freshness TTL until their
-                # Retry-After elapses, so `cswap --status` doesn't re-hit a
-                # rate-limited endpoint once the 60s cache expires (the gap that
-                # re-armed the "usage unavailable" loop on this path).
-                persisted = read_cache(usage_cache_path, float("inf"))
-                persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
-                cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-                if (cached is not MISSING and isinstance(cached, dict)
-                        and account_num in cached):
-                    usage = cached[account_num]
-                elif usage_backoff_active(persisted.get(account_num)):
-                    usage = persisted.get(account_num)  # honor the backoff, no refetch
+                # Prefer the registry's free, never-rate-limited live signal when
+                # this (active) account hosts a live managed session: it shows the
+                # real reading instead of "usage rate-limited" while the usage
+                # endpoint is 429-backed-off, and avoids re-hitting it. Live values
+                # are deliberately NOT persisted to the shared cache below (they
+                # lack the usage-API's spend/extra-usage).
+                live = self._live_usage_by_account().get(account_num)
+                if live is not None:
+                    usage = live
                 else:
-                    fail: dict = {}
-                    usage = oauth.fetch_usage_for_account(
-                        account_num, current_email, creds,
-                        is_active=True, failure_out=fail,
-                    )
-                    if usage is None and fail.get("retry_after"):
-                        marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
-                        usage = merge_last_known(marker, persisted.get(account_num))
-                    existing = dict(persisted)
-                    existing[account_num] = usage
-                    write_cache(usage_cache_path, existing)
+                    # Reuse the cache list_accounts writes (cache-first). On miss,
+                    # fetch with is_active=True (Claude Code owns active credentials,
+                    # cswap must not refresh them) and merge into existing entries so
+                    # other accounts' rows survive.
+                    usage_cache_path = self.backup_dir / "cache" / "usage.json"
+                    # Persisted backoff markers survive the freshness TTL until their
+                    # Retry-After elapses, so `cswap --status` doesn't re-hit a
+                    # rate-limited endpoint once the 60s cache expires (the gap that
+                    # re-armed the "usage unavailable" loop on this path).
+                    persisted = read_cache(usage_cache_path, float("inf"))
+                    persisted = persisted if (persisted is not MISSING and isinstance(persisted, dict)) else {}
+                    cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+                    if (cached is not MISSING and isinstance(cached, dict)
+                            and account_num in cached):
+                        usage = cached[account_num]
+                    elif usage_backoff_active(persisted.get(account_num)):
+                        usage = persisted.get(account_num)  # honor the backoff, no refetch
+                    else:
+                        fail: dict = {}
+                        usage = oauth.fetch_usage_for_account(
+                            account_num, current_email, creds,
+                            is_active=True, failure_out=fail,
+                        )
+                        if usage is None and fail.get("retry_after"):
+                            marker = {"_unavailable": True, "retry_until": time.time() + fail["retry_after"]}
+                            usage = merge_last_known(marker, persisted.get(account_num))
+                        existing = dict(persisted)
+                        existing[account_num] = usage
+                        write_cache(usage_cache_path, existing)
                 stale = _stale_usage_render(usage)
                 if stale is not None:
                     # Backed off, but a recent last-known reading exists -> show it.
@@ -1682,6 +1971,15 @@ class ClaudeAccountSwitcher:
                     account.get("organizationUuid", "") == current_org_uuid):
                 account_num = num
                 break
+
+        # Prefer the registry's free, never-rate-limited live signal when the
+        # active account hosts a live managed session: a real reading even while
+        # the usage endpoint is 429-backed-off (where the cache/fetch path would
+        # return None and stall the auto-switch monitor), and no usage-API hit.
+        if account_num is not None:
+            live = self._live_usage_by_account().get(account_num)
+            if live is not None:
+                return _max_usage_pct(live)
 
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         # Persisted backoff markers (inf TTL) gate the refetch so a 429-backed-off
@@ -1995,12 +2293,15 @@ class ClaudeAccountSwitcher:
         refresh token is dead — i.e. the account is logged out and the caller
         should migrate to a healthy account instead). Never raises.
 
-        Concurrency: the whole read-refresh-write-reseed runs under
-        ``FileLock(self.lock_file)`` so two managed sessions on the same account
-        serialize. The expiry re-check makes the second one a cheap reseed (the
-        first sibling already refreshed the shared backup). No network I/O races
-        the registry because this method touches credentials only — callers
-        (the supervisor's ``_recover_auth``) build the world OUTSIDE the lock.
+        Concurrency: the network refresh runs under the PER-ACCOUNT refresh lock
+        (:meth:`_refresh_lock_path`) acquired BEFORE ``FileLock(self.lock_file)`` —
+        the same lock and ordering :meth:`ensure_fresh_inactive_credentials` uses — so
+        this managed-recovery POST can't race an idle ``build_world`` refresh of the
+        SAME account's single-use token (a managed account isn't covered by
+        ``has_live_session``, so the idle path would otherwise treat it as idle and
+        POST concurrently, revoking the token family). The expiry re-check under the
+        lock makes a sibling a cheap reseed. Callers (``_recover_auth``) build the
+        world OUTSIDE both locks.
         """
         account_num = str(account_num)
         try:
@@ -2013,7 +2314,7 @@ class ClaudeAccountSwitcher:
                 return False
             email = record.get("email", "")
 
-            with FileLock(self.lock_file):
+            with FileLock(self._refresh_lock_path(account_num)), FileLock(self.lock_file):
                 creds = self._read_account_credentials(account_num, email)
                 if not creds:
                     self._logger.warning(

@@ -287,7 +287,15 @@ class SessionManager:
             self._sync_sharing(session_dir, share)
             return session_dir, account_num, email
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        # Acquire the PER-ACCOUNT refresh lock BEFORE the global lock (the same
+        # lock + ordering ensure_fresh_inactive_credentials uses), so _bootstrap's
+        # refresh of this account's single-use OAuth token can't race a concurrent
+        # idle build_world refresh of the SAME token (during bootstrap the profile
+        # isn't live yet, so the idle path treats the account as idle and would POST
+        # the same token -> provider token-reuse revocation -> silent logout).
+        with FileLock(
+            self.switcher._refresh_lock_path(account_num), timeout=_BOOTSTRAP_LOCK_TIMEOUT
+        ), FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if (session_dir / STALE_MARKER).exists() and not live_sessions_for(

@@ -6,14 +6,18 @@ import json
 import time
 
 from claude_swap.cache import (
+    LOGGED_OUT_RECHECK_S,
     MISSING,
     PROBE_VERDICT_TTL_S,
     is_real_usage,
     last_known_usage,
+    logged_out,
+    logged_out_marker,
     merge_last_known,
     probe_ok,
     probe_recent,
     read_cache,
+    usage_backoff_active,
     write_cache,
 )
 
@@ -114,6 +118,43 @@ class TestWriteCache:
         result = read_cache(cache_file, ttl=60)
 
         assert result == data
+
+
+class TestLoggedOut:
+    """The logged-out marker: a dead refresh token, distinct from transient failures."""
+
+    def test_logged_out_true_only_for_logged_out_marker(self):
+        assert logged_out({"_unavailable": True, "_logged_out": True}) is True
+
+    def test_logged_out_false_otherwise(self):
+        assert logged_out({"_unavailable": True}) is False  # plain/429 marker
+        assert logged_out({"_unavailable": True, "retry_until": 9}) is False
+        assert logged_out({"_probe_ok": True}) is False
+        assert logged_out({"five_hour": {"pct": 5.0}}) is False
+        assert logged_out({}) is False
+        assert logged_out(None) is False
+
+    def test_marker_shape(self):
+        marker = logged_out_marker(now=1000.0)
+        assert marker["_unavailable"] is True
+        assert marker["_logged_out"] is True
+        assert marker["retry_until"] == 1000.0 + LOGGED_OUT_RECHECK_S
+
+    def test_marker_carries_no_last_known(self):
+        # A logged-out account must never resurrect as an optimistic stale target.
+        marker = logged_out_marker(now=1000.0)
+        assert "_last_known" not in marker
+        assert last_known_usage(marker, max_age=10**9, now=1000.0) is None
+
+    def test_marker_is_a_backoff_so_refetch_is_throttled(self):
+        # The retry_until gate reuses usage_backoff_active so the dead token is not
+        # re-POSTed every render/tick across concurrent processes.
+        marker = logged_out_marker(now=1000.0)
+        assert usage_backoff_active(marker, now=1000.0) is True
+        assert usage_backoff_active(marker, now=1000.0 + LOGGED_OUT_RECHECK_S + 1) is False
+
+    def test_marker_is_not_real_usage(self):
+        assert is_real_usage(logged_out_marker(now=1.0)) is False
 
 
 class TestIsRealUsage:

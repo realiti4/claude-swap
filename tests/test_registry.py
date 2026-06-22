@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from claude_swap import registry
+from claude_swap import balancer, registry
 from claude_swap.cache import write_cache
 from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -334,6 +334,67 @@ class TestBuildWorld:
         assert usage_backoff_active(entry) is True
 
 
+class TestLoggedOut:
+    """build_world surfaces a dead-refresh-token account as a distinct logged-out
+    signal + persisted marker (not a generic 'unavailable'), and never as a usable
+    or stale migration target."""
+
+    def test_build_world_marks_logged_out(self, temp_home: Path):
+        from claude_swap.cache import logged_out, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        reg = registry.read_registry(sw)
+
+        def fake_fetch(switcher, num, email, *, is_active=False, failure_out=None):
+            if failure_out is not None:
+                failure_out["logged_out"] = True
+            return None
+
+        with patch("claude_swap.registry._fetch_idle_usage", side_effect=fake_fetch):
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+
+        av = acct_views["2"]
+        assert av.signal == "logged_out"
+        assert av.max_pct is None  # unknown headroom -> never a migration target
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert logged_out(entry) is True
+
+    def test_logged_out_marker_throttles_refetch(self, temp_home: Path):
+        # A persisted logged-out marker is a backoff (retry_until): the next pass must
+        # NOT re-POST the dead token (no _fetch_idle_usage call).
+        from claude_swap.cache import logged_out_marker
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(sw.backup_dir / "cache" / "usage.json", {"2": logged_out_marker()})
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._fetch_idle_usage") as m:
+            acct_views, _ = registry.build_world(sw, reg, fetch_idle=True)
+        m.assert_not_called()
+        assert acct_views["2"].signal == "logged_out"
+
+    def test_logged_out_never_probed_on_resume_path(self, temp_home: Path):
+        # The resume/strand path (probe_unavailable=True) must NOT re-probe a
+        # logged-out account: a dead token can't refresh and the messages probe only
+        # 401s, so re-POSTing it every ~30s pass is pure waste (and token-reuse risk).
+        from claude_swap.cache import logged_out, logged_out_marker, read_cache
+
+        sw = ClaudeAccountSwitcher()
+        _seed_accounts(sw, {"2": ("b@x.com", 0)})
+        write_cache(sw.backup_dir / "cache" / "usage.json", {"2": logged_out_marker()})
+        reg = registry.read_registry(sw)
+        with patch("claude_swap.registry._probe_idle_headroom") as probe:
+            acct_views, _ = registry.build_world(
+                sw, reg, fetch_idle=True, probe_unavailable=True
+            )
+        probe.assert_not_called()
+        assert acct_views["2"].signal == "logged_out"
+        # The logged-out marker (and its throttle) survives the pass intact.
+        entry = read_cache(sw.backup_dir / "cache" / "usage.json", 10**9).get("2")
+        assert logged_out(entry) is True
+
+
 class TestProbeUnavailable:
     """The messages-API headroom probe fallback (default OFF). A usage-429-backed-off
     idle account is probed only when ``probe_unavailable=True``; a 2xx synthesizes a
@@ -598,6 +659,67 @@ class TestProbeUnavailable:
             )
         assert acct_views["2"].signal == "probe"
         assert acct_views["2"].max_pct == balancer.PROBE_CONFIRMED_PCT
+
+
+class TestProbeViewUsesRealReading:
+    """A probe view uses min(PROBE_CONFIRMED_PCT, real last-known) so a near-idle
+    account confirmed runnable isn't pinned at the pessimistic 80 — the fix for the
+    "auto-resuming in 2h55m while an account was available" pause. The online
+    reservation still stacks on top, so co-exhaust protection is unchanged."""
+
+    def _marker(self, h5, d7, age_s=0.0):
+        return {
+            "_unavailable": True,
+            "retry_until": time.time() + 3600,
+            "_last_known": {
+                "five_hour": {"pct": h5, "resets_at": 9_999_999_999},
+                "seven_day": {"pct": d7, "resets_at": 9_999_999_999},
+            },
+            "_last_known_at": time.time() - age_s,
+        }
+
+    def test_uses_real_low_reading_instead_of_80(self):
+        # last-known max(14, 27) = 27 -> base 27, not 80.
+        av = registry._probe_view("2", 0, 0.0, self._marker(14.0, 27.0))
+        assert av.signal == "probe"
+        assert av.max_pct == 27.0
+
+    def test_no_last_known_stays_conservative_80(self):
+        # No real reading on the marker -> byte-for-byte the prior behaviour.
+        av = registry._probe_view("2", 0, 0.0, {"_unavailable": True})
+        assert av.max_pct == balancer.PROBE_CONFIRMED_PCT
+
+    def test_clamps_high_reading_to_80(self):
+        # A stale reading near the cap must never make the probe MORE optimistic than
+        # the conservative 80 (the probe only proves "a turn works now").
+        av = registry._probe_view("2", 0, 0.0, self._marker(92.0, 50.0))
+        assert av.max_pct == balancer.PROBE_CONFIRMED_PCT
+
+    def test_old_last_known_falls_back_to_80(self):
+        # An aged-out last-known reading is not trusted -> conservative 80.
+        av = registry._probe_view(
+            "2", 0, 0.0, self._marker(14.0, 27.0, age_s=registry.STALE_USAGE_MAX_AGE_S + 1)
+        )
+        assert av.max_pct == balancer.PROBE_CONFIRMED_PCT
+
+    def test_online_reservation_still_stacks_on_real_reading(self):
+        # The co-exhaust guard is the reservation, not the 80: a real 27% reading with
+        # a one-session reserve (BASE_RESERVE=3) projects to 30, exactly as it would
+        # for any real-cache account at 27%.
+        resv = balancer._pct_cost(0)  # 3.0
+        av = registry._probe_view("2", 0, resv, self._marker(27.0, 10.0))
+        assert av.max_pct == 30.0
+
+    def test_large_session_fits_probe_with_real_reading(self):
+        # The end the fix exists for: a >100k-context session that could NOT fit a
+        # flat-80 probe target (80+6 > 85) DOES fit when the real reading (27%) backs
+        # the probe view (27+6 <= 85) -> it migrates instead of pausing for hours.
+        cfg = balancer.config_from_dict(None)
+        cost = balancer._pct_cost(150_000)  # 6.0 -> 80+6=86 > 85, but 27+6=33 <= 85
+        real_av = registry._probe_view("2", 0, 0.0, self._marker(14.0, 27.0))
+        assert balancer._fits(real_av, {"2": 0.0}, cost, cfg) is True
+        flat_av = registry._probe_view("2", 0, 0.0, {"_unavailable": True})
+        assert balancer._fits(flat_av, {"2": 0.0}, cost, cfg) is False
 
 
 class TestPlacementReservation:

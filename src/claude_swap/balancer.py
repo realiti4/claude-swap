@@ -56,19 +56,29 @@ DEFAULT_HYSTERESIS_BAND = 3
 # Pause horizon when no reset time is known anywhere (defensive fallback).
 DEFAULT_PAUSE_FALLBACK_S = 3600
 
-# The synthesized utilization assigned to an account a messages-API headroom
-# probe confirmed runnable RIGHT NOW (``signal="probe"``; see
-# ``registry.build_world`` / ``oauth.probe_messages_headroom``). A 2xx probe proves
-# only that "a turn works now", NOT an exact percentage, so we assume the account
-# is conservatively ~this full. The value is chosen against the default tunables:
+# The CONSERVATIVE DEFAULT utilization assigned to an account a messages-API
+# headroom probe confirmed runnable RIGHT NOW (``signal="probe"``; see
+# ``registry.build_world`` / ``oauth.probe_messages_headroom``) when NO real reading
+# is available. A 2xx probe proves only that "a turn works now", NOT an exact
+# percentage, so absent any other signal we assume the account is conservatively
+# ~this full. NOTE: when the probe-confirmed account still carries a fresh last-known
+# REAL reading (a 429 marker threads it forward), ``registry._probe_view`` uses
+# ``min(PROBE_CONFIRMED_PCT, real)`` instead — a near-idle account (e.g. 27%) is not
+# pinned at 80, so a large-context session actually fits and migrates rather than
+# pausing for hours. The value is chosen against the default tunables:
 #   * < exhaust_threshold - hysteresis_band (90-3=87) so a probe-confirmed account
 #     is ``_usable`` => a stranded session CAN resume/migrate onto it (the point —
 #     beating an hour-long pause);
 #   * leaves room under target_safety (85) for exactly ONE zero-ctx session
-#     (80 + BASE_RESERVE=3 = 83 <= 85 fits) but NOT a second (after the first lands,
-#     the online reservation makes the second see 80+3+3=86 > 85 => does not fit),
-#     so two stranded sessions don't co-exhaust the same probe-confirmed account;
-#   * deliberately pessimistic so a probe (a guess) ranks BELOW any account with
+#     (80 + BASE_RESERVE=3 = 83 <= 85 fits) but NOT a second when 80 is the base
+#     (after the first lands, the online reservation makes the second see
+#     80+3+3=86 > 85 => does not fit). Co-exhaust protection does NOT rely on the 80
+#     itself: it is the ONLINE RESERVATION (``registry._reserve_load_by_account`` +
+#     the in-pass ``projected`` debit, both folded through ``_with_reserve``) that
+#     stacks a second session's cost on top of whatever base pct applies — so even
+#     when a real low reading lowers the base, a second session still can't co-land
+#     unless the account genuinely has room for both;
+#   * deliberately pessimistic so a bare probe (a guess) ranks BELOW any account with
 #     KNOWN real headroom below 80% — ``_rank_accounts`` sorts on projected headroom,
 #     and most genuinely-usable real accounts sit well under 80%.
 PROBE_CONFIRMED_PCT = 80.0

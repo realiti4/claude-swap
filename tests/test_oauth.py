@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 from datetime import datetime, timezone
@@ -283,6 +284,32 @@ class TestRefreshOAuthCredentials:
         assert seen_body["refresh_token"] == "old-refresh"
         assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
         assert "scope" not in seen_body
+
+    def test_invalid_grant_sets_failure_flag(self):
+        """A dead refresh token (400 invalid_grant) is reported as logged-out, not transient."""
+        err = urllib.error.HTTPError(
+            url=oauth.OAUTH_TOKEN_URL, code=400, msg="Bad Request", hdrs=None,
+            fp=io.BytesIO(b'{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}'),
+        )
+        fail: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            refreshed = oauth.refresh_oauth_credentials(self._make_credentials(), failure_out=fail)
+
+        assert refreshed is None
+        assert fail.get("invalid_grant") is True
+
+    def test_transient_failure_does_not_set_invalid_grant(self):
+        """A 5xx / network blip is NOT a logged-out verdict — failure_out stays clean."""
+        err = urllib.error.HTTPError(
+            url=oauth.OAUTH_TOKEN_URL, code=503, msg="Service Unavailable", hdrs=None,
+            fp=io.BytesIO(b"upstream timeout"),
+        )
+        fail: dict = {}
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            refreshed = oauth.refresh_oauth_credentials(self._make_credentials(), failure_out=fail)
+
+        assert refreshed is None
+        assert "invalid_grant" not in fail
 
 
 class TestBuildTokenStatus:
