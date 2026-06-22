@@ -94,6 +94,22 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
+### Menu bar (macOS)
+
+Run a menu bar app that shows each account's usage and lets you switch with a click:
+
+```bash
+# Install with the optional menu bar extra
+uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+
+cswap --menubar
+```
+
+The menu shows every managed account's 5h / 7d / spend usage, switches accounts
+(specific / rotate / best / next-available), and mirrors the TUI's add / remove /
+refresh actions. A Settings submenu controls what the menu-bar title shows, the
+refresh interval, and launch-at-login.
+
 ### Other commands
 
 ```bash
