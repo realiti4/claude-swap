@@ -169,6 +169,7 @@ def build_usage_result(data: dict) -> dict | None:
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
+            h5_entry["resets_at"] = h5["resets_at"]
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
@@ -176,6 +177,7 @@ def build_usage_result(data: dict) -> dict | None:
         d7_entry = {"pct": d7["utilization"]}
         if d7.get("resets_at"):
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
+            d7_entry["resets_at"] = d7["resets_at"]
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")
@@ -197,6 +199,7 @@ def build_usage_result(data: dict) -> dict | None:
                 }
                 if eu.get("resets_at"):
                     spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+                    spend_entry["resets_at"] = eu["resets_at"]
                 result["spend"] = spend_entry
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)

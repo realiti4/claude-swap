@@ -1904,8 +1904,36 @@ class ClaudeAccountSwitcher:
 
         self._perform_switch(target_account)
 
-    def _perform_switch(self, target_account: str) -> None:
+    def auto_switch_to(self, target_account: str, quiet: bool = True) -> None:
+        """Switch performed by the auto-switcher engine.
+
+        Same transactional path as ``switch_to`` / ``_perform_switch`` but
+        pre-resolves the numeric target (engine passes a validated num) and
+        runs in quiet mode by default so daemon output goes to the log file
+        rather than stdout.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        self._get_sequence_data_migrated()
+
+        data = self._get_sequence_data()
+        if target_account not in (data or {}).get("accounts", {}):
+            from claude_swap.exceptions import AccountNotFoundError
+            raise AccountNotFoundError(
+                f"Account-{target_account} does not exist"
+            )
+
+        self._perform_switch(target_account, quiet=quiet)
+
+    def _perform_switch(self, target_account: str, quiet: bool = False) -> None:
         """Perform the actual account switch with transaction support.
+
+        Args:
+            target_account: Account slot number to switch to.
+            quiet: When True, suppress all stdout output and ``list_accounts``
+                call (daemon mode).  Default False keeps manual-switch output
+                byte-for-byte identical.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -1914,21 +1942,22 @@ class ClaudeAccountSwitcher:
         # default login to an account that also has a live session profile
         # puts the same refresh token in two config dirs — if the server
         # rotates it, one copy goes stale.
-        pre_data = self._get_sequence_data() or {}
-        pre_email = (
-            pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
-        )
-        if pre_email:
-            pids = self._live_session_pids(target_account, pre_email)
-            if pids:
-                warning(
-                    f"Account-{target_account} ({pre_email}) has a live session-mode "
-                    f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
-                    "same account as both the default login and a session can make "
-                    "one copy's token go stale if the server rotates it. If the "
-                    "session later fails to authenticate, exit it and re-run "
-                    f"'cswap run {target_account}'."
-                )
+        if not quiet:
+            pre_data = self._get_sequence_data() or {}
+            pre_email = (
+                pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
+            )
+            if pre_email:
+                pids = self._live_session_pids(target_account, pre_email)
+                if pids:
+                    warning(
+                        f"Account-{target_account} ({pre_email}) has a live session-mode "
+                        f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
+                        "same account as both the default login and a session can make "
+                        "one copy's token go stale if the server rotates it. If the "
+                        "session later fails to authenticate, exit it and re-run "
+                        f"'cswap run {target_account}'."
+                    )
 
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
@@ -2041,12 +2070,13 @@ class ClaudeAccountSwitcher:
                 self._logger.info(
                     f"Activated account {target_account} (no prior live account)"
                 )
-                print(
-                    f"{accent('Activated')} Account-{target_account} ({target_email})"
-                )
-                print()
-                self._print_switch_followup()
-                print()
+                if not quiet:
+                    print(
+                        f"{accent('Activated')} Account-{target_account} ({target_email})"
+                    )
+                    print()
+                    self._print_switch_followup()
+                    print()
                 return
 
             current_email, _ = current_identity
@@ -2145,15 +2175,20 @@ class ClaudeAccountSwitcher:
 
         # Lock released. Safe to do network I/O and let persist callbacks
         # re-acquire the lock from inside list_accounts().
-        print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
-        try:
-            self.list_accounts()
-        except Exception as e:
-            self._logger.warning(f"Post-switch usage display failed: {e!r}")
-            print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
-        print()
-        self._print_switch_followup()
-        print()
+        if not quiet:
+            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            try:
+                self.list_accounts()
+            except Exception as e:
+                self._logger.warning(f"Post-switch usage display failed: {e!r}")
+                print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
+            print()
+            self._print_switch_followup()
+            print()
+        else:
+            self._logger.info(
+                "auto-switch: activated account %s (%s)", target_account, target_email
+            )
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

@@ -963,6 +963,51 @@ class TestPerformSwitchPostDisplay:
         assert "usage display unavailable" in output
         assert "no restart needed" in output
 
+    def test_quiet_switch_with_live_session_prints_nothing(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """quiet=True must produce ZERO stdout even when the target has a live
+        session (the session-drift warning is suppressed), and the switch still
+        commits.
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        switcher.platform = Platform.LINUX
+
+        try:
+            # Target account 2 has a live session-mode Claude → without the
+            # quiet guard this would print a yellow session-drift warning.
+            with patch.object(
+                switcher, "_live_session_pids", return_value=[12345],
+            ):
+                switcher._perform_switch("2", quiet=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        # The switch committed.
+        data = switcher._get_sequence_data()
+        assert data is not None
+        assert data["activeAccountNumber"] == 2
+
+        # Quiet mode = zero stdout: no warning, no "Switched to", no followup.
+        out = capsys.readouterr().out
+        assert out == "", f"quiet switch should print nothing, got: {out!r}"
+
     def test_switch_followup_macos(self, temp_home: Path, capsys):
         """macOS shows the ~30s cache note; a restart applies it instantly."""
         switcher = ClaudeAccountSwitcher()

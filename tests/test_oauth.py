@@ -278,6 +278,80 @@ class TestFetchUsage:
         assert "spend" not in result
 
 
+class TestBuildUsageResultResetsAt:
+    """Assert that resets_at is preserved in build_usage_result output."""
+
+    @staticmethod
+    def _call(data: dict) -> dict | None:
+        return oauth.build_usage_result(data)
+
+    def test_five_hour_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(hours=3)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"five_hour": {"utilization": 42.0, "resets_at": ts}})
+        assert result is not None
+        assert result["five_hour"]["resets_at"] == ts
+
+    def test_seven_day_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(days=2)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"seven_day": {"utilization": 55.0, "resets_at": ts}})
+        assert result is not None
+        assert result["seven_day"]["resets_at"] == ts
+
+    def test_spend_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(days=10)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({
+                "extra_usage": {
+                    "is_enabled": True,
+                    "used_credits": 1000,
+                    "monthly_limit": 10000,
+                    "utilization": 10.0,
+                    "resets_at": ts,
+                    "currency": "USD",
+                }
+            })
+        assert result is not None
+        assert result["spend"]["resets_at"] == ts
+
+    def test_null_resets_at_not_stored(self):
+        result = self._call({"five_hour": {"utilization": 10.0, "resets_at": None}})
+        assert result is not None
+        assert "resets_at" not in result["five_hour"]
+
+    def test_missing_resets_at_not_stored(self):
+        result = self._call({"five_hour": {"utilization": 10.0}})
+        assert result is not None
+        assert "resets_at" not in result["five_hour"]
+
+    def test_resets_at_does_not_affect_existing_fields(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(hours=1)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"five_hour": {"utilization": 80.0, "resets_at": ts}})
+        assert result is not None
+        assert result["five_hour"]["pct"] == 80.0
+        assert "countdown" in result["five_hour"]
+        assert "clock" in result["five_hour"]
+        assert result["five_hour"]["resets_at"] == ts
+
+
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
 

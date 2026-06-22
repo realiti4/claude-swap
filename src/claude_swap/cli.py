@@ -7,7 +7,10 @@ import os
 import sys
 
 from claude_swap import __version__
+from claude_swap.auto_switch import AutoSwitcher, load_config as _as_load_config, save_config as _as_save_config
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.launchd import agent_status, install_agent, uninstall_agent
+from claude_swap.models import Platform
 from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -88,11 +91,139 @@ Examples:
         sys.exit(130)
 
 
+def _auto_command(argv: list[str]) -> None:
+    """Handle ``cswap auto [on|off|status]``, ``cswap watch``, ``cswap _auto-daemon``.
+
+    Pre-dispatched before the main argparse parser so these subcommands can
+    coexist with the existing required mutually-exclusive group.
+    """
+    from dataclasses import replace as _replace
+
+    from claude_swap.auto_switch import AutoSwitchConfig  # noqa: F401 — for type hints
+
+    verb = argv[0] if argv else "auto"
+
+    # Hidden daemon entry point (launchd calls this).
+    if verb == "_auto-daemon":
+        try:
+            switcher = ClaudeAccountSwitcher()
+            config = _as_load_config(switcher.backup_dir)
+            AutoSwitcher(switcher, config).run_daemon()
+        except Exception as exc:
+            error(f"Error: auto-switch daemon: {exc}")
+            sys.exit(1)
+        return
+
+    # Foreground watch loop.
+    if verb == "watch":
+        parser = argparse.ArgumentParser(prog="cswap watch")
+        parser.add_argument("--session-threshold", type=float, metavar="N")
+        parser.add_argument("--weekly-threshold", type=float, metavar="N")
+        parser.add_argument("--no-notify", action="store_true")
+        args = parser.parse_args(argv[1:])
+
+        if Platform.detect() is not Platform.MACOS:
+            print(dimmed(
+                "Auto-switch watch is a macOS-only feature for now.\n"
+                "The decision engine and tests run on all platforms."
+            ))
+            sys.exit(0)
+
+        try:
+            switcher = ClaudeAccountSwitcher()
+            config = _as_load_config(switcher.backup_dir)
+            overrides: dict = {}
+            if args.session_threshold is not None:
+                overrides["session_threshold"] = args.session_threshold
+            if args.weekly_threshold is not None:
+                overrides["weekly_threshold"] = args.weekly_threshold
+            if args.no_notify:
+                overrides["notify"] = False
+            if overrides:
+                config = _replace(config, **overrides)
+
+            AutoSwitcher(switcher, config).watch()
+        except Exception as exc:
+            error(f"Error: {exc}")
+            sys.exit(1)
+        return
+
+    # cswap auto [on|off|status]
+    parser = argparse.ArgumentParser(prog="cswap auto")
+    parser.add_argument(
+        "subverb",
+        nargs="?",
+        choices=["on", "off", "status"],
+        default="status",
+    )
+    parser.add_argument("--session-threshold", type=float, metavar="N")
+    parser.add_argument("--weekly-threshold", type=float, metavar="N")
+    parser.add_argument("--no-notify", action="store_true")
+    args = parser.parse_args(argv[1:])
+
+    try:
+        switcher = ClaudeAccountSwitcher()
+        backup_root = switcher.backup_dir
+
+        if args.subverb == "on":
+            config = _as_load_config(backup_root)
+            overrides_on: dict = {"enabled": True}
+            if args.session_threshold is not None:
+                overrides_on["session_threshold"] = args.session_threshold
+            if args.weekly_threshold is not None:
+                overrides_on["weekly_threshold"] = args.weekly_threshold
+            if args.no_notify:
+                overrides_on["notify"] = False
+            config = _replace(config, **overrides_on)
+            _as_save_config(config, backup_root)
+
+            if Platform.detect() is Platform.MACOS:
+                msg = install_agent(backup_root)
+                print(msg)
+            else:
+                print(dimmed(
+                    "Auto-switch daemon is macOS-only; config saved but daemon "
+                    "not installed. Use `cswap watch` to run it in the foreground."
+                ))
+
+        elif args.subverb == "off":
+            config = _as_load_config(backup_root)
+            config = _replace(config, enabled=False)
+            _as_save_config(config, backup_root)
+
+            if Platform.detect() is Platform.MACOS:
+                msg = uninstall_agent()
+                print(msg)
+            else:
+                print(dimmed("Config saved (no daemon to uninstall — macOS only)."))
+
+        else:  # status (default)
+            config = _as_load_config(backup_root)
+            print(f"enabled:           {config.enabled}")
+            print(f"session_threshold: {config.session_threshold}%")
+            print(f"weekly_threshold:  {config.weekly_threshold}%")
+            print(f"notify:            {config.notify}")
+            print(f"poll interval:     {config.min_interval}s – {config.max_interval}s")
+
+            if Platform.detect() is Platform.MACOS:
+                print(f"agent:             {agent_status()}")
+            else:
+                print(dimmed("agent:             n/a (macOS only)"))
+
+    except Exception as exc:
+        error(f"Error: {exc}")
+        sys.exit(1)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         _run_command(sys.argv[2:])
         return  # only reachable in tests where exec/exit is mocked
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("auto", "watch", "_auto-daemon"):
+        _auto_command(sys.argv[1:])
+        return
 
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
@@ -112,6 +243,8 @@ Examples:
   %(prog)s --switch-to user@example.com
   %(prog)s run 2                            # run account 2 in this terminal only
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
+  %(prog)s auto on                          # macOS: auto-switch accounts before you hit a limit
+  %(prog)s watch                            # run the auto-switcher in this terminal
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge

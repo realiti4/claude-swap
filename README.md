@@ -107,6 +107,53 @@ cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
 ```
 
+### Auto-switch (macOS only)
+
+Automatically switch to the next available account when your current account's quota nears its limit — no manual intervention required.
+
+#### Background daemon (recommended)
+
+Install a launchd agent that monitors usage and switches in the background:
+
+```bash
+cswap auto on          # Enable auto-switch and install the launchd daemon
+cswap auto off         # Disable and uninstall the daemon
+cswap auto status      # Show daemon status and current config
+```
+
+The daemon starts automatically at login and restarts if it crashes.
+
+#### Foreground watch mode
+
+Run the monitor in the current terminal (useful for debugging or one-off sessions):
+
+```bash
+cswap watch
+```
+
+Press `Ctrl+C` to stop.
+
+#### How it works
+
+- **Session threshold** (default 98%): when the active account's 5-hour usage reaches this percentage, auto-switch triggers.
+- **Weekly threshold** (default 99%): same logic for the 7-day rolling window.
+- The next account is chosen by: earliest reset time → most remaining headroom → rotation order.
+- Accounts with active Claude Code sessions are excluded from the candidate pool.
+- A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
+
+#### Configuration
+
+Adjust thresholds when enabling:
+
+```bash
+cswap auto on --session-threshold 95 --weekly-threshold 98
+cswap auto on --no-notify          # disable desktop notifications
+```
+
+The config is stored in `<backup-root>/auto-switch.json` and survives daemon restarts.
+
+> **Note:** Auto-switch is macOS-only. The `watch` command and daemon require macOS. The underlying decision engine (`cswap auto on/off/status`) works on all platforms but the daemon integration uses launchd.
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
