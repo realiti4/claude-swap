@@ -51,3 +51,72 @@ class MenuBarSettings:
         """Write settings as pretty JSON, creating parent directories."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+def tightest_pct(usage: dict | str | None) -> float | None:
+    """Highest 5h/7d utilization percentage, or None if unknown.
+
+    Mirrors ``oauth.account_headroom`` (which returns ``100 - max(pct)``) but
+    surfaces the utilization itself for display. Spend is excluded — it isn't
+    a rate-limit window.
+    """
+    if not isinstance(usage, dict):
+        return None
+    pcts = [
+        window["pct"]
+        for window in (usage.get("five_hour"), usage.get("seven_day"))
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float))
+    ]
+    return max(pcts) if pcts else None
+
+
+def usage_summary(usage: dict | str | None) -> str:
+    """One-line usage summary for an account row."""
+    if isinstance(usage, str):
+        return usage
+    if usage is None:
+        return "usage unavailable"
+    parts: list[str] = []
+    h5 = usage.get("five_hour")
+    if isinstance(h5, dict) and isinstance(h5.get("pct"), (int, float)):
+        parts.append(f"5h {h5['pct']:.0f}%")
+    d7 = usage.get("seven_day")
+    if isinstance(d7, dict) and isinstance(d7.get("pct"), (int, float)):
+        parts.append(f"7d {d7['pct']:.0f}%")
+    spend = usage.get("spend")
+    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+        parts.append(f"$ {spend['pct']:.0f}%")
+    return " · ".join(parts) if parts else "usage unavailable"
+
+
+def format_account_label(num: int, email: str, usage: dict | str | None) -> str:
+    """Build one account row's menu label."""
+    return f"{num}  {email}  {usage_summary(usage)}"
+
+
+def _local_part(email: str, limit: int = 12) -> str:
+    """Email text before '@', truncated with a trailing '*' marker."""
+    local = email.split("@", 1)[0]
+    if len(local) > limit:
+        return local[: limit - 1] + "*"
+    return local
+
+
+def format_title(
+    active_email: str | None,
+    active_usage: dict | str | None,
+    settings: MenuBarSettings,
+) -> str:
+    """Build the menu-bar title from the active account and settings."""
+    if active_email is None:
+        return ICON
+    segments: list[str] = []
+    if settings.show_account_name:
+        segments.append(_local_part(active_email))
+    if settings.show_quota_pct:
+        pct = tightest_pct(active_usage)
+        if pct is not None:
+            segments.append(f"{pct:.0f}%")
+    if not segments:
+        return ICON
+    return f"{ICON} " + " · ".join(segments)
