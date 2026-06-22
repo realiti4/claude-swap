@@ -110,6 +110,20 @@ The menu shows every managed account's 5h / 7d / spend usage, switches accounts
 refresh actions. A Settings submenu controls what the menu-bar title shows, the
 refresh interval, and launch-at-login.
 
+**Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
+switch automatically when the active account crosses a usage threshold. When the
+active account hits the threshold on its 5h or 7d window, it switches to the
+account with the most headroom (skipping any that are themselves at the
+threshold), then notifies you to restart Claude Code. Configure:
+
+- **Threshold** (80% / 90% / 95%) — the usage level that triggers a switch.
+- **Cooldown** (5m / 10m / 30m) — minimum time between automatic switches.
+- **Check** — evaluate *with each display refresh*, or on an independent
+  1m / 3m / 5m timer.
+
+Defaults are 95% / 10m / with-display-refresh, and auto-switch is off until you
+enable it.
+
 ### Other commands
 
 ```bash
