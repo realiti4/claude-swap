@@ -166,6 +166,84 @@ def format_title(
     return f"{ICON} " + " · ".join(segments)
 
 
+NOSWAP_NOTIFY_EVERY = 3600  # seconds between repeat "no fresh account" notifications
+
+
+def _window_pct(usage: dict | str | None, key: str) -> float | None:
+    """Utilization pct for a usage window (``five_hour``/``seven_day``), or None."""
+    if isinstance(usage, dict):
+        window = usage.get(key)
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            return float(window["pct"])
+    return None
+
+
+def _worst_pct(usage: dict | str | None) -> float | None:
+    """Higher of the 5h/7d utilization, or None if either window is unknown."""
+    five = _window_pct(usage, "five_hour")
+    seven = _window_pct(usage, "seven_day")
+    if five is None or seven is None:
+        return None
+    return max(five, seven)
+
+
+def decide_auto_switch(
+    accounts: list[tuple[int, str, bool, dict | str | None]],
+    threshold: float,
+) -> tuple[str, int | None]:
+    """Decide whether to auto-switch, mirroring the launchd monitor's rule.
+
+    Returns one of ``("switch", num)``, ``("none", None)``,
+    ``("no_candidate", None)``, ``("unknown_active", None)``. Total — never raises.
+    """
+    active = next((a for a in accounts if a[2]), None)
+    if active is None:
+        return ("none", None)
+    active_worst = _worst_pct(active[3])
+    if active_worst is None:
+        return ("unknown_active", None)
+    if active_worst < threshold:
+        return ("none", None)
+
+    candidates: list[tuple[float, float, float, int]] = []
+    for num, _email, is_active, usage in accounts:
+        if is_active:
+            continue
+        worst = _worst_pct(usage)
+        if worst is None or worst >= threshold:
+            continue
+        seven = _window_pct(usage, "seven_day")
+        five = _window_pct(usage, "five_hour")
+        candidates.append((worst, seven, five, num))  # seven/five are not None here
+    if not candidates:
+        return ("no_candidate", None)
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return ("switch", candidates[0][3])
+
+
+def plan_auto_switch(
+    decision: tuple[str, int | None],
+    state: "MenuBarState",
+    settings: "MenuBarSettings",
+    now: float,
+) -> tuple[str, int | None]:
+    """Apply cooldown + notification rate-limiting to a decision.
+
+    Returns ``("switch", num)``, ``("cooldown", None)``,
+    ``("notify_noswap", None)``, or ``("noop", None)``. Total — never raises.
+    """
+    kind, num = decision
+    if kind == "switch":
+        if now - state.last_switch_at >= settings.auto_switch_cooldown:
+            return ("switch", num)
+        return ("cooldown", None)
+    if kind == "no_candidate":
+        if now - state.last_noswap_notify_at >= NOSWAP_NOTIFY_EVERY:
+            return ("notify_noswap", None)
+        return ("noop", None)
+    return ("noop", None)
+
+
 LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
 
 

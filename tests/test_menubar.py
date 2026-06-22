@@ -199,3 +199,89 @@ def test_state_accepts_int_timestamps(tmp_path: Path):
     st = menubar.MenuBarState.load(path)
     assert st.last_switch_at == 1750000000.0
     assert isinstance(st.last_switch_at, float)
+
+
+def _acct(num, pct5, pct7, active=False):
+    return (num, f"a{num}@x.com", active,
+            {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}})
+
+
+def test_decide_active_has_headroom():
+    accts = [_acct(1, 50, 10, active=True), _acct(2, 5, 5)]
+    assert menubar.decide_auto_switch(accts, 95) == ("none", None)
+
+
+def test_decide_active_over_5h_picks_best():
+    accts = [_acct(1, 96, 10, active=True), _acct(2, 40, 30), _acct(3, 10, 80)]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+
+
+def test_decide_active_over_7d():
+    accts = [_acct(1, 10, 97, active=True), _acct(2, 50, 20)]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+
+
+def test_decide_skips_saturated_candidates():
+    accts = [_acct(1, 99, 10, active=True), _acct(2, 96, 5), _acct(3, 97, 99)]
+    assert menubar.decide_auto_switch(accts, 95) == ("no_candidate", None)
+
+
+def test_decide_tie_break_by_7d_then_5h():
+    # both candidates worst=40; lower 7d wins -> acct 2 (7d 30 < 7d 40)
+    accts = [_acct(1, 99, 10, active=True), _acct(2, 40, 30), _acct(3, 20, 40)]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+
+
+def test_decide_unknown_active():
+    accts = [(1, "a@x", True, "no credentials"), _acct(2, 5, 5)]
+    assert menubar.decide_auto_switch(accts, 95) == ("unknown_active", None)
+
+
+def test_decide_active_missing_one_window_is_unknown():
+    accts = [(1, "a@x", True, {"five_hour": {"pct": 99}}), _acct(2, 5, 5)]
+    assert menubar.decide_auto_switch(accts, 95) == ("unknown_active", None)
+
+
+def test_decide_excludes_unknown_candidate():
+    accts = [_acct(1, 99, 10, active=True), (2, "b@x", False, None), _acct(3, 50, 50)]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
+
+
+def test_decide_no_other_accounts():
+    accts = [_acct(1, 99, 10, active=True)]
+    assert menubar.decide_auto_switch(accts, 95) == ("no_candidate", None)
+
+
+def test_decide_no_active_account():
+    accts = [_acct(1, 50, 10), _acct(2, 5, 5)]
+    assert menubar.decide_auto_switch(accts, 95) == ("none", None)
+
+
+def test_plan_switch_outside_cooldown():
+    st = menubar.MenuBarState(last_switch_at=0.0)
+    s = menubar.MenuBarSettings(auto_switch_cooldown=600)
+    assert menubar.plan_auto_switch(("switch", 2), st, s, 1000.0) == ("switch", 2)
+
+
+def test_plan_switch_within_cooldown():
+    st = menubar.MenuBarState(last_switch_at=900.0)
+    s = menubar.MenuBarSettings(auto_switch_cooldown=600)
+    assert menubar.plan_auto_switch(("switch", 2), st, s, 1000.0) == ("cooldown", None)
+
+
+def test_plan_no_candidate_past_rate_limit():
+    st = menubar.MenuBarState(last_noswap_notify_at=0.0)
+    s = menubar.MenuBarSettings()
+    assert menubar.plan_auto_switch(("no_candidate", None), st, s, 5000.0) == ("notify_noswap", None)
+
+
+def test_plan_no_candidate_within_rate_limit():
+    st = menubar.MenuBarState(last_noswap_notify_at=4000.0)
+    s = menubar.MenuBarSettings()
+    assert menubar.plan_auto_switch(("no_candidate", None), st, s, 5000.0) == ("noop", None)
+
+
+def test_plan_none_and_unknown_are_noop():
+    st, s = menubar.MenuBarState(), menubar.MenuBarSettings()
+    assert menubar.plan_auto_switch(("none", None), st, s, 1e9) == ("noop", None)
+    assert menubar.plan_auto_switch(("unknown_active", None), st, s, 1e9) == ("noop", None)
