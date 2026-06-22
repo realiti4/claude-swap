@@ -10,6 +10,7 @@ the app glue.
 from __future__ import annotations
 
 import json
+import plistlib
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -120,3 +121,32 @@ def format_title(
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
+
+
+LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
+
+
+def launch_agent_path() -> Path:
+    """Path to the menu bar LaunchAgent plist."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+
+
+def render_launch_agent(program_args: list[str]) -> bytes:
+    """Render the LaunchAgent plist that starts the menu bar at login."""
+    return plistlib.dumps(
+        {
+            "Label": LAUNCH_AGENT_LABEL,
+            "ProgramArguments": list(program_args),
+            "RunAtLoad": True,
+        }
+    )
+
+
+def set_launch_at_login(enabled: bool, program_args: list[str]) -> None:
+    """Install or remove the login LaunchAgent. Removal is idempotent."""
+    path = launch_agent_path()
+    if enabled:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(render_launch_agent(program_args))
+    else:
+        path.unlink(missing_ok=True)
