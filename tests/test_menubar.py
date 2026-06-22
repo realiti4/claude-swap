@@ -151,3 +151,23 @@ def test_set_launch_at_login_writes_then_removes(tmp_path, monkeypatch):
     assert not plist.exists()
     # idempotent: removing again does not raise
     menubar.set_launch_at_login(False, ["/usr/bin/cswap", "--menubar"])
+
+
+def test_settings_auto_switch_defaults(tmp_path: Path):
+    s = menubar.MenuBarSettings.load(tmp_path / "missing.json")
+    assert s.auto_switch_enabled is False
+    assert s.auto_switch_threshold == 95
+    assert s.auto_switch_cooldown == 600
+    assert s.auto_switch_interval == 0
+
+
+def test_settings_auto_switch_round_trip(tmp_path: Path):
+    path = tmp_path / "settings.json"
+    orig = menubar.MenuBarSettings(
+        auto_switch_enabled=True,
+        auto_switch_threshold=80,
+        auto_switch_cooldown=300,
+        auto_switch_interval=180,
+    )
+    orig.save(path)
+    assert menubar.MenuBarSettings.load(path) == orig

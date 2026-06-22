@@ -30,6 +30,10 @@ class MenuBarSettings:
     show_quota_pct: bool = True
     refresh_interval: int = 60
     launch_at_login: bool = False
+    auto_switch_enabled: bool = False
+    auto_switch_threshold: int = 95
+    auto_switch_cooldown: int = 600
+    auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
