@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import json
 import plistlib
+import sys
+import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+
+from claude_swap import oauth
+from claude_swap.exceptions import ClaudeSwitchError
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -150,3 +155,259 @@ def set_launch_at_login(enabled: bool, program_args: list[str]) -> None:
         path.write_bytes(render_launch_agent(program_args))
     else:
         path.unlink(missing_ok=True)
+
+
+def _snapshot(switcher) -> dict:
+    """Fetch accounts + usage off the main thread. Returns a render snapshot.
+
+    Shape: ``{"accounts": [(num, email, is_active, usage), ...],
+    "active_email": str | None, "active_usage": dict | str | None}``.
+    Never raises — failures degrade to empty/unknown so the UI stays alive.
+    """
+    try:
+        accounts_info = switcher._build_accounts_info()
+        usages = switcher._collect_usage(accounts_info)
+    except Exception:
+        switcher._logger.debug("menubar snapshot failed", exc_info=True)
+        return {"accounts": [], "active_email": None, "active_usage": None}
+
+    accounts = []
+    active_email = None
+    active_usage = None
+    for (num, email, _org, _uuid, is_active, _creds), usage in zip(accounts_info, usages):
+        accounts.append((num, email, is_active, usage))
+        if is_active:
+            active_email, active_usage = email, usage
+    return {
+        "accounts": accounts,
+        "active_email": active_email,
+        "active_usage": active_usage,
+    }
+
+
+def run(switcher) -> int:
+    """Entry point for ``cswap --menubar``. Blocks until the user quits."""
+    import rumps  # lazy: optional dependency, imported only when launching
+
+    settings_path = switcher.backup_dir / "menubar_settings.json"
+
+    class MenuBarApp(rumps.App):
+        def __init__(self):
+            super().__init__(ICON, quit_button=None)
+            self.switcher = switcher
+            self.settings = MenuBarSettings.load(settings_path)
+            self.snapshot = {"accounts": [], "active_email": None, "active_usage": None}
+            self._dirty = False
+            self.rebuild_menu()
+            # Background refresh on the user's interval, plus a fast UI-sync tick
+            # that applies snapshots produced by worker threads on the main thread.
+            self.refresh_timer = rumps.Timer(self.on_refresh_tick, self.settings.refresh_interval)
+            self.refresh_timer.start()
+            self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
+            self.sync_timer.start()
+            self.refresh_async()  # first fetch
+
+        # ---- refresh plumbing -------------------------------------------------
+        def refresh_async(self):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+        def _worker(self):
+            snap = _snapshot(self.switcher)
+            self.snapshot = snap
+            self._dirty = True  # picked up by on_sync_tick on the main thread
+
+        def on_refresh_tick(self, _timer):
+            self.refresh_async()
+
+        def on_sync_tick(self, _timer):
+            if self._dirty:
+                self._dirty = False
+                self.rebuild_menu()
+
+        # ---- menu construction ------------------------------------------------
+        def rebuild_menu(self):
+            self.title = format_title(
+                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
+            )
+            self.menu.clear()
+            account_items = []
+            for num, email, is_active, usage in self.snapshot["accounts"]:
+                item = rumps.MenuItem(
+                    format_account_label(num, email, usage),
+                    callback=self._make_switch_to(num),
+                )
+                item.state = 1 if is_active else 0
+                account_items.append(item)
+            if not account_items:
+                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+
+            self.menu = [
+                *account_items,
+                None,
+                rumps.MenuItem("Rotate to next", callback=self._switch(None)),
+                rumps.MenuItem("Switch to best", callback=self._switch("best")),
+                rumps.MenuItem("Next available", callback=self._switch("next-available")),
+                None,
+                self._add_menu(rumps),
+                self._remove_menu(rumps),
+                rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
+                None,
+                self._settings_menu(rumps),
+                rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
+                rumps.MenuItem("Quit", callback=rumps.quit_application),
+            ]
+
+        def _add_menu(self, rumps):
+            menu = rumps.MenuItem("Add account")
+            menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
+            if hasattr(self.switcher, "add_account_from_token"):
+                menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
+            return menu
+
+        def _remove_menu(self, rumps):
+            menu = rumps.MenuItem("Remove account")
+            accounts = self.snapshot["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            for num, email, _is_active, _usage in accounts:
+                menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
+            return menu
+
+        def _settings_menu(self, rumps):
+            menu = rumps.MenuItem("Settings")
+            name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
+            name_item.state = 1 if self.settings.show_account_name else 0
+            pct_item = rumps.MenuItem("Show quota % in menu bar", callback=self.on_toggle_pct)
+            pct_item.state = 1 if self.settings.show_quota_pct else 0
+            menu.add(name_item)
+            menu.add(pct_item)
+            interval = rumps.MenuItem("Refresh interval")
+            labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+            for secs in REFRESH_CHOICES:
+                choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
+                choice.state = 1 if self.settings.refresh_interval == secs else 0
+                interval.add(choice)
+            menu.add(interval)
+            login_item = rumps.MenuItem("Launch at login", callback=self.on_toggle_login)
+            login_item.state = 1 if self.settings.launch_at_login else 0
+            menu.add(login_item)
+            return menu
+
+        # ---- callbacks --------------------------------------------------------
+        def _save_and_rebuild(self):
+            self.settings.save(settings_path)
+            self.rebuild_menu()
+
+        def _guard(self, fn):
+            """Run a switcher action, surfacing ClaudeSwitchError via an alert."""
+            try:
+                fn()
+                return True
+            except ClaudeSwitchError as e:
+                rumps.alert(title="claude-swap", message=str(e))
+                return False
+
+        def _notify_switched(self):
+            # macOS-only app, so always the Keychain-TTL guidance from
+            # ClaudeAccountSwitcher._print_switch_followup.
+            rumps.notification(
+                "claude-swap",
+                "Account switched",
+                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
+            )
+
+        def _make_switch_to(self, num):
+            def cb(_sender):
+                if self._guard(lambda: self.switcher.switch_to(str(num))):
+                    self._notify_switched()
+                    self.refresh_async()
+            return cb
+
+        def _switch(self, strategy):
+            def cb(_sender):
+                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                    self._notify_switched()
+                    self.refresh_async()
+            return cb
+
+        def _make_remove(self, num):
+            def cb(_sender):
+                if rumps.alert(
+                    title="Remove account",
+                    message=f"Remove account {num}?",
+                    ok="Remove",
+                    cancel="Cancel",
+                ) == 1:  # 1 == OK
+                    if self._guard(lambda: self.switcher.remove_account(str(num))):
+                        self.refresh_async()
+            return cb
+
+        def on_add_login(self, _sender):
+            if self._guard(self.switcher.add_account):
+                self.refresh_async()
+
+        def on_add_token(self, _sender):
+            email_win = rumps.Window(
+                title="Add account from setup-token",
+                message="Email for this token:",
+                ok="Next", cancel="Cancel", dimensions=(320, 24),
+            )
+            email_resp = email_win.run()
+            if email_resp.clicked != 1 or not email_resp.text.strip():
+                return
+            token_win = rumps.Window(
+                title="Add account from setup-token",
+                message="Setup token (sk-ant-oat01-…):",
+                ok="Add", cancel="Cancel", dimensions=(320, 24),
+            )
+            token_resp = token_win.run()
+            if token_resp.clicked != 1 or not token_resp.text.strip():
+                return
+            if self._guard(lambda: self.switcher.add_account_from_token(
+                token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
+            )):
+                self.refresh_async()
+
+        def on_refresh_creds(self, _sender):
+            if self.switcher._get_current_account() is None:
+                rumps.alert(title="claude-swap",
+                            message="No active Claude Code login detected. Log in first.")
+                return
+            if self._guard(lambda: self.switcher.add_account(slot=None)):
+                self.refresh_async()
+
+        def on_refresh_now(self, _sender):
+            self.refresh_async()
+
+        def on_toggle_name(self, _sender):
+            self.settings.show_account_name = not self.settings.show_account_name
+            self._save_and_rebuild()
+
+        def on_toggle_pct(self, _sender):
+            self.settings.show_quota_pct = not self.settings.show_quota_pct
+            self._save_and_rebuild()
+
+        def _make_interval(self, secs):
+            def cb(_sender):
+                self.settings.refresh_interval = secs
+                self.refresh_timer.interval = secs
+                self._save_and_rebuild()
+            return cb
+
+        def on_toggle_login(self, _sender):
+            enabled = not self.settings.launch_at_login
+            try:
+                set_launch_at_login(enabled, _program_args())
+            except OSError as e:
+                rumps.alert(title="claude-swap", message=f"Could not update login item: {e}")
+                return
+            self.settings.launch_at_login = enabled
+            self._save_and_rebuild()
+
+    MenuBarApp().run()
+    return 0
+
+
+def _program_args() -> list[str]:
+    """Argv that re-launches the menu bar — used for the login plist."""
+    return [sys.executable, "-m", "claude_swap", "--menubar"]
