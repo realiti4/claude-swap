@@ -123,12 +123,30 @@ cswap --purge                   # Remove all claude-swap data
 | Platform | Credentials | Config backups |
 |----------|-------------|----------------|
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
-| macOS | macOS Keychain | `~/.claude-swap-backup/` |
+| macOS | macOS Keychain (or file-based with `CSWAP_FILE_STORAGE`) | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location. Data from older installs under `~/.claude-swap-backup/` is migrated automatically on first run.
+
+### macOS file-based storage (`CSWAP_FILE_STORAGE`)
+
+macOS stores credentials in the login Keychain by default. On a headless or remote
+macOS host (SSH/mosh, CI, a detached daemon) the Keychain is often locked or
+unreachable, so the `security` CLI prompts for an unlock that never gets answered —
+or fails outright. Claude Code itself falls back to `~/.claude/.credentials.json`
+there, so set `CSWAP_FILE_STORAGE=1` to make cswap store credentials (active and
+`.enc` backups) as files too, staying in lockstep with Claude Code:
+
+```bash
+export CSWAP_FILE_STORAGE=1   # e.g. in ~/.zshrc on the remote host
+```
+
+This is opt-in; the Keychain remains the macOS default. Set it from the start (or
+re-add your accounts afterwards), since file-stored and Keychain-stored credentials
+live in different places. Linux/WSL/Windows always use file storage and ignore the
+variable.
 
 ## Advanced
 

@@ -238,17 +238,37 @@ class ClaudeAccountSwitcher:
         if sys.platform != "win32":
             os.chmod(path, 0o600)
 
+    def _prefer_file_storage(self) -> bool:
+        """Whether credentials should live in files rather than the macOS Keychain.
+
+        Linux/WSL/Windows always use files. macOS uses the Keychain by default,
+        but a headless or remote session (SSH/mosh, CI, a detached daemon) often
+        cannot reach the login Keychain: ``security`` then prompts for an unlock
+        that never gets answered, or fails outright. Claude Code itself falls
+        back to ``~/.claude/.credentials.json`` in that situation, so setting
+        ``CSWAP_FILE_STORAGE=1`` makes cswap store and read credentials as files
+        on macOS too, staying in lockstep with Claude Code.
+
+        Opt-in only: the Keychain remains the macOS default. Switch the variable
+        on from the start (or re-add accounts afterwards), since file-stored and
+        Keychain-stored credentials live in different places.
+        """
+        if self.platform in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
+            return True
+        return bool(os.environ.get("CSWAP_FILE_STORAGE"))
+
     def _read_credentials(self) -> str | None:
         """Read credentials from Claude Code's storage.
 
         Claude Code stores credentials in:
         - macOS: Keychain with service "Claude Code-credentials"
-        - Linux/WSL/Windows: File at ~/.claude/.credentials.json
+        - Linux/WSL/Windows (or macOS with ``CSWAP_FILE_STORAGE``): File at
+          ~/.claude/.credentials.json
 
         Returns:
             Credentials string if found, empty string if not found, None on error.
         """
-        if self.platform == Platform.MACOS:
+        if not self._prefer_file_storage():
             try:
                 val = macos_keychain.get_password(
                     CLAUDE_CODE_KEYCHAIN_SERVICE, os.environ.get("USER", "user")
@@ -274,12 +294,13 @@ class ClaudeAccountSwitcher:
 
         Claude Code stores credentials in:
         - macOS: Keychain with service "Claude Code-credentials"
-        - Linux/WSL/Windows: File at ~/.claude/.credentials.json
+        - Linux/WSL/Windows (or macOS with ``CSWAP_FILE_STORAGE``): File at
+          ~/.claude/.credentials.json
 
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
-        if self.platform == Platform.MACOS:
+        if not self._prefer_file_storage():
             try:
                 macos_keychain.set_password(
                     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -318,11 +339,12 @@ class ClaudeAccountSwitcher:
 
         Linux/WSL/Windows store them as base64 files under ``credentials_dir``;
         macOS (and any UNKNOWN platform) use the macOS Keychain (via the
-        ``security`` CLI). Windows moved to files because the Windows Credential
-        Manager rejects entries over ~2,500 bytes, which Claude Code session
-        credentials can exceed (#45).
+        ``security`` CLI), unless ``CSWAP_FILE_STORAGE`` opts macOS into files
+        too (see ``_prefer_file_storage``). Windows moved to files because the
+        Windows Credential Manager rejects entries over ~2,500 bytes, which
+        Claude Code session credentials can exceed (#45).
         """
-        return self.platform in (Platform.LINUX, Platform.WSL, Platform.WINDOWS)
+        return self._prefer_file_storage()
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         """Read account credentials from backup.
@@ -1960,12 +1982,13 @@ class ClaudeAccountSwitcher:
         """Print the platform-appropriate note after a successful switch.
 
         A restart is never required: Claude Code clears its cached OAuth token
-        when ``.credentials.json`` changes (Linux/WSL/Windows — effective on the
+        when ``.credentials.json`` changes (file storage — effective on the
         next message) or when the macOS Keychain cache TTL (~30s) expires. Both
-        lines are therefore dim informational hints, not warnings; macOS adds
-        that a restart skips the ~30s wait.
+        lines are therefore dim informational hints, not warnings; the Keychain
+        path adds that a restart skips the ~30s wait. The file-storage note also
+        covers macOS under ``CSWAP_FILE_STORAGE``.
         """
-        if self.platform == Platform.MACOS:
+        if not self._prefer_file_storage():
             print(dimmed(
                 "Switch takes effect within about 30 seconds — "
                 "restart Claude Code to apply immediately."

@@ -2821,3 +2821,82 @@ class TestUsageAwareSwitch:
 
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+
+class TestMacosFileStorageOptIn:
+    """macOS file-storage opt-in via ``CSWAP_FILE_STORAGE``.
+
+    Lets a headless/remote macOS host (SSH/mosh, CI) store credentials in
+    ``~/.claude/.credentials.json`` and ``.enc`` backup files instead of the
+    login Keychain, matching Claude Code's own fallback. Keychain stays the
+    macOS default; the variable is strictly opt-in.
+    """
+
+    def test_macos_defaults_to_keychain(self, temp_home: Path, monkeypatch):
+        monkeypatch.delenv("CSWAP_FILE_STORAGE", raising=False)
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        assert s._prefer_file_storage() is False
+        assert s._uses_file_backup_backend() is False
+
+    def test_macos_opts_into_file_storage(self, temp_home: Path, monkeypatch):
+        monkeypatch.setenv("CSWAP_FILE_STORAGE", "1")
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        assert s._prefer_file_storage() is True
+        assert s._uses_file_backup_backend() is True
+
+    def test_non_macos_always_uses_files_regardless_of_env(
+        self, temp_home: Path, monkeypatch
+    ):
+        monkeypatch.delenv("CSWAP_FILE_STORAGE", raising=False)
+        for plat in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
+            s = ClaudeAccountSwitcher()
+            s.platform = plat
+            assert s._prefer_file_storage() is True, plat
+
+    def test_macos_active_credentials_roundtrip_via_file(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        monkeypatch.setenv("CSWAP_FILE_STORAGE", "1")
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+
+        creds = '{"claudeAiOauth": {"accessToken": "tok"}}'
+        s._write_credentials(creds)
+
+        cred_file = temp_home / ".claude" / ".credentials.json"
+        assert cred_file.exists()
+        assert s._read_credentials() == creds
+        # File storage must bypass the Keychain entirely.
+        assert block_real_keychain.data == {}
+
+    def test_macos_backup_credentials_use_enc_files(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        monkeypatch.setenv("CSWAP_FILE_STORAGE", "1")
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+
+        with patch.object(s, "_live_session_pids", return_value=[]), \
+             patch.object(s, "_invalidate_session_credentials"):
+            s._write_account_credentials("2", "user@example.com", "secret-creds")
+
+        enc = s.credentials_dir / ".creds-2-user@example.com.enc"
+        assert enc.exists()
+        assert s._read_account_credentials("2", "user@example.com") == "secret-creds"
+        assert block_real_keychain.data == {}
+
+    def test_macos_followup_message_under_file_storage(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("CSWAP_FILE_STORAGE", "1")
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+
+        s._print_switch_followup()
+
+        out = capsys.readouterr().out
+        assert "no restart needed" in out
+        assert "30 seconds" not in out
