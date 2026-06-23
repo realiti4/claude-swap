@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -10,15 +11,27 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
     ValidationError,
 )
+from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
-from claude_swap.paths import get_backup_root
-from claude_swap.switcher import ClaudeAccountSwitcher, SETUP_TOKEN_SCOPES
+from claude_swap.paths import get_backup_root, get_credentials_path
+from claude_swap.switcher import (
+    CLAUDE_CODE_KEYCHAIN_SERVICE,
+    ClaudeAccountSwitcher,
+    SECURITY_SERVICE,
+    SETUP_TOKEN_SCOPES,
+)
+
+
+def _raise_locked(*args, **kwargs):
+    """Stand-in for a locked/unavailable Keychain operation."""
+    raise KeychainError("locked")
 
 
 class TestEmailValidation:
@@ -958,8 +971,8 @@ class TestPerformSwitchPostDisplay:
         switcher._print_switch_followup()
 
         out = capsys.readouterr().out
-        assert "within about 30 seconds" in out
         assert "apply immediately" in out
+        assert "30 seconds" in out
         assert "no restart needed" not in out
 
     def test_switch_followup_non_macos(self, temp_home: Path, capsys):
@@ -2909,3 +2922,258 @@ class TestRemoveAccountForce:
         data = s._get_sequence_data()
         assert "2" not in data["accounts"]
         assert 2 not in data["sequence"]
+
+
+class TestMacosKeychainFallback:
+    """macOS auto-fallback to file storage when the Keychain is unusable, plus the
+    ``.enc``-wins backup reconciliation.
+
+    The autouse ``block_real_keychain`` fixture fakes a *working* in-memory
+    Keychain; individual tests force failures by patching the ``macos_keychain``
+    wrapper to raise ``KeychainError`` (``_raise_locked``).
+    """
+
+    def _macos_switcher(self) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        return s
+
+    # -- capability cache -------------------------------------------------
+
+    def test_non_macos_never_uses_keychain(self, temp_home: Path):
+        for plat in (Platform.LINUX, Platform.WSL, Platform.WINDOWS):
+            s = ClaudeAccountSwitcher()
+            s.platform = plat
+            assert s._use_keychain() is False
+            assert s._uses_file_backup_backend() is True
+
+    def test_capability_cache_sticky_false(self, temp_home: Path, monkeypatch):
+        s = self._macos_switcher()
+        assert s._use_keychain() is True  # optimistic before any op
+
+        # A failing op flips routing to unusable for the rest of the process...
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with pytest.raises(KeychainError):
+            s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._use_keychain() is False
+
+        # ...and a later *success* must NOT flip it back (no split-brain).
+        monkeypatch.setattr(macos_keychain, "get_password", lambda *a, **k: "ok")
+        s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._use_keychain() is False
+
+    def test_item_exists_is_capability_neutral(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False  # already in file mode this run
+        block_real_keychain.data[("svc", "acct")] = "x"
+        # item_exists is NOT routed through _kc_call, so a True result must not
+        # resurrect the keychain routing.
+        assert macos_keychain.item_exists("svc", "acct") is True
+        assert s._use_keychain() is False
+
+    def test_capability_cache_is_process_local(self, temp_home: Path):
+        s1 = self._macos_switcher()
+        s1._keychain_usable_cache = False
+        assert s1._use_keychain() is False
+        # A fresh instance starts unknown and is optimistic again.
+        s2 = self._macos_switcher()
+        assert s2._keychain_usable_cache is None
+        assert s2._use_keychain() is True
+
+    def test_kc_call_propagates_programming_errors(self, temp_home: Path):
+        # A bug (not a keychain failure) must propagate and leave the cache
+        # untouched — it is not evidence the Keychain is unusable.
+        s = self._macos_switcher()
+
+        def boom(*a, **k):
+            raise TypeError("bug")
+
+        with pytest.raises(TypeError):
+            s._kc_call(boom)
+        assert s._keychain_usable_cache is None
+
+    def test_active_write_does_not_swallow_programming_errors(
+        self, temp_home: Path, monkeypatch
+    ):
+        # The narrowed fallback catch must let a real bug surface, not silently
+        # route to file storage with the cache still claiming "usable".
+        s = self._macos_switcher()
+
+        def boom(*a, **k):
+            raise TypeError("bug")
+
+        monkeypatch.setattr(macos_keychain, "set_password", boom)
+        with pytest.raises(TypeError):
+            s._write_credentials('{"x":1}')
+
+    # -- active store -----------------------------------------------------
+
+    def test_active_write_keys_keychain_by_account_name(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        monkeypatch.delenv("USER", raising=False)
+        s = self._macos_switcher()
+        s._write_credentials('{"x":1}')
+        acct = macos_keychain.keychain_account_name()
+        assert (CLAUDE_CODE_KEYCHAIN_SERVICE, acct) in block_real_keychain.data
+        # Never the legacy "user" default that mismatches Claude Code headless.
+        assert (CLAUDE_CODE_KEYCHAIN_SERVICE, "user") not in block_real_keychain.data
+        assert s._last_active_credentials_backend == "keychain"
+
+    def test_active_read_prefers_keychain_then_file(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "FROM-KC"
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("FROM-FILE")
+        # Keychain has data → wins (matches Claude Code's keychain-first read).
+        assert s._read_credentials() == "FROM-KC"
+        # Keychain empty → falls through to the plaintext file.
+        del block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)]
+        assert s._read_credentials() == "FROM-FILE"
+
+    def test_active_write_falls_back_to_file_and_clears_stale_keychain(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        # A stale keychain entry that Claude Code's keychain-first read would
+        # otherwise resurrect (#30337).
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "STALE"
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+
+        s._write_credentials('{"fresh":1}')
+
+        assert s._last_active_credentials_backend == "file"
+        assert get_credentials_path().read_text() == '{"fresh":1}'
+        assert (CLAUDE_CODE_KEYCHAIN_SERVICE, acct) not in block_real_keychain.data
+
+    def test_keychain_write_leaves_existing_file_untouched(
+        self, temp_home: Path, block_real_keychain
+    ):
+        # #1414: cswap must not delete a plaintext file it can't prove is its own.
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("PRESERVE-ME")
+        s._write_credentials('{"fresh":1}')  # keychain usable → writes keychain
+        assert s._last_active_credentials_backend == "keychain"
+        assert cred.read_text() == "PRESERVE-ME"
+
+    # -- backup store: .enc-wins -----------------------------------------
+
+    def _no_session(self, s):
+        return (
+            patch.object(s, "_live_session_pids", return_value=[]),
+            patch.object(s, "_invalidate_session_credentials"),
+        )
+
+    def test_backup_read_enc_wins_over_stale_keychain(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "STALE-KC")
+        s._write_backup_enc("1", "a@example.com", "FRESH-FILE")
+        assert s._read_account_credentials("1", "a@example.com") == "FRESH-FILE"
+
+    def test_backup_keychain_write_deletes_enc(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._write_backup_enc("1", "a@example.com", "OLD-FILE")
+        p1, p2 = self._no_session(s)
+        with p1, p2:
+            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+        assert not s._backup_enc_path("1", "a@example.com").exists()
+        assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
+
+    def test_backup_enc_unlink_failure_rewrites_fresh(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._write_backup_enc("1", "a@example.com", "OLD-FILE")
+        enc = s._backup_enc_path("1", "a@example.com")
+
+        orig_unlink = Path.unlink
+
+        def flaky_unlink(self_path, *a, **k):
+            if self_path == enc:
+                raise OSError("cannot unlink")
+            return orig_unlink(self_path, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        p1, p2 = self._no_session(s)
+        with p1, p2:
+            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+        monkeypatch.setattr(Path, "unlink", orig_unlink)
+
+        # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
+        # still return the new creds (no stale shadow).
+        assert base64.b64decode(enc.read_text()).decode() == "NEW-KC"
+        assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
+
+    def test_backup_file_mode_writes_enc_and_clears_keychain(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "STALE-KC")  # seed keychain
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+        p1, p2 = self._no_session(s)
+        with p1, p2:
+            s._write_account_credentials("1", "a@example.com", "FILE-CREDS")
+        assert s._read_account_credentials("1", "a@example.com") == "FILE-CREDS"
+        # Stale keychain copy cleared (best-effort) so it can't resurface.
+        assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
+
+    @pytest.mark.parametrize("bad", ["corrupt", "", "!!!!", "   ", "\n"])
+    def test_backup_bad_enc_falls_back_to_keychain(
+        self, temp_home: Path, block_real_keychain, bad
+    ):
+        # A corrupt / empty / whitespace .enc must not shadow a valid Keychain
+        # backup. Permissive base64 would decode "!!!!"/"" to empty bytes and let
+        # the junk file "win"; validate=True + a non-empty guard prevents that.
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "FROM-KC")
+        s._backup_enc_path("1", "a@example.com").write_text(bad)
+        assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
+
+    def test_backup_delete_removes_both_backends(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "KC")
+        s._write_backup_enc("1", "a@example.com", "FILE")
+        s._delete_account_credentials("1", "a@example.com")
+        assert not s._backup_enc_path("1", "a@example.com").exists()
+        assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
+
+    # -- healthy-Mac no-op guard & follow-up ------------------------------
+
+    def test_healthy_mac_reads_create_no_files(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "KC")
+        # Reading a backup must not materialize an .enc on a healthy keychain.
+        assert s._read_account_credentials("1", "a@example.com") == "KC"
+        assert not s._backup_enc_path("1", "a@example.com").exists()
+        # Reading the (absent) active credential must not create the file.
+        assert s._read_credentials() == ""
+        assert not get_credentials_path().exists()
+
+    def test_switch_followup_reflects_recorded_backend(
+        self, temp_home: Path, capsys
+    ):
+        s = self._macos_switcher()
+        s._last_active_credentials_backend = "file"
+        s._print_switch_followup()
+        assert "next message" in capsys.readouterr().out
+        s._last_active_credentials_backend = "keychain"
+        s._print_switch_followup()
+        assert "30 seconds" in capsys.readouterr().out

@@ -141,16 +141,12 @@ def keychain_service_name(session_dir: Path) -> str:
 
 
 def _keychain_account_name() -> str:
-    """Keychain account name, mirroring Claude's ``getUsername()``."""
-    user = os.environ.get("USER")
-    if user:
-        return user
-    try:
-        import pwd  # POSIX-only; matches the macOS-only call sites
+    """Keychain account name, mirroring Claude's ``getUsername()``.
 
-        return pwd.getpwuid(os.geteuid()).pw_name
-    except Exception:
-        return "claude-code-user"
+    Delegates to :func:`macos_keychain.keychain_account_name` so session profiles
+    and the active store derive the account name identically.
+    """
+    return macos_keychain.keychain_account_name()
 
 
 def delete_macos_keychain_entry(session_dir: Path) -> None:

@@ -330,11 +330,23 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     # and already-migrated users have every account here, so they never touch
     # keyring at all. Only the still-missing accounts proceed below; on a retry
     # this also narrows work to the accounts that actually failed last time.
-    pending = {
-        account_num: info
-        for account_num, info in accounts.items()
-        if not switcher._read_account_credentials(account_num, info.get("email", ""))
-    }
+    #
+    # Read the security service *directly* (not the transparent .enc-wins backup
+    # methods): this migration's job is the Keychain specifically, so a fallback
+    # .enc must not be mistaken for "already migrated". A down Keychain here is not
+    # "nothing to migrate" — defer and retry rather than skip real entries.
+    try:
+        pending = {
+            account_num: info
+            for account_num, info in accounts.items()
+            if not switcher._kc_read_backup(account_num, info.get("email", ""))
+        }
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        # Keychain unusable (locked/denied/missing) — defer, don't skip real
+        # entries. A programming error is NOT caught here; it propagates.
+        raise MigrationIncomplete(
+            f"Keychain unavailable, deferring macOS keyring migration: {e}"
+        ) from e
     if not pending:
         return True  # All accounts already in the security service.
 
@@ -425,16 +437,18 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
             continue
 
         # --- write + verify before deleting the source ------------------------
+        # Keychain-only helpers: this migration targets the security service, so
+        # it must not be diverted to .enc files by the transparent backup methods.
         try:
-            switcher._write_account_credentials(account_num, email, creds)
-            readback = switcher._read_account_credentials(account_num, email)
+            switcher._kc_write_backup(account_num, email, creds)
+            readback = switcher._kc_read_backup(account_num, email)
         except Exception as e:  # noqa: BLE001
             switcher._logger.warning(
                 f"macos_keyring_to_security: write/read-back for {canonical} failed: {e}"
             )
             # A partial/garbage security item must not shadow the still-intact
             # keyring entry. Drop it; the retry rewrites it.
-            switcher._delete_account_credentials(account_num, email)
+            switcher._delete_backup_keychain_quiet(account_num, email)
             failed += 1
             continue
 
@@ -443,7 +457,7 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
                 f"macos_keyring_to_security: read-back mismatch for {canonical}; "
                 "discarding the security item and leaving the keyring entry in place"
             )
-            switcher._delete_account_credentials(account_num, email)
+            switcher._delete_backup_keychain_quiet(account_num, email)
             failed += 1
             continue
 

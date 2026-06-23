@@ -57,7 +57,7 @@ class TestBackupCredentialsSecurity:
     def test_read_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
             mock_kc.get_password.return_value = "fake-token"
 
             result = macos_switcher._read_account_credentials("1", "user@example.com")
@@ -70,7 +70,7 @@ class TestBackupCredentialsSecurity:
     def test_write_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
             macos_switcher._write_account_credentials(
                 "2", "alice@example.com", "secret-token"
             )
@@ -82,7 +82,7 @@ class TestBackupCredentialsSecurity:
     def test_delete_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
             macos_switcher._delete_account_credentials("3", "bob@example.com")
 
             mock_kc.delete_password.assert_has_calls([

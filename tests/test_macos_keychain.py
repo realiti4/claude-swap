@@ -156,5 +156,57 @@ def test_delete_password_raises_on_other_nonzero():
             macos_keychain.delete_password("svc", "acct")
 
 
+# ---------------------------------------------------------------------------
+# timeouts — a wedged Keychain must surface as KeychainError, never a hang
+# ---------------------------------------------------------------------------
+
+
+def test_calls_pass_timeout_to_subprocess():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout="x\n")
+        macos_keychain.get_password("svc", "acct")
+        assert run.call_args.kwargs.get("timeout") == macos_keychain._TIMEOUT
+
+
+@pytest.mark.parametrize("fn,args", [
+    ("get_password", ("svc", "acct")),
+    ("set_password", ("svc", "acct", "secret")),
+    ("delete_password", ("svc", "acct")),
+])
+def test_timeout_becomes_keychain_error(fn, args):
+    timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
+        with pytest.raises(macos_keychain.KeychainError):
+            getattr(macos_keychain, fn)(*args)
+
+
+def test_item_exists_stays_false_on_timeout_and_missing_binary():
+    # item_exists must never raise (it feeds cleanup, not the capability cache).
+    timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
+        assert macos_keychain.item_exists("svc", "acct") is False
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=FileNotFoundError):
+        assert macos_keychain.item_exists("svc", "acct") is False
+
+
+# ---------------------------------------------------------------------------
+# keychain_account_name — mirror Claude Code's getUsername()
+# ---------------------------------------------------------------------------
+
+
+def test_keychain_account_name_prefers_user_env(monkeypatch):
+    monkeypatch.setenv("USER", "alice")
+    assert macos_keychain.keychain_account_name() == "alice"
+
+
+def test_keychain_account_name_no_user_env_avoids_legacy_default(monkeypatch):
+    # The old active-store default was the bare string "user", which mismatches
+    # Claude Code's OS-username on headless hosts ($USER unset). The shared helper
+    # must fall back to the OS username / "claude-code-user", never "user".
+    monkeypatch.delenv("USER", raising=False)
+    name = macos_keychain.keychain_account_name()
+    assert name and name != "user"
+
+
 # The real-Keychain round-trip test lives in test_macos_keychain_contract.py,
 # next to the `tmp_keychain` fixture it depends on.
