@@ -1208,6 +1208,81 @@ class TestExhaustionState:
         assert as_._state.exhaustion_notified is False
         mock_notify.assert_not_called()
 
+    def test_exhaustion_re_notify_cycle(self, tmp_path: Path):
+        """exhausted (notify 1) → recover via switch → exhausted AGAIN → notify 2.
+
+        Guards 'a NEXT real exhaustion re-notifies' (the flag isn't permanent).
+        """
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(99.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            # 1) Both over → all-exhausted → first notify.
+            d1 = as_.run_once()
+            assert d1.reason == "all-exhausted"
+            assert mock_notify.call_count == 1
+            assert as_._state.exhaustion_notified is True
+
+            # 2) Account 2 frees up → switch → flag cleared (recovery).
+            as_._switcher._accounts[1]["usage"] = _usage(10.0)
+            d2 = as_.run_once()
+            assert d2.action == "switch"
+            assert as_._state.exhaustion_notified is False
+
+            # 3) Both over AGAIN (account 2 now active after the switch — make
+            #    BOTH over so it's all-exhausted again). Reset both to over.
+            as_._switcher._accounts[0]["usage"] = _usage(99.0)
+            as_._switcher._accounts[1]["usage"] = _usage(99.0)
+            d3 = as_.run_once()
+            assert d3.reason == "all-exhausted"
+
+        # The next real exhaustion re-notified → 2 exhaustion notifications total
+        # (plus the 1 switch notification in between = 3 calls). Count the
+        # exhaustion ones specifically.
+        exhaustion_calls = sum(
+            "exhausted" in c.args[0].lower() for c in mock_notify.call_args_list
+        )
+        assert exhaustion_calls == 2
+
+    def test_exhaustion_flag_cleared_by_offline_path(self, tmp_path: Path):
+        """An offline tick (active fetch → None) clears a stale exhaustion flag,
+        with no spurious notification."""
+        # Pre-inject exhaustion_notified=True on disk, then construct.
+        save_state(
+            MonitorState(exhaustion_notified=True, consecutive_failures=0),
+            backup_root=tmp_path,
+        )
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},   # active → offline
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        assert as_._state.exhaustion_notified is True   # loaded from disk
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            decision = as_.run_once()
+        assert decision.reason == "active-usage-unknown"   # offline
+        assert as_._state.exhaustion_notified is False     # cleared
+        mock_notify.assert_not_called()                    # no exhaustion notify
+
+    def test_exhaustion_flag_cleared_by_candidates_unverifiable(self, tmp_path: Path):
+        """A candidates-unverifiable tick clears a stale exhaustion flag, no notify."""
+        save_state(
+            MonitorState(exhaustion_notified=True, consecutive_failures=0),
+            backup_root=tmp_path,
+        )
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},   # active over
+            {"num": "2", "email": "b@x.com", "usage": None},           # peer blip
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        assert as_._state.exhaustion_notified is True
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            decision = as_.run_once()
+        assert decision.reason == "candidates-unverifiable"
+        assert as_._state.exhaustion_notified is False     # cleared
+        mock_notify.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestActiveFirstFetch — anti-spam two-phase fetch (one call/normal tick)
@@ -1292,6 +1367,30 @@ class TestActiveFirstFetch:
         # No switchable others → nothing else to fetch beyond the active probe.
         assert _patch_oauth_fetch.call_count == 1
 
+    def test_removed_account_gc_from_last_usage(self, tmp_path: Path):
+        """L4 end-to-end: an account dropped from the managed set is GC'd from
+        last_usage on the next tick (no stale entry lingers in status)."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},   # active, over 50
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        # Seed account 2 into last_usage via a Phase-2 tick: make active cross.
+        as_._switcher._accounts[0]["usage"] = _usage(99.0)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        assert "2" in as_._state.last_usage   # recorded during Phase 2
+
+        # Remove account 2 from the managed set; active back under threshold.
+        as_._switcher._accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},
+        ]
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        # Account 2 is no longer managed → pruned from last_usage.
+        assert "2" not in as_._state.last_usage
+        assert "1" in as_._state.last_usage
+
 
 # ---------------------------------------------------------------------------
 # TestMonitorState — defensive load/save of the state file
@@ -1336,11 +1435,25 @@ class TestMonitorState:
         assert st.consecutive_failures == 0
         assert st.offline_notified is False
 
-    def test_from_dict_keeps_offline_notified_when_failures_present(self):
+    def test_from_dict_normalizes_offline_notified_when_failures_below_gate(self):
+        """failures==1 (< the >=2 notify gate) but offline_notified=True is
+        inconsistent → normalized to False (L3)."""
         st = MonitorState.from_dict(
-            {"consecutive_failures": 3, "offline_notified": True}
+            {"consecutive_failures": 1, "offline_notified": True}
+        )
+        assert st.consecutive_failures == 1
+        assert st.offline_notified is False
+
+    def test_from_dict_keeps_offline_notified_when_failures_present(self):
+        """failures >= 2 (the gate) with offline_notified=True is consistent."""
+        st = MonitorState.from_dict(
+            {"consecutive_failures": 2, "offline_notified": True}
         )
         assert st.offline_notified is True
+        st3 = MonitorState.from_dict(
+            {"consecutive_failures": 3, "offline_notified": True}
+        )
+        assert st3.offline_notified is True
 
     def test_state_file_missing_or_corrupt_returns_defaults(self, tmp_path: Path):
         # Missing file → defaults.
@@ -1387,6 +1500,32 @@ class TestMonitorState:
         assert merged["1"]["usage"] == {"five_hour": {"pct": 1.0}}
         assert merged["2"]["usage"] == {"seven_day": {"pct": 2.0}}
         assert merged["2"]["fetched_at"] == 9.0
+
+    def test_merged_usage_prunes_removed_accounts(self):
+        """L4: an account in prior last_usage but NOT in valid_nums is dropped."""
+        st = MonitorState(
+            last_usage={
+                "1": {"usage": {"five_hour": {"pct": 1.0}}, "fetched_at": 1.0},
+                "2": {"usage": {"five_hour": {"pct": 2.0}}, "fetched_at": 1.0},  # removed
+                "3": {"usage": {"five_hour": {"pct": 3.0}}, "fetched_at": 1.0},  # not probed
+            }
+        )
+        # This tick: only account 1 fetched; managed accounts are {1, 3}
+        # (account 2 was removed).
+        merged = st.merged_usage(
+            {"1": {"five_hour": {"pct": 9.0}}}, 9.0, valid_nums={"1", "3"}
+        )
+        assert "1" in merged and merged["1"]["fetched_at"] == 9.0   # refreshed
+        assert "3" in merged                                        # preserved (managed, not probed)
+        assert "2" not in merged                                    # pruned (removed account)
+
+    def test_merged_usage_no_prune_when_valid_nums_none(self):
+        """Backward-compat: without valid_nums, no pruning (all kept)."""
+        st = MonitorState(
+            last_usage={"2": {"usage": {"five_hour": {"pct": 2.0}}, "fetched_at": 1.0}}
+        )
+        merged = st.merged_usage({}, 9.0)   # valid_nums defaults to None
+        assert "2" in merged
 
 
 # ---------------------------------------------------------------------------

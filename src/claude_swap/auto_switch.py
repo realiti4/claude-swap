@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace as _state_replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -36,6 +37,25 @@ from claude_swap.notify import notify
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
+
+# Public API of this module, including the re-exports from auto_switch_state
+# (``AutoSwitchConfig`` / ``load_config`` / ``save_config`` / ``load_state`` /
+# ``save_state`` / ``MonitorState``) which are imported for backward-compatible
+# access via ``claude_swap.auto_switch`` and consumed by ``cli.py``. Declaring
+# them here documents the surface and stops linters flagging the re-exports as
+# unused imports.
+__all__ = [
+    "AutoSwitcher",
+    "AutoSwitchConfig",
+    "SwitchDecision",
+    "decide_switch",
+    "next_interval",
+    "load_config",
+    "save_config",
+    "load_state",
+    "save_state",
+    "MonitorState",
+]
 
 _logger = logging.getLogger("claude-swap")
 
@@ -78,8 +98,12 @@ class SwitchDecision:
 _BIG = float("inf")
 
 
-def _parse_reset_ts(usage: dict | None) -> float:
-    """Extract seven_day.resets_at as a POSIX timestamp; +inf on any failure."""
+def _parse_reset_ts(usage: dict | str | None) -> float:
+    """Extract seven_day.resets_at as a POSIX timestamp; +inf on any failure.
+
+    Accepts the full usage union (``dict | str | None``) since callers pass the
+    ``"no credentials"`` sentinel too; the isinstance guard handles non-dicts.
+    """
     if not isinstance(usage, dict):
         return _BIG
     d7 = usage.get("seven_day")
@@ -115,22 +139,25 @@ def _window_pct(usage: dict | str | None, key: str) -> float:
     return 0.0
 
 
-def _active_crosses(
+def _crosses_threshold(
     usage: dict | str | None,
     config: AutoSwitchConfig,
-) -> tuple[bool, str | None, float | None]:
-    """Whether the active account is at/over a switch threshold (PURE).
+) -> tuple[bool, str | None, float | None, float, float]:
+    """Whether an account is at/over a switch threshold (PURE).
 
-    SINGLE SOURCE OF TRUTH for the threshold check — used by BOTH
-    ``decide_switch`` and ``AutoSwitcher._active_over_threshold`` so the
-    active-first short-circuit can never drift from the pure decision.
+    SINGLE SOURCE OF TRUTH for the threshold check — used for BOTH the active
+    account (in ``decide_switch`` and ``AutoSwitcher._active_over_threshold``)
+    AND candidate viability, so the active-first short-circuit can never drift
+    from the pure decision.
 
-    Returns ``(crossed, trigger_window, trigger_pct)``:
+    Returns ``(crossed, trigger_window, trigger_pct, h5_pct, d7_pct)``:
     * ``crossed`` — True iff 5h% >= session_threshold OR 7d% >= weekly_threshold.
     * When BOTH cross, the binding window reported is the one with the HIGHER
       utilisation (severity), so logs/notifications reflect the worst window.
       (Target selection is unchanged — always soonest-7d-reset.)
-    * Not crossed → ``(False, None, None)``.
+    * ``h5_pct`` / ``d7_pct`` are the raw window utilisations (always returned,
+      so callers don't recompute them).
+    * Not crossed → ``(False, None, None, h5_pct, d7_pct)``.
     """
     h5 = _window_pct(usage, "five_hour")
     d7 = _window_pct(usage, "seven_day")
@@ -138,13 +165,15 @@ def _active_crosses(
     d7_crossed = d7 >= config.weekly_threshold
 
     if not h5_crossed and not d7_crossed:
-        return (False, None, None)
+        return (False, None, None, h5, d7)
     if h5_crossed and d7_crossed:
         # Both over — report the more severe (higher pct) window.
-        return (True, "5h", h5) if h5 >= d7 else (True, "7d", d7)
+        if h5 >= d7:
+            return (True, "5h", h5, h5, d7)
+        return (True, "7d", d7, h5, d7)
     if h5_crossed:
-        return (True, "5h", h5)
-    return (True, "7d", d7)
+        return (True, "5h", h5, h5, d7)
+    return (True, "7d", d7, h5, d7)
 
 
 def decide_switch(
@@ -200,11 +229,12 @@ def decide_switch(
         )
 
     # ------------------------------------------------------------------
-    # 2. Threshold crossed? (single source of truth via _active_crosses)
+    # 2. Threshold crossed? (single source of truth via _crosses_threshold,
+    #    which also returns the raw pcts so we don't recompute them).
     # ------------------------------------------------------------------
-    crossed, trigger_window, trigger_pct = _active_crosses(active_usage, config)
-    h5_pct = _window_pct(active_usage, "five_hour")
-    d7_pct = _window_pct(active_usage, "seven_day")
+    crossed, trigger_window, trigger_pct, h5_pct, d7_pct = _crosses_threshold(
+        active_usage, config
+    )
 
     if not crossed:
         return SwitchDecision(
@@ -252,7 +282,7 @@ def decide_switch(
         if not isinstance(cand_usage, dict):
             any_unverifiable = True   # None / "no credentials" → couldn't verify
             continue
-        cand_crossed, _cw, _cp = _active_crosses(cand_usage, config)
+        cand_crossed, _cw, _cp, _ch5, _cd7 = _crosses_threshold(cand_usage, config)
         if not cand_crossed:
             viable.append(n)
 
@@ -497,11 +527,13 @@ class AutoSwitcher:
     def _active_over_threshold(self, active_usage: dict) -> bool:
         """True iff the active account is at/over a switch threshold.
 
-        Delegates to the shared pure ``_active_crosses`` so the active-first
+        Delegates to the shared pure ``_crosses_threshold`` so the active-first
         short-circuit can never disagree with ``decide_switch`` about whether a
         switch is even possible.
         """
-        crossed, _window, _pct = _active_crosses(active_usage, self._config)
+        crossed, _window, _pct, _h5, _d7 = _crosses_threshold(
+            active_usage, self._config
+        )
         return crossed
 
     # ------------------------------------------------------------------
@@ -605,8 +637,19 @@ class AutoSwitcher:
                 detail=detail,
             )
 
+        # Past Phase 1 with a dict => active_num must be a real slot: if it were
+        # None, active_row would be None → active_usage would be the
+        # "no credentials" sentinel (not a dict) and we'd have returned above.
+        # Narrow the type so the str-keyed usage maps below are well-typed.
+        assert active_num is not None
+        active_num_str: str = active_num
+
         # ---- ONLINE: active fetched OK. Recovery + refresh last-known-good. -
-        self._handle_online_tick({active_num: active_usage})
+        # valid_nums = currently-managed accounts → prunes removed accounts
+        # from last_usage while preserving peers not probed on this active-only
+        # tick.
+        managed_nums = set(row_by_num)
+        self._handle_online_tick({active_num_str: active_usage}, managed_nums)
 
         # Is the active account at/over a threshold? Only then is a switch even
         # possible — and only then do we pay for the others' fetches.
@@ -631,7 +674,9 @@ class AutoSwitcher:
         # ---- Phase 2: active crossed → fetch the OTHER switchable accounts --
         # so decide_switch sees a COMPLETE usage map (active + all candidates)
         # and can pick the soonest-7d-reset target. (N-1 calls, rare path.)
-        usage_by_account: dict[str, dict | str | None] = {active_num: active_usage}
+        usage_by_account: dict[str, dict | str | None] = {
+            active_num_str: active_usage
+        }
         for num in switchable:
             row = row_by_num.get(num)
             usage_by_account[num] = (
@@ -640,10 +685,10 @@ class AutoSwitcher:
 
         # Record the candidates' fresh GOOD readings too (don't discard Phase-2
         # work) — last_usage now reflects the COMPLETE map, surfaced in status.
-        self._merge_last_usage(usage_by_account)
+        self._merge_last_usage(usage_by_account, managed_nums)
 
         decision = decide_switch(
-            active_num,
+            active_num_str,
             usage_by_account,
             switchable,
             self._config,
@@ -741,13 +786,20 @@ class AutoSwitcher:
             offline_notified=notified,
         )
 
-    def _handle_online_tick(self, usage_by_account: dict[str, object]) -> None:
+    def _handle_online_tick(
+        self,
+        usage_by_account: Mapping[str, object],
+        valid_nums: set[str] | None = None,
+    ) -> None:
         """Mark online, handle recovery, refresh last-known-good usage.
 
         We only "recover" LOUDLY (INFO log + notification) from a state we
         actually ANNOUNCED — i.e. ``offline_notified`` is True. A single
         transient failure that never crossed the >=2 notify gate clears
         silently, so there's never a "back online" with no prior "offline".
+
+        ``valid_nums`` (currently-managed account nums) prunes removed accounts
+        from ``last_usage`` — see ``merged_usage``.
         """
         announced_offline = self._state.offline_notified
         now = _now_ts()
@@ -760,8 +812,9 @@ class AutoSwitcher:
                     "Usage monitoring resumed.",
                 )
 
-        # Merge fresh GOOD readings (never overwrite a good entry with None).
-        merged = self._state.merged_usage(usage_by_account, now)
+        # Merge fresh GOOD readings (never overwrite a good entry with None);
+        # prune entries for accounts no longer managed.
+        merged = self._state.merged_usage(usage_by_account, now, valid_nums)
 
         self._state = _state_replace(
             self._state,
@@ -771,14 +824,19 @@ class AutoSwitcher:
             last_usage=merged,
         )
 
-    def _merge_last_usage(self, usage_by_account: dict[str, object]) -> None:
+    def _merge_last_usage(
+        self,
+        usage_by_account: Mapping[str, object],
+        valid_nums: set[str] | None = None,
+    ) -> None:
         """Merge fresh GOOD readings into ``last_usage`` (no recovery handling).
 
         Used after Phase 2 so the candidates' last-known usage is recorded (and
         rendered in ``cswap auto status``) rather than discarded. A None /
         non-dict fetch never clobbers a good entry (see ``merged_usage``).
+        ``valid_nums`` prunes removed accounts.
         """
-        merged = self._state.merged_usage(usage_by_account, _now_ts())
+        merged = self._state.merged_usage(usage_by_account, _now_ts(), valid_nums)
         self._state = _state_replace(self._state, last_usage=merged)
 
     def _apply_exhaustion(self, reason: str) -> None:

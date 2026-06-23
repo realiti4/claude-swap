@@ -207,7 +207,7 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
-def account_headroom(usage: dict | None) -> float | None:
+def account_headroom(usage: dict | str | None) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
     Considers only the 5-hour and 7-day utilization windows — the two that
@@ -216,6 +216,9 @@ def account_headroom(usage: dict | None) -> float | None:
     *binding* window (``100 - max(pct)``), so ``<= 0`` means the account is at
     or over a limit. Returns ``None`` when usage is unavailable or carries no
     window data, which callers treat as "unknown" (never auto-skipped).
+
+    Accepts the full usage union (incl. the ``"no credentials"`` sentinel str);
+    the isinstance guard returns ``None`` for any non-dict.
     """
     if not isinstance(usage, dict):
         return None

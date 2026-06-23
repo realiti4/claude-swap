@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -231,12 +232,13 @@ class MonitorState:
 
         failures = max(0, _int("consecutive_failures", 0))
         offline_notified = bool(data.get("offline_notified", False))
-        # Normalise: failures==0 and offline_notified are mutually inconsistent
-        # (you cannot be "online with 0 failures" yet still flagged offline).
-        # Forcing them consistent prevents a hand-edited / partially-written
-        # state file from emitting a phantom "back online" notification at the
-        # first tick after startup.
-        if failures == 0:
+        # Normalise to match the runtime offline-notify gate (failures >= 2):
+        # offline_notified can only legitimately be True once we've actually
+        # declared offline, which requires >= 2 consecutive failures. A
+        # corrupt/partial state with failures < 2 but offline_notified=True is
+        # inconsistent and would emit a phantom "back online" at the first tick
+        # after startup — force it consistent.
+        if failures < 2:
             offline_notified = False
 
         return cls(
@@ -265,15 +267,25 @@ class MonitorState:
 
     def merged_usage(
         self,
-        usage_by_account: dict[str, object],
+        usage_by_account: Mapping[str, object],
         fetched_at: float,
+        valid_nums: set[str] | None = None,
     ) -> dict:
         """Return a new ``last_usage`` map with fresh GOOD readings merged in.
 
         A None/non-dict fetch for an account is ignored so a good reading is
         never clobbered by a later failed fetch.
+
+        When ``valid_nums`` is given (the set of CURRENTLY MANAGED account
+        nums), entries for accounts NOT in that set are pruned — so a removed
+        account's stale reading is garbage-collected rather than lingering
+        forever and showing in ``cswap auto status``. Pruning is keyed on
+        managed accounts (not "fetched this tick"), so a peer that simply wasn't
+        probed on a normal active-only tick is preserved.
         """
         merged = dict(self.last_usage)
+        if valid_nums is not None:
+            merged = {k: v for k, v in merged.items() if k in valid_nums}
         for num, usage in usage_by_account.items():
             if isinstance(usage, dict):
                 merged[str(num)] = {"usage": usage, "fetched_at": fetched_at}
