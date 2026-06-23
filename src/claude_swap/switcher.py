@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -18,13 +17,23 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
-    CredentialWriteError,
     SessionError,
     SwitchError,
     ValidationError,
 )
 from claude_swap import oauth
 from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    account_ref,
+    account_row,
+    usage_fields,
+)
+from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
+    CLAUDE_CODE_KEYCHAIN_SERVICE,
+    SECURITY_SERVICE,
+    CredentialStore,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
@@ -43,8 +52,6 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
-    get_claude_config_home,
-    get_credentials_path,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -56,14 +63,8 @@ from claude_swap.process_detection import get_running_instances
 # and for the Windows Credential Manager migration).
 KEYRING_SERVICE = "claude-code"
 
-# Service name for per-account backup credentials now managed via the ``security``
-# CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
-# new security items coexist during migration (safe write → verify → delete).
-SECURITY_SERVICE = "claude-swap"
-
-# Service name of Claude Code's *active* credential in the macOS Keychain (read by
-# Claude Code itself; we read/write it when switching accounts).
-CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# SECURITY_SERVICE and CLAUDE_CODE_KEYCHAIN_SERVICE now live in credentials.py
+# (storage concerns); re-exported above for migrations.py and the test suite.
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
@@ -145,14 +146,12 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
-        # macOS Keychain usability, learned per-process from real `security`
-        # calls (see _kc_call / _use_keychain). None = not yet probed; True/False
-        # once an op has run. Must be set BEFORE run_migrations(), which performs
-        # Keychain ops on macOS. _last_active_credentials_backend records where the
-        # most recent active-credential write landed ("keychain" | "file"), for the
-        # post-switch follow-up message.
-        self._keychain_usable_cache: bool | None = None
-        self._last_active_credentials_backend: str | None = None
+        # The credential storage layer (active + per-account backup stores, macOS
+        # Keychain-vs-file routing, the per-process capability cache). Reads its
+        # live config (platform, _logger, credentials_dir) back off this switcher.
+        # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
+        # One store per switcher: the capability cache is per-process.
+        self._store = CredentialStore(self)
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -247,270 +246,61 @@ class ClaudeAccountSwitcher:
         if sys.platform != "win32":
             os.chmod(path, 0o600)
 
+    # -- credential storage (delegates to CredentialStore) ----------------
+    #
+    # The active and per-account backup credential stores live in
+    # ``CredentialStore`` (credentials.py). The methods below are thin delegators
+    # kept so existing call sites (migrations, transfer, models, session, tests)
+    # keep working unchanged. The store reads platform / _logger / credentials_dir
+    # back off this switcher, but its sticky capability cache and last-active
+    # backend live on the store — exposed here as proxy properties so callers that
+    # poke them on the switcher (chiefly the test suite) still reach the real state.
+
+    @property
+    def _keychain_usable_cache(self) -> bool | None:
+        return self._store._keychain_usable_cache
+
+    @_keychain_usable_cache.setter
+    def _keychain_usable_cache(self, value: bool | None) -> None:
+        self._store._keychain_usable_cache = value
+
+    @property
+    def _last_active_credentials_backend(self) -> str | None:
+        return self._store._last_active_credentials_backend
+
+    @_last_active_credentials_backend.setter
+    def _last_active_credentials_backend(self, value: str | None) -> None:
+        self._store._last_active_credentials_backend = value
+
     def _kc_call(self, fn, *args):
-        """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
-
-        A success (including ``get_password`` returning ``None`` for a missing
-        item) marks the Keychain usable — but only flips the cache ``None -> True``,
-        never ``False -> True``: once a call has failed this run we stay in file
-        mode so one invocation can't split-brain between backends. A
-        ``KeychainError`` / ``TimeoutExpired`` / ``OSError`` (binary missing) marks
-        it unusable and re-raises so the caller can fall back. Only those three are
-        caught — a programming error propagates.
-
-        Do NOT route ``item_exists`` through here: it returns ``False`` for both
-        "absent" and "failed", so a timeout would be misread as a usable Keychain.
-        """
-        try:
-            result = fn(*args)
-        except macos_keychain.KEYCHAIN_ERRORS:
-            self._keychain_usable_cache = False
-            raise
-        if self._keychain_usable_cache is None:
-            self._keychain_usable_cache = True
-        return result
+        return self._store._kc_call(fn, *args)
 
     def _use_keychain(self) -> bool:
-        """Whether credential *writes* should target the macOS Keychain this run.
-
-        ``False`` off macOS. On macOS, ``True`` until a Keychain op has failed this
-        process (the cache flips to ``False`` and sticks). Unknown (``None``) is
-        optimistic — the first real op tries the Keychain and records the outcome.
-        """
-        if self.platform != Platform.MACOS:
-            return False
-        return self._keychain_usable_cache is not False
+        return self._store._use_keychain()
 
     def _read_credentials(self) -> str | None:
-        """Read Claude Code's active credentials.
-
-        macOS reads the Keychain (service "Claude Code-credentials") when it's
-        usable — mirroring Claude Code's keychain-first read — and an empty or
-        failed Keychain falls through to the plaintext file
-        ``~/.claude/.credentials.json`` (where Claude Code itself falls back).
-        Linux/WSL/Windows always read the file. Non-mutating.
-
-        Returns:
-            Credentials string if found, "" if not found, None on a file read error.
-        """
-        if self._use_keychain():
-            try:
-                val = self._kc_call(
-                    macos_keychain.get_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
-                    macos_keychain.keychain_account_name(),
-                )
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                # Locked / denied / unavailable Keychain (rc-44 "not found" comes
-                # back as None, not raised). _kc_call has flipped routing to file
-                # mode; fall through to the plaintext file Claude Code uses too.
-                # (A programming error is NOT caught here — it propagates.)
-                self._logger.warning(f"Keychain read failed, trying file: {e}")
-                val = None
-            if val:
-                return val
-            # Keychain empty (rc-44) or failed → read the plaintext fallback file.
-
-        cred_file = get_credentials_path()
-        if cred_file.exists():
-            try:
-                return cred_file.read_text(encoding="utf-8")
-            except Exception as e:
-                self._logger.error(f"Failed to read credentials file: {e}")
-                return None
-        return ""
-
-    def _write_active_credentials_file(self, credentials: str) -> None:
-        """Atomically write Claude Code's plaintext active-credentials file."""
-        cred_dir = get_claude_config_home()
-        cred_dir.mkdir(parents=True, exist_ok=True)
-        cred_file = cred_dir / ".credentials.json"
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
-        try:
-            os.write(fd, credentials.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            os.replace(tmp_path, str(cred_file))
-            if sys.platform != "win32":
-                os.chmod(str(cred_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
-    def _delete_active_keychain_entry(self) -> None:
-        """Best-effort removal of the active-credential Keychain item (macOS only).
-
-        Claude Code reads the Keychain before the plaintext file, so once we fall
-        back to the file we must clear any stale Keychain entry or Claude Code would
-        resurrect it (#30337). Best-effort: when the Keychain is down the delete
-        can't run, which is the documented recovery residual.
-        """
-        if self.platform != Platform.MACOS:
-            return
-        try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
-        except Exception:
-            pass  # best-effort; a down Keychain can't be cleaned now
+        return self._store._read_credentials()
 
     def _write_credentials(self, credentials: str) -> None:
-        """Write Claude Code's active credentials.
-
-        macOS writes the Keychain when usable (recording backend ``"keychain"``)
-        and **leaves the plaintext file untouched**, mirroring Claude Code, which
-        preserves the file alongside a populated Keychain for container ``~/.claude``
-        sharing (#1414): cswap can't prove an existing file is its own stale fallback
-        vs. a credential another consumer relies on. If the Keychain write fails — or
-        the Keychain is already known unusable — it writes the plaintext file and
-        best-effort clears any stale Keychain entry (#30337), recording backend
-        ``"file"``. Linux/WSL/Windows always write the file.
-
-        Raises:
-            CredentialWriteError: If writing credentials fails.
-        """
-        if self._use_keychain():
-            try:
-                self._kc_call(
-                    macos_keychain.set_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
-                    macos_keychain.keychain_account_name(),
-                    credentials,
-                )
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                # _kc_call flipped routing to file mode; fall through to the file.
-                # (A programming error is NOT caught here — it propagates.)
-                self._logger.warning(f"Keychain write failed, falling back to file: {e}")
-            else:
-                self._last_active_credentials_backend = "keychain"
-                return
-
-        # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write
-        # that just failed. Write the plaintext file and (macOS) best-effort clear
-        # any stale Keychain entry so Claude Code's keychain-first read can't shadow
-        # it (#30337).
-        try:
-            self._write_active_credentials_file(credentials)
-        except Exception as e:
-            raise CredentialWriteError(f"Failed to write credentials: {e}")
-        self._delete_active_keychain_entry()
-        self._last_active_credentials_backend = "file"
+        self._store._write_credentials(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
-        """Whether per-account backup *writes* go to files vs. the Keychain.
-
-        Linux/WSL/Windows always use base64 ``.enc`` files under ``credentials_dir``
-        (Windows moved off the Credential Manager because it rejects entries over
-        ~2,500 bytes, #45). macOS uses the Keychain while it's usable and falls back
-        to ``.enc`` files when it isn't (headless/SSH/locked); UNKNOWN platforms have
-        no Keychain, so they use files too. Backup *reads* are ``.enc``-wins
-        regardless (see ``_read_account_credentials``).
-        """
-        return not self._use_keychain()
-
-    # -- backup credential backends ---------------------------------------
-    #
-    # Two backends for per-account backups: base64 ``.enc`` files under
-    # ``credentials_dir`` and the macOS Keychain (``SECURITY_SERVICE``). On macOS
-    # reads are ``.enc``-wins: a fallback ``.enc`` (written while the Keychain was
-    # unusable) is authoritative over a possibly-stale Keychain copy, so a Keychain
-    # that recovers can't shadow a newer file. A successful Keychain write
-    # therefore reconciles the ``.enc`` away (correctness-critical, not best-effort).
+        return self._store._uses_file_backup_backend()
 
     def _backup_enc_path(self, account_num: str, email: str) -> Path:
-        return self.credentials_dir / f".creds-{account_num}-{email}.enc"
-
-    def _backup_username(self, account_num: str, email: str) -> str:
-        return f"account-{account_num}-{email}"
-
-    def _kc_read_backup(self, account_num: str, email: str) -> str:
-        """Read a per-account backup from the Keychain only (no file fallback).
-
-        Routes through ``_kc_call`` (so a failure flips the capability cache).
-        Returns ``""`` when the item is absent; raises on a Keychain failure so
-        the caller decides (normal reads swallow it; the migration defers).
-        """
-        creds = self._kc_call(
-            macos_keychain.get_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-        )
-        return creds or ""
-
-    def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
-        """Write a per-account backup to the Keychain only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.set_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-            credentials,
-        )
-
-    def _kc_delete_backup(self, account_num: str, email: str) -> None:
-        """Delete a per-account backup Keychain item only. Raises on failure."""
-        self._kc_call(
-            macos_keychain.delete_password,
-            SECURITY_SERVICE,
-            self._backup_username(account_num, email),
-        )
-
-    def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
-        """Best-effort backup Keychain delete (never raises)."""
-        try:
-            self._kc_delete_backup(account_num, email)
-        except Exception as e:
-            self._logger.warning(f"Failed to delete credentials from Keychain: {e}")
+        return self._store._backup_enc_path(account_num, email)
 
     def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
-        """Atomically write a per-account backup ``.enc`` (base64) file."""
-        self.credentials_dir.mkdir(parents=True, exist_ok=True)
-        enc_file = self._backup_enc_path(account_num, email)
-        encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(self.credentials_dir), suffix=".tmp")
-        try:
-            os.write(fd, encoded.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            os.replace(tmp_path, str(enc_file))
-            if sys.platform != "win32":
-                os.chmod(str(enc_file), 0o600)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        self._store._write_backup_enc(account_num, email, credentials)
 
-    def _reconcile_enc_after_keychain_write(
-        self, account_num: str, email: str, credentials: str
-    ) -> None:
-        """Stop a leftover ``.enc`` from shadowing a just-written Keychain backup.
+    def _kc_read_backup(self, account_num: str, email: str) -> str:
+        return self._store._kc_read_backup(account_num, email)
 
-        ``.enc``-wins reads make this correctness-critical: delete the ``.enc``; if
-        the delete fails, atomically rewrite it with the same fresh creds; if that
-        also fails, raise so the inconsistency surfaces rather than serving stale.
-        """
-        enc_file = self._backup_enc_path(account_num, email)
-        if not enc_file.exists():
-            return
-        try:
-            enc_file.unlink()
-            return
-        except Exception as e:
-            self._logger.warning(
-                f"Could not delete .enc after Keychain backup write ({e}); "
-                "rewriting it with the fresh credentials to keep both consistent"
-            )
-        self._write_backup_enc(account_num, email, credentials)
+    def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
+        self._store._kc_write_backup(account_num, email, credentials)
+
+    def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
+        self._store._delete_backup_keychain_quiet(account_num, email)
 
     def _post_backup_write(self, account_num: str, email: str) -> None:
         """Invalidate the slot's session profile after backup credentials change.
@@ -533,91 +323,22 @@ class ClaudeAccountSwitcher:
             self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
-        """Read account credentials from backup. ``""`` when missing.
-
-        macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
-        copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
-        Linux/WSL/Windows read the ``.enc`` only.
-        """
-        enc_file = self._backup_enc_path(account_num, email)
-        if enc_file.exists():
-            try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
-                # validate=True: reject non-alphabet junk (e.g. "!!!!") instead of
-                # silently discarding it to empty bytes, which would let a corrupt
-                # .enc shadow a valid Keychain copy.
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-            except Exception as e:
-                # Corrupt/garbled .enc → on macOS fall through to the Keychain copy.
-                self._logger.warning(f"Failed to read credentials file: {e}")
-            else:
-                if decoded:
-                    return decoded
-                # Empty/whitespace .enc is not a real backup → try the Keychain.
-        if self.platform == Platform.MACOS:
-            try:
-                return self._kc_read_backup(account_num, email)
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                self._logger.warning(f"Failed to read credentials from Keychain: {e}")
-        return ""
+        return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
-        """Write account credentials to backup.
+        """Write account credentials to backup, then invalidate the slot's session.
 
-        macOS writes the Keychain when usable, then reconciles the ``.enc`` away
-        (see ``_reconcile_enc_after_keychain_write``). When the Keychain is unusable
-        it writes the ``.enc`` atomically, then best-effort deletes any stale
-        Keychain copy so a recovered Keychain can't shadow the fresh file.
-        Linux/WSL/Windows write the ``.enc`` only.
+        The store performs the pure write and raises on failure *before* returning,
+        so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
+        once and only after a successful write.
         """
-        if self._use_keychain():
-            try:
-                self._kc_write_backup(account_num, email, credentials)
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                # Keychain unusable; _kc_call flipped routing to file mode.
-                # (A programming error is NOT caught here — it propagates.)
-                self._logger.warning(
-                    f"Keychain backup write failed, falling back to file: {e}"
-                )
-            else:
-                self._reconcile_enc_after_keychain_write(account_num, email, credentials)
-                self._post_backup_write(account_num, email)
-                return
-
-        # File mode: write the .enc atomically, then (macOS) best-effort drop the
-        # stale Keychain copy so a recovered Keychain can't shadow the fresh file.
-        try:
-            self._write_backup_enc(account_num, email, credentials)
-        except Exception as e:
-            self._logger.warning(f"Failed to write credentials file: {e}")
-            raise
-        if self.platform == Platform.MACOS:
-            self._delete_backup_keychain_quiet(account_num, email)
+        self._store._write_account_credentials(account_num, email, credentials)
         self._post_backup_write(account_num, email)
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
-        """Delete account credentials from backup (both backends on macOS).
-
-        Removes the ``.enc`` file(s) and, on macOS, the Keychain item(s). The
-        Keychain delete is best-effort: if it's locked the item may linger as
-        harmless unreferenced cruft (the slot is gone from sequence.json; a re-add
-        overwrites it via ``-U``; purge sweeps it). Includes the legacy
-        ``account-None-{email}`` alias.
-        """
-        nums = [account_num]
-        if str(account_num) != "None":
-            nums.append("None")
-        for num in nums:
-            enc_file = self._backup_enc_path(num, email)
-            try:
-                if enc_file.exists():
-                    enc_file.unlink()
-            except Exception as e:
-                self._logger.warning(f"Failed to delete credentials file: {e}")
-            if self.platform == Platform.MACOS:
-                self._delete_backup_keychain_quiet(num, email)
+        self._store._delete_account_credentials(account_num, email)
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
@@ -1526,18 +1247,56 @@ class ClaudeAccountSwitcher:
             return None, "exhausted"
         return None, "stay"
 
+    def _build_list_payload(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        usages: list[dict | str | None],
+    ) -> dict:
+        """Build the ``--list --json`` payload from gathered account + usage data."""
+        active_num: int | None = None
+        accounts = []
+        for (num, email, org_name, org_uuid, is_active, _), usage in zip(
+            accounts_info, usages
+        ):
+            if is_active:
+                active_num = num
+            accounts.append(
+                account_row(num, email, org_name, org_uuid, is_active, usage)
+            )
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "activeAccountNumber": active_num,
+            "accounts": accounts,
+        }
+
     def list_accounts(
         self,
         show_token_status: bool = False,
-    ) -> None:
-        """List all managed accounts."""
+        json_output: bool = False,
+    ) -> dict | None:
+        """List all managed accounts.
+
+        In ``json_output`` mode, returns the schema-v1 payload (printing nothing)
+        for the CLI to serialize; otherwise prints the human view and returns None.
+        """
         if not self.sequence_file.exists():
+            # JSON mode must never prompt — emit an empty list instead of the
+            # interactive first-run setup.
+            if json_output:
+                return {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "activeAccountNumber": None,
+                    "accounts": [],
+                }
             print(dimmed("No accounts are managed yet."))
             self._first_run_setup()
-            return
+            return None
 
         accounts_info = self._build_accounts_info()
         usages = self._collect_usage(accounts_info)
+
+        if json_output:
+            return self._build_list_payload(accounts_info, usages)
 
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
@@ -1597,18 +1356,90 @@ class ClaudeAccountSwitcher:
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
-    def status(self) -> None:
-        """Display current account status."""
+    def _active_account_usage(
+        self, account_num: str, current_email: str
+    ) -> dict | str | None:
+        """Usage for the active account as a ``_collect_usage``-style entry.
+
+        Returns ``"no credentials"`` when the live store has no usable token, a
+        usage dict on success, or ``None`` when the fetch fails. Reuses (and
+        refreshes) the same ``cache/usage.json`` list_accounts writes — cache-first,
+        fetching with ``is_active=True`` so cswap never refreshes Claude Code's live
+        credentials, and merging into existing entries so other rows survive.
+        """
+        creds = self._read_credentials() or ""
+        if not creds or not oauth.extract_access_token(creds):
+            return "no credentials"
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+        if (cached is not MISSING and isinstance(cached, dict)
+                and account_num in cached):
+            return cached[account_num]
+        usage = oauth.fetch_usage_for_account(
+            account_num, current_email, creds, is_active=True,
+        )
+        existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+        existing[account_num] = usage
+        write_cache(usage_cache_path, existing)
+        return usage
+
+    def _build_status_payload(self) -> dict:
+        """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
+        identity = self._get_current_account()
+        if identity is None:
+            return {"schemaVersion": SCHEMA_VERSION, "active": None}
+        current_email, current_org_uuid = identity
+
+        data = self._get_sequence_data_migrated()
+        if not data:
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": {"email": current_email, "managed": False},
+            }
+
+        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        if not account_num:
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": {"email": current_email, "managed": False},
+            }
+
+        acct = data["accounts"][account_num]
+        org_name = acct.get("organizationName", "") or ""
+        org_uuid = acct.get("organizationUuid", "") or ""
+        status, usage = usage_fields(
+            self._active_account_usage(account_num, current_email)
+        )
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "active": {
+                "number": int(account_num),
+                "email": current_email,
+                "organizationName": org_name,
+                "organizationUuid": org_uuid,
+                "isOrganization": bool(org_uuid),
+                "managed": True,
+                "usageStatus": status,
+                "usage": usage,
+            },
+            "totalManagedAccounts": len(data.get("accounts", {})),
+        }
+
+    def status(self, json_output: bool = False) -> dict | None:
+        """Display current account status (or return the schema-v1 payload)."""
+        if json_output:
+            return self._build_status_payload()
+
         identity = self._get_current_account()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
-            return
+            return None
         current_email, current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
-            return
+            return None
 
         account_num = self._find_account_slot(data, current_email, current_org_uuid)
         org_name = ""
@@ -1623,32 +1454,15 @@ class ClaudeAccountSwitcher:
                 f"({current_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
-            creds = self._read_credentials() or ""
-            if creds and oauth.extract_access_token(creds):
-                # Reuse the cache list_accounts writes (cache-first). On miss,
-                # fetch with is_active=True (Claude Code owns active credentials,
-                # cswap must not refresh them) and merge into existing entries so
-                # other accounts' rows survive.
-                usage_cache_path = self.backup_dir / "cache" / "usage.json"
-                cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-                if (cached is not MISSING and isinstance(cached, dict)
-                        and account_num in cached):
-                    usage = cached[account_num]
-                else:
-                    usage = oauth.fetch_usage_for_account(
-                        account_num, current_email, creds,
-                        is_active=True,
-                    )
-                    existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
-                    existing[account_num] = usage
-                    write_cache(usage_cache_path, existing)
-                if isinstance(usage, dict):
-                    lines = _format_usage_lines(usage)
-                    for j, line in enumerate(lines):
-                        connector = "└" if j == len(lines) - 1 else "├"
-                        print(f"  {dimmed(connector)} {muted(line)}")
+            usage = self._active_account_usage(account_num, current_email)
+            if isinstance(usage, dict):
+                lines = _format_usage_lines(usage)
+                for j, line in enumerate(lines):
+                    connector = "└" if j == len(lines) - 1 else "├"
+                    print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+        return None
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
@@ -1669,7 +1483,68 @@ class ClaudeAccountSwitcher:
 
         self.add_account()
 
-    def switch(self, strategy: str | None = None) -> None:
+    def _switch_result_from_op(
+        self, op: dict, strategy: str, extra_warnings: list[str] | None = None
+    ) -> dict:
+        """Build a switch result from a ``_perform_switch`` return value.
+
+        ``switched`` is derived from whether the live identity actually changed
+        (``from != to``) — covering recorded/live drift in plain rotation, not just
+        ``switch_to`` onto the already-active account.
+        """
+        from_ref = op["from"]
+        to_ref = op["to"]
+        switched = from_ref != to_ref
+        if switched:
+            reason = "switched"
+            message = f"Switched to Account-{to_ref['number']} ({to_ref['email']})"
+        else:
+            reason = "already-active"
+            message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "switched": switched,
+            "from": from_ref,
+            "to": to_ref,
+            "strategy": strategy,
+            "reason": reason,
+            "message": message,
+            "warnings": (extra_warnings or []) + op["warnings"],
+        }
+
+    def _switch_noop(
+        self,
+        *,
+        strategy: str,
+        reason: str,
+        message: str,
+        from_ref: dict | None = None,
+        to_ref: dict | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict:
+        """Build a no-op switch result (``switched: false``).
+
+        For a no-op the user neither left nor arrived anywhere — ``from`` and
+        ``to`` are both the current account. Callers pass ``to_ref`` (where they
+        stayed); ``from_ref`` defaults to it so every ``switched: false`` payload
+        reports ``from == to``.
+        """
+        if from_ref is None:
+            from_ref = to_ref
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "switched": False,
+            "from": from_ref,
+            "to": to_ref,
+            "strategy": strategy,
+            "reason": reason,
+            "message": message,
+            "warnings": warnings or [],
+        }
+
+    def switch(
+        self, strategy: str | None = None, json_output: bool = False
+    ) -> dict | None:
         """Switch to next account in sequence.
 
         Args:
@@ -1687,6 +1562,9 @@ class ClaudeAccountSwitcher:
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
         """
+        strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
+        warnings: list[str] = []
+
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1711,11 +1589,16 @@ class ClaudeAccountSwitcher:
 
             target = str(preferred)
             if not self._account_is_switchable(target):
-                print(
-                    f"{accent('Skipping')} Account-{target} "
-                    f"(no stored credentials/config, re-add with "
-                    f"cswap --add-account --slot {target})"
-                )
+                if json_output:
+                    warnings.append(
+                        f"Skipped Account-{target} (no stored credentials/config)"
+                    )
+                else:
+                    print(
+                        f"{accent('Skipping')} Account-{target} "
+                        f"(no stored credentials/config, re-add with "
+                        f"cswap --add-account --slot {target})"
+                    )
                 fallback = next(
                     (str(num) for num in sequence
                      if str(num) != target and self._account_is_switchable(str(num))),
@@ -1727,27 +1610,49 @@ class ClaudeAccountSwitcher:
                         "Re-add a slot with: cswap --add-account --slot <number>"
                     )
                 target = fallback
-            self._perform_switch(target)
-            return
+            op = self._perform_switch(target, emit_output=not json_output)
+            return (
+                self._switch_result_from_op(op, strategy_label, warnings)
+                if json_output else None
+            )
 
         current_email, current_org_uuid = identity
 
         # Check if current account is managed
         if not self._account_exists(current_email, current_org_uuid):
+            # In JSON mode, don't silently auto-add (a surprising side effect in
+            # automation) — report it as a structured no-op instead.
+            if json_output:
+                ref = account_ref(None, current_email)
+                return self._switch_noop(
+                    strategy=strategy_label,
+                    reason="unmanaged-account",
+                    from_ref=ref,
+                    to_ref=ref,
+                    message="Active account is not managed; run cswap --add-account",
+                )
             print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
             data = self._get_sequence_data()
             account_num = data.get("activeAccountNumber")
             print(f"It has been automatically added as Account-{account_num}.")
             print(dimmed("Please run the switch command again to switch to the next account."))
-            return
+            return None
 
         data = self._get_sequence_data()
         sequence = data.get("sequence", [])
 
         if len(sequence) < 2:
+            if json_output:
+                num = self._find_account_slot(data, current_email, current_org_uuid)
+                return self._switch_noop(
+                    strategy=strategy_label,
+                    reason="only-one-account",
+                    to_ref=account_ref(int(num), current_email) if num else None,
+                    message="Only one account is managed. Add more accounts to switch between.",
+                )
             print(dimmed("Only one account is managed. Add more accounts to switch between."))
-            return
+            return None
 
         active_account = data.get("activeAccountNumber")
         # Where the user actually is right now (live identity), falling back to
@@ -1757,44 +1662,96 @@ class ClaudeAccountSwitcher:
         if current_num is None:
             current_num = str(active_account) if active_account is not None else None
 
+        current_ref = (
+            account_ref(int(current_num), current_email) if current_num else None
+        )
+
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
         if strategy == "best":
             target, note = self._select_best_switchable(current_num)
             if target is not None:
-                self._perform_switch(target)
-                return
+                op = self._perform_switch(target, emit_output=not json_output)
+                return (
+                    self._switch_result_from_op(op, strategy_label, warnings)
+                    if json_output else None
+                )
             if note == "current-unavailable":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="usage-unavailable",
+                        to_ref=current_ref,
+                        message=(
+                            f"Current account usage is unavailable — staying on "
+                            f"Account-{current_num}."
+                        ),
+                    )
                 print(dimmed(
                     f"Current account usage is unavailable — staying on "
                     f"Account-{current_num}. Run cswap --switch to rotate."
                 ))
-                return
+                return None
             if note == "no-comparison":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="usage-unavailable",
+                        to_ref=current_ref,
+                        message=(
+                            f"No other account has usage data to compare — staying "
+                            f"on Account-{current_num}."
+                        ),
+                    )
                 print(dimmed(
                     f"No other account has usage data to compare — staying on "
                     f"Account-{current_num}. Run cswap --switch to rotate."
                 ))
-                return
+                return None
             if note == "incomplete-comparison":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="usage-unavailable",
+                        to_ref=current_ref,
+                        message=(
+                            f"No account with known usage has more remaining quota; "
+                            f"some usage is unavailable — staying on Account-{current_num}."
+                        ),
+                    )
                 print(dimmed(
                     f"No account with known usage has more remaining quota; some "
                     f"usage is unavailable — staying on Account-{current_num}."
                 ))
-                return
+                return None
             if note == "stay":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="already-best",
+                        to_ref=current_ref,
+                        message=(
+                            f"Already on the account with the most remaining quota "
+                            f"(Account-{current_num})."
+                        ),
+                    )
                 print(
                     f"{accent('Already on the account with the most remaining quota')} "
                     f"(Account-{current_num})."
                 )
-                return
+                return None
             if note == "exhausted":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="candidates-exhausted",
+                        to_ref=current_ref,
+                        message=(
+                            f"All accounts are at their 5h/7d limit — staying on "
+                            f"Account-{current_num}."
+                        ),
+                    )
                 warning(
                     f"All accounts are at their 5h/7d limit — staying on "
                     f"Account-{current_num}."
                 )
-                return
+                return None
             # note == "none": fall through; rotation reports the lack of targets.
 
         # Find current index and get next, skipping broken candidates.
@@ -1824,17 +1781,27 @@ class ClaudeAccountSwitcher:
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if not self._account_is_switchable(candidate):
-                print(
-                    f"{accent('Skipping')} Account-{candidate} "
-                    f"(no stored credentials/config, re-add with "
-                    f"cswap --add-account --slot {candidate})"
-                )
+                if json_output:
+                    warnings.append(
+                        f"Skipped Account-{candidate} (no stored credentials/config)"
+                    )
+                else:
+                    print(
+                        f"{accent('Skipping')} Account-{candidate} "
+                        f"(no stored credentials/config, re-add with "
+                        f"cswap --add-account --slot {candidate})"
+                    )
                 continue
             if strategy == "next-available":
                 headroom = oauth.account_headroom(usage.get(candidate))
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
-                    print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
+                    if json_output:
+                        warnings.append(
+                            f"Skipped Account-{candidate} (at 5h/7d limit)"
+                        )
+                    else:
+                        print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
                     continue
             next_account = candidate
             break
@@ -1842,22 +1809,43 @@ class ClaudeAccountSwitcher:
         # Every rotation target is at its limit. Switching onto an exhausted
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="candidates-exhausted",
+                    to_ref=current_ref, warnings=warnings,
+                    message=(
+                        f"All other accounts are at their 5h/7d limit — staying on "
+                        f"Account-{current_num}."
+                    ),
+                )
             warning(
                 f"All other accounts are at their 5h/7d limit — staying on "
                 f"Account-{current_num}."
             )
-            return
+            return None
 
         if next_account is None:
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="no-valid-target",
+                    to_ref=current_ref, warnings=warnings,
+                    message="No other accounts have valid stored credentials/config.",
+                )
             print(dimmed(
                 "No other accounts have valid stored credentials/config.\n"
                 "Re-add a skipped slot with: cswap --add-account --slot <number>"
             ))
-            return
+            return None
 
-        self._perform_switch(next_account)
+        op = self._perform_switch(next_account, emit_output=not json_output)
+        return (
+            self._switch_result_from_op(op, strategy_label, warnings)
+            if json_output else None
+        )
 
-    def switch_to(self, identifier: str) -> None:
+    def switch_to(
+        self, identifier: str, json_output: bool = False
+    ) -> dict | None:
         """Switch to specific account."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1870,27 +1858,31 @@ class ClaudeAccountSwitcher:
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
 
-            # For email identifiers, handle ambiguous matches interactively
-            data = self._get_sequence_data()
-            matches = [
-                num for num, acc in (data or {}).get("accounts", {}).items()
-                if acc.get("email") == identifier
-            ]
-            if len(matches) > 1:
-                print(f"Multiple accounts found for '{identifier}':")
-                for num in matches:
-                    acc = data["accounts"][num]
-                    tag = self._get_display_tag(
-                        acc.get("email", ""),
-                        acc.get("organizationName", ""),
-                        acc.get("organizationUuid", ""),
-                    )
-                    print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
-                choice = input("Enter account number to switch to: ").strip()
-                if not choice.isdigit() or choice not in matches:
-                    print(dimmed("Cancelled"))
-                    return
-                identifier = choice
+            # For email identifiers, handle ambiguous matches interactively —
+            # except in JSON mode, where we never prompt. There we fall through
+            # to _resolve_account_identifier, which raises a ConfigError listing
+            # the matching slots (+ org labels) → structured error envelope.
+            if not json_output:
+                data = self._get_sequence_data()
+                matches = [
+                    num for num, acc in (data or {}).get("accounts", {}).items()
+                    if acc.get("email") == identifier
+                ]
+                if len(matches) > 1:
+                    print(f"Multiple accounts found for '{identifier}':")
+                    for num in matches:
+                        acc = data["accounts"][num]
+                        tag = self._get_display_tag(
+                            acc.get("email", ""),
+                            acc.get("organizationName", ""),
+                            acc.get("organizationUuid", ""),
+                        )
+                        print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
+                    choice = input("Enter account number to switch to: ").strip()
+                    if not choice.isdigit() or choice not in matches:
+                        print(dimmed("Cancelled"))
+                        return None
+                    identifier = choice
 
         target_account = self._resolve_account_identifier(identifier)
         if not target_account:
@@ -1902,15 +1894,37 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-        self._perform_switch(target_account)
+        # JSON mode: short-circuit a no-op before mutating. Re-activating the
+        # account you're already on would otherwise re-write credentials, take
+        # the lock, and (on macOS) touch the Keychain — wasteful for a scripted
+        # idempotent "ensure active = N". Human mode keeps its existing behavior.
+        if json_output and data:
+            identity = self._get_current_account()
+            if identity is not None:
+                cur_slot = self._find_account_slot(data, identity[0], identity[1])
+                if cur_slot == target_account:
+                    email = (
+                        data.get("accounts", {}).get(target_account, {}).get("email", "")
+                    )
+                    ref = account_ref(int(target_account), email)
+                    return self._switch_noop(
+                        strategy="direct",
+                        reason="already-active",
+                        from_ref=ref,
+                        to_ref=ref,
+                        message=f"Already on Account-{target_account} ({email})",
+                    )
+
+        op = self._perform_switch(target_account, emit_output=not json_output)
+        return self._switch_result_from_op(op, "direct") if json_output else None
 
     def auto_switch_to(self, target_account: str, quiet: bool = True) -> None:
         """Switch performed by the auto-switcher engine.
 
         Same transactional path as ``switch_to`` / ``_perform_switch`` but
         pre-resolves the numeric target (engine passes a validated num) and
-        runs in quiet mode by default so daemon output goes to the log file
-        rather than stdout.
+        runs quietly by default so daemon output goes to the log file rather
+        than stdout (``quiet`` maps to ``emit_output=False``).
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1935,46 +1949,53 @@ class ClaudeAccountSwitcher:
                 f"(re-add with: cswap --add-account --slot {target_account})"
             )
 
-        self._perform_switch(target_account, quiet=quiet)
+        # quiet → emit_output=False (daemon mode: log only, no stdout).
+        self._perform_switch(target_account, emit_output=not quiet)
 
-    def _perform_switch(self, target_account: str, quiet: bool = False) -> None:
+    def _perform_switch(self, target_account: str, emit_output: bool = True) -> dict:
         """Perform the actual account switch with transaction support.
 
-        Args:
-            target_account: Account slot number to switch to.
-            quiet: When True, suppress all stdout output and ``list_accounts``
-                call (daemon mode).  Default False keeps manual-switch output
-                byte-for-byte identical.
+        Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
+        left/landed identities under the lock so callers don't reconstruct ``from``
+        after the mutation. When ``emit_output`` is False (JSON / daemon mode) all
+        human output is suppressed — the live-session warning, the
+        "Switched"/"Activated" lines, the nested list_accounts() summary and the
+        followup — and the live-session warning rides back in ``warnings`` instead.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
+        warnings_out: list[str] = []
         # Session-mode drift warning (warn, never block): switching the
         # default login to an account that also has a live session profile
         # puts the same refresh token in two config dirs — if the server
         # rotates it, one copy goes stale.
-        if not quiet:
-            pre_data = self._get_sequence_data() or {}
-            pre_email = (
-                pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
-            )
-            if pre_email:
-                pids = self._live_session_pids(target_account, pre_email)
-                if pids:
-                    warning(
-                        f"Account-{target_account} ({pre_email}) has a live session-mode "
-                        f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
-                        "same account as both the default login and a session can make "
-                        "one copy's token go stale if the server rotates it. If the "
-                        "session later fails to authenticate, exit it and re-run "
-                        f"'cswap run {target_account}'."
-                    )
+        pre_data = self._get_sequence_data() or {}
+        pre_email = (
+            pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
+        )
+        if pre_email:
+            pids = self._live_session_pids(target_account, pre_email)
+            if pids:
+                msg = (
+                    f"Account-{target_account} ({pre_email}) has a live session-mode "
+                    f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
+                    "same account as both the default login and a session can make "
+                    "one copy's token go stale if the server rotates it. If the "
+                    "session later fails to authenticate, exit it and re-run "
+                    f"'cswap run {target_account}'."
+                )
+                if emit_output:
+                    warning(msg)
+                else:
+                    warnings_out.append(msg)
 
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
+            to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
@@ -1990,6 +2011,12 @@ class ClaudeAccountSwitcher:
             # live Claude credential still exists). In both cases, skip the
             # back-up-current step so we never write account-None-* backups.
             if current_identity is None or current_account is None:
+                # Account left: None on a fresh machine (no live account at all),
+                # else the unmanaged live account (slot unknown to cswap).
+                from_ref = (
+                    None if current_identity is None
+                    else account_ref(None, current_identity[0])
+                )
                 target_creds = self._read_account_credentials(
                     target_account, target_email
                 )
@@ -2081,16 +2108,17 @@ class ClaudeAccountSwitcher:
                 self._logger.info(
                     f"Activated account {target_account} (no prior live account)"
                 )
-                if not quiet:
+                if emit_output:
                     print(
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
                     )
                     print()
                     self._print_switch_followup()
                     print()
-                return
+                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
+            from_ref = account_ref(int(current_account), current_email)
 
             # Create transaction for rollback capability
             try:
@@ -2185,8 +2213,10 @@ class ClaudeAccountSwitcher:
                 raise
 
         # Lock released. Safe to do network I/O and let persist callbacks
-        # re-acquire the lock from inside list_accounts().
-        if not quiet:
+        # re-acquire the lock from inside list_accounts(). All of this is display
+        # only — suppressed in JSON / daemon mode (the nested list_accounts()
+        # would otherwise leak human output onto the JSON stdout).
+        if emit_output:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             try:
                 self.list_accounts()
@@ -2196,10 +2226,7 @@ class ClaudeAccountSwitcher:
             print()
             self._print_switch_followup()
             print()
-        else:
-            self._logger.info(
-                "auto-switch: activated account %s (%s)", target_account, target_email
-            )
+        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
@@ -2218,11 +2245,11 @@ class ClaudeAccountSwitcher:
             backend = "keychain" if self._use_keychain() else "file"
         if backend == "keychain":
             print(dimmed(
-                "Switch takes effect within about 30 seconds — "
-                "restart Claude Code to apply immediately."
+                "Restart Claude Code to apply immediately — otherwise the "
+                "session can take up to ~30 seconds to pick up the new account."
             ))
         else:
-            print(dimmed("Active on your next message — no restart needed."))
+            print(dimmed("New account is active on your next message — no restart needed."))
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.

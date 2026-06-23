@@ -994,7 +994,7 @@ class TestPerformSwitchPostDisplay:
             with patch.object(
                 switcher, "_live_session_pids", return_value=[12345],
             ):
-                switcher._perform_switch("2", quiet=True)
+                switcher._perform_switch("2", emit_output=False)
         finally:
             for p in patches:
                 p.stop()
@@ -1016,8 +1016,8 @@ class TestPerformSwitchPostDisplay:
         switcher._print_switch_followup()
 
         out = capsys.readouterr().out
-        assert "within about 30 seconds" in out
         assert "apply immediately" in out
+        assert "30 seconds" in out
         assert "no restart needed" not in out
 
     def test_switch_followup_non_macos(self, temp_home: Path, capsys):
@@ -2615,7 +2615,7 @@ class TestSwitchSkipsBrokenSlots:
 
         with _patch.object(s, "_perform_switch") as mock_perform:
             s.auto_switch_to("2")
-            mock_perform.assert_called_once_with("2", quiet=True)
+            mock_perform.assert_called_once_with("2", emit_output=False)
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded

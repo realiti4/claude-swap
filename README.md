@@ -217,6 +217,36 @@ cswap --import backup.cswap --force          # Overwrite existing
 
 The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap --export - | gpg -c > backup.gpg`).
 
+### JSON output for scripting
+
+Add `--json` to `--list`, `--status`, `--switch`, or `--switch-to` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+
+```bash
+cswap --list --json                 # all accounts with usage/quota
+cswap --status --json               # current active account
+cswap --switch --strategy best --json   # switch, then report the result
+cswap --switch-to 2 --json
+```
+
+<details>
+<summary>Example output & schema notes</summary>
+
+```json
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 2,
+  "accounts": [
+    { "number": 2, "email": "you@example.com", "active": true, "usageStatus": "ok",
+      "usage": { "fiveHour": { "pct": 25.0, "resetsAt": "2026-06-22T23:29:59Z" },
+                 "sevenDay": { "pct": 16.0, "resetsAt": "2026-06-26T17:59:59Z" } } }
+  ]
+}
+```
+
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+
+</details>
+
 ### Add an account from a raw OAuth token
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
