@@ -291,7 +291,10 @@ def _auto_command(argv: list[str]) -> None:
                 overrides_on["strategy"] = "consume-first"
             config = _replace(config, **overrides_on)
             _as_save_config(config, backup_root)
-            print(dimmed(f"strategy: {config.strategy}"))
+            # Normal-visibility disclosure: a new install silently defaults to
+            # consume-first (and a purge-then-on can flip an existing user), so
+            # the active strategy must be plainly shown, not dimmed.
+            print(f"Auto-switch enabled (strategy: {config.strategy}).")
 
             if Platform.detect() is Platform.MACOS:
                 msg = install_agent(backup_root)

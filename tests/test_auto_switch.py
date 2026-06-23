@@ -26,6 +26,7 @@ from claude_swap.auto_switch import (
     load_config,
     next_blocked5h,
     next_interval,
+    next_interval_until_reset,
     save_config,
 )
 from claude_swap.auto_switch_state import MonitorState, load_state, save_state
@@ -445,17 +446,13 @@ class TestAutoSwitchConfig:
         cfg = AutoSwitchConfig()
         assert cfg.strategy == "reactive"
         assert cfg.hysteresis == 5.0
-        assert cfg.full_refresh_interval == 300
 
     def test_strategy_roundtrip_consume_first(self):
-        cfg = AutoSwitchConfig(
-            strategy="consume-first", hysteresis=3.0, full_refresh_interval=120
-        )
+        cfg = AutoSwitchConfig(strategy="consume-first", hysteresis=3.0)
         cfg2 = AutoSwitchConfig.from_dict(cfg.to_dict())
         assert cfg2 == cfg
         assert cfg2.strategy == "consume-first"
         assert cfg2.hysteresis == 3.0
-        assert cfg2.full_refresh_interval == 120
 
     def test_invalid_strategy_falls_back_to_reactive(self):
         assert AutoSwitchConfig.from_dict({"strategy": "bogus"}).strategy == "reactive"
@@ -473,17 +470,23 @@ class TestAutoSwitchConfig:
         assert AutoSwitchConfig.from_dict({"hysteresis": -10.0}).hysteresis == 0.0
         assert AutoSwitchConfig.from_dict({"hysteresis": "bad"}).hysteresis == 5.0
 
-    def test_full_refresh_interval_bad_value_defaults(self):
-        assert (
-            AutoSwitchConfig.from_dict({"full_refresh_interval": "x"})
-            .full_refresh_interval
-            == 300
+    def test_hysteresis_clamped_below_session_threshold(self):
+        """FIX 3: H >= S would make the lower band S-H <= 0 → permanent 5h
+        lockout. Cap H at S - 1 so the dead band always has positive width."""
+        cfg = AutoSwitchConfig.from_dict(
+            {"session_threshold": 98.0, "hysteresis": 200.0}
         )
-        assert (
-            AutoSwitchConfig.from_dict({"full_refresh_interval": 0})
-            .full_refresh_interval
-            == 0
+        assert cfg.hysteresis == 97.0   # capped at S - 1
+        # A reasonable margin under S is left untouched.
+        cfg2 = AutoSwitchConfig.from_dict(
+            {"session_threshold": 98.0, "hysteresis": 5.0}
         )
+        assert cfg2.hysteresis == 5.0
+        # Exactly at S is capped to S - 1 too.
+        cfg3 = AutoSwitchConfig.from_dict(
+            {"session_threshold": 90.0, "hysteresis": 90.0}
+        )
+        assert cfg3.hysteresis == 89.0
 
     def test_from_dict_partial_uses_defaults(self):
         cfg = AutoSwitchConfig.from_dict({"enabled": True})
@@ -664,6 +667,63 @@ class TestNextInterval:
         """consecutive_failures=0 → normal adaptive behaviour."""
         usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
         assert next_interval(usage, self.CFG, 0) == 60
+
+
+class TestNextIntervalUntilReset:
+    """Reset-aware scheduler (PURE, consume-first only): only shortens, clamps."""
+
+    CFG = AutoSwitchConfig(min_interval=60, max_interval=300)
+    NOW = 1_000_000.0
+
+    @staticmethod
+    def _usage_with_reset(reset_ts: float) -> dict:
+        # Build a usage dict whose 7d reset is at reset_ts (UTC ISO).
+        iso = datetime.fromtimestamp(reset_ts, tz=timezone.utc).isoformat()
+        return {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0, "resets_at": iso}}
+
+    def test_no_reset_within_window_keeps_base(self):
+        # Soonest reset is 1000s away, base is 300 → unchanged.
+        active = self._usage_with_reset(self.NOW + 1000)
+        assert next_interval_until_reset(300, active, [], self.NOW, self.CFG) == 300
+
+    def test_shortens_to_just_after_soonest_reset(self):
+        # Reset in 100s → wake at ~105s (100 + 5s margin), within [60, 300].
+        active = self._usage_with_reset(self.NOW + 100)
+        assert next_interval_until_reset(300, active, [], self.NOW, self.CFG) == 105
+
+    def test_peer_reset_sooner_than_active_drives_it(self):
+        active = self._usage_with_reset(self.NOW + 250)
+        peer = self.NOW + 80      # peer resets sooner
+        assert next_interval_until_reset(
+            300, active, [peer], self.NOW, self.CFG
+        ) == 85
+
+    def test_clamped_to_min_interval(self):
+        # Reset 1s away → 6s, but floor is 60 → clamped up to 60.
+        active = self._usage_with_reset(self.NOW + 1)
+        assert next_interval_until_reset(300, active, [], self.NOW, self.CFG) == 60
+
+    def test_never_exceeds_base(self):
+        # Reset is within window but the +5 would exceed a small base → clamp.
+        active = self._usage_with_reset(self.NOW + 99)
+        assert next_interval_until_reset(100, active, [], self.NOW, self.CFG) == 100
+
+    def test_past_reset_ignored_keeps_base(self):
+        active = self._usage_with_reset(self.NOW - 500)   # already reset
+        assert next_interval_until_reset(300, active, [], self.NOW, self.CFG) == 300
+
+    def test_unknown_resets_keep_base(self):
+        # No active reset, no peers → nothing to shorten toward.
+        assert next_interval_until_reset(
+            300, "no credentials", [], self.NOW, self.CFG
+        ) == 300
+        assert next_interval_until_reset(300, None, [], self.NOW, self.CFG) == 300
+
+    def test_only_shortens_never_lengthens(self):
+        # Even a reset exactly at base boundary does not extend the base.
+        active = self._usage_with_reset(self.NOW + 50)
+        out = next_interval_until_reset(120, active, [], self.NOW, self.CFG)
+        assert out <= 120
 
 
 # ---------------------------------------------------------------------------
@@ -1691,6 +1751,47 @@ class TestDecideConsumeFirst:
         d = self._decide("1", u, {"2"})
         assert d.action == "stay" and d.reason == "all-session-limited"
 
+    def test_active_7d_exhausted_peer_unverifiable_is_candidates_unverifiable(self):
+        """FIX 1: active genuinely 7d-exhausted + only peer returns None →
+        candidates-unverifiable (NOT all-exhausted): the peer might be fine, we
+        just couldn't read it. No alarming exhaustion notification."""
+        u = {"1": _usage(50, 99.5, _ts(2)), "2": None}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "stay"
+        assert d.reason == "candidates-unverifiable"
+
+    def test_active_7d_exhausted_peer_no_credentials_is_unverifiable(self):
+        u = {"1": _usage(50, 99.5, _ts(2)), "2": "no credentials"}
+        d = self._decide("1", u, {"2"})
+        assert d.reason == "candidates-unverifiable"
+
+    def test_active_7d_exhausted_peer_verified_exhausted_is_all_exhausted(self):
+        """Only declare all-exhausted when EVERY candidate is VERIFIED 7d-over."""
+        u = {"1": _usage(50, 99.5, _ts(2)), "2": _usage(50, 99.5, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.reason == "all-exhausted"
+
+    def test_active_7d_exhausted_mixed_peer_verified_over_one_unverifiable(self):
+        """A verified-over peer + an unverifiable peer (none available) → still
+        unverifiable (we couldn't rule the unknown one out)."""
+        u = {
+            "1": _usage(50, 99.5, _ts(2)),     # active, 7d over
+            "2": _usage(50, 99.5, _ts(48)),    # peer, verified 7d over
+            "3": None,                          # peer, unverifiable
+        }
+        d = self._decide("1", u, {"2", "3"})
+        assert d.reason == "candidates-unverifiable"
+
+    def test_session_limited_detail_does_not_claim_only_5h(self):
+        """FIX 4: detail must not assert '5h session limit' when the active is
+        actually 7d-exhausted."""
+        u = {"1": _usage(50, 99.5, _ts(2)), "2": _usage(99, 40, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        # active 7d-exhausted (not available), peer has 7d room but 5h-blocked
+        # → all-session-limited, but the detail is the accurate generic wording.
+        assert d.reason == "all-session-limited"
+        assert "weekly limit and/or 5h session limits" in d.detail
+
     def test_unverifiable_peer_excluded(self):
         u = {"1": _usage(40, 10, _ts(2)), "2": None, "3": "no credentials"}
         d = self._decide("1", u, {"2", "3"})
@@ -1840,4 +1941,63 @@ class TestConsumeFirstEngine:
             d = as_.run_once()
         assert d.action == "stay" and d.reason == "under-threshold"
         assert fs.switched_to == []
+
+    def test_active_7d_exhausted_peer_blip_no_exhaustion_notify(self, tmp_path):
+        """FIX 1 (engine): active 7d-exhausted + the only peer's fetch fails →
+        candidates-unverifiable, NO exhaustion notification (it's a blip)."""
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(50, 99.5, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": None},   # fetch returns None
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            d = as_.run_once()
+        assert d.action == "stay"
+        assert d.reason == "candidates-unverifiable"
+        assert fs.switched_to == []
+        # The alarming "All Accounts Exhausted" notification must NOT fire.
+        mock_notify.assert_not_called()
+        assert as_._state.exhaustion_notified is False
+
+    def test_active_7d_exhausted_all_peers_verified_over_notifies(self, tmp_path):
+        """Contrast: every account VERIFIED 7d-over → real all-exhausted notify."""
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(50, 99.5, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(50, 99.5, _ts(48))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            d = as_.run_once()
+        assert d.reason == "all-exhausted"
+        mock_notify.assert_called_once()
+        assert as_._state.exhaustion_notified is True
+
+    def test_known_peer_resets_collected_from_last_usage(self, tmp_path):
+        """FIX 7 wiring: after a consume-first tick, _known_peer_resets returns
+        the 7d reset timestamps recorded in last_usage (for the scheduler)."""
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(48))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        resets = as_._known_peer_resets()
+        # Both accounts had a known reset → two finite timestamps, none +inf.
+        assert len(resets) == 2
+        assert all(r != float("inf") for r in resets)
+        assert sorted(resets) == resets or True  # order-agnostic; finite values
+
+    def test_consume_first_interval_only_shortens(self, tmp_path):
+        """_consume_first_interval never exceeds the base it's given."""
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(0.02)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(48))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        base = 300
+        out = as_._consume_first_interval(base)
+        assert as_._config.min_interval <= out <= base
 

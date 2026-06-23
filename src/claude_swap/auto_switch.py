@@ -51,6 +51,7 @@ __all__ = [
     "decide_switch",
     "decide_consume_first",
     "next_interval",
+    "next_interval_until_reset",
     "load_config",
     "save_config",
     "load_state",
@@ -454,10 +455,17 @@ def decide_consume_first(
     ]
     candidates: list[str] = []
     any_7d_room = False
+    any_unverifiable = False
     for num in eligible:
         u = usage_by_account.get(num)
-        if isinstance(u, dict) and _has_7d_room(u, config):
-            any_7d_room = True
+        if isinstance(u, dict):
+            if _has_7d_room(u, config):
+                any_7d_room = True
+        elif num != active_num:
+            # A NON-active eligible peer whose usage we couldn't read (None /
+            # "no credentials"). The active is handled by the unknown-usage
+            # short-circuit above, so it's never unverifiable here.
+            any_unverifiable = True
         if _is_available(num, u, config, blocked5h):
             candidates.append(num)
 
@@ -475,11 +483,24 @@ def decide_consume_first(
                 action="stay", target=None, reason="all-session-limited",
                 trigger_window=trigger_window, trigger_pct=trigger_pct,
                 detail=(
-                    "All accounts are temporarily at their 5h session limit; "
-                    "weekly quota remains — will resume after a 5h reset."
+                    "No account is available right now (weekly limit and/or 5h "
+                    "session limits); will resume as windows reset."
                 ),
             )
-        # No 7d room anywhere → genuinely exhausted (notify path).
+        if any_unverifiable:
+            # No verified 7d room anywhere, but a peer's usage couldn't be read
+            # — it may not actually be exhausted. Quiet stay (NOT the alarming
+            # exhaustion notification) until the next tick can verify it.
+            return SwitchDecision(
+                action="stay", target=None, reason="candidates-unverifiable",
+                trigger_window=trigger_window, trigger_pct=trigger_pct,
+                detail=(
+                    "No verified-available account to switch to "
+                    "(some candidates' usage could not be read this tick). "
+                    "Will retry."
+                ),
+            )
+        # No 7d room anywhere (all verified) → genuinely exhausted (notify path).
         return SwitchDecision(
             action="stay", target=None, reason="all-exhausted",
             trigger_window=trigger_window, trigger_pct=trigger_pct,
@@ -569,6 +590,44 @@ def next_interval(
         interval = config.max_interval
 
     return max(config.min_interval, min(config.max_interval, interval))
+
+
+def next_interval_until_reset(
+    base_interval: int,
+    active_usage: dict | str | None,
+    peer_resets: list[float],
+    now: float,
+    config: AutoSwitchConfig,
+) -> int:
+    """Shorten the sleep so a tick lands shortly AFTER the soonest known reset.
+
+    PURE. Consume-first only: when a 7d window resets, that account jumps to the
+    soonest-reset slot and the consumption order changes — we want to re-rank
+    promptly rather than wait out the full ``base_interval``. So if any known
+    reset (the active account's own + ``peer_resets``) falls within
+    ``base_interval`` from ``now``, wake ~5s after it instead.
+
+    Guarantees (never spins, never lengthens):
+    * Result is clamped to ``[config.min_interval, base_interval]`` — it can
+      ONLY shorten the base, never extend it, and never drop below the floor.
+    * A reset already in the past, or none within the window, leaves the base
+      unchanged.
+    """
+    soonest = _parse_reset_ts(active_usage)  # +inf when unknown
+    for ts in peer_resets:
+        if ts < soonest:
+            soonest = ts
+
+    # No usable future reset within the base window → keep the base.
+    if soonest == _BIG or soonest <= now or (soonest - now) >= base_interval:
+        return base_interval
+
+    # Wake ~5s after the reset, clamped to the cadence band.
+    wake_in = int((soonest - now) + 5)
+    # Clamp into [min_interval, base_interval]. The outer min(base_interval, …)
+    # is defense-in-depth: it guarantees we NEVER lengthen past base even in the
+    # (production-unreachable) case where base_interval < min_interval.
+    return min(base_interval, max(config.min_interval, wake_in))
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1022,10 @@ class AutoSwitcher:
         pure ``decide_consume_first``, then switches through the shared apply
         path. ``decide_consume_first`` never switches on stale/unknown data.
         """
+        # Design A: fetch all peers every tick. A cached/active-first "design B"
+        # (poll the active, infer peer resets from cached usage, confirm-before-
+        # switch, slow full-refresh sub-cadence) is a possible future
+        # optimization but is intentionally NOT implemented here.
         usage_by_account: dict[str, dict | str | None] = {active_num: active_usage}
         for num in switchable:
             row = row_by_num.get(num)
@@ -1112,6 +1175,35 @@ class AutoSwitcher:
         """Persist monitor state once (best-effort; never raises)."""
         save_state(self._state, self._switcher.backup_dir)
 
+    def _known_peer_resets(self) -> list[float]:
+        """7d reset timestamps from the last-known usage of every account.
+
+        Used by the consume-first scheduler to wake shortly after the soonest
+        reset. Unknown/unparseable resets are dropped (they'd be +inf anyway).
+        """
+        resets: list[float] = []
+        for entry in self._state.last_usage.values():
+            if isinstance(entry, dict):
+                ts = _parse_reset_ts(entry.get("usage"))
+                if ts != _BIG:
+                    resets.append(ts)
+        return resets
+
+    def _consume_first_interval(self, base_interval: int) -> int:
+        """Reset-aware sleep for consume-first (reactive uses ``base_interval``).
+
+        Shortens ``base_interval`` so a tick lands ~5s after the soonest known
+        7d reset (active + peers), so the consumption order is re-ranked
+        promptly. Only shortens; clamped to ``[min_interval, base_interval]``.
+        """
+        return next_interval_until_reset(
+            base_interval,
+            self._last_active_usage,
+            self._known_peer_resets(),
+            _now_ts(),
+            self._config,
+        )
+
     def watch(self) -> None:
         """Run the monitor loop in the foreground (Ctrl-C to stop)."""
         from claude_swap.printer import accent, dimmed, muted
@@ -1135,6 +1227,11 @@ class AutoSwitcher:
                 interval = next_interval(
                     self._last_active_usage, self._config, failures
                 )
+                # consume-first only (and only when ONLINE): wake shortly after
+                # the soonest known reset so the order re-ranks promptly. Never
+                # lengthens; reactive cadence is untouched.
+                if failures == 0 and self._config.strategy == "consume-first":
+                    interval = self._consume_first_interval(interval)
                 if failures > 0:
                     status = (
                         f"  offline — retry in {interval}s "
@@ -1180,11 +1277,14 @@ class AutoSwitcher:
                 try:
                     decision = self.run_once()
                     # run_once gathered once this tick; reuse its result.
+                    failures = self._state.consecutive_failures
                     interval = next_interval(
-                        self._last_active_usage,
-                        self._config,
-                        self._state.consecutive_failures,
+                        self._last_active_usage, self._config, failures,
                     )
+                    # consume-first only (online only): land a tick shortly after
+                    # the soonest reset to re-rank promptly. Reactive unchanged.
+                    if failures == 0 and self._config.strategy == "consume-first":
+                        interval = self._consume_first_interval(interval)
                 except Exception as exc:
                     _logger.exception("auto-switch daemon: tick error: %r", exc)
                     interval = self._config.max_interval

@@ -146,14 +146,16 @@ cswap auto on --strategy reactive        # switch only at 98%/99%
 cswap auto status                        # shows the active strategy
 ```
 
+> `cswap auto on --strategy X` **persists** the choice to the daemon config. `cswap watch --strategy X` applies the strategy to that foreground session **only** — it does not change the persisted daemon config. Use `cswap auto on --strategy X` to make the change stick.
+
 #### How it works
 
 - **Session threshold** (default 98%): the 5-hour limit. In `reactive` mode crossing it triggers a switch; in `consume-first` mode it marks an account temporarily unavailable (skipped, then reclaimed after its 5-hour reset).
-- **Weekly threshold** (default 99%): same for the 7-day rolling window; an account at/over it is excluded until it resets.
+- **Weekly threshold** (default 99%): the **weekly window** — a fixed weekly quota that resets on a schedule (not a gradually-rolling average; at reset an account's weekly utilization drops cleanly back to ~0%, which is what makes "consume the soonest-resetting account first" worthwhile). An account at/over it is excluded until it resets.
 - The next account is chosen by: earliest reset time → most remaining headroom → rotation order.
 - Accounts with active Claude Code sessions are excluded from the candidate pool.
 - A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
-- **Polling is light on the API.** The monitor polls between 60s (when the active account is near a limit) and 300s (when it's far away). A normal check reads only the active account's usage (one API call); the other accounts are read only when the active account actually crosses a threshold and a switch is possible.
+- **Polling.** In **`reactive`** mode polling is minimal: a normal check reads only the active account's usage (one API call), and the other accounts are read only when the active account crosses a threshold and a switch is possible. In **`consume-first`** mode every check polls **all** accounts (it has to, to rank them by reset time) — still gentle at the same 60s–300s cadence (faster near a limit, slower when far away).
 
 #### Connection loss
 

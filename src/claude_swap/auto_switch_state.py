@@ -55,9 +55,6 @@ _CONFIG_DEFAULTS: dict = {
     # only becomes available again below ``session_threshold - hysteresis``,
     # preventing available<->blocked thrash around the threshold.
     "hysteresis": 5.0,
-    # Slow safety sub-cadence (seconds) for consume-first: refresh ALL peers at
-    # least this often to catch out-of-band usage from another device.
-    "full_refresh_interval": 300,
 }
 
 
@@ -87,10 +84,8 @@ class AutoSwitchConfig:
     # Decision policy: "reactive" (default — KEEPS the existing test suite green)
     # or "consume-first" (proactive soonest-7d-reset ordering).
     strategy: str = "reactive"
-    # 5h-axis hysteresis margin (percentage points); >= 0.
+    # 5h-axis hysteresis margin (percentage points); 0 <= hysteresis < session_threshold.
     hysteresis: float = 5.0
-    # Slow safety full-refresh sub-cadence for consume-first (seconds).
-    full_refresh_interval: int = 300
 
     @classmethod
     def from_dict(cls, data: object) -> AutoSwitchConfig:
@@ -101,27 +96,23 @@ class AutoSwitchConfig:
         strategy = data.get("strategy", _CONFIG_DEFAULTS["strategy"])
         if strategy not in _VALID_STRATEGIES:
             strategy = _CONFIG_DEFAULTS["strategy"]
-        # Hysteresis is clamped to >= 0 (a negative margin is meaningless).
+        session_threshold = float(
+            data.get("session_threshold", _CONFIG_DEFAULTS["session_threshold"])
+        )
+        # Hysteresis is clamped to >= 0 (a negative margin is meaningless) AND
+        # below session_threshold: if H >= S the lower band (S - H <= 0) would
+        # make a 5h-blocked account NEVER clear (permanent lockout). Cap at
+        # S - 1 so the dead band always has positive width.
         try:
             hysteresis = max(
                 0.0, float(data.get("hysteresis", _CONFIG_DEFAULTS["hysteresis"]))
             )
         except (TypeError, ValueError):
             hysteresis = float(_CONFIG_DEFAULTS["hysteresis"])
-        try:
-            full_refresh_interval = int(
-                data.get(
-                    "full_refresh_interval",
-                    _CONFIG_DEFAULTS["full_refresh_interval"],
-                )
-            )
-        except (TypeError, ValueError):
-            full_refresh_interval = int(_CONFIG_DEFAULTS["full_refresh_interval"])
+        hysteresis = min(hysteresis, max(0.0, session_threshold - 1.0))
         return cls(
             enabled=bool(data.get("enabled", _CONFIG_DEFAULTS["enabled"])),
-            session_threshold=float(
-                data.get("session_threshold", _CONFIG_DEFAULTS["session_threshold"])
-            ),
+            session_threshold=session_threshold,
             weekly_threshold=float(
                 data.get("weekly_threshold", _CONFIG_DEFAULTS["weekly_threshold"])
             ),
@@ -139,7 +130,6 @@ class AutoSwitchConfig:
             ),
             strategy=strategy,
             hysteresis=hysteresis,
-            full_refresh_interval=full_refresh_interval,
         )
 
     def to_dict(self) -> dict:
@@ -154,7 +144,6 @@ class AutoSwitchConfig:
             "offline_backoff_cap": self.offline_backoff_cap,
             "strategy": self.strategy,
             "hysteresis": self.hysteresis,
-            "full_refresh_interval": self.full_refresh_interval,
         }
 
 
@@ -221,8 +210,6 @@ class MonitorState:
             hysteresis FSM (persisted as a list since JSON has no set; the
             engine converts to a frozenset at its boundary). Only meaningful for
             the consume-first strategy.
-        last_full_refresh_ts: wall-clock POSIX ts of the last consume-first slow
-            safety refresh (all peers fetched), or ``None`` until the first.
     """
 
     last_online_ts: float | None = None
@@ -232,7 +219,6 @@ class MonitorState:
     last_switch: dict | None = None
     last_usage: dict = field(default_factory=dict)
     blocked5h: list[str] = field(default_factory=list)
-    last_full_refresh_ts: float | None = None
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -311,7 +297,6 @@ class MonitorState:
             last_switch=last_switch,
             last_usage=last_usage,
             blocked5h=blocked5h,
-            last_full_refresh_ts=_opt_float("last_full_refresh_ts"),
         )
 
     def to_dict(self) -> dict:
@@ -324,7 +309,6 @@ class MonitorState:
             "last_switch": self.last_switch,
             "last_usage": self.last_usage,
             "blocked5h": self.blocked5h,
-            "last_full_refresh_ts": self.last_full_refresh_ts,
         }
 
     # ------------------------------------------------------------------

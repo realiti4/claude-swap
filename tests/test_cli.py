@@ -796,6 +796,101 @@ class TestAutoCommand:
         mock_uninstall.assert_called_once()
 
     # -----------------------------------------------------------------------
+    # consume-first strategy (CLI surface)
+    # -----------------------------------------------------------------------
+
+    def test_auto_on_shows_strategy_normal_visibility(self, temp_home: Path, capsys):
+        """FIX 6: the active strategy is shown in a plain (non-dimmed) line."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        out = capsys.readouterr().out
+        assert "Auto-switch enabled (strategy: " in out
+        # New install (no prior config file) silently defaults to consume-first.
+        assert "consume-first" in out
+
+    def test_auto_on_new_install_defaults_consume_first(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        # No auto-switch.json on disk → "new install".
+        assert not (backup / "auto-switch.json").exists()
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        assert load_config(backup_root=backup).strategy == "consume-first"
+
+    def test_auto_on_existing_config_preserves_strategy(self, temp_home: Path, capsys):
+        """An existing config (reactive) is preserved when --strategy is absent."""
+        from claude_swap.auto_switch import AutoSwitchConfig, load_config, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(
+            AutoSwitchConfig(enabled=False, strategy="reactive"), backup_root=backup
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        # Strategy NOT flipped to consume-first because a config already existed.
+        assert load_config(backup_root=backup).strategy == "reactive"
+
+    def test_auto_on_explicit_strategy_persisted(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on", "--strategy", "reactive"])
+
+        assert load_config(backup_root=backup).strategy == "reactive"
+
+    def test_auto_status_shows_strategy_line(self, capsys, temp_home: Path):
+        from claude_swap.auto_switch import AutoSwitchConfig, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(
+            AutoSwitchConfig(enabled=True, strategy="consume-first"),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "strategy:" in out
+        assert "consume-first" in out
+
+    # -----------------------------------------------------------------------
     # watch
     # -----------------------------------------------------------------------
 
