@@ -170,6 +170,40 @@ class TestInstallAgent:
         _, plist_bytes = self._run_install(tmp_path)
         assert len(plist_bytes) > 0
 
+    def test_plist_written_atomically_no_temp_left(self, tmp_path: Path):
+        """After install, the final plist is valid and no .plist.tmp remains."""
+        _, plist_bytes = self._run_install(tmp_path)
+        # Valid plist content (atomic replace landed a complete file).
+        parsed = plistlib.loads(plist_bytes)
+        assert parsed["Label"] == LABEL
+        # No leftover temp file from the atomic write.
+        tmp_file = tmp_path / "LaunchAgents" / f"{LABEL}.plist.tmp"
+        assert not tmp_file.exists()
+
+    def test_plist_write_failure_cleans_temp_and_raises(self, tmp_path: Path):
+        """If plistlib.dump fails mid-write, the temp file is removed and the
+        error propagates (no truncated final plist)."""
+        plist_parent = tmp_path / "LaunchAgents"
+        plist_parent.mkdir(parents=True)
+        mock_plist_path = plist_parent / f"{LABEL}.plist"
+        tmp_file = plist_parent / f"{LABEL}.plist.tmp"
+
+        with (
+            patch("claude_swap.launchd.Platform.detect", return_value=Platform.MACOS),
+            patch("claude_swap.launchd.PLIST_PATH", mock_plist_path),
+            patch("claude_swap.launchd.shutil.which", return_value="/usr/bin/cswap"),
+            patch(
+                "claude_swap.launchd.plistlib.dump",
+                side_effect=OSError("disk full"),
+            ),
+        ):
+            with pytest.raises(OSError):
+                install_agent(backup_root=tmp_path)
+
+        # No final plist, no leftover temp.
+        assert not mock_plist_path.exists()
+        assert not tmp_file.exists()
+
     def test_plist_has_correct_label(self, tmp_path: Path):
         _, plist_bytes = self._run_install(tmp_path)
         parsed = plistlib.loads(plist_bytes)

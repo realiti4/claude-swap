@@ -137,12 +137,21 @@ class TestDecideSwitch:
         assert d.trigger_window == "7d"
         assert d.trigger_pct == 99.5
 
-    def test_both_crossed_reports_5h_as_binding(self):
-        """5h is the binding/faster window when both cross."""
+    def test_both_crossed_reports_more_severe_window(self):
+        """When both cross, the HIGHER-pct (more severe) window is reported."""
+        # 5h=99, 7d=100 → 7d is more severe.
         usage = {"1": _usage(99.0, 100.0), "2": _usage(0.0, 0.0)}
         d = self._call("1", usage, {"2"})
+        assert d.trigger_window == "7d"
+        assert d.trigger_pct == 100.0
+        assert d.action == "switch"
+
+    def test_both_crossed_reports_5h_when_5h_higher(self):
+        """When both cross and 5h is the higher pct, report 5h."""
+        usage = {"1": _usage(100.0, 99.5), "2": _usage(0.0, 0.0)}
+        d = self._call("1", usage, {"2"})
         assert d.trigger_window == "5h"
-        assert d.trigger_pct == 99.0
+        assert d.trigger_pct == 100.0
         assert d.action == "switch"
 
     # ------------------------------------------------------------------
@@ -220,15 +229,37 @@ class TestDecideSwitch:
         assert d.action == "stay"
         assert d.reason == "all-exhausted"
 
-    def test_candidate_with_none_usage_excluded(self):
+    def test_candidate_with_none_usage_is_unverifiable(self):
+        """A candidate we couldn't FETCH (None) → candidates-unverifiable, NOT
+        all-exhausted (we didn't verify it's over-limit — a transient blip)."""
         usage = {"1": _usage(99.0), "2": None}
         d = self._call("1", usage, {"2"})
         assert d.action == "stay"
-        assert d.reason == "all-exhausted"
+        assert d.reason == "candidates-unverifiable"
 
-    def test_candidate_with_no_credentials_excluded(self):
+    def test_candidate_with_no_credentials_is_unverifiable(self):
+        """"no credentials" candidate → unverifiable, not all-exhausted."""
         usage = {"1": _usage(99.0), "2": "no credentials"}
         d = self._call("1", usage, {"2"})
+        assert d.action == "stay"
+        assert d.reason == "candidates-unverifiable"
+
+    def test_unverifiable_only_when_no_verified_viable(self):
+        """If a verified-available candidate exists, an unverifiable peer does
+        NOT block the switch."""
+        usage = {
+            "1": _usage(99.0),          # active over threshold
+            "2": None,                  # unverifiable
+            "3": _usage(10.0),          # verified available → switch here
+        }
+        d = self._call("1", usage, {"2", "3"})
+        assert d.action == "switch"
+        assert d.target == "3"
+
+    def test_all_candidates_over_limit_is_exhausted(self):
+        """Every candidate FETCHED and over-limit → all-exhausted (the real one)."""
+        usage = {"1": _usage(99.0), "2": _usage(99.0), "3": _usage(0.0, 99.5)}
+        d = self._call("1", usage, {"2", "3"})
         assert d.action == "stay"
         assert d.reason == "all-exhausted"
 
@@ -264,6 +295,26 @@ class TestDecideSwitch:
         usage = {"1": _usage(100.0, 100.0)}
         d = self._call("1", usage, [])
         assert d.reason == "single-account"
+
+    def test_never_targets_active_even_if_in_switchable(self):
+        """Defensive: even if the caller wrongly includes the active account in
+        switchable, decide_switch must never pick it as the target."""
+        usage = {
+            "1": _usage(99.0, 0.0, _ts(+1)),   # active, over threshold, soonest reset
+            "2": _usage(10.0, 0.0, _ts(+48)),  # the only legitimate target
+        }
+        # Active "1" is (wrongly) in switchable AND would sort first by reset.
+        d = self._call("1", usage, {"1", "2"})
+        assert d.action == "switch"
+        assert d.target == "2"          # never the active account
+        assert d.target != "1"
+
+    def test_active_in_switchable_but_no_real_candidate_stays(self):
+        """Active in switchable with no OTHER candidate → stays, never targets active."""
+        usage = {"1": _usage(99.0)}
+        d = self._call("1", usage, {"1"})   # only the active, wrongly listed
+        assert d.action == "stay"
+        assert d.target is None
 
     # ------------------------------------------------------------------
     # active usage unknown
@@ -502,16 +553,24 @@ class TestNextInterval:
             v = next_interval(usage, self.CFG)
             assert self.CFG.min_interval <= v <= self.CFG.max_interval
 
-    def test_clamped_to_min(self):
-        # min_interval above the 2*min band value still floors correctly.
-        cfg = AutoSwitchConfig(min_interval=200, max_interval=300)
-        usage = {"five_hour": {"pct": 50.0}}   # would be 240, but >= floor 200
-        assert next_interval(usage, cfg) >= 200
+    def test_clamped_to_min_exact(self):
+        # 85% band → min(max, 2*min) = min(300, 580) = 300; but the floor must
+        # never drop below min_interval. Use a high min to exercise the floor.
+        cfg = AutoSwitchConfig(min_interval=290, max_interval=300)
+        usage = {"five_hour": {"pct": 50.0}}   # 50% band → int(300*0.8)=240 → floored to 290
+        assert next_interval(usage, cfg) == 290
 
-    def test_clamped_to_max(self):
+    def test_clamped_to_max_exact(self):
         cfg = AutoSwitchConfig(min_interval=60, max_interval=300)
         usage = {"five_hour": {"pct": 0.0}}
-        assert next_interval(usage, cfg) <= 300
+        assert next_interval(usage, cfg) == 300
+
+    def test_band_values_exact(self):
+        """Exact stepped band values at the defaults (min 60, max 300)."""
+        assert next_interval({"five_hour": {"pct": 96.0}}, self.CFG) == 60    # >=95
+        assert next_interval({"five_hour": {"pct": 85.0}}, self.CFG) == 120   # >=85 → 2*min
+        assert next_interval({"five_hour": {"pct": 50.0}}, self.CFG) == 240   # >=50 → int(max*0.8)
+        assert next_interval({"five_hour": {"pct": 49.9}}, self.CFG) == 300   # <50 → max
 
     def test_uses_binding_window(self):
         """The window with the highest utilisation drives the interval."""
@@ -522,19 +581,20 @@ class TestNextInterval:
         )
 
     def test_next_interval_backoff_grows_and_caps(self):
-        """Offline backoff grows exponentially from max_interval and caps."""
+        """Offline backoff ramps from min_interval (gentle first re-probe) and caps."""
         cfg = AutoSwitchConfig(
             min_interval=60, max_interval=300, offline_backoff_cap=600
         )
-        # failures=1 → max_interval * 2**0 = 300
-        assert next_interval(None, cfg, 1) == 300
-        # failures=2 → 300 * 2**1 = 600 (== cap)
-        assert next_interval(None, cfg, 2) == 600
-        # failures=3 → 300 * 2**2 = 1200 → capped at 600
-        assert next_interval(None, cfg, 3) == 600
+        # Ramp: min_interval * 2**min(failures-1, 4) → 60, 120, 240, 480, 600(cap), 600...
+        assert next_interval(None, cfg, 1) == 60
+        assert next_interval(None, cfg, 2) == 120
+        assert next_interval(None, cfg, 3) == 240
+        assert next_interval(None, cfg, 4) == 480
+        assert next_interval(None, cfg, 5) == 600   # 60*16=960 → capped at 600
+        assert next_interval(None, cfg, 6) == 600   # exponent capped at 4
         # Monotonic non-decreasing as failures grow, always <= cap.
         prev = 0
-        for f in range(1, 10):
+        for f in range(1, 12):
             v = next_interval(None, cfg, f)
             assert v >= prev
             assert v <= cfg.offline_backoff_cap
@@ -544,8 +604,10 @@ class TestNextInterval:
         """When offline, the interval is backoff — usage% is irrelevant."""
         cfg = AutoSwitchConfig(min_interval=60, max_interval=300, offline_backoff_cap=600)
         near_threshold = {"five_hour": {"pct": 99.0}}
-        # Online would be min_interval (60); offline overrides to backoff.
-        assert next_interval(near_threshold, cfg, 1) == 300
+        # Online would be min_interval (60); offline failures=1 → 60 (same here,
+        # but failures=3 proves usage is ignored: 240, not the 60 a 99% online tick gives).
+        assert next_interval(near_threshold, cfg, 1) == 60
+        assert next_interval(near_threshold, cfg, 3) == 240
 
     def test_next_interval_zero_failures_is_online_path(self):
         """consecutive_failures=0 → normal adaptive behaviour."""
@@ -612,7 +674,10 @@ def _patch_oauth_fetch():
 class _FakeSwitcher:
     """Minimal fake switcher for AutoSwitcher unit tests.
 
-    The first account is the ACTIVE one (mirrors ``_get_current_account``).
+    The ACTIVE account is the one whose dict has ``active=True``; if none is
+    flagged, the FIRST account is active (back-compat default). This lets tests
+    construct "active is account 2, candidate is account 1" cases.
+
     Each account dict carries a ``usage`` value (dict / None / "no credentials")
     that is encoded into the row's credentials so the engine's active-first
     probe (``_fetch_one`` → patched ``oauth.fetch_usage_for_account``) recovers
@@ -623,21 +688,30 @@ class _FakeSwitcher:
     def __init__(self, backup_dir: Path, accounts: list[dict]) -> None:
         self.backup_dir = backup_dir
         self.platform = Platform.LINUX
-        self._accounts = accounts   # list of {num, email, usage}
+        self._accounts = accounts   # list of {num, email, usage, active?}
         self.switched_to: list[str] = []
 
-    def _active_email(self) -> str | None:
-        return self._accounts[0]["email"] if self._accounts else None
+    def _active_index(self) -> int | None:
+        if not self._accounts:
+            return None
+        for i, a in enumerate(self._accounts):
+            if a.get("active"):
+                return i
+        return 0   # default: first account is active
+
+    def _active_num(self) -> str | None:
+        idx = self._active_index()
+        return str(self._accounts[idx]["num"]) if idx is not None else None
 
     def _build_accounts_info(self):
-        active_email = self._active_email()
+        active_num = self._active_num()
         return [
             (
                 int(a["num"]),
                 a["email"],
                 "",
                 "",
-                a["email"] == active_email,          # is_active: first account
+                str(a["num"]) == active_num,         # is_active (index 4)
                 _encode_creds(a.get("usage")),       # creds carry the usage
             )
             for a in self._accounts
@@ -658,10 +732,10 @@ class _FakeSwitcher:
         }
 
     def _get_current_account(self):
-        # First account is "active"
-        if self._accounts:
-            return (self._accounts[0]["email"], "")
-        return None
+        idx = self._active_index()
+        if idx is None:
+            return None
+        return (self._accounts[idx]["email"], "")
 
     @staticmethod
     def _find_account_slot(data, email, org_uuid):
@@ -671,7 +745,13 @@ class _FakeSwitcher:
         return None
 
     def _account_is_switchable(self, num: str) -> bool:
-        return any(a["num"] == num for a in self._accounts[1:])
+        # Switchable = managed AND not the active account (the active account is
+        # never a switch target). Honors the explicit active flag.
+        active_num = self._active_num()
+        return any(
+            str(a["num"]) == str(num) and str(a["num"]) != active_num
+            for a in self._accounts
+        )
 
     def _live_session_pids(self, num: str, email: str) -> list[int]:
         return []
@@ -725,7 +805,8 @@ class TestAutoSwitcherRunOnce:
         assert decision.reason == "all-exhausted"
         mock_notify.assert_called_once()
 
-    def test_exhaustion_notify_rate_limited(self, tmp_path: Path):
+    def test_exhaustion_notify_is_one_shot(self, tmp_path: Path):
+        """Persisted one-shot: consecutive exhausted ticks notify exactly once."""
         accounts = [
             {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
             {"num": "2", "email": "b@x.com", "usage": _usage(99.0)},
@@ -733,8 +814,9 @@ class TestAutoSwitcherRunOnce:
         as_ = _make_auto_switcher(tmp_path, accounts)
         with patch("claude_swap.auto_switch.notify") as mock_notify:
             as_.run_once()
-            as_.run_once()   # second call — within gate → no second notify
+            as_.run_once()   # still exhausted; exhaustion_notified already True
         assert mock_notify.call_count == 1
+        assert as_._state.exhaustion_notified is True
 
     def test_notify_not_called_when_config_notify_false(self, tmp_path: Path):
         accounts = [
@@ -816,7 +898,9 @@ class TestConnectionLossFallback:
         persisted = load_state(tmp_path)
         assert persisted.consecutive_failures == 1
 
-    def test_run_once_active_no_credentials_is_neither(self, tmp_path: Path):
+    def test_run_once_active_no_credentials_is_neither(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
         """Active uncredentialed → NEITHER (no token, didn't try): not offline.
 
         Active-first: the trichotomy keys on the ACTIVE probe. "no credentials"
@@ -828,17 +912,14 @@ class TestConnectionLossFallback:
             {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
         ]
         as_ = _make_auto_switcher(tmp_path, accounts)
-        with patch("claude_swap.auto_switch.notify") as mock_notify, \
-             patch("claude_swap.oauth.fetch_usage_for_account") as spy_fetch:
-            # The autouse fixture already patched oauth; re-patch locally to spy.
-            spy_fetch.side_effect = lambda *a, **k: None
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
             decision = as_.run_once()
         assert decision.reason == "active-usage-unknown"
         assert as_.consecutive_failures == 0            # NOT offline
         assert as_._switcher.switched_to == []
-        # Active had no creds → engine short-circuits, never calls the API,
-        # never fetches the others.
-        spy_fetch.assert_not_called()
+        # Active had no creds → engine short-circuits, never calls the usage API
+        # (the single patched seam), never fetches the others.
+        _patch_oauth_fetch.assert_not_called()
         mock_notify.assert_not_called()
 
     def test_no_switch_while_offline(self, tmp_path: Path):
@@ -957,7 +1038,7 @@ class TestConnectionLossFallback:
         assert as_._state.last_usage["1"]["usage"] == good
 
     def test_state_persisted_every_tick(self, tmp_path: Path):
-        """run_once persists state even on a plain under-threshold stay."""
+        """run_once persists state (a REAL field) even on an under-threshold stay."""
         accounts = [
             {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},
             {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
@@ -965,7 +1046,10 @@ class TestConnectionLossFallback:
         as_ = _make_auto_switcher(tmp_path, accounts)
         with patch("claude_swap.auto_switch.notify"):
             as_.run_once()
-        assert (tmp_path / "auto-switch-state.json").exists()
+        # Assert a real persisted field, not merely that the file exists.
+        persisted = load_state(tmp_path)
+        assert persisted.last_online_ts is not None
+        assert persisted.consecutive_failures == 0
 
     # ------------------------------------------------------------------
     # Trichotomy: zero accounts / all-no-credentials / mixed
@@ -1043,6 +1127,86 @@ class TestConnectionLossFallback:
             as_.run_once()
 
         assert sum("offline" in t.lower() for t in titles) == 2
+
+    def test_recovery_notify_not_fired_after_single_transient(self, tmp_path: Path):
+        """A single sub-gate failure (failures=1, never notified) → NO recovery
+        notification on the next online tick."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},   # one offline blip
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()                       # failures=1, NOT notified
+            assert as_.consecutive_failures == 1
+            assert as_._state.offline_notified is False
+            assert mock_notify.call_count == 0
+            # Recover immediately.
+            as_._switcher._accounts[0]["usage"] = _usage(10.0)
+            as_.run_once()
+        # No "offline" and no "back online" ever fired.
+        assert mock_notify.call_count == 0
+        assert as_.consecutive_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# TestExhaustionState — persisted one-shot exhaustion + candidates-unverifiable
+# ---------------------------------------------------------------------------
+
+class TestExhaustionState:
+    """The 'all accounts exhausted' notification is a PERSISTED one-shot."""
+
+    def test_exhaustion_one_shot_survives_restart(self, tmp_path: Path):
+        """A respawned daemon (fresh AutoSwitcher on same dir) must NOT re-notify."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(99.0)},
+        ]
+        as1 = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as n1:
+            d1 = as1.run_once()
+        assert d1.reason == "all-exhausted"
+        assert n1.call_count == 1
+        assert load_state(tmp_path).exhaustion_notified is True
+
+        # Simulate launchd respawn: a brand-new AutoSwitcher reloads state from
+        # disk. Still exhausted → must NOT notify again (persisted one-shot).
+        as2 = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as n2:
+            d2 = as2.run_once()
+        assert d2.reason == "all-exhausted"
+        assert n2.call_count == 0
+
+    def test_exhaustion_flag_cleared_on_recovery(self, tmp_path: Path):
+        """After exhaustion, a switchable account appearing clears the flag and
+        a later exhaustion notifies again."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(99.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()                       # exhausted → 1 notify
+            assert as_._state.exhaustion_notified is True
+            # Account 2 frees up → switch happens (not exhausted) → flag cleared.
+            as_._switcher._accounts[1]["usage"] = _usage(10.0)
+            as_.run_once()
+            assert as_._state.exhaustion_notified is False
+            assert as_._switcher.switched_to == ["2"]
+
+    def test_candidates_unverifiable_does_not_notify_exhaustion(self, tmp_path: Path):
+        """Active over threshold + a peer returns None → stay/candidates-unverifiable;
+        NO exhaustion notification (we couldn't verify, not a real exhaustion)."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},   # active over
+            {"num": "2", "email": "b@x.com", "usage": None},           # peer blip
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            decision = as_.run_once()
+        assert decision.reason == "candidates-unverifiable"
+        assert as_._switcher.switched_to == []
+        assert as_._state.exhaustion_notified is False
+        mock_notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1305,7 @@ class TestMonitorState:
         assert st.last_online_ts is None
         assert st.consecutive_failures == 0
         assert st.offline_notified is False
+        assert st.exhaustion_notified is False
         assert st.last_switch is None
         assert st.last_usage == {}
 
@@ -1149,12 +1314,33 @@ class TestMonitorState:
             last_online_ts=123.0,
             consecutive_failures=2,
             offline_notified=True,
+            exhaustion_notified=True,
             last_switch={"account": "2", "ts": 1.0, "reason": "5h-threshold"},
             last_usage={"1": {"usage": {"five_hour": {"pct": 1.0}}, "fetched_at": 5.0}},
         )
         save_state(st, backup_root=tmp_path)
         loaded = load_state(backup_root=tmp_path)
         assert loaded == st
+
+    def test_exhaustion_notified_round_trip(self, tmp_path: Path):
+        st = MonitorState(exhaustion_notified=True, consecutive_failures=0)
+        save_state(st, backup_root=tmp_path)
+        assert load_state(backup_root=tmp_path).exhaustion_notified is True
+
+    def test_from_dict_normalizes_offline_notified_when_no_failures(self):
+        """failures==0 but offline_notified=True (inconsistent / hand-edited)
+        → normalized to False so no phantom 'back online' at startup."""
+        st = MonitorState.from_dict(
+            {"consecutive_failures": 0, "offline_notified": True}
+        )
+        assert st.consecutive_failures == 0
+        assert st.offline_notified is False
+
+    def test_from_dict_keeps_offline_notified_when_failures_present(self):
+        st = MonitorState.from_dict(
+            {"consecutive_failures": 3, "offline_notified": True}
+        )
+        assert st.offline_notified is True
 
     def test_state_file_missing_or_corrupt_returns_defaults(self, tmp_path: Path):
         # Missing file → defaults.

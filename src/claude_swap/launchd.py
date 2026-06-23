@@ -148,8 +148,20 @@ def install_agent(backup_root: Path | None = None) -> str:
     # Ensure the LaunchAgents dir exists.
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(PLIST_PATH, "wb") as fh:
-        plistlib.dump(payload, fh)
+    # Atomic write: dump to a temp file then os.replace() onto the final path,
+    # so an interruption can never leave a TRUNCATED plist that launchd would
+    # fail to parse at the next login (mirrors the config/state writers).
+    tmp_path = PLIST_PATH.with_suffix(".plist.tmp")
+    try:
+        with open(tmp_path, "wb") as fh:
+            plistlib.dump(payload, fh)
+        os.replace(tmp_path, PLIST_PATH)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
     _logger.info("launchd: wrote plist at %s", PLIST_PATH)
 

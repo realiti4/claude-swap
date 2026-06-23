@@ -147,6 +147,47 @@ def _last_switch_status_line(backup_root) -> str | None:
     return f"account-{acct} at {when} ({reason})"
 
 
+def _last_usage_status_lines(backup_root) -> list[str]:
+    """Per-account last-known 5h/7d% (with age) from monitor state.
+
+    Renders the ``last_usage`` the daemon records each tick — clearly labelled
+    as last-known (the daemon probes only the active account most ticks, so a
+    peer's reading can be older). Empty when nothing has been recorded yet.
+    """
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    if not isinstance(state.last_usage, dict) or not state.last_usage:
+        return []
+
+    def _pct(usage: dict, key: str):
+        w = usage.get(key) if isinstance(usage, dict) else None
+        if isinstance(w, dict) and isinstance(w.get("pct"), (int, float)):
+            return float(w["pct"])
+        return None
+
+    lines: list[str] = []
+    for num in sorted(state.last_usage, key=lambda n: (len(n), n)):
+        entry = state.last_usage[num]
+        if not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        h5 = _pct(usage, "five_hour")
+        d7 = _pct(usage, "seven_day")
+        h5_s = f"5h {h5:.0f}%" if h5 is not None else "5h —"
+        d7_s = f"7d {d7:.0f}%" if d7 is not None else "7d —"
+        fetched_at = entry.get("fetched_at")
+        age = (
+            _fmt_clock_ago(fetched_at)
+            if isinstance(fetched_at, (int, float))
+            else "unknown"
+        )
+        lines.append(f"  acct {num}: {h5_s}  {d7_s}  (last-known {age})")
+    return lines
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle ``cswap auto [on|off|status]``, ``cswap watch``, ``cswap _auto-daemon``.
 
@@ -264,6 +305,11 @@ def _auto_command(argv: list[str]) -> None:
             last_switch = _last_switch_status_line(backup_root)
             if last_switch is not None:
                 print(f"last switch:       {last_switch}")
+            usage_lines = _last_usage_status_lines(backup_root)
+            if usage_lines:
+                print("last-known usage:")
+                for line in usage_lines:
+                    print(line)
 
             if Platform.detect() is Platform.MACOS:
                 print(f"agent:             {agent_status()}")

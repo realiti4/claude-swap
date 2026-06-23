@@ -604,6 +604,81 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "last switch:" not in out
 
+    def test_auto_status_shows_last_known_usage(self, capsys, temp_home: Path):
+        """status renders per-account last-known 5h/7d% from monitor state."""
+        import time
+
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_state(
+            MonitorState(
+                last_online_ts=time.time(),
+                last_usage={
+                    "3": {
+                        "usage": {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 12.0}},
+                        "fetched_at": time.time(),
+                    },
+                },
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last-known usage:" in out
+        assert "acct 3" in out
+        assert "5h 25%" in out
+        assert "7d 12%" in out
+
+    def test_auto_status_no_usage_block_when_empty(self, capsys, temp_home: Path):
+        """No 'last-known usage:' header when state has no readings."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last-known usage:" not in out
+
+    def test_auto_on_config_save_failure_clean_error(self, temp_home: Path, capsys):
+        """If save_config raises (e.g. read-only dir), print a clean error and
+        exit(1) — NOT a raw traceback."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX), \
+             patch(
+                 "claude_swap.cli._as_save_config",
+                 side_effect=OSError("read-only file system"),
+             ):
+            with pytest.raises(SystemExit) as exc_info:
+                self._dispatch(["auto", "on"])
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        # A clean one-line error was printed (no bare traceback text).
+        assert "read-only file system" in combined or "Error" in combined
+
     # -----------------------------------------------------------------------
     # auto on / off
     # -----------------------------------------------------------------------

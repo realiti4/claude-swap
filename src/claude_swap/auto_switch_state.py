@@ -160,6 +160,10 @@ class MonitorState:
             on any online tick). Drives the offline backoff.
         offline_notified: True once the one-shot "offline" notification has
             been sent; cleared on recovery so the next outage notifies again.
+        exhaustion_notified: True once the one-shot "all accounts exhausted"
+            notification has been sent; cleared on any non-exhausted tick so
+            the next exhaustion notifies again. Persisted (unlike the old
+            in-memory monotonic gate) so a daemon restart does NOT re-spam it.
         last_switch: ``{"account": str, "ts": float, "reason": str}`` of the
             most recent successful auto-switch, or ``None``.
         last_usage: ``{num: {"usage": <dict>, "fetched_at": <ts>}}`` — the
@@ -170,6 +174,7 @@ class MonitorState:
     last_online_ts: float | None = None
     consecutive_failures: int = 0
     offline_notified: bool = False
+    exhaustion_notified: bool = False
     last_switch: dict | None = None
     last_usage: dict = field(default_factory=dict)
 
@@ -224,10 +229,21 @@ class MonitorState:
                     }
             last_usage = clean
 
+        failures = max(0, _int("consecutive_failures", 0))
+        offline_notified = bool(data.get("offline_notified", False))
+        # Normalise: failures==0 and offline_notified are mutually inconsistent
+        # (you cannot be "online with 0 failures" yet still flagged offline).
+        # Forcing them consistent prevents a hand-edited / partially-written
+        # state file from emitting a phantom "back online" notification at the
+        # first tick after startup.
+        if failures == 0:
+            offline_notified = False
+
         return cls(
             last_online_ts=_opt_float("last_online_ts"),
-            consecutive_failures=max(0, _int("consecutive_failures", 0)),
-            offline_notified=bool(data.get("offline_notified", False)),
+            consecutive_failures=failures,
+            offline_notified=offline_notified,
+            exhaustion_notified=bool(data.get("exhaustion_notified", False)),
             last_switch=last_switch,
             last_usage=last_usage,
         )
@@ -238,6 +254,7 @@ class MonitorState:
             "last_online_ts": self.last_online_ts,
             "consecutive_failures": self.consecutive_failures,
             "offline_notified": self.offline_notified,
+            "exhaustion_notified": self.exhaustion_notified,
             "last_switch": self.last_switch,
             "last_usage": self.last_usage,
         }

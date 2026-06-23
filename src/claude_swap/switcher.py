@@ -1924,6 +1924,17 @@ class ClaudeAccountSwitcher:
                 f"Account-{target_account} does not exist"
             )
 
+        # Re-validate switchability up front (parity with switch_to). The engine
+        # picks a target from a snapshot taken earlier in the tick; if the
+        # account's credential/config backups were removed in the meantime
+        # (remove-during-tick race), fail cleanly HERE with a clear error rather
+        # than deep inside the transactional _perform_switch.
+        if not self._account_is_switchable(target_account):
+            raise SwitchError(
+                f"Account-{target_account} has no stored credentials/config "
+                f"(re-add with: cswap --add-account --slot {target_account})"
+            )
+
         self._perform_switch(target_account, quiet=quiet)
 
     def _perform_switch(self, target_account: str, quiet: bool = False) -> None:

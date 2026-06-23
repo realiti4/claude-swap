@@ -103,9 +103,9 @@ def _parse_reset_ts(usage: dict | None) -> float:
 def _window_pct(usage: dict | str | None, key: str) -> float:
     """Return ``usage[key]["pct"]`` as a float; 0.0 on any missing/bad value.
 
-    Shared by ``decide_switch`` and ``AutoSwitcher._active_over_threshold`` so
-    the threshold check is identical in both (the active-first short-circuit
-    must agree with the pure decision function).
+    Shared by ``decide_switch`` and ``AutoSwitcher`` so the threshold check is
+    identical everywhere (the active-first short-circuit must agree with the
+    pure decision function).
     """
     if not isinstance(usage, dict):
         return 0.0
@@ -113,6 +113,38 @@ def _window_pct(usage: dict | str | None, key: str) -> float:
     if isinstance(w, dict) and isinstance(w.get("pct"), (int, float)):
         return float(w["pct"])
     return 0.0
+
+
+def _active_crosses(
+    usage: dict | str | None,
+    config: AutoSwitchConfig,
+) -> tuple[bool, str | None, float | None]:
+    """Whether the active account is at/over a switch threshold (PURE).
+
+    SINGLE SOURCE OF TRUTH for the threshold check — used by BOTH
+    ``decide_switch`` and ``AutoSwitcher._active_over_threshold`` so the
+    active-first short-circuit can never drift from the pure decision.
+
+    Returns ``(crossed, trigger_window, trigger_pct)``:
+    * ``crossed`` — True iff 5h% >= session_threshold OR 7d% >= weekly_threshold.
+    * When BOTH cross, the binding window reported is the one with the HIGHER
+      utilisation (severity), so logs/notifications reflect the worst window.
+      (Target selection is unchanged — always soonest-7d-reset.)
+    * Not crossed → ``(False, None, None)``.
+    """
+    h5 = _window_pct(usage, "five_hour")
+    d7 = _window_pct(usage, "seven_day")
+    h5_crossed = h5 >= config.session_threshold
+    d7_crossed = d7 >= config.weekly_threshold
+
+    if not h5_crossed and not d7_crossed:
+        return (False, None, None)
+    if h5_crossed and d7_crossed:
+        # Both over — report the more severe (higher pct) window.
+        return (True, "5h", h5) if h5 >= d7 else (True, "7d", d7)
+    if h5_crossed:
+        return (True, "5h", h5)
+    return (True, "7d", d7)
 
 
 def decide_switch(
@@ -168,15 +200,13 @@ def decide_switch(
         )
 
     # ------------------------------------------------------------------
-    # 2. Threshold crossed?
+    # 2. Threshold crossed? (single source of truth via _active_crosses)
     # ------------------------------------------------------------------
+    crossed, trigger_window, trigger_pct = _active_crosses(active_usage, config)
     h5_pct = _window_pct(active_usage, "five_hour")
     d7_pct = _window_pct(active_usage, "seven_day")
 
-    h5_crossed = h5_pct >= config.session_threshold
-    d7_crossed = d7_pct >= config.weekly_threshold
-
-    if not h5_crossed and not d7_crossed:
+    if not crossed:
         return SwitchDecision(
             action="stay",
             target=None,
@@ -188,10 +218,6 @@ def decide_switch(
                 f"7d={d7_pct:.1f}% — under threshold."
             ),
         )
-
-    # Both crossed → 5h is the binding/faster window
-    trigger_window = "5h" if h5_crossed else "7d"
-    trigger_pct = h5_pct if h5_crossed else d7_pct
 
     # ------------------------------------------------------------------
     # 3. No switchable accounts at all?
@@ -207,22 +233,43 @@ def decide_switch(
         )
 
     # ------------------------------------------------------------------
-    # 4. Build viable candidates
+    # 4. Build viable candidates. Distinguish two failure shapes:
+    #   * over-limit  → candidate was FETCHED and is at/over its own threshold.
+    #   * unverifiable → candidate usage is unknown (None / "no credentials").
+    # Only declare "all-exhausted" when EVERY candidate was verified over-limit.
+    # If any candidate is merely unverifiable, return a softer stay so we never
+    # fire the alarming "all accounts exhausted" notification on a peer's
+    # transient network blip — we just wait for the next tick.
     # ------------------------------------------------------------------
     viable: list[str] = []
+    any_unverifiable = False
     for n in switchable:
+        if n == active_num:          # defensive: never target the active account
+            continue
         if n in live_session_nums:
             continue
         cand_usage = usage_by_account.get(n)
         if not isinstance(cand_usage, dict):
+            any_unverifiable = True   # None / "no credentials" → couldn't verify
             continue
-        cand_h5_pct = _window_pct(cand_usage, "five_hour")
-        cand_d7_pct = _window_pct(cand_usage, "seven_day")
-        if (cand_h5_pct < config.session_threshold
-                and cand_d7_pct < config.weekly_threshold):
+        cand_crossed, _cw, _cp = _active_crosses(cand_usage, config)
+        if not cand_crossed:
             viable.append(n)
 
     if not viable:
+        if any_unverifiable:
+            return SwitchDecision(
+                action="stay",
+                target=None,
+                reason="candidates-unverifiable",
+                trigger_window=trigger_window,
+                trigger_pct=trigger_pct,
+                detail=(
+                    "No verified-available account to switch to "
+                    "(some candidates' usage could not be read this tick). "
+                    "Will retry."
+                ),
+            )
         return SwitchDecision(
             action="stay",
             target=None,
@@ -273,10 +320,13 @@ def next_interval(
     """Return the next polling interval in seconds (adaptive, clamped). PURE.
 
     When ``consecutive_failures > 0`` the engine is OFFLINE (can't reach the
-    usage API): back off exponentially so a real outage doesn't hammer the
-    network, capped at ``config.offline_backoff_cap``::
+    usage API): back off exponentially from ``min_interval`` so the FIRST
+    re-probe is quick (faster recovery detection) yet a sustained outage ramps
+    up, capped at ``config.offline_backoff_cap``::
 
-        min(offline_backoff_cap, max_interval * 2 ** min(failures - 1, 4))
+        min(offline_backoff_cap, min_interval * 2 ** min(failures - 1, 4))
+
+    With the defaults (min 60, cap 600) the ramp is 60 → 120 → 240 → 480 → 600.
 
     When online (``consecutive_failures == 0``) use a stepped adaptive mapping
     over the binding window (max of 5h%, 7d%), floored at ``min_interval`` and
@@ -290,22 +340,18 @@ def next_interval(
     if consecutive_failures > 0:
         # Cap the exponent at 4 (×16) so the multiplier never overflows.
         exp = min(consecutive_failures - 1, 4)
-        backoff = config.max_interval * (2 ** exp)
+        backoff = config.min_interval * (2 ** exp)
         return min(config.offline_backoff_cap, backoff)
 
     if not isinstance(active_usage, dict):
         return config.max_interval
 
-    pcts: list[float] = []
-    for key in ("five_hour", "seven_day"):
-        w = active_usage.get(key)
-        if isinstance(w, dict) and isinstance(w.get("pct"), (int, float)):
-            pcts.append(float(w["pct"]))
-
-    if not pcts:
-        return config.max_interval
-
-    approach = max(pcts)
+    # Binding window = the higher of the two utilisations. Missing/bad windows
+    # read as 0.0 (→ far-away → max_interval), matching the old "no pct" case.
+    approach = max(
+        _window_pct(active_usage, "five_hour"),
+        _window_pct(active_usage, "seven_day"),
+    )
 
     if approach >= 95.0:
         interval = config.min_interval
@@ -323,8 +369,6 @@ def next_interval(
 # ---------------------------------------------------------------------------
 # Monitor: AutoSwitcher
 # ---------------------------------------------------------------------------
-
-_EXHAUSTION_NOTIFY_GATE_SECS = 30 * 60  # 30 minutes
 
 
 class AutoSwitcher:
@@ -348,7 +392,6 @@ class AutoSwitcher:
             switcher.backup_dir
         )
         self._lock_path = switcher.backup_dir / ".auto-switch.lock"
-        self._last_exhaustion_notify_ts: float = 0.0
         # Active account's usage from the most recent ``run_once`` gather, used
         # by ``watch`` / ``run_daemon`` to size the next poll interval WITHOUT a
         # second gather (one gather per tick).
@@ -389,24 +432,24 @@ class AutoSwitcher:
         """
         s = self._switcher
 
-        # Build accounts info once (carries per-account credentials). No I/O to
-        # the usage API here.
+        # Build accounts info once (carries per-account credentials, is_active,
+        # and is already in sequence order). No usage-API I/O here. Everything
+        # below is derived from this single read — no redundant disk reads.
         accounts_info = s._build_accounts_info()
 
-        # Active account number.
-        data = s._get_sequence_data_migrated()
-        ident = s._get_current_account()
-        active_num: str | None = None
-        if ident is not None and data is not None:
-            email, org_uuid = ident
-            active_num = s._find_account_slot(data, email, org_uuid)
+        # Active account number — from the is_active flag (index 4), not a
+        # second _get_current_account()/_find_account_slot() round-trip.
+        active_num: str | None = next(
+            (str(r[0]) for r in accounts_info if r[4]), None
+        )
 
-        # Switchable set (excludes active).
-        seq = (data or {}).get("sequence") or []
+        # Switchable set (excludes active). _account_is_switchable still runs
+        # per-candidate — it validates the config+creds backups, which the row
+        # alone doesn't guarantee.
         switchable: set[str] = {
-            str(n)
-            for n in seq
-            if str(n) != active_num and s._account_is_switchable(str(n))
+            str(r[0])
+            for r in accounts_info
+            if str(r[0]) != active_num and s._account_is_switchable(str(r[0]))
         }
 
         # Live session nums (avoid switching onto these).
@@ -416,8 +459,11 @@ class AutoSwitcher:
             if s._live_session_pids(str(num), email)
         }
 
-        # Rotation index for stable tie-breaking.
-        rotation_index: dict[str, int] = {str(n): i for i, n in enumerate(seq)}
+        # Rotation index for stable tie-breaking — accounts_info is already in
+        # sequence order.
+        rotation_index: dict[str, int] = {
+            str(r[0]): i for i, r in enumerate(accounts_info)
+        }
 
         return active_num, accounts_info, switchable, live_session_nums, rotation_index
 
@@ -451,16 +497,12 @@ class AutoSwitcher:
     def _active_over_threshold(self, active_usage: dict) -> bool:
         """True iff the active account is at/over a switch threshold.
 
-        Uses the SAME comparison as ``decide_switch`` (via ``_window_pct``) so
-        the active-first short-circuit can never disagree with the pure decision
-        function about whether a switch is even possible.
+        Delegates to the shared pure ``_active_crosses`` so the active-first
+        short-circuit can never disagree with ``decide_switch`` about whether a
+        switch is even possible.
         """
-        h5 = _window_pct(active_usage, "five_hour")
-        d7 = _window_pct(active_usage, "seven_day")
-        return (
-            h5 >= self._config.session_threshold
-            or d7 >= self._config.weekly_threshold
-        )
+        crossed, _window, _pct = _active_crosses(active_usage, self._config)
+        return crossed
 
     # ------------------------------------------------------------------
     # Public API
@@ -505,6 +547,7 @@ class AutoSwitcher:
             # (do not touch the offline state machine) and back off via the
             # max interval through the existing daemon/watch try/except.
             _logger.exception("auto-switch: gather failed: %r", exc)
+            self._apply_exhaustion("tick-error")
             self._persist_state()
             return SwitchDecision(
                 action="stay",
@@ -551,6 +594,7 @@ class AutoSwitcher:
                     else "No usable credentials for the active account — can't "
                     "read usage (not a network outage)."
                 )
+            self._apply_exhaustion("active-usage-unknown")
             self._persist_state()
             return SwitchDecision(
                 action="stay",
@@ -570,6 +614,7 @@ class AutoSwitcher:
             # Under both thresholds → stay WITHOUT fetching the others (one API
             # call total this tick). Mirror decide_switch's under-threshold
             # decision exactly (it stays PURE and is simply not called here).
+            self._apply_exhaustion("under-threshold")
             self._persist_state()
             return SwitchDecision(
                 action="stay",
@@ -592,6 +637,10 @@ class AutoSwitcher:
             usage_by_account[num] = (
                 self._fetch_one(row) if row is not None else "no credentials"
             )
+
+        # Record the candidates' fresh GOOD readings too (don't discard Phase-2
+        # work) — last_usage now reflects the COMPLETE map, surfaced in status.
+        self._merge_last_usage(usage_by_account)
 
         decision = decide_switch(
             active_num,
@@ -636,6 +685,8 @@ class AutoSwitcher:
                 _logger.exception(
                     "auto-switch: switch to %s failed: %r", decision.target, exc
                 )
+                # A failed switch is NOT exhaustion — clear the flag.
+                self._apply_exhaustion("tick-error")
                 self._persist_state()
                 return SwitchDecision(
                     action="stay",
@@ -646,17 +697,10 @@ class AutoSwitcher:
                     detail=f"Switch error: {exc!r}",
                 )
 
-        elif decision.reason == "all-exhausted":
-            now = time.monotonic()
-            if now - self._last_exhaustion_notify_ts > _EXHAUSTION_NOTIFY_GATE_SECS:
-                self._last_exhaustion_notify_ts = now
-                _logger.info("auto-switch: all accounts exhausted")
-                if self._config.notify:
-                    notify(
-                        "Claude Swap — All Accounts Exhausted",
-                        "All managed accounts are at their rate-limit. "
-                        "Consider adding another account.",
-                    )
+        # One-shot exhaustion notification (persisted; survives restart). Fires
+        # ONLY on a real all-exhausted decision (every candidate verified
+        # over-limit) — never on "candidates-unverifiable" (a peer's blip).
+        self._apply_exhaustion(decision.reason)
 
         self._persist_state()
         return decision
@@ -698,15 +742,19 @@ class AutoSwitcher:
         )
 
     def _handle_online_tick(self, usage_by_account: dict[str, object]) -> None:
-        """Mark online, handle recovery, refresh last-known-good usage."""
-        was_offline = (
-            self._state.consecutive_failures > 0 or self._state.offline_notified
-        )
+        """Mark online, handle recovery, refresh last-known-good usage.
+
+        We only "recover" LOUDLY (INFO log + notification) from a state we
+        actually ANNOUNCED — i.e. ``offline_notified`` is True. A single
+        transient failure that never crossed the >=2 notify gate clears
+        silently, so there's never a "back online" with no prior "offline".
+        """
+        announced_offline = self._state.offline_notified
         now = _now_ts()
 
-        if was_offline:
+        if announced_offline:
             _logger.info("auto-switch: usage API reachable again — back online.")
-            if self._state.offline_notified and self._config.notify:
+            if self._config.notify:
                 notify(
                     "Claude Swap — Auto-switch back online",
                     "Usage monitoring resumed.",
@@ -722,6 +770,42 @@ class AutoSwitcher:
             offline_notified=False,
             last_usage=merged,
         )
+
+    def _merge_last_usage(self, usage_by_account: dict[str, object]) -> None:
+        """Merge fresh GOOD readings into ``last_usage`` (no recovery handling).
+
+        Used after Phase 2 so the candidates' last-known usage is recorded (and
+        rendered in ``cswap auto status``) rather than discarded. A None /
+        non-dict fetch never clobbers a good entry (see ``merged_usage``).
+        """
+        merged = self._state.merged_usage(usage_by_account, _now_ts())
+        self._state = _state_replace(self._state, last_usage=merged)
+
+    def _apply_exhaustion(self, reason: str) -> None:
+        """Manage the PERSISTED one-shot 'all accounts exhausted' notification.
+
+        Mirrors the offline one-shot pattern (survives daemon restarts — no
+        in-memory monotonic gate):
+        * reason == "all-exhausted" → fire the notification once (only when not
+          already notified) and set ``exhaustion_notified`` True.
+        * any other reason (recovery: a switch happened, the active is under
+          threshold, candidates unverifiable, or we're offline) → clear the
+          flag so the NEXT real exhaustion notifies again.
+        """
+        if reason == "all-exhausted":
+            if not self._state.exhaustion_notified:
+                _logger.info("auto-switch: all accounts exhausted")
+                if self._config.notify:
+                    notify(
+                        "Claude Swap — All Accounts Exhausted",
+                        "All managed accounts are at their rate-limit. "
+                        "Consider adding another account.",
+                    )
+                self._state = _state_replace(
+                    self._state, exhaustion_notified=True
+                )
+        elif self._state.exhaustion_notified:
+            self._state = _state_replace(self._state, exhaustion_notified=False)
 
     def _persist_state(self) -> None:
         """Persist monitor state once (best-effort; never raises)."""

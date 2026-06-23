@@ -2583,6 +2583,40 @@ class TestSwitchSkipsBrokenSlots:
         with pytest.raises(SwitchError, match="has no stored config backup"):
             s.switch_to("2")
 
+    def test_auto_switch_to_revalidates_switchability(self, temp_home: Path):
+        """auto_switch_to must re-check switchability BEFORE the transaction.
+
+        Defends a remove-during-tick race: the engine picked target 2 from an
+        earlier snapshot, but its credential backup is gone now. We must fail
+        cleanly with a SwitchError up front, not deep inside _perform_switch.
+        """
+        from unittest.mock import patch as _patch
+
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        # Account 2 EXISTS in data['accounts'] but has NO credential backup.
+        self._seed(s, 2, "b@example.com", creds=False)
+
+        # The guard must fire before _perform_switch is ever called.
+        with _patch.object(s, "_perform_switch") as mock_perform:
+            with pytest.raises(SwitchError, match="no stored credentials/config"):
+                s.auto_switch_to("2")
+            mock_perform.assert_not_called()
+
+    def test_auto_switch_to_proceeds_when_switchable(self, temp_home: Path):
+        """A fully-backed-up target passes the guard and reaches _perform_switch."""
+        from unittest.mock import patch as _patch
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")   # full creds + config
+
+        with _patch.object(s, "_perform_switch") as mock_perform:
+            s.auto_switch_to("2")
+            mock_perform.assert_called_once_with("2", quiet=True)
+
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded
         activeAccountNumber is broken (e.g., right after import)."""
