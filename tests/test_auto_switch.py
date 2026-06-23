@@ -18,9 +18,13 @@ from claude_swap.auto_switch import (
     AutoSwitchConfig,
     AutoSwitcher,
     SwitchDecision,
+    _has_7d_room,
+    _is_available,
     _parse_reset_ts,
+    decide_consume_first,
     decide_switch,
     load_config,
+    next_blocked5h,
     next_interval,
     save_config,
 )
@@ -433,6 +437,53 @@ class TestAutoSwitchConfig:
         # Missing key falls back to default.
         cfg3 = AutoSwitchConfig.from_dict({"enabled": True})
         assert cfg3.offline_backoff_cap == 600
+
+    # --- consume-first config fields (strategy / hysteresis / full_refresh) ---
+
+    def test_strategy_defaults_reactive(self):
+        """C9: dataclass default MUST stay reactive (protects existing tests)."""
+        cfg = AutoSwitchConfig()
+        assert cfg.strategy == "reactive"
+        assert cfg.hysteresis == 5.0
+        assert cfg.full_refresh_interval == 300
+
+    def test_strategy_roundtrip_consume_first(self):
+        cfg = AutoSwitchConfig(
+            strategy="consume-first", hysteresis=3.0, full_refresh_interval=120
+        )
+        cfg2 = AutoSwitchConfig.from_dict(cfg.to_dict())
+        assert cfg2 == cfg
+        assert cfg2.strategy == "consume-first"
+        assert cfg2.hysteresis == 3.0
+        assert cfg2.full_refresh_interval == 120
+
+    def test_invalid_strategy_falls_back_to_reactive(self):
+        assert AutoSwitchConfig.from_dict({"strategy": "bogus"}).strategy == "reactive"
+        assert AutoSwitchConfig.from_dict({"strategy": 42}).strategy == "reactive"
+        assert AutoSwitchConfig.from_dict({"strategy": None}).strategy == "reactive"
+
+    def test_strategy_missing_key_defaults_reactive(self):
+        """An older config file with no strategy key loads as reactive."""
+        cfg = AutoSwitchConfig.from_dict(
+            {"enabled": True, "session_threshold": 90.0}
+        )
+        assert cfg.strategy == "reactive"
+
+    def test_hysteresis_clamped_non_negative(self):
+        assert AutoSwitchConfig.from_dict({"hysteresis": -10.0}).hysteresis == 0.0
+        assert AutoSwitchConfig.from_dict({"hysteresis": "bad"}).hysteresis == 5.0
+
+    def test_full_refresh_interval_bad_value_defaults(self):
+        assert (
+            AutoSwitchConfig.from_dict({"full_refresh_interval": "x"})
+            .full_refresh_interval
+            == 300
+        )
+        assert (
+            AutoSwitchConfig.from_dict({"full_refresh_interval": 0})
+            .full_refresh_interval
+            == 0
+        )
 
     def test_from_dict_partial_uses_defaults(self):
         cfg = AutoSwitchConfig.from_dict({"enabled": True})
@@ -1578,3 +1629,215 @@ class TestSingleFlight:
             lock.release()
 
         assert fs.switched_to == []
+
+
+# ---------------------------------------------------------------------------
+# TestDecideConsumeFirst — the proactive policy (pure, fixtureless)
+# ---------------------------------------------------------------------------
+
+
+class TestDecideConsumeFirst:
+    """Proactive consume-first: keep on the soonest-7d-reset AVAILABLE account."""
+
+    CFG = _make_config(
+        strategy="consume-first", session_threshold=98.0,
+        weekly_threshold=99.0, hysteresis=5.0,
+    )
+
+    def _decide(self, active, usage, switchable, blocked=frozenset(), live=set(),
+                rot=None):
+        return decide_consume_first(
+            active, usage, switchable, self.CFG, live, blocked,
+            rot or {n: i for i, n in enumerate(sorted(usage))},
+        )
+
+    def test_active_already_optimal_stays(self):
+        u = {"1": _usage(40, 10, _ts(2)), "2": _usage(20, 5, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "stay" and d.reason == "optimal"
+
+    def test_switches_to_sooner_reset_peer_under_threshold(self):
+        # Active resets later; peer 2 resets sooner; both well under limits.
+        u = {"1": _usage(40, 10, _ts(48)), "2": _usage(20, 5, _ts(2))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "switch" and d.target == "2"
+        assert d.reason == "consume-first"
+
+    def test_active_5h_limit_7d_room_switches_temporarily(self):
+        u = {"1": _usage(99, 30, _ts(2)), "2": _usage(10, 20, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "switch" and d.target == "2"
+
+    def test_5h_blocked_clears_below_lower_band_switches_back(self):
+        # 1 is in blocked5h; its 5h has decayed to 92 (< 98-5) -> available again,
+        # and it resets soonest -> switch back to it.
+        u = {"1": _usage(92, 30, _ts(2)), "2": _usage(10, 20, _ts(48))}
+        d = self._decide("2", u, {"1"}, blocked=frozenset({"1"}))
+        assert d.action == "switch" and d.target == "1"
+
+    def test_5h_dip_within_margin_does_not_switch_back(self):
+        # 1 blocked, 5h=95 (in [93,98)) -> still blocked -> stay on current 2.
+        u = {"1": _usage(95, 30, _ts(2)), "2": _usage(10, 20, _ts(48))}
+        d = self._decide("2", u, {"1"}, blocked=frozenset({"1"}))
+        assert d.action == "stay" and d.reason == "optimal"
+
+    def test_all_7d_limited_is_all_exhausted(self):
+        u = {"1": _usage(50, 99.5, _ts(2)), "2": _usage(50, 99.5, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "stay" and d.reason == "all-exhausted"
+
+    def test_7d_room_but_all_5h_blocked_is_session_limited(self):
+        u = {"1": _usage(99, 40, _ts(2)), "2": _usage(99, 40, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "stay" and d.reason == "all-session-limited"
+
+    def test_unverifiable_peer_excluded(self):
+        u = {"1": _usage(40, 10, _ts(2)), "2": None, "3": "no credentials"}
+        d = self._decide("1", u, {"2", "3"})
+        assert d.action == "stay" and d.reason == "optimal"  # active is sole available
+
+    def test_live_session_peer_excluded(self):
+        u = {"1": _usage(40, 10, _ts(48)), "2": _usage(10, 5, _ts(2))}
+        d = self._decide("1", u, {"2"}, live={"2"})
+        assert d.action == "stay"  # 2 would be optimal but is live -> excluded
+
+    def test_active_usage_unknown_stays(self):
+        assert decide_consume_first(
+            None, {}, set(), self.CFG, set(), frozenset()
+        ).reason == "active-usage-unknown"
+        u = {"1": None}
+        assert self._decide("1", u, set()).reason == "active-usage-unknown"
+
+    def test_threshold_boundary_98_blocks(self):
+        # 5h exactly 98.0 -> not available (>=), 7d room elsewhere -> switch away.
+        u = {"1": _usage(98.0, 40, _ts(2)), "2": _usage(10, 5, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "switch" and d.target == "2"
+
+    def test_tie_reset_then_headroom(self):
+        # Equal reset -> more headroom wins (peer 2 has more room than active).
+        same = _ts(5)
+        u = {"1": _usage(70, 70, same), "2": _usage(10, 10, same)}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "switch" and d.target == "2"
+
+    def test_missing_resets_at_sorts_last(self):
+        # Active has a known soon reset; peer has none -> active stays optimal.
+        u = {"1": _usage(40, 10, _ts(2)), "2": _usage(10, 5, None)}
+        d = self._decide("1", u, {"2"})
+        assert d.action == "stay" and d.reason == "optimal"
+
+    def test_never_raises_on_malformed(self):
+        for bad in [{"1": {}}, {"1": {"five_hour": "x"}}, {"1": {"seven_day": 5}}]:
+            d = decide_consume_first("1", bad, set(), self.CFG, set(), frozenset())
+            assert isinstance(d, SwitchDecision)
+
+    def test_single_available_active_stays_optimal(self):
+        u = {"1": _usage(40, 10, _ts(2))}
+        d = self._decide("1", u, set())
+        assert d.action == "stay" and d.reason == "optimal"
+
+
+class TestHysteresisState:
+    """next_blocked5h FSM (pure): enter at S, sticky through [S-H, S), clear below."""
+
+    CFG = _make_config(session_threshold=98.0, hysteresis=5.0)
+
+    def test_enters_blocked_at_threshold(self):
+        assert next_blocked5h({"n": _usage(98, 1)}, self.CFG, frozenset()) == frozenset({"n"})
+
+    def test_stays_blocked_in_dead_band(self):
+        assert next_blocked5h({"n": _usage(95, 1)}, self.CFG, frozenset({"n"})) == frozenset({"n"})
+
+    def test_clears_below_lower_band(self):
+        assert next_blocked5h({"n": _usage(92, 1)}, self.CFG, frozenset({"n"})) == frozenset()
+
+    def test_unknown_usage_carries_prior(self):
+        assert next_blocked5h({"n": None}, self.CFG, frozenset({"n"})) == frozenset({"n"})
+        assert next_blocked5h({"n": None}, self.CFG, frozenset()) == frozenset()
+
+    def test_not_blocked_stays_clear_under_threshold(self):
+        assert next_blocked5h({"n": _usage(97, 1)}, self.CFG, frozenset()) == frozenset()
+
+    def test_is_available_respects_hysteresis(self):
+        # blocked account needs h5 < 93 to be available.
+        assert not _is_available("n", _usage(95, 10), self.CFG, frozenset({"n"}))
+        assert _is_available("n", _usage(92, 10), self.CFG, frozenset({"n"}))
+        assert _is_available("n", _usage(97, 10), self.CFG, frozenset())  # not blocked
+
+    def test_has_7d_room(self):
+        assert _has_7d_room(_usage(0, 50), self.CFG)
+        assert not _has_7d_room(_usage(0, 99.5), self.CFG)
+        # Only ever called on verified dicts in decide_consume_first; on a
+        # non-dict _window_pct yields 0.0 (treated as room) — harmless quirk.
+        assert _has_7d_room(None, self.CFG)
+
+
+# ---------------------------------------------------------------------------
+# TestConsumeFirstEngine — run_once with strategy=consume-first (design A)
+# ---------------------------------------------------------------------------
+
+
+class TestConsumeFirstEngine:
+    """The proactive policy end-to-end through run_once (fetches all peers)."""
+
+    def _switcher(self, tmp_path, accounts):
+        cfg = AutoSwitchConfig(
+            enabled=True, strategy="consume-first",
+            session_threshold=98.0, weekly_threshold=99.0, hysteresis=5.0,
+        )
+        fs = _FakeSwitcher(tmp_path, accounts)
+        return AutoSwitcher(switcher=fs, config=cfg), fs
+
+    def test_switches_to_sooner_reset_proactively_under_threshold(self, tmp_path):
+        # Active (1) far from limits but resets LATER; peer (2) resets sooner.
+        # The REACTIVE policy would stay; consume-first proactively moves to 2.
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(48)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(2))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            d = as_.run_once()
+        assert d.action == "switch" and d.target == "2"
+        assert fs.switched_to == ["2"]
+
+    def test_stays_when_active_is_optimal(self, tmp_path):
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(48))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            d = as_.run_once()
+        assert d.action == "stay" and d.reason == "optimal"
+        assert fs.switched_to == []
+
+    def test_active_5h_blocked_switches_and_persists_blocked5h(self, tmp_path):
+        # Active hits its 5h limit (7d still has room) → switch away + remember
+        # it as 5h-blocked in persisted state (so it returns after a 5h reset).
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(99, 30, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(10, 20, _ts(48))},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            d = as_.run_once()
+        assert d.action == "switch" and d.target == "2"
+        assert "1" in load_state(tmp_path).blocked5h
+
+    def test_reactive_strategy_does_not_switch_proactively(self, tmp_path):
+        # Same scenario as the proactive test, but strategy=reactive → STAY
+        # (active under threshold), proving the branch is strategy-gated.
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(48)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(2))},
+        ]
+        cfg = AutoSwitchConfig(enabled=True, strategy="reactive")
+        fs = _FakeSwitcher(tmp_path, accounts)
+        as_ = AutoSwitcher(switcher=fs, config=cfg)
+        with patch("claude_swap.auto_switch.notify"):
+            d = as_.run_once()
+        assert d.action == "stay" and d.reason == "under-threshold"
+        assert fs.switched_to == []
+

@@ -49,6 +49,7 @@ __all__ = [
     "AutoSwitchConfig",
     "SwitchDecision",
     "decide_switch",
+    "decide_consume_first",
     "next_interval",
     "load_config",
     "save_config",
@@ -174,6 +175,78 @@ def _crosses_threshold(
     if h5_crossed:
         return (True, "5h", h5, h5, d7)
     return (True, "7d", d7, h5, d7)
+
+
+def _consume_sort_key(
+    num: str,
+    usage_by_account: dict[str, dict | str | None],
+    rotation_index: dict[str, int],
+) -> tuple[float, float, int]:
+    """Ranking key shared by decide_switch and decide_consume_first (PURE).
+
+    Ascending: soonest 7d reset → most headroom → lowest rotation index. A single
+    key function so the two strategies can never drift in their target ordering.
+    """
+    u = usage_by_account.get(num)
+    reset_ts = _parse_reset_ts(u)
+    headroom = oauth.account_headroom(u)
+    neg_headroom = -headroom if headroom is not None else _BIG  # more headroom → smaller
+    idx = rotation_index.get(num, 0)
+    return (reset_ts, neg_headroom, idx)
+
+
+def _has_7d_room(usage: dict | str | None, config: AutoSwitchConfig) -> bool:
+    """True iff the 7-day window is strictly under the weekly threshold (PURE)."""
+    return _window_pct(usage, "seven_day") < config.weekly_threshold
+
+
+def _is_available(
+    num: str,
+    usage: dict | str | None,
+    config: AutoSwitchConfig,
+    blocked5h: frozenset[str],
+) -> bool:
+    """Usable right now: 5h room (with hysteresis) AND 7d room (PURE).
+
+    5h availability is sticky: an account already 5h-blocked stays unavailable
+    until its 5h% falls below ``session_threshold - hysteresis`` (anti-thrash
+    dead band), so a value dithering around the threshold can't cause flip-flop.
+    """
+    if not isinstance(usage, dict):
+        return False
+    h5 = _window_pct(usage, "five_hour")
+    if num in blocked5h:
+        h5_ok = h5 < (config.session_threshold - config.hysteresis)
+    else:
+        h5_ok = h5 < config.session_threshold
+    return h5_ok and _has_7d_room(usage, config)
+
+
+def next_blocked5h(
+    usage_by_account: dict[str, dict | str | None],
+    config: AutoSwitchConfig,
+    prev_blocked5h: frozenset[str],
+) -> frozenset[str]:
+    """Advance the sticky 5h-blocked set (PURE).
+
+    Enter blocked at ``5h% >= session_threshold``; stay blocked through the dead
+    band ``[session_threshold - hysteresis, session_threshold)``; clear below it.
+    An account with unknown usage this tick CARRIES its prior state (a blip never
+    flips the FSM).
+    """
+    nxt: set[str] = set()
+    for num, usage in usage_by_account.items():
+        if not isinstance(usage, dict):
+            if num in prev_blocked5h:
+                nxt.add(num)
+            continue
+        h5 = _window_pct(usage, "five_hour")
+        if num in prev_blocked5h:
+            if h5 >= (config.session_threshold - config.hysteresis):
+                nxt.add(num)
+        elif h5 >= config.session_threshold:
+            nxt.add(num)
+    return frozenset(nxt)
 
 
 def decide_switch(
@@ -312,15 +385,10 @@ def decide_switch(
     # ------------------------------------------------------------------
     # 5. Select target: soonest 7d reset → most headroom → lowest index
     # ------------------------------------------------------------------
-    def sort_key(num: str) -> tuple[float, float, int]:
-        u = usage_by_account.get(num)
-        reset_ts = _parse_reset_ts(u)  # ascending: soonest first
-        headroom = oauth.account_headroom(u)
-        neg_headroom = -headroom if headroom is not None else _BIG  # more headroom → smaller
-        idx = rotation_index.get(num, 0)
-        return (reset_ts, neg_headroom, idx)
-
-    target = min(viable, key=sort_key)
+    target = min(
+        viable,
+        key=lambda n: _consume_sort_key(n, usage_by_account, rotation_index),
+    )
 
     return SwitchDecision(
         action="switch",
@@ -333,6 +401,113 @@ def decide_switch(
             f"({trigger_pct:.1f}% >= "
             f"{config.session_threshold if trigger_window == '5h' else config.weekly_threshold:.1f}%). "
             f"Switching to account {target}."
+        ),
+    )
+
+
+def decide_consume_first(
+    active_num: str | None,
+    usage_by_account: dict[str, dict | str | None],
+    switchable: set[str],
+    config: AutoSwitchConfig,
+    live_session_nums: set[str],
+    blocked5h: frozenset[str],
+    rotation_index: dict[str, int] | None = None,
+) -> SwitchDecision:
+    """Proactive "consume-first" decision (PURE — no I/O, never raises).
+
+    Keeps the user on the account to consume FIRST = the AVAILABLE account whose
+    7-day window resets soonest (use-it-or-lose-it). Unlike ``decide_switch`` the
+    ACTIVE account is itself a candidate for ``optimal`` (so an already-optimal
+    active simply stays). Switches only when the optimal account CHANGES — a
+    reset re-orders the queue, the active exhausts, or a 5h-blocked account
+    clears and reclaims the soonest-reset slot.
+
+    Args mirror ``decide_switch`` plus ``blocked5h`` (the sticky 5h-blocked set).
+    """
+    if rotation_index is None:
+        rotation_index = {}
+
+    # 1. Active usage known? (never switch blind — identical to decide_switch)
+    if active_num is None:
+        return SwitchDecision(
+            action="stay", target=None, reason="active-usage-unknown",
+            trigger_window=None, trigger_pct=None,
+            detail="Active account is unknown; cannot decide whether to switch.",
+        )
+    active_usage = usage_by_account.get(active_num)
+    if not isinstance(active_usage, dict):
+        return SwitchDecision(
+            action="stay", target=None, reason="active-usage-unknown",
+            trigger_window=None, trigger_pct=None,
+            detail=(
+                f"Active account {active_num} usage is unavailable; "
+                "cannot decide whether to switch."
+            ),
+        )
+
+    # 2. Eligible = the active account (ALWAYS a candidate) + switchable peers
+    #    without a live session. The active being a candidate is what lets an
+    #    already-optimal active win and stay.
+    eligible = [active_num] + [
+        n for n in switchable if n != active_num and n not in live_session_nums
+    ]
+    candidates: list[str] = []
+    any_7d_room = False
+    for num in eligible:
+        u = usage_by_account.get(num)
+        if isinstance(u, dict) and _has_7d_room(u, config):
+            any_7d_room = True
+        if _is_available(num, u, config, blocked5h):
+            candidates.append(num)
+
+    crossed, trigger_window, trigger_pct, _h5, _d7 = _crosses_threshold(
+        active_usage, config
+    )
+
+    # 3. Nothing usable right now — distinguish temporary vs real exhaustion.
+    if not candidates:
+        if any_7d_room:
+            # Weekly quota remains somewhere, but every account is 5h-blocked
+            # (or unverifiable) this moment — temporary, clears on a 5h reset.
+            # Quiet stay (NOT routed to the exhaustion notification).
+            return SwitchDecision(
+                action="stay", target=None, reason="all-session-limited",
+                trigger_window=trigger_window, trigger_pct=trigger_pct,
+                detail=(
+                    "All accounts are temporarily at their 5h session limit; "
+                    "weekly quota remains — will resume after a 5h reset."
+                ),
+            )
+        # No 7d room anywhere → genuinely exhausted (notify path).
+        return SwitchDecision(
+            action="stay", target=None, reason="all-exhausted",
+            trigger_window=trigger_window, trigger_pct=trigger_pct,
+            detail="All accounts are at or over their weekly limit.",
+        )
+
+    # 4. Optimal = soonest-7d-reset available account (shared ranking key).
+    optimal = min(
+        candidates,
+        key=lambda n: _consume_sort_key(n, usage_by_account, rotation_index),
+    )
+
+    # 5. Already on the consume-first account → stay; else move to consume it.
+    if optimal == active_num:
+        return SwitchDecision(
+            action="stay", target=None, reason="optimal",
+            trigger_window=trigger_window, trigger_pct=trigger_pct,
+            detail=(
+                f"Active account {active_num} is the consume-first account "
+                "(soonest weekly reset among available)."
+            ),
+        )
+    return SwitchDecision(
+        action="switch", target=optimal, reason="consume-first",
+        trigger_window=trigger_window, trigger_pct=trigger_pct,
+        detail=(
+            f"Switching to account {optimal} to consume first "
+            "(soonest weekly reset among available accounts)."
         ),
     )
 
@@ -651,6 +826,16 @@ class AutoSwitcher:
         managed_nums = set(row_by_num)
         self._handle_online_tick({active_num_str: active_usage}, managed_nums)
 
+        # Proactive "consume-first" strategy diverges here: it must evaluate the
+        # optimal account EVERY tick (not only when the active is over a
+        # threshold), so it fetches all peers and ranks by soonest 7d reset.
+        if self._config.strategy == "consume-first":
+            return self._run_once_consume_first(
+                active_num_str, active_usage, row_by_num, switchable,
+                live_session_nums, rotation_index, managed_nums,
+            )
+
+        # ---- REACTIVE strategy (default) -----------------------------------
         # Is the active account at/over a threshold? Only then is a switch even
         # possible — and only then do we pay for the others' fetches.
         if not self._active_over_threshold(active_usage):
@@ -703,50 +888,108 @@ class AutoSwitcher:
             decision.detail,
         )
 
-        if decision.action == "switch" and decision.target is not None:
-            try:
-                self._switcher.auto_switch_to(decision.target, quiet=True)
-                _logger.info(
-                    "auto-switch: switched to account %s (%s)",
-                    decision.target,
-                    decision.detail,
-                )
-                # Record the switch in persistent state.
-                self._state = _state_replace(
-                    self._state,
-                    last_switch={
-                        "account": decision.target,
-                        "ts": _now_ts(),
-                        "reason": decision.reason,
-                    },
-                )
-                if self._config.notify:
-                    notify(
-                        "Claude Swap — Auto Switch",
-                        f"Switched to account {decision.target}. "
-                        f"{decision.detail}",
-                    )
-            except Exception as exc:
-                _logger.exception(
-                    "auto-switch: switch to %s failed: %r", decision.target, exc
-                )
-                # A failed switch is NOT exhaustion — clear the flag.
-                self._apply_exhaustion("tick-error")
-                self._persist_state()
-                return SwitchDecision(
-                    action="stay",
-                    target=None,
-                    reason="tick-error",
-                    trigger_window=decision.trigger_window,
-                    trigger_pct=decision.trigger_pct,
-                    detail=f"Switch error: {exc!r}",
-                )
+        err = self._apply_switch_decision(decision)
+        if err is not None:
+            return err
 
         # One-shot exhaustion notification (persisted; survives restart). Fires
         # ONLY on a real all-exhausted decision (every candidate verified
         # over-limit) — never on "candidates-unverifiable" (a peer's blip).
         self._apply_exhaustion(decision.reason)
+        self._persist_state()
+        return decision
 
+    def _apply_switch_decision(self, decision: SwitchDecision) -> SwitchDecision | None:
+        """Perform the switch in ``decision`` (if any). Shared by both strategies.
+
+        Returns ``None`` when there is nothing to do or the switch succeeded
+        (the caller proceeds with the original decision), or a ``tick-error``
+        SwitchDecision when the switch raised (caller returns it). On success
+        records ``last_switch`` and fires the switch notification.
+        """
+        if decision.action != "switch" or decision.target is None:
+            return None
+        try:
+            self._switcher.auto_switch_to(decision.target, quiet=True)
+            _logger.info(
+                "auto-switch: switched to account %s (%s)",
+                decision.target, decision.detail,
+            )
+            self._state = _state_replace(
+                self._state,
+                last_switch={
+                    "account": decision.target,
+                    "ts": _now_ts(),
+                    "reason": decision.reason,
+                },
+            )
+            if self._config.notify:
+                notify(
+                    "Claude Swap — Auto Switch",
+                    f"Switched to account {decision.target}. {decision.detail}",
+                )
+            return None
+        except Exception as exc:
+            _logger.exception(
+                "auto-switch: switch to %s failed: %r", decision.target, exc
+            )
+            # A failed switch is NOT exhaustion — clear the flag.
+            self._apply_exhaustion("tick-error")
+            self._persist_state()
+            return SwitchDecision(
+                action="stay",
+                target=None,
+                reason="tick-error",
+                trigger_window=decision.trigger_window,
+                trigger_pct=decision.trigger_pct,
+                detail=f"Switch error: {exc!r}",
+            )
+
+    def _run_once_consume_first(
+        self,
+        active_num: str,
+        active_usage: dict,
+        row_by_num: dict[str, tuple],
+        switchable: set[str],
+        live_session_nums: set[str],
+        rotation_index: dict[str, int],
+        managed_nums: set[str],
+    ) -> SwitchDecision:
+        """Proactive consume-first tick: rank ALL accounts by soonest 7d reset.
+
+        Needs every account's usage to know the consumption order, so it fetches
+        all switchable peers this tick (design A — simple + robust; gentle at the
+        60-300s cadence). Advances the sticky 5h-blocked FSM, decides via the
+        pure ``decide_consume_first``, then switches through the shared apply
+        path. ``decide_consume_first`` never switches on stale/unknown data.
+        """
+        usage_by_account: dict[str, dict | str | None] = {active_num: active_usage}
+        for num in switchable:
+            row = row_by_num.get(num)
+            usage_by_account[num] = (
+                self._fetch_one(row) if row is not None else "no credentials"
+            )
+        # Record fresh readings (prune removed accounts; never clobber good ones).
+        self._merge_last_usage(usage_by_account, managed_nums)
+
+        # Advance + persist the sticky 5h-blocked hysteresis state.
+        prev_blocked = frozenset(self._state.blocked5h)
+        blocked = next_blocked5h(usage_by_account, self._config, prev_blocked)
+        self._state = _state_replace(self._state, blocked5h=sorted(blocked))
+
+        decision = decide_consume_first(
+            active_num, usage_by_account, switchable, self._config,
+            live_session_nums, blocked, rotation_index,
+        )
+        _logger.debug(
+            "auto-switch consume-first tick: action=%s reason=%s",
+            decision.action, decision.reason,
+        )
+
+        err = self._apply_switch_decision(decision)
+        if err is not None:
+            return err
+        self._apply_exhaustion(decision.reason)
         self._persist_state()
         return decision
 

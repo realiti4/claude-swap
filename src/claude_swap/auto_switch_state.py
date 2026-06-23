@@ -33,6 +33,8 @@ _logger = logging.getLogger("claude-swap")
 _STATE_FILENAME = "auto-switch-state.json"
 _CONFIG_FILENAME = "auto-switch.json"
 
+_VALID_STRATEGIES = ("reactive", "consume-first")
+
 _CONFIG_DEFAULTS: dict = {
     "enabled": False,
     "session_threshold": 98.0,
@@ -44,6 +46,18 @@ _CONFIG_DEFAULTS: dict = {
     "min_interval": 60,
     "max_interval": 300,
     "offline_backoff_cap": 600,
+    # Decision policy. "reactive" = switch only when the active account crosses
+    # a threshold (the original behaviour, KEPT as the dataclass default so the
+    # existing test suite is unaffected). "consume-first" = proactively keep the
+    # user on the soonest-7d-reset account (use-it-or-lose-it).
+    "strategy": "reactive",
+    # Hysteresis margin (percentage points) on the 5h axis: a 5h-blocked account
+    # only becomes available again below ``session_threshold - hysteresis``,
+    # preventing available<->blocked thrash around the threshold.
+    "hysteresis": 5.0,
+    # Slow safety sub-cadence (seconds) for consume-first: refresh ALL peers at
+    # least this often to catch out-of-band usage from another device.
+    "full_refresh_interval": 300,
 }
 
 
@@ -70,12 +84,39 @@ class AutoSwitchConfig:
     max_interval: int = 300
     # Hard ceiling for the offline exponential backoff sleep (seconds).
     offline_backoff_cap: int = 600
+    # Decision policy: "reactive" (default — KEEPS the existing test suite green)
+    # or "consume-first" (proactive soonest-7d-reset ordering).
+    strategy: str = "reactive"
+    # 5h-axis hysteresis margin (percentage points); >= 0.
+    hysteresis: float = 5.0
+    # Slow safety full-refresh sub-cadence for consume-first (seconds).
+    full_refresh_interval: int = 300
 
     @classmethod
     def from_dict(cls, data: object) -> AutoSwitchConfig:
         """Build from an arbitrary object.  Unknown/missing keys → defaults."""
         if not isinstance(data, dict):
             return cls()
+        # Strategy must be a known value; anything else falls back to reactive.
+        strategy = data.get("strategy", _CONFIG_DEFAULTS["strategy"])
+        if strategy not in _VALID_STRATEGIES:
+            strategy = _CONFIG_DEFAULTS["strategy"]
+        # Hysteresis is clamped to >= 0 (a negative margin is meaningless).
+        try:
+            hysteresis = max(
+                0.0, float(data.get("hysteresis", _CONFIG_DEFAULTS["hysteresis"]))
+            )
+        except (TypeError, ValueError):
+            hysteresis = float(_CONFIG_DEFAULTS["hysteresis"])
+        try:
+            full_refresh_interval = int(
+                data.get(
+                    "full_refresh_interval",
+                    _CONFIG_DEFAULTS["full_refresh_interval"],
+                )
+            )
+        except (TypeError, ValueError):
+            full_refresh_interval = int(_CONFIG_DEFAULTS["full_refresh_interval"])
         return cls(
             enabled=bool(data.get("enabled", _CONFIG_DEFAULTS["enabled"])),
             session_threshold=float(
@@ -96,6 +137,9 @@ class AutoSwitchConfig:
                     "offline_backoff_cap", _CONFIG_DEFAULTS["offline_backoff_cap"]
                 )
             ),
+            strategy=strategy,
+            hysteresis=hysteresis,
+            full_refresh_interval=full_refresh_interval,
         )
 
     def to_dict(self) -> dict:
@@ -108,6 +152,9 @@ class AutoSwitchConfig:
             "min_interval": self.min_interval,
             "max_interval": self.max_interval,
             "offline_backoff_cap": self.offline_backoff_cap,
+            "strategy": self.strategy,
+            "hysteresis": self.hysteresis,
+            "full_refresh_interval": self.full_refresh_interval,
         }
 
 
@@ -170,6 +217,12 @@ class MonitorState:
         last_usage: ``{num: {"usage": <dict>, "fetched_at": <ts>}}`` — the
             last-known GOOD usage reading per account. Only updated with fresh
             dicts; a failed (None) fetch never overwrites a good entry.
+        blocked5h: account nums currently 5h-blocked under the consume-first
+            hysteresis FSM (persisted as a list since JSON has no set; the
+            engine converts to a frozenset at its boundary). Only meaningful for
+            the consume-first strategy.
+        last_full_refresh_ts: wall-clock POSIX ts of the last consume-first slow
+            safety refresh (all peers fetched), or ``None`` until the first.
     """
 
     last_online_ts: float | None = None
@@ -178,6 +231,8 @@ class MonitorState:
     exhaustion_notified: bool = False
     last_switch: dict | None = None
     last_usage: dict = field(default_factory=dict)
+    blocked5h: list[str] = field(default_factory=list)
+    last_full_refresh_ts: float | None = None
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -241,6 +296,13 @@ class MonitorState:
         if failures < 2:
             offline_notified = False
 
+        raw_blocked = data.get("blocked5h")
+        if isinstance(raw_blocked, list):
+            # Keep only string entries (account nums); drop anything malformed.
+            blocked5h = [str(x) for x in raw_blocked if isinstance(x, str)]
+        else:
+            blocked5h = []
+
         return cls(
             last_online_ts=_opt_float("last_online_ts"),
             consecutive_failures=failures,
@@ -248,6 +310,8 @@ class MonitorState:
             exhaustion_notified=bool(data.get("exhaustion_notified", False)),
             last_switch=last_switch,
             last_usage=last_usage,
+            blocked5h=blocked5h,
+            last_full_refresh_ts=_opt_float("last_full_refresh_ts"),
         )
 
     def to_dict(self) -> dict:
@@ -259,6 +323,8 @@ class MonitorState:
             "exhaustion_notified": self.exhaustion_notified,
             "last_switch": self.last_switch,
             "last_usage": self.last_usage,
+            "blocked5h": self.blocked5h,
+            "last_full_refresh_ts": self.last_full_refresh_ts,
         }
 
     # ------------------------------------------------------------------

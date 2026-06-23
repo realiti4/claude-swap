@@ -217,6 +217,10 @@ def _auto_command(argv: list[str]) -> None:
         parser.add_argument("--session-threshold", type=float, metavar="N")
         parser.add_argument("--weekly-threshold", type=float, metavar="N")
         parser.add_argument("--no-notify", action="store_true")
+        parser.add_argument(
+            "--strategy", choices=["reactive", "consume-first"],
+            metavar="{reactive,consume-first}",
+        )
         args = parser.parse_args(argv[1:])
 
         if Platform.detect() is not Platform.MACOS:
@@ -236,6 +240,8 @@ def _auto_command(argv: list[str]) -> None:
                 overrides["weekly_threshold"] = args.weekly_threshold
             if args.no_notify:
                 overrides["notify"] = False
+            if args.strategy is not None:
+                overrides["strategy"] = args.strategy
             if overrides:
                 config = _replace(config, **overrides)
 
@@ -256,6 +262,10 @@ def _auto_command(argv: list[str]) -> None:
     parser.add_argument("--session-threshold", type=float, metavar="N")
     parser.add_argument("--weekly-threshold", type=float, metavar="N")
     parser.add_argument("--no-notify", action="store_true")
+    parser.add_argument(
+        "--strategy", choices=["reactive", "consume-first"],
+        metavar="{reactive,consume-first}",
+    )
     args = parser.parse_args(argv[1:])
 
     try:
@@ -263,6 +273,10 @@ def _auto_command(argv: list[str]) -> None:
         backup_root = switcher.backup_dir
 
         if args.subverb == "on":
+            # New install (no config file yet) defaults to the proactive
+            # consume-first policy; an existing config keeps its strategy unless
+            # --strategy overrides it.
+            config_existed = (backup_root / "auto-switch.json").exists()
             config = _as_load_config(backup_root)
             overrides_on: dict = {"enabled": True}
             if args.session_threshold is not None:
@@ -271,8 +285,13 @@ def _auto_command(argv: list[str]) -> None:
                 overrides_on["weekly_threshold"] = args.weekly_threshold
             if args.no_notify:
                 overrides_on["notify"] = False
+            if args.strategy is not None:
+                overrides_on["strategy"] = args.strategy
+            elif not config_existed:
+                overrides_on["strategy"] = "consume-first"
             config = _replace(config, **overrides_on)
             _as_save_config(config, backup_root)
+            print(dimmed(f"strategy: {config.strategy}"))
 
             if Platform.detect() is Platform.MACOS:
                 msg = install_agent(backup_root)
@@ -297,6 +316,7 @@ def _auto_command(argv: list[str]) -> None:
         else:  # status (default)
             config = _as_load_config(backup_root)
             print(f"enabled:           {config.enabled}")
+            print(f"strategy:          {config.strategy}")
             print(f"session_threshold: {config.session_threshold}%")
             print(f"weekly_threshold:  {config.weekly_threshold}%")
             print(f"notify:            {config.notify}")
