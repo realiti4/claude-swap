@@ -140,6 +140,7 @@ Press `Ctrl+C` to stop.
 - The next account is chosen by: earliest reset time → most remaining headroom → rotation order.
 - Accounts with active Claude Code sessions are excluded from the candidate pool.
 - A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
+- **Polling is light on the API.** The monitor polls between 60s (when the active account is near a limit) and 300s (when it's far away). A normal check reads only the active account's usage (one API call); the other accounts are read only when the active account actually crosses a threshold and a switch is possible.
 
 #### Connection loss
 

@@ -37,7 +37,10 @@ _CONFIG_DEFAULTS: dict = {
     "session_threshold": 98.0,
     "weekly_threshold": 99.0,
     "notify": True,
-    "min_interval": 20,
+    # Network-polling cadence band (seconds). 60s floor keeps us off the
+    # rate-limit radar (CodexBar defaults to a 5-min refresh; usage tools cache)
+    # while still reacting promptly near a limit; 300s ceiling when far away.
+    "min_interval": 60,
     "max_interval": 300,
     "offline_backoff_cap": 600,
 }
@@ -60,7 +63,9 @@ class AutoSwitchConfig:
     session_threshold: float = 98.0
     weekly_threshold: float = 99.0
     notify: bool = True
-    min_interval: int = 20
+    # Online polling cadence band (seconds): 60s floor (near a limit) → 300s
+    # ceiling (far away). Stays in the researched 60-300s safe band.
+    min_interval: int = 60
     max_interval: int = 300
     # Hard ceiling for the offline exponential backoff sleep (seconds).
     offline_backoff_cap: int = 600

@@ -363,8 +363,9 @@ class TestAutoSwitchConfig:
         assert cfg.session_threshold == 98.0
         assert cfg.weekly_threshold == 99.0
         assert cfg.notify is True
-        assert cfg.min_interval == 20
+        assert cfg.min_interval == 60
         assert cfg.max_interval == 300
+        assert cfg.offline_backoff_cap == 600
 
     def test_from_dict_round_trip(self):
         cfg = AutoSwitchConfig(enabled=True, session_threshold=90.0, notify=False)
@@ -465,9 +466,10 @@ class TestParseResetTs:
 # ---------------------------------------------------------------------------
 
 class TestNextInterval:
-    """Tests for the next_interval function."""
+    """Tests for the next_interval function (60s floor cadence band)."""
 
-    CFG = AutoSwitchConfig(min_interval=20, max_interval=300)
+    # Default-band config (min 60, max 300) — matches the shipped defaults.
+    CFG = AutoSwitchConfig(min_interval=60, max_interval=300)
 
     def test_none_usage_returns_max(self):
         assert next_interval(None, self.CFG) == 300
@@ -477,25 +479,37 @@ class TestNextInterval:
 
     def test_near_threshold_returns_min(self):
         usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
-        assert next_interval(usage, self.CFG) == 20
+        assert next_interval(usage, self.CFG) == 60   # min_interval floor
 
-    def test_mid_range_returns_between_min_and_max(self):
+    def test_85_band_returns_two_times_min(self):
         usage = {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}}
-        result = next_interval(usage, self.CFG)
-        assert self.CFG.min_interval <= result <= 60
+        # >= 85% → min(max, 2*min) = 120
+        assert next_interval(usage, self.CFG) == 120
 
-    def test_low_usage_returns_large_interval(self):
+    def test_50_band_returns_mid(self):
+        usage = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}}
+        # >= 50% → ~80% of ceiling = 240
+        assert next_interval(usage, self.CFG) == 240
+
+    def test_low_usage_returns_max(self):
         usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0}}
-        result = next_interval(usage, self.CFG)
-        assert result > 200
+        assert next_interval(usage, self.CFG) == 300   # far away → ceiling
+
+    def test_result_always_in_band(self):
+        """Every online result is clamped to [min_interval, max_interval]."""
+        for pct in (0.0, 10.0, 49.9, 50.0, 84.9, 85.0, 94.9, 95.0, 100.0):
+            usage = {"five_hour": {"pct": pct}}
+            v = next_interval(usage, self.CFG)
+            assert self.CFG.min_interval <= v <= self.CFG.max_interval
 
     def test_clamped_to_min(self):
-        cfg = AutoSwitchConfig(min_interval=100, max_interval=300)
-        usage = {"five_hour": {"pct": 100.0}}
-        assert next_interval(usage, cfg) >= 100
+        # min_interval above the 2*min band value still floors correctly.
+        cfg = AutoSwitchConfig(min_interval=200, max_interval=300)
+        usage = {"five_hour": {"pct": 50.0}}   # would be 240, but >= floor 200
+        assert next_interval(usage, cfg) >= 200
 
     def test_clamped_to_max(self):
-        cfg = AutoSwitchConfig(min_interval=20, max_interval=300)
+        cfg = AutoSwitchConfig(min_interval=60, max_interval=300)
         usage = {"five_hour": {"pct": 0.0}}
         assert next_interval(usage, cfg) <= 300
 
@@ -510,7 +524,7 @@ class TestNextInterval:
     def test_next_interval_backoff_grows_and_caps(self):
         """Offline backoff grows exponentially from max_interval and caps."""
         cfg = AutoSwitchConfig(
-            min_interval=20, max_interval=300, offline_backoff_cap=600
+            min_interval=60, max_interval=300, offline_backoff_cap=600
         )
         # failures=1 → max_interval * 2**0 = 300
         assert next_interval(None, cfg, 1) == 300
@@ -528,37 +542,109 @@ class TestNextInterval:
 
     def test_next_interval_backoff_ignores_usage(self):
         """When offline, the interval is backoff — usage% is irrelevant."""
-        cfg = AutoSwitchConfig(min_interval=20, max_interval=300, offline_backoff_cap=600)
+        cfg = AutoSwitchConfig(min_interval=60, max_interval=300, offline_backoff_cap=600)
         near_threshold = {"five_hour": {"pct": 99.0}}
-        # Online would be min_interval (20); offline overrides to backoff.
+        # Online would be min_interval (60); offline overrides to backoff.
         assert next_interval(near_threshold, cfg, 1) == 300
 
     def test_next_interval_zero_failures_is_online_path(self):
-        """consecutive_failures=0 → normal adaptive behaviour (unchanged)."""
+        """consecutive_failures=0 → normal adaptive behaviour."""
         usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
-        assert next_interval(usage, self.CFG, 0) == 20
+        assert next_interval(usage, self.CFG, 0) == 60
 
 
 # ---------------------------------------------------------------------------
 # TestAutoSwitcherRunOnce — with a mocked switcher
 # ---------------------------------------------------------------------------
 
+_NO_CREDS = "no credentials"
+
+
+def _encode_creds(usage: object) -> str:
+    """Encode an account's intended usage into a creds JSON blob.
+
+    The engine probes usage via ``oauth.fetch_usage_for_account`` (patched in
+    tests by ``_patch_oauth_fetch``), which decodes this blob. We carry the
+    usage IN the creds so the fake is fully self-contained and no per-account
+    registry is needed.
+
+    * ``"no credentials"``  → empty creds (engine returns the sentinel without
+                              calling oauth — i.e. "we did NOT try")
+    * ``None``              → a token IS present but the fetch returns None
+                              (genuine outage signal)
+    * ``dict``              → a token is present and the fetch returns the dict
+    """
+    if usage == _NO_CREDS:
+        return ""   # no token → engine short-circuits to "no credentials"
+    payload = {"claudeAiOauth": {"accessToken": "tok"}}
+    if usage is None:
+        payload["_fake_usage_kind"] = "none"
+    else:
+        payload["_fake_usage_kind"] = "dict"
+        payload["_fake_usage"] = usage
+    return json.dumps(payload)
+
+
+@pytest.fixture(autouse=True)
+def _patch_oauth_fetch():
+    """Route the engine's single-account usage probe to the fake's creds blob.
+
+    Decodes ``_fake_usage`` from the credentials passed by
+    ``AutoSwitcher._fetch_one`` → ``oauth.fetch_usage_for_account``. Returns a
+    MagicMock so tests can assert ``.call_count`` (number of ACTUAL usage API
+    calls this tick — uncredentialed accounts never reach here).
+    """
+    def _decode(account_num, email, credentials, is_active, persist_credentials=None):
+        try:
+            data = json.loads(credentials)
+        except Exception:
+            return None
+        if data.get("_fake_usage_kind") == "none":
+            return None
+        return data.get("_fake_usage")
+
+    with patch(
+        "claude_swap.oauth.fetch_usage_for_account", side_effect=_decode
+    ) as mock_fetch:
+        yield mock_fetch
+
+
 class _FakeSwitcher:
-    """Minimal fake switcher for AutoSwitcher unit tests."""
+    """Minimal fake switcher for AutoSwitcher unit tests.
+
+    The first account is the ACTIVE one (mirrors ``_get_current_account``).
+    Each account dict carries a ``usage`` value (dict / None / "no credentials")
+    that is encoded into the row's credentials so the engine's active-first
+    probe (``_fetch_one`` → patched ``oauth.fetch_usage_for_account``) recovers
+    it. ``_collect_usage`` is retained for ``cswap --list``-style callers but is
+    NOT on the daemon tick path anymore.
+    """
 
     def __init__(self, backup_dir: Path, accounts: list[dict]) -> None:
         self.backup_dir = backup_dir
         self.platform = Platform.LINUX
-        self._accounts = accounts   # list of (num, email, usage_or_none)
+        self._accounts = accounts   # list of {num, email, usage}
         self.switched_to: list[str] = []
 
+    def _active_email(self) -> str | None:
+        return self._accounts[0]["email"] if self._accounts else None
+
     def _build_accounts_info(self):
+        active_email = self._active_email()
         return [
-            (int(a["num"]), a["email"], "", "", False, "fake-creds")
+            (
+                int(a["num"]),
+                a["email"],
+                "",
+                "",
+                a["email"] == active_email,          # is_active: first account
+                _encode_creds(a.get("usage")),       # creds carry the usage
+            )
             for a in self._accounts
         ]
 
     def _collect_usage(self, accounts_info):
+        # Full-set fetch (cswap --list / status). Not used by the daemon tick.
         num_to_usage = {a["num"]: a.get("usage") for a in self._accounts}
         return [num_to_usage.get(str(info[0])) for info in accounts_info]
 
@@ -667,7 +753,7 @@ class TestAutoSwitcherRunOnce:
             {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
         ]
         as_ = _make_auto_switcher(tmp_path, accounts)
-        with patch.object(as_, "_gather", side_effect=RuntimeError("oops")):
+        with patch.object(as_, "_gather_meta", side_effect=RuntimeError("oops")):
             decision = as_.run_once()
         assert decision.action == "stay"
         assert decision.reason == "tick-error"
@@ -683,15 +769,14 @@ class TestAutoSwitcherRunOnce:
             decision = as_.run_once()
         assert decision.reason == "tick-error"
 
-    def test_run_once_gathers_exactly_once(self, tmp_path: Path):
-        """run_once must call _gather once — the interval is sized from the
-        stashed usage, not a second gather."""
+    def test_run_once_gathers_meta_exactly_once(self, tmp_path: Path):
+        """run_once must build account metadata exactly once per tick."""
         accounts = [
             {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},
             {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
         ]
         as_ = _make_auto_switcher(tmp_path, accounts)
-        with patch.object(as_, "_gather", wraps=as_._gather) as spy:
+        with patch.object(as_, "_gather_meta", wraps=as_._gather_meta) as spy:
             as_.run_once()
         assert spy.call_count == 1
 
@@ -731,19 +816,30 @@ class TestConnectionLossFallback:
         persisted = load_state(tmp_path)
         assert persisted.consecutive_failures == 1
 
-    def test_run_once_active_fails_others_ok_is_not_offline(self, tmp_path: Path):
-        """Active fetch None but a peer OK → online (active-usage-unknown)."""
-        # Active is account 1; give it None usage but account 2 a good reading.
+    def test_run_once_active_no_credentials_is_neither(self, tmp_path: Path):
+        """Active uncredentialed → NEITHER (no token, didn't try): not offline.
+
+        Active-first: the trichotomy keys on the ACTIVE probe. "no credentials"
+        means we did not try, so it is NOT a network outage even if a peer is
+        fine — and the others are not fetched.
+        """
         accounts = [
-            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "1", "email": "a@x.com", "usage": "no credentials"},
             {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
         ]
         as_ = _make_auto_switcher(tmp_path, accounts)
-        with patch("claude_swap.auto_switch.notify"):
+        with patch("claude_swap.auto_switch.notify") as mock_notify, \
+             patch("claude_swap.oauth.fetch_usage_for_account") as spy_fetch:
+            # The autouse fixture already patched oauth; re-patch locally to spy.
+            spy_fetch.side_effect = lambda *a, **k: None
             decision = as_.run_once()
         assert decision.reason == "active-usage-unknown"
         assert as_.consecutive_failures == 0            # NOT offline
-        assert as_._switcher.switched_to == []          # never switches blind
+        assert as_._switcher.switched_to == []
+        # Active had no creds → engine short-circuits, never calls the API,
+        # never fetches the others.
+        spy_fetch.assert_not_called()
+        mock_notify.assert_not_called()
 
     def test_no_switch_while_offline(self, tmp_path: Path):
         """Even with the active account 'over threshold' missing, offline = no switch."""
@@ -852,11 +948,12 @@ class TestConnectionLossFallback:
             as_.run_once()
         assert as_._state.last_usage["1"]["usage"] == good
 
-        # Now account 1's fetch fails (None) but account 2 still OK → online.
+        # Now the active account's fetch fails (None) → offline tick; the
+        # online path (which merges last_usage) does not run, so the good
+        # account-1 reading must NOT be clobbered.
         as_._switcher._accounts[0]["usage"] = None
         with patch("claude_swap.auto_switch.notify"):
             as_.run_once()
-        # The good account-1 reading must NOT be clobbered by the None fetch.
         assert as_._state.last_usage["1"]["usage"] == good
 
     def test_state_persisted_every_tick(self, tmp_path: Path):
@@ -946,6 +1043,90 @@ class TestConnectionLossFallback:
             as_.run_once()
 
         assert sum("offline" in t.lower() for t in titles) == 2
+
+
+# ---------------------------------------------------------------------------
+# TestActiveFirstFetch — anti-spam two-phase fetch (one call/normal tick)
+# ---------------------------------------------------------------------------
+
+class TestActiveFirstFetch:
+    """A normal tick probes ONLY the active account (one usage API call)."""
+
+    @staticmethod
+    def _fetched_nums(mock_fetch) -> list[str]:
+        """Account nums actually passed to oauth.fetch_usage_for_account."""
+        return [str(c.args[0]) for c in mock_fetch.call_args_list]
+
+    def test_run_once_fetches_active_only_when_under_threshold(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
+        """Active under threshold → exactly ONE usage fetch; others NOT fetched."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(50.0, 40.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+            {"num": "3", "email": "c@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.reason == "under-threshold"
+        assert decision.action == "stay"
+        # Exactly one usage API call — the active account only.
+        assert _patch_oauth_fetch.call_count == 1
+        assert self._fetched_nums(_patch_oauth_fetch) == ["1"]
+        assert as_._switcher.switched_to == []
+
+    def test_run_once_fetches_others_only_when_active_crosses(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
+        """Active >= threshold → others fetched; switch to soonest-7d-reset target."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},                   # active over 5h
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0, 0.0, _ts(+48))},   # resets in 48h
+            {"num": "3", "email": "c@x.com", "usage": _usage(10.0, 0.0, _ts(+10))},   # resets in 10h → soonest
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.action == "switch"
+        assert decision.target == "3"                 # soonest 7d reset
+        assert as_._switcher.switched_to == ["3"]
+        # Active (1) + both others (2, 3) fetched = 3 calls.
+        assert _patch_oauth_fetch.call_count == 3
+        assert set(self._fetched_nums(_patch_oauth_fetch)) == {"1", "2", "3"}
+
+    def test_run_once_offline_does_not_fetch_others(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
+        """Active fetch None (outage) → offline tick; others NOT fetched."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},      # active: tried, failed
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+            {"num": "3", "email": "c@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.reason == "active-usage-unknown"
+        assert as_.consecutive_failures == 1          # offline tick
+        # Only the active account was probed — no peer fetches during an outage.
+        assert _patch_oauth_fetch.call_count == 1
+        assert self._fetched_nums(_patch_oauth_fetch) == ["1"]
+        assert as_._switcher.switched_to == []
+
+    def test_run_once_over_threshold_but_no_others_stays(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
+        """Active over threshold, single account → stay/single-account, 1 fetch."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.reason == "single-account"
+        # No switchable others → nothing else to fetch beyond the active probe.
+        assert _patch_oauth_fetch.call_count == 1
 
 
 # ---------------------------------------------------------------------------
