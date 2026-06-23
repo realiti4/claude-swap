@@ -133,10 +133,23 @@ cswap watch
 
 Press `Ctrl+C` to stop.
 
+#### Strategies
+
+Two policies decide *when* to switch (`cswap auto on --strategy <name>`, or `cswap watch --strategy <name>`):
+
+- **`consume-first`** (default for new installs) — *proactive*. Keeps you on the account to consume **first**: the available account whose **weekly window resets soonest** (use-it-or-lose-it, so quota isn't wasted at reset). It switches whenever that account changes — a reset re-orders the queue, the current account exhausts, or an account that hit its 5-hour limit clears and reclaims the soonest-reset slot. If the chosen account hits its 5-hour session limit while its weekly still has room, it moves to another account temporarily and returns once the 5-hour window resets.
+- **`reactive`** — *threshold-only* (the original behavior). Stays put until the active account crosses a limit (5h ≥ 98% or 7d ≥ 99%), then jumps to the account with the soonest weekly reset among those that still have headroom.
+
+```bash
+cswap auto on --strategy consume-first   # proactive (default)
+cswap auto on --strategy reactive        # switch only at 98%/99%
+cswap auto status                        # shows the active strategy
+```
+
 #### How it works
 
-- **Session threshold** (default 98%): when the active account's 5-hour usage reaches this percentage, auto-switch triggers.
-- **Weekly threshold** (default 99%): same logic for the 7-day rolling window.
+- **Session threshold** (default 98%): the 5-hour limit. In `reactive` mode crossing it triggers a switch; in `consume-first` mode it marks an account temporarily unavailable (skipped, then reclaimed after its 5-hour reset).
+- **Weekly threshold** (default 99%): same for the 7-day rolling window; an account at/over it is excluded until it resets.
 - The next account is chosen by: earliest reset time → most remaining headroom → rotation order.
 - Accounts with active Claude Code sessions are excluded from the candidate pool.
 - A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
