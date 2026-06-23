@@ -91,6 +91,62 @@ Examples:
         sys.exit(130)
 
 
+def _fmt_clock_ago(ts: float) -> str:
+    """Render a wall-clock POSIX ts as ``HH:MM (Nm ago)`` in local time."""
+    from datetime import datetime, timezone
+
+    try:
+        dt_local = datetime.fromtimestamp(ts).astimezone()
+        delta = datetime.now(timezone.utc).timestamp() - ts
+        mins = max(0, int(delta // 60))
+        if mins >= 60:
+            ago = f"{mins // 60}h {mins % 60}m ago"
+        else:
+            ago = f"{mins}m ago"
+        return f"{dt_local.strftime('%H:%M')} ({ago})"
+    except Exception:
+        return "unknown"
+
+
+def _monitoring_status_line(backup_root) -> str:
+    """One-line monitoring health for ``cswap auto status`` (offline-aware).
+
+    Only renders "offline" once we've actually DECLARED offline
+    (``offline_notified`` — i.e. >= 2 consecutive failures, matching the
+    notification gate). A single transient failure that hasn't yet crossed the
+    threshold renders as "checking — retrying", so the UI word "offline" lines
+    up with when the engine truly considers itself offline.
+    """
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    if state.offline_notified:
+        if state.last_online_ts is not None:
+            return f"offline since {_fmt_clock_ago(state.last_online_ts)}"
+        return "offline (never reached the usage API)"
+    if 0 < state.consecutive_failures < 2:
+        n = state.consecutive_failures
+        return f"checking — {n} failed check{'s' if n != 1 else ''}, retrying"
+    if state.last_online_ts is not None:
+        return f"online (last check {_fmt_clock_ago(state.last_online_ts)})"
+    return "online (no check yet)"
+
+
+def _last_switch_status_line(backup_root) -> str | None:
+    """``account-X at HH:MM (reason)`` from state, or None when never switched."""
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    sw = state.last_switch
+    if not isinstance(sw, dict) or "account" not in sw:
+        return None
+    acct = sw.get("account")
+    reason = sw.get("reason", "")
+    ts = sw.get("ts")
+    when = _fmt_clock_ago(ts) if isinstance(ts, (int, float)) else "unknown"
+    return f"account-{acct} at {when} ({reason})"
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle ``cswap auto [on|off|status]``, ``cswap watch``, ``cswap _auto-daemon``.
 
@@ -204,6 +260,10 @@ def _auto_command(argv: list[str]) -> None:
             print(f"weekly_threshold:  {config.weekly_threshold}%")
             print(f"notify:            {config.notify}")
             print(f"poll interval:     {config.min_interval}s – {config.max_interval}s")
+            print(f"monitoring:        {_monitoring_status_line(backup_root)}")
+            last_switch = _last_switch_status_line(backup_root)
+            if last_switch is not None:
+                print(f"last switch:       {last_switch}")
 
             if Platform.detect() is Platform.MACOS:
                 print(f"agent:             {agent_status()}")

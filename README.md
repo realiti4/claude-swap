@@ -141,6 +141,14 @@ Press `Ctrl+C` to stop.
 - Accounts with active Claude Code sessions are excluded from the candidate pool.
 - A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
 
+#### Connection loss
+
+The monitor depends on the Anthropic usage API. If the network drops and usage can't be read, the auto-switcher fails safely:
+
+- **Safe:** it never switches on stale or unknown data — switching onto a possibly-exhausted account would be risky, and during a real outage Claude Code is blocked anyway, so no quota is burning. It simply waits.
+- **Visible:** it backs off (exponentially, capped) instead of hammering the network, sends a one-shot "offline" notification, and `cswap auto status` shows a `monitoring: offline since …` line.
+- **Recoverable:** the first successful poll after the outage resumes monitoring automatically and sends a one-shot "back online" notification.
+
 #### Configuration
 
 Adjust thresholds when enabling:

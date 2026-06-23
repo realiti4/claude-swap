@@ -536,6 +536,74 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "enabled" in out
 
+    def test_auto_status_shows_monitoring_line(self, capsys, temp_home: Path):
+        """status shows a 'monitoring:' line; offline state is surfaced."""
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        # Persist an offline state.
+        save_state(
+            MonitorState(
+                last_online_ts=1.0, consecutive_failures=3, offline_notified=True
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "monitoring:" in out
+        assert "offline" in out.lower()
+
+    def test_auto_status_shows_last_switch_when_present(self, capsys, temp_home: Path):
+        """status shows a 'last switch:' line when state has one."""
+        import time
+
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_state(
+            MonitorState(
+                last_online_ts=time.time(),
+                last_switch={"account": "2", "ts": time.time(), "reason": "5h-threshold"},
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last switch:" in out
+        assert "account-2" in out
+
+    def test_auto_status_no_last_switch_line_when_absent(self, capsys, temp_home: Path):
+        """No 'last switch:' line when state has never recorded one."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last switch:" not in out
+
     # -----------------------------------------------------------------------
     # auto on / off
     # -----------------------------------------------------------------------

@@ -12,126 +12,46 @@ Architecture
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _state_replace
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap import oauth
+# AutoSwitchConfig + its load/save live in auto_switch_state (both are persisted
+# engine state). Re-exported here so existing imports
+# (``from claude_swap.auto_switch import AutoSwitchConfig`` / ``load_config`` /
+# ``save_config``) keep working unchanged.
+from claude_swap.auto_switch_state import (
+    AutoSwitchConfig,
+    MonitorState,
+    load_config,
+    load_state,
+    save_config,
+    save_state,
+)
 from claude_swap.locking import FileLock
 from claude_swap.notify import notify
-from claude_swap.paths import get_backup_root
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 _logger = logging.getLogger("claude-swap")
 
-# ---------------------------------------------------------------------------
-# Config model
-# ---------------------------------------------------------------------------
 
-_CONFIG_FILENAME = "auto-switch.json"
+def _now_ts() -> float:
+    """Wall-clock POSIX timestamp (survives restarts; renderable as local time).
 
-_DEFAULTS: dict = {
-    "enabled": False,
-    "session_threshold": 98.0,
-    "weekly_threshold": 99.0,
-    "notify": True,
-    "min_interval": 20,
-    "max_interval": 300,
-}
+    Distinct from ``time.monotonic()`` which is only valid for in-process
+    durations and cannot be turned into a clock time for ``cswap auto status``.
+    """
+    return datetime.now(timezone.utc).timestamp()
 
 
-@dataclass(frozen=True)
-class AutoSwitchConfig:
-    """Persistent configuration for the auto-switch engine."""
-
-    enabled: bool = False
-    session_threshold: float = 98.0
-    weekly_threshold: float = 99.0
-    notify: bool = True
-    min_interval: int = 20
-    max_interval: int = 300
-
-    # ------------------------------------------------------------------
-    # Serialisation
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_dict(cls, data: object) -> AutoSwitchConfig:
-        """Build from an arbitrary object.  Unknown/missing keys → defaults."""
-        if not isinstance(data, dict):
-            return cls()
-        return cls(
-            enabled=bool(data.get("enabled", _DEFAULTS["enabled"])),
-            session_threshold=float(
-                data.get("session_threshold", _DEFAULTS["session_threshold"])
-            ),
-            weekly_threshold=float(
-                data.get("weekly_threshold", _DEFAULTS["weekly_threshold"])
-            ),
-            notify=bool(data.get("notify", _DEFAULTS["notify"])),
-            min_interval=int(
-                data.get("min_interval", _DEFAULTS["min_interval"])
-            ),
-            max_interval=int(
-                data.get("max_interval", _DEFAULTS["max_interval"])
-            ),
-        )
-
-    def to_dict(self) -> dict:
-        """Convert to a JSON-serialisable dict."""
-        return {
-            "enabled": self.enabled,
-            "session_threshold": self.session_threshold,
-            "weekly_threshold": self.weekly_threshold,
-            "notify": self.notify,
-            "min_interval": self.min_interval,
-            "max_interval": self.max_interval,
-        }
-
-
-# ------------------------------------------------------------------
-# Module-level load / save helpers
-# ------------------------------------------------------------------
-
-
-def _config_path(backup_root: Path | None = None) -> Path:
-    root = backup_root if backup_root is not None else get_backup_root()
-    return root / _CONFIG_FILENAME
-
-
-def load_config(backup_root: Path | None = None) -> AutoSwitchConfig:
-    """Load config from disk; return defaults when the file is absent or bad."""
-    path = _config_path(backup_root)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return AutoSwitchConfig.from_dict(data)
-    except FileNotFoundError:
-        return AutoSwitchConfig()
-    except Exception as exc:
-        _logger.debug("auto-switch: config load failed: %r", exc)
-        return AutoSwitchConfig()
-
-
-def save_config(config: AutoSwitchConfig, backup_root: Path | None = None) -> None:
-    """Atomically write config to disk at 0o600."""
-    path = _config_path(backup_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    try:
-        tmp.write_text(json.dumps(config.to_dict(), indent=2), encoding="utf-8")
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
-        tmp.replace(path)
-    except Exception as exc:
-        tmp.unlink(missing_ok=True)
-        raise exc
+# ``AutoSwitchConfig`` + ``load_config`` / ``save_config`` are defined in
+# ``claude_swap.auto_switch_state`` and imported above (re-exported for
+# backward compatibility).
 
 
 # ---------------------------------------------------------------------------
@@ -353,14 +273,28 @@ def decide_switch(
 def next_interval(
     active_usage: dict | None,
     config: AutoSwitchConfig,
+    consecutive_failures: int = 0,
 ) -> int:
-    """Return the next polling interval in seconds (adaptive, clamped).
+    """Return the next polling interval in seconds (adaptive, clamped). PURE.
 
-    Closer to threshold → shorter interval.  The mapping is:
+    When ``consecutive_failures > 0`` the engine is OFFLINE (can't reach the
+    usage API): back off exponentially so a real outage doesn't hammer the
+    network, capped at ``config.offline_backoff_cap``::
+
+        min(offline_backoff_cap, max_interval * 2 ** min(failures - 1, 4))
+
+    When online (``consecutive_failures == 0``) use the adaptive mapping —
+    closer to threshold → shorter interval:
     - max(5h%, 7d%) >= 95% → ``min_interval``
     - max(5h%, 7d%) >= 85% → ~60s
     - else → scale linearly toward ``max_interval``
     """
+    if consecutive_failures > 0:
+        # Cap the exponent at 4 (×16) so the multiplier never overflows.
+        exp = min(consecutive_failures - 1, 4)
+        backoff = config.max_interval * (2 ** exp)
+        return min(config.offline_backoff_cap, backoff)
+
     if not isinstance(active_usage, dict):
         return config.max_interval
 
@@ -419,6 +353,15 @@ class AutoSwitcher:
         # by ``watch`` / ``run_daemon`` to size the next poll interval WITHOUT a
         # second gather (one gather per tick).
         self._last_active_usage: dict | None = None
+        # Persistent monitor state (online/offline, backoff, last switch). Held
+        # in memory across ticks and persisted once per tick. Defensive load:
+        # a missing/corrupt file yields defaults, never crashes.
+        self._state: MonitorState = load_state(switcher.backup_dir)
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Current consecutive offline-tick count (0 when online)."""
+        return self._state.consecutive_failures
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -484,15 +427,32 @@ class AutoSwitcher:
     def run_once(self) -> SwitchDecision:
         """Execute one monitor tick.
 
-        Returns the decision; on I/O error returns a stay/tick-error decision
-        and logs the exception.
+        Connection-loss fallback (SAFE / VISIBLE / RECOVERABLE):
+        * SAFE — when the usage API is unreachable (every fetch returned None)
+          we NEVER switch. We deliberately do NOT switch on the last-known
+          (stale) cached usage: switching onto a possibly-stale-exhausted
+          target is risky and low value — a true network outage also blocks
+          Claude Code itself, so no quota is burning while we're offline, and
+          the next online tick self-corrects.
+        * VISIBLE — offline ticks back off (see ``next_interval``) and send a
+          one-shot "offline" notification; ``cswap auto status`` surfaces it.
+        * RECOVERABLE — the first online tick resets the failure counter and
+          (if we had notified) sends a one-shot "back online" notification.
+
+        Returns the decision; on gather error returns a stay/tick-error
+        decision and logs the exception. Persists monitor state every tick.
         """
         try:
             active_num, usage_by_account, switchable, live_session_nums, rotation_index = (
                 self._gather()
             )
         except Exception as exc:
+            # A gather failure is NOT the same as "the usage API is offline":
+            # it's a local/programming error. Treat it as a normal failed tick
+            # (do not touch the offline state machine) and back off via the
+            # max interval through the existing daemon/watch try/except.
             _logger.exception("auto-switch: gather failed: %r", exc)
+            self._persist_state()
             return SwitchDecision(
                 action="stay",
                 target=None,
@@ -510,6 +470,52 @@ class AutoSwitcher:
         self._last_active_usage = (
             active_usage_now if isinstance(active_usage_now, dict) else None
         )
+
+        # Online/offline classification is a TRICHOTOMY, not a binary, because
+        # ``_collect_usage`` returns one of three things per account:
+        #   * dict              → reachable, got data            (online signal)
+        #   * None              → had a token, the HTTP call FAILED (outage signal)
+        #   * "no credentials"  → no token, we did NOT try        (no signal)
+        # The offline state machine must fire ONLY when nothing got data AND at
+        # least one token-bearing fetch actually failed. Otherwise (zero managed
+        # accounts, or every account uncredentialed) we genuinely can't check —
+        # but that is NOT a network outage, so we must not raise a false
+        # "Can't reach the usage API" notification.
+        got_data = any(isinstance(u, dict) for u in usage_by_account.values())
+        attempted = any(u is None for u in usage_by_account.values())
+
+        if not got_data:
+            if attempted:
+                # Genuine network/API outage: we tried and every attempt failed.
+                self._handle_offline_tick()
+                detail = (
+                    "Usage API unreachable (offline) — monitoring paused, "
+                    "will resume automatically. Not switching on stale data."
+                )
+            else:
+                # Zero accounts OR all uncredentialed: can't check, but NOT a
+                # network outage — do NOT touch the offline state machine (no
+                # false offline notification, no failure increment).
+                detail = (
+                    "No managed accounts to check."
+                    if not usage_by_account
+                    else "No usable account credentials — can't read usage "
+                    "(not a network outage)."
+                )
+            self._persist_state()
+            return SwitchDecision(
+                action="stay",
+                target=None,
+                reason="active-usage-unknown",
+                trigger_window=None,
+                trigger_pct=None,
+                detail=detail,
+            )
+
+        # ---- ONLINE TICK ---------------------------------------------------
+        # got_data is True → online. Recovery handling + refresh last-known-good
+        # usage + persist.
+        self._handle_online_tick(usage_by_account)
 
         decision = decide_switch(
             active_num,
@@ -535,6 +541,15 @@ class AutoSwitcher:
                     decision.target,
                     decision.detail,
                 )
+                # Record the switch in persistent state.
+                self._state = _state_replace(
+                    self._state,
+                    last_switch={
+                        "account": decision.target,
+                        "ts": _now_ts(),
+                        "reason": decision.reason,
+                    },
+                )
                 if self._config.notify:
                     notify(
                         "Claude Swap — Auto Switch",
@@ -545,6 +560,7 @@ class AutoSwitcher:
                 _logger.exception(
                     "auto-switch: switch to %s failed: %r", decision.target, exc
                 )
+                self._persist_state()
                 return SwitchDecision(
                     action="stay",
                     target=None,
@@ -566,7 +582,74 @@ class AutoSwitcher:
                         "Consider adding another account.",
                     )
 
+        self._persist_state()
         return decision
+
+    # ------------------------------------------------------------------
+    # Offline / online state machine (mutates self._state, never raises)
+    # ------------------------------------------------------------------
+
+    def _handle_offline_tick(self) -> None:
+        """Increment the failure counter; send a one-shot offline notice.
+
+        Never switches. Logs the transition into offline at INFO exactly once
+        (subsequent offline ticks stay quiet in the log).
+        """
+        failures = self._state.consecutive_failures + 1
+        just_went_offline = self._state.consecutive_failures == 0
+        notified = self._state.offline_notified
+
+        # One-shot offline notification: after >= 2 consecutive failures, if we
+        # haven't already told the user and notifications are enabled.
+        if failures >= 2 and not notified and self._config.notify:
+            notify(
+                "Claude Swap — Auto-switch offline",
+                "Can't reach the usage API — monitoring paused, will resume "
+                "automatically.",
+            )
+            notified = True
+
+        if just_went_offline:
+            _logger.info(
+                "auto-switch: usage API unreachable — entering offline mode "
+                "(will back off and resume on reconnect)."
+            )
+
+        self._state = _state_replace(
+            self._state,
+            consecutive_failures=failures,
+            offline_notified=notified,
+        )
+
+    def _handle_online_tick(self, usage_by_account: dict[str, object]) -> None:
+        """Mark online, handle recovery, refresh last-known-good usage."""
+        was_offline = (
+            self._state.consecutive_failures > 0 or self._state.offline_notified
+        )
+        now = _now_ts()
+
+        if was_offline:
+            _logger.info("auto-switch: usage API reachable again — back online.")
+            if self._state.offline_notified and self._config.notify:
+                notify(
+                    "Claude Swap — Auto-switch back online",
+                    "Usage monitoring resumed.",
+                )
+
+        # Merge fresh GOOD readings (never overwrite a good entry with None).
+        merged = self._state.merged_usage(usage_by_account, now)
+
+        self._state = _state_replace(
+            self._state,
+            last_online_ts=now,
+            consecutive_failures=0,
+            offline_notified=False,
+            last_usage=merged,
+        )
+
+    def _persist_state(self) -> None:
+        """Persist monitor state once (best-effort; never raises)."""
+        save_state(self._state, self._switcher.backup_dir)
 
     def watch(self) -> None:
         """Run the monitor loop in the foreground (Ctrl-C to stop)."""
@@ -587,13 +670,20 @@ class AutoSwitcher:
             while True:
                 decision = self.run_once()
                 # run_once already gathered once this tick; reuse its result.
-                interval = next_interval(self._last_active_usage, self._config)
-                _action = decision.action
-                _reason = decision.reason
-                status = (
-                    f"  action={_action}  reason={_reason}  "
-                    f"next poll in {interval}s"
+                failures = self._state.consecutive_failures
+                interval = next_interval(
+                    self._last_active_usage, self._config, failures
                 )
+                if failures > 0:
+                    status = (
+                        f"  offline — retry in {interval}s "
+                        f"({failures} failure{'s' if failures != 1 else ''})"
+                    )
+                else:
+                    status = (
+                        f"  action={decision.action}  reason={decision.reason}  "
+                        f"next poll in {interval}s"
+                    )
                 print(muted(status))
                 time.sleep(interval)
         except KeyboardInterrupt:
@@ -629,7 +719,11 @@ class AutoSwitcher:
                 try:
                     decision = self.run_once()
                     # run_once gathered once this tick; reuse its result.
-                    interval = next_interval(self._last_active_usage, self._config)
+                    interval = next_interval(
+                        self._last_active_usage,
+                        self._config,
+                        self._state.consecutive_failures,
+                    )
                 except Exception as exc:
                     _logger.exception("auto-switch daemon: tick error: %r", exc)
                     interval = self._config.max_interval

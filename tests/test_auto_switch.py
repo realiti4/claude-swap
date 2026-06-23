@@ -24,6 +24,7 @@ from claude_swap.auto_switch import (
     next_interval,
     save_config,
 )
+from claude_swap.auto_switch_state import MonitorState, load_state, save_state
 from claude_swap.models import Platform
 
 
@@ -370,6 +371,17 @@ class TestAutoSwitchConfig:
         cfg2 = AutoSwitchConfig.from_dict(cfg.to_dict())
         assert cfg == cfg2
 
+    def test_offline_backoff_cap_default(self):
+        assert AutoSwitchConfig().offline_backoff_cap == 600
+
+    def test_auto_switch_config_offline_backoff_cap_roundtrip(self):
+        cfg = AutoSwitchConfig(offline_backoff_cap=1234)
+        cfg2 = AutoSwitchConfig.from_dict(cfg.to_dict())
+        assert cfg2.offline_backoff_cap == 1234
+        # Missing key falls back to default.
+        cfg3 = AutoSwitchConfig.from_dict({"enabled": True})
+        assert cfg3.offline_backoff_cap == 600
+
     def test_from_dict_partial_uses_defaults(self):
         cfg = AutoSwitchConfig.from_dict({"enabled": True})
         assert cfg.enabled is True
@@ -494,6 +506,37 @@ class TestNextInterval:
         assert next_interval(usage_high_d7, self.CFG) == next_interval(
             usage_high_h5, self.CFG
         )
+
+    def test_next_interval_backoff_grows_and_caps(self):
+        """Offline backoff grows exponentially from max_interval and caps."""
+        cfg = AutoSwitchConfig(
+            min_interval=20, max_interval=300, offline_backoff_cap=600
+        )
+        # failures=1 → max_interval * 2**0 = 300
+        assert next_interval(None, cfg, 1) == 300
+        # failures=2 → 300 * 2**1 = 600 (== cap)
+        assert next_interval(None, cfg, 2) == 600
+        # failures=3 → 300 * 2**2 = 1200 → capped at 600
+        assert next_interval(None, cfg, 3) == 600
+        # Monotonic non-decreasing as failures grow, always <= cap.
+        prev = 0
+        for f in range(1, 10):
+            v = next_interval(None, cfg, f)
+            assert v >= prev
+            assert v <= cfg.offline_backoff_cap
+            prev = v
+
+    def test_next_interval_backoff_ignores_usage(self):
+        """When offline, the interval is backoff — usage% is irrelevant."""
+        cfg = AutoSwitchConfig(min_interval=20, max_interval=300, offline_backoff_cap=600)
+        near_threshold = {"five_hour": {"pct": 99.0}}
+        # Online would be min_interval (20); offline overrides to backoff.
+        assert next_interval(near_threshold, cfg, 1) == 300
+
+    def test_next_interval_zero_failures_is_online_path(self):
+        """consecutive_failures=0 → normal adaptive behaviour (unchanged)."""
+        usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
+        assert next_interval(usage, self.CFG, 0) == 20
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +706,320 @@ class TestAutoSwitcherRunOnce:
         with patch("claude_swap.auto_switch.notify"):
             as_.run_once()
         assert as_._last_active_usage == active_usage
+
+
+# ---------------------------------------------------------------------------
+# TestConnectionLossFallback — offline detection / backoff / recovery / state
+# ---------------------------------------------------------------------------
+
+class TestConnectionLossFallback:
+    """SAFE / VISIBLE / RECOVERABLE behaviour when the usage API is offline."""
+
+    def test_run_once_detects_offline_when_all_fetch_fail(self, tmp_path: Path):
+        """All fetches None → online False, failures increments, no switch."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "2", "email": "b@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.action == "stay"
+        assert as_._switcher.switched_to == []          # never switched
+        assert as_.consecutive_failures == 1
+        # State persisted to disk.
+        persisted = load_state(tmp_path)
+        assert persisted.consecutive_failures == 1
+
+    def test_run_once_active_fails_others_ok_is_not_offline(self, tmp_path: Path):
+        """Active fetch None but a peer OK → online (active-usage-unknown)."""
+        # Active is account 1; give it None usage but account 2 a good reading.
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.reason == "active-usage-unknown"
+        assert as_.consecutive_failures == 0            # NOT offline
+        assert as_._switcher.switched_to == []          # never switches blind
+
+    def test_no_switch_while_offline(self, tmp_path: Path):
+        """Even with the active account 'over threshold' missing, offline = no switch."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "2", "email": "b@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        as_._switcher.auto_switch_to = MagicMock()
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+            as_.run_once()
+            as_.run_once()
+        as_._switcher.auto_switch_to.assert_not_called()
+        assert as_.consecutive_failures == 3
+
+    def test_offline_notify_is_one_shot(self, tmp_path: Path):
+        """>= 2 offline ticks → exactly one 'offline' notification."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()   # failures=1, no notify yet
+            assert mock_notify.call_count == 0
+            as_.run_once()   # failures=2 → one offline notify
+            as_.run_once()   # failures=3 → still just one (already notified)
+            as_.run_once()
+        # Exactly one notification, and it's the offline one.
+        assert mock_notify.call_count == 1
+        title = mock_notify.call_args[0][0]
+        assert "offline" in title.lower()
+        assert as_._state.offline_notified is True
+
+    def test_recovery_resets_and_notifies(self, tmp_path: Path):
+        """Offline (notified) → online → failures 0, one 'back online' notify."""
+        # BOTH accounts offline → truly offline (nothing fetched).
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "2", "email": "b@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+
+        # Drive offline until notified.
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+            as_.run_once()   # offline notify fires here
+        assert as_._state.offline_notified is True
+        assert as_.consecutive_failures >= 2
+
+        # Now the API comes back — accounts fetch successfully again.
+        as_._switcher._accounts[0]["usage"] = _usage(20.0)
+        as_._switcher._accounts[1]["usage"] = _usage(10.0)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()
+        assert as_.consecutive_failures == 0
+        assert as_._state.offline_notified is False
+        assert as_._state.last_online_ts is not None
+        # Exactly one 'back online' notification.
+        assert mock_notify.call_count == 1
+        assert "online" in mock_notify.call_args[0][0].lower()
+
+    def test_no_recovery_notify_if_never_notified_offline(self, tmp_path: Path):
+        """A single offline blip (failures=1, not notified) → no recovery notify."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()   # failures=1, NOT notified
+        assert as_._state.offline_notified is False
+        # Recover immediately.
+        as_._switcher._accounts[0]["usage"] = _usage(10.0)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()
+        assert as_.consecutive_failures == 0
+        mock_notify.assert_not_called()
+
+    def test_last_switch_recorded_in_state(self, tmp_path: Path):
+        """A successful switch tick records last_switch in persisted state."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(99.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            decision = as_.run_once()
+        assert decision.action == "switch"
+        sw = as_._state.last_switch
+        assert sw is not None
+        assert sw["account"] == "2"
+        assert sw["reason"] == "5h-threshold"
+        assert isinstance(sw["ts"], float)
+        # Persisted to disk too.
+        assert load_state(tmp_path).last_switch == sw
+
+    def test_last_usage_not_overwritten_with_none(self, tmp_path: Path):
+        """A good reading survives a later failed fetch for that account."""
+        good = _usage(20.0, 15.0)
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": good},
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        assert as_._state.last_usage["1"]["usage"] == good
+
+        # Now account 1's fetch fails (None) but account 2 still OK → online.
+        as_._switcher._accounts[0]["usage"] = None
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        # The good account-1 reading must NOT be clobbered by the None fetch.
+        assert as_._state.last_usage["1"]["usage"] == good
+
+    def test_state_persisted_every_tick(self, tmp_path: Path):
+        """run_once persists state even on a plain under-threshold stay."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},
+            {"num": "2", "email": "b@x.com", "usage": _usage(10.0)},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        assert (tmp_path / "auto-switch-state.json").exists()
+
+    # ------------------------------------------------------------------
+    # Trichotomy: zero accounts / all-no-credentials / mixed
+    # ------------------------------------------------------------------
+
+    def test_zero_accounts_is_not_offline(self, tmp_path: Path):
+        """Empty usage map → stay, failures stays 0, NO offline notification."""
+        as_ = _make_auto_switcher(tmp_path, [])  # no managed accounts
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            decision = as_.run_once()
+            as_.run_once()   # a second tick must still not fire a notify
+        assert decision.action == "stay"
+        assert as_.consecutive_failures == 0
+        assert as_._state.offline_notified is False
+        mock_notify.assert_not_called()
+
+    def test_all_no_credentials_is_not_offline(self, tmp_path: Path):
+        """Every account uncredentialed ("no credentials") → not a network outage."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": "no credentials"},
+            {"num": "2", "email": "b@x.com", "usage": "no credentials"},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify") as mock_notify:
+            as_.run_once()
+            as_.run_once()   # >=2 ticks: still no false offline notification
+        assert as_.consecutive_failures == 0
+        assert as_._state.offline_notified is False
+        assert as_._switcher.switched_to == []
+        mock_notify.assert_not_called()
+
+    def test_mixed_no_credentials_and_none_is_offline(self, tmp_path: Path):
+        """One "no credentials" + one None (real failure) → offline DOES fire."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},            # tried, failed
+            {"num": "2", "email": "b@x.com", "usage": "no credentials"},  # didn't try
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        # At least one token-bearing fetch failed → genuine outage signal.
+        assert as_.consecutive_failures == 1
+        assert as_._switcher.switched_to == []
+
+    def test_second_outage_after_recovery_renotifies(self, tmp_path: Path):
+        """offline≥2 (notify) → online (recovery) → offline≥2 → offline notify again."""
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": None},
+            {"num": "2", "email": "b@x.com", "usage": None},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        titles: list[str] = []
+
+        def _capture(title, _msg):
+            titles.append(title)
+
+        with patch("claude_swap.auto_switch.notify", side_effect=_capture):
+            # First outage → offline notify on the 2nd failure.
+            as_.run_once()
+            as_.run_once()
+            offline_after_first = sum("offline" in t.lower() for t in titles)
+            assert offline_after_first == 1
+
+            # Recover.
+            as_._switcher._accounts[0]["usage"] = _usage(20.0)
+            as_._switcher._accounts[1]["usage"] = _usage(10.0)
+            as_.run_once()
+            assert as_._state.offline_notified is False
+            assert sum("back online" in t.lower() for t in titles) == 1
+
+            # Second outage → offline notify fires a SECOND time.
+            as_._switcher._accounts[0]["usage"] = None
+            as_._switcher._accounts[1]["usage"] = None
+            as_.run_once()
+            as_.run_once()
+
+        assert sum("offline" in t.lower() for t in titles) == 2
+
+
+# ---------------------------------------------------------------------------
+# TestMonitorState — defensive load/save of the state file
+# ---------------------------------------------------------------------------
+
+class TestMonitorState:
+    """MonitorState serialisation + defensive load (never crashes)."""
+
+    def test_defaults(self):
+        st = MonitorState()
+        assert st.last_online_ts is None
+        assert st.consecutive_failures == 0
+        assert st.offline_notified is False
+        assert st.last_switch is None
+        assert st.last_usage == {}
+
+    def test_round_trip(self, tmp_path: Path):
+        st = MonitorState(
+            last_online_ts=123.0,
+            consecutive_failures=2,
+            offline_notified=True,
+            last_switch={"account": "2", "ts": 1.0, "reason": "5h-threshold"},
+            last_usage={"1": {"usage": {"five_hour": {"pct": 1.0}}, "fetched_at": 5.0}},
+        )
+        save_state(st, backup_root=tmp_path)
+        loaded = load_state(backup_root=tmp_path)
+        assert loaded == st
+
+    def test_state_file_missing_or_corrupt_returns_defaults(self, tmp_path: Path):
+        # Missing file → defaults.
+        assert load_state(backup_root=tmp_path) == MonitorState()
+        # Corrupt file → defaults, no crash.
+        (tmp_path / "auto-switch-state.json").write_text("not-json{{{")
+        assert load_state(backup_root=tmp_path) == MonitorState()
+
+    def test_from_dict_non_dict_returns_defaults(self):
+        assert MonitorState.from_dict(None) == MonitorState()
+        assert MonitorState.from_dict([1, 2, 3]) == MonitorState()
+        assert MonitorState.from_dict("bad") == MonitorState()
+
+    def test_from_dict_drops_malformed_last_usage_entries(self):
+        st = MonitorState.from_dict({
+            "last_usage": {
+                "1": {"usage": {"five_hour": {"pct": 1.0}}, "fetched_at": 5.0},
+                "2": {"usage": None},          # malformed → dropped
+                "3": "not-a-dict",             # malformed → dropped
+            }
+        })
+        assert "1" in st.last_usage
+        assert "2" not in st.last_usage
+        assert "3" not in st.last_usage
+
+    def test_from_dict_negative_failures_clamped(self):
+        st = MonitorState.from_dict({"consecutive_failures": -5})
+        assert st.consecutive_failures == 0
+
+    def test_save_state_sets_0o600(self, tmp_path: Path):
+        import sys
+        if sys.platform == "win32":
+            pytest.skip("POSIX permissions not applicable on Windows")
+        save_state(MonitorState(consecutive_failures=1), backup_root=tmp_path)
+        stat = (tmp_path / "auto-switch-state.json").stat()
+        assert oct(stat.st_mode)[-3:] == "600"
+
+    def test_merged_usage_skips_none(self):
+        st = MonitorState(
+            last_usage={"1": {"usage": {"five_hour": {"pct": 1.0}}, "fetched_at": 1.0}}
+        )
+        merged = st.merged_usage({"1": None, "2": {"seven_day": {"pct": 2.0}}}, 9.0)
+        # Existing good entry preserved; None ignored; new good entry added.
+        assert merged["1"]["usage"] == {"five_hour": {"pct": 1.0}}
+        assert merged["2"]["usage"] == {"seven_day": {"pct": 2.0}}
+        assert merged["2"]["fetched_at"] == 9.0
 
 
 # ---------------------------------------------------------------------------
