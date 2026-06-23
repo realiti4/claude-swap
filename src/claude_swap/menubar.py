@@ -32,6 +32,7 @@ class MenuBarSettings:
 
     show_account_name: bool = True
     show_quota_pct: bool = True
+    show_session_pct: bool = False
     refresh_interval: int = 60
     launch_at_login: bool = False
     auto_switch_enabled: bool = False
@@ -165,6 +166,10 @@ def format_title(
         pct = tightest_pct(active_usage)
         if pct is not None:
             segments.append(f"{pct:.0f}%")
+    if settings.show_session_pct:
+        session = _window_pct(active_usage, "five_hour")
+        if session is not None:
+            segments.append(f"{session:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -465,8 +470,11 @@ def run(switcher) -> int:
             name_item.state = 1 if self.settings.show_account_name else 0
             pct_item = rumps.MenuItem("Show quota % in menu bar", callback=self.on_toggle_pct)
             pct_item.state = 1 if self.settings.show_quota_pct else 0
+            session_item = rumps.MenuItem("Show session % in menu bar", callback=self.on_toggle_session)
+            session_item.state = 1 if self.settings.show_session_pct else 0
             menu.add(name_item)
             menu.add(pct_item)
+            menu.add(session_item)
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -604,6 +612,10 @@ def run(switcher) -> int:
 
         def on_toggle_pct(self, _sender):
             self.settings.show_quota_pct = not self.settings.show_quota_pct
+            self._save_and_rebuild()
+
+        def on_toggle_session(self, _sender):
+            self.settings.show_session_pct = not self.settings.show_session_pct
             self._save_and_rebuild()
 
         def _make_interval(self, secs):

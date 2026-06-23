@@ -292,3 +292,41 @@ def test_plan_none_and_unknown_are_noop():
     st, s = menubar.MenuBarState(), menubar.MenuBarSettings()
     assert menubar.plan_auto_switch(("none", None), st, s, 1e9) == ("noop", None)
     assert menubar.plan_auto_switch(("unknown_active", None), st, s, 1e9) == ("noop", None)
+
+
+# --- session % in menu-bar title (show_session_pct) ---------------------------
+
+_USAGE_SESSION = {"five_hour": {"pct": 38.0}, "seven_day": {"pct": 71.0}}
+# tightest (max) = 71; session (5h) = 38
+
+
+def test_settings_show_session_pct_default_false():
+    assert menubar.MenuBarSettings().show_session_pct is False
+
+
+def test_format_title_session_pct_only():
+    s = menubar.MenuBarSettings(
+        show_account_name=False, show_quota_pct=False, show_session_pct=True
+    )
+    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ 38%"
+
+
+def test_format_title_session_with_name():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, show_quota_pct=False, show_session_pct=True
+    )
+    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ loc · 38%"
+
+
+def test_format_title_quota_then_session_when_both_on():
+    s = menubar.MenuBarSettings(
+        show_account_name=False, show_quota_pct=True, show_session_pct=True
+    )
+    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ 71% · 38%"
+
+
+def test_format_title_session_dropped_when_unavailable():
+    s = menubar.MenuBarSettings(
+        show_account_name=False, show_quota_pct=False, show_session_pct=True
+    )
+    assert menubar.format_title("loc@x.com", "no credentials", s) == "⇄"
