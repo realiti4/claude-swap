@@ -605,10 +605,15 @@ def next_interval(
 ) -> int:
     """Return the next polling interval in seconds (adaptive, clamped). PURE.
 
-    When ``consecutive_failures > 0`` the engine is OFFLINE (can't reach the
-    usage API): back off exponentially from ``min_interval`` so the FIRST
-    re-probe is quick (faster recovery detection) yet a sustained outage ramps
-    up, capped at ``config.offline_backoff_cap``::
+    When ``consecutive_failures > 0`` the engine is OFFLINE (couldn't read the
+    active account's usage). If a usage cache is configured
+    (``config.usage_cache_file``) the daemon has a cheap, API-free recovery path
+    — the next tick can serve the active account from a fresh statusline cache
+    even while the API is rate-limited — so it retries at ``min_interval``
+    instead of backing off (the common case: a transient 429 from contention on
+    the active account, which the cache covers). With NO cache configured the
+    API is the only source, so back off exponentially from ``min_interval`` to
+    avoid hammering a real outage, capped at ``config.offline_backoff_cap``::
 
         min(offline_backoff_cap, min_interval * 2 ** min(failures - 1, 4))
 
@@ -629,6 +634,11 @@ def next_interval(
     sub-floor ``critical_interval`` early-return above).
     """
     if consecutive_failures > 0:
+        # With a usage cache, retry at the floor — a fresh cache recovers us
+        # without an API call, so a long backoff would only keep us needlessly
+        # "offline" after a transient rate-limit. Without a cache, back off.
+        if config.usage_cache_file:
+            return config.min_interval
         # Cap the exponent at 4 (×16) so the multiplier never overflows.
         exp = min(consecutive_failures - 1, 4)
         backoff = config.min_interval * (2 ** exp)

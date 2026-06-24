@@ -659,9 +659,11 @@ class TestNextInterval:
         assert next_interval(usage, self.CFG) == 60
 
     def test_critical_band_only_online(self):
-        # Offline (failures>0) ignores usage → backoff, never the critical cadence.
+        # Offline (failures>0) ignores usage → never the tight critical cadence.
+        # CFG has a usage_cache_file (default), so offline retries at min_interval.
         usage = {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 0.0}}
-        assert next_interval(usage, self.CFG, 3) == 240   # backoff, not 15
+        out = next_interval(usage, self.CFG, 3)
+        assert out == self.CFG.min_interval and out != self.CFG.critical_interval
 
     def test_85_band_returns_two_times_min(self):
         usage = {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}}
@@ -717,10 +719,24 @@ class TestNextInterval:
             usage_high_h5, self.CFG
         ) == 120
 
-    def test_next_interval_backoff_grows_and_caps(self):
-        """Offline backoff ramps from min_interval (gentle first re-probe) and caps."""
+    def test_offline_with_cache_retries_at_floor(self):
+        """With a usage cache configured, offline retries at min_interval (the
+        cache is a cheap recovery path) — no exponential backoff."""
         cfg = AutoSwitchConfig(
-            min_interval=60, max_interval=300, offline_backoff_cap=600
+            min_interval=60, offline_backoff_cap=600,
+            usage_cache_file="/tmp/x.json",
+        )
+        for failures in (1, 2, 3, 5, 10):
+            assert next_interval(None, cfg, failures) == 60
+
+    def test_next_interval_backoff_grows_and_caps(self):
+        """Offline backoff ramps from min_interval (gentle first re-probe) and caps.
+
+        Backoff applies only when NO usage cache is configured (the API is then
+        the only recovery source)."""
+        cfg = AutoSwitchConfig(
+            min_interval=60, max_interval=300, offline_backoff_cap=600,
+            usage_cache_file="",
         )
         # Ramp: min_interval * 2**min(failures-1, 4) → 60, 120, 240, 480, 600(cap), 600...
         assert next_interval(None, cfg, 1) == 60
@@ -739,7 +755,10 @@ class TestNextInterval:
 
     def test_next_interval_backoff_ignores_usage(self):
         """When offline, the interval is backoff — usage% is irrelevant."""
-        cfg = AutoSwitchConfig(min_interval=60, max_interval=300, offline_backoff_cap=600)
+        cfg = AutoSwitchConfig(
+            min_interval=60, max_interval=300, offline_backoff_cap=600,
+            usage_cache_file="",
+        )
         near_threshold = {"five_hour": {"pct": 99.0}}
         # Online would be min_interval (60); offline failures=1 → 60 (same here,
         # but failures=3 proves usage is ignored: 240, not the 60 a 99% online tick gives).
