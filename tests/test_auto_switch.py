@@ -488,6 +488,26 @@ class TestAutoSwitchConfig:
         )
         assert cfg3.hysteresis == 89.0
 
+    def test_critical_interval_default(self):
+        assert AutoSwitchConfig().critical_interval == 15
+
+    def test_critical_interval_roundtrip(self):
+        cfg = AutoSwitchConfig(critical_interval=20)
+        cfg2 = AutoSwitchConfig.from_dict(cfg.to_dict())
+        assert cfg2.critical_interval == 20
+
+    def test_critical_interval_clamped_to_floor_and_min_interval(self):
+        # Floored at 10 (never spam the API), capped at min_interval (it only
+        # makes sense tighter than the normal floor).
+        assert AutoSwitchConfig.from_dict({"critical_interval": 1}).critical_interval == 10
+        assert AutoSwitchConfig.from_dict(
+            {"critical_interval": 999, "min_interval": 60}
+        ).critical_interval == 60
+        # Bad value → default (15).
+        assert AutoSwitchConfig.from_dict({"critical_interval": "x"}).critical_interval == 15
+        # Missing key → default.
+        assert AutoSwitchConfig.from_dict({"enabled": True}).critical_interval == 15
+
     def test_from_dict_partial_uses_defaults(self):
         cfg = AutoSwitchConfig.from_dict({"enabled": True})
         assert cfg.enabled is True
@@ -599,9 +619,36 @@ class TestNextInterval:
     def test_empty_usage_returns_max(self):
         assert next_interval({}, self.CFG) == 300
 
-    def test_near_threshold_returns_min(self):
+    def test_critical_5h_band_polls_tight(self):
+        # 5h within _CRITICAL_BAND_PCT (3) of the 98% threshold → tight
+        # critical_interval (15), BELOW min_interval, so the switch fires before
+        # the hard 100% 5h wall aborts the in-flight request.
         usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
-        assert next_interval(usage, self.CFG) == 60   # min_interval floor
+        assert next_interval(usage, self.CFG) == 15   # critical_interval < min_interval
+
+    def test_just_below_critical_band_not_tight(self):
+        # 5h at 94.9 (just below 98-3=95) leaves the tight cadence: it falls to
+        # the normal adaptive band (>=85 → 120), never the critical 15.
+        usage = {"five_hour": {"pct": 94.9}, "seven_day": {"pct": 0.0}}
+        out = next_interval(usage, self.CFG)
+        assert out == 120 and out != self.CFG.critical_interval
+
+    def test_critical_band_boundary_is_inclusive(self):
+        # Exactly at session_threshold - _CRITICAL_BAND_PCT (95.0) → tight.
+        usage = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 0.0}}
+        assert next_interval(usage, self.CFG) == 15
+
+    def test_critical_band_is_5h_only(self):
+        # A 7d window near its limit must NOT trigger the tight 5h cadence — 7d
+        # moves over days, a 60s poll catches it fine. 7d=99, 5h=10 → 60 (>=95
+        # binding band), never 15.
+        usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 99.0}}
+        assert next_interval(usage, self.CFG) == 60
+
+    def test_critical_band_only_online(self):
+        # Offline (failures>0) ignores usage → backoff, never the critical cadence.
+        usage = {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 0.0}}
+        assert next_interval(usage, self.CFG, 3) == 240   # backoff, not 15
 
     def test_85_band_returns_two_times_min(self):
         usage = {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}}
@@ -618,11 +665,13 @@ class TestNextInterval:
         assert next_interval(usage, self.CFG) == 300   # far away → ceiling
 
     def test_result_always_in_band(self):
-        """Every online result is clamped to [min_interval, max_interval]."""
+        """Online result is in [min_interval, max_interval], except the tight 5h
+        critical band which returns the sub-floor critical_interval."""
+        lo = min(self.CFG.critical_interval, self.CFG.min_interval)
         for pct in (0.0, 10.0, 49.9, 50.0, 84.9, 85.0, 94.9, 95.0, 100.0):
             usage = {"five_hour": {"pct": pct}}
             v = next_interval(usage, self.CFG)
-            assert self.CFG.min_interval <= v <= self.CFG.max_interval
+            assert lo <= v <= self.CFG.max_interval
 
     def test_clamped_to_min_exact(self):
         # 85% band → min(max, 2*min) = min(300, 580) = 300; but the floor must
@@ -638,18 +687,22 @@ class TestNextInterval:
 
     def test_band_values_exact(self):
         """Exact stepped band values at the defaults (min 60, max 300)."""
-        assert next_interval({"five_hour": {"pct": 96.0}}, self.CFG) == 60    # >=95
-        assert next_interval({"five_hour": {"pct": 85.0}}, self.CFG) == 120   # >=85 → 2*min
+        assert next_interval({"five_hour": {"pct": 96.0}}, self.CFG) == 15    # 5h critical band
+        assert next_interval({"five_hour": {"pct": 90.0}}, self.CFG) == 120   # >=85 → 2*min
         assert next_interval({"five_hour": {"pct": 50.0}}, self.CFG) == 240   # >=50 → int(max*0.8)
         assert next_interval({"five_hour": {"pct": 49.9}}, self.CFG) == 300   # <50 → max
 
     def test_uses_binding_window(self):
-        """The window with the highest utilisation drives the interval."""
-        usage_high_d7 = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 97.0}}
-        usage_high_h5 = {"five_hour": {"pct": 97.0}, "seven_day": {"pct": 10.0}}
+        """The window with the highest utilisation drives the interval.
+
+        Tested below the 5h critical band (which is intentionally 5h-only and
+        asymmetric): at 90% both axes map to the same ``>=85`` band.
+        """
+        usage_high_d7 = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 90.0}}
+        usage_high_h5 = {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 10.0}}
         assert next_interval(usage_high_d7, self.CFG) == next_interval(
             usage_high_h5, self.CFG
-        )
+        ) == 120
 
     def test_next_interval_backoff_grows_and_caps(self):
         """Offline backoff ramps from min_interval (gentle first re-probe) and caps."""
@@ -681,9 +734,10 @@ class TestNextInterval:
         assert next_interval(near_threshold, cfg, 3) == 240
 
     def test_next_interval_zero_failures_is_online_path(self):
-        """consecutive_failures=0 → normal adaptive behaviour."""
+        """consecutive_failures=0 → normal adaptive behaviour (here the tight 5h
+        critical cadence), NOT the offline backoff."""
         usage = {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}}
-        assert next_interval(usage, self.CFG, 0) == 60
+        assert next_interval(usage, self.CFG, 0) == 15   # online critical band
 
 
 class TestNextIntervalUntilReset:

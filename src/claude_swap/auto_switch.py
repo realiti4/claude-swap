@@ -99,6 +99,12 @@ class SwitchDecision:
 
 _BIG = float("inf")
 
+# How close (percentage points below ``session_threshold``) the 5h window must be
+# before the daemon drops to the tight ``critical_interval`` cadence, so it
+# observes the >= session_threshold crossing and switches BEFORE the hard 100%
+# wall. 3pt → tight polling starts at 95% with the default 98% threshold.
+_CRITICAL_BAND_PCT = 3.0
+
 
 def _parse_reset_ts(usage: dict | str | None, window: str = "seven_day") -> float:
     """Extract ``<window>.resets_at`` as a POSIX timestamp; +inf on any failure.
@@ -555,14 +561,19 @@ def next_interval(
 
     With the defaults (min 60, cap 600) the ramp is 60 → 120 → 240 → 480 → 600.
 
-    When online (``consecutive_failures == 0``) use a stepped adaptive mapping
-    over the binding window (max of 5h%, 7d%), floored at ``min_interval`` and
-    ceilinged at ``max_interval``:
+    When online (``consecutive_failures == 0``):
+    - 5h >= ``session_threshold - _CRITICAL_BAND_PCT`` → ``critical_interval``
+      (tight, BELOW ``min_interval``: catch the switch crossing before the hard
+      100% 5h wall aborts the in-flight request). Checked first, on the 5h axis
+      only; bypasses the ``min_interval`` floor.
+    Otherwise a stepped adaptive mapping over the binding window (max of 5h%,
+    7d%), floored at ``min_interval`` and ceilinged at ``max_interval``:
     - >= 95% → ``min_interval``                       (poll fast near a limit)
     - >= 85% → ``min(max_interval, 2 * min_interval)`` (e.g. 120s)
     - >= 50% → mid-band (~240s)
     - else   → ``max_interval``                       (far away → slow)
-    Result is always clamped to ``[min_interval, max_interval]``.
+    Result is always clamped to ``[min_interval, max_interval]`` (except the
+    sub-floor ``critical_interval`` early-return above).
     """
     if consecutive_failures > 0:
         # Cap the exponent at 4 (×16) so the multiplier never overflows.
@@ -573,12 +584,22 @@ def next_interval(
     if not isinstance(active_usage, dict):
         return config.max_interval
 
+    h5 = _window_pct(active_usage, "five_hour")
+    # Critical 5h band: the 5h window can spike within a single agentic turn, and
+    # a hard 100% hit ABORTS the in-flight request (forcing a restart). While the
+    # 5h window is within ``_CRITICAL_BAND_PCT`` of the switch threshold, poll
+    # tight — below ``min_interval`` — so the daemon observes the
+    # ``>= session_threshold`` crossing and flips the default login BEFORE 100%,
+    # so the next message lands on a fresh account. Brief + self-terminating (the
+    # moment it switches, the new active account is low-usage → slow cadence
+    # again), so it does NOT raise the steady-state poll rate / spam the API. Only
+    # the 5h axis triggers this; the slow-moving 7d window keeps the normal bands.
+    if h5 >= config.session_threshold - _CRITICAL_BAND_PCT:
+        return config.critical_interval
+
     # Binding window = the higher of the two utilisations. Missing/bad windows
     # read as 0.0 (→ far-away → max_interval), matching the old "no pct" case.
-    approach = max(
-        _window_pct(active_usage, "five_hour"),
-        _window_pct(active_usage, "seven_day"),
-    )
+    approach = max(h5, _window_pct(active_usage, "seven_day"))
 
     if approach >= 95.0:
         interval = config.min_interval

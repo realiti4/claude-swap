@@ -35,6 +35,11 @@ _CONFIG_FILENAME = "auto-switch.json"
 
 _VALID_STRATEGIES = ("reactive", "consume-first")
 
+# Hard floor (seconds) for the near-limit "critical" poll cadence: even a
+# misconfigured ``critical_interval`` never polls faster than this, to stay off
+# the usage-API rate-limit radar.
+_CRITICAL_INTERVAL_FLOOR = 10
+
 _CONFIG_DEFAULTS: dict = {
     "enabled": False,
     "session_threshold": 98.0,
@@ -55,6 +60,13 @@ _CONFIG_DEFAULTS: dict = {
     # only becomes available again below ``session_threshold - hysteresis``,
     # preventing available<->blocked thrash around the threshold.
     "hysteresis": 5.0,
+    # Tight poll cadence (seconds) used ONLY while the 5h window is within reach
+    # of ``session_threshold``, so the daemon catches the crossing and switches
+    # the default login BEFORE the hard 100% wall (which aborts the in-flight
+    # request). Below ``min_interval`` by design; clamped to
+    # ``[_CRITICAL_INTERVAL_FLOOR, min_interval]``. Brief + self-terminating
+    # (only near the 5h limit), so it does not raise the steady-state poll rate.
+    "critical_interval": 15,
 }
 
 
@@ -86,6 +98,11 @@ class AutoSwitchConfig:
     strategy: str = "reactive"
     # 5h-axis hysteresis margin (percentage points); 0 <= hysteresis < session_threshold.
     hysteresis: float = 5.0
+    # Tight near-limit poll cadence (seconds), used only while the 5h window is
+    # within a few points of ``session_threshold`` so the switch fires before
+    # 100%. Below ``min_interval`` by design; ``from_dict`` floors it at
+    # ``_CRITICAL_INTERVAL_FLOOR`` and caps it at ``min_interval``.
+    critical_interval: int = 15
 
     @classmethod
     def from_dict(cls, data: object) -> AutoSwitchConfig:
@@ -110,6 +127,24 @@ class AutoSwitchConfig:
         except (TypeError, ValueError):
             hysteresis = float(_CONFIG_DEFAULTS["hysteresis"])
         hysteresis = min(hysteresis, max(0.0, session_threshold - 1.0))
+        min_interval = int(
+            data.get("min_interval", _CONFIG_DEFAULTS["min_interval"])
+        )
+        max_interval = int(
+            data.get("max_interval", _CONFIG_DEFAULTS["max_interval"])
+        )
+        # critical_interval is the tight near-limit cadence: it only makes sense
+        # TIGHTER than the normal floor, and must never spam the API. Clamp to
+        # [_CRITICAL_INTERVAL_FLOOR, min_interval].
+        try:
+            critical_interval = int(
+                data.get("critical_interval", _CONFIG_DEFAULTS["critical_interval"])
+            )
+        except (TypeError, ValueError):
+            critical_interval = int(_CONFIG_DEFAULTS["critical_interval"])
+        critical_interval = max(
+            _CRITICAL_INTERVAL_FLOOR, min(critical_interval, min_interval)
+        )
         return cls(
             enabled=bool(data.get("enabled", _CONFIG_DEFAULTS["enabled"])),
             session_threshold=session_threshold,
@@ -117,12 +152,8 @@ class AutoSwitchConfig:
                 data.get("weekly_threshold", _CONFIG_DEFAULTS["weekly_threshold"])
             ),
             notify=bool(data.get("notify", _CONFIG_DEFAULTS["notify"])),
-            min_interval=int(
-                data.get("min_interval", _CONFIG_DEFAULTS["min_interval"])
-            ),
-            max_interval=int(
-                data.get("max_interval", _CONFIG_DEFAULTS["max_interval"])
-            ),
+            min_interval=min_interval,
+            max_interval=max_interval,
             offline_backoff_cap=int(
                 data.get(
                     "offline_backoff_cap", _CONFIG_DEFAULTS["offline_backoff_cap"]
@@ -130,6 +161,7 @@ class AutoSwitchConfig:
             ),
             strategy=strategy,
             hysteresis=hysteresis,
+            critical_interval=critical_interval,
         )
 
     def to_dict(self) -> dict:
@@ -144,6 +176,7 @@ class AutoSwitchConfig:
             "offline_backoff_cap": self.offline_backoff_cap,
             "strategy": self.strategy,
             "hysteresis": self.hysteresis,
+            "critical_interval": self.critical_interval,
         }
 
 
