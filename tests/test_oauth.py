@@ -680,3 +680,18 @@ def test_fetch_usage_returns_none_on_timeout():
     with patch.object(oauth, "request_usage_data", side_effect=TimeoutError("slow")):
         result = oauth.fetch_usage_for_account("1", "a@x.com", _creds(), is_active=True)
     assert result is None
+
+
+def test_fetch_usage_returns_rate_limited_on_429_after_refresh():
+    # is_active=False + refreshToken + non-expired token -> no proactive refresh.
+    # First usage request 401s -> refresh succeeds -> retry request 429s -> sentinel.
+    creds = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old", "refreshToken": "rt",
+        "expiresAt": 9999999999000,  # far future ms -> not proactively refreshed
+    }})
+    refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt"}})
+    with patch.object(oauth, "request_usage_data",
+                      side_effect=[_http_error(401), _http_error(429)]), \
+         patch.object(oauth, "refresh_oauth_credentials", return_value=refreshed):
+        result = oauth.fetch_usage_for_account("1", "a@x.com", creds, is_active=False)
+    assert result == oauth.RATE_LIMITED
