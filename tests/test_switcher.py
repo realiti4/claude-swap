@@ -3177,3 +3177,82 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+import time as _time
+from claude_swap import oauth as _oauth
+
+
+class TestCollectUsageBackoff:
+    """Rate-limit backoff, last-known-good retention, and the only= subset."""
+
+    def _setup(self, temp_home):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _info(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+        return [
+            (1, "a@x.com", "", "", True, creds),
+            (2, "b@x.com", "", "", False, creds),
+        ]
+
+    def _patch_fetch(self, monkeypatch, responses, counter):
+        def fake(num, email, creds, is_active, persist_credentials=None):
+            counter.append(num)
+            return responses[num]
+        monkeypatch.setattr(_oauth, "fetch_usage_for_account", fake)
+
+    def test_429_arms_backoff_and_skips_network_next_call(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        # First call: account 1 returns a usage dict, account 2 is rate limited.
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 10.0}},
+                                        "2": _oauth.RATE_LIMITED}, calls)
+        first = s._collect_usage(self._info())
+        assert first[0] == {"five_hour": {"pct": 10.0}}
+        assert s._rate_limited_until() > _time.time()  # backoff armed
+        # Second call within the window: NO network calls; last-known-good for #1.
+        calls.clear()
+        second = s._collect_usage(self._info())
+        assert calls == []                       # network skipped
+        assert second[0] == {"five_hour": {"pct": 10.0}}   # retained
+        assert second[1] == "rate limited"       # never had a dict
+
+    def test_last_known_good_retained_on_transient_failure(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 7.0}}, "2": None}, calls)
+        s._collect_usage(self._info())           # seed cache for #1
+        # Now #1 fails (None); its prior dict must be retained.
+        self._patch_fetch(monkeypatch, {"1": None, "2": None}, calls)
+        # bypass the 15s shortcut by clearing it is unnecessary; only=None re-fetches
+        # because the 15s cache holds dicts -> shortcut returns them. Force a real
+        # fetch by waiting out the TTL is slow; instead assert via only= path:
+        out = s._collect_usage(self._info(), only={"1", "2"})
+        assert out[0] == {"five_hour": {"pct": 7.0}}   # retained, not erased
+
+    def test_only_limits_network_to_subset(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 1.0}},
+                                        "2": {"five_hour": {"pct": 2.0}}}, calls)
+        s._collect_usage(self._info(), only={"1"})
+        assert calls == ["1"]                    # only account 1 hit the network
+
+    def test_backoff_expired_resumes_fetching(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        s._set_rate_limited_until(_time.time() - 1)   # already expired
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 5.0}},
+                                        "2": {"five_hour": {"pct": 6.0}}}, calls)
+        out = s._collect_usage(self._info(), only={"1", "2"})
+        assert sorted(calls) == ["1", "2"]       # fetched again
+        assert out[0] == {"five_hour": {"pct": 5.0}}
