@@ -743,6 +743,22 @@ class TestRun:
 
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
+    def test_exec_default_uses_plain_env(self, manager, capture_exec, monkeypatch):
+        """exec_default launches plain claude with the unmodified environment."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(["--resume"])
+
+        assert exc.value.binary == "/fake/bin/claude"
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+        # Plain claude behavior: API key is NOT scrubbed (unlike session mode).
+        assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
+
+    def test_exec_default_claude_not_on_path(self, manager, monkeypatch):
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
+        with pytest.raises(SessionError, match="not found on PATH"):
+            manager.exec_default([])
+
 
 # ---------------------------------------------------------------------------
 # switcher guards

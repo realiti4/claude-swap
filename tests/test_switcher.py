@@ -3309,3 +3309,33 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+class TestRemoveAccountPrunesMappings:
+    """Removing an account drops any directory mappings pointing at it."""
+
+    def test_remove_account_prunes_mappings(self, temp_home, monkeypatch):
+        from claude_swap.mappings import MappingStore
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "u1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        switcher._write_json(switcher.sequence_file, data)
+
+        store = MappingStore(switcher.backup_dir)
+        store.set(temp_home, "a@x.com", "")
+        assert store.get(temp_home) is not None
+
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        switcher.remove_account("1")
+
+        assert store.get(temp_home) is None
