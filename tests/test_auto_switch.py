@@ -6,6 +6,7 @@ AutoSwitcher tests use temp_home + Platform.LINUX mirroring TestUsageAwareSwitch
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap.auto_switch import (
+    _MAX_FAST_RETRIES,
+    _WAKE_GAP_THRESHOLD,
     AutoSwitchConfig,
     AutoSwitcher,
     SwitchDecision,
@@ -1870,6 +1873,15 @@ class TestDecideConsumeFirst:
         d = self._decide("1", u, {"2"})
         assert d.reason == "active-usage-unknown" and d.incomplete is True
 
+    def test_no_credentials_peer_also_flags_incomplete(self):
+        # A "no credentials" peer is unreadable like None → incomplete flag set
+        # (so section-3 stays QUIET, not the alarming all-exhausted). The fast
+        # retry it triggers is bounded by consecutive_incomplete, not this flag.
+        u = {"1": "no credentials", "2": _usage(20, 5, _ts(48))}
+        d = self._decide("2", u, {"1"})
+        assert d.action == "stay" and d.reason == "optimal"
+        assert d.incomplete is True
+
     def test_switches_to_sooner_reset_peer_under_threshold(self):
         # Active resets later; peer 2 resets sooner; both well under limits.
         u = {"1": _usage(40, 10, _ts(48)), "2": _usage(20, 5, _ts(2))}
@@ -2204,41 +2216,78 @@ class TestConsumeFirstEngine:
         # Nearest reset is the 48h 7d one → far beyond 300s → base unchanged.
         assert as_._consume_first_interval(300) == 300
 
+    def test_consecutive_incomplete_increments_then_resets(self, tmp_path):
+        # Peer 2 unreadable (None) → active-optimal STAY flagged incomplete →
+        # the consecutive counter climbs each tick; it resets the moment the peer
+        # becomes readable again (so the bounded fast-retry self-clears).
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": None},   # unreadable peer
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            d1 = as_.run_once()
+            assert d1.action == "stay" and d1.incomplete is True
+            assert as_._state.consecutive_incomplete == 1
+            as_.run_once()
+            assert as_._state.consecutive_incomplete == 2
+            # Peer becomes readable → complete tick → counter resets to 0.
+            fs._accounts[1]["usage"] = _usage(20, 5, _ts(48))
+            as_.run_once()
+            assert as_._state.consecutive_incomplete == 0
+
 
 class TestRetryInterval:
-    """_retry_interval: a stay flagged ``incomplete`` retries at the floor."""
+    """_retry_interval: a stay flagged ``incomplete`` retries at the floor, but
+    the fast retry is BOUNDED by _MAX_FAST_RETRIES consecutive incomplete ticks."""
 
-    def _as(self, tmp_path):
+    def _as(self, tmp_path, ci=1):
         accounts = [
             {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(2)), "active": True},
             {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(48))},
         ]
-        return _make_auto_switcher(tmp_path, accounts)
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        as_._state = dataclasses.replace(as_._state, consecutive_incomplete=ci)
+        return as_
 
     def _stay(self, incomplete):
         return SwitchDecision("stay", None, "optimal", None, None, "", incomplete=incomplete)
 
     def test_stay_incomplete_shortens_to_min(self, tmp_path):
-        as_ = self._as(tmp_path)
+        as_ = self._as(tmp_path, ci=1)
         assert as_._retry_interval(self._stay(True), 300) == as_._config.min_interval
 
+    def test_at_bound_still_shortens(self, tmp_path):
+        as_ = self._as(tmp_path, ci=_MAX_FAST_RETRIES)
+        assert as_._retry_interval(self._stay(True), 300) == as_._config.min_interval
+
+    def test_past_bound_backs_off(self, tmp_path):
+        # A persistently unreadable peer must stop pinning the floor cadence.
+        as_ = self._as(tmp_path, ci=_MAX_FAST_RETRIES + 1)
+        assert as_._retry_interval(self._stay(True), 300) == 300
+
     def test_stay_not_incomplete_unchanged(self, tmp_path):
-        as_ = self._as(tmp_path)
+        as_ = self._as(tmp_path, ci=1)
         assert as_._retry_interval(self._stay(False), 300) == 300
 
     def test_switch_incomplete_unchanged(self, tmp_path):
         # Only a STAY retries soon; a switch already moved, re-rank next tick.
-        as_ = self._as(tmp_path)
+        as_ = self._as(tmp_path, ci=1)
         d = SwitchDecision("switch", "2", "consume-first", None, None, "", incomplete=True)
         assert as_._retry_interval(d, 300) == 300
 
     def test_none_decision_unchanged(self, tmp_path):
-        as_ = self._as(tmp_path)
+        as_ = self._as(tmp_path, ci=1)
         assert as_._retry_interval(None, 300) == 300
 
     def test_never_lengthens(self, tmp_path):
-        as_ = self._as(tmp_path)
+        as_ = self._as(tmp_path, ci=1)
         assert as_._retry_interval(self._stay(True), 15) == 15   # already below floor
+
+    def test_at_min_interval_is_idempotent(self, tmp_path):
+        # Boundary: interval already == min_interval → min(60,60) == 60.
+        as_ = self._as(tmp_path, ci=1)
+        assert as_._retry_interval(self._stay(True), as_._config.min_interval) == 60
 
 
 class TestSleepWakeDetection:
@@ -2274,4 +2323,34 @@ class TestSleepWakeDetection:
         monkeypatch.setattr("claude_swap.auto_switch.time.sleep", fake_sleep)
         assert as_._sleep_with_wake_detection(300) is True
         assert clock["calls"] == 1   # broke out on the first chunk's overshoot
+
+    def test_short_interval_single_chunk(self, tmp_path, monkeypatch):
+        # interval < _WAKE_CHECK_CHUNK (30) → a single chunk of `interval`.
+        as_ = self._as(tmp_path)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("claude_swap.auto_switch._now_ts", lambda: clock["t"])
+        monkeypatch.setattr(
+            "claude_swap.auto_switch.time.sleep",
+            lambda secs: clock.__setitem__("t", clock["t"] + secs),
+        )
+        assert as_._sleep_with_wake_detection(15) is False
+        assert clock["t"] == 1015.0
+
+    def test_gap_threshold_boundary(self, tmp_path, monkeypatch):
+        # Overshoot of exactly _WAKE_GAP_THRESHOLD (60) does NOT trip (check is >);
+        # 61 does. Drive the overshoot via the first chunk's extra wall-clock.
+        def run(extra):
+            as_ = self._as(tmp_path)
+            clock = {"t": 1000.0, "calls": 0}
+            monkeypatch.setattr("claude_swap.auto_switch._now_ts", lambda: clock["t"])
+
+            def fake_sleep(secs):
+                clock["calls"] += 1
+                clock["t"] += secs + (extra if clock["calls"] == 1 else 0)
+
+            monkeypatch.setattr("claude_swap.auto_switch.time.sleep", fake_sleep)
+            return as_._sleep_with_wake_detection(300)
+
+        assert run(_WAKE_GAP_THRESHOLD) is False        # exactly 60 → not detected
+        assert run(_WAKE_GAP_THRESHOLD + 1) is True     # 61 → detected
 

@@ -243,6 +243,12 @@ class MonitorState:
             hysteresis FSM (persisted as a list since JSON has no set; the
             engine converts to a frozenset at its boundary). Only meaningful for
             the consume-first strategy.
+        consecutive_incomplete: number of consecutive consume-first ticks that
+            STAYED on incomplete info (a switchable peer's usage couldn't be read).
+            Bounds the fast-retry: a transient miss retries quickly, but a peer
+            that is persistently unreadable (no credentials, or an expired
+            inactive token the daemon won't refresh) stops forcing the floor
+            cadence after a few ticks. Reset to 0 on any complete/switch tick.
     """
 
     last_online_ts: float | None = None
@@ -252,6 +258,7 @@ class MonitorState:
     last_switch: dict | None = None
     last_usage: dict = field(default_factory=dict)
     blocked5h: list[str] = field(default_factory=list)
+    consecutive_incomplete: int = 0
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -330,6 +337,7 @@ class MonitorState:
             last_switch=last_switch,
             last_usage=last_usage,
             blocked5h=blocked5h,
+            consecutive_incomplete=max(0, _int("consecutive_incomplete", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -342,6 +350,7 @@ class MonitorState:
             "last_switch": self.last_switch,
             "last_usage": self.last_usage,
             "blocked5h": self.blocked5h,
+            "consecutive_incomplete": self.consecutive_incomplete,
         }
 
     # ------------------------------------------------------------------

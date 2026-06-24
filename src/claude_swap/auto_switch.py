@@ -123,6 +123,17 @@ _CRITICAL_BAND_PCT = 3.0
 _WAKE_CHECK_CHUNK = 30
 _WAKE_GAP_THRESHOLD = 60
 
+# Max consecutive consume-first ticks that may force the tight retry cadence when
+# we stayed on incomplete info (a peer we couldn't read this tick). A transient
+# usage-API miss recovers within a tick or two; a peer that is PERSISTENTLY
+# unreadable (no credentials, or an expired inactive token the daemon won't
+# refresh) would otherwise hold the floor cadence forever (5x the steady-state
+# active-account probe rate). After this many consecutive incomplete ticks we
+# fall back to the normal cadence — we still re-check the peer, just not at the
+# floor. The peer itself is never the API-load cost (an unreadable peer makes 0
+# or 1 fast-failing call); the cost is the active-account probe frequency.
+_MAX_FAST_RETRIES = 3
+
 
 def _parse_reset_ts(usage: dict | str | None, window: str = "seven_day") -> float:
     """Extract ``<window>.resets_at`` as a POSIX timestamp; +inf on any failure.
@@ -1111,6 +1122,21 @@ class AutoSwitcher:
         err = self._apply_switch_decision(decision)
         if err is not None:
             return err
+
+        # Track consecutive incomplete STAYs so the fast retry is BOUNDED: a
+        # transient peer-fetch miss recovers in a tick or two, but a persistently
+        # unreadable peer (no credentials, or an expired inactive token the
+        # daemon won't refresh) must not pin the floor cadence forever (see
+        # ``_retry_interval`` / ``_MAX_FAST_RETRIES``). Reset on any complete or
+        # switch tick.
+        incomplete_stay = decision.action == "stay" and decision.incomplete
+        self._state = _state_replace(
+            self._state,
+            consecutive_incomplete=(
+                self._state.consecutive_incomplete + 1 if incomplete_stay else 0
+            ),
+        )
+
         self._apply_exhaustion(decision.reason)
         self._persist_state()
         return decision
@@ -1297,10 +1323,19 @@ class AutoSwitcher:
 
         A transient usage-API miss on a peer that might be the consume-first
         optimal otherwise costs up to ``max_interval`` before the next re-check;
-        retrying at the floor (60s) catches it promptly without spamming the API
-        (it only fires on a stay flagged ``incomplete``).
+        retrying at the floor (60s) catches it promptly. The fast retry is
+        BOUNDED by ``_MAX_FAST_RETRIES`` consecutive incomplete ticks
+        (``consecutive_incomplete``) so a peer that is PERSISTENTLY unreadable
+        (no credentials, or an expired inactive token the daemon won't refresh)
+        falls back to the normal cadence instead of pinning the floor forever —
+        a transient blip recovers within a tick or two, well inside the bound.
         """
-        if decision is not None and decision.action == "stay" and decision.incomplete:
+        if (
+            decision is not None
+            and decision.action == "stay"
+            and decision.incomplete
+            and self._state.consecutive_incomplete <= _MAX_FAST_RETRIES
+        ):
             return min(interval, self._config.min_interval)
         return interval
 
