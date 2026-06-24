@@ -100,18 +100,19 @@ class SwitchDecision:
 _BIG = float("inf")
 
 
-def _parse_reset_ts(usage: dict | str | None) -> float:
-    """Extract seven_day.resets_at as a POSIX timestamp; +inf on any failure.
+def _parse_reset_ts(usage: dict | str | None, window: str = "seven_day") -> float:
+    """Extract ``<window>.resets_at`` as a POSIX timestamp; +inf on any failure.
 
-    Accepts the full usage union (``dict | str | None``) since callers pass the
-    ``"no credentials"`` sentinel too; the isinstance guard handles non-dicts.
+    ``window`` is ``"seven_day"`` (default) or ``"five_hour"``. Accepts the full
+    usage union (``dict | str | None``) since callers pass the ``"no
+    credentials"`` sentinel too; the isinstance guard handles non-dicts.
     """
     if not isinstance(usage, dict):
         return _BIG
-    d7 = usage.get("seven_day")
-    if not isinstance(d7, dict):
+    win = usage.get(window)
+    if not isinstance(win, dict):
         return _BIG
-    raw = d7.get("resets_at")
+    raw = win.get("resets_at")
     if not isinstance(raw, str):
         return _BIG
     try:
@@ -601,11 +602,13 @@ def next_interval_until_reset(
 ) -> int:
     """Shorten the sleep so a tick lands shortly AFTER the soonest known reset.
 
-    PURE. Consume-first only: when a 7d window resets, that account jumps to the
-    soonest-reset slot and the consumption order changes — we want to re-rank
-    promptly rather than wait out the full ``base_interval``. So if any known
-    reset (the active account's own + ``peer_resets``) falls within
-    ``base_interval`` from ``now``, wake ~5s after it instead.
+    PURE. Consume-first only: a reset can change which account we should be on —
+    a 7d reset re-orders the consumption queue, and a 5h reset un-blocks a
+    previously-exhausted account — so we want to re-rank promptly rather than
+    wait out the full ``base_interval``. The caller passes the active account's
+    usage (its 7d reset is read here) plus ``peer_resets`` (every account's 7d
+    reset and any blocked account's 5h reset); if the soonest of those falls
+    within ``base_interval`` from ``now``, wake ~5s after it instead.
 
     Guarantees (never spins, never lengthens):
     * Result is clamped to ``[config.min_interval, base_interval]`` — it can
@@ -1197,17 +1200,43 @@ class AutoSwitcher:
                     resets.append(ts)
         return resets
 
+    def _blocked_peer_5h_resets(self) -> list[float]:
+        """5h reset timestamps of the accounts currently in ``blocked5h``.
+
+        A 5h-blocked account is unavailable until its 5-hour window resets — at
+        which point it becomes switchable again and may be the new consume-first
+        optimal (e.g. the soonest-7d-reset account that was temporarily blocked).
+        The 7d-only ``_known_peer_resets`` never sees that moment, so without
+        this the daemon only notices on its next normal-cadence tick (up to
+        ``max_interval`` later). Feeding these resets into the scheduler makes it
+        wake ~5s after the block clears and re-rank promptly. It only ADDS a
+        single well-timed wake (the scheduler can only shorten, and is clamped to
+        the ``min_interval`` floor) — it does not raise the steady-state poll
+        rate, so it never overloads the usage API. Unknown/unparseable resets are
+        dropped; an account at 5h 0% has no ``resets_at`` and is naturally absent.
+        """
+        resets: list[float] = []
+        for num in self._state.blocked5h:
+            entry = self._state.last_usage.get(str(num))
+            if isinstance(entry, dict):
+                ts = _parse_reset_ts(entry.get("usage"), "five_hour")
+                if ts != _BIG:
+                    resets.append(ts)
+        return resets
+
     def _consume_first_interval(self, base_interval: int) -> int:
         """Reset-aware sleep for consume-first (reactive uses ``base_interval``).
 
         Shortens ``base_interval`` so a tick lands ~5s after the soonest known
-        7d reset (active + peers), so the consumption order is re-ranked
-        promptly. Only shortens; clamped to ``[min_interval, base_interval]``.
+        reset — every account's 7d reset (consumption order re-ranks) AND the 5h
+        reset of any currently-blocked account (it becomes available again). Only
+        shortens; clamped to ``[min_interval, base_interval]``, so it adds at most
+        one well-timed wake and never raises the steady-state poll rate.
         """
         return next_interval_until_reset(
             base_interval,
             self._last_active_usage,
-            self._known_peer_resets(),
+            self._known_peer_resets() + self._blocked_peer_5h_resets(),
             _now_ts(),
             self._config,
         )

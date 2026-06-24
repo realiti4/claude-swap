@@ -565,6 +565,23 @@ class TestParseResetTs:
     def test_unparseable_resets_at_is_infinite(self):
         assert _parse_reset_ts({"seven_day": {"resets_at": "not-a-date"}}) == float("inf")
 
+    def test_window_param_selects_five_hour(self):
+        """The window param reads five_hour.resets_at; default stays seven_day."""
+        usage = {
+            "five_hour": {"pct": 100.0, "resets_at": "2026-06-22T12:00:00+00:00"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-06-28T00:00:00+00:00"},
+        }
+        h5 = _parse_reset_ts(usage, "five_hour")
+        d7_default = _parse_reset_ts(usage)            # default seven_day
+        d7_explicit = _parse_reset_ts(usage, "seven_day")
+        assert h5 != float("inf") and d7_default != float("inf")
+        assert d7_default == d7_explicit               # default unchanged
+        assert h5 < d7_default                          # 5h reset is sooner
+
+    def test_window_missing_resets_at_is_infinite(self):
+        # An account at 5h 0% carries no five_hour.resets_at → +inf, not a crash.
+        assert _parse_reset_ts({"five_hour": {"pct": 0.0}}, "five_hour") == float("inf")
+
 
 # ---------------------------------------------------------------------------
 # TestNextInterval — adaptive polling
@@ -2031,4 +2048,53 @@ class TestConsumeFirstEngine:
         base = 300
         out = as_._consume_first_interval(base)
         assert as_._config.min_interval <= out <= base
+
+    def test_wakes_after_blocked_peer_5h_reset(self, tmp_path):
+        """A 5h-blocked peer's reset shortens the consume-first sleep.
+
+        A 5h-exhausted account is temporarily unavailable, but becomes the
+        consume-first optimal again the moment its 5h window resets. The 7d-only
+        _known_peer_resets never captured that moment, so the daemon waited out
+        the full base interval (up to max_interval) before re-ranking. Its 5h
+        reset must now drive an early wake.
+        """
+        peer_5h = _ts(100 / 3600)   # acct 2's 5h resets ~100s from now
+        accounts = [
+            # active acct 1: healthy, only a far 7d reset (no near reset to confound)
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(48)), "active": True},
+            # peer acct 2: 5h-exhausted (→ sticky-blocked) with a NEAR 5h reset
+            {"num": "2", "email": "b@x", "usage": {
+                "five_hour": {"pct": 100.0, "resets_at": peer_5h},
+                "seven_day": {"pct": 30.0, "resets_at": _ts(72)},
+            }},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        assert "2" in as_._state.blocked5h        # sticky-blocked on 5h
+        # _blocked_peer_5h_resets exposes exactly that one reset.
+        blocked = as_._blocked_peer_5h_resets()
+        assert len(blocked) == 1 and blocked[0] != float("inf")
+        # It drives the next wake well under the 300s base (~105s).
+        out = as_._consume_first_interval(300)
+        assert as_._config.min_interval <= out <= 130
+
+    def test_unblocked_peer_5h_reset_does_not_shorten(self, tmp_path):
+        """Only a BLOCKED account's 5h reset matters; an available peer's 5h
+        reset must not shorten the interval (its availability isn't changing)."""
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(48)), "active": True},
+            # peer acct 2 is healthy (5h 20% → not blocked) despite a near 5h reset
+            {"num": "2", "email": "b@x", "usage": {
+                "five_hour": {"pct": 20.0, "resets_at": _ts(100 / 3600)},
+                "seven_day": {"pct": 5.0, "resets_at": _ts(72)},
+            }},
+        ]
+        as_, fs = self._switcher(tmp_path, accounts)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+        assert "2" not in as_._state.blocked5h
+        assert as_._blocked_peer_5h_resets() == []
+        # Nearest reset is the 48h 7d one → far beyond 300s → base unchanged.
+        assert as_._consume_first_interval(300) == 300
 
