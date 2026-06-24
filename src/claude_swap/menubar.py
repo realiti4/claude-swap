@@ -289,6 +289,84 @@ def decide_auto_switch(
     return ("switch", candidates[0][3])
 
 
+def decide_consume_first(
+    accounts: list[tuple[int, str, bool, dict | str | None]],
+    threshold: float,
+    blocked=frozenset(),
+) -> tuple[str, int | None]:
+    """Proactive 'consume the soonest-resetting account first' strategy.
+
+    Eligible accounts have 5h not blocked (hysteresis) AND 7d below the threshold;
+    the eligible account whose 7d window resets soonest (then most headroom, then
+    rotation order) is optimal. Returns ``("switch", num)``, ``("none", None)``
+    (already optimal), ``("unknown_active", None)``, ``("no_candidate", None)``
+    (all weekly-exhausted -> notify), ``("no_candidate_unverifiable", None)``, or
+    ``("all_session_limited", None)`` (weekly room but all 5h-blocked -> silent).
+    Total — never raises.
+    """
+    active = next((a for a in accounts if a[2]), None)
+    if active is None:
+        return ("none", None)
+    if _window_pct(active[3], "five_hour") is None or _window_pct(active[3], "seven_day") is None:
+        return ("unknown_active", None)
+
+    eligible: list[tuple[float, float, int, int]] = []
+    any_unverifiable = False
+    any_weekly_room = False
+    for idx, (num, _email, is_active, usage) in enumerate(accounts):
+        five = _window_pct(usage, "five_hour")
+        seven = _window_pct(usage, "seven_day")
+        if five is None or seven is None:
+            if not is_active:
+                any_unverifiable = True
+            continue
+        if seven < threshold:
+            any_weekly_room = True
+        limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
+        if five < limit5 and seven < threshold:
+            eligible.append((_resets_at_ts(usage.get("seven_day")), _worst_pct(usage), idx, num))
+    if not eligible:
+        if any_unverifiable:
+            return ("no_candidate_unverifiable", None)
+        if any_weekly_room:
+            return ("all_session_limited", None)
+        return ("no_candidate", None)
+    eligible.sort(key=lambda e: (e[0], e[1], e[2]))
+    best_num = eligible[0][3]
+    if best_num == active[0]:
+        return ("none", None)
+    return ("switch", best_num)
+
+
+def limiting_pct_by_account(
+    accounts: list[tuple[int, str, bool, dict | str | None]],
+    strategy: str,
+) -> dict[str, float | None]:
+    """Per-account 'limiting %' feeding the hysteresis FSM, per strategy.
+
+    reactive -> worst-of(5h, 7d); consume-first -> the 5h axis. None when unknown.
+    """
+    out: dict[str, float | None] = {}
+    for num, _email, _is_active, usage in accounts:
+        if strategy == "consume-first":
+            out[str(num)] = _window_pct(usage, "five_hour")
+        else:
+            out[str(num)] = _worst_pct(usage)
+    return out
+
+
+def evaluate_strategy(
+    strategy: str,
+    accounts: list[tuple[int, str, bool, dict | str | None]],
+    threshold: float,
+    blocked,
+) -> tuple[str, int | None]:
+    """Dispatch to the active strategy's decision function (unknown -> reactive)."""
+    if strategy == "consume-first":
+        return decide_consume_first(accounts, threshold, blocked)
+    return decide_auto_switch(accounts, threshold, blocked)
+
+
 def plan_auto_switch(
     decision: tuple[str, int | None],
     state: "MenuBarState",

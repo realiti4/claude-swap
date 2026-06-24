@@ -425,3 +425,66 @@ def test_plan_silent_outcomes_are_noop():
     assert menubar.plan_auto_switch(("no_candidate_unverifiable", None), st, s, 1e9) == ("noop", None)
     assert menubar.plan_auto_switch(("all_session_limited", None), st, s, 1e9) == ("noop", None)
 
+
+def _cf(num, pct5, pct7, reset7, active=False):
+    return (num, f"a{num}@x.com", active,
+            {"five_hour": {"pct": pct5},
+             "seven_day": {"pct": pct7, "resets_at": reset7}})
+
+_R_EARLY = "2026-06-24T07:00:00+00:00"
+_R_MID = "2026-06-25T07:00:00+00:00"
+_R_LATE = "2026-06-26T07:00:00+00:00"
+
+
+def test_consume_first_picks_soonest_weekly_reset():
+    # active #1 resets late; #2 resets early -> switch to #2 (consume it first).
+    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 20, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
+
+
+def test_consume_first_stays_when_active_is_optimal():
+    accts = [_cf(1, 10, 20, _R_EARLY, active=True), _cf(2, 10, 20, _R_LATE)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
+
+
+def test_consume_first_tie_break_headroom_then_rotation():
+    # equal reset -> more headroom (lower worst) wins; then rotation order.
+    accts = [_cf(1, 99, 99, _R_LATE, active=True),
+             _cf(2, 40, 30, _R_EARLY), _cf(3, 10, 80, _R_EARLY)]
+    # #2 worst=40, #3 worst=80 -> #2
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
+
+
+def test_consume_first_all_session_limited_is_silent():
+    # everyone 5h-saturated but weekly has room -> temporary, silent stay.
+    accts = [_cf(1, 99, 10, _R_EARLY, active=True), _cf(2, 98, 20, _R_LATE)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("all_session_limited", None)
+
+
+def test_consume_first_exhausted_notifies():
+    accts = [_cf(1, 99, 99, _R_EARLY, active=True), _cf(2, 98, 99, _R_LATE)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("no_candidate", None)
+
+
+def test_consume_first_unverifiable_is_silent():
+    accts = [_cf(1, 99, 99, _R_EARLY, active=True), (2, "b@x", False, None)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("no_candidate_unverifiable", None)
+
+
+def test_consume_first_unknown_active():
+    accts = [(1, "a@x", True, "no credentials"), _cf(2, 10, 20, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("unknown_active", None)
+
+
+def test_limiting_pct_by_account_per_strategy():
+    accts = [_ra(1, 80, 50, active=True), (2, "b@x", False, None)]
+    assert menubar.limiting_pct_by_account(accts, "reactive") == {"1": 80.0, "2": None}
+    assert menubar.limiting_pct_by_account(accts, "consume-first") == {"1": 80.0, "2": None}
+
+
+def test_evaluate_strategy_dispatch():
+    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 20, _R_EARLY)]
+    assert menubar.evaluate_strategy("consume-first", accts, 95, frozenset()) == ("switch", 2)
+    # reactive: active not over limit -> none
+    assert menubar.evaluate_strategy("reactive", accts, 95, frozenset()) == ("none", None)
+
