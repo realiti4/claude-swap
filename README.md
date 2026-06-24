@@ -176,21 +176,29 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 </details>
 
-### Add an account from a raw OAuth token
+### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-and you don't want to log in via the browser flow first — useful on headless
-servers or when receiving a token from another machine — register it directly:
+or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+flow first — useful on headless servers or when receiving a token from another
+machine — register it directly. The token type is auto-detected:
 
 ```bash
-cswap --add-token sk-ant-oat01-...
+cswap --add-token sk-ant-oat01-...           # OAuth setup-token
+cswap --add-token sk-ant-api03-...           # managed API key
 cswap --add-token sk-ant-oat01-... --slot 3
 cswap --add-token - --slot 3                 # read token from stdin
 cswap --add-token --email user@example.com   # optional label override
 ```
 
-`--email` is optional; omitted values use `setup-token-{slot}@token.local`.
-No Anthropic API calls are made.
+`--email` is optional; omitted values use `setup-token-{slot}@token.local`
+(or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+
+**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
+(the kind Claude Code uses after `/login` with a key) rather than an OAuth
+setup-token. It switches like any other account; since API keys have no subscription
+quota, they show no usage and the usage-aware `--switch` strategies never skip them as
+rate-limited.
 
 ## Uninstall
 

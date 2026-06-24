@@ -25,6 +25,7 @@ from claude_swap import oauth
 from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_API_KEY,
     USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -35,6 +36,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
     CredentialStore,
+    looks_like_api_key,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -569,6 +571,61 @@ class ClaudeAccountSwitcher:
             return False
         return self._find_account_slot(data, email, organization_uuid) is not None
 
+    def _account_kind(self, account_num: str | None) -> str:
+        """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
+
+        Slots added before this field existed have no ``kind`` and read as
+        ``"oauth"`` (back-compat).
+        """
+        if account_num is None:
+            return "oauth"
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        return "api_key" if record.get("kind") == "api_key" else "oauth"
+
+    def _reject_live_api_key_capture(self, creds: str) -> None:
+        """Guard for ``add_account``: never capture a live managed key as OAuth.
+
+        ``add_account`` snapshots the *live* active credential under an
+        ``oauthAccount`` identity. Now that ``_read_credentials`` can return a raw
+        ``sk-ant-api…`` key, a live ``/login`` key could be backed up as a kindless
+        account, corrupting the session-guard / export / collision logic that keys
+        off ``kind``. Reject with guidance toward the supported path instead.
+        """
+        if looks_like_api_key(creds):
+            raise ValidationError(
+                "Active login is an API-key account. Add it with "
+                "'cswap --add-token sk-ant-api...' instead of --add-account."
+            )
+
+    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+        """Reject registering a token whose (email, personal-org) already exists as
+        the *other* kind.
+
+        Identity is matched on ``(email, organizationUuid)`` only, so two slots
+        sharing an email across kinds (one OAuth, one API key) could not be told
+        apart at switch time. Rather than thread ``kind`` through the whole identity
+        system, refuse the collision and point the user at a distinct ``--email``.
+        The default ``…@token.local`` labels never collide; this only guards a forced
+        ``--email``.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return
+        slot = self._find_account_slot(data, email, "")
+        if slot is None:
+            return
+        existing_kind = self._account_kind(slot)
+        new_kind = "api_key" if is_api_key else "oauth"
+        if existing_kind != new_kind:
+            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
+            new_label = "API-key" if is_api_key else "OAuth"
+            raise ValidationError(
+                f"'{email}' already exists as an {existing_label} account "
+                f"(slot {slot}); cannot add it as an {new_label} account. "
+                f"Pass a distinct --email."
+            )
+
     @staticmethod
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
         """Return display tag for an account's org context."""
@@ -710,6 +767,7 @@ class ClaudeAccountSwitcher:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
+            self._reject_live_api_key_capture(current_creds)
 
             config_path = self._get_claude_config_path()
             try:
@@ -787,6 +845,7 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
+        self._reject_live_api_key_capture(current_creds)
 
         config_path = self._get_claude_config_path()
         try:
@@ -850,18 +909,21 @@ class ClaudeAccountSwitcher:
     def add_account_from_token(
         self, token: str, email: str | None = None, slot: int | None = None
     ) -> None:
-        """Register a raw OAuth setup-token as a new account.
+        """Register a raw OAuth setup-token or managed API key as a new account.
 
         Useful for headless servers or when the token is received from another
-        machine, without needing a prior Claude Code login on this machine.
-        No Anthropic API calls are made.
+        machine, without needing a prior Claude Code login on this machine. The
+        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis), anything else is
+        treated as an OAuth setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth access token, or ``"-"`` to read one line from
-                   stdin, or ``""`` to prompt securely via getpass.
+            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+                   one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
-                   defaults to ``setup-token-{slot}@token.local`` since
-                   setup-tokens carry no real email metadata.
+                   defaults to ``setup-token-{slot}@token.local`` (or
+                   ``api-key-{slot}@token.local`` for API keys) since these tokens
+                   carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
         """
         import getpass
@@ -869,11 +931,13 @@ class ClaudeAccountSwitcher:
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
         elif not token:
-            token = getpass.getpass("Setup token: ")
+            token = getpass.getpass("Token: ")
 
         token = token.strip()
         if not token:
             raise ValidationError("Token cannot be empty")
+
+        is_api_key = looks_like_api_key(token)
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
@@ -882,13 +946,40 @@ class ClaudeAccountSwitcher:
         self._init_sequence_file()
         self._migrate_org_fields()
 
-        # Synthesize a placeholder email when one isn't provided. Setup-tokens
+        # Synthesize a placeholder email when one isn't provided. These tokens
         # have no real email metadata, so requiring users to invent one is
         # noise; the slot number gives every default account a unique key.
         if not email:
             if slot is None:
                 slot = self._get_next_account_number()
-            email = f"setup-token-{slot}@token.local"
+            label = "api-key" if is_api_key else "setup-token"
+            email = f"{label}-{slot}@token.local"
+
+        # Don't silently overwrite/convert an existing account of the other kind:
+        # identity is matched on (email, org) only, so an api-key and an OAuth
+        # account sharing an email would be indistinguishable at switch time.
+        self._reject_cross_kind_collision(email, is_api_key)
+
+        # Build the credential payload by kind: a managed key is stored raw; an
+        # OAuth setup-token is wrapped in Claude Code's credential JSON. The
+        # synthesized config is identical for both (no real org metadata).
+        if is_api_key:
+            credentials = token
+        else:
+            credentials = json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": token,
+                    "scopes": list(SETUP_TOKEN_SCOPES),
+                }
+            })
+        config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
@@ -898,27 +989,14 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            credentials = json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": token,
-                    "scopes": list(SETUP_TOKEN_SCOPES),
-                }
-            })
-            config = json.dumps({
-                "oauthAccount": {
-                    "emailAddress": email,
-                    "accountUuid": "",
-                    "organizationUuid": None,
-                    "organizationName": None,
-                }
-            })
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
-            self._logger.info(f"Updated token for account {account_num}: {email}")
+            kind_label = "API key" if is_api_key else "token"
+            self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
-                f"{accent('Updated token')} for Account {account_num} "
+                f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
             return
@@ -964,21 +1042,6 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        credentials = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": token,
-                "scopes": list(SETUP_TOKEN_SCOPES),
-            }
-        })
-        config = json.dumps({
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        })
-
         if displace_slot:
             d_num, d_email = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -1002,23 +1065,27 @@ class ClaudeAccountSwitcher:
         self._write_account_config(account_num, email, config)
 
         data = self._get_sequence_data()
-        data["accounts"][account_num] = {
+        record = {
             "email": email,
             "uuid": "",
             "organizationUuid": "",
             "organizationName": "",
             "added": get_timestamp(),
         }
+        if is_api_key:
+            record["kind"] = "api_key"
+        data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Added account {account_num} from token: {email}")
+        source_label = "API key" if is_api_key else "token"
+        self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
-            f"{muted('[personal]')} {muted('(from token)')}"
+            f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
     def remove_account(self, identifier: str) -> None:
@@ -1245,6 +1312,9 @@ class ClaudeAccountSwitcher:
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
             num, email, _, _, is_active, creds = account_info
+            if looks_like_api_key(creds):
+                # Managed API-key account: no subscription quota to fetch.
+                return USAGE_API_KEY
             if not creds or not oauth.extract_access_token(creds):
                 return USAGE_NO_CREDENTIALS
 
@@ -1416,6 +1486,8 @@ class ClaudeAccountSwitcher:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}")
             if usage == USAGE_TOKEN_EXPIRED:
                 print(f"     {dimmed('token expired — Claude Code refreshes the active account')}")
+            elif usage == USAGE_API_KEY:
+                print(f"     {dimmed('API key (no quota)')}")
             elif isinstance(usage, str):
                 print(f"     {dimmed(usage)}")
             elif usage is None:
@@ -1478,6 +1550,9 @@ class ClaudeAccountSwitcher:
         owner-aware refresh decision to ``_fetch_active_usage``.
         """
         creds = self._read_credentials() or ""
+        if looks_like_api_key(creds):
+            # Managed API-key account: no subscription quota to fetch.
+            return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
             return USAGE_NO_CREDENTIALS
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
@@ -1570,6 +1645,8 @@ class ClaudeAccountSwitcher:
                     print(f"  {dimmed(connector)} {muted(line)}")
             elif usage == USAGE_TOKEN_EXPIRED:
                 print(f"  {dimmed('token expired — Claude Code refreshes the active account')}")
+            elif usage == USAGE_API_KEY:
+                print(f"  {dimmed('API key (no quota)')}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None

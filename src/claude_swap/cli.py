@@ -102,7 +102,8 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s --add-account
-  %(prog)s --add-token sk-ant-oat01-...
+  %(prog)s --add-token sk-ant-oat01-...           # OAuth setup-token
+  %(prog)s --add-token sk-ant-api03-...           # managed API key
   %(prog)s --add-token sk-ant-oat01-... --slot 3
   %(prog)s --add-token sk-ant-oat01-... --email me@example.com
   %(prog)s --add-token - --slot 3
@@ -169,7 +170,8 @@ Examples:
         metavar="EMAIL",
         help=(
             "Email address for the account. Optional with --add-token; "
-            "defaults to setup-token-{slot}@token.local since setup-tokens "
+            "defaults to setup-token-{slot}@token.local (or "
+            "api-key-{slot}@token.local for API keys) since these tokens "
             "carry no real email metadata."
         ),
     )
@@ -252,8 +254,9 @@ Examples:
         nargs="?",
         const="",
         help=(
-            "Register a raw OAuth setup-token as a new account. "
-            "Pass '-' to read from stdin or omit the value to be prompted securely."
+            "Register a raw OAuth setup-token or managed API key (sk-ant-api...) "
+            "as a new account; the type is auto-detected. Pass '-' to read from "
+            "stdin or omit the value to be prompted securely."
         ),
     )
 
