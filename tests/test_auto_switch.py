@@ -491,6 +491,16 @@ class TestAutoSwitchConfig:
         )
         assert cfg3.hysteresis == 89.0
 
+    def test_usage_cache_file_default_and_roundtrip(self):
+        assert AutoSwitchConfig().usage_cache_file.endswith("statusline-usage-cache.json")
+        cfg = AutoSwitchConfig(usage_cache_file="/tmp/x.json")
+        assert AutoSwitchConfig.from_dict(cfg.to_dict()).usage_cache_file == "/tmp/x.json"
+        # Empty string (disabled) round-trips and a missing key uses the default.
+        assert AutoSwitchConfig.from_dict({"usage_cache_file": ""}).usage_cache_file == ""
+        assert AutoSwitchConfig.from_dict({"enabled": True}).usage_cache_file.endswith(
+            "statusline-usage-cache.json"
+        )
+
     def test_critical_interval_default(self):
         assert AutoSwitchConfig().critical_interval == 15
 
@@ -949,7 +959,9 @@ class _FakeSwitcher:
 
 
 def _make_auto_switcher(backup_dir: Path, accounts: list[dict]) -> AutoSwitcher:
-    cfg = AutoSwitchConfig(enabled=True)
+    # usage_cache_file="" so behaviour tests never read the real on-disk
+    # statusline cache (hermetic); the cache path has its own dedicated tests.
+    cfg = AutoSwitchConfig(enabled=True, usage_cache_file="")
     fs = _FakeSwitcher(backup_dir, accounts)
     return AutoSwitcher(switcher=fs, config=cfg)
 
@@ -2052,6 +2064,7 @@ class TestConsumeFirstEngine:
         cfg = AutoSwitchConfig(
             enabled=True, strategy="consume-first",
             session_threshold=98.0, weekly_threshold=99.0, hysteresis=5.0,
+            usage_cache_file="",   # hermetic: don't read the real statusline cache
         )
         fs = _FakeSwitcher(tmp_path, accounts)
         return AutoSwitcher(switcher=fs, config=cfg), fs
@@ -2353,4 +2366,93 @@ class TestSleepWakeDetection:
 
         assert run(_WAKE_GAP_THRESHOLD) is False        # exactly 60 → not detected
         assert run(_WAKE_GAP_THRESHOLD + 1) is True     # 61 → detected
+
+
+class TestActiveUsageFromCache:
+    """_active_usage_from_cache: reuse the statusline cache for the active account
+    only when fresh AND its 7d reset matches the active account's last-known one."""
+
+    def _as(self, tmp_path, cache_path, last_known_reset=None):
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 30, _ts(48)), "active": True},
+        ]
+        as_ = _make_auto_switcher(tmp_path, accounts)
+        as_._config = dataclasses.replace(as_._config, usage_cache_file=cache_path)
+        if last_known_reset is not None:
+            as_._state = dataclasses.replace(
+                as_._state,
+                last_usage={"1": {
+                    "usage": {"seven_day": {"pct": 30.0, "resets_at": last_known_reset}},
+                    "fetched_at": 1.0,
+                }},
+            )
+        return as_
+
+    def _write_cache(self, tmp_path, seven_day_reset):
+        f = tmp_path / "usage-cache.json"
+        f.write_text(json.dumps({
+            "five_hour": {"utilization": 50.0, "resets_at": _ts(2)},
+            "seven_day": {"utilization": 30.0, "resets_at": seven_day_reset},
+        }))
+        return f
+
+    def _fresh(self, monkeypatch, f, age=10):
+        monkeypatch.setattr(
+            "claude_swap.auto_switch._now_ts", lambda: f.stat().st_mtime + age
+        )
+
+    def test_disabled_returns_none(self, tmp_path):
+        assert self._as(tmp_path, "")._active_usage_from_cache("1") is None
+
+    def test_none_active_num_returns_none(self, tmp_path):
+        assert self._as(tmp_path, "/x.json")._active_usage_from_cache(None) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        as_ = self._as(tmp_path, str(tmp_path / "nope.json"), last_known_reset=_ts(72))
+        assert as_._active_usage_from_cache("1") is None
+
+    def test_fresh_matching_reset_returns_usage(self, tmp_path, monkeypatch):
+        reset = _ts(72)
+        f = self._write_cache(tmp_path, reset)
+        as_ = self._as(tmp_path, str(f), last_known_reset=reset)
+        self._fresh(monkeypatch, f)
+        u = as_._active_usage_from_cache("1")
+        assert isinstance(u, dict) and u["five_hour"]["pct"] == 50.0
+
+    def test_jitter_within_tolerance_matches(self, tmp_path, monkeypatch):
+        # The API jitters resets_at sub-seconds between calls for the SAME
+        # account (observed live), so a small (<60s) difference must still match
+        # — an exact == would false-reject and the feature would never engage.
+        f = self._write_cache(tmp_path, _ts(72))
+        as_ = self._as(tmp_path, str(f), last_known_reset=_ts(72 + 5 / 3600))  # ~5s off
+        self._fresh(monkeypatch, f)
+        assert isinstance(as_._active_usage_from_cache("1"), dict)
+
+    def test_stale_returns_none(self, tmp_path, monkeypatch):
+        reset = _ts(72)
+        f = self._write_cache(tmp_path, reset)
+        as_ = self._as(tmp_path, str(f), last_known_reset=reset)
+        self._fresh(monkeypatch, f, age=1000)   # older than _EXTERNAL_CACHE_TTL
+        assert as_._active_usage_from_cache("1") is None
+
+    def test_mismatched_reset_returns_none(self, tmp_path, monkeypatch):
+        # Cache is a DIFFERENT account (7d reset doesn't match last-known active).
+        f = self._write_cache(tmp_path, _ts(72))
+        as_ = self._as(tmp_path, str(f), last_known_reset=_ts(120))
+        self._fresh(monkeypatch, f)
+        assert as_._active_usage_from_cache("1") is None
+
+    def test_no_last_known_returns_none(self, tmp_path, monkeypatch):
+        # Cold start — no last-known active reset to match against → direct fetch.
+        f = self._write_cache(tmp_path, _ts(72))
+        as_ = self._as(tmp_path, str(f))   # no last_known
+        self._fresh(monkeypatch, f)
+        assert as_._active_usage_from_cache("1") is None
+
+    def test_corrupt_file_returns_none(self, tmp_path, monkeypatch):
+        f = tmp_path / "bad.json"
+        f.write_text("not json {{{")
+        as_ = self._as(tmp_path, str(f), last_known_reset=_ts(72))
+        self._fresh(monkeypatch, f)
+        assert as_._active_usage_from_cache("1") is None
 

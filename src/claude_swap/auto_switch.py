@@ -12,11 +12,13 @@ Architecture
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace as _state_replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap import oauth
@@ -122,6 +124,19 @@ _CRITICAL_BAND_PCT = 3.0
 # calls), so steady-state behaviour is unchanged.
 _WAKE_CHECK_CHUNK = 30
 _WAKE_GAP_THRESHOLD = 60
+
+# Max age (seconds) of the shared usage cache (``config.usage_cache_file``) the
+# daemon will trust for the ACTIVE account instead of making its own usage-API
+# call. The statusline refreshes that cache on a ~60s TTL; +30s of slack covers
+# render timing. Older than this → fall back to a direct fetch.
+_EXTERNAL_CACHE_TTL = 90
+
+# Tolerance (seconds) for matching the cache's 7d reset to the active account's
+# last-known 7d reset (the account-identity check). The API reports ``resets_at``
+# with ~0.01-1s of sub-second jitter between calls for the SAME account, so an
+# exact match would false-reject; a different account's weekly window resets
+# hours apart, so 60s cleanly separates same-account from wrong-account.
+_RESET_MATCH_TOLERANCE = 60.0
 
 # Max consecutive consume-first ticks that may force the tight retry cadence when
 # we stayed on incomplete info (a peer we couldn't read this tick). A transient
@@ -793,6 +808,53 @@ class AutoSwitcher:
 
         return active_num, accounts_info, switchable, live_session_nums, rotation_index
 
+    def _active_usage_from_cache(self, active_num: str | None) -> dict | None:
+        """The active account's usage from the shared statusline cache, or None.
+
+        Avoids a redundant usage-API call on the ACTIVE account — the one Claude
+        Code is actively using AND polling for its statusline, so a direct fetch
+        contends with those calls and is the one that flaps under rate limits.
+        The statusline already fetches the same endpoint and caches the raw
+        response (``config.usage_cache_file``); we reuse it.
+
+        Returns None (→ caller falls back to a direct fetch) when the feature is
+        off, the cache is missing / stale / unparseable, or — the key safety —
+        the cache's 7d reset does NOT match the active account's last-known 7d
+        reset. The cache carries no account id, so that match is the only proof
+        it reflects the CURRENT active account; after any switch (daemon OR a
+        manual ``--switch-to``) it fails until a direct fetch re-establishes the
+        active account's reset, so we never read a stale wrong-account cache.
+        """
+        if active_num is None:
+            return None
+        path = self._config.usage_cache_file
+        if not path:
+            return None
+        try:
+            cache_path = Path(path)
+            if _now_ts() - cache_path.stat().st_mtime > _EXTERNAL_CACHE_TTL:
+                return None
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _logger.debug("auto-switch: usage cache %s unreadable: %r", path, exc)
+            return None
+        usage = oauth.build_usage_result(raw)
+        if not isinstance(usage, dict):
+            return None
+        entry = self._state.last_usage.get(active_num)
+        known = entry.get("usage") if isinstance(entry, dict) else None
+        known_ts = _parse_reset_ts(known)
+        cache_ts = _parse_reset_ts(usage)
+        if known_ts == _BIG or cache_ts == _BIG:
+            return None  # no 7d reset on one side → can't verify identity
+        if abs(cache_ts - known_ts) > _RESET_MATCH_TOLERANCE:
+            return None  # different account (weekly windows reset hours apart)
+        _logger.debug(
+            "auto-switch: active account %s usage from statusline cache",
+            active_num,
+        )
+        return usage
+
     def _fetch_one(self, row: tuple) -> dict | str | None:
         """Fetch ONE account's usage uncached (one API call); never raises.
 
@@ -897,9 +959,15 @@ class AutoSwitcher:
         row_by_num: dict[str, tuple] = {str(r[0]): r for r in accounts_info}
 
         # ---- Phase 1: probe ONLY the active account (one API call). --------
+        # Prefer the shared statusline usage cache for the active account (skips
+        # a redundant, rate-limit-contended call on the account Claude Code is
+        # using); fall back to a direct fetch when the cache is absent/stale or
+        # can't be matched to the current active account.
         active_row = row_by_num.get(active_num) if active_num is not None else None
         active_usage: dict | str | None = (
-            self._fetch_one(active_row) if active_row is not None else "no credentials"
+            (self._active_usage_from_cache(active_num) or self._fetch_one(active_row))
+            if active_row is not None
+            else "no credentials"
         )
 
         # Stash the active account's usage so watch/run_daemon size the next

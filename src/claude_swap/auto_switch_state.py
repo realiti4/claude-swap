@@ -67,6 +67,14 @@ _CONFIG_DEFAULTS: dict = {
     # ``[_CRITICAL_INTERVAL_FLOOR, min_interval]``. Brief + self-terminating
     # (only near the 5h limit), so it does not raise the steady-state poll rate.
     "critical_interval": 15,
+    # Path to a shared usage cache the daemon reads for the ACTIVE account, to
+    # avoid a redundant (and rate-limit-contended) usage-API call on the account
+    # Claude Code is actively using — its statusline already polls and caches the
+    # same endpoint. Default = the CodexBar/statusline convention. The daemon
+    # only trusts it when fresh AND its 7d reset matches the active account's
+    # last-known 7d reset (account-identity guard); otherwise it falls back to a
+    # direct fetch. Set to "" to disable.
+    "usage_cache_file": "/tmp/claude/statusline-usage-cache.json",
 }
 
 
@@ -103,6 +111,9 @@ class AutoSwitchConfig:
     # 100%. Below ``min_interval`` by design; ``from_dict`` floors it at
     # ``_CRITICAL_INTERVAL_FLOOR`` and caps it at ``min_interval``.
     critical_interval: int = 15
+    # Shared usage-cache path read for the ACTIVE account (the contended one) to
+    # skip a redundant usage-API call; "" disables. See ``_CONFIG_DEFAULTS``.
+    usage_cache_file: str = "/tmp/claude/statusline-usage-cache.json"
 
     @classmethod
     def from_dict(cls, data: object) -> AutoSwitchConfig:
@@ -162,6 +173,9 @@ class AutoSwitchConfig:
             strategy=strategy,
             hysteresis=hysteresis,
             critical_interval=critical_interval,
+            usage_cache_file=str(
+                data.get("usage_cache_file", _CONFIG_DEFAULTS["usage_cache_file"])
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -177,6 +191,7 @@ class AutoSwitchConfig:
             "strategy": self.strategy,
             "hysteresis": self.hysteresis,
             "critical_interval": self.critical_interval,
+            "usage_cache_file": self.usage_cache_file,
         }
 
 
