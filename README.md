@@ -124,6 +124,17 @@ threshold), then notifies you to restart Claude Code. Configure:
 Defaults are 95% / 10m / with-display-refresh, and auto-switch is off until you
 enable it.
 
+**Strategies.** *Settings → Auto-switch strategy*:
+
+- **Reactive** (default) — stays put until the active account crosses the
+  threshold, then switches to the account with the most headroom.
+- **Consume-first** — proactively keeps you on the account whose **weekly window
+  resets soonest** (use-it-or-lose-it), switching as resets re-order the queue.
+  It polls all accounts each tick (needed to rank them).
+
+A small hysteresis dead band prevents switching back and forth when an account
+hovers at the threshold.
+
 ### Other commands
 
 ```bash
