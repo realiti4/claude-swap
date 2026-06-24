@@ -248,11 +248,16 @@ def _resets_at_ts(window: dict | str | None) -> float:
 def decide_auto_switch(
     accounts: list[tuple[int, str, bool, dict | str | None]],
     threshold: float,
+    blocked=frozenset(),
 ) -> tuple[str, int | None]:
-    """Decide whether to auto-switch, mirroring the launchd monitor's rule.
+    """Reactive auto-switch: switch when the active account hits the threshold.
 
-    Returns one of ``("switch", num)``, ``("none", None)``,
-    ``("no_candidate", None)``, ``("unknown_active", None)``. Total — never raises.
+    ``blocked`` is the hysteresis set (account-number strings at/over limit); a
+    blocked candidate must clear ``threshold - AUTO_HYSTERESIS`` to be eligible
+    again. Returns ``("switch", num)``, ``("none", None)``,
+    ``("unknown_active", None)``, ``("no_candidate", None)`` (all peers exhausted),
+    or ``("no_candidate_unverifiable", None)`` (a peer's usage was unreadable).
+    Total — never raises.
     """
     active = next((a for a in accounts if a[2]), None)
     if active is None:
@@ -264,17 +269,22 @@ def decide_auto_switch(
         return ("none", None)
 
     candidates: list[tuple[float, float, float, int]] = []
+    any_unverifiable = False
     for num, _email, is_active, usage in accounts:
         if is_active:
             continue
         worst = _worst_pct(usage)
-        if worst is None or worst >= threshold:
+        if worst is None:
+            any_unverifiable = True
+            continue
+        limit = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
+        if worst >= limit:
             continue
         seven = _window_pct(usage, "seven_day")
         five = _window_pct(usage, "five_hour")
-        candidates.append((worst, seven, five, num))  # seven/five are not None here
+        candidates.append((worst, seven, five, num))
     if not candidates:
-        return ("no_candidate", None)
+        return ("no_candidate_unverifiable", None) if any_unverifiable else ("no_candidate", None)
     candidates.sort(key=lambda c: (c[0], c[1], c[2]))
     return ("switch", candidates[0][3])
 

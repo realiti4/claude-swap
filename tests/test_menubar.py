@@ -395,3 +395,33 @@ def test_resets_at_ts_orders_and_handles_missing():
     assert menubar._resets_at_ts({"resets_at": "garbage"}) == float("inf")
     assert menubar._resets_at_ts(None) == float("inf")
 
+
+def _ra(num, pct5, pct7, active=False):
+    return (num, f"a{num}@x.com", active,
+            {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}})
+
+
+def test_decide_reactive_hysteresis_excludes_blocked_candidate():
+    # active over limit; only peer (#2) is at 92 — within the 90..95 dead band.
+    accts = [_ra(1, 99, 10, active=True), _ra(2, 92, 20)]
+    # not blocked -> 92 < 95 -> eligible -> switch
+    assert menubar.decide_auto_switch(accts, 95, frozenset()) == ("switch", 2)
+    # blocked -> must clear 90 -> 92 >= 90 -> ineligible -> no candidate
+    assert menubar.decide_auto_switch(accts, 95, frozenset({"2"})) == ("no_candidate", None)
+
+
+def test_decide_reactive_unverifiable_when_only_peer_unreadable():
+    accts = [_ra(1, 99, 10, active=True), (2, "b@x", False, "no credentials")]
+    assert menubar.decide_auto_switch(accts, 95, frozenset()) == ("no_candidate_unverifiable", None)
+
+
+def test_decide_reactive_exhausted_stays_no_candidate():
+    accts = [_ra(1, 99, 10, active=True), _ra(2, 96, 50)]  # peer over limit, readable
+    assert menubar.decide_auto_switch(accts, 95, frozenset()) == ("no_candidate", None)
+
+
+def test_plan_silent_outcomes_are_noop():
+    st, s = menubar.MenuBarState(), menubar.MenuBarSettings()
+    assert menubar.plan_auto_switch(("no_candidate_unverifiable", None), st, s, 1e9) == ("noop", None)
+    assert menubar.plan_auto_switch(("all_session_limited", None), st, s, 1e9) == ("noop", None)
+
