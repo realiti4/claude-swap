@@ -164,8 +164,8 @@ cswap auto status                        # shows the active strategy
 The monitor depends on the Anthropic usage API. If the network drops and usage can't be read, the auto-switcher fails safely:
 
 - **Safe:** it never switches on stale or unknown data — switching onto a possibly-exhausted account would be risky, and during a real outage Claude Code is blocked anyway, so no quota is burning. It simply waits.
-- **Visible:** it backs off (exponentially, capped) instead of hammering the network, sends a one-shot "offline" notification, and `cswap auto status` shows a `monitoring: offline since …` line.
-- **Recoverable:** the first successful poll after the outage resumes monitoring automatically and sends a one-shot "back online" notification.
+- **Visible:** `cswap auto status` shows a `monitoring: offline since …` line and a one-shot "offline" notification fires.
+- **Recoverable:** the first successful poll resumes monitoring automatically and sends a one-shot "back online" notification. With a usage cache configured (the default — see `usage_cache_file` above) the daemon retries at the `min_interval` floor while offline: a fresh statusline cache recovers it without an API call, so a transient rate‑limit (the active account is the most polled, so it's the one that 429s under contention) doesn't leave it "offline" for long. With no cache it backs off exponentially (capped) instead of hammering a real outage.
 
 #### Configuration
 
