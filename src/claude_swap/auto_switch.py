@@ -746,13 +746,21 @@ class AutoSwitcher:
         ``cswap --list`` / ``cswap auto status`` still refetch the full set on
         demand) and does NOT go through ``_collect_usage`` (whose 15s cache can
         never help a daemon whose tick interval is >= 60s).
+
+        ``allow_refresh=False``: the daemon NEVER refreshes an inactive
+        account's expired token. A refresh rotates the one-time OAuth refresh
+        token server-side, and the daemon runs under launchd where the Keychain
+        may be locked (Mac asleep) — a rotation we cannot persist bricks the
+        account until re-login. An expired peer therefore reads as ``None`` here
+        and keeps its last-known usage; a foreground ``cswap --list`` / switch
+        (unlocked session) refreshes and re-backs-up the token instead.
         """
         num, email, _org_name, _org_uuid, is_active, creds = row
         if not creds or not oauth.extract_access_token(creds):
             return "no credentials"
         try:
             return oauth.fetch_usage_for_account(
-                str(num), email, creds, is_active=is_active
+                str(num), email, creds, is_active=is_active, allow_refresh=False
             )
         except Exception as exc:  # never let a fetch take the tick down
             _logger.debug("auto-switch: usage fetch for %s failed: %r", num, exc)

@@ -767,7 +767,10 @@ def _patch_oauth_fetch():
     MagicMock so tests can assert ``.call_count`` (number of ACTUAL usage API
     calls this tick — uncredentialed accounts never reach here).
     """
-    def _decode(account_num, email, credentials, is_active, persist_credentials=None):
+    def _decode(
+        account_num, email, credentials, is_active,
+        persist_credentials=None, allow_refresh=True,
+    ):
         try:
             data = json.loads(credentials)
         except Exception:
@@ -904,6 +907,34 @@ class TestAutoSwitcherRunOnce:
         assert decision.action == "stay"
         assert as_._switcher.switched_to == []
         mock_notify.assert_not_called()
+
+    def test_daemon_probe_never_refreshes_inactive_tokens(
+        self, tmp_path: Path, _patch_oauth_fetch
+    ):
+        """Every daemon usage probe MUST pass allow_refresh=False.
+
+        Regression guard: the daemon's _fetch_one originally called
+        fetch_usage_for_account with refresh enabled and NO persist callback, so
+        a refresh of an inactive expired token rotated the one-time OAuth refresh
+        token server-side and silently discarded the rotation — bricking the
+        peer account until re-login. The background daemon must never refresh an
+        inactive token (it runs under launchd where the Keychain may be locked).
+        """
+        accounts = [
+            {"num": "1", "email": "a@x.com", "usage": _usage(50.0)},   # active
+            {"num": "2", "email": "b@x.com", "usage": _usage(20.0)},   # peer
+        ]
+        cfg = AutoSwitchConfig(enabled=True, strategy="consume-first")
+        fs = _FakeSwitcher(tmp_path, accounts)
+        as_ = AutoSwitcher(switcher=fs, config=cfg)
+        with patch("claude_swap.auto_switch.notify"):
+            as_.run_once()
+
+        assert _patch_oauth_fetch.call_count >= 1
+        for call in _patch_oauth_fetch.call_args_list:
+            assert call.kwargs.get("allow_refresh") is False, (
+                f"daemon probe must pass allow_refresh=False, got {call}"
+            )
 
     def test_notify_on_exhaustion(self, tmp_path: Path):
         accounts = [

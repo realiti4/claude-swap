@@ -251,10 +251,22 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    allow_refresh: bool = True,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+
+    ``allow_refresh`` gates the inactive-account token refresh and MUST be False
+    for the background launchd daemon. An OAuth refresh rotates the one-time
+    refresh token server-side; if the rotated token cannot be persisted — the
+    Keychain is locked while the Mac is asleep under launchd, or (as the daemon
+    historically did) no persist callback is wired — the rotation is lost and
+    the account is bricked until re-login. Foreground paths (a switch,
+    ``cswap --list``) run in the user's unlocked session where persistence is
+    reliable, so they keep the default (True). When False, an expired inactive
+    token returns None (its last-known usage stands) instead of a doomed,
+    token-burning refresh.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -263,11 +275,26 @@ def fetch_usage_for_account(
 
     working_credentials = credentials
 
-    if (
+    inactive_expired = (
         not is_active
-        and oauth.get("refreshToken")
+        and bool(oauth.get("refreshToken"))
         and is_oauth_token_expired(oauth.get("expiresAt"))
-    ):
+    )
+
+    if inactive_expired and not allow_refresh:
+        # Background daemon: never rotate a refresh token we may be unable to
+        # persist (locked Keychain under launchd). Skip the doomed request too —
+        # an expired token only 401s. Last-known usage stands; a foreground
+        # path refreshes it later.
+        _logger.debug(
+            "Inactive account %s (%s): token expired but refresh is disabled "
+            "for this context (background daemon) — leaving last-known usage.",
+            account_num,
+            email,
+        )
+        return None
+
+    if inactive_expired:
         refreshed = refresh_oauth_credentials(working_credentials)
         if refreshed:
             working_credentials = refreshed
@@ -283,6 +310,7 @@ def fetch_usage_for_account(
         if (
             e.code != 401
             or is_active
+            or not allow_refresh
             or not oauth
             or not oauth.get("refreshToken")
         ):
