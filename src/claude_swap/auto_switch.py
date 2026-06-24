@@ -83,7 +83,7 @@ def _now_ts() -> float:
 
 @dataclass(frozen=True)
 class SwitchDecision:
-    """Result of one call to ``decide_switch``."""
+    """Result of one call to ``decide_switch`` / ``decide_consume_first``."""
 
     action: str          # "switch" | "stay"
     target: str | None   # account num to switch to (when action=="switch")
@@ -91,6 +91,12 @@ class SwitchDecision:
     trigger_window: str | None  # "5h" | "7d" | None
     trigger_pct: float | None   # the crossing utilisation %
     detail: str          # human-readable one-liner
+    # True when a SWITCHABLE peer's usage couldn't be read this tick (None /
+    # "no credentials"), so the decision is based on incomplete information and
+    # that peer might actually be the consume-first optimal. The monitor loop
+    # uses this to retry sooner instead of waiting out the full cadence for a
+    # transient usage-API miss. Always False for the reactive ``decide_switch``.
+    incomplete: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +110,18 @@ _BIG = float("inf")
 # observes the >= session_threshold crossing and switches BEFORE the hard 100%
 # wall. 3pt → tight polling starts at 95% with the default 98% threshold.
 _CRITICAL_BAND_PCT = 3.0
+
+# Wake-from-sleep detection. The monitor sleeps in chunks of at most
+# ``_WAKE_CHECK_CHUNK`` seconds; if a chunk's wall-clock overshoots what we asked
+# for by more than ``_WAKE_GAP_THRESHOLD`` seconds, the process was suspended
+# (the Mac slept), so we break the remaining sleep and re-poll immediately on
+# wake — a scheduled re-rank (e.g. a blocked account's 5h reset) can't fire while
+# suspended, and a long ``time.sleep`` would otherwise keep waiting out its
+# remainder after wake. Normal scheduling jitter is sub-second, so 60s never
+# false-positives; the chunks add only a handful of cheap timer checks (no API
+# calls), so steady-state behaviour is unchanged.
+_WAKE_CHECK_CHUNK = 30
+_WAKE_GAP_THRESHOLD = 60
 
 
 def _parse_reset_ts(usage: dict | str | None, window: str = "seven_day") -> float:
@@ -442,6 +460,7 @@ def decide_consume_first(
             action="stay", target=None, reason="active-usage-unknown",
             trigger_window=None, trigger_pct=None,
             detail="Active account is unknown; cannot decide whether to switch.",
+            incomplete=True,
         )
     active_usage = usage_by_account.get(active_num)
     if not isinstance(active_usage, dict):
@@ -452,6 +471,7 @@ def decide_consume_first(
                 f"Active account {active_num} usage is unavailable; "
                 "cannot decide whether to switch."
             ),
+            incomplete=True,
         )
 
     # 2. Eligible = the active account (ALWAYS a candidate) + switchable peers
@@ -493,6 +513,7 @@ def decide_consume_first(
                     "No account is available right now (weekly limit and/or 5h "
                     "session limits); will resume as windows reset."
                 ),
+                incomplete=any_unverifiable,
             )
         if any_unverifiable:
             # No verified 7d room anywhere, but a peer's usage couldn't be read
@@ -506,6 +527,7 @@ def decide_consume_first(
                     "(some candidates' usage could not be read this tick). "
                     "Will retry."
                 ),
+                incomplete=True,
             )
         # No 7d room anywhere (all verified) → genuinely exhausted (notify path).
         return SwitchDecision(
@@ -529,6 +551,10 @@ def decide_consume_first(
                 f"Active account {active_num} is the consume-first account "
                 "(soonest weekly reset among available)."
             ),
+            # We are optimal among the accounts we could MEASURE — but if a peer
+            # was unverifiable this tick it might actually reset sooner, so flag
+            # the stay as incomplete to trigger a prompt re-check.
+            incomplete=any_unverifiable,
         )
     return SwitchDecision(
         action="switch", target=optimal, reason="consume-first",
@@ -537,6 +563,7 @@ def decide_consume_first(
             f"Switching to account {optimal} to consume first "
             "(soonest weekly reset among available accounts)."
         ),
+        incomplete=any_unverifiable,
     )
 
 
@@ -1262,6 +1289,44 @@ class AutoSwitcher:
             self._config,
         )
 
+    def _retry_interval(
+        self, decision: SwitchDecision | None, interval: int
+    ) -> int:
+        """Shorten ``interval`` to ``min_interval`` when we STAYED on incomplete
+        info (a switchable peer's usage couldn't be read this tick).
+
+        A transient usage-API miss on a peer that might be the consume-first
+        optimal otherwise costs up to ``max_interval`` before the next re-check;
+        retrying at the floor (60s) catches it promptly without spamming the API
+        (it only fires on a stay flagged ``incomplete``).
+        """
+        if decision is not None and decision.action == "stay" and decision.incomplete:
+            return min(interval, self._config.min_interval)
+        return interval
+
+    def _sleep_with_wake_detection(self, interval: int) -> bool:
+        """Sleep ``interval`` seconds in chunks; return True on a detected
+        system-sleep gap so the caller re-polls immediately on wake.
+
+        macOS suspends the process during system sleep: a scheduled re-rank (a
+        blocked account's 5h reset) can't fire, and a single long ``time.sleep``
+        keeps waiting out its remainder after wake. Sleeping in
+        ``_WAKE_CHECK_CHUNK``-second chunks and watching for a chunk whose
+        wall-clock overshoots by more than ``_WAKE_GAP_THRESHOLD`` detects the
+        suspension and breaks out so the next tick re-fetches + re-ranks within
+        seconds of wake. No API calls — steady-state behaviour is unchanged.
+        """
+        deadline = _now_ts() + interval
+        while True:
+            remaining = deadline - _now_ts()
+            if remaining <= 0:
+                return False
+            chunk = remaining if remaining < _WAKE_CHECK_CHUNK else _WAKE_CHECK_CHUNK
+            before = _now_ts()
+            time.sleep(chunk)
+            if (_now_ts() - before) - chunk > _WAKE_GAP_THRESHOLD:
+                return True
+
     def watch(self) -> None:
         """Run the monitor loop in the foreground (Ctrl-C to stop)."""
         from claude_swap.printer import accent, dimmed, muted
@@ -1290,6 +1355,7 @@ class AutoSwitcher:
                 # lengthens; reactive cadence is untouched.
                 if failures == 0 and self._config.strategy == "consume-first":
                     interval = self._consume_first_interval(interval)
+                    interval = self._retry_interval(decision, interval)
                 if failures > 0:
                     status = (
                         f"  offline — retry in {interval}s "
@@ -1301,7 +1367,8 @@ class AutoSwitcher:
                         f"next poll in {interval}s"
                     )
                 print(muted(status))
-                time.sleep(interval)
+                if self._sleep_with_wake_detection(interval):
+                    print(muted("  resumed after sleep — re-polling now"))
         except KeyboardInterrupt:
             print(f"\n{dimmed('Auto-switch stopped.')}")
         finally:
@@ -1343,6 +1410,9 @@ class AutoSwitcher:
                     # the soonest reset to re-rank promptly. Reactive unchanged.
                     if failures == 0 and self._config.strategy == "consume-first":
                         interval = self._consume_first_interval(interval)
+                        # Retry sooner if we stayed on incomplete info (a peer
+                        # we couldn't read this tick might be the optimal).
+                        interval = self._retry_interval(decision, interval)
                 except Exception as exc:
                     _logger.exception("auto-switch daemon: tick error: %r", exc)
                     interval = self._config.max_interval
@@ -1353,7 +1423,12 @@ class AutoSwitcher:
                     decision.action if decision is not None else "?",
                     decision.reason if decision is not None else "?",
                 )
-                time.sleep(interval)
+                if self._sleep_with_wake_detection(interval):
+                    _logger.info(
+                        "auto-switch: resumed after a sleep/suspend gap — "
+                        "re-polling now (a blocked account may have reset while "
+                        "suspended)."
+                    )
         finally:
             lock.release()
             _logger.info("auto-switch daemon: stopped")

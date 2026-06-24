@@ -1817,6 +1817,58 @@ class TestDecideConsumeFirst:
         u = {"1": _usage(40, 10, _ts(2)), "2": _usage(20, 5, _ts(48))}
         d = self._decide("1", u, {"2"})
         assert d.action == "stay" and d.reason == "optimal"
+        assert d.incomplete is False   # all peers verified
+
+    # --- incomplete flag: a switchable peer we couldn't read this tick ---
+
+    def test_optimal_stay_with_unverifiable_peer_is_incomplete(self):
+        # Active (2) is optimal among what we can MEASURE, but peer 1's usage is
+        # None this tick — it might reset sooner and be the real optimal. The
+        # daemon must retry soon, so the stay is flagged incomplete. (This is the
+        # wake-from-sleep bug: a transient peer-fetch miss left the daemon on a
+        # sub-optimal account for a full poll interval.)
+        u = {"1": None, "2": _usage(20, 5, _ts(48))}
+        d = self._decide("2", u, {"1"})
+        assert d.action == "stay" and d.reason == "optimal"
+        assert d.incomplete is True
+
+    def test_candidates_unverifiable_is_incomplete(self):
+        # Active weekly-exhausted (no 7d room), only peer unreadable → quiet stay
+        # flagged incomplete (retry to verify the peer).
+        u = {"1": _usage(10, 99, _ts(2)), "2": None}
+        d = self._decide("1", u, {"2"})
+        assert d.reason == "candidates-unverifiable" and d.incomplete is True
+
+    def test_all_session_limited_incomplete_only_when_a_peer_unverifiable(self):
+        # Active 5h-blocked + an UNREADABLE peer (7d room exists) → incomplete.
+        u_unver = {"1": _usage(98, 10, _ts(2)), "2": None}
+        d1 = self._decide("1", u_unver, {"2"})
+        assert d1.reason == "all-session-limited" and d1.incomplete is True
+        # Active 5h-blocked + a peer that is VERIFIABLY 5h-blocked → not incomplete
+        # (a known 5h reset is already handled by the reset-aware scheduler).
+        u_ver = {"1": _usage(98, 10, _ts(2)), "2": _usage(99, 5, _ts(48))}
+        d2 = self._decide("1", u_ver, {"2"})
+        assert d2.reason == "all-session-limited" and d2.incomplete is False
+
+    def test_all_exhausted_is_not_incomplete(self):
+        u = {"1": _usage(10, 99, _ts(2)), "2": _usage(10, 99, _ts(48))}
+        d = self._decide("1", u, {"2"})
+        assert d.reason == "all-exhausted" and d.incomplete is False
+
+    def test_switch_carries_incomplete_when_a_peer_unverifiable(self):
+        u = {
+            "1": _usage(40, 10, _ts(48)),   # active, resets latest
+            "2": _usage(20, 5, _ts(2)),     # verified, sooner → switch target
+            "3": None,                       # unreadable peer
+        }
+        d = self._decide("1", u, {"2", "3"})
+        assert d.action == "switch" and d.target == "2"
+        assert d.incomplete is True
+
+    def test_active_usage_unknown_is_incomplete(self):
+        u = {"1": None, "2": _usage(20, 5, _ts(2))}
+        d = self._decide("1", u, {"2"})
+        assert d.reason == "active-usage-unknown" and d.incomplete is True
 
     def test_switches_to_sooner_reset_peer_under_threshold(self):
         # Active resets later; peer 2 resets sooner; both well under limits.
@@ -2151,4 +2203,75 @@ class TestConsumeFirstEngine:
         assert as_._blocked_peer_5h_resets() == []
         # Nearest reset is the 48h 7d one → far beyond 300s → base unchanged.
         assert as_._consume_first_interval(300) == 300
+
+
+class TestRetryInterval:
+    """_retry_interval: a stay flagged ``incomplete`` retries at the floor."""
+
+    def _as(self, tmp_path):
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(40, 10, _ts(2)), "active": True},
+            {"num": "2", "email": "b@x", "usage": _usage(20, 5, _ts(48))},
+        ]
+        return _make_auto_switcher(tmp_path, accounts)
+
+    def _stay(self, incomplete):
+        return SwitchDecision("stay", None, "optimal", None, None, "", incomplete=incomplete)
+
+    def test_stay_incomplete_shortens_to_min(self, tmp_path):
+        as_ = self._as(tmp_path)
+        assert as_._retry_interval(self._stay(True), 300) == as_._config.min_interval
+
+    def test_stay_not_incomplete_unchanged(self, tmp_path):
+        as_ = self._as(tmp_path)
+        assert as_._retry_interval(self._stay(False), 300) == 300
+
+    def test_switch_incomplete_unchanged(self, tmp_path):
+        # Only a STAY retries soon; a switch already moved, re-rank next tick.
+        as_ = self._as(tmp_path)
+        d = SwitchDecision("switch", "2", "consume-first", None, None, "", incomplete=True)
+        assert as_._retry_interval(d, 300) == 300
+
+    def test_none_decision_unchanged(self, tmp_path):
+        as_ = self._as(tmp_path)
+        assert as_._retry_interval(None, 300) == 300
+
+    def test_never_lengthens(self, tmp_path):
+        as_ = self._as(tmp_path)
+        assert as_._retry_interval(self._stay(True), 15) == 15   # already below floor
+
+
+class TestSleepWakeDetection:
+    """_sleep_with_wake_detection: chunked sleep; True on a system-suspend gap."""
+
+    def _as(self, tmp_path):
+        accounts = [
+            {"num": "1", "email": "a@x", "usage": _usage(10, 5, _ts(2)), "active": True},
+        ]
+        return _make_auto_switcher(tmp_path, accounts)
+
+    def test_normal_sleep_returns_false(self, tmp_path, monkeypatch):
+        as_ = self._as(tmp_path)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("claude_swap.auto_switch._now_ts", lambda: clock["t"])
+        monkeypatch.setattr(
+            "claude_swap.auto_switch.time.sleep",
+            lambda secs: clock.__setitem__("t", clock["t"] + secs),  # advances exactly
+        )
+        assert as_._sleep_with_wake_detection(70) is False
+        assert clock["t"] == 1070.0   # slept the full interval (30 + 30 + 10)
+
+    def test_suspend_gap_returns_true(self, tmp_path, monkeypatch):
+        as_ = self._as(tmp_path)
+        clock = {"t": 1000.0, "calls": 0}
+        monkeypatch.setattr("claude_swap.auto_switch._now_ts", lambda: clock["t"])
+
+        def fake_sleep(secs):
+            clock["calls"] += 1
+            # The Mac slept ~2h DURING the first chunk → big wall-clock jump.
+            clock["t"] += secs + (7200 if clock["calls"] == 1 else 0)
+
+        monkeypatch.setattr("claude_swap.auto_switch.time.sleep", fake_sleep)
+        assert as_._sleep_with_wake_detection(300) is True
+        assert clock["calls"] == 1   # broke out on the first chunk's overshoot
 
