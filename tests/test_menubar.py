@@ -495,3 +495,20 @@ def test_evaluate_strategy_dispatch():
     # reactive: active not over limit -> none
     assert menubar.evaluate_strategy("reactive", accts, 95, frozenset()) == ("none", None)
 
+
+
+# --- reset countdown in account-row usage summary -----------------------------
+
+def test_usage_summary_includes_countdown():
+    usage = {
+        "five_hour": {"pct": 42.0, "countdown": "2h 33m", "clock": "14:50"},
+        "seven_day": {"pct": 18.0, "countdown": "1d 19h"},
+        "spend": {"pct": 30.0},
+    }
+    assert menubar.usage_summary(usage) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
+
+
+def test_usage_summary_countdown_per_window_presence():
+    # countdown shown only for the window that has it; spend never gets one
+    usage = {"five_hour": {"pct": 5.0, "countdown": "1h"}, "seven_day": {"pct": 8.0}}
+    assert menubar.usage_summary(usage) == "5h 5% (1h) · 7d 8%"

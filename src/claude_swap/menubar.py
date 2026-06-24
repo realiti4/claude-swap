@@ -137,12 +137,14 @@ def usage_summary(usage: dict | str | None) -> str:
     if usage is None:
         return "usage unavailable"
     parts: list[str] = []
-    h5 = usage.get("five_hour")
-    if isinstance(h5, dict) and isinstance(h5.get("pct"), (int, float)):
-        parts.append(f"5h {h5['pct']:.0f}%")
-    d7 = usage.get("seven_day")
-    if isinstance(d7, dict) and isinstance(d7.get("pct"), (int, float)):
-        parts.append(f"7d {d7['pct']:.0f}%")
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            seg = f"{label} {window['pct']:.0f}%"
+            countdown = window.get("countdown")
+            if isinstance(countdown, str) and countdown:
+                seg += f" ({countdown})"  # time until this window resets
+            parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
         parts.append(f"$ {spend['pct']:.0f}%")
