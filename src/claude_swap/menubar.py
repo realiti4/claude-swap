@@ -525,15 +525,21 @@ def run(switcher) -> int:
             # with a sub-refresh interval; possible in either mode), fetch fresh
             # and evaluate on a later tick so we never act on stale usage.
             if now - self._snapshot_at > cadence and not self._refreshing:
-                self.refresh_async()
+                self.refresh_async(full=(self.settings.auto_switch_strategy == "consume-first"))
                 return
             self._last_auto_eval = now
             self._maybe_auto_switch(now)
 
         def _maybe_auto_switch(self, now):
-            decision = decide_auto_switch(
-                self.snapshot["accounts"], self.settings.auto_switch_threshold
+            accounts = self.snapshot["accounts"]
+            strategy = self.settings.auto_switch_strategy
+            threshold = self.settings.auto_switch_threshold
+            limiting = limiting_pct_by_account(accounts, strategy)
+            self.state.blocked = sorted(
+                next_blocked(limiting, threshold, AUTO_HYSTERESIS, frozenset(self.state.blocked))
             )
+            self.state.save(state_path)
+            decision = evaluate_strategy(strategy, accounts, threshold, frozenset(self.state.blocked))
             action, num = plan_auto_switch(decision, self.state, self.settings, now)
             if action == "switch":
                 try:
@@ -640,6 +646,15 @@ def run(switcher) -> int:
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
+
+            strategy_menu = rumps.MenuItem("Auto-switch strategy")
+            st_labels = {"reactive": "Reactive (threshold)",
+                         "consume-first": "Consume-first (soonest reset)"}
+            for name in AUTO_STRATEGY_CHOICES:
+                ch = rumps.MenuItem(st_labels[name], callback=self._make_strategy(name))
+                ch.state = 1 if self.settings.auto_switch_strategy == name else 0
+                strategy_menu.add(ch)
+            menu.add(strategy_menu)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
             for pct in AUTO_THRESHOLD_CHOICES:
@@ -793,6 +808,13 @@ def run(switcher) -> int:
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
             self._last_auto_eval = 0.0  # let it evaluate on the next tick when enabling
             self._save_and_rebuild()
+
+        def _make_strategy(self, name):
+            def cb(_sender):
+                self.settings.auto_switch_strategy = name
+                self._last_auto_eval = 0.0  # re-evaluate promptly on change
+                self._save_and_rebuild()
+            return cb
 
         def _make_threshold(self, pct):
             def cb(_sender):
