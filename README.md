@@ -107,6 +107,32 @@ cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
 ```
 
+### Memorable subcommands
+
+Prefer words to flags? Every command also has a subcommand alias. The classic
+`--flags` still work and combine with the subcommands
+(`cswap switch --strategy best`, `cswap list --json`):
+
+| Subcommand | Classic flag |
+|---|---|
+| `cswap help` | `--help` |
+| `cswap list` (`ls`) | `--list` |
+| `cswap status` (`st`) | `--status` |
+| `cswap switch` | `--switch` |
+| `cswap switch <num\|email>` | `--switch-to` |
+| `cswap add` | `--add-account` |
+| `cswap add-token [TOKEN\|-]` | `--add-token` |
+| `cswap remove <num\|email>` (`rm`) | `--remove-account` |
+| `cswap export <path>` | `--export` |
+| `cswap import <path>` | `--import` |
+| `cswap tui` | `--tui` |
+| `cswap upgrade` (`update`) | `--upgrade` |
+| `cswap purge` | `--purge` |
+
+(`cswap run <num|email>` already used the subcommand form and is unchanged.) The
+usage line in `cswap help` now also shows a clean command name instead of the
+installed shim's absolute path.
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.

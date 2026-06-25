@@ -514,6 +514,113 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestSubcommandAliases:
+    """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
+
+    def test_translate_is_noop_for_flags(self):
+        """argv that already uses --flags is passed through untouched."""
+        assert cli._translate_subcommand(["--list"]) == ["--list"]
+        assert cli._translate_subcommand(["--switch", "--json"]) == ["--switch", "--json"]
+        assert cli._translate_subcommand([]) == []
+
+    def test_translate_bare_switch_rotates(self):
+        assert cli._translate_subcommand(["switch"]) == ["--switch"]
+        assert cli._translate_subcommand(["switch", "--strategy", "best"]) == [
+            "--switch", "--strategy", "best",
+        ]
+
+    def test_translate_switch_with_target(self):
+        assert cli._translate_subcommand(["switch", "2"]) == ["--switch-to", "2"]
+        assert cli._translate_subcommand(["switch", "u@x.com", "--json"]) == [
+            "--switch-to", "u@x.com", "--json",
+        ]
+
+    def test_translate_simple_verbs_and_aliases(self):
+        assert cli._translate_subcommand(["list"]) == ["--list"]
+        assert cli._translate_subcommand(["ls"]) == ["--list"]
+        assert cli._translate_subcommand(["status"]) == ["--status"]
+        assert cli._translate_subcommand(["st"]) == ["--status"]
+        assert cli._translate_subcommand(["add"]) == ["--add-account"]
+        assert cli._translate_subcommand(["rm", "2"]) == ["--remove-account", "2"]
+        assert cli._translate_subcommand(["upgrade"]) == ["--upgrade"]
+        assert cli._translate_subcommand(["update"]) == ["--upgrade"]
+
+    def test_translate_value_verbs_pass_through_extra_flags(self):
+        assert cli._translate_subcommand(["export", "b.cswap", "--full"]) == [
+            "--export", "b.cswap", "--full",
+        ]
+        assert cli._translate_subcommand(["add-token", "sk-tok", "--slot", "3"]) == [
+            "--add-token", "sk-tok", "--slot", "3",
+        ]
+
+    def test_translate_unknown_verb_unchanged(self):
+        """An unrecognized first token is left for the parser to reject."""
+        assert cli._translate_subcommand(["bogus"]) == ["bogus"]
+
+    def test_switch_subcommand_dispatches_switch_to(self):
+        """`cswap switch 2` reaches switch_to("2")."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "switch", "2"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        switcher_cls.return_value.switch_to.assert_called_once_with("2", json_output=False)
+
+    def test_bare_switch_subcommand_dispatches_switch(self):
+        """`cswap switch` reaches switch() (rotate)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "switch"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy=None, json_output=False
+        )
+
+    def test_list_subcommand_with_json(self):
+        """`cswap list --json` reaches list_accounts(json_output=True)."""
+        payload = {"schemaVersion": 1, "accounts": []}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--json"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=True,
+        )
+
+    def test_run_subcommand_still_dispatches(self):
+        """`cswap run 2` keeps reaching the session pre-dispatch (not translated)."""
+        calls = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, share=True):
+                calls.append((identifier, claude_args, share))
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap", "run", "2"]):
+            cli.main()
+        assert calls == [("2", [], True)]
+
+    def test_help_subcommand_prints_help(self):
+        """`cswap help` exits 0 and prints help (with subcommand docs)."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert result.returncode == 0
+        assert "Multi-Account Switcher" in result.stdout
+        assert "memorable shortcuts" in result.stdout
+
+
 class TestJsonOutputCli:
     """CLI wiring for ``--json``: validation, single serialization, error envelope."""
 
