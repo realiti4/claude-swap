@@ -107,8 +107,8 @@ cswap --menubar
 
 The menu shows every managed account's 5h / 7d / spend usage, switches accounts
 (specific / rotate / best / next-available), and mirrors the TUI's add / remove /
-refresh actions. A Settings submenu controls what the menu-bar title shows, the
-refresh interval, and launch-at-login.
+refresh actions. A Settings submenu controls what the menu-bar title shows and
+the refresh interval.
 
 **Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
 switch automatically when the active account crosses a usage threshold. When the

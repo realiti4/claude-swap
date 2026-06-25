@@ -10,8 +10,6 @@ the app glue.
 from __future__ import annotations
 
 import json
-import plistlib
-import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -38,7 +36,6 @@ class MenuBarSettings:
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     refresh_interval: int = 60
-    launch_at_login: bool = False
     auto_switch_enabled: bool = False
     auto_switch_threshold: int = 95
     auto_switch_cooldown: int = 600
@@ -392,35 +389,6 @@ def plan_auto_switch(
     return ("noop", None)
 
 
-LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
-
-
-def launch_agent_path() -> Path:
-    """Path to the menu bar LaunchAgent plist."""
-    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
-
-
-def render_launch_agent(program_args: list[str]) -> bytes:
-    """Render the LaunchAgent plist that starts the menu bar at login."""
-    return plistlib.dumps(
-        {
-            "Label": LAUNCH_AGENT_LABEL,
-            "ProgramArguments": list(program_args),
-            "RunAtLoad": True,
-        }
-    )
-
-
-def set_launch_at_login(enabled: bool, program_args: list[str]) -> None:
-    """Install or remove the login LaunchAgent. Removal is idempotent."""
-    path = launch_agent_path()
-    if enabled:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(render_launch_agent(program_args))
-    else:
-        path.unlink(missing_ok=True)
-
-
 def _snapshot(switcher, full: bool = True) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
@@ -644,9 +612,6 @@ def run(switcher) -> int:
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
                 interval.add(choice)
             menu.add(interval)
-            login_item = rumps.MenuItem("Launch at login", callback=self.on_toggle_login)
-            login_item.state = 1 if self.settings.launch_at_login else 0
-            menu.add(login_item)
 
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
@@ -814,16 +779,6 @@ def run(switcher) -> int:
                 self._save_and_rebuild()
             return cb
 
-        def on_toggle_login(self, _sender):
-            enabled = not self.settings.launch_at_login
-            try:
-                set_launch_at_login(enabled, _program_args())
-            except OSError as e:
-                rumps.alert(title="claude-swap", message=f"Could not update login item: {e}")
-                return
-            self.settings.launch_at_login = enabled
-            self._save_and_rebuild()
-
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
             self._last_auto_eval = 0.0  # let it evaluate on the next tick when enabling
@@ -857,8 +812,3 @@ def run(switcher) -> int:
 
     MenuBarApp().run()
     return 0
-
-
-def _program_args() -> list[str]:
-    """Argv that re-launches the menu bar — used for the login plist."""
-    return [sys.executable, "-m", "claude_swap", "--menubar"]

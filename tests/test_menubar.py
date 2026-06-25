@@ -7,7 +7,6 @@ These tests never import or run rumps/AppKit. They exercise the pure helpers
 from __future__ import annotations
 
 import json
-import plistlib
 from pathlib import Path
 
 import pytest
@@ -20,7 +19,6 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     assert s.show_account_name is True
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
-    assert s.launch_at_login is False
 
 
 def test_settings_round_trip(tmp_path: Path):
@@ -29,7 +27,6 @@ def test_settings_round_trip(tmp_path: Path):
         show_account_name=False,
         title_pct="5h",
         refresh_interval=300,
-        launch_at_login=True,
     )
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
@@ -150,28 +147,6 @@ def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
-
-
-def test_render_launch_agent_contains_args_and_label():
-    data = menubar.render_launch_agent(["/usr/bin/cswap", "--menubar"])
-    parsed = plistlib.loads(data)
-    assert parsed["Label"] == menubar.LAUNCH_AGENT_LABEL
-    assert parsed["ProgramArguments"] == ["/usr/bin/cswap", "--menubar"]
-    assert parsed["RunAtLoad"] is True
-
-
-def test_set_launch_at_login_writes_then_removes(tmp_path, monkeypatch):
-    plist = tmp_path / "agent.plist"
-    monkeypatch.setattr(menubar, "launch_agent_path", lambda: plist)
-
-    menubar.set_launch_at_login(True, ["/usr/bin/cswap", "--menubar"])
-    assert plist.exists()
-    assert plistlib.loads(plist.read_bytes())["RunAtLoad"] is True
-
-    menubar.set_launch_at_login(False, ["/usr/bin/cswap", "--menubar"])
-    assert not plist.exists()
-    # idempotent: removing again does not raise
-    menubar.set_launch_at_login(False, ["/usr/bin/cswap", "--menubar"])
 
 
 def test_settings_auto_switch_defaults(tmp_path: Path):
