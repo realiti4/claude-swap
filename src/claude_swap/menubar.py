@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -771,8 +771,23 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap",
                             message="No active Claude Code login detected. Log in first.")
                 return
-            if self._guard(lambda: self.switcher.add_account(slot=None)):
-                self.refresh_async(full=True)
+            try:
+                self.switcher.add_account(slot=None)
+            except CredentialReadError:
+                # Almost always a launchd/login-agent Keychain block: the active
+                # credential lives in the macOS Keychain, which a background agent
+                # can't read (the security call times out). Point at the fix.
+                rumps.alert(
+                    title="claude-swap",
+                    message="Couldn't read the active credential. If the menu bar is running "
+                            "as a background/login agent, macOS blocks its Keychain access — "
+                            "quit and relaunch it from a Terminal with: cswap --menubar",
+                )
+                return
+            except ClaudeSwitchError as e:
+                rumps.alert(title="claude-swap", message=str(e))
+                return
+            self.refresh_async(full=True)
 
         def on_refresh_now(self, _sender):
             self.refresh_async(full=True)
