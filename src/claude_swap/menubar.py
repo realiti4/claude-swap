@@ -127,19 +127,46 @@ def tightest_pct(usage: dict | str | None) -> float | None:
     return max(pcts) if pcts else None
 
 
-def usage_summary(usage: dict | str | None) -> str:
-    """One-line usage summary for an account row."""
+def _live_countdown(window: dict | str | None, now: float) -> str | None:
+    """Time until a usage window resets, computed live from ``resets_at``.
+
+    The cached usage dict's ``countdown`` string is frozen at fetch time, so a
+    stale (e.g. last-known-good) entry would show a wrong remaining time. Deriving
+    it from the absolute ``resets_at`` keeps it correct between/without refetches.
+    Returns ``None`` when there's no ``resets_at`` or it has already passed (the
+    cached value is stale — omit rather than show a wrong/negative countdown).
+    """
+    ts = _resets_at_ts(window)
+    if ts == float("inf"):
+        return None
+    remaining = int(ts - now)
+    if remaining <= 0:
+        return None
+    days, rem = divmod(remaining, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
+    """One-line usage summary for an account row (reset countdown computed live)."""
     if isinstance(usage, str):
         return usage
     if usage is None:
         return "usage unavailable"
+    if now is None:
+        now = time.time()
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
-            countdown = window.get("countdown")
-            if isinstance(countdown, str) and countdown:
+            countdown = _live_countdown(window, now)
+            if countdown:
                 seg += f" ({countdown})"  # time until this window resets
             parts.append(seg)
     spend = usage.get("spend")
@@ -148,9 +175,11 @@ def usage_summary(usage: dict | str | None) -> str:
     return " · ".join(parts) if parts else "usage unavailable"
 
 
-def format_account_label(num: int, email: str, usage: dict | str | None) -> str:
+def format_account_label(
+    num: int, email: str, usage: dict | str | None, now: float | None = None
+) -> str:
     """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage)}"
+    return f"{num}  {email}  {usage_summary(usage, now)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:

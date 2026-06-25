@@ -472,18 +472,39 @@ def test_evaluate_strategy_dispatch():
 
 
 
-# --- reset countdown in account-row usage summary -----------------------------
+# --- reset countdown (computed LIVE from resets_at, not the frozen string) -----
 
-def test_usage_summary_includes_countdown():
+import datetime as _dt
+
+_NOW = 1_000_000.0
+
+
+def _iso(delta_s):  # ISO-8601 for _NOW + delta_s, UTC
+    return _dt.datetime.fromtimestamp(_NOW + delta_s, _dt.timezone.utc).isoformat()
+
+
+def test_live_countdown_formats_from_resets_at():
+    assert menubar._live_countdown({"resets_at": _iso(9 * 3600 + 5 * 60)}, _NOW) == "9h 5m"
+    assert menubar._live_countdown({"resets_at": _iso(86400 + 19 * 3600)}, _NOW) == "1d 19h"
+    assert menubar._live_countdown({"resets_at": _iso(34 * 60)}, _NOW) == "34m"
+
+
+def test_live_countdown_none_when_passed_or_missing():
+    assert menubar._live_countdown({"resets_at": _iso(-60)}, _NOW) is None   # already reset
+    assert menubar._live_countdown({"pct": 5.0}, _NOW) is None               # no resets_at
+    assert menubar._live_countdown("no credentials", _NOW) is None
+
+
+def test_usage_summary_live_countdown_from_resets_at():
     usage = {
-        "five_hour": {"pct": 42.0, "countdown": "2h 33m", "clock": "14:50"},
-        "seven_day": {"pct": 18.0, "countdown": "1d 19h"},
+        "five_hour": {"pct": 42.0, "resets_at": _iso(2 * 3600 + 33 * 60)},
+        "seven_day": {"pct": 18.0, "resets_at": _iso(86400 + 19 * 3600)},
         "spend": {"pct": 30.0},
     }
-    assert menubar.usage_summary(usage) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
+    assert menubar.usage_summary(usage, _NOW) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
 
 
-def test_usage_summary_countdown_per_window_presence():
-    # countdown shown only for the window that has it; spend never gets one
-    usage = {"five_hour": {"pct": 5.0, "countdown": "1h"}, "seven_day": {"pct": 8.0}}
-    assert menubar.usage_summary(usage) == "5h 5% (1h) · 7d 8%"
+def test_usage_summary_omits_countdown_when_passed_or_missing():
+    # 5h reset already passed (stale data) -> omit; 7d has no resets_at -> omit
+    usage = {"five_hour": {"pct": 53.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 8.0}}
+    assert menubar.usage_summary(usage, _NOW) == "5h 53% · 7d 8%"
