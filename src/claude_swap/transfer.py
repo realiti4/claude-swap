@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
+from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
@@ -199,18 +200,27 @@ def export_accounts(
         if not full:
             config_obj = _slim_config(config_obj, f"config for {email}")
 
-        accounts_payload.append(
-            {
-                "number": int(num),
-                "email": email,
-                "uuid": record.get("uuid", ""),
-                "organizationUuid": org_uuid,
-                "organizationName": record.get("organizationName", "") or "",
-                "added": record.get("added", ""),
-                "credentials": _parse_payload(creds_text, f"credentials for {email}"),
-                "config": config_obj,
-            }
-        )
+        # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
+        # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
+        # below doesn't choke and import can restore it as-is.
+        is_api_key = looks_like_api_key(creds_text)
+        entry: dict[str, Any] = {
+            "number": int(num),
+            "email": email,
+            "uuid": record.get("uuid", ""),
+            "organizationUuid": org_uuid,
+            "organizationName": record.get("organizationName", "") or "",
+            "added": record.get("added", ""),
+            "credentials": (
+                creds_text.strip()
+                if is_api_key
+                else _parse_payload(creds_text, f"credentials for {email}")
+            ),
+            "config": config_obj,
+        }
+        if is_api_key:
+            entry["kind"] = "api_key"
+        accounts_payload.append(entry)
 
     if not accounts_payload:
         raise TransferError(
@@ -306,10 +316,23 @@ def import_accounts(
         org_uuid = raw.get("organizationUuid", "") or ""
         creds_obj = raw.get("credentials")
         config_obj = raw.get("config")
-        if not isinstance(creds_obj, dict) or not isinstance(config_obj, dict):
-            raise TransferError(
-                f"credentials and config for {email} must be JSON objects"
-            )
+        if not isinstance(config_obj, dict):
+            raise TransferError(f"config for {email} must be a JSON object")
+        # API-key accounts carry the credential as a raw string; OAuth accounts
+        # carry a JSON object.
+        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        if is_api_key:
+            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+                raise TransferError(
+                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                )
+            creds_text = creds_obj.strip()
+        else:
+            if not isinstance(creds_obj, dict):
+                raise TransferError(
+                    f"credentials for {email} must be a JSON object"
+                )
+            creds_text = json.dumps(creds_obj)
         key = (email, org_uuid)
         if key in seen_keys:
             raise TransferError(
@@ -324,7 +347,8 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "creds_text": json.dumps(creds_obj),
+                "kind": "api_key" if is_api_key else "oauth",
+                "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }
         )
@@ -406,13 +430,16 @@ def import_accounts(
 
         data.setdefault("accounts", {})
         data.setdefault("sequence", [])
-        data["accounts"][target_num] = {
+        new_record = {
             "email": entry["email"],
             "uuid": entry["uuid"],
             "organizationUuid": entry["org_uuid"],
             "organizationName": entry["org_name"],
             "added": entry["added"],
         }
+        if entry["kind"] == "api_key":
+            new_record["kind"] = "api_key"
+        data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))
             data["sequence"].sort()

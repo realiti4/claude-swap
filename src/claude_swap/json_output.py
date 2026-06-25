@@ -17,6 +17,9 @@ SCHEMA_VERSION = 1
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
 USAGE_RATE_LIMITED = "rate limited"
+# API-key (``/login`` managed key) accounts have no subscription quota; usage is
+# reported as this sentinel instead of being fetched from the OAuth usage API.
+USAGE_API_KEY = "api key"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -65,7 +68,8 @@ def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired while Claude Code owns it), the ``USAGE_RATE_LIMITED``
-    sentinel (usage endpoint returned HTTP 429), the ``USAGE_NO_CREDENTIALS``
+    sentinel (usage endpoint returned HTTP 429), the ``USAGE_API_KEY`` sentinel
+    (managed API-key account, no subscription quota), the ``USAGE_NO_CREDENTIALS``
     sentinel, or ``None`` (fetch failed).
     """
     if isinstance(entry, dict):
@@ -74,6 +78,8 @@ def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
         return "token_expired", None
     if entry == USAGE_RATE_LIMITED:
         return "rate_limited", None
+    if entry == USAGE_API_KEY:
+        return "api_key", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None

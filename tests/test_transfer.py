@@ -428,14 +428,27 @@ class TestValidation:
         with pytest.raises(TransferError, match="not valid JSON"):
             import_accounts(s, str(f))
 
-    def test_credentials_must_be_object(self, temp_home: Path):
+    def test_credentials_garbage_string_rejected(self, temp_home: Path):
+        # A non-key string credential is interpreted as an API-key account and
+        # rejected because it isn't a valid sk-ant-api… key.
         s = _linux_switcher(temp_home)
         env = self._make_envelope()
         env["accounts"][0]["credentials"] = "a string"
         f = temp_home / "c.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="must be JSON objects"):
+        with pytest.raises(TransferError, match="must be a raw sk-ant-api"):
+            import_accounts(s, str(f))
+
+    def test_credentials_non_object_non_string_rejected(self, temp_home: Path):
+        # A list/number credential is neither a raw key nor a JSON object.
+        s = _linux_switcher(temp_home)
+        env = self._make_envelope()
+        env["accounts"][0]["credentials"] = [1, 2, 3]
+        f = temp_home / "c.cswap"
+        f.write_text(json.dumps(env))
+
+        with pytest.raises(TransferError, match="must be a JSON object"):
             import_accounts(s, str(f))
 
     @pytest.mark.parametrize(
