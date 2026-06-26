@@ -1275,6 +1275,41 @@ class TestPerformSwitchPostDisplay:
         data = switcher._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
+    def test_switch_refuses_to_back_up_empty_active_creds(
+        self,
+        temp_home: Path,
+        sample_sequence_data: dict,
+    ):
+        """If the live credential reads empty (e.g. Keychain unreadable under a
+        launchd agent), the switch must abort BEFORE overwriting the current
+        account's good backup — otherwise the backup is destroyed."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data
+        )
+        good_1 = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-good-1", "refreshToken": "rt-1"}}
+        )
+        creds_store[("1", "test@example.com")] = good_1
+        live_state = {"creds": ""}  # Keychain unreadable -> empty read
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state
+        )
+        # Account 1 is the live identity (config present) -> backup branch, the
+        # path where an empty read would otherwise clobber account 1's backup.
+        id_patch = patch.object(
+            switcher, "_get_current_account", return_value=("test@example.com", "")
+        )
+        id_patch.start()
+        patches.append(id_patch)
+        try:
+            with pytest.raises(CredentialReadError):
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+        # account 1's good backup must be untouched
+        assert creds_store[("1", "test@example.com")] == good_1
+
     def test_switch_uses_live_identity_for_current_backup_slot(
         self,
         temp_home: Path,

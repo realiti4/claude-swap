@@ -2341,6 +2341,14 @@ class ClaudeAccountSwitcher:
                 original_creds = self._read_credentials()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
+                if not original_creds:
+                    # Empty (e.g. the macOS Keychain was unreadable) — abort BEFORE
+                    # the backup below so we never overwrite the current account's
+                    # good backup with an empty credential.
+                    raise CredentialReadError(
+                        "Current account credential is empty; refusing to overwrite "
+                        "its backup"
+                    )
                 original_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
