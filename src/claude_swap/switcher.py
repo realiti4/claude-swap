@@ -286,6 +286,20 @@ class ClaudeAccountSwitcher:
     def _use_keychain(self) -> bool:
         return self._store._use_keychain()
 
+    def recheck_keychain(self) -> None:
+        """Re-arm Keychain probing after a prior failure this process.
+
+        The capability cache flips to file mode on the first Keychain error and
+        sticks for the process so a single CLI invocation can't split-brain
+        between backends (see ``CredentialStore._kc_call``). A long-running
+        consumer — the menu bar — instead treats each refresh cycle as its own
+        invocation and calls this between cycles, so a *transient* ``security``
+        timeout doesn't permanently route the active-credential read to a
+        (possibly absent) plaintext file, which would freeze the active
+        account's usage at the last-known-good snapshot.
+        """
+        self._keychain_usable_cache = None
+
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
 

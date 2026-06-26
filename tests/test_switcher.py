@@ -3218,6 +3218,23 @@ class TestMacosKeychainFallback:
         s._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._use_keychain() is False
 
+    def test_recheck_keychain_rearms_after_transient_failure(
+        self, temp_home: Path, monkeypatch
+    ):
+        # A long-running consumer (the menu bar) treats each refresh cycle as
+        # its own "invocation": a transient Keychain timeout must not stick for
+        # the whole process, or the active credential read would be routed to a
+        # (possibly absent) plaintext file forever, freezing usage.
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with pytest.raises(KeychainError):
+            s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._use_keychain() is False
+
+        s.recheck_keychain()
+        assert s._keychain_usable_cache is None  # re-armed for the next probe
+        assert s._use_keychain() is True
+
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
     ):

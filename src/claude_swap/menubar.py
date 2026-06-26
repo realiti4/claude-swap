@@ -498,6 +498,12 @@ def run(switcher) -> int:
                 now = time.time()
                 if now - self._last_full_fetch >= _FULL_REFRESH_EVERY:
                     full = True
+                # Re-arm Keychain probing each cycle. A one-off `security`
+                # timeout flips the credential store to file mode and sticks for
+                # the process; with no plaintext fallback that freezes the active
+                # account's usage. Treating each refresh as its own invocation
+                # lets a transient failure self-heal on the next tick.
+                self.switcher.recheck_keychain()
                 snap = _snapshot(self.switcher, full=full)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
