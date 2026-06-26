@@ -471,6 +471,8 @@ def run(switcher) -> int:
             self._last_auto_eval = 0.0
             self._last_full_fetch = 0.0
             self._refreshing = False
+            self._config_path = switcher._get_claude_config_path()
+            self._config_mtime = 0.0
             self.rebuild_menu()
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.
@@ -512,8 +514,31 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
+            self._detect_active_change()
             if self.settings.auto_switch_enabled:
                 self._auto_tick()
+
+        def _detect_active_change(self):
+            # Reflect account switches from any source (menu, CLI, auto-switcher)
+            # within ~1s. Detecting *which* account is active is a cheap local
+            # read of ~/.claude.json -- no Keychain or usage API -- so we can do
+            # it on every tick. We gate the read on the file's mtime (a cheap
+            # stat) so a large config isn't parsed each second, and only kick a
+            # refresh when the active email actually changed (Claude Code rewrites
+            # this file often for unrelated reasons).
+            if self._refreshing:
+                return  # a worker is already in-flight; it refreshes the marker
+            try:
+                mtime = self._config_path.stat().st_mtime
+            except OSError:
+                return
+            if mtime == self._config_mtime:
+                return
+            self._config_mtime = mtime
+            current = self.switcher._get_current_account()
+            email = current[0] if current else None
+            if email and email != self.snapshot.get("active_email"):
+                self.refresh_async(full=True)
 
         def _auto_tick(self):
             now = time.time()
