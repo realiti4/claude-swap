@@ -24,6 +24,7 @@ from claude_swap.exceptions import (
 from claude_swap import oauth
 from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.json_output import (
+    KEYCHAIN_UNAVAILABLE_STATUS,
     SCHEMA_VERSION,
     account_ref,
     account_row,
@@ -32,6 +33,7 @@ from claude_swap.json_output import (
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
+    ActiveCredentials,
     CredentialStore,
 )
 from claude_swap.locking import FileLock
@@ -152,6 +154,12 @@ class ClaudeAccountSwitcher:
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
+
+        # Set by _build_accounts_info: True when the active account's credential
+        # could not be read because the macOS Keychain was unavailable (locked /
+        # denied / timeout) with no plaintext fallback — so the usage row shows
+        # "keychain unavailable" instead of a misleading "no credentials".
+        self._active_keychain_unavailable = False
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -280,6 +288,9 @@ class ClaudeAccountSwitcher:
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
+
+    def _read_active_credentials(self) -> ActiveCredentials:
+        return self._store._read_active_credentials()
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
@@ -1114,6 +1125,10 @@ class ClaudeAccountSwitcher:
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str]] = []
+        # Reset each build; set below only when the active slot's Keychain read
+        # failed with no file fallback. Read by _collect_usage.fetch (main thread
+        # writes it here before the fetch pool starts → no data race).
+        self._active_keychain_unavailable = False
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -1122,7 +1137,9 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                creds = self._read_credentials() or ""
+                active = self._read_active_credentials()
+                creds = active.value or ""
+                self._active_keychain_unavailable = active.keychain_unavailable
             else:
                 creds = self._read_account_credentials(str(num), email)
 
@@ -1144,6 +1161,8 @@ class ClaudeAccountSwitcher:
         ) -> dict | str | None:
             num, email, _, _, is_active, creds = account_info
             if not creds or not oauth.extract_access_token(creds):
+                if is_active and self._active_keychain_unavailable:
+                    return KEYCHAIN_UNAVAILABLE_STATUS
                 return "no credentials"
 
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
@@ -1361,14 +1380,18 @@ class ClaudeAccountSwitcher:
     ) -> dict | str | None:
         """Usage for the active account as a ``_collect_usage``-style entry.
 
-        Returns ``"no credentials"`` when the live store has no usable token, a
-        usage dict on success, or ``None`` when the fetch fails. Reuses (and
+        Returns ``"no credentials"`` when the live store has no usable token,
+        ``"keychain unavailable"`` when the Keychain read failed with no fallback,
+        a usage dict on success, or ``None`` when the fetch fails. Reuses (and
         refreshes) the same ``cache/usage.json`` list_accounts writes — cache-first,
         fetching with ``is_active=True`` so cswap never refreshes Claude Code's live
         credentials, and merging into existing entries so other rows survive.
         """
-        creds = self._read_credentials() or ""
+        active = self._read_active_credentials()
+        creds = active.value or ""
         if not creds or not oauth.extract_access_token(creds):
+            if active.keychain_unavailable:
+                return KEYCHAIN_UNAVAILABLE_STATUS
             return "no credentials"
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)

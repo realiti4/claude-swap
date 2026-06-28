@@ -21,8 +21,9 @@ import base64
 import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import CredentialWriteError
@@ -37,6 +38,30 @@ SECURITY_SERVICE = "claude-swap"
 # Service name of Claude Code's *active* credential in the macOS Keychain (read by
 # Claude Code itself; we read/write it when switching accounts).
 CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+# Bounded retry for the active-credential Keychain read. A locked/contended login
+# Keychain can fail a single `security` call transiently — e.g. just after wake
+# while the keychain is still settling, or under contention with Claude Code's own
+# statusline polling the same item — and a second attempt a moment later usually
+# succeeds. This is an I/O backoff between retries of an external CLI, NOT a sleep
+# papering over an internal race.
+_ACTIVE_READ_ATTEMPTS = 2
+_ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+class ActiveCredentials(NamedTuple):
+    """Outcome of reading Claude Code's active credential.
+
+    ``value`` is the credential string, ``""`` when no credential exists in any
+    backend, or ``None`` on a plaintext-file read error. ``keychain_unavailable``
+    is True only when the macOS Keychain read failed (locked / denied / timeout)
+    and no plaintext fallback covered it — letting callers distinguish a
+    transiently unreadable Keychain from a genuinely empty slot, instead of
+    collapsing both into a misleading "no credentials".
+    """
+
+    value: str | None
+    keychain_unavailable: bool
 
 
 class _StoreHost(Protocol):
@@ -104,43 +129,80 @@ class CredentialStore:
         return self._keychain_usable_cache is not False
 
     def _read_credentials(self) -> str | None:
-        """Read Claude Code's active credentials.
+        """Read Claude Code's active credentials (value only).
 
-        macOS reads the Keychain (service "Claude Code-credentials") when it's
-        usable — mirroring Claude Code's keychain-first read — and an empty or
-        failed Keychain falls through to the plaintext file
-        ``~/.claude/.credentials.json`` (where Claude Code itself falls back).
-        Linux/WSL/Windows always read the file. Non-mutating.
-
-        Returns:
-            Credentials string if found, "" if not found, None on a file read error.
+        Thin wrapper over :meth:`_read_active_credentials` preserving the historic
+        ``str | None`` contract the switch paths rely on: credential string if
+        found, ``""`` if not found, ``None`` on a file read error.
         """
-        if self._use_keychain():
+        return self._read_active_credentials().value
+
+    def _read_active_keychain(self) -> tuple[str | None, bool]:
+        """Read the active-credential Keychain item with a bounded retry.
+
+        Returns ``(value, failed)``. ``value`` is the credential string, or
+        ``None`` when the item is absent (rc-44) or unreadable. ``failed`` is True
+        only when *every* attempt raised a KeychainError (locked / denied /
+        timeout); a genuinely absent item (rc-44, returned as ``None`` without
+        raising) reports ``failed=False`` and is not retried. The retry rides out
+        a transient lock/contention — it does not paper over an internal race.
+        """
+        last_error: Exception | None = None
+        for attempt in range(_ACTIVE_READ_ATTEMPTS):
             try:
-                val = self._kc_call(
+                value = self._kc_call(
                     macos_keychain.get_password,
                     CLAUDE_CODE_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
                 )
+                return value, False
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                # Locked / denied / unavailable Keychain (rc-44 "not found" comes
-                # back as None, not raised). _kc_call has flipped routing to file
-                # mode; fall through to the plaintext file Claude Code uses too.
-                # (A programming error is NOT caught here — it propagates.)
-                self._host._logger.warning(f"Keychain read failed, trying file: {e}")
-                val = None
+                last_error = e
+                if attempt + 1 < _ACTIVE_READ_ATTEMPTS:
+                    time.sleep(_ACTIVE_READ_RETRY_DELAY)
+        # Every attempt failed: _kc_call has flipped routing to file mode.
+        self._host._logger.warning(
+            f"Keychain read failed after {_ACTIVE_READ_ATTEMPTS} attempt(s), "
+            f"trying file: {last_error}"
+        )
+        return None, True
+
+    def _read_active_credentials(self) -> ActiveCredentials:
+        """Read Claude Code's active credentials, classifying the outcome.
+
+        macOS reads the Keychain (service "Claude Code-credentials") when it's
+        usable — mirroring Claude Code's keychain-first read, with a bounded retry
+        to ride out a transient lock/contention — and an empty or failed Keychain
+        falls through to the plaintext file ``~/.claude/.credentials.json`` (where
+        Claude Code itself falls back). Linux/WSL/Windows always read the file.
+        Non-mutating.
+
+        Unlike a bare read, this reports ``keychain_unavailable`` so the display
+        layer can say "keychain unavailable" rather than "no credentials" when the
+        slot is merely unreadable — which would otherwise nudge the user into an
+        unnecessary re-login.
+        """
+        keychain_unavailable = False
+        if self._use_keychain():
+            val, keychain_unavailable = self._read_active_keychain()
             if val:
-                return val
-            # Keychain empty (rc-44) or failed → read the plaintext fallback file.
+                return ActiveCredentials(val, False)
+            # val is None: either rc-44 "absent" (keychain_unavailable False) or
+            # every attempt failed (True). Either way, try the plaintext fallback.
+        elif self._host.platform == Platform.MACOS:
+            # Keychain already known unusable this process (a prior op failed and
+            # the capability cache stuck to file mode): a missing file below is
+            # "keychain unavailable", not a genuinely empty slot.
+            keychain_unavailable = True
 
         cred_file = get_credentials_path()
         if cred_file.exists():
             try:
-                return cred_file.read_text(encoding="utf-8")
+                return ActiveCredentials(cred_file.read_text(encoding="utf-8"), False)
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return None
-        return ""
+                return ActiveCredentials(None, False)
+        return ActiveCredentials("", keychain_unavailable)
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
