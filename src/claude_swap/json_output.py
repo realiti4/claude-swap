@@ -19,6 +19,10 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
+# The active account's macOS Keychain was unreadable (locked / denied / timeout)
+# with no plaintext fallback — distinct from a genuinely empty slot, so the user
+# isn't misled into an unnecessary re-login.
+USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -67,8 +71,9 @@ def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
-    (managed API-key account, no subscription quota), the ``USAGE_NO_CREDENTIALS``
-    sentinel, or ``None`` (fetch failed).
+    (managed API-key account, no subscription quota), the
+    ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
+    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed).
     """
     if isinstance(entry, dict):
         return "ok", usage_to_json(entry)
@@ -76,6 +81,8 @@ def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_KEYCHAIN_UNAVAILABLE:
+        return "keychain_unavailable", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None

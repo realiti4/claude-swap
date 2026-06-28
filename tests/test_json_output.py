@@ -15,6 +15,7 @@ from claude_swap.json_output import (
     usage_fields,
     usage_to_json,
 )
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -42,13 +43,18 @@ class TestJsonHelpers:
         assert out["spend"]["resetsAt"] == "2026-07-01T00:00:00Z"
 
     def test_usage_fields_variants(self):
-        from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_TOKEN_EXPIRED
+        from claude_swap.json_output import (
+            USAGE_KEYCHAIN_UNAVAILABLE,
+            USAGE_NO_CREDENTIALS,
+            USAGE_TOKEN_EXPIRED,
+        )
 
         assert usage_fields({"five_hour": {"pct": 1.0}})[0] == "ok"
         assert usage_fields({"five_hour": {"pct": 1.0}})[1] == {"fiveHour": {"pct": 1.0}}
         assert usage_fields(USAGE_NO_CREDENTIALS) == ("no_credentials", None)
         assert usage_fields("no credentials") == ("no_credentials", None)
         assert usage_fields(USAGE_TOKEN_EXPIRED) == ("token_expired", None)
+        assert usage_fields(USAGE_KEYCHAIN_UNAVAILABLE) == ("keychain_unavailable", None)
         assert usage_fields(None) == ("unavailable", None)
 
     def test_error_envelope_shape(self):
@@ -93,7 +99,8 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage):
             payload = switcher.list_accounts(json_output=True)
@@ -120,7 +127,8 @@ class TestListJson:
 
         # Account 1 active with creds but the fetch fails (None → unavailable);
         # account 2 has no backup creds (→ no_credentials).
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=""), \
              patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
             payload = switcher.list_accounts(json_output=True)
@@ -160,7 +168,8 @@ class TestStatusJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage):
             payload = switcher.status(json_output=True)
 

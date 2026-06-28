@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_credentials_path
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -444,7 +445,8 @@ class TestStatusCache:
         }
         write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
             switcher.status()
 
@@ -471,7 +473,8 @@ class TestStatusCache:
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result) as mock_fetch:
             switcher.status()
@@ -507,7 +510,8 @@ class TestStatusCache:
 
         usage_result = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result):
             switcher.status()
 
@@ -940,7 +944,8 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
 
-        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(self._EXPIRED, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
@@ -3169,6 +3174,98 @@ class TestMacosKeychainFallback:
         # Keychain empty → falls through to the plaintext file.
         del block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)]
         assert s._read_credentials() == "FROM-FILE"
+
+    def test_active_read_retries_transient_keychain_failure(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        # A single transient Keychain failure is retried; the second attempt
+        # succeeds, so the read returns the credential rather than falling back.
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "FROM-KC"
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+
+        calls = {"n": 0}
+        real_get = macos_keychain.get_password
+
+        def flaky_get(service, account):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeychainError("transient lock")
+            return real_get(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky_get)
+
+        result = s._read_active_credentials()
+        assert result.value == "FROM-KC"
+        assert result.keychain_unavailable is False
+        assert calls["n"] == 2  # failed once, retried once, succeeded
+
+    def test_active_read_keychain_unavailable_no_fallback(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        # OAuth Keychain unreadable on every attempt AND no file / managed-key
+        # fallback → report keychain_unavailable, distinct from an empty slot.
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        assert not get_credentials_path().exists()
+
+        result = s._read_active_credentials()
+        assert result.value == ""
+        assert result.keychain_unavailable is True
+        # The legacy value-only contract still reads as empty.
+        assert s._read_credentials() == ""
+
+    def test_active_read_keychain_failure_covered_by_file(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        # A failed OAuth Keychain read covered by a plaintext file is NOT
+        # "unavailable".
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("FROM-FILE")
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+
+        result = s._read_active_credentials()
+        assert result.value == "FROM-FILE"
+        assert result.keychain_unavailable is False
+
+    def test_active_read_absent_item_is_not_keychain_unavailable(
+        self, temp_home: Path, block_real_keychain
+    ):
+        # rc-44 "not found" (item genuinely absent, no raise) with no fallback is a
+        # real empty slot → "no credentials", never "keychain unavailable". No
+        # retry happens because nothing was raised.
+        s = self._macos_switcher()
+        assert not get_credentials_path().exists()
+
+        result = s._read_active_credentials()
+        assert result.value == ""
+        assert result.keychain_unavailable is False
+
+    def test_list_active_shows_keychain_unavailable(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        monkeypatch, block_real_keychain, capsys
+    ):
+        # Regression: the active account rendered "no credentials" when the
+        # Keychain was merely locked, nudging the user into an unnecessary
+        # re-login. It must now read "keychain unavailable" instead.
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = self._macos_switcher()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        assert not get_credentials_path().exists()
+
+        s.list_accounts()
+        out = capsys.readouterr().out
+        assert "test@example.com" in out and "(active)" in out
+        # The active row shows the intentional, actionable line — not the
+        # misleading "no credentials" that prompted the re-login.
+        assert "keychain unavailable — locked or in use; try again" in out
 
     def test_active_write_falls_back_to_file_and_clears_stale_keychain(
         self, temp_home: Path, monkeypatch, block_real_keychain
