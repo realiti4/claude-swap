@@ -11,13 +11,6 @@ from __future__ import annotations
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
-# Sentinel usage entry produced by the switcher when the active account's macOS
-# Keychain is unreadable (locked / denied / timeout) with no plaintext fallback.
-# Rendered verbatim in the human ``--list`` view and mapped to its own JSON
-# ``usageStatus`` so a transiently unreadable Keychain isn't reported as a
-# genuinely empty slot ("no credentials").
-KEYCHAIN_UNAVAILABLE_STATUS = "keychain unavailable"
-
 
 def _window_to_json(entry: dict) -> dict:
     """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``."""
@@ -63,14 +56,12 @@ def usage_to_json(usage: dict) -> dict:
 def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
-    ``_collect_usage`` yields one of: a usage dict, the ``"no credentials"`` or
-    ``"keychain unavailable"`` sentinel string, or ``None`` (fetch failed).
+    ``_collect_usage`` yields one of: a usage dict, the string ``"no credentials"``,
+    or ``None`` (fetch failed).
     """
     if isinstance(entry, dict):
         return "ok", usage_to_json(entry)
     if isinstance(entry, str):
-        if entry == KEYCHAIN_UNAVAILABLE_STATUS:
-            return "keychain_unavailable", None
         return "no_credentials", None
     return "unavailable", None
 
