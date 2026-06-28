@@ -90,11 +90,89 @@ Examples:
         sys.exit(130)
 
 
+def _autoswitch_command(argv: list[str]) -> None:
+    """Handle `cswap autoswitch [start|stop|status|check]` (bare = setup wizard).
+
+    Pre-dispatched like `run` because it has its own sub-verbs that can't coexist
+    with main()'s required mutually-exclusive flag group. The hidden `__run` verb
+    is the entry point the detached watcher process re-invokes on itself.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap autoswitch",
+        description=(
+            "Automatically switch to the account with the most quota left when "
+            "the active one crosses a usage-% threshold. Run with no subcommand "
+            "for the interactive setup wizard."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Subcommands:
+  (none)    interactive setup wizard (set thresholds, start/stop watcher)
+  start     start the background watcher
+  stop      stop the background watcher
+  status    show watcher state, rules, and per-account usage vs threshold
+  check     evaluate once now and switch if over threshold
+
+Examples:
+  cswap autoswitch            # set it up
+  cswap autoswitch start      # run the watcher in the background
+  cswap autoswitch status
+        """,
+    )
+    parser.add_argument(
+        "subcommand",
+        nargs="?",
+        choices=["start", "stop", "status", "check", "__run"],
+        help="What to do (omit for the setup wizard)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        from claude_swap import autoswitch
+
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        if args.subcommand == "__run":
+            autoswitch.run_watcher(switcher)
+        elif args.subcommand == "start":
+            pid = autoswitch.start_watcher(switcher)
+            print(f"Auto-switch watcher started (PID {pid}).")
+            print(dimmed("Stop it with 'cswap autoswitch stop'."))
+        elif args.subcommand == "stop":
+            stopped = autoswitch.stop_watcher(switcher)
+            print("Auto-switch watcher stopped." if stopped
+                  else dimmed("No auto-switch watcher was running."))
+        elif args.subcommand == "status":
+            autoswitch.print_status(switcher)
+        elif args.subcommand == "check":
+            autoswitch.print_check(switcher)
+        else:
+            autoswitch.run_wizard(switcher)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         _run_command(sys.argv[2:])
         return  # only reachable in tests where exec/exit is mocked
+
+    # `autoswitch` (alias `auto`) has its own sub-verbs, so it's pre-dispatched
+    # like `run` rather than mapped to a flag.
+    if len(sys.argv) > 1 and sys.argv[1] in ("autoswitch", "auto"):
+        _autoswitch_command(sys.argv[2:])
+        return
 
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
@@ -114,6 +192,8 @@ Examples:
   %(prog)s --switch-to user@example.com
   %(prog)s run 2                            # run account 2 in this terminal only
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
+  %(prog)s autoswitch                       # set up auto-switching by usage %% (wizard)
+  %(prog)s autoswitch start                 # background watcher: switch before a limit hits
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge
