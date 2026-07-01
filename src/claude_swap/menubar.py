@@ -20,7 +20,7 @@ from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
-AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
+AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
 AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
