@@ -278,6 +278,80 @@ class TestFetchUsage:
         assert "spend" not in result
 
 
+class TestBuildUsageResultResetsAt:
+    """Assert that resets_at is preserved in build_usage_result output."""
+
+    @staticmethod
+    def _call(data: dict) -> dict | None:
+        return oauth.build_usage_result(data)
+
+    def test_five_hour_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(hours=3)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"five_hour": {"utilization": 42.0, "resets_at": ts}})
+        assert result is not None
+        assert result["five_hour"]["resets_at"] == ts
+
+    def test_seven_day_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(days=2)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"seven_day": {"utilization": 55.0, "resets_at": ts}})
+        assert result is not None
+        assert result["seven_day"]["resets_at"] == ts
+
+    def test_spend_resets_at_preserved(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(days=10)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({
+                "extra_usage": {
+                    "is_enabled": True,
+                    "used_credits": 1000,
+                    "monthly_limit": 10000,
+                    "utilization": 10.0,
+                    "resets_at": ts,
+                    "currency": "USD",
+                }
+            })
+        assert result is not None
+        assert result["spend"]["resets_at"] == ts
+
+    def test_null_resets_at_not_stored(self):
+        result = self._call({"five_hour": {"utilization": 10.0, "resets_at": None}})
+        assert result is not None
+        assert "resets_at" not in result["five_hour"]
+
+    def test_missing_resets_at_not_stored(self):
+        result = self._call({"five_hour": {"utilization": 10.0}})
+        assert result is not None
+        assert "resets_at" not in result["five_hour"]
+
+    def test_resets_at_does_not_affect_existing_fields(self):
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (fixed_now + timedelta(hours=1)).isoformat()
+        with patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = self._call({"five_hour": {"utilization": 80.0, "resets_at": ts}})
+        assert result is not None
+        assert result["five_hour"]["pct"] == 80.0
+        assert "countdown" in result["five_hour"]
+        assert "clock" in result["five_hour"]
+        assert result["five_hour"]["resets_at"] == ts
+
+
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
 
@@ -620,6 +694,74 @@ class TestFetchUsageForAccount:
                 "1", "test@example.com", credentials,
                 is_active=True,
                 persist_credentials=persist_mock,
+            )
+
+        assert result is None
+        persist_mock.assert_not_called()
+
+    def test_inactive_expired_token_not_refreshed_when_refresh_disabled(self):
+        """allow_refresh=False (the background daemon) must NOT refresh an
+        inactive account's expired token.
+
+        A refresh rotates the one-time OAuth refresh token server-side; the
+        daemon runs under launchd where the Keychain may be locked (Mac asleep),
+        so a rotation it cannot persist would brick the account. With refresh
+        disabled it must skip both the token POST and the doomed usage GET and
+        return None, leaving last-known usage to stand.
+        """
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+
+        persist_mock = MagicMock()
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise AssertionError(
+                    "Refresh-disabled fetch must not POST to the token endpoint"
+                )
+            if "oauth/usage" in req.full_url:
+                raise AssertionError(
+                    "Refresh-disabled fetch must not GET usage with an expired token"
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "2", "test@example.com", credentials,
+                is_active=False,
+                persist_credentials=persist_mock,
+                allow_refresh=False,
+            )
+
+        assert result is None
+        persist_mock.assert_not_called()
+
+    def test_inactive_401_not_retried_when_refresh_disabled(self):
+        """allow_refresh=False must not refresh-retry an inactive account on 401.
+
+        Even a still-valid (non-expired) inactive token that 401s must return
+        None without rotating the refresh token when refresh is disabled.
+        """
+        credentials = self._make_credentials()  # fresh (non-expired) token
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise AssertionError(
+                    "Refresh-disabled fetch must not refresh-retry on 401"
+                )
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        persist_mock = MagicMock()
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "2", "test@example.com", credentials,
+                is_active=False,
+                persist_credentials=persist_mock,
+                allow_refresh=False,
             )
 
         assert result is None

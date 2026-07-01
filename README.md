@@ -107,10 +107,83 @@ cswap --upgrade                 # Upgrade claude-swap to the latest version
 cswap --purge                   # Remove all claude-swap data
 ```
 
+### Auto-switch (macOS only)
+
+Automatically switch to the next available account when your current account's quota nears its limit — no manual intervention required.
+
+#### Background daemon (recommended)
+
+Install a launchd agent that monitors usage and switches in the background:
+
+```bash
+cswap auto on          # Enable auto-switch and install the launchd daemon
+cswap auto off         # Disable and uninstall the daemon
+cswap auto status      # Show daemon status and current config
+```
+
+The daemon starts automatically at login and restarts if it crashes.
+
+#### Foreground watch mode
+
+Run the monitor in the current terminal (useful for debugging or one-off sessions):
+
+```bash
+cswap watch
+```
+
+Press `Ctrl+C` to stop.
+
+#### Strategies
+
+Two policies decide *when* to switch (`cswap auto on --strategy <name>`, or `cswap watch --strategy <name>`):
+
+- **`consume-first`** (default for new installs) — *proactive*. Keeps you on the account to consume **first**: the available account whose **weekly window resets soonest** (use-it-or-lose-it, so quota isn't wasted at reset). It switches whenever that account changes — a reset re-orders the queue, the current account exhausts, or an account that hit its 5-hour limit clears and reclaims the soonest-reset slot. If the chosen account hits its 5-hour session limit while its weekly still has room, it moves to another account temporarily and returns once the 5-hour window resets.
+- **`reactive`** — *threshold-only* (the original behavior). Stays put until the active account crosses a limit (5h ≥ 98% or 7d ≥ 99%), then jumps to the account with the soonest weekly reset among those that still have headroom.
+
+```bash
+cswap auto on --strategy consume-first   # proactive (default)
+cswap auto on --strategy reactive        # switch only at 98%/99%
+cswap auto status                        # shows the active strategy
+```
+
+> `cswap auto on --strategy X` **persists** the choice to the daemon config. `cswap watch --strategy X` applies the strategy to that foreground session **only** — it does not change the persisted daemon config. Use `cswap auto on --strategy X` to make the change stick.
+
+#### How it works
+
+- **Session threshold** (default 98%): the 5-hour limit. In `reactive` mode crossing it triggers a switch; in `consume-first` mode it marks an account temporarily unavailable (skipped, then reclaimed after its 5-hour reset).
+- **Weekly threshold** (default 99%): the **weekly window** — a fixed weekly quota that resets on a schedule (not a gradually-rolling average; at reset an account's weekly utilization drops cleanly back to ~0%, which is what makes "consume the soonest-resetting account first" worthwhile). An account at/over it is excluded until it resets.
+- The next account is chosen by: earliest reset time → most remaining headroom → rotation order.
+- Accounts running a separate `cswap run` **session-mode** profile are excluded from the candidate pool (so the daemon never swaps an account out from under a dedicated `cswap run` session). Your **default-login** account — the one an ordinary `claude` chat reads — is **not** pinned: the daemon switches it when it hits the 5-hour limit. An in-flight conversation isn't migrated mid-stream; the switch takes effect on your **next message** (see [Tips](#tips), "Continuing sessions").
+- **Inactive accounts.** The background daemon reads each peer's usage but never **refreshes** an expired inactive account's token — an OAuth refresh rotates a one-time refresh token, and a rotation the daemon can't persist (e.g. a locked Keychain while the Mac is asleep) would otherwise brick that account until re-login. So a peer that has been inactive for a while shows its **last-known** usage in `cswap auto status` until you next touch it (a foreground `cswap --list`, or a switch, refreshes and re-saves it). Reset times are fixed, so this never affects the consumption ranking.
+- **Active-account usage cache (`usage_cache_file`).** The **active** account is the one Claude Code is actively using *and* polling for its statusline, so the daemon's own usage call on it contends with those and is the one that flaps under rate limits. If a CodexBar-compatible statusline is caching usage (default path `/tmp/claude/statusline-usage-cache.json`), the daemon **reuses that cache** for the active account instead of making a redundant call — but only when the cache is fresh (≤90s) *and* its 7‑day reset matches the active account's last-known reset (an account-identity check, since the cache carries no account id). Otherwise it falls back to a direct fetch. Set `usage_cache_file` to `""` in `auto-switch.json` to disable.
+- A macOS notification is sent when a switch happens or all accounts are exhausted (requires `notify: true`, which is the default).
+- **Polling.** In **`reactive`** mode polling is minimal: a normal check reads only the active account's usage (one API call), and the other accounts are read only when the active account crosses a threshold and a switch is possible. In **`consume-first`** mode every check polls **all** accounts (it has to, to rank them by reset time) — still gentle at the same 60s–300s cadence (slower when far away). As the active account's **5-hour** window nears the limit the cadence tightens to a brief critical interval (`critical_interval`, default 15s) so the switch fires **before** the hard 100% wall — which would otherwise abort the in-flight request and force a restart. This tight poll only fires close to the 5-hour limit and stops the moment the switch happens, so it doesn't raise the steady-state poll rate.
+
+#### Connection loss
+
+The monitor depends on the Anthropic usage API. If the network drops and usage can't be read, the auto-switcher fails safely:
+
+- **Safe:** it never switches on stale or unknown data — switching onto a possibly-exhausted account would be risky, and during a real outage Claude Code is blocked anyway, so no quota is burning. It simply waits.
+- **Visible:** `cswap auto status` shows a `monitoring: offline since …` line and a one-shot "offline" notification fires.
+- **Recoverable:** the first successful poll resumes monitoring automatically and sends a one-shot "back online" notification. With a usage cache configured (the default — see `usage_cache_file` above) the daemon retries at the `min_interval` floor while offline: a fresh statusline cache recovers it without an API call, so a transient rate‑limit (the active account is the most polled, so it's the one that 429s under contention) doesn't leave it "offline" for long. With no cache it backs off exponentially (capped) instead of hammering a real outage.
+
+#### Configuration
+
+Adjust thresholds when enabling:
+
+```bash
+cswap auto on --session-threshold 95 --weekly-threshold 98
+cswap auto on --no-notify          # disable desktop notifications
+```
+
+The config is stored in `<backup-root>/auto-switch.json` and survives daemon restarts.
+
+> **Note:** Auto-switch is macOS-only. The `watch` command and daemon require macOS. The underlying decision engine (`cswap auto on/off/status`) works on all platforms but the daemon integration uses launchd.
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
-- **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — run `cswap --switch` in any terminal and carry on. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
+- **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — whether you ran `cswap --switch` manually or the **auto-switch daemon** swapped the account for you — and carry on; the new account takes effect on your next message (on macOS once the ~30s Keychain cache expires). An in-flight turn is not migrated mid-stream: it stays on the account it started on. This is why the daemon polls tightly as the 5-hour limit approaches and switches **before** 100% — so your next message lands on a fresh account rather than hitting the wall. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
 
 ## How it works
 

@@ -2110,15 +2110,49 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(target_account, emit_output=not json_output)
         return self._switch_result_from_op(op, "direct") if json_output else None
 
+    def auto_switch_to(self, target_account: str, quiet: bool = True) -> None:
+        """Switch performed by the auto-switcher engine.
+
+        Same transactional path as ``switch_to`` / ``_perform_switch`` but
+        pre-resolves the numeric target (engine passes a validated num) and
+        runs quietly by default so daemon output goes to the log file rather
+        than stdout (``quiet`` maps to ``emit_output=False``).
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        self._get_sequence_data_migrated()
+
+        data = self._get_sequence_data()
+        if target_account not in (data or {}).get("accounts", {}):
+            from claude_swap.exceptions import AccountNotFoundError
+            raise AccountNotFoundError(
+                f"Account-{target_account} does not exist"
+            )
+
+        # Re-validate switchability up front (parity with switch_to). The engine
+        # picks a target from a snapshot taken earlier in the tick; if the
+        # account's credential/config backups were removed in the meantime
+        # (remove-during-tick race), fail cleanly HERE with a clear error rather
+        # than deep inside the transactional _perform_switch.
+        if not self._account_is_switchable(target_account):
+            raise SwitchError(
+                f"Account-{target_account} has no stored credentials/config "
+                f"(re-add with: cswap --add-account --slot {target_account})"
+            )
+
+        # quiet → emit_output=False (daemon mode: log only, no stdout).
+        self._perform_switch(target_account, emit_output=not quiet)
+
     def _perform_switch(self, target_account: str, emit_output: bool = True) -> dict:
         """Perform the actual account switch with transaction support.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
         left/landed identities under the lock so callers don't reconstruct ``from``
-        after the mutation. When ``emit_output`` is False (JSON mode) all human
-        output is suppressed — the live-session warning, the "Switched"/"Activated"
-        lines, the nested list_accounts() summary and the followup — and the
-        live-session warning rides back in ``warnings`` instead.
+        after the mutation. When ``emit_output`` is False (JSON / daemon mode) all
+        human output is suppressed — the live-session warning, the
+        "Switched"/"Activated" lines, the nested list_accounts() summary and the
+        followup — and the live-session warning rides back in ``warnings`` instead.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -2372,8 +2406,8 @@ class ClaudeAccountSwitcher:
 
         # Lock released. Safe to do network I/O and let persist callbacks
         # re-acquire the lock from inside list_accounts(). All of this is display
-        # only — suppressed in JSON mode (the nested list_accounts() would
-        # otherwise leak human output onto the JSON stdout).
+        # only — suppressed in JSON / daemon mode (the nested list_accounts()
+        # would otherwise leak human output onto the JSON stdout).
         if emit_output:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             try:

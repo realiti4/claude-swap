@@ -8,8 +8,11 @@ import os
 import sys
 
 from claude_swap import __version__
+from claude_swap.auto_switch import AutoSwitcher, load_config as _as_load_config, save_config as _as_save_config
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.launchd import agent_status, install_agent, uninstall_agent
+from claude_swap.models import Platform
 from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -90,11 +93,268 @@ Examples:
         sys.exit(130)
 
 
+def _fmt_clock_ago(ts: float) -> str:
+    """Render a wall-clock POSIX ts as ``HH:MM (Nm ago)`` in local time."""
+    from datetime import datetime, timezone
+
+    try:
+        dt_local = datetime.fromtimestamp(ts).astimezone()
+        delta = datetime.now(timezone.utc).timestamp() - ts
+        mins = max(0, int(delta // 60))
+        if mins >= 60:
+            ago = f"{mins // 60}h {mins % 60}m ago"
+        else:
+            ago = f"{mins}m ago"
+        return f"{dt_local.strftime('%H:%M')} ({ago})"
+    except Exception:
+        return "unknown"
+
+
+def _monitoring_status_line(backup_root) -> str:
+    """One-line monitoring health for ``cswap auto status`` (offline-aware).
+
+    Only renders "offline" once we've actually DECLARED offline
+    (``offline_notified`` — i.e. >= 2 consecutive failures, matching the
+    notification gate). A single transient failure that hasn't yet crossed the
+    threshold renders as "checking — retrying", so the UI word "offline" lines
+    up with when the engine truly considers itself offline.
+    """
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    if state.offline_notified:
+        if state.last_online_ts is not None:
+            return f"offline since {_fmt_clock_ago(state.last_online_ts)}"
+        return "offline (never reached the usage API)"
+    if 0 < state.consecutive_failures < 2:
+        n = state.consecutive_failures
+        return f"checking — {n} failed check{'s' if n != 1 else ''}, retrying"
+    if state.last_online_ts is not None:
+        return f"online (last check {_fmt_clock_ago(state.last_online_ts)})"
+    return "online (no check yet)"
+
+
+def _last_switch_status_line(backup_root) -> str | None:
+    """``account-X at HH:MM (reason)`` from state, or None when never switched."""
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    sw = state.last_switch
+    if not isinstance(sw, dict) or "account" not in sw:
+        return None
+    acct = sw.get("account")
+    reason = sw.get("reason", "")
+    ts = sw.get("ts")
+    when = _fmt_clock_ago(ts) if isinstance(ts, (int, float)) else "unknown"
+    return f"account-{acct} at {when} ({reason})"
+
+
+def _last_usage_status_lines(backup_root) -> list[str]:
+    """Per-account last-known 5h/7d% (with age) from monitor state.
+
+    Renders the ``last_usage`` the daemon records each tick — clearly labelled
+    as last-known (the daemon probes only the active account most ticks, so a
+    peer's reading can be older). Empty when nothing has been recorded yet.
+    """
+    from claude_swap.auto_switch_state import load_state
+
+    state = load_state(backup_root)
+    if not isinstance(state.last_usage, dict) or not state.last_usage:
+        return []
+
+    def _pct(usage: dict, key: str):
+        w = usage.get(key) if isinstance(usage, dict) else None
+        if isinstance(w, dict) and isinstance(w.get("pct"), (int, float)):
+            return float(w["pct"])
+        return None
+
+    lines: list[str] = []
+    for num in sorted(state.last_usage, key=lambda n: (len(n), n)):
+        entry = state.last_usage[num]
+        if not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        h5 = _pct(usage, "five_hour")
+        d7 = _pct(usage, "seven_day")
+        h5_s = f"5h {h5:.0f}%" if h5 is not None else "5h —"
+        d7_s = f"7d {d7:.0f}%" if d7 is not None else "7d —"
+        fetched_at = entry.get("fetched_at")
+        age = (
+            _fmt_clock_ago(fetched_at)
+            if isinstance(fetched_at, (int, float))
+            else "unknown"
+        )
+        lines.append(f"  acct {num}: {h5_s}  {d7_s}  (last-known {age})")
+    return lines
+
+
+def _auto_command(argv: list[str]) -> None:
+    """Handle ``cswap auto [on|off|status]``, ``cswap watch``, ``cswap _auto-daemon``.
+
+    Pre-dispatched before the main argparse parser so these subcommands can
+    coexist with the existing required mutually-exclusive group.
+    """
+    from dataclasses import replace as _replace
+
+    from claude_swap.auto_switch import AutoSwitchConfig  # noqa: F401 — for type hints
+
+    verb = argv[0] if argv else "auto"
+
+    # Hidden daemon entry point (launchd calls this).
+    if verb == "_auto-daemon":
+        try:
+            switcher = ClaudeAccountSwitcher()
+            config = _as_load_config(switcher.backup_dir)
+            AutoSwitcher(switcher, config).run_daemon()
+        except Exception as exc:
+            error(f"Error: auto-switch daemon: {exc}")
+            sys.exit(1)
+        return
+
+    # Foreground watch loop.
+    if verb == "watch":
+        parser = argparse.ArgumentParser(prog="cswap watch")
+        parser.add_argument("--session-threshold", type=float, metavar="N")
+        parser.add_argument("--weekly-threshold", type=float, metavar="N")
+        parser.add_argument("--no-notify", action="store_true")
+        parser.add_argument(
+            "--strategy", choices=["reactive", "consume-first"],
+            metavar="{reactive,consume-first}",
+        )
+        args = parser.parse_args(argv[1:])
+
+        if Platform.detect() is not Platform.MACOS:
+            print(dimmed(
+                "Auto-switch watch is a macOS-only feature for now.\n"
+                "The decision engine and tests run on all platforms."
+            ))
+            sys.exit(0)
+
+        try:
+            switcher = ClaudeAccountSwitcher()
+            config = _as_load_config(switcher.backup_dir)
+            overrides: dict = {}
+            if args.session_threshold is not None:
+                overrides["session_threshold"] = args.session_threshold
+            if args.weekly_threshold is not None:
+                overrides["weekly_threshold"] = args.weekly_threshold
+            if args.no_notify:
+                overrides["notify"] = False
+            if args.strategy is not None:
+                overrides["strategy"] = args.strategy
+            if overrides:
+                config = _replace(config, **overrides)
+
+            AutoSwitcher(switcher, config).watch()
+        except Exception as exc:
+            error(f"Error: {exc}")
+            sys.exit(1)
+        return
+
+    # cswap auto [on|off|status]
+    parser = argparse.ArgumentParser(prog="cswap auto")
+    parser.add_argument(
+        "subverb",
+        nargs="?",
+        choices=["on", "off", "status"],
+        default="status",
+    )
+    parser.add_argument("--session-threshold", type=float, metavar="N")
+    parser.add_argument("--weekly-threshold", type=float, metavar="N")
+    parser.add_argument("--no-notify", action="store_true")
+    parser.add_argument(
+        "--strategy", choices=["reactive", "consume-first"],
+        metavar="{reactive,consume-first}",
+    )
+    args = parser.parse_args(argv[1:])
+
+    try:
+        switcher = ClaudeAccountSwitcher()
+        backup_root = switcher.backup_dir
+
+        if args.subverb == "on":
+            # New install (no config file yet) defaults to the proactive
+            # consume-first policy; an existing config keeps its strategy unless
+            # --strategy overrides it.
+            config_existed = (backup_root / "auto-switch.json").exists()
+            config = _as_load_config(backup_root)
+            overrides_on: dict = {"enabled": True}
+            if args.session_threshold is not None:
+                overrides_on["session_threshold"] = args.session_threshold
+            if args.weekly_threshold is not None:
+                overrides_on["weekly_threshold"] = args.weekly_threshold
+            if args.no_notify:
+                overrides_on["notify"] = False
+            if args.strategy is not None:
+                overrides_on["strategy"] = args.strategy
+            elif not config_existed:
+                overrides_on["strategy"] = "consume-first"
+            config = _replace(config, **overrides_on)
+            _as_save_config(config, backup_root)
+            # Normal-visibility disclosure: a new install silently defaults to
+            # consume-first (and a purge-then-on can flip an existing user), so
+            # the active strategy must be plainly shown, not dimmed.
+            print(f"Auto-switch enabled (strategy: {config.strategy}).")
+
+            if Platform.detect() is Platform.MACOS:
+                msg = install_agent(backup_root)
+                print(msg)
+            else:
+                print(dimmed(
+                    "Auto-switch daemon is macOS-only; config saved but daemon "
+                    "not installed. Use `cswap watch` to run it in the foreground."
+                ))
+
+        elif args.subverb == "off":
+            config = _as_load_config(backup_root)
+            config = _replace(config, enabled=False)
+            _as_save_config(config, backup_root)
+
+            if Platform.detect() is Platform.MACOS:
+                msg = uninstall_agent()
+                print(msg)
+            else:
+                print(dimmed("Config saved (no daemon to uninstall — macOS only)."))
+
+        else:  # status (default)
+            config = _as_load_config(backup_root)
+            print(f"enabled:           {config.enabled}")
+            print(f"strategy:          {config.strategy}")
+            print(f"session_threshold: {config.session_threshold}%")
+            print(f"weekly_threshold:  {config.weekly_threshold}%")
+            print(f"notify:            {config.notify}")
+            print(f"poll interval:     {config.min_interval}s – {config.max_interval}s")
+            print(f"monitoring:        {_monitoring_status_line(backup_root)}")
+            last_switch = _last_switch_status_line(backup_root)
+            if last_switch is not None:
+                print(f"last switch:       {last_switch}")
+            usage_lines = _last_usage_status_lines(backup_root)
+            if usage_lines:
+                print("last-known usage:")
+                for line in usage_lines:
+                    print(line)
+
+            if Platform.detect() is Platform.MACOS:
+                print(f"agent:             {agent_status()}")
+            else:
+                print(dimmed("agent:             n/a (macOS only)"))
+
+    except Exception as exc:
+        error(f"Error: {exc}")
+        sys.exit(1)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         _run_command(sys.argv[2:])
         return  # only reachable in tests where exec/exit is mocked
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("auto", "watch", "_auto-daemon"):
+        _auto_command(sys.argv[1:])
+        return
 
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
@@ -115,6 +375,8 @@ Examples:
   %(prog)s --switch-to user@example.com
   %(prog)s run 2                            # run account 2 in this terminal only
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
+  %(prog)s auto on                          # macOS: auto-switch accounts before you hit a limit
+  %(prog)s watch                            # run the auto-switcher in this terminal
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge

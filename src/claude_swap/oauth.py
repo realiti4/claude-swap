@@ -170,6 +170,7 @@ def build_usage_result(data: dict) -> dict | None:
         if h5.get("resets_at"):
             h5_entry["resets_at"] = h5["resets_at"]
             h5_entry["countdown"], h5_entry["clock"] = format_reset(h5["resets_at"])
+            h5_entry["resets_at"] = h5["resets_at"]
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
@@ -178,6 +179,7 @@ def build_usage_result(data: dict) -> dict | None:
         if d7.get("resets_at"):
             d7_entry["resets_at"] = d7["resets_at"]
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
+            d7_entry["resets_at"] = d7["resets_at"]
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")
@@ -200,6 +202,7 @@ def build_usage_result(data: dict) -> dict | None:
                 if eu.get("resets_at"):
                     spend_entry["resets_at"] = eu["resets_at"]
                     spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+                    spend_entry["resets_at"] = eu["resets_at"]
                 result["spend"] = spend_entry
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
@@ -207,7 +210,7 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
-def account_headroom(usage: dict | None) -> float | None:
+def account_headroom(usage: dict | str | None) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
     Considers only the 5-hour and 7-day utilization windows — the two that
@@ -216,6 +219,9 @@ def account_headroom(usage: dict | None) -> float | None:
     *binding* window (``100 - max(pct)``), so ``<= 0`` means the account is at
     or over a limit. Returns ``None`` when usage is unavailable or carries no
     window data, which callers treat as "unknown" (never auto-skipped).
+
+    Accepts the full usage union (incl. the ``"no credentials"`` sentinel str);
+    the isinstance guard returns ``None`` for any non-dict.
     """
     if not isinstance(usage, dict):
         return None
@@ -245,10 +251,22 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    allow_refresh: bool = True,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+
+    ``allow_refresh`` gates the inactive-account token refresh and MUST be False
+    for the background launchd daemon. An OAuth refresh rotates the one-time
+    refresh token server-side; if the rotated token cannot be persisted — the
+    Keychain is locked while the Mac is asleep under launchd, or (as the daemon
+    historically did) no persist callback is wired — the rotation is lost and
+    the account is bricked until re-login. Foreground paths (a switch,
+    ``cswap --list``) run in the user's unlocked session where persistence is
+    reliable, so they keep the default (True). When False, an expired inactive
+    token returns None (its last-known usage stands) instead of a doomed,
+    token-burning refresh.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -257,11 +275,26 @@ def fetch_usage_for_account(
 
     working_credentials = credentials
 
-    if (
+    inactive_expired = (
         not is_active
-        and oauth.get("refreshToken")
+        and bool(oauth.get("refreshToken"))
         and is_oauth_token_expired(oauth.get("expiresAt"))
-    ):
+    )
+
+    if inactive_expired and not allow_refresh:
+        # Background daemon: never rotate a refresh token we may be unable to
+        # persist (locked Keychain under launchd). Skip the doomed request too —
+        # an expired token only 401s. Last-known usage stands; a foreground
+        # path refreshes it later.
+        _logger.debug(
+            "Inactive account %s (%s): token expired but refresh is disabled "
+            "for this context (background daemon) — leaving last-known usage.",
+            account_num,
+            email,
+        )
+        return None
+
+    if inactive_expired:
         refreshed = refresh_oauth_credentials(working_credentials)
         if refreshed:
             working_credentials = refreshed
@@ -277,6 +310,7 @@ def fetch_usage_for_account(
         if (
             e.code != 401
             or is_active
+            or not allow_refresh
             or not oauth
             or not oauth.get("refreshToken")
         ):

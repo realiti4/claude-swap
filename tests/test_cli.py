@@ -8,12 +8,13 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -493,6 +494,528 @@ class TestRunCommand:
         )
         assert "run 2" in result.stdout
 
+class TestAutoCommand:
+    """Tests for _auto_command dispatch and cswap auto/watch/_auto-daemon."""
+
+    def _dispatch(self, argv: list[str]):
+        """Call cli._auto_command directly."""
+        from claude_swap import cli as _cli
+        return _cli._auto_command(argv)
+
+    # -----------------------------------------------------------------------
+    # auto status
+    # -----------------------------------------------------------------------
+
+    def test_auto_status_default_prints_config(self, capsys, temp_home: Path):
+        """``cswap auto`` with no subverb shows config fields."""
+        from claude_swap.auto_switch import AutoSwitchConfig, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(AutoSwitchConfig(enabled=True), backup_root=backup)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto"])
+
+        out = capsys.readouterr().out
+        assert "enabled" in out
+        assert "session_threshold" in out
+        assert "weekly_threshold" in out
+
+    def test_auto_status_explicit_subverb(self, capsys, temp_home: Path):
+        """``cswap auto status`` is equivalent to ``cswap auto``."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "enabled" in out
+
+    def test_auto_status_shows_monitoring_line(self, capsys, temp_home: Path):
+        """status shows a 'monitoring:' line; offline state is surfaced."""
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        # Persist an offline state.
+        save_state(
+            MonitorState(
+                last_online_ts=1.0, consecutive_failures=3, offline_notified=True
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "monitoring:" in out
+        assert "offline" in out.lower()
+
+    def test_auto_status_shows_last_switch_when_present(self, capsys, temp_home: Path):
+        """status shows a 'last switch:' line when state has one."""
+        import time
+
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_state(
+            MonitorState(
+                last_online_ts=time.time(),
+                last_switch={"account": "2", "ts": time.time(), "reason": "5h-threshold"},
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last switch:" in out
+        assert "account-2" in out
+
+    def test_auto_status_no_last_switch_line_when_absent(self, capsys, temp_home: Path):
+        """No 'last switch:' line when state has never recorded one."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last switch:" not in out
+
+    def test_auto_status_shows_last_known_usage(self, capsys, temp_home: Path):
+        """status renders per-account last-known 5h/7d% from monitor state."""
+        import time
+
+        from claude_swap.auto_switch_state import MonitorState, save_state
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_state(
+            MonitorState(
+                last_online_ts=time.time(),
+                last_usage={
+                    "3": {
+                        "usage": {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 12.0}},
+                        "fetched_at": time.time(),
+                    },
+                },
+            ),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last-known usage:" in out
+        assert "acct 3" in out
+        assert "5h 25%" in out
+        assert "7d 12%" in out
+
+    def test_auto_status_no_usage_block_when_empty(self, capsys, temp_home: Path):
+        """No 'last-known usage:' header when state has no readings."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "last-known usage:" not in out
+
+    def test_auto_on_config_save_failure_clean_error(self, temp_home: Path, capsys):
+        """If save_config raises (e.g. read-only dir), print a clean error and
+        exit(1) — NOT a raw traceback."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX), \
+             patch(
+                 "claude_swap.cli._as_save_config",
+                 side_effect=OSError("read-only file system"),
+             ):
+            with pytest.raises(SystemExit) as exc_info:
+                self._dispatch(["auto", "on"])
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        # A clean one-line error was printed (no bare traceback text).
+        assert "read-only file system" in combined or "Error" in combined
+
+    # -----------------------------------------------------------------------
+    # auto on / off
+    # -----------------------------------------------------------------------
+
+    def _mock_switcher_with_backup(self, backup: Path):
+        """Return a mock ClaudeAccountSwitcher whose backup_dir is ``backup``."""
+        mock = MagicMock(spec=ClaudeAccountSwitcher)
+        mock.backup_dir = backup
+        return mock
+
+    def test_auto_on_saves_enabled(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with (
+            patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw),
+            patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX),
+        ):
+            self._dispatch(["auto", "on"])
+
+        cfg = load_config(backup_root=backup)
+        assert cfg.enabled is True
+
+    def test_auto_off_saves_disabled(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import AutoSwitchConfig, load_config, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(AutoSwitchConfig(enabled=True), backup_root=backup)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with (
+            patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw),
+            patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX),
+        ):
+            self._dispatch(["auto", "off"])
+
+        cfg = load_config(backup_root=backup)
+        assert cfg.enabled is False
+
+    def test_auto_on_with_thresholds(self, temp_home: Path):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with (
+            patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw),
+            patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX),
+        ):
+            self._dispatch(["auto", "on", "--session-threshold", "90", "--weekly-threshold", "95"])
+
+        cfg = load_config(backup_root=backup)
+        assert cfg.session_threshold == 90.0
+        assert cfg.weekly_threshold == 95.0
+
+    def test_auto_on_no_notify_flag(self, temp_home: Path):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with (
+            patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw),
+            patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX),
+        ):
+            self._dispatch(["auto", "on", "--no-notify"])
+
+        cfg = load_config(backup_root=backup)
+        assert cfg.notify is False
+
+    def test_auto_on_macos_calls_install_agent(self, temp_home: Path, capsys):
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.MACOS), \
+             patch("claude_swap.cli.install_agent", return_value="installed ok") as mock_install:
+            self._dispatch(["auto", "on"])
+
+        mock_install.assert_called_once()
+
+    def test_auto_off_macos_calls_uninstall_agent(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import AutoSwitchConfig, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(AutoSwitchConfig(enabled=True), backup_root=backup)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.MACOS), \
+             patch("claude_swap.cli.uninstall_agent", return_value="uninstalled ok") as mock_uninstall:
+            self._dispatch(["auto", "off"])
+
+        mock_uninstall.assert_called_once()
+
+    # -----------------------------------------------------------------------
+    # consume-first strategy (CLI surface)
+    # -----------------------------------------------------------------------
+
+    def test_auto_on_shows_strategy_normal_visibility(self, temp_home: Path, capsys):
+        """FIX 6: the active strategy is shown in a plain (non-dimmed) line."""
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        out = capsys.readouterr().out
+        assert "Auto-switch enabled (strategy: " in out
+        # New install (no prior config file) silently defaults to consume-first.
+        assert "consume-first" in out
+
+    def test_auto_on_new_install_defaults_consume_first(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        # No auto-switch.json on disk → "new install".
+        assert not (backup / "auto-switch.json").exists()
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        assert load_config(backup_root=backup).strategy == "consume-first"
+
+    def test_auto_on_existing_config_preserves_strategy(self, temp_home: Path, capsys):
+        """An existing config (reactive) is preserved when --strategy is absent."""
+        from claude_swap.auto_switch import AutoSwitchConfig, load_config, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(
+            AutoSwitchConfig(enabled=False, strategy="reactive"), backup_root=backup
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on"])
+
+        # Strategy NOT flipped to consume-first because a config already existed.
+        assert load_config(backup_root=backup).strategy == "reactive"
+
+    def test_auto_on_explicit_strategy_persisted(self, temp_home: Path, capsys):
+        from claude_swap.auto_switch import load_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "on", "--strategy", "reactive"])
+
+        assert load_config(backup_root=backup).strategy == "reactive"
+
+    def test_auto_status_shows_strategy_line(self, capsys, temp_home: Path):
+        from claude_swap.auto_switch import AutoSwitchConfig, save_config
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        save_config(
+            AutoSwitchConfig(enabled=True, strategy="consume-first"),
+            backup_root=backup,
+        )
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            self._dispatch(["auto", "status"])
+
+        out = capsys.readouterr().out
+        assert "strategy:" in out
+        assert "consume-first" in out
+
+    # -----------------------------------------------------------------------
+    # watch
+    # -----------------------------------------------------------------------
+
+    def test_watch_non_macos_prints_notice(self, capsys):
+        from claude_swap.models import Platform
+
+        with patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            with pytest.raises(SystemExit) as excinfo:
+                self._dispatch(["watch"])
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "macOS" in out
+
+    def test_watch_macos_calls_autoswitch_watch(self, temp_home: Path):
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_switcher = self._mock_switcher_with_backup(backup)
+        mock_as = MagicMock()
+
+        with patch("claude_swap.cli.Platform.detect", return_value=Platform.MACOS), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_switcher), \
+             patch("claude_swap.cli.AutoSwitcher", return_value=mock_as):
+            self._dispatch(["watch"])
+
+        mock_as.watch.assert_called_once()
+
+    # -----------------------------------------------------------------------
+    # _auto-daemon
+    # -----------------------------------------------------------------------
+
+    def test_auto_daemon_calls_run_daemon(self, temp_home: Path):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_switcher = self._mock_switcher_with_backup(backup)
+        mock_as = MagicMock()
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_switcher), \
+             patch("claude_swap.cli.AutoSwitcher", return_value=mock_as):
+            self._dispatch(["_auto-daemon"])
+
+        mock_as.run_daemon.assert_called_once()
+
+    # -----------------------------------------------------------------------
+    # main() pre-dispatch routing
+    # -----------------------------------------------------------------------
+
+    def test_main_dispatches_auto(self, temp_home: Path, capsys):
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_sw = self._mock_switcher_with_backup(backup)
+
+        with patch.object(sys, "argv", ["cswap", "auto"]), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_sw), \
+             patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX):
+            cli.main()
+
+        out = capsys.readouterr().out
+        assert "enabled" in out
+
+    def test_main_dispatches_watch(self, capsys):
+        from claude_swap.models import Platform
+
+        with (
+            patch.object(sys, "argv", ["cswap", "watch"]),
+            patch("claude_swap.cli.Platform.detect", return_value=Platform.LINUX),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        assert "macOS" in capsys.readouterr().out
+
+    def test_main_dispatches_auto_daemon(self, temp_home: Path):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        mock_switcher = self._mock_switcher_with_backup(backup)
+        mock_as = MagicMock()
+
+        with patch.object(sys, "argv", ["cswap", "_auto-daemon"]), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=mock_switcher), \
+             patch("claude_swap.cli.AutoSwitcher", return_value=mock_as):
+            cli.main()
+
+        mock_as.run_daemon.assert_called_once()
+
+    def test_auto_daemon_not_in_help(self):
+        """_auto-daemon is a hidden verb — must not appear in main --help."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "_auto-daemon" not in result.stdout
+
+    def test_auto_not_in_main_help_group(self):
+        """auto/watch are pre-dispatched, not in the mutually-exclusive group."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        # They appear in the examples but NOT as top-level flags in the group.
+        # The real check is that the main parser doesn't error on them.
+        assert result.returncode == 0
+
+
+# keep existing test:
     def test_session_error_exits_cleanly(self, capsys):
         class FailingSessionManager:
             def __init__(self, switcher):

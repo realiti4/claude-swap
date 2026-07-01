@@ -1183,6 +1183,51 @@ class TestPerformSwitchPostDisplay:
         assert "usage display unavailable" in output
         assert "no restart needed" in output
 
+    def test_quiet_switch_with_live_session_prints_nothing(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """quiet=True must produce ZERO stdout even when the target has a live
+        session (the session-drift warning is suppressed), and the switch still
+        commits.
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        switcher.platform = Platform.LINUX
+
+        try:
+            # Target account 2 has a live session-mode Claude → without the
+            # quiet guard this would print a yellow session-drift warning.
+            with patch.object(
+                switcher, "_live_session_pids", return_value=[12345],
+            ):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        # The switch committed.
+        data = switcher._get_sequence_data()
+        assert data is not None
+        assert data["activeAccountNumber"] == 2
+
+        # Quiet mode = zero stdout: no warning, no "Switched to", no followup.
+        out = capsys.readouterr().out
+        assert out == "", f"quiet switch should print nothing, got: {out!r}"
+
     def test_switch_followup_macos(self, temp_home: Path, capsys):
         """macOS shows the ~30s cache note; a restart applies it instantly."""
         switcher = ClaudeAccountSwitcher()
@@ -2757,6 +2802,40 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(SwitchError, match="has no stored config backup"):
             s.switch_to("2")
+
+    def test_auto_switch_to_revalidates_switchability(self, temp_home: Path):
+        """auto_switch_to must re-check switchability BEFORE the transaction.
+
+        Defends a remove-during-tick race: the engine picked target 2 from an
+        earlier snapshot, but its credential backup is gone now. We must fail
+        cleanly with a SwitchError up front, not deep inside _perform_switch.
+        """
+        from unittest.mock import patch as _patch
+
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        # Account 2 EXISTS in data['accounts'] but has NO credential backup.
+        self._seed(s, 2, "b@example.com", creds=False)
+
+        # The guard must fire before _perform_switch is ever called.
+        with _patch.object(s, "_perform_switch") as mock_perform:
+            with pytest.raises(SwitchError, match="no stored credentials/config"):
+                s.auto_switch_to("2")
+            mock_perform.assert_not_called()
+
+    def test_auto_switch_to_proceeds_when_switchable(self, temp_home: Path):
+        """A fully-backed-up target passes the guard and reaches _perform_switch."""
+        from unittest.mock import patch as _patch
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")   # full creds + config
+
+        with _patch.object(s, "_perform_switch") as mock_perform:
+            s.auto_switch_to("2")
+            mock_perform.assert_called_once_with("2", emit_output=False)
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded
