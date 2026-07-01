@@ -327,6 +327,31 @@ class TestCLI:
         upgrade_fn.assert_called_once_with()
         switcher_cls.assert_not_called()
 
+    def test_menubar_flag_dispatches(self, monkeypatch):
+        called = {}
+
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+            def _is_running_in_container(self):
+                return False
+
+        def _fake_run(switcher):
+            called["ran"] = True
+            return 0
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["cswap", "--menubar"])
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr("claude_swap.menubar.run", _fake_run, raising=False)
+        # geteuid only exists on POSIX; ensure non-root path
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        assert called.get("ran") is True
+
 
 class TestCLICommands:
     """Test individual CLI commands."""

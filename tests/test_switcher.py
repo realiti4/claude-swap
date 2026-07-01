@@ -1275,6 +1275,41 @@ class TestPerformSwitchPostDisplay:
         data = switcher._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
+    def test_switch_refuses_to_back_up_empty_active_creds(
+        self,
+        temp_home: Path,
+        sample_sequence_data: dict,
+    ):
+        """If the live credential reads empty (e.g. Keychain unreadable under a
+        launchd agent), the switch must abort BEFORE overwriting the current
+        account's good backup — otherwise the backup is destroyed."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data
+        )
+        good_1 = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-good-1", "refreshToken": "rt-1"}}
+        )
+        creds_store[("1", "test@example.com")] = good_1
+        live_state = {"creds": ""}  # Keychain unreadable -> empty read
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state
+        )
+        # Account 1 is the live identity (config present) -> backup branch, the
+        # path where an empty read would otherwise clobber account 1's backup.
+        id_patch = patch.object(
+            switcher, "_get_current_account", return_value=("test@example.com", "")
+        )
+        id_patch.start()
+        patches.append(id_patch)
+        try:
+            with pytest.raises(CredentialReadError):
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+        # account 1's good backup must be untouched
+        assert creds_store[("1", "test@example.com")] == good_1
+
     def test_switch_uses_live_identity_for_current_backup_slot(
         self,
         temp_home: Path,
@@ -3056,6 +3091,94 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestRemoveAccountForce:
+    """Tests for remove_account force flag (Finding 1: GUI stdin fix)."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({"claudeAiOauth": {"accessToken": f"sk-{num}"}}),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {"emailAddress": email}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None,
+            "lastUpdated": "",
+            "sequence": [],
+            "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def test_assume_yes_removes_without_calling_input(self, temp_home: Path):
+        """assume_yes=True must skip input() entirely and delete the account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        import builtins
+
+        def _no_input(prompt=""):
+            raise AssertionError("input() must not be called when assume_yes=True")
+
+        with patch.object(builtins, "input", _no_input), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2", assume_yes=True)
+
+        data = s._get_sequence_data()
+        assert "2" not in data["accounts"]
+        assert 2 not in data["sequence"]
+
+    def test_default_prompt_cancel_does_not_remove(self, temp_home: Path):
+        """Default (force=False): answering 'n' cancels removal."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        with patch("builtins.input", return_value="n"), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2")
+
+        data = s._get_sequence_data()
+        assert "2" in data["accounts"]
+
+    def test_default_prompt_confirm_removes(self, temp_home: Path):
+        """Default (force=False): answering 'y' completes removal."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        with patch("builtins.input", return_value="y"), \
+             patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2")
+
+        data = s._get_sequence_data()
+        assert "2" not in data["accounts"]
+        assert 2 not in data["sequence"]
+
+
 class TestMacosKeychainFallback:
     """macOS auto-fallback to file storage when the Keychain is unusable, plus the
     ``.enc``-wins backup reconciliation.
@@ -3094,6 +3217,23 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(macos_keychain, "get_password", lambda *a, **k: "ok")
         s._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._use_keychain() is False
+
+    def test_recheck_keychain_rearms_after_transient_failure(
+        self, temp_home: Path, monkeypatch
+    ):
+        # A long-running consumer (the menu bar) treats each refresh cycle as
+        # its own "invocation": a transient Keychain timeout must not stick for
+        # the whole process, or the active credential read would be routed to a
+        # (possibly absent) plaintext file forever, freezing usage.
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with pytest.raises(KeychainError):
+            s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._use_keychain() is False
+
+        s.recheck_keychain()
+        assert s._keychain_usable_cache is None  # re-armed for the next probe
+        assert s._use_keychain() is True
 
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
@@ -3309,3 +3449,82 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+import time as _time
+from claude_swap import oauth as _oauth
+
+
+class TestCollectUsageBackoff:
+    """Rate-limit backoff, last-known-good retention, and the only= subset."""
+
+    def _setup(self, temp_home):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _info(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}})
+        return [
+            (1, "a@x.com", "", "", True, creds),
+            (2, "b@x.com", "", "", False, creds),
+        ]
+
+    def _patch_fetch(self, monkeypatch, responses, counter):
+        def fake(num, email, creds, is_active, persist_credentials=None):
+            counter.append(num)
+            return responses[num]
+        monkeypatch.setattr(_oauth, "fetch_usage_for_account", fake)
+
+    def test_429_arms_backoff_and_skips_network_next_call(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        # First call: account 1 returns a usage dict, account 2 is rate limited.
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 10.0}},
+                                        "2": _oauth.RATE_LIMITED}, calls)
+        first = s._collect_usage(self._info())
+        assert first[0] == {"five_hour": {"pct": 10.0}}
+        assert s._rate_limited_until() > _time.time()  # backoff armed
+        # Second call within the window: NO network calls; last-known-good for #1.
+        calls.clear()
+        second = s._collect_usage(self._info())
+        assert calls == []                       # network skipped
+        assert second[0] == {"five_hour": {"pct": 10.0}}   # retained
+        assert second[1] == "rate limited"       # never had a dict
+
+    def test_last_known_good_retained_on_transient_failure(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 7.0}}, "2": None}, calls)
+        s._collect_usage(self._info())           # seed cache for #1
+        # Now #1 fails (None); its prior dict must be retained.
+        self._patch_fetch(monkeypatch, {"1": None, "2": None}, calls)
+        # bypass the 15s shortcut by clearing it is unnecessary; only=None re-fetches
+        # because the 15s cache holds dicts -> shortcut returns them. Force a real
+        # fetch by waiting out the TTL is slow; instead assert via only= path:
+        out = s._collect_usage(self._info(), only={"1", "2"})
+        assert out[0] == {"five_hour": {"pct": 7.0}}   # retained, not erased
+
+    def test_only_limits_network_to_subset(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 1.0}},
+                                        "2": {"five_hour": {"pct": 2.0}}}, calls)
+        s._collect_usage(self._info(), only={"1"})
+        assert calls == ["1"]                    # only account 1 hit the network
+
+    def test_backoff_expired_resumes_fetching(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        s._set_rate_limited_until(_time.time() - 1)   # already expired
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 5.0}},
+                                        "2": {"five_hour": {"pct": 6.0}}}, calls)
+        out = s._collect_usage(self._info(), only={"1", "2"})
+        assert sorted(calls) == ["1", "2"]       # fetched again
+        assert out[0] == {"five_hour": {"pct": 5.0}}

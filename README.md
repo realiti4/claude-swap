@@ -94,6 +94,47 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
+### Menu bar (macOS)
+
+Run a menu bar app that shows each account's usage and lets you switch with a click:
+
+```bash
+# Install with the optional menu bar extra
+uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+
+cswap --menubar
+```
+
+The menu shows every managed account's 5h / 7d / spend usage, switches accounts
+(specific / rotate / best / next-available), and mirrors the TUI's add / remove /
+refresh actions. A Settings submenu controls what the menu-bar title shows and
+the refresh interval.
+
+**Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
+switch automatically when the active account crosses a usage threshold. When the
+active account hits the threshold on its 5h or 7d window, it switches to the
+account with the most headroom (skipping any that are themselves at the
+threshold), then notifies you to restart Claude Code. Configure:
+
+- **Threshold** (80% / 90% / 95%) — the usage level that triggers a switch.
+- **Cooldown** (5m / 10m / 30m) — minimum time between automatic switches.
+- **Check** — evaluate *with each display refresh*, or on an independent
+  1m / 3m / 5m timer.
+
+Defaults are 95% / 10m / with-display-refresh, and auto-switch is off until you
+enable it.
+
+**Strategies.** *Settings → Auto-switch strategy*:
+
+- **Reactive** (default) — stays put until the active account crosses the
+  threshold, then switches to the account with the most headroom.
+- **Consume-first** — proactively keeps you on the account whose **weekly window
+  resets soonest** (use-it-or-lose-it), switching as resets re-order the queue.
+  It polls all accounts each tick (needed to rank them).
+
+A small hysteresis dead band prevents switching back and forth when an account
+hovers at the threshold.
+
 ### Other commands
 
 ```bash

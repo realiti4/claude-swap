@@ -244,6 +244,11 @@ Examples:
         help="Launch interactive arrow-key menu (single-level)",
     )
     group.add_argument(
+        "--menubar",
+        action="store_true",
+        help="Launch the macOS menu bar app (macOS only)",
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help="Upgrade claude-swap to the latest version on PyPI",
@@ -361,6 +366,19 @@ Examples:
                 )
                 sys.exit(1)
             sys.exit(tui_run(switcher))
+        elif args.menubar:
+            if sys.platform != "darwin":
+                error("The menu bar is only available on macOS.")
+                sys.exit(1)
+            try:
+                from claude_swap.menubar import run as menubar_run
+            except ImportError:
+                error(
+                    "Menu bar mode requires 'rumps'. "
+                    "Install with: pip install 'claude-swap[menubar]'"
+                )
+                sys.exit(1)
+            sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.

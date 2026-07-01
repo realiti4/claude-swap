@@ -15,6 +15,7 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+RATE_LIMITED = "rate limited"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -245,7 +246,7 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
-) -> dict | None:
+) -> dict | str | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
@@ -273,6 +274,9 @@ def fetch_usage_for_account(
         data = request_usage_data(access_token)
         return build_usage_result(data)
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _logger.debug("Usage fetch rate limited (429)")
+            return RATE_LIMITED
         _logger.debug("Usage fetch failed: %r", e)
         if (
             e.code != 401
@@ -297,6 +301,11 @@ def fetch_usage_for_account(
         try:
             data = request_usage_data(new_token)
             return build_usage_result(data)
+        except urllib.error.HTTPError as retry_error:
+            if retry_error.code == 429:
+                return RATE_LIMITED
+            _logger.debug("Usage fetch failed after refresh: %r", retry_error)
+            return None
         except Exception as retry_error:
             _logger.debug("Usage fetch failed after refresh: %r", retry_error)
             return None

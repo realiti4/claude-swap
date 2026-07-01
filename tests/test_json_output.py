@@ -42,13 +42,18 @@ class TestJsonHelpers:
         assert out["spend"]["resetsAt"] == "2026-07-01T00:00:00Z"
 
     def test_usage_fields_variants(self):
-        from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_TOKEN_EXPIRED
+        from claude_swap.json_output import (
+            USAGE_NO_CREDENTIALS,
+            USAGE_RATE_LIMITED,
+            USAGE_TOKEN_EXPIRED,
+        )
 
         assert usage_fields({"five_hour": {"pct": 1.0}})[0] == "ok"
         assert usage_fields({"five_hour": {"pct": 1.0}})[1] == {"fiveHour": {"pct": 1.0}}
         assert usage_fields(USAGE_NO_CREDENTIALS) == ("no_credentials", None)
         assert usage_fields("no credentials") == ("no_credentials", None)
         assert usage_fields(USAGE_TOKEN_EXPIRED) == ("token_expired", None)
+        assert usage_fields(USAGE_RATE_LIMITED) == ("rate_limited", None)
         assert usage_fields(None) == ("unavailable", None)
 
     def test_error_envelope_shape(self):

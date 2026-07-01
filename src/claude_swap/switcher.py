@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
     USAGE_NO_CREDENTIALS,
+    USAGE_RATE_LIMITED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
@@ -76,6 +78,8 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
+_DEFAULT_BACKOFF = 90  # seconds to skip usage fetching after a 429 (per-IP)
+_FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -281,6 +285,20 @@ class ClaudeAccountSwitcher:
 
     def _use_keychain(self) -> bool:
         return self._store._use_keychain()
+
+    def recheck_keychain(self) -> None:
+        """Re-arm Keychain probing after a prior failure this process.
+
+        The capability cache flips to file mode on the first Keychain error and
+        sticks for the process so a single CLI invocation can't split-brain
+        between backends (see ``CredentialStore._kc_call``). A long-running
+        consumer — the menu bar — instead treats each refresh cycle as its own
+        invocation and calls this between cycles, so a *transient* ``security``
+        timeout doesn't permanently route the active-credential read to a
+        (possibly absent) plaintext file, which would freeze the active
+        account's usage at the last-known-good snapshot.
+        """
+        self._keychain_usable_cache = None
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
@@ -1092,7 +1110,7 @@ class ClaudeAccountSwitcher:
         """Remove account from managed accounts.
 
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
-        the TUI, which collects confirmation before calling).
+        the TUI and the menu-bar GUI, which collect confirmation before calling).
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1203,6 +1221,8 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
         return accounts_info
 
+    def _rate_limit_path(self) -> Path:
+        return self.backup_dir / "cache" / "usage_ratelimit.json"
     def _active_cc_running(self) -> bool:
         """Whether any default-profile Claude Code instance is running.
 
@@ -1303,16 +1323,45 @@ class ClaudeAccountSwitcher:
             return USAGE_TOKEN_EXPIRED
         return usage
 
-    def _collect_usage(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str]]
-    ) -> list[dict | str | None]:
-        """Fetch usage for each account (cache-first), returning one entry per row.
 
-        Each entry is a usage dict, the string ``"no credentials"``, or ``None``
-        when the API call failed. Results are cached under
-        ``<backup_dir>/cache/usage.json`` for ``_USAGE_CACHE_TTL`` seconds and
-        reused only when the cache covers exactly the same set of accounts.
+    def _rate_limited_until(self) -> float:
+        data = read_cache(self._rate_limit_path(), _FOREVER, default=None)
+        if isinstance(data, dict) and isinstance(data.get("until"), (int, float)):
+            return float(data["until"])
+        return 0.0
+
+    def _set_rate_limited_until(self, ts: float) -> None:
+        write_cache(self._rate_limit_path(), {"until": ts})
+
+    def _collect_usage(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        only: set[str] | None = None,
+    ) -> list[dict | str | None]:
+        """Fetch usage per account (cache-first), with per-IP 429 backoff.
+
+        Each entry is a usage dict, the string ``"no credentials"`` /
+        ``"rate limited"``, or ``None`` when the API call failed. While a 429
+        backoff window is active, the network is skipped entirely and the
+        last-known-good cache is returned. ``only`` (a set of account-number
+        strings) restricts which accounts hit the network this call; the rest
+        come from cache. ``only=None`` fetches all (the CLI behavior).
         """
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        account_keys = [str(info[0]) for info in accounts_info]
+
+        # Last-known-good cache, ignoring the freshness TTL (for retention/backoff).
+        prior = read_cache(usage_cache_path, _FOREVER, default=None)
+        if not isinstance(prior, dict):
+            prior = {}
+
+        # Global per-IP backoff: skip the network while rate limited.
+        if time.time() < self._rate_limited_until():
+            return [
+                prior[k] if isinstance(prior.get(k), dict) else USAGE_RATE_LIMITED
+                for k in account_keys
+            ]
+
         def fetch(
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
@@ -1333,33 +1382,55 @@ class ClaudeAccountSwitcher:
                 with FileLock(self.lock_file):
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
-            # An account running in session mode is "inactive" here but live
-            # in its own config dir, where claude manages the token. Treat it
-            # like the active account (no proactive refresh / 401-retry):
-            # refreshing the backup copy could rotate the refresh token out
-            # from under the live session. Worst case its usage shows as
-            # unavailable until the session exits.
             has_live_session = bool(self._live_session_pids(str(num), email))
-
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
                 is_active=has_live_session,
                 persist_credentials=persist,
             )
 
-        usage_cache_path = self.backup_dir / "cache" / "usage.json"
-        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-        account_keys = {str(info[0]) for info in accounts_info}
-        if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
-            return [cached.get(str(info[0])) for info in accounts_info]
+        # Fresh-cache shortcut (CLI path only): reuse if <15s old and same keys.
+        if only is None:
+            cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+            if (cached is not MISSING and isinstance(cached, dict)
+                    and set(cached.keys()) == set(account_keys)):
+                return [cached.get(k) for k in account_keys]
 
-        with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, accounts_info))
-        write_cache(usage_cache_path, {
-            str(info[0]): usage
-            for info, usage in zip(accounts_info, usages)
-        })
-        return usages
+        to_fetch = (
+            accounts_info if only is None
+            else [info for info in accounts_info if str(info[0]) in only]
+        )
+        fetched: dict[str, dict | str | None] = {}
+        if to_fetch:
+            with ThreadPoolExecutor() as executor:
+                fetched = dict(zip(
+                    (str(info[0]) for info in to_fetch),
+                    executor.map(fetch, to_fetch),
+                ))
+
+        # Merge: a fresh usage dict wins; otherwise retain the prior good dict;
+        # otherwise store the sentinel/None. Accounts not fetched this round take
+        # their prior cached value.
+        rate_limited = False
+        result_map: dict[str, dict | str | None] = {}
+        for k in account_keys:
+            if k in fetched:
+                val = fetched[k]
+                if val == USAGE_RATE_LIMITED:
+                    rate_limited = True
+                if isinstance(val, dict):
+                    result_map[k] = val
+                elif isinstance(prior.get(k), dict):
+                    result_map[k] = prior[k]
+                else:
+                    result_map[k] = val
+            else:
+                result_map[k] = prior.get(k)
+
+        write_cache(usage_cache_path, result_map)
+        if rate_limited:
+            self._set_rate_limited_until(time.time() + _DEFAULT_BACKOFF)
+        return [result_map[k] for k in account_keys]
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""
@@ -2283,6 +2354,14 @@ class ClaudeAccountSwitcher:
                 original_creds = self._read_credentials()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
+                if not original_creds:
+                    # Empty (e.g. the macOS Keychain was unreadable) — abort BEFORE
+                    # the backup below so we never overwrite the current account's
+                    # good backup with an empty credential.
+                    raise CredentialReadError(
+                        "Current account credential is empty; refusing to overwrite "
+                        "its backup"
+                    )
                 original_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
