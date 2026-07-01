@@ -1170,6 +1170,14 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
+        from claude_swap.mappings import MappingStore
+
+        pruned = MappingStore(self.backup_dir).prune_account(
+            email, account_info.get("organizationUuid", "") or ""
+        )
+        if pruned:
+            print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
+
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds).
 

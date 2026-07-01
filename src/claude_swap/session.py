@@ -246,6 +246,22 @@ class SessionManager:
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
 
+    def exec_default(self, claude_args: list[str]) -> NoReturn:
+        """Launch plain Claude Code with the current default login.
+
+        Used by `cswap run` (no account) when the cwd has no mapping, or its
+        mapped account no longer exists. Equivalent to typing `claude`
+        directly: the unmodified environment is passed through (no session
+        profile, no auth-override scrubbing), so whatever the default login
+        resolves to is what runs.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+        self._exec(claude_bin, claude_args, env=dict(os.environ))
+
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
 

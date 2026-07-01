@@ -84,6 +84,27 @@ cswap run 2 --no-share          # don't share your ~/.claude customizations
 
 Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
 
+### Use a specific account per directory (auto-select)
+
+Map an account to a repo/project directory, then launch with no account argument
+and claude-swap picks the mapped account automatically — in session mode, so
+different repos can run different accounts at the same time.
+
+~~~bash
+cswap map 2 ~/work/client-app        # map a path to account 2 (work)
+cswap map user@example.com           # map the CURRENT directory to an account
+cswap map                            # list all mappings
+cswap unmap ~/work/client-app        # remove a mapping (defaults to cwd)
+
+cd ~/work/client-app/src
+cswap run                            # no account → launches account 2 [session mode]
+~~~
+
+The nearest mapped ancestor directory wins, so subfolders inherit their parent's
+mapping. In an unmapped directory, `cswap run` (with no account) just launches
+Claude Code with your current default login. Mappings are stored locally per
+machine and are not included in `--export` / `--import`.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -98,6 +119,10 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap map 2 ~/work/app          # Map a directory to an account
+cswap map                       # List directory→account mappings
+cswap unmap ~/work/app          # Remove a directory mapping
+cswap run                       # Run the current dir's mapped account (or default login if unmapped)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --status                  # Show current account
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)

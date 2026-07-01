@@ -10,7 +10,7 @@ import sys
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.printer import dimmed, error, muted
+from claude_swap.printer import accent, bolded, dimmed, error, muted, warning
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -52,8 +52,10 @@ Examples:
     )
     parser.add_argument(
         "account",
+        nargs="?",
         metavar="NUM|EMAIL",
-        help="Account to run (number or email)",
+        help="Account to run (number or email). Omit to use the current "
+        "directory's mapping (see `cswap map`).",
     )
     parser.add_argument(
         "--no-share",
@@ -81,7 +83,175 @@ Examples:
 
         from claude_swap.session import SessionManager
 
-        SessionManager(switcher).run(args.account, tail, share=not args.no_share)
+        manager = SessionManager(switcher)
+
+        if args.account is not None:
+            manager.run(args.account, tail, share=not args.no_share)
+            return  # only reachable in tests where exec/exit is mocked
+
+        # No account given: resolve from the current directory's mapping.
+        from claude_swap.mappings import MappingStore
+
+        match = MappingStore(switcher.backup_dir).resolve(os.getcwd())
+        if match is not None:
+            _, entry = match
+            seq = switcher._get_sequence_data_migrated() or {}
+            slot = switcher._find_account_slot(
+                seq, entry.get("email", ""), entry.get("organizationUuid", "") or ""
+            )
+            if slot is not None:
+                manager.run(slot, tail, share=not args.no_share)
+                return  # only reachable in tests
+            warning(
+                f"Mapped account {entry.get('email')} no longer exists — "
+                "launching the default account."
+            )
+        else:
+            print(
+                dimmed(
+                    f"No account mapped for {os.getcwd()} — "
+                    "launching the default account."
+                )
+            )
+        manager.exec_default(tail)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_mappings(switcher: ClaudeAccountSwitcher, store) -> None:
+    """Print all directory → account mappings (human-readable)."""
+    mappings = store.all()
+    if not mappings:
+        print(dimmed("No directory mappings yet."))
+        print(muted("Map one with: cswap map <NUM|EMAIL> [PATH]"))
+        return
+    seq = switcher._get_sequence_data_migrated() or {}
+    print(bolded("Directory mappings:"))
+    for path in sorted(mappings):
+        entry = mappings[path]
+        email = entry.get("email", "")
+        org_uuid = entry.get("organizationUuid", "") or ""
+        slot = switcher._find_account_slot(seq, email, org_uuid)
+        if slot:
+            account = seq.get("accounts", {}).get(slot, {})
+            tag = switcher._get_display_tag(
+                email, account.get("organizationName", ""), org_uuid
+            )
+            print(f"  {path} {dimmed('→')} {slot}: {email} {muted(f'[{tag}]')}")
+        else:
+            print(f"  {path} {dimmed('→')} {email} {muted('(account removed)')}")
+
+
+def _map_command(argv: list[str]) -> None:
+    """Handle `cswap map [NUM|EMAIL] [PATH]`.
+
+    With no NUM|EMAIL, lists all mappings. Otherwise maps PATH (default: the
+    current directory) to the given account. Pre-dispatched before the main
+    parser for the same reason as `run` (the main parser's required
+    mutually-exclusive group can't hold a positional subcommand).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap map",
+        description=(
+            "Map a stored account to a directory so `cswap run` (with no "
+            "account) auto-launches it there. With no arguments, lists all "
+            "mappings."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap map 2 ~/work/client-app
+  cswap map user@example.com          # map the current directory
+  cswap map                           # list all mappings
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to map (number or email). Omit to list mappings.",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        metavar="PATH",
+        help="Directory to map (default: current directory)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        from claude_swap.mappings import MappingStore, normalize_path
+
+        store = MappingStore(switcher.backup_dir)
+
+        if args.account is None:
+            _print_mappings(switcher, store)
+            return
+
+        account_num, email, org_uuid = switcher.resolve_account(args.account)
+        target = args.path or os.getcwd()
+        previous = store.get(target)
+        store.set(target, email, org_uuid)
+
+        shown = normalize_path(target)
+        if previous and previous.get("email") != email:
+            prev_email = previous.get("email")
+            print(
+                f"{accent('Mapped')} {shown} → Account-{account_num} ({email}) "
+                f"{muted(f'(was {prev_email})')}"
+            )
+        else:
+            print(f"{accent('Mapped')} {shown} → Account-{account_num} ({email})")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _unmap_command(argv: list[str]) -> None:
+    """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
+    parser = argparse.ArgumentParser(
+        prog="cswap unmap",
+        description="Remove a directory → account mapping (default: current directory).",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        metavar="PATH",
+        help="Directory to unmap (default: current directory)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        from claude_swap.mappings import MappingStore, normalize_path
+
+        store = MappingStore(switcher.backup_dir)
+        target = args.path or os.getcwd()
+        shown = normalize_path(target)
+        if store.remove(target):
+            print(f"{accent('Unmapped')} {shown}")
+        else:
+            print(dimmed(f"No mapping for {shown}"))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -95,6 +265,12 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         _run_command(sys.argv[2:])
         return  # only reachable in tests where exec/exit is mocked
+    if len(sys.argv) > 1 and sys.argv[1] == "map":
+        _map_command(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "unmap":
+        _unmap_command(sys.argv[2:])
+        return
 
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
@@ -115,6 +291,10 @@ Examples:
   %(prog)s --switch-to user@example.com
   %(prog)s run 2                            # run account 2 in this terminal only
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
+  %(prog)s map 2 ~/work/app                 # map a directory to account 2
+  %(prog)s map                              # list directory mappings
+  %(prog)s unmap ~/work/app                 # remove a directory mapping
+  %(prog)s run                              # run the current dir's mapped account
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge
