@@ -3132,8 +3132,8 @@ class TestRemoveAccountForce:
             data["activeAccountNumber"] = num
         s._write_json(s.sequence_file, data)
 
-    def test_force_true_removes_without_calling_input(self, temp_home: Path):
-        """force=True must skip input() entirely and delete the account."""
+    def test_assume_yes_removes_without_calling_input(self, temp_home: Path):
+        """assume_yes=True must skip input() entirely and delete the account."""
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
@@ -3141,11 +3141,11 @@ class TestRemoveAccountForce:
         import builtins
 
         def _no_input(prompt=""):
-            raise AssertionError("input() must not be called when force=True")
+            raise AssertionError("input() must not be called when assume_yes=True")
 
         with patch.object(builtins, "input", _no_input), \
              patch.object(s, "_ensure_no_live_session"):
-            s.remove_account("2", force=True)
+            s.remove_account("2", assume_yes=True)
 
         data = s._get_sequence_data()
         assert "2" not in data["accounts"]

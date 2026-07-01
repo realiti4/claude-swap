@@ -780,6 +780,14 @@ class TestGuards:
         assert not session_dir.exists()
         assert block_real_keychain.get_password(service, account) is None
 
+    def test_remove_account_assume_yes_skips_prompt(self, seeded_switcher, monkeypatch):
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        seeded_switcher.remove_account(ACCOUNT_NUM, assume_yes=True)
+        data = seeded_switcher._get_sequence_data()
+        assert ACCOUNT_NUM not in data["accounts"]
+
     def test_delete_account_files_chokepoint_refuses_live(self, seeded_switcher):
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL

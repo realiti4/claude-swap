@@ -7,6 +7,7 @@ restrained aesthetic. Falls back to plain text when colors aren't supported.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
@@ -67,6 +68,23 @@ def colors_enabled() -> bool:
     if _colors_enabled is None:
         _colors_enabled = _detect_color_support()
     return _colors_enabled
+
+
+@contextlib.contextmanager
+def force_color():
+    """Temporarily force colored output on, restoring the prior cache after.
+
+    Used by the TUI when capturing CLI output into a buffer: capture redirects
+    stdout to a non-tty StringIO, which would otherwise disable color — but the
+    TUI re-renders the ANSI itself, so it wants the codes emitted.
+    """
+    global _colors_enabled
+    saved = _colors_enabled
+    _colors_enabled = True
+    try:
+        yield
+    finally:
+        _colors_enabled = saved
 
 
 def _style(text: str, *codes: str) -> str:

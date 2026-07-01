@@ -167,14 +167,10 @@ class TestDoSwitch:
         switcher = ClaudeAccountSwitcher()
 
         screen = _stub_screen()
-        # Pick the second item (slot 2) with one DOWN + ENTER
-        screen.getch.side_effect = [tui.curses.KEY_DOWN, 10, ord("\n")]
+        # Pick the second item (slot 2): one DOWN + ENTER, then 'q' to leave pager.
+        screen.getch.side_effect = [tui.curses.KEY_DOWN, 10, ord("q")]
 
-        with patch.object(switcher, "switch_to") as mock_switch, \
-             patch("claude_swap.tui.curses.def_prog_mode"), \
-             patch("claude_swap.tui.curses.endwin"), \
-             patch("claude_swap.tui.curses.reset_prog_mode"), \
-             patch("builtins.input", return_value=""):
+        with patch.object(switcher, "switch_to") as mock_switch:
             tui._do_switch(screen, switcher)
 
         mock_switch.assert_called_once_with("2")
@@ -278,19 +274,14 @@ class TestDoRemove:
         switcher = ClaudeAccountSwitcher()
 
         screen = _stub_screen()
-        keys = [10]  # pick first slot
-        keys += [ord("y"), 10]  # confirm: y
-        screen.getch.side_effect = keys
+        # pick first slot, confirm 'y' + Enter, then 'q' to leave the pager.
+        screen.getch.side_effect = [10, ord("y"), 10, ord("q")]
 
         with patch.object(switcher, "remove_account") as mock_rm, \
-             patch("claude_swap.tui.curses.def_prog_mode"), \
-             patch("claude_swap.tui.curses.endwin"), \
-             patch("claude_swap.tui.curses.reset_prog_mode"), \
-             patch("claude_swap.tui.curses.curs_set"), \
-             patch("builtins.input", return_value=""):
+             patch("claude_swap.tui.curses.curs_set"):
             tui._do_remove(screen, switcher)
 
-        mock_rm.assert_called_once_with("3")
+        mock_rm.assert_called_once_with("3", assume_yes=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -337,3 +328,210 @@ class TestCliIntegration:
                 cli.main()
             assert exc.value.code == 0
         mock_run.assert_called_once_with(switcher_cls.return_value)
+
+
+class TestClampInterval:
+    def test_in_range(self):
+        assert tui._clamp_interval(5) == 5
+
+    def test_below_min(self):
+        assert tui._clamp_interval(0) == 1
+        assert tui._clamp_interval(-3) == 1
+
+    def test_above_max(self):
+        assert tui._clamp_interval(999) == 60
+
+    def test_custom_bounds(self):
+        assert tui._clamp_interval(100, lo=2, hi=10) == 10
+
+
+class TestAnsiSegments:
+    def test_plain_text_single_run(self):
+        assert tui._ansi_segments("hello") == [("hello", 0)]
+
+    def test_empty_string(self):
+        assert tui._ansi_segments("") == [("", 0)]
+
+    def test_bold_run(self):
+        assert tui._ansi_segments("\x1b[1mX\x1b[0m") == [("X", tui._STYLE_BOLD)]
+
+    def test_stacked_bold_accent(self):
+        # printer.bold_accent emits "\x1b[1m\x1b[38;5;173m...\x1b[0m"
+        segs = tui._ansi_segments("\x1b[1m\x1b[38;5;173mY\x1b[0m")
+        assert segs == [("Y", tui._STYLE_BOLD | tui._STYLE_ACCENT)]
+
+    def test_mixed_runs_with_reset(self):
+        segs = tui._ansi_segments("a\x1b[2mb\x1b[0mc")
+        assert segs == [("a", 0), ("b", tui._STYLE_DIM), ("c", 0)]
+
+    def test_muted_and_red_and_yellow(self):
+        assert tui._ansi_segments("\x1b[38;5;250mm\x1b[0m") == [("m", tui._STYLE_MUTED)]
+        assert tui._ansi_segments("\x1b[31mr\x1b[0m") == [("r", tui._STYLE_RED)]
+        assert tui._ansi_segments("\x1b[33my\x1b[0m") == [("y", tui._STYLE_YELLOW)]
+
+    def test_unknown_code_ignored(self):
+        assert tui._ansi_segments("\x1b[99mZ\x1b[0m") == [("Z", 0)]
+
+
+class TestStyleToAttr:
+    def test_bold_maps_to_a_bold(self):
+        # A_BOLD is a plain constant available without initscr.
+        assert tui._style_to_attr(tui._STYLE_BOLD) & tui.curses.A_BOLD
+
+    def test_dim_maps_to_a_dim(self):
+        assert tui._style_to_attr(tui._STYLE_DIM) & tui.curses.A_DIM
+
+    def test_no_flags_is_normal(self):
+        assert tui._style_to_attr(0) == tui.curses.A_NORMAL
+
+    def test_color_lookup_without_initscr_does_not_raise(self):
+        # has_colors()/color_pair() raise outside initscr; must be swallowed.
+        attr = tui._style_to_attr(tui._STYLE_ACCENT)
+        assert isinstance(attr, int)
+
+
+class TestAddstrAnsi:
+    def test_draws_each_run_clipped(self):
+        screen = _stub_screen()
+        tui._addstr_ansi(screen, 4, 2, "\x1b[1mAB\x1b[0mCD", max_width=3)
+        # First run "AB" (bold) then "C" (clipped from "CD" at width 3).
+        calls = [c.args for c in screen.addstr.call_args_list]
+        drawn = "".join(a[2] for a in calls)
+        assert drawn == "ABC"
+
+    def test_swallows_curses_error(self):
+        screen = _stub_screen()
+        screen.addstr.side_effect = tui.curses.error
+        # Must not raise.
+        tui._addstr_ansi(screen, 4, 2, "x", max_width=10)
+
+
+class TestPager:
+    def test_returns_on_q(self):
+        screen = _stub_screen(rows=10, cols=40)
+        screen.getch.side_effect = [ord("q")]
+        tui._pager(screen, "T", [f"line{i}" for i in range(50)])
+
+    def test_returns_on_escape(self):
+        screen = _stub_screen()
+        screen.getch.side_effect = [27]
+        tui._pager(screen, "T", ["a", "b"])
+
+    def test_returns_on_enter(self):
+        screen = _stub_screen()
+        screen.getch.side_effect = [10]
+        tui._pager(screen, "T", ["a"])
+
+    def test_scroll_down_then_quit_no_error(self):
+        screen = _stub_screen(rows=8, cols=40)
+        screen.getch.side_effect = [
+            tui.curses.KEY_DOWN, tui.curses.KEY_NPAGE,
+            tui.curses.KEY_END, tui.curses.KEY_HOME, ord("q"),
+        ]
+        tui._pager(screen, "T", [f"row{i}" for i in range(100)])
+
+    def test_short_content_does_not_overscroll(self):
+        screen = _stub_screen(rows=30, cols=40)
+        screen.getch.side_effect = [tui.curses.KEY_DOWN, tui.curses.KEY_NPAGE, ord("q")]
+        tui._pager(screen, "T", ["only line"])
+
+
+class TestRunInline:
+    def test_captures_colored_output_and_pages(self):
+        screen = _stub_screen()
+        seen = {}
+
+        def fake_pager(s, title, lines, subtitle=""):
+            seen["title"] = title
+            seen["lines"] = lines
+
+        def fn():
+            from claude_swap import printer
+            print(printer.accent("hello"))
+            print("plain")
+
+        with patch("claude_swap.tui._pager", side_effect=fake_pager):
+            tui._run_inline(screen, "Title", fn)
+
+        assert seen["title"] == "Title"
+        # Color is forced on during capture → accent line carries ANSI.
+        assert any("hello" in line for line in seen["lines"])
+        assert "\x1b[38;5;173m" in "\n".join(seen["lines"])
+        assert "plain" in seen["lines"]
+
+    def test_stray_input_becomes_message_and_stdin_restored(self):
+        import sys as _sys
+        screen = _stub_screen()
+        before = _sys.stdin
+
+        def fn():
+            input("give me something")  # no stdin → EOFError
+
+        with patch("claude_swap.tui._pager") as mock_pager:
+            tui._run_inline(screen, "T", fn)
+
+        assert _sys.stdin is before  # restored
+        lines = mock_pager.call_args.args[2]
+        assert any("input is not available" in line for line in lines)
+
+    def test_switch_error_captured(self):
+        screen = _stub_screen()
+
+        def fn():
+            raise ClaudeSwitchError("boom")
+
+        with patch("claude_swap.tui._pager") as mock_pager:
+            tui._run_inline(screen, "T", fn)
+        lines = mock_pager.call_args.args[2]
+        assert any("boom" in line for line in lines)
+
+
+class TestWatch:
+    def test_empty_state_returns_without_loop(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+        screen.getch.return_value = ord("q")  # dismiss _show_message
+        with patch.object(switcher, "list_accounts") as mock_list:
+            tui._do_watch(screen, switcher)
+        mock_list.assert_not_called()
+
+    def test_refreshes_then_quits(self, temp_home: Path):
+        _make_seq(temp_home, [("1", "a@x.com")])
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+        screen.getch.side_effect = [ord("q")]
+        with patch.object(switcher, "list_accounts") as mock_list, \
+             patch("claude_swap.tui.time.monotonic", return_value=100.0):
+            tui._watch_loop(screen, switcher, interval=5)
+        mock_list.assert_called()  # at least one refresh before quit
+        screen.timeout.assert_any_call(250)
+        screen.timeout.assert_any_call(-1)
+
+    def test_plus_raises_interval(self, temp_home: Path):
+        _make_seq(temp_home, [("1", "a@x.com")])
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+        # First loop refreshes (monotonic 100), then '+' (interval→6),
+        # then 'q'. monotonic stays 100 so no second refresh.
+        screen.getch.side_effect = [ord("+"), ord("q")]
+        with patch.object(switcher, "list_accounts") as mock_list, \
+             patch("claude_swap.tui.time.monotonic", return_value=100.0):
+            tui._watch_loop(screen, switcher, interval=5)
+        assert mock_list.call_count == 1
+
+
+class TestInitColors:
+    def test_initializes_pairs_when_color_supported(self):
+        with patch("claude_swap.tui.curses.has_colors", return_value=True), \
+             patch("claude_swap.tui.curses.start_color"), \
+             patch("claude_swap.tui.curses.use_default_colors"), \
+             patch("claude_swap.tui.curses.init_pair") as mock_pair, \
+             patch("claude_swap.tui.curses.COLORS", 256, create=True):
+            tui._colors_initialized = False
+            tui._init_colors()
+        assert mock_pair.call_count == 4
+
+    def test_no_color_terminal_is_safe(self):
+        with patch("claude_swap.tui.curses.has_colors", return_value=False):
+            tui._colors_initialized = False
+            tui._init_colors()  # must not raise

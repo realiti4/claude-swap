@@ -761,7 +761,7 @@ def run(switcher) -> int:
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
-                    if self._guard(lambda: self.switcher.remove_account(str(num), force=True)):
+                    if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
                         self.refresh_async(full=True)
             return cb
 

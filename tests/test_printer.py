@@ -138,3 +138,16 @@ class TestLinePrinters:
         printer.warning("be careful")
         captured = capsys.readouterr()
         assert "\033[33m" in captured.out
+
+
+def test_force_color_overrides_and_restores():
+    from claude_swap import printer
+    saved = printer._colors_enabled
+    try:
+        printer._colors_enabled = False
+        with printer.force_color():
+            assert printer.colors_enabled() is True
+            assert printer.accent("X") == "\x1b[38;5;173mX\x1b[0m"
+        assert printer._colors_enabled is False
+    finally:
+        printer._colors_enabled = saved
