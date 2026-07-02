@@ -4,7 +4,10 @@ version = "0.15.1"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["keyring>=25.0.0"]
+dependencies = [
+    "keyring>=25.0.0",
+    "truststore>=0.10.4",
+]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
 keywords = ["claude", "claude-code", "account-switcher", "cli"]
