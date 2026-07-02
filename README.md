@@ -71,6 +71,27 @@ Or let claude-swap auto-pick by remaining quota — `cswap --switch --strategy b
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
+### Auto-switch by usage
+
+Instead of switching by hand, let claude-swap watch your quota and hop to the freshest account *before* the active one hits its limit. Run the setup wizard:
+
+```bash
+cswap autoswitch
+```
+
+The wizard is a small menu — set a **common threshold** that applies to every account (e.g. switch at 85% usage), optionally **override individual accounts** (e.g. keep your work account until 95%), set the poll interval, and start/stop the background watcher. Each change is saved as you go.
+
+The watcher polls each account's quota every interval and, when the **active** account's usage (the higher of its 5-hour / 7-day window) reaches its threshold, switches to the account with the most quota left — exactly `cswap --switch --strategy best`. If no other account has more headroom (or there's only one account), it stays put and logs why; it never switches onto a worse account.
+
+```bash
+cswap autoswitch start      # run the watcher in the background
+cswap autoswitch status     # rules + per-account usage vs threshold
+cswap autoswitch check      # evaluate once now and switch if over threshold
+cswap autoswitch stop       # stop the watcher
+```
+
+Rules are stored in `autoswitch.json` in the backup directory, and the watcher writes a log to `autoswitch.log` there. A swap rewrites the credentials file Claude Code reads, so it takes full effect on Claude's **next** start — a session already running keeps the account it loaded.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
@@ -98,6 +119,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap autoswitch                # Set up / control auto-switching by usage % (start/stop/status/check)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --status                  # Show current account
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
