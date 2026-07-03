@@ -87,6 +87,41 @@ def test_usage_summary_none():
     assert menubar.usage_summary(None) == "usage unavailable"
 
 
+def test_format_usage_log_full():
+    usage = {
+        "five_hour": {"pct": 35.0, "clock": "06:59"},
+        "seven_day": {"pct": 55.0, "clock": "Jun 29 21:59"},
+    }
+    assert menubar.format_usage_log("a@x.com", usage) == (
+        "usage a@x.com: 5h 35% (resets 06:59) · 7d 55% (resets Jun 29 21:59)"
+    )
+
+
+def test_format_usage_log_without_clock():
+    usage = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 12.0}}
+    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 0% · 7d 12%"
+
+
+def test_format_usage_log_partial_window():
+    usage = {"seven_day": {"pct": 12.0, "clock": "Jul 3"}}
+    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 7d 12% (resets Jul 3)"
+
+
+def test_format_usage_log_none_when_no_numeric_window():
+    assert menubar.format_usage_log("a@x.com", None) is None
+    assert menubar.format_usage_log("a@x.com", "rate limited") is None
+    assert menubar.format_usage_log("a@x.com", {"spend": {"pct": 5.0}}) is None
+
+
+def test_usage_log_key_ignores_clock_tracks_pct():
+    u1 = {"five_hour": {"pct": 35.0, "clock": "06:59"}, "seven_day": {"pct": 55.0}}
+    u2 = {"five_hour": {"pct": 35.0, "clock": "07:59"}, "seven_day": {"pct": 55.0}}
+    u3 = {"five_hour": {"pct": 36.0}, "seven_day": {"pct": 55.0}}
+    assert menubar._usage_log_key(u1) == menubar._usage_log_key(u2)  # clock-only change
+    assert menubar._usage_log_key(u1) != menubar._usage_log_key(u3)  # pct change
+    assert menubar._usage_log_key(None) == (None, None)
+
+
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"

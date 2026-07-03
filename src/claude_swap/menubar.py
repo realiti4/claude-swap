@@ -226,6 +226,39 @@ def _window_pct(usage: dict | str | None, key: str) -> float | None:
     return None
 
 
+def format_usage_log(email: str, usage: dict | str | None) -> str | None:
+    """A log line of an account's session (5h) and weekly (7d) limits.
+
+    Uses each window's absolute reset ``clock`` rather than a live countdown,
+    since log lines are already timestamped. Returns ``None`` when no numeric
+    window is available (sentinels, ``None``, or spend-only) so callers can skip
+    logging nothing.
+    """
+    parts: list[str] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        pct = _window_pct(usage, key)
+        if pct is None:
+            continue
+        window = usage.get(key)  # a dict — _window_pct found a numeric pct in it
+        clock = window.get("clock") if isinstance(window, dict) else None
+        seg = f"{label} {pct:.0f}%"
+        if clock:
+            seg += f" (resets {clock})"
+        parts.append(seg)
+    if not parts:
+        return None
+    return f"usage {email}: " + " · ".join(parts)
+
+
+def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None]:
+    """De-dupe key for usage logging: the (5h, 7d) percentages only.
+
+    Reset clocks change every refresh; keying on the percentages means an idle
+    account isn't re-logged every cycle.
+    """
+    return (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
+
+
 def _worst_pct(usage: dict | str | None) -> float | None:
     """Higher of the 5h/7d utilization, or None if either window is unknown."""
     five = _window_pct(usage, "five_hour")
@@ -473,6 +506,7 @@ def run(switcher) -> int:
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
+            self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
             self.rebuild_menu()
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.
@@ -505,6 +539,7 @@ def run(switcher) -> int:
                 # lets a transient failure self-heal on the next tick.
                 self.switcher.recheck_keychain()
                 snap = _snapshot(self.switcher, full=full)
+                self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
                 if full:
@@ -512,6 +547,22 @@ def run(switcher) -> int:
                 self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
+
+        def _log_usage(self, snap):
+            """Log each account's session/weekly limits when they change.
+
+            Runs on every refresh (background thread; the logger is thread-safe)
+            but de-dupes per account on the (5h, 7d) percentages so an idle
+            machine doesn't churn the rotating log with identical lines.
+            """
+            for num, email, _is_active, usage in snap["accounts"]:
+                key = _usage_log_key(usage)
+                if key == (None, None) or self._last_usage_log.get(num) == key:
+                    continue
+                line = format_usage_log(email, usage)
+                if line:
+                    self.switcher._logger.info(line)
+                    self._last_usage_log[num] = key
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
