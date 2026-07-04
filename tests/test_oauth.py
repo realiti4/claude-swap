@@ -777,3 +777,143 @@ class TestFetchUsageForAccount:
         output = capsys.readouterr().out
         assert "failed to save refreshed token" in output
         assert "cswap --add-account" in output
+
+
+class TestClassifyUsageError:
+    """Test _classify_usage_error kinds and Retry-After parsing."""
+
+    @staticmethod
+    def _http_error(code: int, headers: dict | None = None):
+        import email.message
+        hdrs = None
+        if headers is not None:
+            hdrs = email.message.Message()
+            for k, v in headers.items():
+                hdrs[k] = v
+        return urllib.error.HTTPError(
+            url="https://api.anthropic.com/api/oauth/usage",
+            code=code, msg="err", hdrs=hdrs, fp=None,
+        )
+
+    def test_http_codes(self):
+        assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
+        assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
+        assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    def test_retry_after_seconds(self):
+        kind, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "30"})
+        )
+        assert kind == "http-429"
+        assert retry == 30.0
+
+    def test_retry_after_date_form_ignored(self):
+        _, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "Fri, 04 Jul 2026 12:00:00 GMT"})
+        )
+        assert retry is None
+
+    def test_retry_after_negative_clamped(self):
+        _, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "-5"})
+        )
+        assert retry == 0.0
+
+    def test_no_headers(self):
+        kind, retry = oauth._classify_usage_error(self._http_error(429))
+        assert (kind, retry) == ("http-429", None)
+
+    def test_timeout(self):
+        import socket
+        assert oauth._classify_usage_error(TimeoutError())[0] == "timeout"
+        assert oauth._classify_usage_error(socket.timeout())[0] == "timeout"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(TimeoutError())
+        )[0] == "timeout"
+
+    def test_network(self):
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ConnectionRefusedError())
+        )[0] == "network"
+
+    def test_bad_response(self):
+        try:
+            json.loads("not json")
+        except json.JSONDecodeError as e:
+            assert oauth._classify_usage_error(e)[0] == "bad-response"
+
+    def test_fallback_type_name(self):
+        assert oauth._classify_usage_error(ValueError("x"))[0] == "ValueError"
+
+
+class TestTryFetchUsageOutcome:
+    """Test try_fetch_usage_for_account outcome classification."""
+
+    @staticmethod
+    def _make_credentials() -> str:
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": future_ms,
+            }
+        })
+
+    def test_success_outcome(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 12.0
+
+    def test_429_outcome_carries_retry_after(self, caplog):
+        import email.message
+        import logging
+        hdrs = email.message.Message()
+        hdrs["Retry-After"] = "42"
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
+            hdrs=hdrs, fp=None,
+        )
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err),
+            caplog.at_level(logging.WARNING, logger="claude-swap"),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 42.0
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any("http-429" in m and "a@b.c" in m for m in warnings)
+
+    def test_timeout_outcome(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError()),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error == "timeout"
+
+    def test_no_access_token_outcome(self):
+        outcome = oauth.try_fetch_usage_for_account(
+            "1", "a@b.c", json.dumps({"claudeAiOauth": {}}), is_active=False,
+        )
+        assert outcome.error == "no-access-token"
