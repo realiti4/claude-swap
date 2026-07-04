@@ -10,12 +10,17 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
+    SETTING_SPECS,
     AutoSwitchSettings,
+    effective_settings,
     load_settings,
     merged_with_cli,
     save_settings,
+    set_setting,
     settings_path,
+    unset_setting,
 )
 
 
@@ -103,6 +108,84 @@ class TestSaveSettings:
         save_settings(tmp_path, AutoSwitchSettings())
         mode = stat.S_IMODE(settings_path(tmp_path).stat().st_mode)
         assert mode == 0o600
+
+
+class TestSettingSpecs:
+    def test_registry_covers_every_dataclass_field(self):
+        spec_fields = {spec.field for spec in SETTING_SPECS.values()}
+        dataclass_fields = {
+            f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
+        }
+        assert spec_fields == dataclass_fields
+
+    def test_defaults_match_dataclass(self):
+        defaults = AutoSwitchSettings()
+        for spec in SETTING_SPECS.values():
+            assert spec.default == getattr(defaults, spec.field)
+
+
+class TestSetUnsetSetting:
+    def test_set_writes_minimal_file(self, tmp_path: Path):
+        value = set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert value == 80.0
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 80.0}}
+
+    def test_set_int_kind_coerces_and_rejects_floats(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.unhealthyTicks", "5") == 5
+        with pytest.raises(ConfigError, match="integer"):
+            set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
+
+    def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+            set_setting(tmp_path, "autoswitch.threshold", "200")
+        assert not settings_path(tmp_path).exists()
+
+    def test_set_rejects_unknown_key(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="unknown setting"):
+            set_setting(tmp_path, "autoswitch.bogus", "1")
+
+    def test_set_rejects_bool_words_strictly(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "FALSE") is False
+        with pytest.raises(ConfigError, match="true or false"):
+            set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
+
+    def test_set_on_corrupt_file_raises_and_preserves_it(self, tmp_path: Path):
+        settings_path(tmp_path).write_text("{not json")
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert settings_path(tmp_path).read_text() == "{not json"
+
+    def test_unset_removes_key_and_empty_section(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert "autoswitch" not in raw
+
+    def test_unset_stamps_schema_version_on_unversioned_file(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"threshold": 80}})
+        )
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["schemaVersion"] == 1
+
+    def test_unset_absent_key_is_noop(self, tmp_path: Path):
+        assert unset_setting(tmp_path, "autoswitch.threshold") is False
+        assert not settings_path(tmp_path).exists()
+
+
+class TestEffectiveSettings:
+    def test_missing_file_reports_all_defaults(self, tmp_path: Path):
+        rows = effective_settings(tmp_path)
+        assert len(rows) == len(SETTING_SPECS)
+        assert all(not is_set for _, _, is_set in rows)
+
+    def test_presence_not_value_equality_marks_set(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "90")  # equals default
+        by_key = {spec.dotted: is_set for spec, _, is_set in effective_settings(tmp_path)}
+        assert by_key["autoswitch.threshold"] is True
+        assert by_key["autoswitch.intervalSeconds"] is False
 
 
 class TestMergedWithCli:

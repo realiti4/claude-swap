@@ -259,6 +259,151 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _config_command(argv: list[str]) -> None:
+    """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`
+    (same limitation: `config` must be the first argument). Edits
+    settings.json in the backup root with strict validation — unlike loading,
+    which forgivingly clamps — so a typo'd key or out-of-range value errors
+    loudly here instead of silently degrading at `cswap auto` time.
+    """
+    from claude_swap.settings import (
+        SETTING_SPECS,
+        effective_settings,
+        format_setting_value,
+        set_setting,
+        setting_spec,
+        settings_path,
+        unset_setting,
+    )
+
+    key_lines = "\n".join(
+        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        for spec in SETTING_SPECS.values()
+    )
+    parser = argparse.ArgumentParser(
+        prog="cswap config",
+        description=(
+            "Read and edit claude-swap settings (settings.json in the "
+            "backup root)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Keys:
+{key_lines}
+
+Examples:
+  cswap config                              # list effective settings
+  cswap config get autoswitch.threshold
+  cswap config set autoswitch.threshold 80
+  cswap config unset autoswitch.threshold   # back to the default
+  cswap config path                         # where settings.json lives
+        """,
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with list or get)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+
+    p_list = sub.add_parser("list", help="Show all effective settings (the default)")
+    p_get = sub.add_parser("get", help="Print one setting's effective value")
+    p_get.add_argument("key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold")
+    for p in (p_list, p_get):
+        # SUPPRESS: without it the subparser's False default would clobber a
+        # pre-verb `cswap config --json` in the shared namespace.
+        p.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Emit machine-readable JSON to stdout",
+        )
+    p_set = sub.add_parser("set", help="Validate and persist one setting")
+    p_set.add_argument("key", metavar="KEY")
+    p_set.add_argument("value", metavar="VALUE")
+    p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
+    p_unset.add_argument("key", metavar="KEY")
+    sub.add_parser("path", help="Print the settings.json location")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    action = args.action or "list"
+    if json_mode and action not in ("list", "get"):
+        parser.error("--json can only be used with list or get")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+        root = switcher.backup_dir
+
+        if action == "path":
+            print(settings_path(root))
+        elif action == "list":
+            rows = effective_settings(root)
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "path": str(settings_path(root)),
+                    "settings": [
+                        {"key": spec.dotted, "value": value, "isSet": is_set}
+                        for spec, value, is_set in rows
+                    ],
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                key_w = max(len(spec.dotted) for spec, _, _ in rows)
+                val_w = max(len(format_setting_value(v)) for _, v, _ in rows)
+                for spec, value, is_set in rows:
+                    line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
+                    print(line if is_set else f"{line}  {dimmed('(default)')}")
+        elif action == "get":
+            spec = setting_spec(args.key)
+            value, is_set = next(
+                (v, s) for sp, v, s in effective_settings(root) if sp is spec
+            )
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "key": spec.dotted,
+                    "value": value,
+                    "isSet": is_set,
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(format_setting_value(value))
+        elif action == "set":
+            value = set_setting(root, args.key, args.value)
+            print(f"{args.key} = {format_setting_value(value)}")
+        elif action == "unset":
+            if unset_setting(root, args.key):
+                default = setting_spec(args.key).default
+                print(f"{args.key} unset (default: {format_setting_value(default)})")
+            else:
+                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -293,6 +438,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "auto":
         _auto_command(sys.argv[2:])
         return  # only reachable in tests where sys.exit is mocked
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        _config_command(sys.argv[2:])
+        return
 
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
@@ -315,6 +463,8 @@ Examples:
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
   %(prog)s auto                             # auto-switch when nearing rate limits
   %(prog)s auto --once                      # single auto-switch tick (cron-friendly)
+  %(prog)s config                           # show settings (settings.json)
+  %(prog)s config set autoswitch.threshold 80
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge

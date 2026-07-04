@@ -99,10 +99,10 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults are configurable in `settings.json` in the backup root (see [Data locations](#data-locations)) — flags override it:
+Defaults are configurable with `cswap config` (see [Configuration](#configuration)) — flags override them:
 
-```json
-{ "schemaVersion": 1, "autoswitch": { "threshold": 90, "intervalSeconds": 60, "cooldownSeconds": 300 } }
+```bash
+cswap config set autoswitch.threshold 80
 ```
 
 </details>
@@ -135,6 +135,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap config                    # Show or edit settings (see Configuration below)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --status                  # Show current account
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
@@ -170,6 +171,25 @@ Session-mode profiles (`cswap run`) live under the backup directory in `sessions
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location. Data from older installs under `~/.claude-swap-backup/` is migrated automatically on first run.
 
 ## Advanced
+
+### Configuration
+
+Tool preferences live in `settings.json` in the backup root; `cswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+
+<details>
+<summary>Commands & usage</summary>
+
+```bash
+cswap config                              # list effective settings ("(default)" = not set)
+cswap config get autoswitch.threshold
+cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
+cswap config unset autoswitch.threshold   # back to the default
+cswap config path                         # where settings.json lives
+```
+
+`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
+
+</details>
 
 ### Backup and migration
 
