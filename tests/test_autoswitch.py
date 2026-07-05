@@ -509,6 +509,74 @@ class TestAdaptiveScheduler:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_active_far_from_threshold_polls_at_the_cap(self, temp_home, monkeypatch):
+        # Active at 10%: far from the band → polled every 180s, not every tick.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(10), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)  # never-fetched → fetched
+        assert counts["1"] == 1
+        for _ in range(2):  # ages 60s and 120s — inside the 180s tier
+            h.clock.advance(60)
+            self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        h.clock.advance(60)  # age 180s → due again
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
+
+    def test_active_mid_headroom_polls_every_other_tick(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(40), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # age 60s < 2× interval → skipped
+        assert counts["1"] == 1
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # age 120s → due
+        assert counts["1"] == 2
+
+    def test_active_in_band_polls_every_tick(self, temp_home, monkeypatch):
+        # threshold 90, margin 15 → 80% is in the band: cadence never relaxes.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(80), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        for expected in (1, 2, 3):
+            self._tick(h, counts, usage)
+            assert counts["1"] == expected
+            h.clock.advance(60)
+
+    def test_low_threshold_never_relaxes_near_its_band(self, temp_home, monkeypatch):
+        # Tiers are distance-to-band, not absolute pct: with threshold 50
+        # (band edge 35) an active at 10% is only 25 pts out — no relaxation,
+        # even though 10% would hit the 180s cap under the default threshold.
+        h = self._harness(temp_home, monkeypatch, accounts=2, threshold=50)
+        usage = {"1": _usage(10), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        for expected in (1, 2, 3):
+            self._tick(h, counts, usage)
+            assert counts["1"] == expected
+            h.clock.advance(60)
+
+    def test_band_jump_is_seen_at_most_one_relaxed_poll_late(
+        self, temp_home, monkeypatch
+    ):
+        # Active at 40% (2×-interval tier) jumps into the band between polls:
+        # the jump is picked up on the next tier poll and escalates the same
+        # tick (candidates refreshed despite none being due).
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(40), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        usage["1"] = _usage(80)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # tier-skipped: still believed at 40%
+        assert counts["1"] == 1
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # tier poll sees 80% → escalate-all
+        assert counts["1"] == 2
+        assert counts["2"] == 3  # baseline t0 + due t60 + escalation t120
+
     def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
         # The active account's fetches are being refused (429 with a long
         # Retry-After). Its last-good data ages past STALE_OK_S, but the

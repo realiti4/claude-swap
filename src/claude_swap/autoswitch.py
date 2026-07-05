@@ -86,6 +86,18 @@ ESCALATION_MARGIN_PCT = 15.0
 # an unmoved one backs off, up to the cap.
 MOVEMENT_DELTA_PCT = 1.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
+# The active account's cadence relaxes with distance (in utilization points)
+# to the escalation band, because burn rate is absolute: >50 pts below the
+# band → this hard cap (never slower); >25 pts → 2× the interval; else every
+# tick. Distance-based rather than absolute pct so an adjusted threshold
+# keeps the same safety margin (at threshold 50 the cap is simply never
+# reachable). The cap stays under STALE_OK_S so a relaxed active never loses
+# decision trust, and the worst plausible burn (~5%/min, heavy subagent use)
+# moves +15 pts between capped polls — still ≥35 pts from the band, and band
+# entry is seen at most one poll late, absorbed by ESCALATION_MARGIN_PCT +
+# hysteresis.
+ACTIVE_MAX_INTERVAL_S = 180.0
+ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× this
 
 
 def _now_iso() -> str:
@@ -811,7 +823,9 @@ class AutoSwitchEngine:
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
-        Phase A fetches the active account plus ONE due candidate (the one
+        Phase A fetches the active account (at its distance-to-threshold
+        cadence — every tick only near the band, see
+        :meth:`_active_poll_interval_s`) plus ONE due candidate (the one
         with the stalest data — never-fetched first, then oldest fetch);
         everyone else is served from the usage store. Phase B refetches ALL
         candidates and recomputes before any switch decision when a switch
@@ -839,7 +853,14 @@ class AutoSwitchEngine:
         ]
 
         pre = self.switcher.usage_entries_by_account(fetch=set())
-        plan: set[str] = {current}
+        plan: set[str] = set()
+        active_pre = pre.get(current)
+        if (
+            active_pre is None
+            or active_pre.age_s is None
+            or active_pre.age_s >= self._active_poll_interval_s(active_pre)
+        ):
+            plan.add(current)
         if self._idle_hold_since is None:
             pick = due_candidate(candidates, pre, now)
             if pick is not None:
@@ -872,6 +893,30 @@ class AutoSwitchEngine:
         if not self.dry_run:
             self._update_poll_plans(candidates, pre, entries, now)
         return entries, usage, headroom
+
+    def _active_poll_interval_s(self, entry) -> float:
+        """Stepwise active cadence by distance to the escalation band.
+
+        Unknown utilization or in-band → every tick (the at-limit escape and
+        failover paths must never wait); more than ``ACTIVE_RELAX_DISTANCE_PCT``
+        points below the band → 2× the engine interval; more than twice that
+        → ``ACTIVE_MAX_INTERVAL_S``. (At the default threshold 90 these are
+        the <50% / <25% utilization steps.) Derived per tick from the stored
+        entry — no persisted state, and failure backoff / idle-hold /
+        escalation are enforced elsewhere and unaffected.
+        """
+        interval = float(self.settings.interval_seconds)
+        pct = _binding_pct(entry.last_good)
+        if pct is None:
+            return interval
+        distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
+        if distance > 2 * ACTIVE_RELAX_DISTANCE_PCT:
+            tier = ACTIVE_MAX_INTERVAL_S
+        elif distance > ACTIVE_RELAX_DISTANCE_PCT:
+            tier = 2.0 * interval
+        else:
+            return interval
+        return min(tier, ACTIVE_MAX_INTERVAL_S)
 
     def _update_poll_plans(
         self, candidates: list[str], pre: dict, post: dict, now: float
