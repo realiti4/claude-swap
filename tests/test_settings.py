@@ -30,6 +30,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
+        "strategy": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -83,6 +84,16 @@ class TestLoadSettings:
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
         assert load_settings(tmp_path).strategy == "best"
+
+    def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "consume-first"}})
+        )
+        assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_set_strategy_consume_first(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "consume-first")
+        assert load_settings(tmp_path).strategy == "consume-first"
 
 
 class TestSaveSettings:
@@ -230,3 +241,7 @@ class TestMergedWithCli:
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
+
+    def test_strategy_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
+        assert merged.strategy == "consume-first"
