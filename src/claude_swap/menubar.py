@@ -1,46 +1,52 @@
 """macOS menu bar app for claude-swap (``cswap --menubar``).
 
-A thin GUI shell over ``ClaudeAccountSwitcher`` — it never re-implements
-account logic. Built on ``rumps`` (an optional extra, macOS only). The pure
-helpers below (settings, formatting, plist rendering) are import-safe without
-rumps so they can be unit-tested in CI; ``rumps`` is imported lazily inside
-the app glue.
+A thin GUI shell over ``ClaudeAccountSwitcher`` and the core auto-switch engine
+(``claude_swap.autoswitch``) — it never re-implements account, usage, or
+auto-switch logic. Usage for display comes from ``switcher.accounts_snapshot()``
+(backed by the shared usage store); auto-switching, when enabled, runs the same
+``AutoSwitchEngine`` the CLI's ``cswap auto`` drives, sharing
+``autoswitch_state.json`` and the ``autoswitch.*`` settings. The menu bar keeps
+only its own display preferences.
+
+Built on ``rumps`` (an optional extra, macOS only). The pure helpers below
+(settings, formatting, log parsing) are import-safe without rumps so they can be
+unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
-AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
-AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
-AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
-AUTO_HYSTERESIS = 5.0  # dead band (percent) that prevents auto-switch thrash
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
-_FULL_REFRESH_EVERY = 300  # seconds between full (all-account) usage refreshes
+SWITCH_HISTORY_LIMIT = 10
 
 
 @dataclass
 class MenuBarSettings:
-    """User-configurable menu bar behavior, persisted as JSON."""
+    """User-configurable menu bar display behavior, persisted as JSON.
+
+    Only display preferences and the auto-switch on/off toggle live here.
+    Auto-switch *policy* (threshold, cooldown, hysteresis, …) is core config,
+    read/written through ``claude_swap.settings`` (the ``autoswitch.*`` keys),
+    so the CLI and the menu bar share one source of truth.
+    """
 
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
-    auto_switch_threshold: int = 95
-    auto_switch_cooldown: int = 600
-    auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
-    auto_switch_strategy: str = "reactive"  # one of AUTO_STRATEGY_CHOICES
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -69,53 +75,14 @@ class MenuBarSettings:
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
 
-@dataclass
-class MenuBarState:
-    """Cooldown/notification timestamps for the auto-switcher, persisted as JSON.
-
-    Separate from MenuBarSettings: settings are user choices, state is runtime
-    bookkeeping. Persisting across restarts means a relaunch respects the
-    cooldown instead of swapping immediately.
-    """
-
-    last_switch_at: float = 0.0
-    last_noswap_notify_at: float = 0.0
-    blocked: list[str] = field(default_factory=list)  # 5h/limit-blocked account nums
-
-    @classmethod
-    def load(cls, path: Path) -> "MenuBarState":
-        """Load state; defaults on missing/corrupt. Int timestamps coerce to float."""
-        defaults = cls()
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return defaults
-        if not isinstance(raw, dict):
-            return defaults
-        kwargs = {}
-        for f in fields(cls):
-            default = getattr(defaults, f.name)
-            val = raw.get(f.name)
-            if isinstance(default, float):
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    kwargs[f.name] = float(val)
-            elif isinstance(default, list):
-                if isinstance(val, list) and all(isinstance(x, str) for x in val):
-                    kwargs[f.name] = list(val)
-        return cls(**kwargs)
-
-    def save(self, path: Path) -> None:
-        """Write state as pretty JSON, creating parent directories."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
-
+# ---- pure display helpers (operate on the usage-window dict shape produced by
+# ---- oauth.build_usage_result / stored in UsageEntry.last_good) --------------
 
 def tightest_pct(usage: dict | str | None) -> float | None:
     """Highest 5h/7d utilization percentage, or None if unknown.
 
-    Mirrors ``oauth.account_headroom`` (which returns ``100 - max(pct)``) but
-    surfaces the utilization itself for display. Spend is excluded — it isn't
-    a rate-limit window.
+    Surfaces the binding window's utilization for display. Spend is excluded —
+    it isn't a rate-limit window.
     """
     if not isinstance(usage, dict):
         return None
@@ -127,14 +94,34 @@ def tightest_pct(usage: dict | str | None) -> float | None:
     return max(pcts) if pcts else None
 
 
+def _window_pct(usage: dict | str | None, key: str) -> float | None:
+    """Utilization pct for a usage window (``five_hour``/``seven_day``), or None."""
+    if isinstance(usage, dict):
+        window = usage.get(key)
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            return float(window["pct"])
+    return None
+
+
+def _resets_at_ts(window: dict | str | None) -> float:
+    """POSIX timestamp of a usage window's ``resets_at``; inf if missing/bad."""
+    if isinstance(window, dict):
+        ra = window.get("resets_at")
+        if isinstance(ra, str):
+            try:
+                return datetime.fromisoformat(ra).timestamp()
+            except ValueError:
+                pass
+    return float("inf")
+
+
 def _live_countdown(window: dict | str | None, now: float) -> str | None:
     """Time until a usage window resets, computed live from ``resets_at``.
 
     The cached usage dict's ``countdown`` string is frozen at fetch time, so a
     stale (e.g. last-known-good) entry would show a wrong remaining time. Deriving
     it from the absolute ``resets_at`` keeps it correct between/without refetches.
-    Returns ``None`` when there's no ``resets_at`` or it has already passed (the
-    cached value is stale — omit rather than show a wrong/negative countdown).
+    Returns ``None`` when there's no ``resets_at`` or it has already passed.
     """
     ts = _resets_at_ts(window)
     if ts == float("inf"):
@@ -176,7 +163,7 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
 
 
 def format_account_label(
-    num: int, email: str, usage: dict | str | None, now: float | None = None
+    num, email: str, usage: dict | str | None, now: float | None = None
 ) -> str:
     """Build one account row's menu label."""
     return f"{num}  {email}  {usage_summary(usage, now)}"
@@ -214,18 +201,6 @@ def format_title(
     return f"{ICON} " + " · ".join(segments)
 
 
-NOSWAP_NOTIFY_EVERY = 3600  # seconds between repeat "no fresh account" notifications
-
-
-def _window_pct(usage: dict | str | None, key: str) -> float | None:
-    """Utilization pct for a usage window (``five_hour``/``seven_day``), or None."""
-    if isinstance(usage, dict):
-        window = usage.get(key)
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            return float(window["pct"])
-    return None
-
-
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
@@ -259,214 +234,50 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
     return (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
 
 
-def _worst_pct(usage: dict | str | None) -> float | None:
-    """Higher of the 5h/7d utilization, or None if either window is unknown."""
-    five = _window_pct(usage, "five_hour")
-    seven = _window_pct(usage, "seven_day")
-    if five is None or seven is None:
-        return None
-    return max(five, seven)
+_SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
 
 
-def next_blocked(
-    limiting_by_account: dict[str, float | None],
-    threshold: float,
-    hysteresis: float,
-    prev_blocked,
-) -> frozenset[str]:
-    """Sticky 'at-limit' set with a dead band, to stop auto-switch thrash.
+def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
+    """Recent account switches from the log, most-recent first.
 
-    An account enters the set when its limiting % is ``>= threshold`` and leaves
-    only when it drops below ``threshold - hysteresis``. Unknown (``None``) usage
-    carries the prior membership — a network blip never unblocks an account.
+    Reads the ``Switched from account X to Y`` lines the switcher logs and pairs
+    each with its timestamp (trimmed to the minute). Returns at most ``limit``
+    entries like ``"3 → 1   2026-06-27 02:06"``. Any unparseable line is skipped.
     """
-    nxt: set[str] = set()
-    for num, pct in limiting_by_account.items():
-        if pct is None:
-            if num in prev_blocked:
-                nxt.add(num)
+    out: list[str] = []
+    for line in log_text.splitlines():
+        m = _SWITCH_LOG_RE.search(line)
+        if not m:
             continue
-        if num in prev_blocked:
-            if pct >= threshold - hysteresis:
-                nxt.add(num)
-        elif pct >= threshold:
-            nxt.add(num)
-    return frozenset(nxt)
+        stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
+        out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
+    return out[-limit:][::-1]
 
 
-def _resets_at_ts(window: dict | str | None) -> float:
-    """POSIX timestamp of a usage window's ``resets_at``; inf if missing/bad."""
-    if isinstance(window, dict):
-        ra = window.get("resets_at")
-        if isinstance(ra, str):
-            try:
-                return datetime.fromisoformat(ra).timestamp()
-            except ValueError:
-                pass
-    return float("inf")
+def _account_display_usage(entry) -> dict | str | None:
+    """Menu-display usage for a ``UsageEntry``.
 
-
-def decide_auto_switch(
-    accounts: list[tuple[int, str, bool, dict | str | None]],
-    threshold: float,
-    blocked=frozenset(),
-) -> tuple[str, int | None]:
-    """Reactive auto-switch: switch when the active account hits the threshold.
-
-    ``blocked`` is the hysteresis set (account-number strings at/over limit); a
-    blocked candidate must clear ``threshold - AUTO_HYSTERESIS`` to be eligible
-    again. Returns ``("switch", num)``, ``("none", None)``,
-    ``("unknown_active", None)``, ``("no_candidate", None)`` (all peers exhausted),
-    or ``("no_candidate_unverifiable", None)`` (a peer's usage was unreadable).
-    Total — never raises.
+    A human-readable note for a sentinel state (token expired / API key /
+    keychain unavailable), otherwise the last-good measurement dict, otherwise
+    ``None``.
     """
-    active = next((a for a in accounts if a[2]), None)
-    if active is None:
-        return ("none", None)
-    active_worst = _worst_pct(active[3])
-    if active_worst is None:
-        return ("unknown_active", None)
-    if active_worst < threshold:
-        return ("none", None)
-
-    candidates: list[tuple[float, float, float, int]] = []
-    any_unverifiable = False
-    for num, _email, is_active, usage in accounts:
-        if is_active:
-            continue
-        worst = _worst_pct(usage)
-        if worst is None:
-            any_unverifiable = True
-            continue
-        limit = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
-        if worst >= limit:
-            continue
-        seven = _window_pct(usage, "seven_day")
-        five = _window_pct(usage, "five_hour")
-        candidates.append((worst, seven, five, num))
-    if not candidates:
-        return ("no_candidate_unverifiable", None) if any_unverifiable else ("no_candidate", None)
-    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
-    return ("switch", candidates[0][3])
+    if entry.sentinel:
+        return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+    return entry.last_good
 
 
-def decide_consume_first(
-    accounts: list[tuple[int, str, bool, dict | str | None]],
-    threshold: float,
-    blocked=frozenset(),
-) -> tuple[str, int | None]:
-    """Proactive 'consume the soonest-resetting account first' strategy.
+def _snapshot(switcher, fetch_new: bool = True) -> dict:
+    """Read accounts + usage off the main thread. Returns a render snapshot.
 
-    Eligible accounts have 5h not blocked (hysteresis) AND 7d below the threshold;
-    the eligible account whose 7d window resets soonest (then most headroom, then
-    rotation order) is optimal. Returns ``("switch", num)``, ``("none", None)``
-    (already optimal), ``("unknown_active", None)``, ``("no_candidate", None)``
-    (all weekly-exhausted -> notify), ``("no_candidate_unverifiable", None)``, or
-    ``("all_session_limited", None)`` (weekly room but all 5h-blocked -> silent).
-    Total — never raises.
-    """
-    active = next((a for a in accounts if a[2]), None)
-    if active is None:
-        return ("none", None)
-    if _window_pct(active[3], "five_hour") is None or _window_pct(active[3], "seven_day") is None:
-        return ("unknown_active", None)
-
-    eligible: list[tuple[float, float, int, int]] = []
-    any_unverifiable = False
-    any_weekly_room = False
-    for idx, (num, _email, is_active, usage) in enumerate(accounts):
-        five = _window_pct(usage, "five_hour")
-        seven = _window_pct(usage, "seven_day")
-        if five is None or seven is None:
-            if not is_active:
-                any_unverifiable = True
-            continue
-        if seven < threshold:
-            any_weekly_room = True
-        limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
-        if five < limit5 and seven < threshold:
-            eligible.append((_resets_at_ts(usage.get("seven_day")), _worst_pct(usage), idx, num))
-    if not eligible:
-        if any_unverifiable:
-            return ("no_candidate_unverifiable", None)
-        if any_weekly_room:
-            return ("all_session_limited", None)
-        return ("no_candidate", None)
-    eligible.sort(key=lambda e: (e[0], e[1], e[2]))
-    best_num = eligible[0][3]
-    if best_num == active[0]:
-        return ("none", None)
-    return ("switch", best_num)
-
-
-def limiting_pct_by_account(
-    accounts: list[tuple[int, str, bool, dict | str | None]],
-    strategy: str,
-) -> dict[str, float | None]:
-    """Per-account 'limiting %' feeding the hysteresis FSM, per strategy.
-
-    reactive -> worst-of(5h, 7d); consume-first -> the 5h axis. None when unknown.
-    """
-    out: dict[str, float | None] = {}
-    for num, _email, _is_active, usage in accounts:
-        if strategy == "consume-first":
-            out[str(num)] = _window_pct(usage, "five_hour")
-        else:
-            out[str(num)] = _worst_pct(usage)
-    return out
-
-
-def evaluate_strategy(
-    strategy: str,
-    accounts: list[tuple[int, str, bool, dict | str | None]],
-    threshold: float,
-    blocked,
-) -> tuple[str, int | None]:
-    """Dispatch to the active strategy's decision function (unknown -> reactive)."""
-    if strategy == "consume-first":
-        return decide_consume_first(accounts, threshold, blocked)
-    return decide_auto_switch(accounts, threshold, blocked)
-
-
-def plan_auto_switch(
-    decision: tuple[str, int | None],
-    state: "MenuBarState",
-    settings: "MenuBarSettings",
-    now: float,
-) -> tuple[str, int | None]:
-    """Apply cooldown + notification rate-limiting to a decision.
-
-    Returns ``("switch", num)``, ``("cooldown", None)``,
-    ``("notify_noswap", None)``, or ``("noop", None)``. Total — never raises.
-    """
-    kind, num = decision
-    if kind == "switch":
-        if now - state.last_switch_at >= settings.auto_switch_cooldown:
-            return ("switch", num)
-        return ("cooldown", None)
-    if kind == "no_candidate":
-        if now - state.last_noswap_notify_at >= NOSWAP_NOTIFY_EVERY:
-            return ("notify_noswap", None)
-        return ("noop", None)
-    return ("noop", None)
-
-
-def _snapshot(switcher, full: bool = True) -> dict:
-    """Fetch accounts + usage off the main thread. Returns a render snapshot.
-
-    Shape: ``{"accounts": [(num, email, is_active, usage), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``.
-    ``full=False`` fetches only the active account over the network (backups come
-    from cache) to stay under the usage endpoint's per-IP rate limit; ``full=True``
-    fetches all. Never raises — failures degrade to empty/unknown.
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good), ...],
+    "active_email": str | None, "active_usage": dict | str | None}``. Delegates to
+    ``switcher.accounts_snapshot`` (backed by the shared usage store, which serves
+    fresh entries from cache and rate-limits its own fetches). ``fetch_new=False``
+    reads cache-only — used while the auto-switch engine is running and already
+    polling. Never raises — failures degrade to empty/unknown.
     """
     try:
-        accounts_info = switcher._build_accounts_info()
-        only = None
-        if not full:
-            active = next((str(info[0]) for info in accounts_info if info[4]), None)
-            only = {active} if active else None
-        usages = switcher._collect_usage(accounts_info, only=only)
+        snap = switcher.accounts_snapshot(fetch=None if fetch_new else set())
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
         return {"accounts": [], "active_email": None, "active_usage": None}
@@ -474,10 +285,11 @@ def _snapshot(switcher, full: bool = True) -> dict:
     accounts = []
     active_email = None
     active_usage = None
-    for (num, email, _org, _uuid, is_active, _creds), usage in zip(accounts_info, usages):
-        accounts.append((num, email, is_active, usage))
-        if is_active:
-            active_email, active_usage = email, usage
+    for acc in snap.accounts:
+        display = _account_display_usage(acc.usage)
+        accounts.append((acc.number, acc.email, acc.is_active, display, acc.usage.last_good))
+        if acc.is_active:
+            active_email, active_usage = acc.email, display
     return {
         "accounts": accounts,
         "active_email": active_email,
@@ -489,8 +301,11 @@ def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
 
+    from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.settings import load_settings, set_setting
+
     settings_path = switcher.backup_dir / "menubar_settings.json"
-    state_path = switcher.backup_dir / "menubar_state.json"
+    log_path = switcher.backup_dir / "claude-swap.log"
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -499,51 +314,42 @@ def run(switcher) -> int:
             self.settings = MenuBarSettings.load(settings_path)
             self.snapshot = {"accounts": [], "active_email": None, "active_usage": None}
             self._dirty = False
-            self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
-            self._last_auto_eval = 0.0
-            self._last_full_fetch = 0.0
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
+            # Auto-switch engine (the same one `cswap auto` runs), hosted in a
+            # background thread while enabled.
+            self._engine = None
+            self._engine_events: list = []
+            self._event_lock = threading.Lock()
             self.rebuild_menu()
-            # Background refresh on the user's interval, plus a fast UI-sync tick
-            # that applies snapshots produced by worker threads on the main thread.
+            # Background display refresh on the user's interval, plus a fast
+            # UI-sync tick that applies snapshots + engine events on the main thread.
             self.refresh_timer = rumps.Timer(self.on_refresh_tick, self.settings.refresh_interval)
             self.refresh_timer.start()
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
-            self.refresh_async(full=True)  # first fetch is a full one
+            self.refresh_async()  # first display fetch
+            if self.settings.auto_switch_enabled:
+                self._start_engine()
 
-        # ---- refresh plumbing -------------------------------------------------
-        def refresh_async(self, full=False):
+        # ---- display refresh plumbing ----------------------------------------
+        def refresh_async(self):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time
             self._refreshing = True
-            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
+            threading.Thread(target=self._worker, daemon=True).start()
 
-        def _worker(self, full):
+        def _worker(self):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
-            # CPython); the main-thread sync tick reads them. Worst case is acting
-            # one tick late on a slightly stale snapshot, which the staleness gate
-            # in _auto_tick already guards against.
+            # CPython); the main-thread sync tick reads them.
             try:
-                now = time.time()
-                if now - self._last_full_fetch >= _FULL_REFRESH_EVERY:
-                    full = True
-                # Re-arm Keychain probing each cycle. A one-off `security`
-                # timeout flips the credential store to file mode and sticks for
-                # the process; with no plaintext fallback that freezes the active
-                # account's usage. Treating each refresh as its own invocation
-                # lets a transient failure self-heal on the next tick.
-                self.switcher.recheck_keychain()
-                snap = _snapshot(self.switcher, full=full)
+                snap = _snapshot(self.switcher, fetch_new=self._engine is None)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
-                if full:
-                    self._last_full_fetch = self._snapshot_at
                 self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
@@ -555,11 +361,11 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, usage in snap["accounts"]:
-                key = _usage_log_key(usage)
+            for num, email, _is_active, _display, last_good in snap["accounts"]:
+                key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, usage)
+                line = format_usage_log(email, last_good)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
@@ -572,11 +378,10 @@ def run(switcher) -> int:
                 self._dirty = False
                 self.rebuild_menu()
             self._detect_active_change()
-            if self.settings.auto_switch_enabled:
-                self._auto_tick()
+            self._drain_engine_events()
 
         def _detect_active_change(self):
-            # Reflect account switches from any source (menu, CLI, auto-switcher)
+            # Reflect account switches from any source (menu, CLI, auto engine)
             # within ~1s. Detecting *which* account is active is a cheap local
             # read of ~/.claude.json -- no Keychain or usage API -- so we can do
             # it on every tick. We gate the read on the file's mtime (a cheap
@@ -595,75 +400,79 @@ def run(switcher) -> int:
             current = self.switcher._get_current_account()
             email = current[0] if current else None
             if email and email != self.snapshot.get("active_email"):
-                self.refresh_async(full=True)
+                self.refresh_async()
 
-        def _auto_tick(self):
-            now = time.time()
-            cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
-            if now - self._last_auto_eval < cadence:
+        # ---- auto-switch engine ----------------------------------------------
+        def _start_engine(self):
+            """Run the core AutoSwitchEngine (live) in a background thread."""
+            if self._engine is not None:
                 return
-            # If the snapshot is staler than the cadence (always true in mode B
-            # with a sub-refresh interval; possible in either mode), fetch fresh
-            # and evaluate on a later tick so we never act on stale usage.
-            if now - self._snapshot_at > cadence and not self._refreshing:
-                # consume-first forces a full fetch here; between these it may rank
-                # backups up to _FULL_REFRESH_EVERY old — fine, since it ranks by
-                # weekly reset time (days-scale), not by minute-to-minute usage.
-                self.refresh_async(full=(self.settings.auto_switch_strategy == "consume-first"))
-                return
-            self._last_auto_eval = now
-            self._maybe_auto_switch(now)
-
-        def _maybe_auto_switch(self, now):
-            accounts = self.snapshot["accounts"]
-            strategy = self.settings.auto_switch_strategy
-            threshold = self.settings.auto_switch_threshold
-            limiting = limiting_pct_by_account(accounts, strategy)
-            self.state.blocked = sorted(
-                next_blocked(limiting, threshold, AUTO_HYSTERESIS, frozenset(self.state.blocked))
-            )
-            self.state.save(state_path)
-            decision = evaluate_strategy(strategy, accounts, threshold, frozenset(self.state.blocked))
-            action, num = plan_auto_switch(decision, self.state, self.settings, now)
-            if action == "switch":
-                try:
-                    self.switcher.switch_to(str(num))
-                except ClaudeSwitchError as e:
-                    self.switcher._logger.warning("auto-switch failed: %s", e)
-                    rumps.notification("claude-swap", "Auto-switch failed", str(e))
-                    return
-                self.state.last_switch_at = now
-                self.state.save(state_path)
-                self._notify_autoswitch(num)
-                self.refresh_async(full=True)
-            elif action == "notify_noswap":
-                self.state.last_noswap_notify_at = now
-                self.state.save(state_path)
-                rumps.notification(
-                    "claude-swap", "Claude limit — no fresh account",
-                    f"Active account is at its limit (≥{self.settings.auto_switch_threshold}%) "
-                    "but no other account has headroom.",
+            try:
+                engine = AutoSwitchEngine(
+                    self.switcher,
+                    load_settings(self.switcher.backup_dir),
+                    self._on_engine_event,
+                    dry_run=False,
                 )
+            except Exception as e:  # never let a bad start crash the menu bar
+                self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
+                rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                return
+            self._engine = engine
+            threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
 
-        def _notify_autoswitch(self, num):
-            email = next(
-                (e for n, e, _a, _u in self.snapshot["accounts"] if n == num), str(num)
-            )
-            rumps.notification(
-                "claude-swap", "Auto-switched account",
-                f"Switched to {email} — restart Claude Code to apply (active within ~30s).",
-            )
+        def _run_engine(self, engine):
+            try:
+                engine.run_loop()
+            except Exception:
+                self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
 
-        # ---- menu construction ------------------------------------------------
+        def _stop_engine(self):
+            if self._engine is not None:
+                self._engine.stop()
+                self._engine = None
+
+        def _restart_engine(self):
+            """Apply changed core settings by restarting the running engine."""
+            if self._engine is not None:
+                self._stop_engine()
+                self._start_engine()
+
+        def _on_engine_event(self, event):
+            # Runs on the engine thread; must not raise. Queue for the main
+            # thread, which surfaces notifications and reacts on the sync tick.
+            with self._event_lock:
+                self._engine_events.append(event)
+
+        def _drain_engine_events(self):
+            with self._event_lock:
+                events, self._engine_events = self._engine_events, []
+            for ev in events:
+                if ev.kind == "switch" and not getattr(ev, "dry_run", False):
+                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
+                    self.refresh_async()  # reflect the switch promptly
+                elif ev.kind == "account-quarantined":
+                    rumps.notification("claude-swap", "Account quarantined", ev.human())
+                elif ev.kind == "all-exhausted":
+                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+
+        def _threshold(self) -> int:
+            """Current auto-switch threshold from core settings (for the menu)."""
+            try:
+                return int(load_settings(self.switcher.backup_dir).threshold)
+            except Exception:
+                return 0
+
+        # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
                 self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, usage in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, usage),
+                    format_account_label(num, email, display),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -681,10 +490,11 @@ def run(switcher) -> int:
                 self._add_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
+                self._history_menu(rumps),
                 None,
                 self._settings_menu(rumps),
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
-                rumps.MenuItem("Quit", callback=rumps.quit_application),
+                rumps.MenuItem("Quit", callback=self.on_quit),
             ]
 
         def _add_menu(self, rumps):
@@ -699,8 +509,24 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _usage in accounts:
+            for num, email, _is_active, _display, _last_good in accounts:
                 menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
+            return menu
+
+        def _history_menu(self, rumps):
+            menu = rumps.MenuItem("Switch history")
+            try:
+                text = log_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            entries = parse_switch_history(text)
+            if entries:
+                for line in entries:
+                    menu.add(rumps.MenuItem(line, callback=None))
+            else:
+                menu.add(rumps.MenuItem("No switches logged yet", callback=None))
+            menu.add(None)
+            menu.add(rumps.MenuItem("Open full log…", callback=self.on_open_log))
             return menu
 
         def _settings_menu(self, rumps):
@@ -708,6 +534,7 @@ def run(switcher) -> int:
             name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
+
             title_pct = rumps.MenuItem("Title percentage")
             tp_labels = {"off": "None", "5h": "Session (5h)",
                          "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
@@ -716,6 +543,7 @@ def run(switcher) -> int:
                 ch.state = 1 if self.settings.title_pct == mode else 0
                 title_pct.add(ch)
             menu.add(title_pct)
+
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -728,38 +556,13 @@ def run(switcher) -> int:
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            strategy_menu = rumps.MenuItem("Auto-switch strategy")
-            st_labels = {"reactive": "Reactive (threshold)",
-                         "consume-first": "Consume-first (soonest reset)"}
-            for name in AUTO_STRATEGY_CHOICES:
-                ch = rumps.MenuItem(st_labels[name], callback=self._make_strategy(name))
-                ch.state = 1 if self.settings.auto_switch_strategy == name else 0
-                strategy_menu.add(ch)
-            menu.add(strategy_menu)
-
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
+            current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
-                ch.state = 1 if self.settings.auto_switch_threshold == pct else 0
+                ch.state = 1 if current == pct else 0
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
-
-            cooldown_menu = rumps.MenuItem("Auto-switch cooldown")
-            cd_labels = {300: "5 minutes", 600: "10 minutes", 1800: "30 minutes"}
-            for secs in AUTO_COOLDOWN_CHOICES:
-                ch = rumps.MenuItem(cd_labels[secs], callback=self._make_cooldown(secs))
-                ch.state = 1 if self.settings.auto_switch_cooldown == secs else 0
-                cooldown_menu.add(ch)
-            menu.add(cooldown_menu)
-
-            check_menu = rumps.MenuItem("Auto-switch check")
-            ck_labels = {0: "With display refresh", 60: "Every 1 minute",
-                         180: "Every 3 minutes", 300: "Every 5 minutes"}
-            for secs in AUTO_CHECK_CHOICES:
-                ch = rumps.MenuItem(ck_labels[secs], callback=self._make_check(secs))
-                ch.state = 1 if self.settings.auto_switch_interval == secs else 0
-                check_menu.add(ch)
-            menu.add(check_menu)
 
             return menu
 
@@ -778,8 +581,6 @@ def run(switcher) -> int:
                 return False
 
         def _notify_switched(self):
-            # macOS-only app, so always the Keychain-TTL guidance from
-            # ClaudeAccountSwitcher._print_switch_followup.
             rumps.notification(
                 "claude-swap",
                 "Account switched",
@@ -789,19 +590,15 @@ def run(switcher) -> int:
         def _make_switch_to(self, num):
             def cb(_sender):
                 if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self.state.last_switch_at = time.time()
-                    self.state.save(state_path)
                     self._notify_switched()
-                    self.refresh_async(full=True)
+                    self.refresh_async()
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
-                    self.state.last_switch_at = time.time()
-                    self.state.save(state_path)
                     self._notify_switched()
-                    self.refresh_async(full=True)
+                    self.refresh_async()
             return cb
 
         def _make_remove(self, num):
@@ -813,12 +610,12 @@ def run(switcher) -> int:
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
-                        self.refresh_async(full=True)
+                        self.refresh_async()
             return cb
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
-                self.refresh_async(full=True)
+                self.refresh_async()
 
         def on_add_token(self, _sender):
             # A menu-bar (accessory) app isn't the active app, so a modal
@@ -845,7 +642,13 @@ def run(switcher) -> int:
             if self._guard(lambda: self.switcher.add_account_from_token(
                 token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
             )):
-                self.refresh_async(full=True)
+                self.refresh_async()
+
+        def on_open_log(self, _sender):
+            import subprocess
+            # Reveal the log in Finder (-R); if it doesn't exist yet, open the dir.
+            target = log_path if log_path.exists() else log_path.parent
+            subprocess.run(["open", "-R", str(target)], check=False)
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
@@ -868,10 +671,14 @@ def run(switcher) -> int:
             except ClaudeSwitchError as e:
                 rumps.alert(title="claude-swap", message=str(e))
                 return
-            self.refresh_async(full=True)
+            self.refresh_async()
 
         def on_refresh_now(self, _sender):
-            self.refresh_async(full=True)
+            self.refresh_async()
+
+        def on_quit(self, _sender):
+            self._stop_engine()
+            rumps.quit_application()
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
@@ -897,33 +704,22 @@ def run(switcher) -> int:
 
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
-            self._last_auto_eval = 0.0  # let it evaluate on the next tick when enabling
-            self._save_and_rebuild()
-
-        def _make_strategy(self, name):
-            def cb(_sender):
-                self.settings.auto_switch_strategy = name
-                self._last_auto_eval = 0.0  # re-evaluate promptly on change
-                self._save_and_rebuild()
-            return cb
+            self.settings.save(settings_path)
+            if self.settings.auto_switch_enabled:
+                self._start_engine()
+            else:
+                self._stop_engine()
+            self.rebuild_menu()
 
         def _make_threshold(self, pct):
             def cb(_sender):
-                self.settings.auto_switch_threshold = pct
-                self._save_and_rebuild()
-            return cb
-
-        def _make_cooldown(self, secs):
-            def cb(_sender):
-                self.settings.auto_switch_cooldown = secs
-                self._save_and_rebuild()
-            return cb
-
-        def _make_check(self, secs):
-            def cb(_sender):
-                self.settings.auto_switch_interval = secs
-                self._last_auto_eval = 0.0
-                self._save_and_rebuild()
+                try:
+                    set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
+                except Exception as e:
+                    rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
+                    return
+                self._restart_engine()  # apply immediately if running
+                self.rebuild_menu()
             return cb
 
     MenuBarApp().run()
