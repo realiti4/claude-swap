@@ -154,7 +154,7 @@ refresh actions. A Settings submenu controls what the menu-bar title shows and
 the refresh interval.
 
 **Auto-switch.** Enable *Settings → Auto-switch accounts* to run the same
-auto-switch engine as [`cswap auto`](#auto-switch) in the background: it switches
+auto-switch engine as [`cswap auto`](#automatic-switching) in the background: it switches
 you to the account with the most headroom when the active account nears its
 limit, then notifies you to restart Claude Code. *Settings → Auto-switch
 threshold* (80% / 90% / 95% / 98%) sets the trigger level. That threshold and the
