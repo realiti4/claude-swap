@@ -230,14 +230,18 @@ class TestUsageDisplay:
     def test_collect_usage_short_circuits(self, temp_home: Path):
         s = _linux_switcher()
         info = [(2, "api-key-2@token.local", "", "", False, API_KEY)]
-        assert s._collect_usage(info) == [USAGE_API_KEY]
+        entries = s._collect_usage_entries(info)
+        assert entries["2"].sentinel == USAGE_API_KEY
+        assert entries["2"].decision_value() == USAGE_API_KEY
 
     def test_active_account_usage_short_circuits(self, temp_home: Path):
         s = _linux_switcher()
         get_global_config_path().write_text(
             json.dumps({"primaryApiKey": API_KEY}), encoding="utf-8"
         )
-        assert s._active_account_usage("2", "api-key-2@token.local") == USAGE_API_KEY
+        entry = s._active_account_usage("2", "api-key-2@token.local", "")
+        assert entry.sentinel == USAGE_API_KEY
+        assert entry.decision_value() == USAGE_API_KEY
 
 
 class TestStrategyBehaviour:

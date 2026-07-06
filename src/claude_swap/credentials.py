@@ -23,8 +23,9 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import CredentialWriteError
@@ -50,6 +51,30 @@ CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 # (``getApiKeyFromConfigOrMacOSKeychain``). On non-macOS the managed key instead
 # lives in ``~/.claude.json`` as ``primaryApiKey`` (see below).
 CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
+
+# Bounded retry for the active OAuth-credential Keychain read. A locked/contended
+# login Keychain can fail a single `security` call transiently — e.g. just after
+# wake while the keychain is still settling, or under contention with Claude Code's
+# own statusline polling the same item — and a second attempt a moment later
+# usually succeeds. This is an I/O backoff between retries of an external CLI, NOT
+# a sleep papering over an internal race.
+_ACTIVE_READ_ATTEMPTS = 2
+_ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+class ActiveCredentials(NamedTuple):
+    """Outcome of reading Claude Code's active credential.
+
+    ``value`` is the credential string (OAuth JSON or a raw managed key), ``""``
+    when none exists in any backend, or ``None`` on a plaintext-file read error.
+    ``keychain_unavailable`` is True only when the macOS OAuth Keychain read failed
+    (locked / denied / timeout) and nothing else covered it — letting callers
+    distinguish a transiently unreadable Keychain from a genuinely empty slot,
+    instead of collapsing both into a misleading "no credentials".
+    """
+
+    value: str | None
+    keychain_unavailable: bool
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -141,10 +166,50 @@ class CredentialStore:
         return self._keychain_usable_cache is not False
 
     def _read_credentials(self) -> str | None:
-        """Read Claude Code's active credential — OAuth *or* managed API key.
+        """Read Claude Code's active credential — OAuth *or* managed API key (value).
+
+        Thin wrapper over :meth:`_read_active_credentials` preserving the historic
+        ``str | None`` contract the switch paths rely on: credential string if
+        found, ``""`` if not found, ``None`` on a file read error.
+        """
+        return self._read_active_credentials().value
+
+    def _read_active_oauth_keychain(self) -> tuple[str | None, bool]:
+        """Read the active OAuth Keychain item with a bounded retry.
+
+        Returns ``(value, failed)``. ``value`` is the credential string, or
+        ``None`` when the item is absent (rc-44) or unreadable. ``failed`` is True
+        only when *every* attempt raised a KeychainError (locked / denied /
+        timeout); a genuinely absent item (rc-44, returned as ``None`` without
+        raising) reports ``failed=False`` and is not retried. The retry rides out
+        a transient lock/contention — it does not paper over an internal race.
+        """
+        last_error: Exception | None = None
+        for attempt in range(_ACTIVE_READ_ATTEMPTS):
+            try:
+                value = self._kc_call(
+                    macos_keychain.get_password,
+                    CLAUDE_CODE_KEYCHAIN_SERVICE,
+                    macos_keychain.keychain_account_name(),
+                )
+                return value, False
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                last_error = e
+                if attempt + 1 < _ACTIVE_READ_ATTEMPTS:
+                    time.sleep(_ACTIVE_READ_RETRY_DELAY)
+        # Every attempt failed: _kc_call has flipped routing to file mode.
+        self._host._logger.warning(
+            f"Keychain read failed after {_ACTIVE_READ_ATTEMPTS} attempt(s), "
+            f"trying file: {last_error}"
+        )
+        return None, True
+
+    def _read_active_credentials(self) -> ActiveCredentials:
+        """Read Claude Code's active credential, classifying the outcome.
 
         Tries the OAuth credential first (Keychain "Claude Code-credentials" on
-        macOS when usable, then the plaintext ``~/.claude/.credentials.json`` Claude
+        macOS when usable — with a bounded retry to ride out a transient
+        lock/contention — then the plaintext ``~/.claude/.credentials.json`` Claude
         Code also falls back to), and only then the managed-key locations (macOS
         Keychain "Claude Code", then ``~/.claude.json`` ``primaryApiKey``). Trying
         OAuth fully first means a macOS OAuth login that only has a file fallback
@@ -152,26 +217,22 @@ class CredentialStore:
         raw ``sk-ant-api…`` string — callers distinguish it via ``looks_like_api_key``.
         Non-mutating.
 
-        Returns:
-            Credential string if found, "" if not found, None on a file read error.
+        Reports ``keychain_unavailable`` when the OAuth Keychain read failed and
+        nothing else covered it, so the display layer can say "keychain unavailable"
+        rather than "no credentials" for a merely-unreadable slot — which would
+        otherwise nudge the user into an unnecessary re-login.
         """
-        # 1. OAuth Keychain (macOS, when usable).
+        keychain_failed = False
+        # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         if self._use_keychain():
-            try:
-                val = self._kc_call(
-                    macos_keychain.get_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
-                    macos_keychain.keychain_account_name(),
-                )
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                # Locked / denied / unavailable Keychain (rc-44 "not found" comes
-                # back as None, not raised). _kc_call has flipped routing to file
-                # mode; fall through to the plaintext file Claude Code uses too.
-                # (A programming error is NOT caught here — it propagates.)
-                self._host._logger.warning(f"Keychain read failed, trying file: {e}")
-                val = None
+            val, keychain_failed = self._read_active_oauth_keychain()
             if val:
-                return val
+                return ActiveCredentials(val, False)
+        elif self._host.platform == Platform.MACOS:
+            # Keychain already known unusable this process (a prior op failed and the
+            # capability cache stuck to file mode): if nothing is found below, that
+            # absence is "keychain unavailable", not a genuinely empty slot.
+            keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
         cred_file = get_credentials_path()
@@ -180,15 +241,17 @@ class CredentialStore:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return None
+                return ActiveCredentials(None, False)
             if text.strip():
-                return text
+                return ActiveCredentials(text, False)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
         if key:
-            return key
-        return ""
+            return ActiveCredentials(key, False)
+        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
+        # UI distinguishes it from a real empty slot.
+        return ActiveCredentials("", keychain_failed)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -430,14 +493,19 @@ class CredentialStore:
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 
-        macOS writes the Keychain when usable (recording backend ``"keychain"``)
-        and **leaves the plaintext file untouched**, mirroring Claude Code, which
-        preserves the file alongside a populated Keychain for container ``~/.claude``
-        sharing (#1414): cswap can't prove an existing file is its own stale fallback
-        vs. a credential another consumer relies on. If the Keychain write fails — or
-        the Keychain is already known unusable — it writes the plaintext file and
-        best-effort clears any stale Keychain entry (#30337), recording backend
-        ``"file"``. Linux/WSL/Windows always write the file.
+        macOS writes the Keychain when usable (recording backend ``"keychain"``). On
+        a successful Keychain write it then **rewrites an already-present**
+        ``.credentials.json`` with the same fresh creds — never *creating* one when
+        absent, never *deleting* one. This bumps the file's mtime so a running Claude
+        Code session's disk-mtime cache invalidation fires and it hot-reloads the new
+        account instead of serving its memoized token until restart (#86); it also
+        keeps the file consistent for the container ``~/.claude`` sharing consumer
+        (#1414) rather than stranding it on stale content. Keychain-only users keep
+        their fileless posture — their absent-file path already hot-reloads via the
+        ~30s Keychain TTL — and never gain a plaintext credential on disk. If the
+        Keychain write fails — or the Keychain is already known unusable — it writes
+        the plaintext file and best-effort clears any stale Keychain entry (#30337),
+        recording backend ``"file"``. Linux/WSL/Windows always write the file.
 
         Raises:
             CredentialWriteError: If writing credentials fails.
@@ -455,6 +523,10 @@ class CredentialStore:
                 # (A programming error is NOT caught here — it propagates.)
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
             else:
+                # Keychain (primary) now holds the fresh credential. Bump an
+                # already-present shadow file's mtime so running sessions hot-reload
+                # (#86); best-effort, never creates one — see the helper.
+                self._refresh_stale_credentials_file(credentials)
                 self._last_active_credentials_backend = "keychain"
                 return
 
@@ -468,6 +540,34 @@ class CredentialStore:
             raise CredentialWriteError(f"Failed to write credentials: {e}")
         self._delete_active_keychain_entry()
         self._last_active_credentials_backend = "file"
+
+    def _refresh_stale_credentials_file(self, credentials: str) -> None:
+        """Bump an already-present ``.credentials.json``'s mtime after a Keychain write.
+
+        Rewrite-when-present / never-create (#86). Claude Code invalidates its
+        memoized OAuth token only when this file's mtime changes or the file is
+        absent; a Keychain-only switch leaves a *stale* file's mtime frozen, so a
+        running session serves the old token until restart. Rewriting the existing
+        file with the same fresh creds bumps the mtime (atomic ``os.replace``, so it
+        bumps even when the content is unchanged) and keeps a file-reading consumer
+        (#1414 shared ``~/.claude``) consistent. We never *create* the file when
+        absent — Keychain-only users keep their fileless posture and their absent-file
+        (~30s Keychain-TTL) path already hot-reloads.
+
+        Best-effort: the Keychain write is authoritative on macOS and already
+        succeeded, so a failure here must not fail the switch — it only means a
+        running session may lag until restart.
+        """
+        cred_file = get_credentials_path()
+        if not cred_file.exists():
+            return
+        try:
+            self._write_active_credentials_file(credentials)
+        except Exception as e:
+            self._host._logger.warning(
+                f"Could not refresh .credentials.json after Keychain write ({e}); "
+                "a running session may not hot-reload until restart"
+            )
 
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup *writes* go to files vs. the Keychain.

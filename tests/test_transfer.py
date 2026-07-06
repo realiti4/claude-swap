@@ -262,6 +262,54 @@ class TestConflictPolicy:
         assert seq["accounts"]["1"]["email"] == "bob@example.com"
         assert seq["accounts"]["3"]["email"] == "alice@example.com"
 
+    def test_import_over_live_login_hints_force_activation(
+        self, temp_home: Path, capsys
+    ):
+        """Overwriting the stored backup of the current live login prints the
+        --switch-to --force activation hint (issue #79 follow-up): a plain
+        switch would back the stale live creds up over the fresh import."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", "Org A")
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "alice@example.com",
+                "accountUuid": "acct-1",
+                "organizationUuid": "org-a",
+                "organizationName": "Org A",
+            }
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-stale-live"}}
+        ))
+        out = temp_home / "alice.cswap"
+        export_accounts(s, str(out))
+
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "alice@example.com is your current live login" in err
+        assert "cswap --switch-to 1 --force" in err
+
+    def test_import_without_matching_live_login_prints_no_hint(
+        self, temp_home: Path, capsys
+    ):
+        """No activation hint when the live login isn't among the imported
+        accounts (its stored backup was not rewritten)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", "Org A")
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "bob@example.com",
+                "accountUuid": "acct-bob",
+            }
+        }))
+        out = temp_home / "alice.cswap"
+        export_accounts(s, str(out))
+
+        import_accounts(s, str(out), force=True)
+
+        assert "current live login" not in capsys.readouterr().err
+
     def test_slot_allocation_when_exported_slot_taken(self, temp_home: Path):
         """Imported account's exported slot is taken by a different account
         (no email match) → allocate next available slot (max+1, mirrors

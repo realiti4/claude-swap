@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -15,6 +16,7 @@ from claude_swap.json_output import (
     usage_fields,
     usage_to_json,
 )
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -41,10 +43,24 @@ class TestJsonHelpers:
         assert out["spend"]["used"] == 12.5
         assert out["spend"]["resetsAt"] == "2026-07-01T00:00:00Z"
 
+    def test_usage_to_json_projects_scoped_windows(self):
+        usage = {
+            "five_hour": {"pct": 7.0},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "resets_at": "2026-07-03T21:59:59Z",
+                 "countdown": "3h", "clock": "21:59"},
+            ],
+        }
+        out = usage_to_json(usage)
+        assert out["scoped"] == [
+            {"name": "Fable", "pct": 100.0, "resetsAt": "2026-07-03T21:59:59Z",
+             "countdown": "3h", "clock": "21:59"},
+        ]
+
     def test_usage_fields_variants(self):
         from claude_swap.json_output import (
+            USAGE_KEYCHAIN_UNAVAILABLE,
             USAGE_NO_CREDENTIALS,
-            USAGE_RATE_LIMITED,
             USAGE_TOKEN_EXPIRED,
         )
 
@@ -53,7 +69,7 @@ class TestJsonHelpers:
         assert usage_fields(USAGE_NO_CREDENTIALS) == ("no_credentials", None)
         assert usage_fields("no credentials") == ("no_credentials", None)
         assert usage_fields(USAGE_TOKEN_EXPIRED) == ("token_expired", None)
-        assert usage_fields(USAGE_RATE_LIMITED) == ("rate_limited", None)
+        assert usage_fields(USAGE_KEYCHAIN_UNAVAILABLE) == ("keychain_unavailable", None)
         assert usage_fields(None) == ("unavailable", None)
 
     def test_error_envelope_shape(self):
@@ -98,9 +114,10 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
             payload = switcher.list_accounts(json_output=True)
 
         # Method itself prints nothing — the CLI serializes.
@@ -125,15 +142,68 @@ class TestListJson:
 
         # Account 1 active with creds but the fetch fails (None → unavailable);
         # account 2 has no backup creds (→ no_credentials).
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=""), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
 
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["usageStatus"] == "unavailable"
         assert by_num[1]["usage"] is None
         assert by_num[2]["usageStatus"] == "no_credentials"
+
+    @pytest.mark.parametrize(
+        "age_s,expected_status", [(100.0, "ok"), (400.0, "ok"), (4000.0, "unavailable")]
+    )
+    def test_stale_usage_is_decision_gated_in_json(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, age_s: float, expected_status: str,
+    ):
+        """JSON serves last-good only while decision-grade.
+
+        With the refetch failing, staleness past STALE_OK_S is deliberate
+        (stale-on-error) and stays decision-grade — but a script keying on
+        usageStatus == "ok" must never act on arbitrarily old data: past
+        TRUST_MAX_AGE_S the row reports unavailable even though the human
+        view still shows the last-seen numbers with age.
+        """
+        import time as time_mod
+
+        from claude_swap.usage_store import FetchRecord, UsageStore
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        backdated = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - age_s
+        )
+        backdated.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
+            {"1": ("test@example.com", "")},
+        )
+
+        # The stale entry is due for a refetch, but the fetch fails — the
+        # store keeps serving the old measurement.
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None, error="timeout")):
+            payload = switcher.list_accounts(json_output=True)
+
+        row = next(a for a in payload["accounts"] if a["number"] == 1)
+        assert row["usageStatus"] == expected_status
+        if expected_status == "ok":
+            assert row["usage"]["fiveHour"]["pct"] == 25.0
+            assert row["usageAgeSeconds"] >= age_s
+        else:
+            assert row["usage"] is None
+            assert "usageFetchedAt" not in row
 
 
 # --------------------------------------------------------------------------- #
@@ -165,8 +235,9 @@ class TestStatusJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
-             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage):
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
             payload = switcher.status(json_output=True)
 
         assert capsys.readouterr().out == ""
@@ -224,7 +295,7 @@ def _install_patches(switcher, creds_store, configs_store, live_state):
         patch.object(switcher, "_write_credentials",
                      side_effect=lambda c: live_state.__setitem__("creds", c)),
         # Don't make network calls from the (suppressed) post-switch usage path.
-        patch("claude_swap.oauth.fetch_usage_for_account", return_value=None),
+        patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)),
     ]
     for p in patches:
         p.start()
@@ -270,6 +341,54 @@ class TestSwitchJson:
         assert result["switched"] is False
         assert result["reason"] == "already-active"
         assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
+
+    def test_switch_to_force_self_activation_reports_activated(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        """--switch-to <current> --force rewrites creds from the stored backup:
+        switched stays identity-based (false) but reason says 'activated'."""
+        switcher, creds, configs, live = _two_account_stores(temp_home, sample_sequence_data)
+        creds[("1", "test@example.com")] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-imported-1", "refreshToken": "rt-imported-1"}}
+        )
+        patches = _install_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1", json_output=True, force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert capsys.readouterr().out == ""
+        assert result["switched"] is False
+        assert result["reason"] == "activated"
+        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
+        assert result["message"].startswith("Activated Account-1")
+        # The live login was really rewritten from the stored backup.
+        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-imported-1"
+
+    def test_switch_to_force_cross_slot_reports_switched(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        """A cross-slot force is a real switch; reason reports the outcome,
+        not the skipped-backup mechanism."""
+        switcher, creds, configs, live = _two_account_stores(temp_home, sample_sequence_data)
+        slot1_before = creds[("1", "test@example.com")]
+        patches = _install_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("2", json_output=True, force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert capsys.readouterr().out == ""
+        assert result["switched"] is True
+        assert result["reason"] == "switched"
+        assert result["from"] == {"number": 1, "email": "test@example.com"}
+        assert result["to"] == {"number": 2, "email": "account2@example.com"}
+        # Backup-current was skipped: slot 1's stored creds are untouched.
+        assert creds[("1", "test@example.com")] == slot1_before
 
     def test_noop_from_equals_to(
         self, temp_home: Path, mock_claude_config: Path,

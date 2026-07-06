@@ -361,6 +361,7 @@ def import_accounts(
     imported = 0
     skipped = 0
     overwritten = 0
+    written_slots: set[str] = set()
 
     # Track where the envelope's active account ended up locally. We can't
     # just look up envelope_active in the final account map afterwards: the
@@ -448,6 +449,7 @@ def import_accounts(
 
         if is_envelope_active:
             resolved_active_slot = target_num
+        written_slots.add(target_num)
 
         if outcome == "overwrote":
             _eprint(f"Overwrote {entry['email']} (slot {target_num})")
@@ -474,3 +476,16 @@ def import_accounts(
     _eprint(
         f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped"
     )
+
+    # If we just rewrote the stored backup for the account that is the current
+    # live login, a plain switch would back the (possibly stale) live
+    # credentials up over it (issue #79) — point at the explicit activation
+    # path instead.
+    identity = switcher._get_current_account()
+    if identity is not None and final is not None:
+        live_slot = switcher._find_account_slot(final, identity[0], identity[1])
+        if live_slot is not None and live_slot in written_slots:
+            _eprint(
+                f"Note: {identity[0]} is your current live login — activate the "
+                f"imported credentials with: cswap --switch-to {live_slot} --force"
+            )

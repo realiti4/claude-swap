@@ -22,6 +22,14 @@ detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
 
+History sharing (``--share-history``, opt-in): additionally links
+``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
+``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
+unified conversation history. POSIX-only: Windows shares by re-synced copy,
+which would fork history rather than share it. If the profile already
+accumulated its own history, it is merged into ``~/.claude`` first so nothing
+disappears from ``--resume``.
+
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 """
@@ -53,8 +61,9 @@ if TYPE_CHECKING:
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
-# projects/ (per-account history is a feature), sessions/, ide/,
-# .claude.json, .credentials.json, statsig/ and other telemetry.
+# sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
+# telemetry. projects/ and history.jsonl are per-account by default and move
+# to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
 SHARED_ITEMS = (
     "settings.json",
     "keybindings.json",
@@ -62,6 +71,13 @@ SHARED_ITEMS = (
     "skills",
     "commands",
     "agents",
+)
+
+# Conversation-history items linked additionally under --share-history.
+# POSIX symlinks only: Windows copy-mode would fork history, not share it.
+HISTORY_ITEMS = (
+    "projects",
+    "history.jsonl",
 )
 
 # Records which entries in a session profile cswap created (so --no-share and
@@ -173,6 +189,21 @@ def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:
     return list_sessions(claude_dir=session_dir)
 
 
+def _mkdir_private(path: Path) -> None:
+    """mkdir -p with 0o700 on every created level.
+
+    ``Path.mkdir(parents=True, mode=...)`` applies the mode only to the leaf;
+    history dirs must match Claude Code's own 0o700 at every level.
+    """
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
 def _probe_env(session_dir: Path) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
@@ -190,12 +221,24 @@ class SessionManager:
 
     # -- launch ----------------------------------------------------------
 
-    def run(self, identifier: str, claude_args: list[str], share: bool = True) -> NoReturn:
+    def run(
+        self,
+        identifier: str,
+        claude_args: list[str],
+        share: bool = True,
+        share_history: bool = False,
+    ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal."""
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
+            )
+        if share_history and self.switcher.platform == Platform.WINDOWS:
+            raise SessionError(
+                "--share-history is not supported on Windows yet: sharing uses "
+                "re-synced copies there, which would fork the history instead "
+                "of sharing it."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -234,7 +277,9 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
-        session_dir, account_num, email = self.setup_session(identifier, share)
+        session_dir, account_num, email = self.setup_session(
+            identifier, share, share_history
+        )
 
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
@@ -280,7 +325,9 @@ class SessionManager:
 
     # -- bootstrap -------------------------------------------------------
 
-    def setup_session(self, identifier: str, share: bool) -> tuple[Path, str, str]:
+    def setup_session(
+        self, identifier: str, share: bool, share_history: bool = False
+    ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
@@ -298,7 +345,7 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share)
+            self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
@@ -310,11 +357,11 @@ class SessionManager:
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
-                self._sync_sharing(session_dir, share)
+                self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share)
+            self._sync_sharing(session_dir, share, share_history)
 
             if not self._is_session_valid(session_dir, email, org_uuid):
                 self._cleanup_failed_session(session_dir)
@@ -463,34 +510,60 @@ class SessionManager:
 
     # -- sharing ---------------------------------------------------------
 
-    def _sync_sharing(self, session_dir: Path, share: bool) -> None:
-        """Mirror SHARED_ITEMS from ~/.claude into the profile (or undo it).
+    def _sync_sharing(
+        self, session_dir: Path, share: bool, share_history: bool = False
+    ) -> None:
+        """Mirror shared items from ~/.claude into the profile (or undo it).
 
-        Idempotent; runs on every launch. Deliberately sources from the
-        default ``~/.claude`` (not ``get_claude_config_home()``): sharing
+        ``share`` governs SHARED_ITEMS (customizations); ``share_history``
+        governs HISTORY_ITEMS (conversation history) — independent concerns,
+        so ``--no-share --share-history`` gives a bare profile with unified
+        history. Idempotent; runs on every launch. Deliberately sources from
+        the default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
         is set in the invoking environment. Lock-free on the reuse path:
-        concurrent ``run`` vs ``run --no-share`` is last-writer-wins and
-        self-heals on the next launch.
+        concurrent runs with different flags are last-writer-wins and
+        self-heal on the next launch.
         """
         if not session_dir.is_dir():
             return
+        # History links are POSIX-only (run() rejects the flag on Windows;
+        # this also drops any links left by a POSIX→Windows profile move).
+        if self.switcher.platform == Platform.WINDOWS:
+            share_history = False
+        active_items = (SHARED_ITEMS if share else ()) + (
+            HISTORY_ITEMS if share_history else ()
+        )
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
 
-        if not share:
-            for name in managed:
-                self._remove_managed(session_dir / name)
+        # A flag turned off since last launch: remove the links we created
+        # for it (never plain files/dirs the user accumulated themselves).
+        # For history items that holds even when the manifest claims them:
+        # a stale manifest (lock-free launches race) must never be able to
+        # delete real conversation history — only ever unlink symlinks.
+        for name in managed:
+            if name not in active_items:
+                dest = session_dir / name
+                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                    continue
+                self._remove_managed(dest)
+        if not active_items:
             manifest_path.unlink(missing_ok=True)
             return
 
         use_symlinks = self.switcher.platform != Platform.WINDOWS
         new_managed: list[str] = []
 
-        for name in SHARED_ITEMS:
+        for name in active_items:
             src = source_root / name
             dest = session_dir / name
+
+            if name in HISTORY_ITEMS and not self._prepare_history_share(
+                src, dest, session_dir
+            ):
+                continue
 
             if not src.exists():
                 # Source vanished (or never existed): prune our own entry.
@@ -544,13 +617,115 @@ class SessionManager:
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
 
+    def _prepare_history_share(
+        self, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Make a history item linkable; returns False to skip it this launch.
+
+        Handles the two ways a history item differs from a plain shared item:
+        the profile may already hold real history that must survive (merged
+        into ``~/.claude``, never discarded — the generic loop would just
+        refuse), and the share source may not exist yet on a fresh install
+        (created empty so there is something to link). Real history is merged
+        even when the manifest claims the entry is managed: a stale manifest
+        (lock-free launches race) must never let the generic loop delete it.
+        """
+        if dest.exists() and not dest.is_symlink():
+            # Real per-account history accumulated before the flag existed.
+            # Merging moves files out from under any claude still running in
+            # this profile, so only migrate when the profile is quiescent.
+            if live_sessions_for(session_dir):
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name} yet: another session is "
+                        "using this profile — retrying on the next launch."
+                    )
+                )
+                return False
+            try:
+                self._merge_history_into_source(src, dest)
+            except OSError as e:
+                self._logger.warning(
+                    f"Could not merge {dest.name} into {src}: {e}"
+                )
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name}: merging the profile's "
+                        "existing history failed (see log)."
+                    )
+                )
+                return False
+            print(
+                dimmed(
+                    f"Merged the profile's existing {dest.name} into "
+                    f"{src} — conversation history is now shared."
+                )
+            )
+        if not src.exists():
+            # Fresh ~/.claude (or first run): seed an empty share target so
+            # the generic loop below has something to link.
+            try:
+                # 0o600/0o700 to match Claude Code's own modes for history
+                # data — its mode= applies only at creation, so a loose seed
+                # here would stay world-readable forever.
+                if dest.name.endswith(".jsonl"):
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    src.touch(mode=0o600)
+                else:
+                    _mkdir_private(src)
+            except OSError as e:
+                self._logger.warning(f"Could not create {src}: {e}")
+                return False
+        return True
+
+    @staticmethod
+    def _merge_history_into_source(src: Path, dest: Path) -> None:
+        """Move the profile's own history at ``dest`` into ``src``.
+
+        Directories merge file-by-file (transcript filenames are UUIDs, so
+        collisions mean identical sessions — first writer wins and the
+        duplicate is dropped). ``history.jsonl`` merges by appending lines
+        not already present. ``dest`` is removed once empty; any failure
+        raises OSError and leaves remaining files in place for the next try.
+        """
+        if dest.is_dir():
+            _mkdir_private(src)
+            for path in sorted(dest.rglob("*"), reverse=True):
+                rel = path.relative_to(dest)
+                target = src / rel
+                if path.is_dir():
+                    path.rmdir()  # children already moved (reverse walk)
+                    continue
+                if target.exists():
+                    path.unlink()
+                    continue
+                _mkdir_private(target.parent)
+                shutil.move(str(path), str(target))
+            dest.rmdir()
+        else:
+            existing: set[str] = set()
+            if src.exists():
+                existing = set(src.read_text(encoding="utf-8").splitlines())
+            lines = [
+                line
+                for line in dest.read_text(encoding="utf-8").splitlines()
+                if line and line not in existing
+            ]
+            if lines:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                if not src.exists():
+                    src.touch(mode=0o600)  # match Claude Code's history mode
+                with src.open("a", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+            dest.unlink()
+
     @staticmethod
     def _read_manifest(manifest_path: Path) -> list[str]:
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             items = data.get("items", [])
             # Only ever act on names we could have created.
-            return [i for i in items if i in SHARED_ITEMS]
+            return [i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS]
         except (OSError, json.JSONDecodeError, AttributeError):
             return []
 

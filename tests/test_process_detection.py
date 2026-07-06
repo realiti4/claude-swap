@@ -41,19 +41,39 @@ class TestGetClaudeDir:
 
 
 class TestIsPidAlive:
+    # The os.kill(pid, 0) semantics below are the POSIX branch; on Windows
+    # is_pid_alive() dispatches to _is_pid_alive_windows() and never calls
+    # os.kill. Pin the platform so these exercise the intended path on any host.
     def test_alive_pid(self):
-        with patch("os.kill") as mock_kill:
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("os.kill") as mock_kill:
             mock_kill.return_value = None
             assert is_pid_alive(12345) is True
             mock_kill.assert_called_once_with(12345, 0)
 
     def test_dead_pid(self):
-        with patch("os.kill", side_effect=OSError("No such process")):
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("os.kill", side_effect=OSError("No such process")):
             assert is_pid_alive(12345) is False
 
     def test_permission_error_means_alive(self):
-        with patch("os.kill", side_effect=PermissionError("Operation not permitted")):
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("os.kill", side_effect=PermissionError("Operation not permitted")):
             assert is_pid_alive(12345) is True
+
+    def test_windows_dispatches_to_ctypes_impl(self):
+        """On win32, is_pid_alive() delegates to the ctypes-based helper."""
+        with patch("claude_swap.process_detection.sys.platform", "win32"), \
+             patch(
+                 "claude_swap.process_detection._is_pid_alive_windows",
+                 return_value=True,
+             ) as mock_win:
+            assert is_pid_alive(12345) is True
+            mock_win.assert_called_once_with(12345)
+
+    def test_current_process_is_alive(self):
+        """Smoke test on the real platform branch (win32 or POSIX)."""
+        assert is_pid_alive(os.getpid()) is True
 
     def test_invalid_pid_zero(self):
         assert is_pid_alive(0) is False

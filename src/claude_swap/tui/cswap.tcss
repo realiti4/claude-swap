@@ -1,0 +1,202 @@
+/* claude-swap TUI — flat, low-chrome dark layout.
+   Colors come from the registered "cswap-dark" theme (theme.py); this file
+   only handles layout, spacing, and the few component states. */
+
+Screen {
+    background: $background;
+}
+
+/* -- accounts panel (the always-visible monitor) --------------------------- */
+
+#accounts-panel {
+    height: auto;
+    padding: 1 3;
+    background: $background;
+    border-bottom: solid $panel;
+}
+
+#auto-active-panel {
+    height: auto;
+    padding: 1 3 0 3;
+    background: $background;
+}
+
+/* -- dashboard menu ----------------------------------------------------------- */
+
+#menu-title {
+    height: 1;
+    margin-top: 1;
+    padding: 0 3;
+    color: $secondary;
+}
+
+#menu, #accounts {
+    background: $background;
+    padding: 1 2 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+#menu:focus, #accounts:focus {
+    background-tint: $foreground 0%;
+}
+
+#menu ListItem, #accounts ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#accounts ListItem {
+    margin-bottom: 1;
+}
+
+#menu ListItem.-highlight,
+#menu:focus ListItem.-highlight,
+#accounts ListItem.-highlight,
+#accounts:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
+#accounts ListItem.flash {
+    background: $panel;
+}
+
+/* -- switch / watch screens --------------------------------------------------- */
+
+#list-title {
+    height: 1;
+    margin-top: 1;
+    padding: 0 3;
+    color: $secondary;
+}
+
+/* -- auto screen ---------------------------------------------------------- */
+
+#auto-top {
+    height: auto;
+    background: $background;
+    padding: 1 2;
+}
+
+#auto-title-row {
+    height: 1;
+    margin-bottom: 1;
+}
+
+#mode-badge {
+    width: auto;
+    text-style: bold;
+}
+
+#mode-badge.dry {
+    background: $panel;
+    color: $warning;
+}
+
+#mode-badge.live {
+    background: $primary;
+    color: $background;
+}
+
+#auto-summary {
+    width: 1fr;
+    color: $secondary;
+    padding-left: 2;
+}
+
+#candidates {
+    height: auto;
+}
+
+#event-log {
+    background: $background;
+    border-top: solid $panel;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+/* -- modals ----------------------------------------------------------------- */
+
+ConfirmModal, AddTokenModal, OutputModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+.modal-box {
+    width: 64;
+    max-width: 90%;
+    height: auto;
+    max-height: 80%;
+    background: $surface;
+    border: round $panel;
+    padding: 1 2;
+}
+
+.modal-box-wide {
+    width: 90;
+}
+
+.modal-title {
+    text-style: bold;
+    color: $primary;
+    margin-bottom: 1;
+}
+
+.modal-body {
+    color: $foreground;
+    margin-bottom: 1;
+}
+
+.modal-buttons {
+    height: auto;
+    align-horizontal: right;
+    margin-top: 1;
+}
+
+/* Flat chip buttons: quiet at rest, terracotta block when focused. ←/→ move
+   focus between them, Enter presses — the accent shows where Enter lands. */
+.modal-buttons Button {
+    border: none;
+    height: 1;
+    min-width: 12;
+    padding: 0 2;
+    margin-left: 2;
+    background: $panel;
+    color: $foreground;
+    text-style: none;
+}
+
+.modal-buttons Button:hover {
+    background: $panel-lighten-1;
+}
+
+.modal-buttons Button:focus {
+    background: $primary;
+    color: $background;
+    text-style: bold;
+}
+
+.modal-hint {
+    height: 1;
+    margin-top: 1;
+    color: $secondary;
+}
+
+.modal-output {
+    height: auto;
+    max-height: 20;
+    background: $background;
+    padding: 1;
+}
+
+.form-error {
+    height: 1;
+    color: $error;
+}
+
+AddTokenModal Input {
+    margin-bottom: 1;
+}

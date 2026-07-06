@@ -1,10 +1,14 @@
 [project]
 name = "claude-swap"
-version = "0.15.0"
+version = "0.18.0"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["keyring>=25.0.0"]
+dependencies = [
+    "keyring>=25.0.0",
+    "textual>=8.2.8,<9",
+    "truststore>=0.10.4",
+]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
 license = {text = "MIT"}
 keywords = ["claude", "claude-code", "account-switcher", "cli"]
@@ -43,11 +47,12 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
 ]

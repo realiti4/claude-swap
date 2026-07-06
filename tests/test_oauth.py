@@ -277,6 +277,55 @@ class TestFetchUsage:
         assert result["seven_day"]["pct"] == 61.0
         assert "spend" not in result
 
+    def test_scoped_per_model_limits(self):
+        """weekly_scoped entries in limits[] surface as result['scoped'] by model name."""
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=3)
+        response_data = {
+            "five_hour": {"utilization": 7.0, "resets_at": None},
+            "seven_day": {"utilization": 72.0, "resets_at": None},
+            "seven_day_opus": None,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 7,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_all", "group": "weekly", "percent": 72,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 100,
+                 "severity": "critical", "resets_at": future.isoformat(),
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                 "is_active": True},
+            ],
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = oauth.fetch_usage("sk-test-token")
+
+        assert result is not None
+        # Only the model-scoped entry is surfaced; session/weekly_all (scope=None) are not.
+        assert len(result["scoped"]) == 1
+        fable = result["scoped"][0]
+        assert fable["name"] == "Fable"
+        assert fable["pct"] == 100.0
+        assert fable["resets_at"] == future.isoformat()
+        assert fable["countdown"] == "3h 0m"
+        assert "clock" in fable
+
+    def test_no_limits_no_scoped_key(self):
+        """A response without a limits array yields no 'scoped' key (backward compat)."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+        })
+        assert result is not None
+        assert "scoped" not in result
+
 
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
@@ -317,6 +366,81 @@ class TestRefreshOAuthCredentials:
         assert seen_body["refresh_token"] == "old-refresh"
         assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
         assert "scope" not in seen_body
+
+
+class TestTryRefreshOAuthCredentials:
+    """Typed refresh outcomes: permanent vs transient failure classification."""
+
+    _make_credentials = staticmethod(TestRefreshOAuthCredentials._make_credentials)
+
+    @staticmethod
+    def _http_error(code, body: bytes, msg="err"):
+        import io
+
+        return urllib.error.HTTPError(
+            oauth.OAUTH_TOKEN_URL, code, msg, hdrs=None, fp=io.BytesIO(body)
+        )
+
+    def test_success_rotates_and_has_no_error(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error is None
+        rotated = json.loads(outcome.credentials)["claudeAiOauth"]
+        assert rotated["accessToken"] == "new-access"
+        assert rotated["refreshToken"] == "new-refresh"
+
+    def test_invalid_grant_body_on_400_is_permanent(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.credentials is None
+        assert outcome.error == "invalid_grant"
+
+    def test_400_without_marker_is_transient(self):
+        err = self._http_error(400, b'{"error": "temporarily_unavailable"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_5xx_is_transient_even_with_marker(self):
+        err = self._http_error(500, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_network_error_is_transient(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("dns"),
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_missing_refresh_token_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
+        outcome = oauth.try_refresh_oauth_credentials(creds)
+        assert outcome.error == "no_refresh_token"
+
+    def test_invalid_json_is_permanent(self):
+        outcome = oauth.try_refresh_oauth_credentials("not json")
+        assert outcome.error == "no_refresh_token"
+
+    def test_wrapper_returns_none_on_failure(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
 
 
 class TestBuildTokenStatus:
@@ -655,43 +779,146 @@ class TestFetchUsageForAccount:
         assert "cswap --add-account" in output
 
 
-def _creds():
-    import json
-    return json.dumps({"claudeAiOauth": {"accessToken": "sk-test", "refreshToken": "rt"}})
+class TestClassifyUsageError:
+    """Test _classify_usage_error kinds and Retry-After parsing."""
+
+    @staticmethod
+    def _http_error(code: int, headers: dict | None = None):
+        import email.message
+        hdrs = None
+        if headers is not None:
+            hdrs = email.message.Message()
+            for k, v in headers.items():
+                hdrs[k] = v
+        return urllib.error.HTTPError(
+            url="https://api.anthropic.com/api/oauth/usage",
+            code=code, msg="err", hdrs=hdrs, fp=None,
+        )
+
+    def test_http_codes(self):
+        assert oauth._classify_usage_error(self._http_error(429))[0] == "http-429"
+        assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
+        assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
+
+    def test_retry_after_seconds(self):
+        kind, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "30"})
+        )
+        assert kind == "http-429"
+        assert retry == 30.0
+
+    def test_retry_after_date_form_ignored(self):
+        _, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "Fri, 04 Jul 2026 12:00:00 GMT"})
+        )
+        assert retry is None
+
+    def test_retry_after_negative_clamped(self):
+        _, retry = oauth._classify_usage_error(
+            self._http_error(429, {"Retry-After": "-5"})
+        )
+        assert retry == 0.0
+
+    def test_no_headers(self):
+        kind, retry = oauth._classify_usage_error(self._http_error(429))
+        assert (kind, retry) == ("http-429", None)
+
+    def test_timeout(self):
+        import socket
+        assert oauth._classify_usage_error(TimeoutError())[0] == "timeout"
+        assert oauth._classify_usage_error(socket.timeout())[0] == "timeout"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(TimeoutError())
+        )[0] == "timeout"
+
+    def test_network(self):
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ConnectionRefusedError())
+        )[0] == "network"
+
+    def test_bad_response(self):
+        try:
+            json.loads("not json")
+        except json.JSONDecodeError as e:
+            assert oauth._classify_usage_error(e)[0] == "bad-response"
+
+    def test_fallback_type_name(self):
+        assert oauth._classify_usage_error(ValueError("x"))[0] == "ValueError"
 
 
-def _http_error(code):
-    return urllib.error.HTTPError("https://x", code, "err", {}, None)
+class TestTryFetchUsageOutcome:
+    """Test try_fetch_usage_for_account outcome classification."""
 
+    @staticmethod
+    def _make_credentials() -> str:
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": future_ms,
+            }
+        })
 
-def test_fetch_usage_returns_rate_limited_on_429():
-    with patch.object(oauth, "request_usage_data", side_effect=_http_error(429)):
-        result = oauth.fetch_usage_for_account("1", "a@x.com", _creds(), is_active=True)
-    assert result == oauth.RATE_LIMITED
+    def test_success_outcome(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
 
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 12.0
 
-def test_fetch_usage_returns_none_on_other_http_error():
-    with patch.object(oauth, "request_usage_data", side_effect=_http_error(500)):
-        result = oauth.fetch_usage_for_account("1", "a@x.com", _creds(), is_active=True)
-    assert result is None
+    def test_429_outcome_carries_retry_after(self, caplog):
+        import email.message
+        import logging
+        hdrs = email.message.Message()
+        hdrs["Retry-After"] = "42"
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
+            hdrs=hdrs, fp=None,
+        )
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err),
+            caplog.at_level(logging.WARNING, logger="claude-swap"),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 42.0
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        line = next(m for m in warnings if "http-429" in m)
+        # The line users paste into public issues: account number and the
+        # server's Retry-After, never the email.
+        assert "account 1" in line
+        assert "retry-after 42s" in line
+        assert "a@b.c" not in line
 
+    def test_timeout_outcome(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError()),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error == "timeout"
 
-def test_fetch_usage_returns_none_on_timeout():
-    with patch.object(oauth, "request_usage_data", side_effect=TimeoutError("slow")):
-        result = oauth.fetch_usage_for_account("1", "a@x.com", _creds(), is_active=True)
-    assert result is None
-
-
-def test_fetch_usage_returns_rate_limited_on_429_after_refresh():
-    # is_active=False + refreshToken + non-expired token -> no proactive refresh.
-    # First usage request 401s -> refresh succeeds -> retry request 429s -> sentinel.
-    creds = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-old", "refreshToken": "rt",
-        "expiresAt": 9999999999000,  # far future ms -> not proactively refreshed
-    }})
-    refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt"}})
-    with patch.object(oauth, "request_usage_data",
-                      side_effect=[_http_error(401), _http_error(429)]), \
-         patch.object(oauth, "refresh_oauth_credentials", return_value=refreshed):
-        result = oauth.fetch_usage_for_account("1", "a@x.com", creds, is_active=False)
-    assert result == oauth.RATE_LIMITED
+    def test_no_access_token_outcome(self):
+        outcome = oauth.try_fetch_usage_for_account(
+            "1", "a@b.c", json.dumps({"claudeAiOauth": {}}), is_active=False,
+        )
+        assert outcome.error == "no-access-token"

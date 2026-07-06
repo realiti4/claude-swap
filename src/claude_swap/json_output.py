@@ -8,6 +8,8 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
@@ -16,10 +18,13 @@ SCHEMA_VERSION = 1
 # JSON projection agree instead of scattering raw strings.
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
-USAGE_RATE_LIMITED = "rate limited"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
+# The active account's macOS Keychain was unreadable (locked / denied / timeout)
+# with no plaintext fallback — distinct from a genuinely empty slot, so the user
+# isn't misled into an unnecessary re-login.
+USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -31,6 +36,13 @@ def _window_to_json(entry: dict) -> dict:
         out["countdown"] = entry["countdown"]
     if "clock" in entry:
         out["clock"] = entry["clock"]
+    return out
+
+
+def _scoped_window_to_json(entry: dict) -> dict:
+    """Project a per-model scoped weekly window, carrying its model name."""
+    out = _window_to_json(entry)
+    out["name"] = entry["name"]
     return out
 
 
@@ -60,6 +72,8 @@ def usage_to_json(usage: dict) -> dict:
         if "clock" in spend:
             spend_out["clock"] = spend["clock"]
         out["spend"] = spend_out
+    if "scoped" in usage:
+        out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]
     return out
 
 
@@ -67,19 +81,19 @@ def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
-    (active token expired while Claude Code owns it), the ``USAGE_RATE_LIMITED``
-    sentinel (usage endpoint returned HTTP 429), the ``USAGE_API_KEY`` sentinel
-    (managed API-key account, no subscription quota), the ``USAGE_NO_CREDENTIALS``
-    sentinel, or ``None`` (fetch failed).
+    (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
+    (managed API-key account, no subscription quota), the
+    ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
+    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed).
     """
     if isinstance(entry, dict):
         return "ok", usage_to_json(entry)
     if entry == USAGE_TOKEN_EXPIRED:
         return "token_expired", None
-    if entry == USAGE_RATE_LIMITED:
-        return "rate_limited", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_KEYCHAIN_UNAVAILABLE:
+        return "keychain_unavailable", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
@@ -90,6 +104,26 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
+def usage_freshness_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
+    old the served ``usage`` measurement is (the store may serve last-good
+    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    if fetched_at is None:
+        return {}
+    fields: dict = {
+        "usageFetchedAt": (
+            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    }
+    if age_s is not None:
+        fields["usageAgeSeconds"] = round(age_s, 1)
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -97,10 +131,13 @@ def account_row(
     org_uuid: str,
     active: bool,
     usage_entry: dict | str | None,
+    *,
+    usage_fetched_at: float | None = None,
+    usage_age_s: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
-    return {
+    row = {
         "number": number,
         "email": email,
         "organizationName": org_name,
@@ -110,6 +147,9 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if usage is not None:
+        row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    return row
 
 
 def error_envelope(exc: Exception) -> dict:

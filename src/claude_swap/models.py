@@ -11,6 +11,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.usage_store import UsageEntry
+
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -86,6 +88,45 @@ class AccountInfo:
             "organizationName": self.organization_name,
             "added": self.added,
         }
+
+
+@dataclass(frozen=True)
+class AccountSnapshot:
+    """One managed account as seen by interactive UIs (the TUI).
+
+    ``usage`` is the store-backed :class:`UsageEntry` read model; display
+    code reads ``usage.last_good``/``age_s`` directly (may show old data,
+    annotated with its age), while ``usage.sentinel`` carries derived states
+    ("api key", "token expired", ...) that replace the bars entirely.
+    """
+
+    number: str
+    email: str
+    org_name: str
+    org_uuid: str
+    is_active: bool
+    kind: str  # "oauth" | "api_key"
+    switchable: bool
+    usage: UsageEntry
+
+    @property
+    def display_tag(self) -> str:
+        """Org tag for display: the org name, or 'personal'."""
+        return self.org_name if self.org_name else "personal"
+
+
+@dataclass(frozen=True)
+class AccountsSnapshot:
+    """Coherent one-pass view of every managed account.
+
+    Produced by ``ClaudeAccountSwitcher.accounts_snapshot``: metadata, active
+    detection, and usage entries all come from the same collect pass, so a
+    consumer never sees an account list and usage table that disagree.
+    """
+
+    active_number: str | None
+    accounts: tuple[AccountSnapshot, ...]
+    taken_at: float
 
 
 @dataclass

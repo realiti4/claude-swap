@@ -49,6 +49,17 @@ class LockError(ClaudeSwitchError):
     pass
 
 
+class ClaudeCodeLockTimeout(LockError):
+    """Timed out acquiring one of Claude Code's own advisory locks.
+
+    Raised when ``~/.claude.lock`` / ``~/.claude.json.lock`` stays held past
+    our bounded wait — usually Claude Code mid-token-refresh. Nothing has been
+    mutated when this raises; the operation is safe to retry.
+    """
+
+    pass
+
+
 class AccountNotFoundError(ClaudeSwitchError):
     """Account not found."""
 

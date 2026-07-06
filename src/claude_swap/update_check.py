@@ -72,14 +72,14 @@ def check_for_update(current_version: str) -> str | None:
                 "pipx": "pipx upgrade claude-swap",
             }.get(method or "")
             if direct and sys.platform != "win32":
-                # cswap --upgrade actually performs the upgrade here.
-                hint = "Run `cswap --upgrade` to update."
+                # cswap upgrade actually performs the upgrade here.
+                hint = "Run `cswap upgrade` to update."
             elif direct:
-                # Windows: cswap --upgrade only prints, so point at the real command.
+                # Windows: cswap upgrade only prints, so point at the real command.
                 hint = f"Run `{direct}` to update."
             else:
-                # Unknown install method: cswap --upgrade shows manual instructions.
-                hint = "Run `cswap --upgrade` for upgrade instructions."
+                # Unknown install method: cswap upgrade shows manual instructions.
+                hint = "Run `cswap upgrade` for upgrade instructions."
             return (
                 f"A newer version of claude-swap is available ({latest_version}). "
                 f"You are using {current_version}. {hint}"

@@ -13,18 +13,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # uv (not pip) so the PEP 735 dev dependency-group — pytest,
+      # pytest-asyncio — installs from the committed lockfile, same as local
+      # development.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install -e .
-          pip install pytest
+        run: uv sync
 
       - name: Run tests
-        run: pytest
+        run: uv run pytest
+
+  test-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests
+        # Includes the TUI tests: the Textual TUI (unlike the old curses one)
+        # runs on stock Windows, and this job is the proof.
+        run: uv run pytest
 
   macos-keychain:
     runs-on: macos-latest
@@ -32,15 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install -e .
-          pip install pytest
+        run: uv sync
 
       - name: Run macOS Keychain tests (contract + real security wrapper)
         # faulthandler dumps every thread's stack if a test exceeds 60s — a
@@ -48,4 +66,4 @@ jobs:
         # otherwise hang the job with no clue where. The step timeout is the
         # backstop that actually kills it.
         timeout-minutes: 5
-        run: pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60
+        run: uv run pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60

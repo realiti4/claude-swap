@@ -123,6 +123,11 @@ def bold_accent(text: str) -> str:
     return _style(text, _BOLD, _ACCENT)
 
 
+def yellowed(text: str) -> str:
+    """Yellow for warning-toned text (string form; ``warning()`` prints)."""
+    return _style(text, _YELLOW)
+
+
 # --- Line printers (call print() internally) ---
 
 
