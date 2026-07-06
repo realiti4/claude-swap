@@ -182,6 +182,36 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         pass  # best-effort; absent entry is already success (rc 44)
 
 
+def read_session_credentials(session_dir: Path) -> str | None:
+    """Best-effort read of a session profile's *current* credential JSON.
+
+    Once a session has run, the profile — not the backup store — holds the
+    newest generation of the account's token family: claude rotates tokens
+    in place, and nothing syncs them back to backup. On macOS the rotated
+    credential lives in the profile's hashed keychain entry (which shadows
+    the plaintext seed from the moment claude first writes it), elsewhere in
+    the profile's ``.credentials.json``. Read-only by design: writing either
+    location stays claude's job (see the module docstring on why cswap never
+    writes the hashed entry). Returns ``None`` when the profile has no
+    readable credential material.
+    """
+    if not session_dir.is_dir():
+        return None
+    if Platform.detect() == Platform.MACOS:
+        try:
+            creds = macos_keychain.get_password(
+                keychain_service_name(session_dir), _keychain_account_name()
+            )
+            if creds:
+                return creds
+        except KeychainError:
+            pass  # locked/denied/timeout — the plaintext seed is the next-best truth
+    try:
+        return (session_dir / ".credentials.json").read_text()
+    except OSError:
+        return None
+
+
 def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:
     """Live Claude instances running against a session profile."""
     if not session_dir.exists():

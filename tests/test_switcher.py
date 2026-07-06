@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -524,6 +525,104 @@ class TestStatusCache:
         )
         assert entries["1"].last_good == usage_result
         assert entries["2"].last_good == {"five_hour": {"pct": 80}}
+
+
+def _oauth_creds(token: str, expires_in_s: float) -> str:
+    """Credential JSON with an access token expiring ``expires_in_s`` from now."""
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": token,
+        "refreshToken": f"rt-{token}",
+        "expiresAt": int((time.time() + expires_in_s) * 1000),
+    }})
+
+
+class TestFetchAccountUsageSessionProfile:
+    """Inactive-account fetches source credentials from the session profile.
+
+    Claude rotates the token family inside a session profile and nothing
+    syncs it back, so the backup copy's refresh token is a consumed
+    generation once a session has run — fetching with it 401s forever and
+    usage silently freezes at the last pre-session measurement.
+    """
+
+    def _info(self, backup_creds: str) -> tuple:
+        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds)
+
+    def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
+        """Profile creds are used with is_active=True (no refresh, no persist)."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        mock_fetch.assert_called_once()
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert "persist_credentials" not in kwargs
+
+    def test_expired_session_credentials_with_live_session_is_sentinel(
+        self, temp_home: Path
+    ):
+        """Live claude refreshes lazily — don't burn a request that would 401."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_expired_session_credentials_without_live_session_falls_back(
+        self, temp_home: Path
+    ):
+        """No live session: the backup path (with refresh machinery) still runs."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+        session = _oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
+
+    def test_no_session_profile_uses_backup_path(self, temp_home: Path):
+        """Accounts without a session profile behave exactly as before."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
 
 
 class TestListAccountsUsage:

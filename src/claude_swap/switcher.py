@@ -1650,13 +1650,41 @@ class ClaudeAccountSwitcher:
             with FileLock(self.lock_file):
                 self._write_account_credentials(acct_num, acct_email, new_creds)
 
-        # An account running in session mode is "inactive" here but live
-        # in its own config dir, where claude manages the token. Treat it
-        # like the active account (no proactive refresh / 401-retry):
-        # refreshing the backup copy could rotate the refresh token out
-        # from under the live session. Worst case its usage shows as
-        # unavailable until the session exits.
+        from claude_swap.session import read_session_credentials
+
         has_live_session = bool(self._live_session_pids(str(num), email))
+
+        # A session profile supersedes the backup copy as this account's
+        # credential truth: claude rotates the token family inside the profile
+        # and nothing syncs it back, so once a session has run, the backup's
+        # refresh token is a consumed generation the server 401s forever —
+        # usage would silently freeze at the last pre-session measurement.
+        # Fetch with the profile's newest credential, strictly read-only
+        # (is_active=True: no refresh, no persist): rotating the profile's
+        # family here would log the next `cswap run` out the same way.
+        session_creds = read_session_credentials(self._session_dir(str(num), email))
+        if session_creds:
+            session_oauth = oauth.extract_oauth_data(session_creds)
+            if session_oauth and session_oauth.get("accessToken"):
+                if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
+                    outcome = oauth.try_fetch_usage_for_account(
+                        str(num), email, session_creds, is_active=True,
+                    )
+                    return FetchRecord(
+                        usage=outcome.usage,
+                        error=outcome.error,
+                        retry_after_s=outcome.retry_after_s,
+                    )
+                if has_live_session:
+                    # The live claude refreshes lazily on its next API call;
+                    # requesting now would just 401 (same rule as the owned
+                    # active account in _fetch_active_usage).
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                # Expired profile credential and no live session: fall through
+                # to the backup path — cswap must not rotate the profile's
+                # family, but a backup family that is still alive (e.g. the
+                # account was re-added after the profile last ran) can serve
+                # and heal via the normal refresh machinery below.
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
