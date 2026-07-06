@@ -54,6 +54,10 @@ TRUST_MAX_AGE_S = 3600.0
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
 
+# The fetch-error kind (from oauth._classify_usage_error) that means the usage
+# endpoint rate-limited us — an IP-wide signal, hence the global backoff.
+RATE_LIMIT_ERROR = "http-429"
+
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]
 
@@ -202,20 +206,41 @@ class UsageStore:
     def _lock(self) -> FileLock:
         return FileLock(self._lock_path)
 
-    def _read_rows(self) -> dict[str, dict]:
+    def _read_doc(self) -> dict:
+        """The whole document: per-account ``accounts`` plus the ``rateLimit``
+        meta (the shared 429 gate). Tolerant of missing/corrupt/legacy files."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            raw = None
         if not isinstance(raw, dict) or raw.get("schemaVersion") != SCHEMA_VERSION:
-            return {}  # legacy snapshot or future schema: start empty
-        rows = raw.get("accounts")
-        return rows if isinstance(rows, dict) else {}
+            return {"accounts": {}, "rateLimit": {}}  # legacy/future: start empty
+        accounts = raw.get("accounts")
+        meta = raw.get("rateLimit")
+        return {
+            "accounts": accounts if isinstance(accounts, dict) else {},
+            "rateLimit": meta if isinstance(meta, dict) else {},
+        }
+
+    def _write_doc(self, doc: dict) -> None:
+        out: dict = {
+            "schemaVersion": SCHEMA_VERSION,
+            "accounts": doc.get("accounts") or {},
+        }
+        meta = doc.get("rateLimit")
+        if meta:  # omit when empty so the file stays clean and legacy-comparable
+            out["rateLimit"] = meta
+        atomic_write_json(self.path, out)
+
+    def _read_rows(self) -> dict[str, dict]:
+        return self._read_doc()["accounts"]
 
     def _write_rows(self, rows: dict[str, dict]) -> None:
-        atomic_write_json(
-            self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
-        )
+        # Preserve the rateLimit meta a concurrent/other writer set (this runs
+        # under the caller's lock, so the re-read is consistent).
+        doc = self._read_doc()
+        doc["accounts"] = rows
+        self._write_doc(doc)
 
     @staticmethod
     def _matches(row: object, identity: Identity) -> bool:
@@ -329,6 +354,47 @@ class UsageStore:
                 )
 
         self._mutate(identities, effective.keys(), apply)
+        self._note_global_rate_limit(effective.values(), now)
+
+    def _note_global_rate_limit(self, records: Iterable[FetchRecord], now: float) -> None:
+        """Update the shared 429 gate from one fetch pass's outcomes.
+
+        A 429 is an IP-wide signal, so it stands *all* usage fetching down for a
+        growing interval (``in_global_backoff``) — per-account backoff alone
+        can't quiet a per-IP limit when N accounts poll on staggered schedules.
+        Any 429 in the pass extends the gate (even if another account succeeded
+        — the IP is still limiting); a pass with a clean success and no 429
+        clears it. Non-429 errors (timeouts) leave it untouched.
+        """
+        records = list(records)
+        saw_rate_limit = any(r.error == RATE_LIMIT_ERROR for r in records)
+        had_success = any(r.error is None for r in records)
+        if not (saw_rate_limit or had_success):
+            return
+        retry_after = max(
+            (
+                r.retry_after_s
+                for r in records
+                if r.error == RATE_LIMIT_ERROR and r.retry_after_s is not None
+            ),
+            default=None,
+        )
+        with self._lock():
+            doc = self._read_doc()
+            if saw_rate_limit:
+                n = int((doc["rateLimit"] or {}).get("consecutive") or 0) + 1
+                doc["rateLimit"] = {
+                    "consecutive": n,
+                    "blockedUntil": now + _failure_backoff_s(n, retry_after),
+                }
+            else:  # clean success, no 429 → the IP is clear
+                doc["rateLimit"] = {}
+            self._write_doc(doc)
+
+    def in_global_backoff(self, now: float) -> bool:
+        """Whether a shared 429 backoff is currently gating all usage fetches."""
+        blocked_until = (self._read_doc()["rateLimit"] or {}).get("blockedUntil")
+        return isinstance(blocked_until, (int, float)) and now < blocked_until
 
     def set_poll_plan(
         self,

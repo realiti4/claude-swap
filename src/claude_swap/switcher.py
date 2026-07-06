@@ -1710,15 +1710,23 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities)
-        to_fetch = [
-            num
-            for num in info_by_num
-            if num not in sentinels
-            and (fetch is None or num in fetch)
-            and not entries[num].fresh(now)
-            and not entries[num].in_backoff(now)
-            and not entries[num].claimed(now)
-        ]
+        # A prior 429 stands *all* usage fetching down for a growing interval:
+        # the endpoint rate-limits per IP, so quieting every account (not just
+        # the one that saw the 429) is what lets the limiter recover. Last-good
+        # is served meanwhile.
+        to_fetch = (
+            []
+            if store.in_global_backoff(now)
+            else [
+                num
+                for num in info_by_num
+                if num not in sentinels
+                and (fetch is None or num in fetch)
+                and not entries[num].fresh(now)
+                and not entries[num].in_backoff(now)
+                and not entries[num].claimed(now)
+            ]
+        )
 
         if to_fetch:
             store.claim(to_fetch, identities)

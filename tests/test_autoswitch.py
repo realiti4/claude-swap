@@ -597,8 +597,11 @@ class TestAdaptiveScheduler:
         outcome = self._tick(h, counts, usage)
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
-        assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        # The 429 also raised the shared global gate (Retry-After 600s, only
+        # 400s elapsed), so this tick fetches *nothing* — not even the baseline
+        # candidate. Quieting the whole IP is the point; headroom stays trusted
+        # from deliberate-stale last-good, so still no unhealthy ticks / burst.
+        assert sum(counts.values()) == 0
 
     def test_exhausted_candidate_skips_to_its_reset(self, temp_home, monkeypatch):
         from datetime import datetime, timezone

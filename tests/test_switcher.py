@@ -1063,6 +1063,29 @@ class TestActiveAccountRefresh:
         assert entry.last_good == {"five_hour": {"pct": 25.0}}  # last-seen kept
         mock_fetch.assert_not_called()
 
+    def test_global_backoff_skips_all_fetching(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """While the shared 429 gate is up, the collector serves last-good and
+        never calls the usage endpoint — even for an otherwise-eligible account
+        (fresh token, no per-account backoff)."""
+        switcher = self._switcher(sample_sequence_data)
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
+            {"1": ("test@example.com", "")},
+        )
+        info = (1, "test@example.com", "", "", True, self._REFRESHED)
+
+        with patch.object(
+                 switcher._usage_store, "in_global_backoff", return_value=True), \
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            entry = switcher._collect_usage_entries([info])["1"]
+
+        mock_fetch.assert_not_called()
+        assert entry.last_good == {"five_hour": {"pct": 25.0}}  # served from store
+
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""

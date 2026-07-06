@@ -325,3 +325,70 @@ class TestDueCandidate:
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
+
+
+class TestGlobalRateLimitBackoff:
+    """A 429 is an IP-wide signal: it must stand *all* fetching down for a
+    growing interval, not just back off the one account that saw it."""
+
+    def test_not_blocked_initially(self, store, clock):
+        assert store.in_global_backoff(clock.now) is False
+
+    def test_429_trips_global_backoff(self, store, clock):
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT)
+        assert store.in_global_backoff(clock.now) is True
+
+    def test_backoff_grows_on_repeated_429(self, store, clock):
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        first = store._read_doc()["rateLimit"]["blockedUntil"] - clock.now
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        second = store._read_doc()["rateLimit"]["blockedUntil"] - clock.now
+        assert second > first
+
+    def test_clean_success_clears_backoff(self, store, clock):
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.in_global_backoff(clock.now)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.in_global_backoff(clock.now) is False
+
+    def test_mixed_pass_with_a_429_still_backs_off(self, store, clock):
+        # One account 429s while another succeeds in the same pass: the IP is
+        # still limiting, so an intermittent success must not defeat the gate.
+        store.record(
+            {"1": FetchRecord(error="http-429"), "2": FetchRecord(usage=USAGE)},
+            IDENT,
+        )
+        assert store.in_global_backoff(clock.now) is True
+
+    def test_non_429_error_does_not_trip(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        assert store.in_global_backoff(clock.now) is False
+
+    def test_retry_after_is_a_floor(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=5000.0)}, IDENT
+        )
+        # server's Retry-After (5000s) beats the exponential base, and outlives
+        # the per-attempt cap the way _failure_backoff_s treats the server's word
+        assert store._read_doc()["rateLimit"]["blockedUntil"] - clock.now >= 5000.0
+
+    def test_persists_across_instances(self, tmp_path, clock):
+        s1 = UsageStore(tmp_path / "cache", clock=clock)
+        s1.record({"1": FetchRecord(error="http-429")}, IDENT)
+        s2 = UsageStore(tmp_path / "cache", clock=clock)
+        assert s2.in_global_backoff(clock.now) is True
+
+    def test_backoff_expires(self, store, clock):
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.in_global_backoff(clock.now)
+        clock.advance(BACKOFF_CAP_S + 1)
+        assert store.in_global_backoff(clock.now) is False
+
+    def test_coexists_with_per_account_state(self, store, clock):
+        # A 429 updates BOTH the per-account row and the global gate, and neither
+        # write clobbers the other.
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 1
+        assert entry.in_backoff(clock.now) is True
+        assert store.in_global_backoff(clock.now) is True
