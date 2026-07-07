@@ -293,18 +293,6 @@ class _FakeSnap:
         self.accounts = accounts
 
 
-class _FakeSwitcher:
-    _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
-
-    def __init__(self, snap):
-        self._snap = snap
-        self.fetch_calls = []
-
-    def accounts_snapshot(self, fetch=None):
-        self.fetch_calls.append(fetch)
-        return self._snap
-
-
 def test_account_display_usage_sentinel_note_last_good_or_none():
     assert menubar._account_display_usage(
         _FakeEntry(sentinel=USAGE_API_KEY)
@@ -314,13 +302,15 @@ def test_account_display_usage_sentinel_note_last_good_or_none():
     assert menubar._account_display_usage(_FakeEntry()) is None
 
 
-def test_snapshot_shape_and_active_selection():
+def test_adapt_snapshot_shape_and_active_selection():
+    # _adapt_snapshot is a pure transform of an AccountsSnapshot (the fetch
+    # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
         _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
         _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
     ]
-    snap = menubar._snapshot(_FakeSwitcher(_FakeSnap(accts)))
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     # (num, email, is_active, display_usage, last_good)
@@ -331,21 +321,5 @@ def test_snapshot_shape_and_active_selection():
     )
 
 
-def test_snapshot_fetch_new_toggles_fetch_argument():
-    sw = _FakeSwitcher(_FakeSnap([]))
-    menubar._snapshot(sw, fetch_new=True)
-    assert sw.fetch_calls[-1] is None            # allow on-demand fetches
-    menubar._snapshot(sw, fetch_new=False)
-    assert sw.fetch_calls[-1] == set()           # cache-only (engine polls)
-
-
-def test_snapshot_degrades_to_empty_on_error():
-    class _Bad:
-        _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
-
-        def accounts_snapshot(self, fetch=None):
-            raise RuntimeError("boom")
-
-    assert menubar._snapshot(_Bad()) == {
-        "accounts": [], "active_email": None, "active_usage": None,
-    }
+def test_adapt_snapshot_empty():
+    assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT

@@ -266,22 +266,17 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
-def _snapshot(switcher, fetch_new: bool = True) -> dict:
-    """Read accounts + usage off the main thread. Returns a render snapshot.
+EMPTY_SNAPSHOT: dict = {"accounts": [], "active_email": None, "active_usage": None}
+
+
+def _adapt_snapshot(snap) -> dict:
+    """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``. Delegates to
-    ``switcher.accounts_snapshot`` (backed by the shared usage store, which serves
-    fresh entries from cache and rate-limits its own fetches). ``fetch_new=False``
-    reads cache-only — used while the auto-switch engine is running and already
-    polling. Never raises — failures degrade to empty/unknown.
+    "active_email": str | None, "active_usage": dict | str | None}``. The snapshot
+    itself is produced by ``SnapshotSource`` (the paced read path), so this is a
+    pure transform — no fetching, no I/O.
     """
-    try:
-        snap = switcher.accounts_snapshot(fetch=None if fetch_new else set())
-    except Exception:
-        switcher._logger.debug("menubar snapshot failed", exc_info=True)
-        return {"accounts": [], "active_email": None, "active_usage": None}
-
     accounts = []
     active_email = None
     active_usage = None
@@ -303,6 +298,7 @@ def run(switcher) -> int:
 
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
+    from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
@@ -312,7 +308,13 @@ def run(switcher) -> int:
             super().__init__(ICON, quit_button=None)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
-            self.snapshot = {"accounts": [], "active_email": None, "active_usage": None}
+            # The supported paced read path: per refresh it fetches only the
+            # active account plus (at most once per freshness window) one stale
+            # alternate, so an open menu costs O(1) requests per window instead
+            # of a full pass per tick — which kept every token at its per-account
+            # rate-limit edge. Reused across refreshes to hold its pacing state.
+            self._snapshot_source = SnapshotSource(switcher)
+            self.snapshot = dict(EMPTY_SNAPSHOT)
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
@@ -336,17 +338,27 @@ def run(switcher) -> int:
                 self._start_engine()
 
         # ---- display refresh plumbing ----------------------------------------
-        def refresh_async(self):
+        def refresh_async(self, full=False):
             if self._refreshing:
-                return  # in-flight guard: one worker at a time
+                return  # in-flight guard: one worker at a time (SnapshotSource
+                        # pacing state is only touched by this single worker)
             self._refreshing = True
-            threading.Thread(target=self._worker, daemon=True).start()
+            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
-        def _worker(self):
+        def _worker(self, full):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
-            # CPython); the main-thread sync tick reads them.
+            # CPython); the main-thread sync tick reads them. While the engine
+            # runs it already paces all fetching, so the display reads store-only.
             try:
-                snap = _snapshot(self.switcher, fetch_new=self._engine is None)
+                try:
+                    raw = self._snapshot_source.take(
+                        full=full, store_only=self._engine is not None
+                    )
+                except Exception:
+                    # Keep the last good snapshot rather than blanking the menu.
+                    self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
+                    return
+                snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
@@ -674,7 +686,7 @@ def run(switcher) -> int:
             self.refresh_async()
 
         def on_refresh_now(self, _sender):
-            self.refresh_async()
+            self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
             self._stop_engine()
