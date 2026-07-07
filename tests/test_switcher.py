@@ -2002,6 +2002,102 @@ class TestGetCurrentAccountOrgSupport:
 
 # ── Task 5: add_account with org fields ──────────────────────────────────────
 
+class TestLoginAndAdd:
+    """Standalone-login add path: persists the flow result into a slot."""
+
+    def _result(self, email="new@example.com", org_uuid="org-L", org_name="LoginOrg"):
+        from claude_swap.standalone_login import LoginResult
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "AT", "refreshToken": "RT", "expiresAt": 9_999_999_999_000,
+            "scopes": ["user:profile", "user:inference"],
+        }})
+        return LoginResult(
+            credentials=creds, email=email, account_uuid="acc-L",
+            organization_uuid=org_uuid, organization_name=org_name,
+        )
+
+    def test_login_adds_new_slot_without_switching_active(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        assert seq["accounts"]["1"]["email"] == "new@example.com"
+        assert seq["accounts"]["1"]["organizationUuid"] == "org-L"
+        # Standalone login must not hijack the live-login pointer.
+        assert seq.get("activeAccountNumber") is None
+        creds = json.loads(
+            switcher.read_account_credentials("1", "new@example.com")
+        )["claudeAiOauth"]
+        assert creds["refreshToken"] == "RT" and creds["accessToken"] == "AT"
+
+    def test_same_email_different_org_gets_separate_slot(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result(org_uuid="org-A", org_name="A")):
+            switcher.login_and_add()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result(org_uuid="org-B", org_name="B")):
+            switcher.login_and_add()
+
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 2
+        assert {seq["accounts"]["1"]["organizationUuid"],
+                seq["accounts"]["2"]["organizationUuid"]} == {"org-A", "org-B"}
+
+    def test_relogin_same_identity_refreshes_in_place(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 1  # refreshed, not duplicated
+
+    def test_relogin_lifts_quarantine_new_slot(self, temp_home):
+        # A fresh login into a new slot must lift any dead-token quarantine on it
+        # (via the #106 helper, guarded so cswap login is self-contained here).
+        switcher = ClaudeAccountSwitcher()
+        switcher._usage_store.clear_dead_token = MagicMock()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        switcher._usage_store.clear_dead_token.assert_called_once_with(
+            ["1"], {"1": ("new@example.com", "org-L")}
+        )
+
+    def test_relogin_lifts_quarantine_in_place(self, temp_home):
+        # Refreshing an existing account in place must lift its quarantine too;
+        # otherwise a re-login can't recover a dead-token slot (its fetches, and
+        # thus the only path that clears the strike, stay disabled).
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        switcher._usage_store.clear_dead_token = MagicMock()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()  # same identity → in-place refresh
+
+        switcher._usage_store.clear_dead_token.assert_called_once_with(
+            ["1"], {"1": ("new@example.com", "org-L")}
+        )
+
+    def test_empty_email_is_rejected(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result(email="")):
+            with pytest.raises(ConfigError):
+                switcher.login_and_add()
+
+
 class TestAddAccountOrgFields:
     def test_allows_same_email_different_org(self, temp_home):
         """Should allow adding same-email account if organizationUuid differs."""

@@ -45,6 +45,7 @@ _SUBCOMMAND_FLAGS = {
     "status": "--status",
     "add": "--add-account",
     "add-token": "--add-token",
+    "login": "--login",
     "remove": "--remove-account",
     "rm": "--remove-account",
     "export": "--export",
@@ -541,6 +542,7 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s login                      add an account via browser OAuth login
   %(prog)s remove <num|email>         remove an account
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s auto                       auto-switch when nearing rate limits
@@ -562,6 +564,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s login --private                   # log in as a second account in a private window
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
@@ -720,6 +723,19 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         const="",
         help=argparse.SUPPRESS,
     )
+    group.add_argument(
+        "--login",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help=(
+            "With 'login': open the browser in a private/incognito window so you "
+            "can log in as another account without touching your normal session."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -759,8 +775,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
-    if args.slot is not None and not (args.add_account or args.add_token is not None):
-        parser.error("--slot can only be used with 'add' or 'add-token'")
+    if args.slot is not None and not (
+        args.add_account or args.add_token is not None or args.login
+    ):
+        parser.error("--slot can only be used with 'add', 'add-token', or 'login'")
+
+    if args.private and not args.login:
+        parser.error("--private can only be used with --login")
+
+    if args.private and not args.login:
+        parser.error("--private can only be used with --login")
 
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
@@ -809,6 +833,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 email=args.email,
                 slot=args.slot,
             )
+        elif args.login:
+            switcher.login_and_add(slot=args.slot, private=args.private)
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
