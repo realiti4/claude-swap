@@ -2059,6 +2059,37 @@ class TestLoginAndAdd:
         seq = json.loads((get_backup_root() / "sequence.json").read_text())
         assert len(seq["accounts"]) == 1  # refreshed, not duplicated
 
+    def test_relogin_lifts_quarantine_new_slot(self, temp_home):
+        # A fresh login into a new slot must lift any dead-token quarantine on it
+        # (via the #106 helper, guarded so cswap login is self-contained here).
+        switcher = ClaudeAccountSwitcher()
+        switcher._usage_store.clear_dead_token = MagicMock()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        switcher._usage_store.clear_dead_token.assert_called_once_with(
+            ["1"], {"1": ("new@example.com", "org-L")}
+        )
+
+    def test_relogin_lifts_quarantine_in_place(self, temp_home):
+        # Refreshing an existing account in place must lift its quarantine too;
+        # otherwise a re-login can't recover a dead-token slot (its fetches, and
+        # thus the only path that clears the strike, stay disabled).
+        switcher = ClaudeAccountSwitcher()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()
+
+        switcher._usage_store.clear_dead_token = MagicMock()
+        with patch("claude_swap.standalone_login.run_login_flow",
+                   return_value=self._result()):
+            switcher.login_and_add()  # same identity → in-place refresh
+
+        switcher._usage_store.clear_dead_token.assert_called_once_with(
+            ["1"], {"1": ("new@example.com", "org-L")}
+        )
+
     def test_empty_email_is_rejected(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         with patch("claude_swap.standalone_login.run_login_flow",

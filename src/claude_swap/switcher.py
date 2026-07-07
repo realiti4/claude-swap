@@ -1347,6 +1347,19 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def _lift_quarantine_on_relogin(self, num: str, identity: tuple[str, str]) -> None:
+        """Lift any dead-token quarantine on a slot after a re-login refreshes it.
+
+        A quarantined account (dead refresh token) has its usage fetches disabled,
+        so the strike that quarantined it can never clear on its own — only a fresh
+        credential can. ``clear_dead_token`` ships in #106; this is guarded via
+        getattr so ``cswap login`` stays self-contained here and simply no-ops until
+        that helper is present, then activates once both land.
+        """
+        clear = getattr(self._usage_store, "clear_dead_token", None)
+        if clear is not None:
+            clear([num], {num: identity})
+
     def login_and_add(
         self, slot: int | None = None, assume_yes: bool = False, private: bool = False
     ) -> None:
@@ -1392,6 +1405,7 @@ class ClaudeAccountSwitcher:
         if slot is None and existing_slot is not None:
             self._write_account_credentials(existing_slot, email, credentials)
             self._write_account_config(existing_slot, email, config)
+            self._lift_quarantine_on_relogin(existing_slot, (email, org_uuid or ""))
             seq = self._get_sequence_data()
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
@@ -1443,6 +1457,7 @@ class ClaudeAccountSwitcher:
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
+        self._lift_quarantine_on_relogin(account_num, (email, org_uuid or ""))
 
         data = self._get_sequence_data()
         data["accounts"][account_num] = {
