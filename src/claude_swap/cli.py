@@ -45,6 +45,7 @@ _SUBCOMMAND_FLAGS = {
     "status": "--status",
     "add": "--add-account",
     "add-token": "--add-token",
+    "login": "--login",
     "remove": "--remove-account",
     "rm": "--remove-account",
     "export": "--export",
@@ -720,6 +721,22 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         const="",
         help=argparse.SUPPRESS,
     )
+    group.add_argument(
+        "--login",
+        action="store_true",
+        help=(
+            "Add an account via a standalone browser OAuth login — no Claude Code "
+            "log-out/log-in dance. Full scopes, so usage still shows in list."
+        ),
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help=(
+            "With --login: open the browser in a private/incognito window so you "
+            "can log in as another account without touching your normal session."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -759,8 +776,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
-    if args.slot is not None and not (args.add_account or args.add_token is not None):
-        parser.error("--slot can only be used with 'add' or 'add-token'")
+    if args.slot is not None and not (
+        args.add_account or args.add_token is not None or args.login
+    ):
+        parser.error("--slot can only be used with 'add', 'add-token', or 'login'")
+
+    if args.private and not args.login:
+        parser.error("--private can only be used with --login")
+
+    if args.private and not args.login:
+        parser.error("--private can only be used with --login")
 
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
@@ -809,6 +834,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 email=args.email,
                 slot=args.slot,
             )
+        elif args.login:
+            switcher.login_and_add(slot=args.slot, private=args.private)
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:

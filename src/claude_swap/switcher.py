@@ -1347,6 +1347,125 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def login_and_add(
+        self, slot: int | None = None, assume_yes: bool = False, private: bool = False
+    ) -> None:
+        """Add an account via a standalone browser OAuth login (no Claude Code dance).
+
+        Runs Claude Code's PKCE authorization-code flow directly, then persists the
+        resulting broad-scope credential (refresh token, expiry, real org metadata —
+        everything usage tracking needs) into a slot. Identity and slot handling
+        mirror ``add_account``: an existing ``(email, org)`` refreshes in place,
+        otherwise the next free slot (or ``--slot``) is used. Unlike ``add_account``
+        this never touches the live ``~/.claude`` login, so ``activeAccountNumber``
+        is left as-is. With ``private`` the browser opens an incognito window so a
+        second account can be added without disturbing your normal claude.ai session.
+        """
+        from claude_swap.standalone_login import run_login_flow
+
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        result = run_login_flow(private=private)
+        email = result.email
+        if not email:
+            raise ConfigError(
+                "Login completed but returned no email, so the account can't be "
+                "keyed. This usually means the OAuth response shape changed."
+            )
+        org_uuid = result.organization_uuid
+        org_name = result.organization_name
+        credentials = result.credentials
+        config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": result.account_uuid,
+                "organizationUuid": org_uuid or None,
+                "organizationName": org_name or None,
+            }
+        })
+
+        # In-place refresh when this (email, org) already occupies a slot.
+        seq = self._get_sequence_data() or {}
+        existing_slot = self._find_account_slot(seq, email, org_uuid)
+        if slot is None and existing_slot is not None:
+            self._write_account_credentials(existing_slot, email, credentials)
+            self._write_account_config(existing_slot, email, config)
+            seq = self._get_sequence_data()
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
+            tag = self._get_display_tag(email, org_name, org_uuid)
+            self._logger.info(f"Refreshed credentials via login for account {existing_slot}: {email}")
+            print(
+                f"{accent('Updated credentials')} for Account {existing_slot} "
+                f"({email} {muted(f'[{tag}]')})."
+            )
+            return
+
+        # New slot, or an explicit --slot that may be occupied by a different account.
+        if slot is not None:
+            if slot < 1:
+                raise ConfigError("Slot number must be >= 1")
+            account_num = str(slot)
+            data = self._get_sequence_data()
+            if account_num in data.get("accounts", {}):
+                existing = data["accounts"][account_num]
+                is_same = (
+                    existing.get("email") == email
+                    and existing.get("organizationUuid", "") == org_uuid
+                )
+                if not is_same:
+                    existing_tag = self._get_display_tag(
+                        existing.get("email", "unknown"),
+                        existing.get("organizationName", ""),
+                        existing.get("organizationUuid", ""),
+                    )
+                    warning(f"Slot {slot} already occupied")
+                    print(f"{existing.get('email', 'unknown')} {muted(f'[{existing_tag}]')}")
+                    if not assume_yes:
+                        try:
+                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{dimmed('Cancelled')}")
+                            return
+                        if answer not in ("y", "yes"):
+                            print(dimmed("Cancelled"))
+                            return
+                    self._delete_account_files(account_num, existing.get("email", ""))
+                    data = self._get_sequence_data()
+                    if int(account_num) in data.get("sequence", []):
+                        data["sequence"].remove(int(account_num))
+                    data["accounts"].pop(account_num, None)
+                    self._write_json(self.sequence_file, data)
+        else:
+            account_num = str(self._get_next_account_number())
+
+        self._write_account_credentials(account_num, email, credentials)
+        self._write_account_config(account_num, email, config)
+
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": email,
+            "uuid": result.account_uuid,
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
+            "added": get_timestamp(),
+        }
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        # Deliberately NOT setting activeAccountNumber: a standalone login adds a
+        # slot without switching the live ~/.claude login.
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        tag = self._get_display_tag(email, org_name, org_uuid)
+        self._logger.info(
+            f"Added account {account_num} via login: {email} (org: {org_uuid or 'personal'})"
+        )
+        print(f"{accent('Added')} Account {account_num}: {email} {muted(f'[{tag}]')} {muted('(via login)')}")
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 

@@ -200,13 +200,13 @@ class TestCLI:
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
-        """--slot should only be accepted alongside --add-account or --add-token."""
+        """--slot should only be accepted alongside --add-account/--add-token/--login."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
 
         assert excinfo.value.code == 2
-        assert "--slot can only be used with 'add' or 'add-token'" in capsys.readouterr().err
+        assert "--slot can only be used with 'add', 'add-token', or 'login'" in capsys.readouterr().err
 
     def test_slot_flag_in_help(self):
         """--slot should appear in help output."""
