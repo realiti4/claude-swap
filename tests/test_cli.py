@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -378,6 +378,32 @@ class TestCLI:
             cli.main()
         assert exc.value.code == 0
         assert called.get("ran") is True
+
+    @pytest.mark.parametrize(
+        ("flag", "target", "output"),
+        [
+            ("--install-menubar", "install", "Menu bar startup installed"),
+            ("--uninstall-menubar", "uninstall", "Menu bar startup removed"),
+            ("--menubar-status", "is_installed", "running"),
+        ],
+    )
+    def test_menubar_launch_agent_dispatches(
+        self, flag, target, output, monkeypatch, capsys
+    ):
+        switcher_cls = MagicMock()
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", switcher_cls)
+        monkeypatch.setattr(sys, "argv", ["cswap", flag])
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        result = Path("/tmp/com.claude-swap.menubar.plist")
+        if target == "is_installed":
+            result = True
+        with patch(f"claude_swap.menubar_launch_agent.{target}", return_value=result):
+            cli.main()
+
+        assert output in capsys.readouterr().out
+        switcher_cls.assert_not_called()
 
 
 class TestCLICommands:

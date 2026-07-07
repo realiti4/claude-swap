@@ -100,6 +100,26 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
+def test_account_detail_lines_matches_list_rows():
+    usage = {
+        "five_hour": {"pct": 93.0},
+        "seven_day": {"pct": 49.0},
+        "scoped": [{"name": "Fable", "pct": 100.0}],
+    }
+    lines = menubar.account_detail_lines(usage)
+    assert lines[0].startswith("5h:") and "93%" in lines[0]
+    assert lines[1].startswith("7d:") and "49%" in lines[1]
+    assert lines[2].startswith("Fable:") and "100%" in lines[2]
+    assert lines[2].endswith("(!)")
+
+
+def test_account_detail_lines_handles_sentinel_and_missing_usage():
+    assert menubar.account_detail_lines("API key (no quota)") == (
+        "API key (no quota)",
+    )
+    assert menubar.account_detail_lines(None) == ("usage unavailable",)
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():

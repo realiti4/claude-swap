@@ -707,6 +707,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Launch the macOS menu bar app (macOS only)",
     )
     group.add_argument(
+        "--install-menubar",
+        action="store_true",
+        help="Install and start the macOS menu bar at login",
+    )
+    group.add_argument(
+        "--uninstall-menubar",
+        action="store_true",
+        help="Stop and remove the macOS menu bar login agent",
+    )
+    group.add_argument(
+        "--menubar-status",
+        action="store_true",
+        help="Show whether the macOS menu bar login agent is running",
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help="Upgrade claude-swap to the latest version on PyPI",
@@ -766,6 +781,29 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")
             sys.exit(130)
+
+    # LaunchAgent management does not need account/config initialization. Keep
+    # it ahead of switcher construction so status and cleanup still work when
+    # the user's Claude configuration is temporarily unavailable.
+    if args.install_menubar or args.uninstall_menubar or args.menubar_status:
+        try:
+            from claude_swap.menubar_launch_agent import (
+                install,
+                is_installed,
+                uninstall,
+            )
+
+            if args.install_menubar:
+                print(f"Menu bar startup installed: {install()}")
+            elif args.uninstall_menubar:
+                uninstall()
+                print("Menu bar startup removed")
+            else:
+                print("running" if is_installed() else "not running")
+            return
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            sys.exit(1)
 
     # Initialize switcher and dispatch under a single error handler so
     # init-time failures (e.g. MigrationError on a backup-dir collision)
