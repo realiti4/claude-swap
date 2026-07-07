@@ -1,37 +1,68 @@
 # claude-swap
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
+Multi-account switcher for Claude Code.  Rotate between multiple Claude
+subscriptions automatically so you always have tokens available — no manual
+switching, no mid-task interruptions.
+
+> **This is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)**
+> with the following additions:
+> - **Desktop notifications** — Windows toast, macOS banner, Linux libnotify —
+>   fired on every account switch and when all accounts are exhausted
+> - **Max-drain defaults** — documented configuration to squeeze 99.9% out of
+>   each account before rotating
+> - **`--notify` / `--no-notify` flag** on `cswap auto`
+> - **Setup guides** for Windows, macOS, and Linux in `docs/`
+
+---
+
+## Quick start (Windows)
+
+```powershell
+pip install pipx
+pipx install claude-swap   # or: pip install -e .  from this repo
+cswap add                  # register account 1 (opens browser)
+cswap add                  # register account 2
+cswap config set autoswitch.threshold 99.9
+cswap config set autoswitch.hysteresisPct 0
+cswap config set autoswitch.intervalSeconds 30
+cswap auto                 # start the loop — notifications on by default
+```
+
+Full guide: [docs/SETUP.md](./docs/SETUP.md) | Windows-specific: [docs/WINDOWS.md](./docs/WINDOWS.md)
+
+---
 
 ## Installation
 
-### Using uv (recommended)
+### Using pipx (recommended on Windows)
 
 ```bash
-uv tool install claude-swap
-```
-
-### Using pipx
-
-```bash
+pip install pipx
 pipx install claude-swap
 ```
 
-### From source
+### Using uv
 
 ```bash
-git clone https://github.com/realiti4/claude-swap.git
+pip install uv
+uv tool install claude-swap
+```
+
+### From this fork (latest changes)
+
+```bash
+git clone https://github.com/dabirideji/claude-swap
 cd claude-swap
-uv sync
-uv run cswap help
+pip install -e .
 ```
 
 ### Updating
 
 ```bash
-cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgrades
-# or run your installer directly:
-uv tool upgrade claude-swap
+cswap upgrade
+# or:
 pipx upgrade claude-swap
+uv tool upgrade claude-swap
 ```
 
 ## Usage
