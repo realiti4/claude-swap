@@ -509,6 +509,19 @@ class TestCLICommands:
         assert "add-token [TOKEN|-]" in result.stdout
         assert "--email" in result.stdout  # modifier flag stays visible
 
+    def test_login_in_help(self):
+        """The login subcommand is documented; its --login mirror flag is hidden
+        (like every other subcommand flag) while --private stays visible."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "add an account via browser OAuth login" in result.stdout  # command line
+        assert "--private" in result.stdout  # modifier flag stays visible
+        assert "--login" not in result.stdout  # subcommand mirror flag is suppressed
+
 
 class TestRunCommand:
     """`cswap run` pre-dispatch: parsing, forwarding, and dispatch."""
