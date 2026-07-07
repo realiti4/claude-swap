@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -524,6 +525,104 @@ class TestStatusCache:
         )
         assert entries["1"].last_good == usage_result
         assert entries["2"].last_good == {"five_hour": {"pct": 80}}
+
+
+def _oauth_creds(token: str, expires_in_s: float) -> str:
+    """Credential JSON with an access token expiring ``expires_in_s`` from now."""
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": token,
+        "refreshToken": f"rt-{token}",
+        "expiresAt": int((time.time() + expires_in_s) * 1000),
+    }})
+
+
+class TestFetchAccountUsageSessionProfile:
+    """Inactive-account fetches source credentials from the session profile.
+
+    Claude rotates the token family inside a session profile and nothing
+    syncs it back, so the backup copy's refresh token is a consumed
+    generation once a session has run — fetching with it 401s forever and
+    usage silently freezes at the last pre-session measurement.
+    """
+
+    def _info(self, backup_creds: str) -> tuple:
+        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds)
+
+    def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
+        """Profile creds are used with is_active=True (no refresh, no persist)."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        mock_fetch.assert_called_once()
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert "persist_credentials" not in kwargs
+
+    def test_expired_session_credentials_with_live_session_is_sentinel(
+        self, temp_home: Path
+    ):
+        """Live claude refreshes lazily — don't burn a request that would 401."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_expired_session_credentials_without_live_session_falls_back(
+        self, temp_home: Path
+    ):
+        """No live session: the backup path (with refresh machinery) still runs."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+        session = _oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
+
+    def test_no_session_profile_uses_backup_path(self, temp_home: Path):
+        """Accounts without a session profile behave exactly as before."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
 
 
 class TestListAccountsUsage:
@@ -3807,6 +3906,67 @@ class TestFormatUsageLines:
         usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
         lines = _format_usage_lines(usage)
         assert lines == ["Fable: 100%  (!)"]
+
+    def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
+        # A measurement served from the store hours after its fetch still
+        # carries the countdown frozen at fetch time; rendering must derive
+        # the live value from resets_at instead (issue: "resets 15:59 in 17h"
+        # printed when the reset was 15h away).
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": resets_at,
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "in 2h" in line
+        assert "17h" not in line
+
+    def test_reset_falls_back_to_cached_strings_without_resets_at(self):
+        # Entries persisted by older versions have no resets_at — the
+        # fetch-time strings are the best available then.
+        usage = {"seven_day": {"pct": 62.0, "clock": "15:59", "countdown": "17h 0m"}}
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_reset_falls_back_on_unparseable_resets_at(self):
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": "not-a-date",
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_spend_clock_recomputed_from_resets_at(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        resets_at = (now + timedelta(hours=2)).isoformat()
+        expected_clock = oauth.format_reset(resets_at)[1]
+        usage = {
+            "spend": {
+                "used": 1.0,
+                "limit": 10.0,
+                "pct": 10.0,
+                "currency": "USD",
+                "resets_at": resets_at,
+                "clock": "stale-clock",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert f"resets {expected_clock}" in line
+        assert "stale-clock" not in line
 
     def test_no_scoped_key_renders_only_standard_windows(self):
         usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}

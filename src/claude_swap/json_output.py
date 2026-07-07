@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from claude_swap import oauth
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
@@ -28,14 +30,18 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 
 
 def _window_to_json(entry: dict) -> dict:
-    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``."""
+    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``.
+
+    ``countdown``/``clock`` are recomputed from ``resets_at`` at serialization
+    time (the store may serve a measurement hours after its fetch); entries
+    without ``resets_at`` fall back to the fetch-time strings.
+    """
     out: dict = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
-    if "countdown" in entry:
-        out["countdown"] = entry["countdown"]
-    if "clock" in entry:
-        out["clock"] = entry["clock"]
+    cell = oauth.fresh_reset_strings(entry)
+    if cell:
+        out["countdown"], out["clock"] = cell
     return out
 
 
@@ -67,10 +73,9 @@ def usage_to_json(usage: dict) -> dict:
         }
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
-        if "countdown" in spend:
-            spend_out["countdown"] = spend["countdown"]
-        if "clock" in spend:
-            spend_out["clock"] = spend["clock"]
+        cell = oauth.fresh_reset_strings(spend)
+        if cell:
+            spend_out["countdown"], spend_out["clock"] = cell
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]

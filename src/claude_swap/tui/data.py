@@ -1,15 +1,10 @@
-"""Data service for the TUI: coherent snapshots + fetch discipline.
+"""Data service for the TUI: snapshots, blocking actions, display helpers.
 
 The TUI never parses printed CLI output — it consumes
 ``ClaudeAccountSwitcher.accounts_snapshot`` (one collect pass, see
-switcher.py) and renders structured data. This module owns *when* that pass
-may hit the network, preserving the discipline the old curses watch view
-established: per refresh pass, only the active account plus — at most once
-per ``SERVE_TTL_S`` — the stalest due alternate is eligible to fetch, so an
-open dashboard costs O(1) requests per TTL window regardless of account
-count. The usage store's own gates (freshness, backoff/Retry-After, claims)
-apply on top, and the TUI never writes poll plans — ``cswap auto`` stays the
-cadence learner.
+switcher.py) and renders structured data. Fetch pacing lives in
+``claude_swap.snapshot_source.SnapshotSource`` (shared with any GUI shell);
+this module re-exports it for the TUI's use.
 
 Everything here is blocking (file locks, keychain subprocesses, network) and
 must be called from a thread worker, never the UI event loop.
@@ -27,72 +22,8 @@ from typing import Callable
 
 from claude_swap import printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.models import AccountsSnapshot
-from claude_swap.switcher import (
-    SENTINEL_NOTES,
-    ClaudeAccountSwitcher,
-    last_seen_note,
-)
-
-
-class SnapshotSource:
-    """Plans each pass's fetch set and takes one coherent snapshot.
-
-    The first ``take()`` is a full on-demand pass (``fetch=None``, every
-    stale account eligible — what a user opening the dashboard expects, and
-    exactly what ``cswap list`` does); afterwards the watch discipline above
-    applies. ``full=True`` (the user's explicit refresh) repeats the full
-    pass; ``store_only=True`` (the auto screen, where the engine drives all
-    fetching) reads the store without any network eligibility.
-    """
-
-    def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
-        self.switcher = switcher
-        self._first_pass = True
-        self._next_alt_mono = 0.0
-        self._last: AccountsSnapshot | None = None
-
-    def take(
-        self, *, full: bool = False, store_only: bool = False
-    ) -> AccountsSnapshot:
-        """Blocking snapshot pass; call from a thread worker."""
-        if store_only:
-            fetch: set[str] | None = set()
-        elif full or self._first_pass:
-            fetch = None
-            self._next_alt_mono = time.monotonic() + usage_store.SERVE_TTL_S
-        else:
-            fetch = self._disciplined_fetch_set()
-        self._first_pass = False
-        snap = self.switcher.accounts_snapshot(fetch=fetch)
-        self._last = snap
-        return snap
-
-    def _disciplined_fetch_set(self) -> set[str]:
-        """Active account + at most one due alternate per ``SERVE_TTL_S``.
-
-        The alternate is picked from the *previous* snapshot's entries — a
-        deliberate improvement over the old watch view, which re-read every
-        credential just to nominate one. A few-second-stale nomination is
-        harmless: the collector re-checks freshness/backoff/claims before
-        actually fetching, so a bad pick simply fetches nothing.
-        """
-        active = self.switcher.current_account_number()
-        fetch = {active} if active else set()
-        now = time.monotonic()
-        if now >= self._next_alt_mono:
-            self._next_alt_mono = now + usage_store.SERVE_TTL_S
-            if self._last is not None:
-                candidates = [
-                    acc.number
-                    for acc in self._last.accounts
-                    if acc.switchable and acc.number != active
-                ]
-                entries = {acc.number: acc.usage for acc in self._last.accounts}
-                pick = usage_store.due_candidate(candidates, entries, time.time())
-                if pick is not None:
-                    fetch.add(pick)
-        return fetch
+from claude_swap.snapshot_source import SnapshotSource
+from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,36 +27,75 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 # --------------------------------------------------------------------------- #
 class TestJsonHelpers:
     def test_usage_to_json_maps_keys_and_preserves_raw_reset(self):
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=4, seconds=30)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
         usage = {
-            "five_hour": {"pct": 25.0, "resets_at": "2026-06-22T23:00:00Z",
+            "five_hour": {"pct": 25.0, "resets_at": resets_at,
                           "countdown": "4h", "clock": "02:00"},
             "seven_day": {"pct": 16.0},
             "spend": {"used": 12.5, "limit": 300.0, "pct": 4.0, "currency": "USD",
-                      "resets_at": "2026-07-01T00:00:00Z"},
+                      "resets_at": resets_at},
         }
         out = usage_to_json(usage)
         assert out["fiveHour"] == {
-            "pct": 25.0, "resetsAt": "2026-06-22T23:00:00Z",
-            "countdown": "4h", "clock": "02:00",
+            "pct": 25.0, "resetsAt": resets_at,
+            "countdown": countdown, "clock": clock,
         }
         # seven_day had no reset → only pct, camelCased key
         assert out["sevenDay"] == {"pct": 16.0}
         assert out["spend"]["used"] == 12.5
-        assert out["spend"]["resetsAt"] == "2026-07-01T00:00:00Z"
+        assert out["spend"]["resetsAt"] == resets_at
 
     def test_usage_to_json_projects_scoped_windows(self):
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=3, seconds=30)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
         usage = {
             "five_hour": {"pct": 7.0},
             "scoped": [
-                {"name": "Fable", "pct": 100.0, "resets_at": "2026-07-03T21:59:59Z",
+                {"name": "Fable", "pct": 100.0, "resets_at": resets_at,
                  "countdown": "3h", "clock": "21:59"},
             ],
         }
         out = usage_to_json(usage)
         assert out["scoped"] == [
-            {"name": "Fable", "pct": 100.0, "resetsAt": "2026-07-03T21:59:59Z",
-             "countdown": "3h", "clock": "21:59"},
+            {"name": "Fable", "pct": 100.0, "resetsAt": resets_at,
+             "countdown": countdown, "clock": clock},
         ]
+
+    def test_usage_to_json_recomputes_countdown_from_resets_at(self):
+        # A measurement served from the store hours after its fetch still
+        # carries the countdown frozen at fetch time; the JSON projection must
+        # derive the live value from resets_at, same as the human view.
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        usage = {"seven_day": {"pct": 62.0, "resets_at": resets_at,
+                               "countdown": "17h 0m", "clock": "stale-clock"}}
+        out = usage_to_json(usage)
+        assert out["sevenDay"]["countdown"].startswith("2h")
+        assert out["sevenDay"]["clock"] != "stale-clock"
+
+    def test_usage_to_json_falls_back_to_cached_strings_without_resets_at(self):
+        # Entries persisted by older versions have no resets_at — the
+        # fetch-time strings are the best available then.
+        usage = {"seven_day": {"pct": 62.0, "countdown": "17h 0m", "clock": "15:59"}}
+        out = usage_to_json(usage)
+        assert out["sevenDay"] == {"pct": 62.0, "countdown": "17h 0m", "clock": "15:59"}
+
+    def test_usage_to_json_falls_back_on_unparseable_resets_at(self):
+        usage = {"seven_day": {"pct": 62.0, "resets_at": "not-a-date",
+                               "countdown": "17h 0m", "clock": "15:59"}}
+        out = usage_to_json(usage)
+        assert out["sevenDay"]["countdown"] == "17h 0m"
+        assert out["sevenDay"]["clock"] == "15:59"
+
+    def test_usage_to_json_recomputes_spend_strings(self):
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
+        usage = {"spend": {"used": 1.0, "limit": 10.0, "pct": 10.0, "currency": "USD",
+                           "resets_at": resets_at,
+                           "countdown": "stale", "clock": "stale-clock"}}
+        out = usage_to_json(usage)
+        assert out["spend"]["countdown"] == countdown
+        assert out["spend"]["clock"] == clock
 
     def test_usage_fields_variants(self):
         from claude_swap.json_output import (

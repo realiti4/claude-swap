@@ -193,6 +193,31 @@ class TestBackoff:
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)
         assert BACKOFF_BASE_S * 2**4 == 480.0
 
+    def test_edge_429_backoff_capped(self, store, clock):
+        # "Retry-After: 0" is the sustained/edge rule: retries are penalty-free
+        # and ~every other one succeeds, so backoff must stay tight instead of
+        # doubling to BACKOFF_CAP_S — freshness matters most during heavy burn.
+        expected = [30.0, 60.0, 120.0, 120.0, 120.0]
+        for i, want in enumerate(expected):
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+            )
+            entry = store.entries(IDENT)["1"]
+            assert entry.consecutive_failures == i + 1
+            assert entry.backoff_until == pytest.approx(clock.now + want)
+            clock.advance(want + 1)
+
+    def test_retry_after_floor_is_capped(self):
+        # A pathological Retry-After can never park an account for hours.
+        assert usage_store._failure_backoff_s(1, 5000.0) == pytest.approx(
+            usage_store.RETRY_AFTER_FLOOR_CAP_S
+        )
+
+    def test_measured_burst_block_honored_exactly(self):
+        # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and
+        # the block is exactly that long — honor it as the floor, uncapped.
+        assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
+
 
 class TestIdentityGuard:
     def test_slot_reuse_hides_old_usage(self, store):

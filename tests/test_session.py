@@ -1164,3 +1164,50 @@ class TestShareHistoryWindows:
 
         with pytest.raises(SessionError, match="Windows"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+
+class TestReadSessionCredentials:
+    """The profile's current credential JSON: keychain first, then plaintext."""
+
+    def test_missing_dir_returns_none(self, tmp_path):
+        assert session_mod.read_session_credentials(tmp_path / "absent") is None
+
+    def test_reads_plaintext_file_off_macos(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.LINUX)
+        )
+        session_dir = tmp_path / "sess"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-file"}}'
+        )
+        assert "sk-file" in session_mod.read_session_credentials(session_dir)
+
+    def test_keychain_shadows_plaintext_on_macos(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """Claude migrates the seed into its hashed keychain entry on first
+        write and rotates it there — the entry is the newest generation."""
+        session_dir = tmp_path / "sess"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        block_real_keychain.set_password(
+            keychain_service_name(session_dir),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
+    def test_macos_falls_back_to_file_without_keychain_entry(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        session_dir = tmp_path / "sess"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-seed"}}'
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-seed" in creds

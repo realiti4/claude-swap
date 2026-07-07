@@ -906,6 +906,35 @@ class TestTryFetchUsageOutcome:
         assert "account 1" in line
         assert "retry-after 42s" in line
         assert "a@b.c" not in line
+        # Nonzero Retry-After = the burst rule, which cswap's one-request-per-
+        # account-per-pass traffic cannot trip — the log names the real culprit.
+        assert "burst block" in line
+
+    def test_edge_429_warning_has_no_burst_hint(self, caplog):
+        import email.message
+        import logging
+        hdrs = email.message.Message()
+        hdrs["Retry-After"] = "0"
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "Too Many",
+            hdrs=hdrs, fp=None,
+        )
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err),
+            caplog.at_level(logging.WARNING, logger="claude-swap"),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.retry_after_s == 0.0
+        line = next(
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "http-429" in r.getMessage()
+        )
+        # "Retry-After: 0" is the ordinary sustained/edge rule — no hint.
+        assert "retry-after 0s" in line
+        assert "burst block" not in line
 
     def test_timeout_outcome(self):
         with patch(

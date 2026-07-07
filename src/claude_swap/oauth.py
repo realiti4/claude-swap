@@ -178,6 +178,26 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     return countdown, time_str
 
 
+def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
+    """``(countdown, clock)`` for one usage window, or None when unknown.
+
+    Recomputed from ``resets_at`` at render time: the strings cached at fetch
+    time drift as the measurement ages (a countdown frozen 2h ago overstates
+    the remaining wait by those 2h, and a same-day "15:30" clock silently
+    starts meaning yesterday). Entries persisted without ``resets_at`` fall
+    back to the fetch-time strings — stale beats blank.
+    """
+    resets_at = window.get("resets_at")
+    if resets_at:
+        try:
+            return format_reset(resets_at)
+        except (ValueError, TypeError):
+            pass  # unparseable cached value — fall back below
+    if "clock" in window:
+        return window.get("countdown", "?"), window["clock"]
+    return None
+
+
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
     url = "https://api.anthropic.com/api/oauth/usage"
@@ -231,6 +251,11 @@ def _log_usage_failure(
     question without a second ask)."""
     where = f" {context}" if context else ""
     cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
+    if kind == "http-429" and retry_after_s:
+        # The burst rule needs ~5 rapid requests on one account to trip; cswap
+        # sends at most one per account per pass, so state the verified fact
+        # and let the user look for the real poller.
+        cause += " (burst block — cswap's own polling cannot trigger this)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
 
