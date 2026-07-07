@@ -158,6 +158,12 @@ class FakeSwitcher:
         self.calls.append(("add_token", token, email, slot, assume_yes))
         print(f"Added Account {slot or 9}")
 
+    def add_login_result(
+        self, result, slot: int | None = None, assume_yes: bool = False
+    ) -> None:
+        self.calls.append(("add_login_result", result.email, slot, assume_yes))
+        print(f"Added Account 9: {result.email}")
+
 
 def make_app(fake: FakeSwitcher):
     from claude_swap.tui.app import CswapApp
@@ -476,7 +482,13 @@ class TestDashboard:
             await pilot.press("down", "down", "down", "enter")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
-            assert ids == ["add-login", "add-token", "back"]
+            assert ids == [
+                "add-login",
+                "add-browser",
+                "add-browser-private",
+                "add-token",
+                "back",
+            ]
             await pilot.press("escape")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
@@ -647,6 +659,74 @@ class TestDashboard:
             await pilot.press("n")
             await settle(pilot)
             assert not any(call[0] == "add_token" for call in fake.calls)
+
+    # -- browser login (cswap login) ------------------------------------------
+
+    def _pending_and_result(self):
+        from claude_swap.standalone_login import LoginResult, PendingLogin
+
+        pending = PendingLogin(
+            verifier="ver", state="st", url="https://claude.ai/oauth?x=1"
+        )
+        result = LoginResult(
+            credentials="{}",
+            email="new@example.com",
+            account_uuid="au",
+            organization_uuid="ou",
+            organization_name="Org",
+        )
+        return pending, result
+
+    async def test_add_browser_via_menu_completes_login(self, tmp_path):
+        from unittest.mock import patch
+
+        pending, result = self._pending_and_result()
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        with patch(
+            "claude_swap.standalone_login.prepare_login",
+            return_value=(pending, None),
+        ) as prep, patch(
+            "claude_swap.standalone_login.complete_login", return_value=result
+        ) as comp:
+            async with app.run_test(size=(100, 40)) as pilot:
+                await settle(pilot)
+                await menu_select(pilot, "add-menu")
+                await menu_select(pilot, "add-browser")
+                from textual.widgets import Input
+
+                from claude_swap.tui.modals import BrowserLoginModal
+
+                assert isinstance(app.screen, BrowserLoginModal)
+                app.screen.query_one("#code", Input).value = "abc#st"
+                await pilot.click("#login")
+                await settle(pilot)
+        prep.assert_called_once_with(private=False)
+        comp.assert_called_once_with(pending, "abc#st")
+        assert ("add_login_result", "new@example.com", None, False) in fake.calls
+
+    async def test_add_browser_private_passes_flag_cancel_is_safe(self, tmp_path):
+        from unittest.mock import patch
+
+        pending, _ = self._pending_and_result()
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        with patch(
+            "claude_swap.standalone_login.prepare_login",
+            return_value=(pending, "Chrome"),
+        ) as prep:
+            async with app.run_test(size=(100, 40)) as pilot:
+                await settle(pilot)
+                await menu_select(pilot, "add-menu")
+                await menu_select(pilot, "add-browser-private")
+                from claude_swap.tui.modals import BrowserLoginModal
+
+                assert isinstance(app.screen, BrowserLoginModal)
+                assert "Chrome" in (app.screen._notice or "")
+                await pilot.press("escape")  # cancel: nothing runs
+                await settle(pilot)
+        prep.assert_called_once_with(private=True)
+        assert not any(c[0] == "add_login_result" for c in fake.calls)
 
     async def test_empty_state_hint_in_panel(self, tmp_path):
         fake = FakeSwitcher([], tmp_path)

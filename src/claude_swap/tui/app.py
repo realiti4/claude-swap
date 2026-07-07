@@ -20,7 +20,13 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
-from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
+from claude_swap.tui.modals import (
+    AddTokenModal,
+    BrowserLoginModal,
+    ConfirmModal,
+    OutputModal,
+    TokenForm,
+)
 from claude_swap.tui.theme import CSWAP_DARK
 
 
@@ -256,6 +262,51 @@ class CswapApp(App):
             if acc.number == str(slot):
                 return acc.email
         return None
+
+    # -- browser login (cswap login) ---------------------------------------------
+
+    def action_add_browser(self, private: bool = False) -> None:
+        """Standalone browser OAuth login — the TUI face of ``cswap login``.
+
+        The CLI flow reads the pasted authorization code from stdin, which a
+        TUI doesn't have; drive the same round-trip with a modal instead:
+        open the browser now, collect the code, finish off-thread.
+        """
+        from claude_swap.standalone_login import prepare_login
+
+        pending, private_label = prepare_login(private=private)
+        if not private:
+            notice = None
+        elif private_label:
+            notice = (
+                f"Opened a private {private_label} window (your normal "
+                "session stays signed in)."
+            )
+        else:
+            notice = (
+                "No incognito-capable browser found (Chrome/Firefox/Brave/"
+                "Edge) — open the URL below in a private window yourself."
+            )
+        self.push_screen(
+            BrowserLoginModal(url=pending.url, notice=notice),
+            partial(self._on_browser_login_code, pending),
+        )
+
+    def _on_browser_login_code(self, pending, pasted: str | None) -> None:
+        if pasted is None:
+            return
+        self._start_action(
+            "Add account via browser login",
+            partial(self._complete_browser_login, pending, pasted),
+            show_output=True,
+        )
+
+    def _complete_browser_login(self, pending, pasted: str) -> None:
+        """Worker body: exchange the code, persist the account."""
+        from claude_swap.standalone_login import complete_login
+
+        result = complete_login(pending, pasted)
+        self.switcher.add_login_result(result)
 
     # -- navigation -------------------------------------------------------------
 

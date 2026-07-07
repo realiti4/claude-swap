@@ -85,6 +85,8 @@ class DashboardScreen(Screen):
     def _add_entries(self) -> MenuEntries:
         return [
             ("From current Claude Code login", "add-login"),
+            ("From a browser login…", "add-browser"),
+            ("From a browser login (private window)…", "add-browser-private"),
             ("From a setup-token / API key…", "add-token"),
             _BACK,
         ]
@@ -131,6 +133,8 @@ class DashboardScreen(Screen):
             "watch": app.action_open_watch,
             "auto": app.action_open_auto,
             "add-login": app.action_add_current,
+            "add-browser": app.action_add_browser,
+            "add-browser-private": partial(app.action_add_browser, private=True),
             "add-token": app.action_add_token,
             "quit": app.exit,
         }

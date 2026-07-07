@@ -133,6 +133,71 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
         self.dismiss(None)
 
 
+class BrowserLoginModal(ModalScreen["str | None"]):
+    """Standalone browser OAuth login: the authorize URL is already open in a
+    browser; this collects the code the callback page shows. Dismisses with
+    the pasted value, or None on cancel."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("left", "app.focus_previous", show=False),
+        Binding("right", "app.focus_next", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        notice: str | None = None,
+        title: str = "Add account via browser login",
+    ) -> None:
+        super().__init__()
+        self._url = url
+        self._notice = notice
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box modal-box-wide"):
+            yield Label(self._title, classes="modal-title")
+            body = (
+                "Authorize claude-swap in the browser — pick the account (and, "
+                "for a merged email, the organization) you want, then paste the "
+                "code the page shows you.\n\n"
+                "If no browser window opened, open this URL yourself:"
+            )
+            if self._notice:
+                body = f"{self._notice}\n\n{body}"
+            yield Static(body, classes="modal-body")
+            yield Static(self._url, classes="modal-body")
+            yield Input(placeholder="authorization code (required)", id="code")
+            yield Static("", id="form-error", classes="form-error")
+            with Horizontal(classes="modal-buttons"):
+                yield Button("Log in", id="login")
+                yield Button("Cancel", id="cancel")
+            yield Static("enter log in  ·  esc cancel", classes="modal-hint")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        code = self.query_one("#code", Input).value.strip()
+        if not code:
+            self.query_one("#form-error", Static).update(
+                "Paste the authorization code first."
+            )
+            return
+        self.dismiss(code)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class OutputModal(ModalScreen[None]):
     """Scrollable display of captured (ANSI-colored) action output."""
 
