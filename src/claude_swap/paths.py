@@ -1,4 +1,4 @@
-"""Path resolution for Claude Code config and credential files.
+"""Path resolution for Claude Code, Codex, and cswap data files.
 
 Mirrors claude-code's own resolution so cswap reads and writes the same files
 claude-code does. Key rules (from claude-code source):
@@ -12,6 +12,9 @@ claude-code does. Key rules (from claude-code source):
 Also resolves the cswap backup root, which on Linux/WSL follows the XDG Base
 Directory Specification (``$XDG_DATA_HOME/claude-swap``) and falls back to the
 legacy ``~/.claude-swap-backup`` on macOS/Windows.
+
+Codex auth resolution follows Codex CLI: ``CODEX_HOME`` if set, else
+``~/.codex``, with active auth at ``auth.json`` inside that directory.
 
 References:
 - claude-code utils/env.ts getGlobalClaudeFile
@@ -56,6 +59,19 @@ def get_global_config_path() -> Path:
 def get_credentials_path() -> Path:
     """Return the path to the Claude credentials file."""
     return get_claude_config_home() / ".credentials.json"
+
+
+def get_codex_home() -> Path:
+    """Return the Codex config home directory (CODEX_HOME or ~/.codex)."""
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".codex"
+
+
+def get_codex_auth_path() -> Path:
+    """Return the active Codex auth file path."""
+    return get_codex_home() / "auth.json"
 
 
 def get_legacy_backup_root() -> Path:

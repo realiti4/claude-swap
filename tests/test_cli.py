@@ -42,11 +42,11 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
         env["USERPROFILE"] = _ISOLATED_HOME
     elif "USERPROFILE" not in extra:
         env["USERPROFILE"] = extra["HOME"]
-    # CLAUDE_CONFIG_DIR / XDG_DATA_HOME bypass HOME in path resolution, so a
-    # developer with either exported would otherwise point the spawned CLI back
-    # at real config/backup paths (and on macOS, the real Keychain). Drop them
+    # CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_DATA_HOME bypass HOME in path resolution, so a
+    # developer with any exported would otherwise point the spawned CLI back
+    # at real config/auth/backup paths (and on macOS, the real Keychain). Drop them
     # unless a caller set them deliberately.
-    for var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
+    for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME"):
         if var not in extra:
             env.pop(var, None)
     return env
@@ -126,6 +126,12 @@ class TestCLI:
         )
         # Should run (may fail due to no config, but flag should be accepted)
         assert "--debug" not in result.stderr or "unrecognized" not in result.stderr
+
+    def test_subprocess_env_clears_codex_home(self):
+        with patch.dict(os.environ, {"CODEX_HOME": "/real/codex"}):
+            env = _subprocess_env()
+
+        assert "CODEX_HOME" not in env
 
     def test_token_status_flag_requires_list(self, capsys):
         """--token-status should only be accepted alongside --list."""
@@ -689,6 +695,85 @@ class TestSubcommandAliases:
         switcher_cls.return_value.list_accounts.assert_called_once_with(
             show_token_status=False, json_output=True,
         )
+
+    def test_list_subcommand_appends_codex_accounts(self):
+        """`cswap ls` shows Codex accounts after Claude accounts when present."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as claude_cls, \
+             patch("claude_swap.cli.CodexAccountSwitcher") as codex_cls, \
+             patch.object(sys, "argv", ["claude-swap", "ls"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            codex_cls.return_value.has_accounts.return_value = True
+            cli.main()
+
+        claude_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=False,
+            json_output=False,
+        )
+        codex_cls.return_value.list_accounts.assert_called_once_with(json_output=False)
+
+    def test_list_subcommand_survives_corrupt_codex_state(self, capsys):
+        """A corrupt Codex state must not fail the primary `cswap list`."""
+        from claude_swap.exceptions import ConfigError
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as claude_cls, \
+             patch("claude_swap.cli.CodexAccountSwitcher") as codex_cls, \
+             patch.object(sys, "argv", ["claude-swap", "ls"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            codex_cls.return_value.has_accounts.side_effect = ConfigError(
+                "Codex state file is not valid JSON"
+            )
+            cli.main()
+
+        claude_cls.return_value.list_accounts.assert_called_once()
+        assert "Codex accounts unavailable" in capsys.readouterr().err
+
+    def test_list_json_does_not_append_codex_accounts(self):
+        """`cswap list --json` remains Claude-compatible."""
+        payload = {"schemaVersion": 1, "accounts": []}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as claude_cls, \
+             patch("claude_swap.cli.CodexAccountSwitcher") as codex_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            claude_cls.return_value.list_accounts.return_value = payload
+            codex_cls.return_value.has_accounts.return_value = True
+            cli.main()
+
+        codex_cls.return_value.list_accounts.assert_not_called()
+
+    def test_codex_add_dispatches(self):
+        """`cswap codex add` dispatches with label and slot."""
+        with patch("claude_swap.cli.CodexAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "codex", "add", "--label", "work"]):
+            cli.main()
+
+        switcher_cls.return_value.add_account.assert_called_once_with(
+            label="work",
+            slot=None,
+        )
+
+    def test_codex_switch_dispatches(self):
+        """`cswap codex switch 2` dispatches to the Codex switcher."""
+        with patch("claude_swap.cli.CodexAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "codex", "switch", "2"]):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            "2",
+            json_output=False,
+        )
+
+    def test_codex_list_json_serialized_to_stdout(self, capsys):
+        payload = {"schemaVersion": 1, "provider": "codex", "accounts": []}
+        with patch("claude_swap.cli.CodexAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "codex", "list", "--json"]):
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+
+        switcher_cls.return_value.list_accounts.assert_called_once_with(json_output=True)
+        assert json.loads(capsys.readouterr().out) == payload
 
     def test_run_subcommand_still_dispatches(self):
         """`cswap run 2` keeps reaching the session pre-dispatch (not translated)."""

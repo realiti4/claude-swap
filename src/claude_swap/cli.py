@@ -8,6 +8,7 @@ import os
 import sys
 
 from claude_swap import __version__
+from claude_swap.codex import CodexAccountSwitcher
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import dimmed, error, muted
@@ -84,6 +85,63 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
         return [flag, *rest]
 
     return argv
+
+
+def _codex_command(argv: list[str]) -> None:
+    """Handle `cswap codex ...` commands for independent Codex auth switching."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} codex",
+        description="Manage Codex CLI auth snapshots independently of Claude accounts.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    add_parser = subparsers.add_parser("add", help="snapshot the active Codex auth")
+    add_parser.add_argument("--label", metavar="LABEL", help="Display label for the account")
+    add_parser.add_argument("--slot", type=int, metavar="NUM", help="Store in a specific slot")
+
+    list_parser = subparsers.add_parser("list", aliases=["ls"], help="list Codex accounts")
+    list_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    status_parser = subparsers.add_parser("status", help="show current Codex account")
+    status_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    switch_parser = subparsers.add_parser("switch", help="switch Codex auth")
+    switch_parser.add_argument("account", nargs="?", metavar="NUM|LABEL")
+    switch_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    remove_parser = subparsers.add_parser("remove", aliases=["rm"], help="remove a Codex account")
+    remove_parser.add_argument("account", metavar="NUM|LABEL")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    payload: dict | None = None
+    try:
+        switcher = CodexAccountSwitcher()
+        if args.command == "add":
+            switcher.add_account(label=args.label, slot=args.slot)
+        elif args.command in ("list", "ls"):
+            payload = switcher.list_accounts(json_output=args.json)
+        elif args.command == "status":
+            payload = switcher.status(json_output=args.json)
+        elif args.command == "switch":
+            payload = switcher.switch(args.account, json_output=args.json)
+        elif args.command in ("remove", "rm"):
+            switcher.remove_account(args.account)
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+    if json_mode and payload is not None:
+        print(json.dumps(payload, indent=2))
 
 
 def _run_command(argv: list[str]) -> None:
@@ -513,6 +571,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "codex":
+        _codex_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -544,6 +605,7 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s codex <command>            manage Codex auth snapshots
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
@@ -562,6 +624,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s codex add --label work
+  %(prog)s codex switch work
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
@@ -816,6 +880,20 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 show_token_status=args.token_status,
                 json_output=args.json,
             )
+            if not args.json:
+                # The Codex section is auxiliary: its state living in a separate
+                # tree must never fail the primary Claude listing (which has
+                # already printed). Degrade to a warning on any Codex-side error.
+                try:
+                    codex_switcher = CodexAccountSwitcher()
+                    if codex_switcher.has_accounts():
+                        print()
+                        codex_switcher.list_accounts(json_output=False)
+                except ClaudeSwitchError as codex_err:
+                    print(
+                        dimmed(f"Codex accounts unavailable: {codex_err}"),
+                        file=sys.stderr,
+                    )
         elif args.switch:
             payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         elif args.switch_to:

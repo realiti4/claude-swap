@@ -77,6 +77,40 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
+### Track Codex accounts too
+
+Codex support is separate from Claude account switching. Log into Codex normally, then snapshot that active auth:
+
+```bash
+codex login
+cswap codex add --label work
+```
+
+Log into another Codex account and add it the same way:
+
+```bash
+codex login
+cswap codex add --label personal
+```
+
+Switch Codex without changing your Claude account:
+
+```bash
+cswap codex switch
+cswap codex switch work
+```
+
+Check or remove Codex snapshots:
+
+```bash
+cswap codex list
+cswap codex status
+cswap codex remove work
+cswap codex list --json
+```
+
+`cswap ls` shows Claude accounts and, when present, a separate Codex accounts section. Codex switching only replaces `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`); it does not edit Codex config, plugins, sessions, hooks, or model settings. Switch while no Codex session is live - a running `codex` that refreshes its token can rewrite `auth.json` and revert a just-completed switch.
+
 ### Automatic switching
 
 Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
@@ -147,6 +181,8 @@ cswap list                      # Show all accounts with 5h/7d usage and reset t
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap remove 2                  # Remove an account
+cswap codex list                # Show Codex accounts
+cswap codex switch work         # Switch Codex auth only
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version

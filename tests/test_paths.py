@@ -19,6 +19,8 @@ from claude_swap.paths import (
     LEGACY_BACKUP_DIRNAME,
     get_backup_root,
     get_claude_config_home,
+    get_codex_auth_path,
+    get_codex_home,
     get_credentials_path,
     get_global_config_path,
     get_legacy_backup_root,
@@ -32,6 +34,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     with patch("pathlib.Path.home", return_value=home):
@@ -90,6 +93,29 @@ class TestGetCredentialsPath:
         custom = tmp_path / "ccd"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert get_credentials_path() == custom / ".credentials.json"
+
+
+class TestGetCodexHome:
+    def test_default_is_dot_codex_in_home(self, isolated_home: Path):
+        assert get_codex_home() == isolated_home / ".codex"
+
+    def test_respects_codex_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        custom = tmp_path / "custom-codex"
+        monkeypatch.setenv("CODEX_HOME", str(custom))
+        assert get_codex_home() == custom
+
+    def test_empty_codex_home_uses_default(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CODEX_HOME", "")
+        assert get_codex_home() == isolated_home / ".codex"
+
+
+class TestGetCodexAuthPath:
+    def test_auth_json_inside_codex_home(self, isolated_home: Path):
+        assert get_codex_auth_path() == isolated_home / ".codex" / "auth.json"
 
 
 class TestGetBackupRoot:
