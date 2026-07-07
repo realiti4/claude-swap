@@ -194,6 +194,14 @@ cswap --menubar
 
 Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
+Install it as a per-user LaunchAgent to start automatically at login:
+
+```bash
+cswap --install-menubar
+cswap --menubar-status
+cswap --uninstall-menubar  # stop and remove automatic startup
+```
+
 </details>
 
 ## Advanced

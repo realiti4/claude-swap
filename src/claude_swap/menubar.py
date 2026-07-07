@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
-from claude_swap.switcher import SENTINEL_NOTES
+from claude_swap.switcher import SENTINEL_NOTES, _format_usage_lines
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -167,6 +167,15 @@ def format_account_label(
 ) -> str:
     """Build one account row's menu label."""
     return f"{num}  {email}  {usage_summary(usage, now)}"
+
+
+def account_detail_lines(usage: dict | str | None) -> tuple[str, ...]:
+    """Detailed account rows matching the usage portion of ``cswap --list``."""
+    if isinstance(usage, str):
+        return (usage,)
+    if isinstance(usage, dict):
+        return tuple(_format_usage_lines(usage))
+    return ("usage unavailable",)
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -489,6 +498,12 @@ def run(switcher) -> int:
                 )
                 item.state = 1 if is_active else 0
                 account_items.append(item)
+                details = account_detail_lines(display)
+                for index, detail in enumerate(details):
+                    branch = "└" if index == len(details) - 1 else "├"
+                    account_items.append(
+                        rumps.MenuItem(f"    {branch} {detail}", callback=None)
+                    )
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
 
