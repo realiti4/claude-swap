@@ -3648,6 +3648,76 @@ class TestMacosKeychainFallback:
         s._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._use_keychain() is False
 
+    def test_kc_call_failure_schedules_a_recheck(self, temp_home: Path, monkeypatch):
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        before = time.monotonic()
+        with pytest.raises(KeychainError):
+            s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._keychain_disabled_until > before  # a re-probe is scheduled
+
+    def test_keychain_recovers_after_cooldown(self, temp_home: Path):
+        # A long-running daemon (menu bar / TUI) must re-probe after the cooldown
+        # so a transient `security` timeout doesn't disable the Keychain for the
+        # whole process — the stuck-in-file-mode "no credentials" display bug.
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False
+        s._keychain_disabled_until = time.monotonic() - 1  # cooldown already elapsed
+        assert s._use_keychain() is True             # re-probes
+        assert s._keychain_usable_cache is None       # re-armed for a fresh op
+        assert s._keychain_disabled_until == 0.0
+
+    def test_keychain_stays_file_mode_during_cooldown(self, temp_home: Path):
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False
+        s._keychain_disabled_until = time.monotonic() + 100  # still within cooldown
+        assert s._use_keychain() is False
+
+    def test_write_keychain_failure_pins_file_mode(self, temp_home: Path, monkeypatch):
+        # An active write whose Keychain attempt fails falls back to the file; the
+        # stale-item delete is best-effort. Even though the failed op scheduled a
+        # re-probe, the write must pin file mode so a later cooldown can't re-probe
+        # onto the residual Keychain item and resurrect the wrong account.
+        s = self._macos_switcher()
+        store = s._store
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+        monkeypatch.setattr(macos_keychain, "delete_password", _raise_locked)
+        monkeypatch.setattr(store, "_write_active_credentials_file", lambda creds: None)
+        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
+        assert store._last_active_credentials_backend == "file"
+        assert s._keychain_disabled_until == 0.0   # no re-probe scheduled
+        assert s._use_keychain() is False          # pinned, stays file mode
+
+    def test_write_fallback_clears_pending_read_reprobe(self, temp_home: Path, monkeypatch):
+        # The owner's edge: already in file mode from a read timeout with a
+        # re-probe still pending, then a write leaves a stale item behind. The
+        # write must clear that pending re-probe (pin) so it never resurrects.
+        s = self._macos_switcher()
+        store = s._store
+        s._keychain_usable_cache = False
+        s._keychain_disabled_until = time.monotonic() + 100  # pending read re-probe
+        monkeypatch.setattr(macos_keychain, "delete_password", _raise_locked)
+        monkeypatch.setattr(store, "_write_active_credentials_file", lambda creds: None)
+        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
+        assert store._last_active_credentials_backend == "file"
+        assert s._keychain_disabled_until == 0.0   # pending re-probe cleared
+        assert s._use_keychain() is False
+
+    def test_managed_key_write_fallback_pins_file_mode(self, temp_home: Path, monkeypatch):
+        # Managed API-key variant of the same guard: a failed Keychain write
+        # falls back to plaintext primaryApiKey, and managed-key reads check the
+        # Keychain first — so the fallback must pin file mode too, or a cooldown
+        # re-probe could read a stale "Claude Code" Keychain item over the key.
+        s = self._macos_switcher()
+        store = s._store
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+        monkeypatch.setattr(store, "_update_global_config", lambda mutate: None)
+        monkeypatch.setattr(store, "_clear_oauth_credential", lambda: None)
+        store._write_managed_credentials("sk-ant-api03-" + "x" * 40)
+        assert store._last_active_credentials_backend == "file"
+        assert s._keychain_disabled_until == 0.0   # pinned, no re-probe
+        assert s._use_keychain() is False
+
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
     ):

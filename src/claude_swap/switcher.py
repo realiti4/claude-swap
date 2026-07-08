@@ -372,6 +372,14 @@ class ClaudeAccountSwitcher:
         self._store._keychain_usable_cache = value
 
     @property
+    def _keychain_disabled_until(self) -> float:
+        return self._store._keychain_disabled_until
+
+    @_keychain_disabled_until.setter
+    def _keychain_disabled_until(self, value: float) -> None:
+        self._store._keychain_disabled_until = value
+
+    @property
     def _last_active_credentials_backend(self) -> str | None:
         return self._store._last_active_credentials_backend
 
