@@ -105,10 +105,8 @@ def _codex_window_label(window: dict[str, Any]) -> str:
     if not isinstance(seconds, (int, float)):
         return "?"
     hours = round(seconds / 3600)
-    if hours >= 168:
-        return "Week"
     if hours >= 24:
-        return "Day"
+        return f"{round(hours / 24)}d"
     return f"{hours}h"
 
 

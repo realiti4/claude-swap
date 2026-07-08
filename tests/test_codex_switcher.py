@@ -129,7 +129,7 @@ def test_fetch_codex_usage_calls_wham_backend(monkeypatch: pytest.MonkeyPatch):
     assert usage == {
         "windows": [
             {"label": "3h", "pct": 25.0, "resets_at": "2026-07-07T21:00:00Z"},
-            {"label": "Week", "pct": 50.0, "resets_at": "2026-07-14T21:00:00Z"},
+            {"label": "7d", "pct": 50.0, "resets_at": "2026-07-14T21:00:00Z"},
         ],
         "plan": "plus",
         "credits": 2.0,
@@ -177,7 +177,7 @@ def test_list_accounts_prints_codex_usage(
         lambda auth_text, timeout_s: {
             "windows": [
                 {"label": "3h", "pct": 25.0},
-                {"label": "Week", "pct": 50.0},
+                {"label": "7d", "pct": 50.0},
             ],
             "plan": "plus",
             "credits": 2.0,
@@ -191,7 +191,7 @@ def test_list_accounts_prints_codex_usage(
     assert "  1: work (active)" in out
     assert "├ 3h:" in out
     assert "25%" in out
-    assert "├ Week:" in out
+    assert "├ 7d:" in out
     assert "50%" in out
     assert "├ Plan:" in out
     assert "plus" in out
@@ -212,7 +212,7 @@ def test_list_accounts_json_includes_codex_usage(
         lambda auth_text, timeout_s: {
             "windows": [
                 {"label": "3h", "pct": 25.0, "resets_at": "2026-01-01T00:00:00Z"},
-                {"label": "Week", "pct": 50.0},
+                {"label": "7d", "pct": 50.0},
             ],
             "plan": "plus",
             "credits": 2.0,
@@ -232,7 +232,7 @@ def test_list_accounts_json_includes_codex_usage(
     assert account["usage"]["windows"][0]["label"] == "3h"
     assert account["usage"]["windows"][0]["pct"] == 25.0
     assert account["usage"]["windows"][0]["resetsAt"] == "2026-01-01T00:00:00Z"
-    assert account["usage"]["windows"][1] == {"label": "Week", "pct": 50.0}
+    assert account["usage"]["windows"][1] == {"label": "7d", "pct": 50.0}
     assert account["usage"]["plan"] == "plus"
     assert account["usage"]["credits"] == 2.0
     assert account["usageFetchedAt"] == "1970-01-01T00:00:00Z"
