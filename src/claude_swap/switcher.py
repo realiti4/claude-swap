@@ -1145,7 +1145,6 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -1172,6 +1171,8 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        if migrate_from:
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
@@ -1341,7 +1342,6 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
@@ -1370,6 +1370,8 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+        if migrate_from:
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"

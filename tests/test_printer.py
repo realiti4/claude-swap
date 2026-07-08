@@ -151,3 +151,31 @@ def test_force_color_overrides_and_restores():
         assert printer._colors_enabled is False
     finally:
         printer._colors_enabled = saved
+
+
+class TestForceUtf8Output:
+    """Tests for force_utf8_output (issue #113: cp1252 console crash)."""
+
+    def test_reconfigures_legacy_stream_to_utf8(self, monkeypatch):
+        # A cp1252-encoded stdout raises on the tool's glyphs before the fix.
+        import io
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with pytest.raises(UnicodeEncodeError):
+            stream.write("● → ├ ─ └")
+            stream.flush()
+
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(sys, "stderr", stream)
+        printer.force_utf8_output()
+
+        assert stream.encoding == "utf-8"
+        # No longer raises now that the stream encodes UTF-8.
+        stream.write("● → ├ ─ └")
+        stream.flush()
+
+    def test_no_op_on_streams_without_reconfigure(self, monkeypatch):
+        # StringIO has no reconfigure(); the guard must skip it silently.
+        monkeypatch.setattr(sys, "stdout", StringIO())
+        monkeypatch.setattr(sys, "stderr", StringIO())
+        printer.force_utf8_output()  # must not raise

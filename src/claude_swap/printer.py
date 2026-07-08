@@ -42,6 +42,21 @@ def _enable_windows_vt() -> bool:
         return False
 
 
+def force_utf8_output() -> None:
+    """Make stdout/stderr encode UTF-8 so ● → ├ ─ └ don't crash on a legacy
+    console (cp1252 on Windows, or an ASCII/C locale). errors="replace" keeps
+    output flowing on any stream that still can't render a glyph. No-op where
+    the stream can't be reconfigured (replaced/captured streams in tests)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def _detect_color_support() -> bool:
     """Detect whether the terminal supports ANSI colors."""
     # Respect NO_COLOR convention (https://no-color.org/)
