@@ -486,6 +486,13 @@ class CredentialStore:
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
+        if self._host.platform == Platform.MACOS and not wrote_to_keychain:
+            # Same stale-Keychain resurrection guard as the OAuth path: the key
+            # fell back to plaintext ``primaryApiKey`` while a stale "Claude Code"
+            # Keychain item may remain, and managed-key reads check the Keychain
+            # before ``primaryApiKey``. Pin file mode so a cooldown re-probe can't
+            # read that residual over the fresh fallback value.
+            self._pin_file_mode()
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )

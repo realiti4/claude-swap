@@ -3594,6 +3594,21 @@ class TestMacosKeychainFallback:
         assert s._keychain_disabled_until == 0.0   # pending re-probe cleared
         assert s._use_keychain() is False
 
+    def test_managed_key_write_fallback_pins_file_mode(self, temp_home: Path, monkeypatch):
+        # Managed API-key variant of the same guard: a failed Keychain write
+        # falls back to plaintext primaryApiKey, and managed-key reads check the
+        # Keychain first — so the fallback must pin file mode too, or a cooldown
+        # re-probe could read a stale "Claude Code" Keychain item over the key.
+        s = self._macos_switcher()
+        store = s._store
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+        monkeypatch.setattr(store, "_update_global_config", lambda mutate: None)
+        monkeypatch.setattr(store, "_clear_oauth_credential", lambda: None)
+        store._write_managed_credentials("sk-ant-api03-" + "x" * 40)
+        assert store._last_active_credentials_backend == "file"
+        assert s._keychain_disabled_until == 0.0   # pinned, no re-probe
+        assert s._use_keychain() is False
+
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
     ):
