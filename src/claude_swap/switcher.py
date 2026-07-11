@@ -650,6 +650,13 @@ class ClaudeAccountSwitcher:
         instead of the settings file)."""
         self._poll_inputs_override = (threshold, models)
 
+    def clear_poll_policy_inputs(self) -> None:
+        """Drop the hosted engine's pin so poll planning falls back to the
+        settings file — called when the engine's screen closes, or a TUI
+        session threshold override would keep steering cadence after the
+        engine it belonged to is gone."""
+        self._poll_inputs_override = None
+
     def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
         """Threshold + configured model names for poll planning: the hosting
         engine's pinned values when present, else the settings file (reloaded

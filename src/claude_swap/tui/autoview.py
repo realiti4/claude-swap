@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -23,9 +24,14 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, binding_pct
+from claude_swap.autoswitch import (
+    AutoSwitchEngine,
+    AutoSwitchEvent,
+    binding_pct,
+    pct_label,
+)
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import load_settings, parse_model_names
+from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import (
@@ -64,6 +70,10 @@ def event_text(event: AutoSwitchEvent) -> Text:
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("t", "adjust_threshold", "Threshold"),
+        Binding("left", "threshold_step(-1)", "-1%"),
+        Binding("right", "threshold_step(1)", "+1%"),
+        Binding("enter", "adjust_done", "Done"),
         Binding("escape,q", "back", "Back"),
     ]
 
@@ -73,6 +83,14 @@ class AutoScreen(Screen):
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        # Session-only threshold adjustment (t, then arrows). Never written
+        # to settings.json — same memory-only precedent as the dry-run
+        # toggle. ``_configured_threshold`` is the mount-time file value the
+        # screen reverts to on exit; ``_entry_threshold`` is the value when
+        # adjust mode was entered (wake/log only on a net change).
+        self._adjusting = False
+        self._configured_threshold: float | None = None
+        self._entry_threshold: float | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -89,21 +107,98 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
-        summary = self.query_one("#auto-summary", Static)
-        summary.update(
-            f"auto-switch · threshold {self._settings.threshold:.0f}% · "
-            f"poll every {self._settings.interval_seconds:.0f}s"
-        )
+        # The bar tick everywhere reads app.threshold_pct, loaded once at app
+        # startup — sync it to the fresh file value so bars and engine agree,
+        # and remember that value: unmount restores it (only the session
+        # adjustment reverts, not this correction).
+        self._configured_threshold = self._settings.threshold
+        self.app.threshold_pct = self._settings.threshold
+        self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self._start_engine(dry_run=True)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
             self._engine.stop()
+        # A session threshold must not outlive the engine it steered: unpin
+        # the poll planner and put the bar tick back on the file value.
+        self.app.switcher.clear_poll_policy_inputs()
+        if self._configured_threshold is not None:
+            self.app.threshold_pct = self._configured_threshold
         self.app.set_store_only(False)
 
     def action_back(self) -> None:
+        if self._adjusting:
+            self._end_adjust()
+            return
         self.app.pop_screen()
+
+    # -- threshold adjust mode ------------------------------------------------
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("threshold_step", "adjust_done") and not self._adjusting:
+            return False  # hidden and inert until adjust mode is armed
+        return True
+
+    def action_adjust_threshold(self) -> None:
+        if self._adjusting:
+            self._end_adjust()
+            return
+        self._adjusting = True
+        self._entry_threshold = self._settings.threshold
+        self._update_summary()
+        self.refresh_bindings()
+
+    def action_adjust_done(self) -> None:
+        if self._adjusting:
+            self._end_adjust()
+
+    def action_threshold_step(self, delta: float) -> None:
+        if not self._adjusting:
+            return
+        spec = SETTING_SPECS["autoswitch.threshold"]
+        value = min(spec.hi, max(spec.lo, self._settings.threshold + delta))
+        self._set_threshold(value)
+
+    def _end_adjust(self) -> None:
+        self._adjusting = False
+        self._update_summary()
+        self.refresh_bindings()
+        if self._settings.threshold == self._entry_threshold:
+            return  # no net change: nothing to announce, no tick to force
+        if self._engine is not None:
+            self._engine.wake()  # show a decision at the new value now
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— threshold set to {pct_label(self._settings.threshold)}% "
+                "for this session —",
+                style=MUTED,
+            )
+        )
+
+    def _set_threshold(self, value: float) -> None:
+        if value == self._settings.threshold:
+            return
+        self._settings = replace(self._settings, threshold=value)
+        if self._engine is not None:
+            self._engine.apply_threshold(value)
+        self.app.threshold_pct = value
+        self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        text = Text()
+        text.append("auto-switch · ")
+        text.append(
+            f"threshold {pct_label(self._settings.threshold)}%",
+            style=ACCENT if self._adjusting else "",
+        )
+        if self._settings.threshold != self._configured_threshold:
+            text.append(" (session)", style=MUTED)
+        text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        if self._adjusting:
+            text.append("   ← → adjust · enter done", style=MUTED)
+        self.query_one("#auto-summary", Static).update(text)
 
     # -- engine -------------------------------------------------------------
 

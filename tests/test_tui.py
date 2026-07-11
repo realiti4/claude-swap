@@ -158,6 +158,14 @@ class FakeSwitcher:
         self.calls.append(("add_token", token, email, slot, assume_yes))
         print(f"Added Account {slot or 9}")
 
+    def set_poll_policy_inputs(
+        self, threshold: float, models: tuple[str, ...]
+    ) -> None:
+        self._poll_inputs_override = (threshold, models)
+
+    def clear_poll_policy_inputs(self) -> None:
+        self._poll_inputs_override = None
+
 
 def make_app(fake: FakeSwitcher):
     from claude_swap.tui.app import CswapApp
@@ -831,6 +839,8 @@ class _FakeEngine:
         self.on_event = on_event
         self.dry_run = dry_run
         self.stopped = False
+        self.applied_thresholds: list[float] = []
+        self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -842,6 +852,13 @@ class _FakeEngine:
     def stop(self) -> None:
         self.stopped = True
         self._stop.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        self.settings = dataclasses.replace(self.settings, threshold=threshold)
+        self.applied_thresholds.append(threshold)
+
+    def wake(self) -> None:
+        self.wakes += 1
 
 
 @pytest.fixture
@@ -913,6 +930,96 @@ class TestAutoScreen:
             assert isinstance(app.screen, DashboardScreen)
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
+
+    async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert app.threshold_pct == 90.0  # mount syncs to the file value
+            await pilot.press("right")  # inert outside adjust mode
+            await pilot.pause()
+            assert screen._settings.threshold == 90.0
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 93.0
+            assert app.threshold_pct == 93.0
+            engine = fake_engine.instances[0]
+            assert engine.applied_thresholds == [91.0, 92.0, 93.0]
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "threshold 93% (session)" in summary.render().plain
+            await pilot.press("enter")
+            await pilot.pause()
+            assert engine.wakes == 1  # one forced tick on leaving the mode
+            # the override lives in memory only — nothing was persisted
+            assert not (tmp_path / "settings.json").exists()
+            # a dry↔live restart rebuilds the engine from the adjusted copy
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert fake_engine.instances[1].settings.threshold == 93.0
+            await pilot.press("escape")
+            await settle(pilot)
+            # leaving the screen reverts the tick and unpins poll planning
+            assert app.threshold_pct == 90.0
+            assert fake._poll_inputs_override is None
+
+    async def test_threshold_adjust_escape_exits_mode_not_screen(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            await pilot.press("t")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            # no net change → no forced tick
+            assert fake_engine.instances[0].wakes == 0
+            await pilot.press("escape")
+            await settle(pilot)
+            from claude_swap.tui.dashboard import DashboardScreen
+
+            assert isinstance(app.screen, DashboardScreen)
+
+    async def test_threshold_clamps_and_keeps_meaningful_decimals(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 99.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 99.9  # spec's upper bound
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            # never a lying "100%"
+            assert "threshold 99.9% (session)" in summary.render().plain
+            screen.action_threshold_step(-60.0)
+            await pilot.pause()
+            assert screen._settings.threshold == 50.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

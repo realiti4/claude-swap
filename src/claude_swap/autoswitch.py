@@ -36,7 +36,7 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -94,6 +94,16 @@ def _now_iso() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def pct_label(value: float) -> str:
+    """A percentage for display, as configured: 85.555555 stays itself
+    (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
+    way ``.0f`` renders it. Ten significant digits still absorb IEEE float
+    noise (~15th digit) in computed utilizations (100.0 - headroom).
+    Displayed comparisons must format BOTH sides with this helper — mixing
+    formatters can render an impossible "85.5556% < 85.555555%"."""
+    return f"{value:.10g}"
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +189,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {self.threshold:.0f}%){tail}"
+            f"(switch at {pct_label(self.threshold)}%){tail}"
         )
 
 
@@ -398,6 +408,9 @@ class AutoSwitchEngine:
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
+        # Cuts the current inter-tick sleep short (a session threshold change
+        # from the TUI should show a fresh decision now, not next interval).
+        self._wake = threading.Event()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -652,7 +665,9 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
+        entries, usage, headroom = self._collect_scheduled_usage(
+            current, quarantined, threshold=settings.threshold
+        )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -697,7 +712,12 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="below-threshold",
-                        detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                        # Both sides through pct_label: .0f utilization could
+                        # display an impossible "100% < 99.9%".
+                        detail=(
+                            f"{pct_label(utilization)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -892,7 +912,11 @@ class AutoSwitchEngine:
     # -- adaptive usage scheduling ---------------------------------------------
 
     def _collect_scheduled_usage(
-        self, current: str, quarantined: set[str] = frozenset()
+        self,
+        current: str,
+        quarantined: set[str] = frozenset(),
+        *,
+        threshold: float | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -971,12 +995,15 @@ class AutoSwitchEngine:
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
+        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # decides on the same value even if apply_threshold() lands mid-tick.
+        if threshold is None:
+            threshold = self.settings.threshold
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
-                and 100.0 - active_headroom
-                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
@@ -1137,8 +1164,23 @@ class AutoSwitchEngine:
     # -- loop -------------------------------------------------------------------
 
     def stop(self) -> None:
-        """Ask ``run_loop`` to exit; wakes it from any sleep."""
+        """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
+        before the loop starts — the stop is never cleared, so the loop
+        exits immediately (engines are single-use)."""
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Cut the current inter-tick sleep short and tick now."""
+        self._wake.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        """Session override from the TUI: retarget the trigger and poll
+        cadence mid-run. Threshold only — the model axes (and their derived
+        state) are fixed at construction. The frozen-settings swap is atomic
+        and each tick snapshots ``self.settings`` once, so no locking."""
+        self.settings = replace(self.settings, threshold=threshold)
+        self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
@@ -1162,8 +1204,13 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
-        self._stop.clear()
-        while not self._stop.is_set():
+        while True:
+            # Clear at the top, not after the wait: a wake() racing a wait
+            # timeout is then never lost — the tick right after this clear
+            # already sees whatever settings that wake announced.
+            self._wake.clear()
+            if self._stop.is_set():
+                return 0
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
@@ -1182,5 +1229,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._stop.wait(delay)
-        return 0
+            self._wake.wait(delay)

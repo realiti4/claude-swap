@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    pct_label,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
@@ -1244,7 +1246,7 @@ class TestRunLoop:
             return TickOutcome.NO_ACTION
 
         with patch.object(harness.engine, "tick", side_effect=fake_tick), \
-             patch.object(harness.engine._stop, "wait", return_value=None):
+             patch.object(harness.engine._wake, "wait", return_value=None):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
 
@@ -1260,10 +1262,43 @@ class TestRunLoop:
 
         with patch.object(
             harness.engine, "_tick_inner", side_effect=raising_inner
-        ), patch.object(harness.engine._stop, "wait", return_value=None):
+        ), patch.object(harness.engine._wake, "wait", return_value=None):
             harness.engine.run_loop()
         assert len(calls) == 2
         assert any(isinstance(e, ErrorEvent) for e in harness.events)
+
+    def test_stop_before_start_is_not_lost(self, harness):
+        # A stop() issued before the worker thread enters run_loop must not
+        # be cleared away: the loop exits without a single tick.
+        harness.engine.stop()
+        with patch.object(harness.engine, "tick") as tick:
+            assert harness.engine.run_loop() == 0
+        tick.assert_not_called()
+
+    def test_wake_during_tick_cuts_the_following_sleep_short(self, harness):
+        # No wait patching on purpose: if the clear-at-top ordering were
+        # wrong (wake cleared after the wait), the wake fired during tick 1
+        # would be lost and the loop would block on the real 60s sleep —
+        # caught by the join timeout instead of hanging the suite.
+        ticks: list[int] = []
+
+        def fake_tick():
+            ticks.append(1)
+            if len(ticks) == 1:
+                harness.engine.wake()  # e.g. apply_threshold landed mid-tick
+            else:
+                harness.engine.stop()
+            return TickOutcome.NO_ACTION
+
+        with patch.object(harness.engine, "tick", side_effect=fake_tick):
+            worker = threading.Thread(target=harness.engine.run_loop)
+            worker.start()
+            worker.join(timeout=10)
+            finished = not worker.is_alive()
+            harness.engine.stop()  # unblock a failing loop before asserting
+            worker.join(timeout=5)
+        assert finished
+        assert len(ticks) == 2
 
     def test_blocked_with_reset_sleeps_until_reset(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 1800
@@ -1288,6 +1323,98 @@ class TestRunLoop:
     def test_sleep_cap(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 50 * 3600
         assert harness.engine._next_delay(TickOutcome.BLOCKED) == 6 * 3600
+
+
+class TestSessionThreshold:
+    """apply_threshold(): the TUI's session-only, mid-run override."""
+
+    def test_apply_threshold_retargets_trigger_and_poll_pin(self, harness):
+        harness.engine.apply_threshold(72.0)
+        assert harness.engine.settings.threshold == 72.0
+        # Poll-cadence planning follows the new value immediately.
+        assert harness.switcher._poll_inputs_override == (72.0, ())
+        # And the very next tick decides with it: 80% ≥ 72 switches, where
+        # the constructed 90 would not have.
+        outcome = harness.tick_with_usage({
+            "1": _usage(80), "2": _usage(10), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_clear_poll_policy_inputs_unpins(self, harness):
+        harness.engine.apply_threshold(72.0)
+        harness.switcher.clear_poll_policy_inputs()
+        assert harness.switcher._poll_inputs_override is None
+
+    def _collect_fetch_sets(self, harness, threshold: float) -> list:
+        entries = {
+            n: _entry_for(_usage(80.0 if n == "1" else 10.0), harness.clock.now)
+            for n in ("1", "2", "3")
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ) as collect:
+            harness.engine._collect_scheduled_usage("1", threshold=threshold)
+        return [c.kwargs.get("fetch") for c in collect.call_args_list]
+
+    def test_collect_escalates_on_the_tick_snapshot_threshold(self, harness):
+        # Escalation must key on the threshold captured by the tick, not a
+        # re-read of self.settings (engine settings stay at 90 throughout).
+        # Active at 80%: within ESCALATION_MARGIN_PCT of 90 → full refresh...
+        assert {"1", "2", "3"} in self._collect_fetch_sets(harness, 90.0)
+        # ...but not of 99.9 → baseline fetching only.
+        assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
+
+
+class TestPctLabel:
+    def test_whole_numbers_drop_the_decimal(self):
+        assert pct_label(90.0) == "90"
+
+    def test_fractional_threshold_keeps_one_decimal(self):
+        # .0f would render the valid maximum 99.9 as a lying "100".
+        assert pct_label(99.9) == "99.9"
+
+    def test_configured_precision_is_preserved(self):
+        # settings.json accepts arbitrary floats; display must not round.
+        assert pct_label(85.55) == "85.55"
+        assert pct_label(85.555555) == "85.555555"
+
+    def test_float_noise_is_absorbed(self):
+        assert pct_label(100.0 - 37.4) == "62.6"
+        assert pct_label(99.85000000000001) == "99.85"
+
+    def test_poll_event_shows_fractional_threshold(self):
+        poll = PollEvent(
+            active={"number": 1, "email": "a@example.com"},
+            headroom={"1": 40.0},
+            threshold=99.9,
+        )
+        assert "switch at 99.9%" in poll.human()
+
+    def test_below_threshold_detail_shows_fractional_threshold(self, temp_home):
+        h = EngineHarness(temp_home, threshold=99.9)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10)})
+        details = [
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        assert details == ["50% < 99.9%"]
+
+    def test_below_threshold_detail_never_shows_impossible_comparison(
+        self, temp_home
+    ):
+        # utilization 99.85 with threshold 99.9: .0f on the left side used
+        # to render the logically impossible "100% < 99.9%".
+        h = EngineHarness(temp_home, threshold=99.9)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage(99.85), "2": _usage(10)})
+        details = [
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        assert details == ["99.85% < 99.9%"]
 
 
 class TestTokenIdentity:
