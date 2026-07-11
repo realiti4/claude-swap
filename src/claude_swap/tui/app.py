@@ -15,7 +15,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import load_settings, load_tui_settings
+from claude_swap.settings import load_settings, load_tui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
@@ -55,6 +55,10 @@ class CswapApp(App):
         self._full_next = False
         self._refreshing = False
         self._last_refresh_error = ""
+        # Set once startup assigns the initial theme (override or persisted);
+        # guards watch_theme against persisting that assignment itself, and
+        # against ever persisting a --theme override (session-only).
+        self._theme_persistable = False
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -72,12 +76,29 @@ class CswapApp(App):
         except Exception:
             persisted = DEFAULT_THEME
         self.theme = self._theme_override or persisted
+        # Only a theme picked *after* startup (command palette / future UI)
+        # should be saved — not this initial assignment, and never a
+        # --theme override, which is documented as session-only.
+        self._theme_persistable = self._theme_override is None
         self.push_screen(DashboardScreen())
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self._tick()
+
+    def watch_theme(self, old_theme: str, new_theme: str) -> None:
+        """Persist a theme picked via the command palette (or future UI).
+
+        Best-effort like the other settings writes here: a failure to save
+        shouldn't crash the session over a cosmetic preference.
+        """
+        if not self._theme_persistable or new_theme == old_theme:
+            return
+        try:
+            set_setting(self.switcher.backup_dir, "tui.theme", new_theme)
+        except Exception:
+            pass
 
     # -- snapshot poll loop ---------------------------------------------------
 

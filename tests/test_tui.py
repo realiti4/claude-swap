@@ -663,6 +663,30 @@ class TestDashboard:
 
         assert CswapApp.ENABLE_COMMAND_PALETTE is True
 
+    async def test_theme_pick_is_persisted(self, tmp_path):
+        from claude_swap.settings import load_tui_settings
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert load_tui_settings(tmp_path).theme == "cswap-dark"
+            app.theme = "catppuccin-mocha"
+            await pilot.pause()
+            assert load_tui_settings(tmp_path).theme == "catppuccin-mocha"
+
+    async def test_theme_override_is_not_persisted(self, tmp_path):
+        from claude_swap.settings import load_tui_settings, set_setting
+        from claude_swap.tui.app import CswapApp
+
+        set_setting(tmp_path, "tui.theme", "catppuccin-frappe")
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = CswapApp(fake, theme="catppuccin-latte")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.theme == "catppuccin-latte"
+            assert load_tui_settings(tmp_path).theme == "catppuccin-frappe"
+
 
 @pytest.mark.asyncio
 class TestWatchScreen:
