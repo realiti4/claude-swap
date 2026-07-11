@@ -15,13 +15,13 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import load_settings
+from claude_swap.settings import load_settings, load_tui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
-from claude_swap.tui.theme import CSWAP_DARK
+from claude_swap.tui.theme import DEFAULT_THEME, THEMES
 
 
 class CswapApp(App):
@@ -29,10 +29,10 @@ class CswapApp(App):
 
     TITLE = "claude-swap"
     CSS_PATH = "cswap.tcss"
-    # No command palette: actions live in the dashboard's nested menu, in
-    # their own context — not in a global searchable list. This also drops
-    # Textual's system commands (theme picker included; there is one theme).
-    ENABLE_COMMAND_PALETTE = False
+    # Textual's command palette auto-gains a "Change theme" command once more
+    # than one theme is registered — the free interactive picker for
+    # cycling between cswap-dark and the bundled Catppuccin flavors.
+    ENABLE_COMMAND_PALETTE = True
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
 
@@ -40,11 +40,16 @@ class CswapApp(App):
     busy: reactive[bool] = reactive(False)
 
     def __init__(
-        self, switcher: ClaudeAccountSwitcher, *, start: str = "dashboard"
+        self,
+        switcher: ClaudeAccountSwitcher,
+        *,
+        start: str = "dashboard",
+        theme: str | None = None,
     ) -> None:
         super().__init__()
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
+        self._theme_override = theme  # `--theme`, wins over the persisted setting
         self.source = SnapshotSource(switcher)
         self._store_only = False
         self._full_next = False
@@ -60,8 +65,13 @@ class CswapApp(App):
             self.threshold_pct = None
 
     def on_mount(self) -> None:
-        self.register_theme(CSWAP_DARK)
-        self.theme = "cswap-dark"
+        for registered in THEMES.values():
+            self.register_theme(registered)
+        try:
+            persisted = load_tui_settings(self.switcher.backup_dir).theme
+        except Exception:
+            persisted = DEFAULT_THEME
+        self.theme = self._theme_override or persisted
         self.push_screen(DashboardScreen())
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.

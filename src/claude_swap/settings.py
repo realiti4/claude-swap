@@ -1,9 +1,9 @@
 """Tool settings persisted at ``<backup_root>/settings.json``.
 
 One versioned JSON file for user-tunable claude-swap preferences, written
-atomically with the backup dir's 0600/0700 modes. v1 carries only the
-``autoswitch`` section; other sections can be added additively. Unknown keys
-(future fields, other tools' experiments) survive a round trip.
+atomically with the backup dir's 0600/0700 modes. v1 carried only the
+``autoswitch`` section; ``tui`` was added additively alongside it. Unknown
+keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
+from claude_swap.palette import DEFAULT_THEME, THEME_NAMES as TUI_THEME_CHOICES
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -59,6 +60,30 @@ class AutoSwitchSettings:
 
 
 @dataclass(frozen=True)
+class TuiSettings:
+    """Persisted TUI display preference.
+
+    ``theme`` names one of the themes in ``claude_swap.palette.THEME_NAMES``
+    (also the ``TUI_THEME_CHOICES`` re-export below). Themes live in the
+    dependency-free ``palette`` module rather than ``tui.theme`` (which pulls
+    in textual) so loading this section stays as cheap as ``autoswitch``'s
+    for CLI paths that never touch the TUI — ``tui/__init__.py`` defers all
+    textual/rich imports to :func:`tui.run` for exactly this reason.
+    """
+
+    theme: str = DEFAULT_THEME
+
+
+# Which dataclass (and its field defaults) a SETTING_SPECS section belongs
+# to. Populated once both dataclasses exist; extend this when adding a
+# section for a new dataclass.
+_SECTION_DEFAULTS: dict[str, type] = {
+    "autoswitch": AutoSwitchSettings,
+    "tui": TuiSettings,
+}
+
+
+@dataclass(frozen=True)
 class SettingSpec:
     """Metadata for one user-tunable settings.json key.
 
@@ -67,9 +92,9 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch")
+    section: str  # top-level JSON section ("autoswitch", "tui")
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
+    field: str  # snake_case field on the section's settings dataclass
     kind: str  # "float" | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
@@ -82,7 +107,7 @@ class SettingSpec:
 
     @property
     def default(self):
-        return getattr(AutoSwitchSettings(), self.field)
+        return getattr(_SECTION_DEFAULTS[self.section](), self.field)
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -122,12 +147,25 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
+        SettingSpec(
+            "tui", "theme", "theme", "choice", choices=TUI_THEME_CHOICES,
+            help="Textual theme for the TUI dashboard/watch view",
+        ),
     )
 }
 
-_AUTOSWITCH_KEYS: dict[str, str] = {
-    spec.field: spec.json_key for spec in SETTING_SPECS.values()
-}
+
+def _section_keys(section: str) -> dict[str, str]:
+    """field -> json_key for the specs belonging to one section."""
+    return {
+        spec.field: spec.json_key
+        for spec in SETTING_SPECS.values()
+        if spec.section == section
+    }
+
+
+_AUTOSWITCH_KEYS: dict[str, str] = _section_keys("autoswitch")
+_TUI_KEYS: dict[str, str] = _section_keys("tui")
 
 
 def settings_path(backup_root: Path) -> Path:
@@ -148,16 +186,25 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped(settings):
+    """Clamp values into the SETTING_SPECS ranges; bad types → the default.
+
+    Only consults specs for ``settings``'s own section, so this works for any
+    of the section dataclasses (``AutoSwitchSettings``, ``TuiSettings``, ...).
+    """
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return default
         return float(min(max(value, lo), hi))
 
+    section = next(
+        name for name, cls in _SECTION_DEFAULTS.items() if cls is type(settings)
+    )
     kwargs = {}
     for spec in SETTING_SPECS.values():
+        if spec.section != section:
+            continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
@@ -176,7 +223,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
 
 
 def _read_raw(path: Path) -> dict:
@@ -193,21 +240,31 @@ def _read_raw(path: Path) -> dict:
     return raw
 
 
-def load_settings(backup_root: Path) -> AutoSwitchSettings:
-    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
+def _load_section(backup_root: Path, section_name: str, cls: type, keys: dict[str, str]):
+    """Load one settings.json section into ``cls``; missing/corrupt → defaults."""
     raw = _read_raw(settings_path(backup_root))
-    section = raw.get("autoswitch")
+    section = raw.get(section_name)
     if not isinstance(section, dict):
-        return AutoSwitchSettings()
+        return cls()
     kwargs = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
+    for field, json_key in keys.items():
         if json_key in section:
             kwargs[field] = section[json_key]
     try:
-        settings = AutoSwitchSettings(**kwargs)
+        settings = cls(**kwargs)
     except TypeError:
-        settings = AutoSwitchSettings()
+        settings = cls()
     return _clamped(settings)
+
+
+def load_settings(backup_root: Path) -> AutoSwitchSettings:
+    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
+    return _load_section(backup_root, "autoswitch", AutoSwitchSettings, _AUTOSWITCH_KEYS)
+
+
+def load_tui_settings(backup_root: Path) -> TuiSettings:
+    """Load the tui section; missing/corrupt file or fields → defaults."""
+    return _load_section(backup_root, "tui", TuiSettings, _TUI_KEYS)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -363,6 +420,14 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     return True
 
 
+# Section name -> loader, so effective_settings() can show every section's
+# keys (not just autoswitch's) in one `cswap config list`.
+_SECTION_LOADERS = {
+    "autoswitch": load_settings,
+    "tui": load_tui_settings,
+}
+
+
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:
     """(spec, effective value, explicitly set?) per key, in registry order.
 
@@ -371,11 +436,14 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     reflects the file, not value equality.
     """
     raw = _read_raw(settings_path(backup_root))
-    effective = load_settings(backup_root)
+    effective_by_section = {
+        name: loader(backup_root) for name, loader in _SECTION_LOADERS.items()
+    }
     rows = []
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
+        effective = effective_by_section[spec.section]
         rows.append((spec, getattr(effective, spec.field), is_set))
     return rows
 

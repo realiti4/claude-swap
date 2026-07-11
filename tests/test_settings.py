@@ -14,6 +14,7 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
+    TuiSettings,
     effective_settings,
     load_settings,
     merged_with_cli,
@@ -22,6 +23,8 @@ from claude_swap.settings import (
     settings_path,
     unset_setting,
 )
+
+_SECTION_DATACLASSES = {"autoswitch": AutoSwitchSettings, "tui": TuiSettings}
 
 
 def _args(**kwargs) -> argparse.Namespace:
@@ -112,16 +115,20 @@ class TestSaveSettings:
 
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
-        spec_fields = {spec.field for spec in SETTING_SPECS.values()}
-        dataclass_fields = {
-            f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
-        }
-        assert spec_fields == dataclass_fields
+        for section, cls in _SECTION_DATACLASSES.items():
+            spec_fields = {
+                spec.field for spec in SETTING_SPECS.values() if spec.section == section
+            }
+            dataclass_fields = {f.name for f in cls.__dataclass_fields__.values()}
+            assert spec_fields == dataclass_fields
 
     def test_defaults_match_dataclass(self):
-        defaults = AutoSwitchSettings()
-        for spec in SETTING_SPECS.values():
-            assert spec.default == getattr(defaults, spec.field)
+        for section, cls in _SECTION_DATACLASSES.items():
+            defaults = cls()
+            for spec in SETTING_SPECS.values():
+                if spec.section != section:
+                    continue
+                assert spec.default == getattr(defaults, spec.field)
 
 
 class TestSetUnsetSetting:

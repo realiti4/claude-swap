@@ -129,6 +129,8 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
+Open the command palette (`ctrl+p`) and run "Change theme" to pick between `cswap-dark` (default) and the four Catppuccin flavors (Latte, Frappé, Macchiato, Mocha) — the choice persists via `cswap config set tui.theme <name>`, or override it for one session with `cswap tui --theme <name>` / `cswap watch --theme <name>`. The CLI's own accent color follows whichever theme is set.
+
 
 ### Refresh expired tokens
 
@@ -213,6 +215,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set tui.theme catppuccin-mocha  # persisted TUI theme; also sets the CLI's accent
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

@@ -13,16 +13,52 @@ import sys
 import time
 from pathlib import Path
 
+from claude_swap.palette import DEFAULT_THEME, theme_colors
+
 # ANSI escape codes
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
 _RED = "\033[31m"
 _YELLOW = "\033[33m"
-_ACCENT = "\033[38;5;173m"  # Warm salmon/terracotta
 _MUTED = "\033[38;5;250m"  # Soft gray -- readable, but quieter than normal
 
 _colors_enabled: bool | None = None  # lazy-initialized
+_accent_escape: str | None = None  # lazy-initialized
+
+
+def _truecolor(hex_color: str) -> str:
+    """24-bit truecolor foreground escape for a ``#rrggbb`` string.
+
+    Unlike the old fixed 256-color index, the resolved theme's accent can be
+    any hex value (the Catppuccin flavors aren't xterm-palette colors), so
+    this needs the full RGB escape. Safe for the target terminal (kitty).
+    """
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def _resolve_accent() -> str:
+    """The CLI accent color, following the persisted ``tui.theme`` setting.
+
+    Resolved independent of any ``--theme`` CLI override — that flag only
+    exists on `tui`/`watch`, and printer.py is used by plain commands
+    (`list`, `status`, `auto`, ...) that never see it. Best-effort: any
+    failure to read settings.json (including no backup root yet) falls back
+    to cswap-dark's own terracotta, matching the tool's long-standing
+    default CLI color.
+    """
+    global _accent_escape
+    if _accent_escape is None:
+        try:
+            from claude_swap.paths import get_backup_root
+            from claude_swap.settings import load_tui_settings
+
+            theme_name = load_tui_settings(get_backup_root()).theme
+        except Exception:
+            theme_name = DEFAULT_THEME
+        _accent_escape = _truecolor(theme_colors(theme_name).accent)
+    return _accent_escape
 
 
 def _enable_windows_vt() -> bool:
@@ -115,7 +151,7 @@ def _style(text: str, *codes: str) -> str:
 
 def accent(text: str) -> str:
     """Warm accent color for important elements."""
-    return _style(text, _ACCENT)
+    return _style(text, _resolve_accent())
 
 
 def muted(text: str) -> str:
@@ -135,7 +171,7 @@ def bolded(text: str) -> str:
 
 def bold_accent(text: str) -> str:
     """Bold + accent for key markers like (active)."""
-    return _style(text, _BOLD, _ACCENT)
+    return _style(text, _BOLD, _resolve_accent())
 
 
 def yellowed(text: str) -> str:

@@ -11,6 +11,7 @@ from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import dimmed, error, force_utf8_output, muted
+from claude_swap.settings import TUI_THEME_CHOICES
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -626,6 +627,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--theme",
+        choices=TUI_THEME_CHOICES,
+        help=(
+            "With 'tui'/'watch': theme for this session only, overriding the "
+            "persisted tui.theme setting"
+        ),
+    )
+    parser.add_argument(
         "--slot",
         type=int,
         metavar="NUM",
@@ -788,6 +797,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "'switch --strategy next-available'"
         )
 
+    if args.theme is not None and not (args.tui or args.watch):
+        parser.error("--theme can only be used with 'tui' or 'watch'")
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -886,11 +898,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(switcher, theme=args.theme))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher, start="watch"))
+            sys.exit(tui_run(switcher, start="watch", theme=args.theme))
         elif args.menubar:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")

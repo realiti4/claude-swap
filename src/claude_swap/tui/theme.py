@@ -1,67 +1,86 @@
-"""The "cswap-dark" Textual theme and shared color constants.
+"""Textual themes for claude-swap, built from ``claude_swap.palette``.
 
-A subtle modern dark theme: neutral charcoal backgrounds in the VS Code
-register, one warm terracotta accent (the same xterm-173 tone printer.py has
-always used for the CLI — a deliberate nod to Claude Code's orange, used
-sparingly), and desaturated severity colors so usage bars read calmly on a
-dark background. Deliberately *not* a wholesale copy of any other tool's
-palette.
+Textual's ``Theme``/``register_theme`` mechanism only covers its own design
+tokens ($accent, $foreground, ...) consumed by CSS. widgets.py and
+autoview.py render usage bars, account rows, and severity markers with Rich
+``Text.append(style=...)`` calls that bypass CSS entirely, so they need their
+own resolution: ``current_theme_colors()`` reads whichever theme is active on
+the running app and returns the matching ``palette.ThemeColors``, falling
+back to cswap-dark's colors outside a running app (e.g. unit tests calling
+these render functions directly) or for an unregistered theme name.
 """
 
 from __future__ import annotations
 
+from textual.app import active_app
 from textual.theme import Theme
 
-# Core palette (single source of truth — widgets import these for rich
-# renderables, the Theme below maps them onto Textual's design tokens).
-ACCENT = "#d7875f"  # warm terracotta, xterm 173 — matches printer._ACCENT
-FOREGROUND = "#e8e4de"  # soft, slightly warm off-white
-MUTED = "#8a8a8a"  # secondary text
-BACKGROUND = "#141414"
-SURFACE = "#1e1e1e"
-PANEL = "#262626"
+from claude_swap.palette import (
+    CRIT_PCT,
+    DEFAULT_THEME,
+    THEME_COLORS,
+    WARN_PCT,
+    ThemeColors,
+    theme_colors,
+)
 
-# Usage severity ramp (desaturated for dark backgrounds).
-SEV_OK = "#87af87"  # calm green: plenty of headroom
-SEV_WARN = "#d7af5f"  # amber: climbing (>= 70%)
-SEV_CRIT = "#d75f5f"  # soft red: near the limit (>= 90%)
-TRACK = "#3a3a3a"  # unfilled bar track
 
-# Severity band edges. WARN mirrors where a user starts caring; CRIT mirrors
-# the auto-switch default threshold so bar color and switch behavior agree.
-WARN_PCT = 70.0
-CRIT_PCT = 90.0
+def _textual_theme(name: str, colors: ThemeColors) -> Theme:
+    return Theme(
+        name=name,
+        primary=colors.accent,
+        secondary=colors.muted,
+        accent=colors.accent,
+        foreground=colors.foreground,
+        background=colors.background,
+        surface=colors.surface,
+        panel=colors.panel,
+        success=colors.sev_ok,
+        warning=colors.sev_warn,
+        error=colors.sev_crit,
+        dark=colors.dark,
+        variables={
+            # Footer keys pick up the accent instead of the default blue.
+            "footer-key-foreground": colors.accent,
+            "block-cursor-background": colors.panel,
+            "block-cursor-foreground": colors.foreground,
+            "block-cursor-text-style": "none",
+        },
+    )
+
+
+# Registry consulted by app.py (register_theme + the command palette's theme
+# picker). THEME_NAMES/DEFAULT_THEME/theme_colors are re-exported from
+# palette.py so callers only need one import.
+THEMES: dict[str, Theme] = {
+    name: _textual_theme(name, colors) for name, colors in THEME_COLORS.items()
+}
+THEME_NAMES: tuple[str, ...] = tuple(THEMES)
+
+CSWAP_DARK = THEMES["cswap-dark"]
+
+
+def current_theme_colors() -> ThemeColors:
+    """``ThemeColors`` for the currently running app's active theme.
+
+    Outside a running app (e.g. a unit test calling a widgets.py/autoview.py
+    render function directly) there is no active theme, so this falls back
+    to cswap-dark's colors — the same as today's fixed behavior.
+    """
+    app = active_app.get(None)
+    if app is None:
+        return theme_colors(DEFAULT_THEME)
+    return theme_colors(app.theme)
 
 
 def severity_color(pct: float | None) -> str:
-    """Bar/percentage color for a utilization percentage."""
+    """Bar/percentage color for a utilization percentage, in the currently
+    active theme."""
+    colors = current_theme_colors()
     if pct is None:
-        return MUTED
+        return colors.muted
     if pct >= CRIT_PCT:
-        return SEV_CRIT
+        return colors.sev_crit
     if pct >= WARN_PCT:
-        return SEV_WARN
-    return SEV_OK
-
-
-CSWAP_DARK = Theme(
-    name="cswap-dark",
-    primary=ACCENT,
-    secondary=MUTED,
-    accent=ACCENT,
-    foreground=FOREGROUND,
-    background=BACKGROUND,
-    surface=SURFACE,
-    panel=PANEL,
-    success=SEV_OK,
-    warning=SEV_WARN,
-    error=SEV_CRIT,
-    dark=True,
-    variables={
-        # Footer keys pick up the accent instead of the default blue.
-        "footer-key-foreground": ACCENT,
-        "block-cursor-background": PANEL,
-        "block-cursor-foreground": FOREGROUND,
-        "block-cursor-text-style": "none",
-    },
-)
+        return colors.sev_warn
+    return colors.sev_ok

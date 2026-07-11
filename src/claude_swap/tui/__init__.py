@@ -14,14 +14,20 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
-def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
+def run(
+    switcher: "ClaudeAccountSwitcher",
+    start: str = "dashboard",
+    *,
+    theme: str | None = None,
+) -> int:
     """Run the TUI over an existing switcher. Returns the process exit code.
 
     ``start="watch"`` (the ``cswap watch`` command) opens directly on the
-    live watch page, stacked over the dashboard.
+    live watch page, stacked over the dashboard. ``theme``, from ``--theme``,
+    overrides the persisted ``tui.theme`` setting for this session only.
     """
     from claude_swap.tui.app import CswapApp
 
-    app = CswapApp(switcher, start=start)
+    app = CswapApp(switcher, start=start, theme=theme)
     app.run()
     return app.return_code or 0

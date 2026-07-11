@@ -18,15 +18,7 @@ from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
-from claude_swap.tui.theme import (
-    ACCENT,
-    FOREGROUND,
-    MUTED,
-    SEV_CRIT,
-    SEV_WARN,
-    TRACK,
-    severity_color,
-)
+from claude_swap.tui.theme import current_theme_colors, severity_color
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -45,9 +37,10 @@ def bar_cells(
     threshold: float | None = None,
 ) -> Text:
     """Just the bar glyphs: severity-colored fill, track, optional tick."""
+    colors = current_theme_colors()
     text = Text()
     if pct is None:
-        text.append(_BAR_EMPTY * width, style=TRACK)
+        text.append(_BAR_EMPTY * width, style=colors.track)
         return text
     frac = min(max(pct, 0.0), 100.0) / 100.0
     cells = frac * width
@@ -60,13 +53,13 @@ def bar_cells(
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
         if tick_at is not None and i == tick_at:
-            text.append(_BAR_TICK, style=SEV_WARN)
+            text.append(_BAR_TICK, style=colors.sev_warn)
         elif i < full:
             text.append(_BAR_FILLED, style=fill_style)
         elif i == full and half:
             text.append(_BAR_HALF, style=fill_style)
         else:
-            text.append(_BAR_EMPTY, style=TRACK)
+            text.append(_BAR_EMPTY, style=colors.track)
     return text
 
 
@@ -80,16 +73,17 @@ def usage_bar(
     threshold: float | None = None,
 ) -> Text:
     """One full bar line: ``5h ━━━━╸────┃──  47%  resets 2h 13m``."""
+    colors = current_theme_colors()
     text = Text()
-    text.append(f"{label} ", style=MUTED)
+    text.append(f"{label} ", style=colors.muted)
     text.append(bar_cells(pct, width, stale=stale, threshold=threshold))
     if pct is None:
-        text.append("  usage unknown", style=MUTED)
+        text.append("  usage unknown", style=colors.muted)
     else:
         color = severity_color(pct)
         text.append(f" {pct:3.0f}%", style=f"{color} dim" if stale else color)
     if suffix:
-        text.append(f"  {suffix}", style=MUTED)
+        text.append(f"  {suffix}", style=colors.muted)
     return text
 
 
@@ -133,21 +127,22 @@ def account_card_text(
 ) -> Text:
     """The full account card: header line + per-window bar rows."""
     now = now if now is not None else time.time()
+    colors = current_theme_colors()
 
     text = Text()
-    text.append(f"{acc.number:>2}  ", style=f"bold {FOREGROUND}")
-    text.append(acc.email, style=FOREGROUND)
-    text.append(f"  [{acc.display_tag}]", style=MUTED)
+    text.append(f"{acc.number:>2}  ", style=f"bold {colors.foreground}")
+    text.append(acc.email, style=colors.foreground)
+    text.append(f"  [{acc.display_tag}]", style=colors.muted)
     if acc.is_active:
-        text.append("   ● active", style=f"bold {ACCENT}")
+        text.append("   ● active", style=f"bold {colors.accent}")
     age = data.format_age(acc.usage.age_s)
     if age:
-        text.append(f"   {age}", style=MUTED)
+        text.append(f"   {age}", style=colors.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
-        style = MUTED if sentinel == USAGE_API_KEY else SEV_WARN
+        style = colors.muted if sentinel == USAGE_API_KEY else colors.sev_warn
         marker = "·" if sentinel == USAGE_API_KEY else "⚠"
         text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
         # Same supplementary line `cswap list` prints: the last good
@@ -157,15 +152,15 @@ def account_card_text(
             last_seen = data.last_seen_note(acc.usage)
             if last_seen is not None:
                 text.append("\n    ")
-                text.append(f"└ {last_seen}", style=MUTED)
+                text.append(f"└ {last_seen}", style=colors.muted)
         return text
 
     rows = usage_rows(acc.usage.last_good, now)
     if not rows:
         text.append("\n    ")
-        text.append("usage unavailable", style=MUTED)
+        text.append("usage unavailable", style=colors.muted)
         if acc.usage.last_error:
-            text.append(f" · {acc.usage.last_error}", style=MUTED)
+            text.append(f" · {acc.usage.last_error}", style=colors.muted)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
@@ -194,15 +189,16 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
     maxed per-model window shows as ``Fable (!)``. Sentinel states show
     their label instead.
     """
+    colors = current_theme_colors()
     text = Text(no_wrap=True, overflow="ellipsis")
-    text.append(f"{acc.number:>2}  ", style=f"bold {MUTED}")
-    text.append(acc.email, style=FOREGROUND)
-    text.append(f"  [{acc.display_tag}]", style=MUTED)
+    text.append(f"{acc.number:>2}  ", style=f"bold {colors.muted}")
+    text.append(acc.email, style=colors.foreground)
+    text.append(f"  [{acc.display_tag}]", style=colors.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
-        style = MUTED if sentinel == USAGE_API_KEY else SEV_WARN
+        style = colors.muted if sentinel == USAGE_API_KEY else colors.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
         return text
 
@@ -215,14 +211,14 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
             continue
         pct = float(window["pct"])
         if parts:
-            text.append(" · ", style=TRACK)
+            text.append(" · ", style=colors.track)
         color = severity_color(pct)
-        text.append(f"{label} ", style=MUTED)
+        text.append(f"{label} ", style=colors.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         if pct >= 100:
             reset = data.reset_text(window, now)
             if reset:
-                text.append(f" ({reset})", style=MUTED)
+                text.append(f" ({reset})", style=colors.muted)
         parts += 1
     maxed = [
         w["name"]
@@ -231,11 +227,11 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
     ]
     for name in maxed:
         if parts:
-            text.append(" · ", style=TRACK)
-        text.append(f"{name} (!)", style=SEV_CRIT)
+            text.append(" · ", style=colors.track)
+        text.append(f"{name} (!)", style=colors.sev_crit)
         parts += 1
     if not parts:
-        text.append("usage unknown", style=MUTED)
+        text.append("usage unknown", style=colors.muted)
     return text
 
 
@@ -253,15 +249,16 @@ class AccountsPanel(Static):
 
     def render(self) -> Text:
         app: "CswapApp" = self.app  # type: ignore[assignment]
+        colors = current_theme_colors()
         snap = app.snapshot
         if snap is None:
-            return Text("loading…", style=MUTED)
+            return Text("loading…", style=colors.muted)
         if not snap.accounts:
             return Text(
                 "No managed accounts yet.\n"
                 "Use the menu below: Add account — from your current "
                 "Claude Code login, or from a setup-token / API key.",
-                style=MUTED,
+                style=colors.muted,
             )
         now = time.time()
         width = (self.size.width or 80) - 2
@@ -276,7 +273,7 @@ class AccountsPanel(Static):
             elif self._show_minis:
                 blocks.append(mini_account_text(acc, now))
         if not blocks:
-            return Text("no active managed login", style=MUTED)
+            return Text("no active managed login", style=colors.muted)
         text = Text()
         previous_multiline = False
         for i, block in enumerate(blocks):
@@ -325,6 +322,7 @@ class MenuItem(ListItem):
     """One menu row: a label plus an action id the screen dispatches on."""
 
     def __init__(self, label: str, action_id: str, *, muted: bool = False) -> None:
-        style = MUTED if muted else FOREGROUND
+        colors = current_theme_colors()
+        style = colors.muted if muted else colors.foreground
         super().__init__(Static(Text(label, style=style)))
         self.action_id = action_id

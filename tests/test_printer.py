@@ -12,10 +12,12 @@ from claude_swap import printer
 
 @pytest.fixture(autouse=True)
 def _reset_color_cache():
-    """Reset the color detection cache before each test."""
+    """Reset the color detection/accent caches before each test."""
     printer._colors_enabled = None
+    printer._accent_escape = None
     yield
     printer._colors_enabled = None
+    printer._accent_escape = None
 
 
 class TestColorDetection:
@@ -76,7 +78,7 @@ class TestStyling:
         monkeypatch.setenv("FORCE_COLOR", "1")
         result = printer.accent("hello")
         assert "hello" in result
-        assert "\033[38;5;173m" in result
+        assert "\033[38;2;215;135;95m" in result
         assert "\033[0m" in result
 
     def test_muted_with_colors_enabled(self, monkeypatch):
@@ -105,7 +107,7 @@ class TestStyling:
         monkeypatch.setenv("FORCE_COLOR", "1")
         result = printer.bold_accent("(active)")
         assert "\033[1m" in result
-        assert "\033[38;5;173m" in result
+        assert "\033[38;2;215;135;95m" in result
         assert "(active)" in result
 
 
@@ -147,7 +149,7 @@ def test_force_color_overrides_and_restores():
         printer._colors_enabled = False
         with printer.force_color():
             assert printer.colors_enabled() is True
-            assert printer.accent("X") == "\x1b[38;5;173mX\x1b[0m"
+            assert printer.accent("X") == "\x1b[38;2;215;135;95mX\x1b[0m"
         assert printer._colors_enabled is False
     finally:
         printer._colors_enabled = saved

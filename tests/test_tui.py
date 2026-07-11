@@ -658,10 +658,10 @@ class TestDashboard:
             panel = app.screen.query_one(AccountsPanel).render().plain
             assert "No managed accounts yet" in panel
 
-    async def test_palette_is_disabled(self, tmp_path):
+    async def test_palette_is_enabled(self, tmp_path):
         from claude_swap.tui.app import CswapApp
 
-        assert CswapApp.ENABLE_COMMAND_PALETTE is False
+        assert CswapApp.ENABLE_COMMAND_PALETTE is True
 
 
 @pytest.mark.asyncio
@@ -967,7 +967,7 @@ class TestBareInvocation:
 
         launched = {}
 
-        def fake_run(switcher):
+        def fake_run(switcher, start="dashboard", *, theme=None):
             launched["switcher"] = switcher
             return 0
 
@@ -996,7 +996,7 @@ class TestBareInvocation:
 
         launched = {}
 
-        def fake_run(switcher, start="dashboard"):
+        def fake_run(switcher, start="dashboard", *, theme=None):
             launched["start"] = start
             return 0
 
