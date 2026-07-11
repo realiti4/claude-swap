@@ -371,11 +371,11 @@ def _log_usage_failure(
     question without a second ask)."""
     where = f" {context}" if context else ""
     cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
-    if kind == "http-429" and retry_after_s:
-        # The burst rule needs ~5 rapid requests on one account to trip; cswap
-        # sends at most one per account per pass, so state the verified fact
-        # and let the user look for the real poller.
-        cause += " (burst block — cswap's own polling cannot trigger this)"
+    if kind == "http-429":
+        # The endpoint budgets requests per access token (see poll_policy):
+        # cumulative polling across cswap surfaces can drain it, and backoff
+        # plus the adaptive cadence are the recovery.
+        cause += " (per-token usage budget drained; backing off)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
 

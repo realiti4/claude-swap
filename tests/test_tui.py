@@ -208,9 +208,12 @@ class TestFormatting:
         assert tui_data.format_duration(3600 * 26) == "1d 2h"
 
     def test_format_age_fresh_is_silent(self):
+        # Ages inside the serve TTL are the polling cadence at work, not
+        # staleness worth flagging.
         assert tui_data.format_age(3.0) is None
+        assert tui_data.format_age(120) is None
         assert tui_data.format_age(None) is None
-        assert tui_data.format_age(120) == "· 2m ago"
+        assert tui_data.format_age(400) == "· 6m ago"
 
     def test_sentinel_labels_match_cswap_list(self):
         # The TUI must describe sentinel states with the exact wording `cswap
@@ -275,44 +278,21 @@ class TestSnapshotSource:
         )
         return fake, tui_data.SnapshotSource(fake)
 
-    def test_first_pass_is_full(self, tmp_path):
+    def test_every_pass_is_store_governed(self, tmp_path):
+        # Pacing lives in the usage store (poll plans + freshness + atomic
+        # reservation), so every take is the same on-demand pass `cswap list`
+        # runs — including the user's explicit refresh, which cannot bypass
+        # the store's per-token cadence.
         fake, source = self._source(tmp_path)
         source.take()
-        assert fake.fetch_sets == [None]
-
-    def test_steady_state_fetches_active_only(self, tmp_path):
-        fake, source = self._source(tmp_path)
-        source.take()
-        source.take()  # inside the SERVE_TTL window: no alternate yet
-        assert fake.fetch_sets[1] == {"1"}
-
-    def test_alternate_joins_once_per_ttl(self, tmp_path):
-        fake, source = self._source(tmp_path)
-        source.take()
-        source._next_alt_mono = 0.0  # force the TTL window to elapse
-        source.take()
-        assert fake.fetch_sets[1] == {"1", "2"}
-        source.take()  # timer was reset: back to active-only
-        assert fake.fetch_sets[2] == {"1"}
-
-    def test_full_refresh_and_store_only(self, tmp_path):
-        fake, source = self._source(tmp_path)
         source.take()
         source.take(full=True)
-        assert fake.fetch_sets[1] is None
-        source.take(store_only=True)
-        assert fake.fetch_sets[2] == set()
+        assert fake.fetch_sets == [None, None, None]
 
-    def test_sentinel_accounts_never_nominated(self, tmp_path):
-        accounts = [
-            make_account(1, active=True),
-            make_account(2, entry=make_entry(sentinel=USAGE_API_KEY)),
-        ]
-        fake, source = self._source(tmp_path, accounts)
-        source.take()
-        source._next_alt_mono = 0.0
-        source.take()
-        assert fake.fetch_sets[1] == {"1"}
+    def test_store_only_never_fetches(self, tmp_path):
+        fake, source = self._source(tmp_path)
+        source.take(store_only=True)
+        assert fake.fetch_sets == [set()]
 
 
 class TestUsageRows:

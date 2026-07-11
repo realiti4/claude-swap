@@ -193,11 +193,12 @@ class TestBackoff:
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)
         assert BACKOFF_BASE_S * 2**4 == 480.0
 
-    def test_edge_429_backoff_capped(self, store, clock):
-        # "Retry-After: 0" is the sustained/edge rule: retries are penalty-free
-        # and ~every other one succeeds, so backoff must stay tight instead of
-        # doubling to BACKOFF_CAP_S — freshness matters most during heavy burn.
-        expected = [30.0, 60.0, 120.0, 120.0, 120.0]
+    def test_edge_429_backoff_waits_a_refill(self, store, clock):
+        # "Retry-After: 0" is the drained-bucket edge: the token's budget is
+        # empty and refills slowly, so even the first backoff waits at least
+        # one refill's worth (EDGE_BACKOFF_S); the exponential curve may push
+        # past it, capped at BACKOFF_CAP_S.
+        expected = [300.0, 300.0, 300.0, 300.0, 480.0, 600.0, 600.0]
         for i, want in enumerate(expected):
             store.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
@@ -403,3 +404,85 @@ class TestDeadTokenQuarantine:
         assert not entry.token_dead()
         assert entry.last_error is None
         assert entry.backoff_until is None
+
+
+class TestReserve:
+    """Atomic fetch reservation: eligibility re-checked under the lock."""
+
+    def _stale(self, store, clock, num="1"):
+        store.record({num: FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(SERVE_TTL_S + CLAIM_TTL_S + 1)
+
+    def test_reserve_wins_and_stamps(self, store):
+        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        # The stamp is the claim: an immediate second reservation loses —
+        # this is the double-fetch race the old read-then-claim flow allowed.
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+
+    def test_fresh_entry_not_won(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(CLAIM_TTL_S + 1)  # claim expired, entry still fresh
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+
+    def test_respect_plans_waits_for_next_poll(self, store, clock):
+        self._stale(store, clock)
+        store.set_poll_plan({"1": (clock.now + 300.0, 300.0)}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        clock.advance(301)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+
+    def test_scheduler_beats_the_ttl_when_due(self, store, clock):
+        # Urgent cadence: a due plan wins even inside the serve TTL for the
+        # scheduler; on-demand callers still respect freshness.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 60.0, 60.0)}, IDENT)
+        clock.advance(61)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=False) == ["1"]
+
+    def test_scheduler_may_fetch_a_not_due_stale_entry(self, store, clock):
+        # Escalation semantics: an explicit set bypasses a future nextPollAt
+        # when the entry has gone stale.
+        self._stale(store, clock)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=False) == ["1"]
+
+    def test_backoff_blocks_both_modes(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(CLAIM_TTL_S + 1)  # claim gone, 30s backoff still on
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+
+    def test_dead_token_never_won(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
+        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+
+    def test_unknown_row_and_identity_mismatch_win(self, store, clock):
+        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        # Slot reused by a different account: the old row is invisible and
+        # replaced, so the new identity is fetch-eligible immediately.
+        store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
+        other = {"2": ("new@x.com", "org-9")}
+        assert store.reserve(["2"], other, respect_plans=True) == ["2"]
+
+
+class TestLast429Marker:
+    def test_last_429_survives_recovery(self, store, clock):
+        # The planner needs "was there a 429 recently?" even after a
+        # successful fetch cleared the failure fields.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        t429 = clock.now
+        clock.advance(400)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 0
+        assert entry.last_429_at == pytest.approx(t429)
+
+    def test_non_429_failures_leave_the_marker_alone(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        assert store.entries(IDENT)["1"].last_429_at is None

@@ -994,11 +994,11 @@ class TestTryFetchUsageOutcome:
         assert "account 1" in line
         assert "retry-after 42s" in line
         assert "a@b.c" not in line
-        # Nonzero Retry-After = the burst rule, which cswap's one-request-per-
-        # account-per-pass traffic cannot trip — the log names the real culprit.
-        assert "burst block" in line
+        # Any 429 = the per-token usage budget, which cumulative polling
+        # across cswap surfaces can drain — the log says what is happening.
+        assert "per-token usage budget" in line
 
-    def test_edge_429_warning_has_no_burst_hint(self, caplog):
+    def test_edge_429_warning_names_the_budget(self, caplog):
         import email.message
         import logging
         hdrs = email.message.Message()
@@ -1020,9 +1020,9 @@ class TestTryFetchUsageOutcome:
             for r in caplog.records
             if r.levelno == logging.WARNING and "http-429" in r.getMessage()
         )
-        # "Retry-After: 0" is the ordinary sustained/edge rule — no hint.
+        # "Retry-After: 0" is the drained-bucket edge — same budget hint.
         assert "retry-after 0s" in line
-        assert "burst block" not in line
+        assert "per-token usage budget" in line
 
     def test_timeout_outcome(self):
         with patch(

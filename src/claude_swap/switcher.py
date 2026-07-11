@@ -73,6 +73,8 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
+from claude_swap import poll_policy
+from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -97,9 +99,10 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # instant (request hygiene; see issue #85).
 _FETCH_STAGGER_S = 0.25
 
-# Show a "· Xm ago" age note on displayed usage older than this. Below it the
-# data is essentially current (auto refreshes every tick; --list on demand).
-_USAGE_AGE_NOTE_S = 90.0
+# Show a "· Xm ago" age note on displayed usage older than this. Inside the
+# serve TTL the data is current by design (that is the polling cadence), so
+# an age note there would be permanent noise.
+_USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -247,6 +250,9 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
+        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -636,20 +642,31 @@ class ClaudeAccountSwitcher:
             for num, entry in self._usage_store.entries(identities).items()
         }
 
-    def set_usage_poll_plan(
-        self, plans: dict[str, tuple[float | None, float | None]]
+    def set_poll_policy_inputs(
+        self, threshold: float, models: tuple[str, ...]
     ) -> None:
-        """Persist the auto engine's per-slot ``(nextPollAt, pollIntervalS)``."""
-        data = self._get_sequence_data() or {}
-        accounts = data.get("accounts", {})
-        identities = {
-            num: (
-                accounts.get(num, {}).get("email", ""),
-                accounts.get(num, {}).get("organizationUuid", "") or "",
-            )
-            for num in plans
-        }
-        self._usage_store.set_poll_plan(plans, identities)
+        """Pin the threshold/models poll planning keys on (set by a hosted
+        auto engine so cadence follows its effective, CLI-merged settings
+        instead of the settings file)."""
+        self._poll_inputs_override = (threshold, models)
+
+    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
+        """Threshold + configured model names for poll planning: the hosting
+        engine's pinned values when present, else the settings file (reloaded
+        only when it changes — one stat per pass)."""
+        if self._poll_inputs_override is not None:
+            return self._poll_inputs_override
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
+            return self._poll_inputs_cache[1]
+        loaded = load_settings(self.backup_dir)
+        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        self._poll_inputs_cache = (mtime, inputs)
+        return inputs
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order that have usable stored backups."""
@@ -1829,16 +1846,19 @@ class ClaudeAccountSwitcher:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
-        strategies) makes every account eligible; the auto engine passes an
-        explicit set to restrict which accounts *may* be fetched this pass.
-        Either way an account is skipped — its stored entry served instead —
-        when a sentinel state applies, its entry is fresh (≤ ``SERVE_TTL_S``),
-        it is inside failure backoff, or another collector claimed it moments
-        ago. A failed fetch only updates the entry's error/backoff fields, so
-        the last-good measurement keeps being served (stale-on-error).
+        strategies, dashboards) makes every account a candidate but respects
+        the persisted poll plans; the auto engine passes an explicit set whose
+        members may beat the serve TTL when their plan says so (urgent
+        cadence) or when escalation needs them fresh. Final eligibility —
+        freshness, backoff, claims, plans — is decided atomically by
+        ``UsageStore.reserve``, so concurrent collectors can never
+        double-fetch a slot. After each successful fetch the adapted cadence
+        is persisted (``_persist_poll_plans``), making every surface inherit
+        the same plan. A failed fetch only updates the entry's error/backoff
+        fields, so the last-good measurement keeps being served
+        (stale-on-error).
         """
         store = self._usage_store
-        now = store.clock()
         identities = {
             str(num): (email, org_uuid or "")
             for num, email, _org_name, org_uuid, _active, _creds in accounts_info
@@ -1857,18 +1877,17 @@ class ClaudeAccountSwitcher:
         for num in info_by_num:
             if num not in sentinels and entries[num].token_dead():
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
-        to_fetch = [
+        requested = [
             num
             for num in info_by_num
-            if num not in sentinels
-            and (fetch is None or num in fetch)
-            and not entries[num].fresh(now)
-            and not entries[num].in_backoff(now)
-            and not entries[num].claimed(now)
+            if num not in sentinels and (fetch is None or num in fetch)
         ]
+        to_fetch = store.reserve(
+            requested, identities, respect_plans=fetch is None
+        )
 
         if to_fetch:
-            store.claim(to_fetch, identities)
+            pre = entries
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in to_fetch]
             )
@@ -1877,6 +1896,9 @@ class ClaudeAccountSwitcher:
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
             entries = store.entries(identities)
+            self._persist_poll_plans(
+                records, pre, entries, info_by_num, identities
+            )
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
             # so surface "re-login needed" in *this* pass instead of leaving the
@@ -1889,6 +1911,45 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _persist_poll_plans(
+        self,
+        records: dict[str, FetchRecord],
+        pre: dict[str, UsageEntry],
+        post: dict[str, UsageEntry],
+        info_by_num: dict[str, tuple],
+        identities: dict[str, tuple[str, str]],
+    ) -> None:
+        """Adapt and persist the cadence of every slot just fetched
+        successfully, so the next collector — whichever surface it runs in —
+        inherits the plan. Failures are paced by the store's backoff instead
+        and keep their (now past-due) plan for when the backoff lifts."""
+        now = self._usage_store.clock()
+        threshold, models = self._poll_policy_inputs()
+        plans: dict[str, tuple[float | None, float | None]] = {}
+        for num, rec in records.items():
+            if rec.sentinel is not None or rec.error is not None:
+                continue
+            before, after = pre.get(num), post.get(num)
+            if after is None or after.fetched_at is None:
+                continue
+            recent_429 = (
+                before is not None
+                and before.last_429_at is not None
+                and (now - before.last_429_at) < poll_policy.RECENT_429_WINDOW_S
+            )
+            plans[num] = poll_policy.plan_after_fetch(
+                prev_interval_s=before.poll_interval_s if before else None,
+                prev_usage=before.last_good if before else None,
+                new_usage=after.last_good,
+                is_active=bool(info_by_num[num][4]),
+                threshold=threshold,
+                models=models,
+                recent_429=recent_429,
+                now=now,
+            )
+        if plans:
+            self._usage_store.set_poll_plan(plans, identities)
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → decision-grade usage value for managed accounts."""

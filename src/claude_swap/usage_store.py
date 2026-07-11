@@ -32,12 +32,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
+from claude_swap.poll_policy import EDGE_BACKOFF_S, SERVE_TTL_S
 from claude_swap.settings import atomic_write_json
 
 SCHEMA_VERSION = 2
 
-# Freshness is the reader's judgment per purpose, not a global TTL:
-SERVE_TTL_S = 30.0  # fresher than this → serve without fetching
+# Freshness is the reader's judgment per purpose, not a global TTL.
+# SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
+# without fetching) doubles as the per-token sustained-rate governor: see
+# poll_policy's module docstring for the measured budget it must stay under.
 STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 CLAIM_TTL_S = 10.0  # in-flight claim window: skip just-claimed accounts
 
@@ -53,19 +56,19 @@ TRUST_MAX_AGE_S = 3600.0
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
 
-# The usage endpoint runs two rate-limit rules (measured 2026-07-06 with a
-# two-account/one-IP probe; both scope per-account), told apart by the
-# Retry-After value:
-# - "Retry-After: 0" = the sustained/edge rule: the account's overall Claude
-#   Code activity has its budget at the edge; retries are penalty-free and
-#   ~every other one succeeds. Long exponential backoff only costs freshness
-#   during exactly the heavy-burn periods where it matters most, so edge
-#   backoff is capped low.
-# - "Retry-After: N>0" = the burst rule (~5 rapid requests on one account →
-#   hard 300s block; measured: accurate, counts down, not extended by
-#   probing). Honored as the wait, up to a safety cap so a pathological
-#   header can never park an account for hours.
-EDGE_BACKOFF_CAP_S = 120.0
+# The usage endpoint enforces a per-access-token budget on non-first-party
+# User-Agents (proven 2026-07-11: idle token, polling alone trips it; see
+# poll_policy for the measured bucket/refill shape). Cumulative polling from
+# cswap's own surfaces is exactly what drains it. Retry-After tells the rules
+# apart:
+# - "Retry-After: 0" = the drained-bucket edge: the token's budget is empty
+#   and refills at roughly one request per 2.5 minutes, so an immediate retry
+#   mostly re-drains it. Back off at least one refill's worth
+#   (poll_policy.EDGE_BACKOFF_S) before trying again.
+# - "Retry-After: N>0" = the burst rule (several rapid requests on one token
+#   → hard block; measured: accurate, counts down, not extended by probing).
+#   Honored as the wait, up to a safety cap so a pathological header can
+#   never park an account for hours.
 RETRY_AFTER_FLOOR_CAP_S = 900.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
@@ -129,6 +132,11 @@ class UsageEntry:
     backoff_until: float | None = None
     next_poll_at: float | None = None
     poll_interval_s: float | None = None
+    # When this token last answered 429 (any Retry-After). Deliberately NOT
+    # cleared by a later success: the planner keeps the cadence floored at
+    # poll_policy.POST_429_MIN_INTERVAL_S until RECENT_429_WINDOW_S has
+    # passed, giving the drained bucket time to refill.
+    last_429_at: float | None = None
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
@@ -190,8 +198,10 @@ def due_candidate(
     removes it from the due set between attempts.
 
     Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Only auto *writes* poll plans
-    (``nextPollAt``/``pollIntervalS``); watch just respects them here.
+    single alternate to poll per pass. Poll plans
+    (``nextPollAt``/``pollIntervalS``) are written by whichever collector
+    fetched (see the plan persistence in ``_collect_usage_entries``), so
+    every surface inherits the same adaptive cadence.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -224,8 +234,8 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
-        # Edge rule: retrying is penalty-free, so keep the cadence tight.
-        return min(computed, EDGE_BACKOFF_CAP_S)
+        # Drained-bucket edge: wait at least one refill before retrying.
+        return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
     # Burst rule: wait at least what the server asked (up to the safety cap);
     # our own curve may wait longer.
     return max(min(retry_after_s, RETRY_AFTER_FLOOR_CAP_S), computed)
@@ -319,6 +329,7 @@ class UsageStore:
                 backoff_until=_num_or_none(row.get("backoffUntil")),
                 next_poll_at=next_poll_at,
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
+                last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 trust_extended=trust_extended,
             )
@@ -351,6 +362,50 @@ class UsageStore:
         now = self.clock()
         self._mutate(identities, nums, lambda _n, row: row.update(lastAttemptAt=now))
 
+    def reserve(
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        respect_plans: bool,
+    ) -> list[str]:
+        """Atomically win the right to fetch: re-check eligibility and stamp
+        ``lastAttemptAt`` in one locked pass, returning only the slots won.
+
+        Deciding eligibility on a lock-free :meth:`entries` read and then
+        claiming separately lets two collectors both pass the check and both
+        fetch; the re-check under the lock closes that window. Eligibility:
+        not quarantined (dead token), not in failure backoff, not claimed
+        within ``CLAIM_TTL_S``, and then by caller mode —
+
+        - ``respect_plans=True`` (on-demand callers: list/status/switch,
+          dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
+          *and* poll-due (past ``nextPollAt``, or no plan yet).
+        - ``respect_plans=False`` (the auto engine's deliberate schedule):
+          poll-due *or* stale — a due entry may be re-fetched inside the
+          serve TTL (that is how the bounded urgent cadence beats the TTL),
+          and an escalation refresh may fetch a not-yet-due candidate.
+        """
+        nums = list(nums)
+        if not nums:
+            return []
+        now = self.clock()
+        won: list[str] = []
+        with self._lock():
+            rows = self._read_rows()
+            for num in nums:
+                identity = identities[num]
+                row = rows.get(num)
+                if not self._matches(row, identity):
+                    rows[num] = row = self._fresh_row(identity)
+                elif not _row_eligible(row, now, respect_plans):
+                    continue
+                row["lastAttemptAt"] = now
+                won.append(num)
+            if won:
+                self._write_rows(rows)
+        return won
+
     def record(
         self, outcomes: dict[str, FetchRecord], identities: dict[str, Identity]
     ) -> None:
@@ -377,6 +432,10 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 row["lastError"] = rec.error
+                if rec.error == "http-429":
+                    # Kept across later successes: the poll planner floors the
+                    # cadence while a 429 is recent (see UsageEntry.last_429_at).
+                    row["last429At"] = now
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures, rec.retry_after_s
                 )
@@ -429,6 +488,26 @@ class UsageStore:
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _row_eligible(row: dict, now: float, respect_plans: bool) -> bool:
+    """Fetch eligibility of a stored row, evaluated under the write lock
+    (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+        return False
+    backoff_until = _num_or_none(row.get("backoffUntil"))
+    if backoff_until is not None and now < backoff_until:
+        return False
+    last_attempt = _num_or_none(row.get("lastAttemptAt"))
+    if last_attempt is not None and (now - last_attempt) < CLAIM_TTL_S:
+        return False
+    fetched_at = _num_or_none(row.get("fetchedAt"))
+    stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
+    next_poll_at = _num_or_none(row.get("nextPollAt"))
+    poll_due = next_poll_at is not None and now >= next_poll_at
+    if respect_plans:
+        return stale and (poll_due or next_poll_at is None)
+    return poll_due or stale
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

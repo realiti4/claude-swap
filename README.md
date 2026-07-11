@@ -171,6 +171,10 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover with `cswap add --slot N`)
 
+### Usage polling and rate limits
+
+Anthropic's usage endpoint budgets requests per account, and sustained polling above that budget throttles the account's usage reads (HTTP 429) until the traffic drops. cswap paces itself to stay under it: every surface (`cswap list`, the TUI, the menu bar, auto-switch) shares one on-disk cache with a per-account adaptive schedule, so no matter how many are open — or how often a dashboard repaints — each account is fetched at most once per ~3 minutes. Accounts whose usage is moving (being consumed here or on another machine) or burning toward the auto-switch threshold are polled closer to that floor — the active account down to once a minute while a switch is genuinely near — while idle accounts relax to 5–10 minutes. This is why displayed usage can carry an age note like `· 6m ago`: the data is deliberately paced, not stuck, and a manual refresh doesn't bypass the budget either.
+
 ## Data locations
 
 | Platform | Credentials | Config backups |

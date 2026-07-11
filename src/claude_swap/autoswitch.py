@@ -41,10 +41,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.poll_policy import (
+    ESCALATION_MARGIN_PCT,
+    RESET_SLACK_S,
+    binding_pct,
+)
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate
@@ -59,10 +64,9 @@ _logger = logging.getLogger("claude-swap")
 # expired" re-read holds with margin after our swap.
 FRESHEN_BUFFER_MS = 10 * 60 * 1000
 
-# Sleep caps around a known quota reset: a little slack past the reset, and
-# never trust one long sleep (laptops suspend, clocks drift) — cap and
-# re-evaluate.
-RESET_SLACK_S = 60.0
+# Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
+# with the rest of the cadence numbers): never trust one long sleep (laptops
+# suspend, clocks drift) — cap and re-evaluate.
 MAX_SLEEP_S = 6 * 3600.0
 NO_RESET_FALLBACK_S = 300.0
 
@@ -73,30 +77,15 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
-# Adaptive scheduler: the baseline request volume is O(1) per tick — the
+# Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
-# every account in parallel. Candidates far from mattering are served stale
-# from the usage store. The engine escalates to a full refresh only when a
-# switch could actually be near: active utilization within this margin of the
-# threshold, or active usage unknown (failover needs fresh candidate data).
-ESCALATION_MARGIN_PCT = 15.0
-# A candidate whose binding pct moved at least this much between polls is
-# being used elsewhere (another PC / session mode) → poll it more closely;
-# an unmoved one backs off, up to the cap.
-MOVEMENT_DELTA_PCT = 1.0
-CANDIDATE_MAX_INTERVAL_S = 600.0
-# The active account's cadence relaxes with distance (in utilization points)
-# to the escalation band, because burn rate is absolute: >50 pts below the
-# band → this hard cap (never slower); >25 pts → 2× the interval; else every
-# tick. Distance-based rather than absolute pct so an adjusted threshold
-# keeps the same safety margin (at threshold 50 the cap is simply never
-# reachable). The cap stays under STALE_OK_S so a relaxed active never loses
-# decision trust, and the worst plausible burn (~5%/min, heavy subagent use)
-# moves +15 pts between capped polls — still ≥35 pts from the band, and band
-# entry is seen at most one poll late, absorbed by ESCALATION_MARGIN_PCT +
-# hysteresis.
-ACTIVE_MAX_INTERVAL_S = 180.0
-ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× this
+# every account in parallel, and the per-account cadence itself (movement,
+# threshold distance, urgent mode, 429 recovery) lives in poll_policy, is
+# persisted in the usage store by whichever collector fetched, and is shared
+# by every surface. The engine escalates to a full candidate refresh only
+# when a switch could actually be near: active utilization within
+# ESCALATION_MARGIN_PCT of the threshold, or active usage unknown (failover
+# needs fresh candidate data).
 
 
 def _now_iso() -> str:
@@ -348,12 +337,6 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
-    """Utilization of the binding (worst) relevant window, or None."""
-    headroom = oauth.account_headroom(usage, models)
-    return None if headroom is None else 100.0 - headroom
-
-
 def _window_pcts(
     usage: dict | None, models: tuple[str, ...] = ()
 ) -> dict[str, float]:
@@ -369,43 +352,11 @@ def _window_pcts(
     }
 
 
-def _limiting_reset_ts(
-    usage: dict | None, models: tuple[str, ...] = ()
-) -> float | None:
-    """Epoch when the last of the ≥100% relevant windows resets (account
-    usable again)."""
-    latest: float | None = None
-    for _, pct, resets_at in oauth.relevant_windows(usage, models):
-        if pct < 100.0:
-            continue
-        ts = _parse_reset_ts(resets_at)
-        if ts is not None and (latest is None or ts > latest):
-            latest = ts
-    return latest
-
-
-def _earliest_future_reset_ts(
-    usage: dict | None, now: float, models: tuple[str, ...] = ()
-) -> float | None:
-    """Epoch of the next relevant-window reset ahead of ``now``, any
-    utilization."""
-    earliest: float | None = None
-    for _, _, resets_at in oauth.relevant_windows(usage, models):
-        ts = _parse_reset_ts(resets_at)
-        if ts is not None and ts > now and (earliest is None or ts < earliest):
-            earliest = ts
-    return earliest
-
-
-def _parse_reset_ts(resets_at: str | None) -> float | None:
-    if not resets_at:
-        return None
-    try:
-        return datetime.fromisoformat(
-            str(resets_at).replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
-        return None
+# Reset math moved to poll_policy with the cadence numbers; aliased for the
+# engine's sleep scheduling and the test suite.
+_limiting_reset_ts = poll_policy.limiting_reset_ts
+_earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
+_parse_reset_ts = poll_policy.parse_reset_ts
 
 
 def _ref(number: str, email: str) -> dict:
@@ -438,6 +389,10 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Poll plans written by the collector must key on the same threshold/
+        # models the engine decides with (CLI overrides included), not on
+        # whatever the settings file happens to say.
+        switcher.set_poll_policy_inputs(settings.threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -941,22 +896,23 @@ class AutoSwitchEngine:
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
-        Phase A fetches the active account (at its distance-to-threshold
-        cadence — every tick only near the band, see
-        :meth:`_active_poll_interval_s`) plus ONE due candidate (the one
-        with the stalest data — never-fetched first, then oldest fetch);
-        everyone else is served from the usage store. Phase B refetches ALL
-        candidates and recomputes before any switch decision when a switch
-        could be near: active utilization within ``ESCALATION_MARGIN_PCT`` of
-        the threshold, or active usage unknown (failover must not run on
-        stale candidate data). Candidate selection never runs on the
-        pre-escalation snapshot.
+        Phase A fetches the active account (when its persisted poll plan says
+        it is due — poll_policy's urgent mode is what tightens that cadence
+        near the band) plus ONE due candidate (the one with the stalest data
+        — never-fetched first, then oldest fetch); everyone else is served
+        from the usage store. Phase B refetches ALL candidates and recomputes
+        before any switch decision when a switch could be near: active
+        utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
+        active usage unknown (failover must not run on stale candidate data).
+        Candidate selection never runs on the pre-escalation snapshot.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.
         Backoff (``backoffUntil``) is enforced by the collector even for the
         active account — a Retry-After must never be defeated — and during an
         idle-hold no candidate is polled at all (slow crawl for everything).
+        Adapted cadences are persisted by the collector itself after each
+        fetch (shared with every other surface), not by the engine.
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
@@ -973,10 +929,21 @@ class AutoSwitchEngine:
         pre = self.switcher.usage_entries_by_account(fetch=set())
         plan: set[str] = set()
         active_pre = pre.get(current)
+        # The active account is nominated when never fetched, poll-due per its
+        # persisted plan, or (no plan yet) past the normal cadence floor. The
+        # collector's reserve() honors due-ness even inside the serve TTL, so
+        # an urgent plan (60s while burning near the band) actually fetches.
         if (
             active_pre is None
             or active_pre.age_s is None
-            or active_pre.age_s >= self._active_poll_interval_s(active_pre)
+            or (
+                active_pre.next_poll_at is not None
+                and now >= active_pre.next_poll_at
+            )
+            or (
+                active_pre.next_poll_at is None
+                and active_pre.age_s >= poll_policy.MIN_INTERVAL_S
+            )
         ):
             plan.add(current)
         if self._idle_hold_since is None:
@@ -1010,81 +977,7 @@ class AutoSwitchEngine:
             )
             for num, value in usage.items()
         }
-        if not self.dry_run:
-            self._update_poll_plans(candidates, pre, entries, now)
         return entries, usage, headroom
-
-    def _active_poll_interval_s(self, entry) -> float:
-        """Stepwise active cadence by distance to the escalation band.
-
-        Unknown utilization or in-band → every tick (the at-limit escape and
-        failover paths must never wait); more than ``ACTIVE_RELAX_DISTANCE_PCT``
-        points below the band → 2× the engine interval; more than twice that
-        → ``ACTIVE_MAX_INTERVAL_S``. (At the default threshold 90 these are
-        the <50% / <25% utilization steps.) Derived per tick from the stored
-        entry — no persisted state, and failure backoff / idle-hold /
-        escalation are enforced elsewhere and unaffected.
-        """
-        interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good, self._models)
-        if pct is None:
-            return interval
-        distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
-        if distance > 2 * ACTIVE_RELAX_DISTANCE_PCT:
-            tier = ACTIVE_MAX_INTERVAL_S
-        elif distance > ACTIVE_RELAX_DISTANCE_PCT:
-            tier = 2.0 * interval
-        else:
-            return interval
-        return min(tier, ACTIVE_MAX_INTERVAL_S)
-
-    def _update_poll_plans(
-        self, candidates: list[str], pre: dict, post: dict, now: float
-    ) -> None:
-        """Adapt each just-fetched candidate's poll cadence, persisted in the
-        store (survives ``--once`` engine restarts).
-
-        Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since its
-        previous poll — someone is using it elsewhere) halves the interval,
-        floored at the engine interval; no movement backs it off ×1.5 up to
-        ``CANDIDATE_MAX_INTERVAL_S``. A poll is never scheduled later than the
-        candidate's next window reset (stored usage is obsolete the moment a
-        window rolls over — a 95% candidate is really ~0% after its reset).
-        A candidate at its limit skips straight to its window reset
-        (``nextPollAt`` only — the learned interval is kept for when it
-        comes back).
-        """
-        plans: dict[str, tuple[float | None, float | None]] = {}
-        for num in candidates:
-            before, after = pre.get(num), post.get(num)
-            if before is None or after is None or after.sentinel is not None:
-                continue
-            if after.fetched_at is None or after.fetched_at == before.fetched_at:
-                continue  # not fetched this pass
-            base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good, self._models)
-            new_pct = binding_pct(after.last_good, self._models)
-            if prev_pct is None or new_pct is None:
-                interval = self.settings.interval_seconds
-            elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
-                interval = max(self.settings.interval_seconds, base / 2)
-            else:
-                interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
-            next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good, self._models)
-            if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good, self._models)
-                if reset_ts is not None and reset_ts > next_poll:
-                    next_poll = reset_ts
-            else:
-                reset_ts = _earliest_future_reset_ts(
-                    after.last_good, now, self._models
-                )
-                if reset_ts is not None:
-                    next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
-            plans[num] = (next_poll, interval)
-        if plans:
-            self.switcher.set_usage_poll_plan(plans)
 
     def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
         if self.dry_run:

@@ -275,3 +275,10 @@ def sample_sequence_data_with_org():
             },
         },
     }
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_poll_jitter(monkeypatch):
+    """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
+    itself is exercised in test_poll_policy via an injected rng."""
+    monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
