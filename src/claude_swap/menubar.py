@@ -24,7 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.settings import USAGE_DISPLAY_CHOICES, USAGE_DISPLAY_USED, reframe_pct
 from claude_swap.switcher import SENTINEL_NOTES
+
+USAGE_DISPLAY_LABELS = {USAGE_DISPLAY_USED: "Used", "remaining": "Remaining"}
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -169,8 +172,16 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
-def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
-    """One-line usage summary for an account row (reset countdown computed live)."""
+def usage_summary(
+    usage: dict | str | None, now: float | None = None, display: str = USAGE_DISPLAY_USED
+) -> str:
+    """One-line usage summary for an account row (reset countdown computed live).
+
+    ``display`` (the usage.display setting) reframes each window's pct via
+    ``reframe_pct``; the over-limit (!) marker still keys off the raw
+    utilization, since a window is exhausted at pct >= 100 regardless of how
+    the number is framed.
+    """
     if isinstance(usage, str):
         return usage
     if usage is None:
@@ -183,7 +194,8 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
         if key == "seven_day":
             window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            seg = f"{label} {window['pct']:.0f}%"
+            val, suffix = reframe_pct(window["pct"], display)
+            seg = f"{label} {val:.0f}%{suffix}"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
@@ -192,7 +204,8 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     for window in usage.get("scoped") or []:
         window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-            seg = f"{window['name']} {window['pct']:.0f}%"
+            val, suffix = reframe_pct(window["pct"], display)
+            seg = f"{window['name']} {val:.0f}%{suffix}"
             if window["pct"] >= 100:
                 seg += " (!)"  # maxed model — the usual reason to switch
             countdown = _live_countdown(window, now)
@@ -201,15 +214,17 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
             parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-        parts.append(f"$ {spend['pct']:.0f}%")
+        val, suffix = reframe_pct(spend["pct"], display)
+        parts.append(f"$ {val:.0f}%{suffix}")
     return " · ".join(parts) if parts else "usage unavailable"
 
 
 def format_account_label(
-    num, email: str, usage: dict | str | None, now: float | None = None
+    num, email: str, usage: dict | str | None, now: float | None = None,
+    display: str = USAGE_DISPLAY_USED,
 ) -> str:
     """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage, now)}"
+    return f"{num}  {email}  {usage_summary(usage, now, display)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -225,8 +240,13 @@ def format_title(
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
+    display: str = USAGE_DISPLAY_USED,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``display`` (the usage.display setting) reframes the title's percentage
+    segment(s) the same way ``usage_summary`` does.
+    """
     if active_email is None:
         return ICON
     if now is None:
@@ -237,26 +257,31 @@ def format_title(
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            val, suffix = reframe_pct(p, display)
+            segments.append(f"{val:.0f}%{suffix}")
     if settings.title_pct in ("7d", "both"):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            val, suffix = reframe_pct(p, display)
+            segments.append(f"{val:.0f}%{suffix}")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
         for window in active_usage.get("scoped") or []:
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {window['pct']:.0f}%")
+                val, suffix = reframe_pct(window["pct"], display)
+                segments.append(f"{window['name']} {val:.0f}%{suffix}")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
 
 
-def format_usage_log(email: str, usage: dict | str | None) -> str | None:
+def format_usage_log(
+    email: str, usage: dict | str | None, display: str = USAGE_DISPLAY_USED
+) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
@@ -271,7 +296,8 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
             continue
         window = usage.get(key)  # a dict — _window_pct found a numeric pct in it
         clock = window.get("clock") if isinstance(window, dict) else None
-        seg = f"{label} {pct:.0f}%"
+        val, suffix = reframe_pct(pct, display)
+        seg = f"{label} {val:.0f}%{suffix}"
         if clock:
             seg += f" (resets {clock})"
         parts.append(seg)
@@ -352,7 +378,7 @@ def run(switcher) -> int:
     import rumps  # lazy: optional dependency, imported only when launching
 
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import load_settings, set_setting
+    from claude_swap.settings import load_settings, load_usage_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -363,6 +389,12 @@ def run(switcher) -> int:
             super().__init__(ICON, quit_button=None)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
+            # usage.display lives in the main settings.json (not
+            # menubar_settings.json), alongside autoswitch.*, so `cswap
+            # config set usage.display remaining` and the menu bar toggle
+            # below both act on the same source of truth `cswap list`/
+            # `status` read.
+            self.usage_display = load_usage_settings(switcher.backup_dir).display
             # The supported paced read path: per refresh it fetches only the
             # active account plus (at most once per freshness window) one stale
             # alternate, so an open menu costs O(1) requests per window instead
@@ -432,7 +464,7 @@ def run(switcher) -> int:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, last_good)
+                line = format_usage_log(email, last_good, self.usage_display)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
@@ -538,13 +570,14 @@ def run(switcher) -> int:
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
-                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
+                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings,
+                display=self.usage_display,
             )
             self.menu.clear()
             account_items = []
             for num, email, is_active, display, _last_good in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, display),
+                    format_account_label(num, email, display, display=self.usage_display),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -621,6 +654,19 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            # Mirrors the Title percentage picker but flips the usage.display
+            # setting in the main settings.json (not menubar_settings.json),
+            # so the menu bar, `cswap list`, and `cswap status` all reframe
+            # percentages together.
+            usage_display_menu = rumps.MenuItem("Usage display")
+            for mode in USAGE_DISPLAY_CHOICES:
+                ch = rumps.MenuItem(
+                    USAGE_DISPLAY_LABELS[mode], callback=self._make_usage_display(mode)
+                )
+                ch.state = 1 if self.usage_display == mode else 0
+                usage_display_menu.add(ch)
+            menu.add(usage_display_menu)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -770,6 +816,13 @@ def run(switcher) -> int:
             def cb(_sender):
                 self.settings.title_pct = mode
                 self._save_and_rebuild()
+            return cb
+
+        def _make_usage_display(self, mode):
+            def cb(_sender):
+                set_setting(self.switcher.backup_dir, "usage.display", mode)
+                self.usage_display = mode
+                self.rebuild_menu()
             return cb
 
         def _make_interval(self, secs):

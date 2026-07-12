@@ -25,6 +25,14 @@ from claude_swap.exceptions import ConfigError
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 
+# Usage display modes for the ``usage.display`` key: how a window's
+# utilization percentage is framed across the human surfaces (``cswap
+# list``/``status`` and the macOS menu bar). ``used`` (the default) shows the
+# raw utilization; ``remaining`` shows ``100 - pct`` with a ``left`` suffix.
+USAGE_DISPLAY_USED = "used"
+USAGE_DISPLAY_REMAINING = "remaining"
+USAGE_DISPLAY_CHOICES = (USAGE_DISPLAY_USED, USAGE_DISPLAY_REMAINING)
+
 _logger = logging.getLogger("claude-swap")
 
 
@@ -59,6 +67,27 @@ class AutoSwitchSettings:
 
 
 @dataclass(frozen=True)
+class UsageSettings:
+    """Display preferences for usage surfaces (the ``usage`` section).
+
+    Parallel to :class:`AutoSwitchSettings` but for presentation, not engine
+    policy. ``display`` reframes utilization percentages: ``used`` (default,
+    the raw pct) or ``remaining`` (``100 - pct`` with a ``left`` suffix).
+    """
+
+    display: str = USAGE_DISPLAY_USED
+
+
+# Section → zero-arg factory for that section's settings dataclass, so
+# :pyattr:`SettingSpec.default` can resolve a spec's default no matter which
+# section it lives in (``autoswitch`` today, ``usage`` added additively).
+_SECTION_DEFAULTS: dict[str, type] = {
+    "autoswitch": AutoSwitchSettings,
+    "usage": UsageSettings,
+}
+
+
+@dataclass(frozen=True)
 class SettingSpec:
     """Metadata for one user-tunable settings.json key.
 
@@ -82,7 +111,7 @@ class SettingSpec:
 
     @property
     def default(self):
-        return getattr(AutoSwitchSettings(), self.field)
+        return getattr(_SECTION_DEFAULTS[self.section](), self.field)
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -128,6 +157,64 @@ SETTING_SPECS: dict[str, SettingSpec] = {
 _AUTOSWITCH_KEYS: dict[str, str] = {
     spec.field: spec.json_key for spec in SETTING_SPECS.values()
 }
+
+# The ``usage`` section, kept in its own registry so the autoswitch-only
+# machinery above (``_clamped``/``load_settings``/``save_settings``, all keyed
+# off ``SETTING_SPECS`` and :class:`AutoSwitchSettings`) never has to consider
+# a non-autoswitch field. ``setting_spec``/``set_setting``/``unset_setting``
+# are section-agnostic already, so ``cswap config set usage.display remaining``
+# routes here and writes ``raw["usage"]["display"]``.
+USAGE_SPECS: dict[str, SettingSpec] = {
+    spec.dotted: spec
+    for spec in (
+        SettingSpec(
+            "usage", "display", "display", "choice", choices=USAGE_DISPLAY_CHOICES,
+            help="Show account usage as percent used or percent remaining",
+        ),
+    )
+}
+
+_USAGE_KEYS: dict[str, str] = {
+    spec.field: spec.json_key for spec in USAGE_SPECS.values()
+}
+
+
+def load_usage_settings(backup_root: Path) -> UsageSettings:
+    """Load the ``usage`` section; missing/corrupt/unknown → defaults.
+
+    Mirrors :func:`load_settings`' forgiving posture: a garbled value degrades
+    to the default rather than raising, so a bad hand edit never blocks the
+    tool. Unknown choices are logged (matching ``_clamped``'s choice warning).
+    """
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("usage")
+    if not isinstance(section, dict):
+        return UsageSettings()
+    display = section.get("display", UsageSettings.display)
+    if display not in USAGE_DISPLAY_CHOICES:
+        _logger.warning(
+            "settings.json: unsupported usage.display %r; using %r",
+            display, UsageSettings.display,
+        )
+        display = UsageSettings.display
+    return UsageSettings(display=display)
+
+
+def reframe_pct(pct: float, display: str) -> tuple[float, str]:
+    """Split a utilization pct into ``(value, suffix)`` for a display mode.
+
+    ``used`` → ``(pct, "")``; ``remaining`` → ``(100 - pct, " left")``, clamped
+    at 0 so an over-limit window reads ``0% left`` rather than a negative
+    number. Each surface formats the width itself; this only picks the number
+    and the trailing label, so every surface renders ``62%`` or ``38% left``
+    consistently. An unknown mode falls through to ``used``.
+    """
+    if display == USAGE_DISPLAY_REMAINING:
+        remaining = 100.0 - pct
+        if remaining < 0:
+            remaining = 0.0
+        return remaining, " left"
+    return pct, ""
 
 
 def settings_path(backup_root: Path) -> Path:
@@ -225,12 +312,18 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
 
 
 def setting_spec(dotted_key: str) -> SettingSpec:
-    """Look up a spec by dotted key; unknown keys raise with the valid list."""
+    """Look up a spec by dotted key; unknown keys raise with the valid list.
+
+    Consults every section's registry (``autoswitch``, then ``usage``) so the
+    one config dispatch path serves all sections.
+    """
     spec = SETTING_SPECS.get(dotted_key)
+    if spec is None:
+        spec = USAGE_SPECS.get(dotted_key)
     if spec is None:
         raise ConfigError(
             f"unknown setting '{dotted_key}'\n"
-            f"Valid keys: {', '.join(SETTING_SPECS)}"
+            f"Valid keys: {', '.join([*SETTING_SPECS, *USAGE_SPECS])}"
         )
     return spec
 
@@ -377,6 +470,14 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
         rows.append((spec, getattr(effective, spec.field), is_set))
+    # Additive sections resolved through their own loaders, each spec's
+    # ``is_set`` read from its own section so a non-autoswitch key is detected
+    # in raw["usage"], not the autoswitch section.
+    usage = load_usage_settings(backup_root)
+    for spec in USAGE_SPECS.values():
+        section = raw.get(spec.section)
+        is_set = isinstance(section, dict) and spec.json_key in section
+        rows.append((spec, getattr(usage, spec.field), is_set))
     return rows
 
 

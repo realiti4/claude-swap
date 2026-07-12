@@ -13,10 +13,14 @@ import pytest
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
+    USAGE_DISPLAY_REMAINING,
+    USAGE_SPECS,
     AutoSwitchSettings,
     effective_settings,
     load_settings,
+    load_usage_settings,
     merged_with_cli,
+    reframe_pct,
     save_settings,
     set_setting,
     settings_path,
@@ -195,8 +199,10 @@ class TestSetUnsetSetting:
 class TestEffectiveSettings:
     def test_missing_file_reports_all_defaults(self, tmp_path: Path):
         rows = effective_settings(tmp_path)
-        assert len(rows) == len(SETTING_SPECS)
+        assert len(rows) == len(SETTING_SPECS) + len(USAGE_SPECS)
         assert all(not is_set for _, _, is_set in rows)
+        by_key = {spec.dotted: value for spec, value, _ in rows}
+        assert by_key["usage.display"] == "used"
 
     def test_presence_not_value_equality_marks_set(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.threshold", "90")  # equals default
@@ -230,3 +236,55 @@ class TestMergedWithCli:
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
+
+
+class TestUsageSettings:
+    """Issue #125 part 1: the ``usage`` section (usage.display), additive and
+    isolated from the ``autoswitch`` section's machinery."""
+
+    def test_missing_file_defaults_to_used(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path).display == "used"
+
+    def test_round_trips_through_load(self, tmp_path: Path):
+        set_setting(tmp_path, "usage.display", "remaining")
+        assert load_usage_settings(tmp_path).display == USAGE_DISPLAY_REMAINING
+
+    def test_garbage_value_degrades_to_default(self, tmp_path: Path):
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"usage": {"display": "half"}}')
+        assert load_usage_settings(tmp_path).display == "used"
+
+    def test_set_does_not_disturb_autoswitch_section(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "75")
+        set_setting(tmp_path, "usage.display", "remaining")
+        assert load_settings(tmp_path).threshold == 75.0
+        assert load_usage_settings(tmp_path).display == USAGE_DISPLAY_REMAINING
+
+    def test_invalid_choice_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "usage.display", "half")
+
+    def test_unset_removes_key_and_empty_section(self, tmp_path: Path):
+        set_setting(tmp_path, "usage.display", "remaining")
+        assert unset_setting(tmp_path, "usage.display") is True
+        assert load_usage_settings(tmp_path).display == "used"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert "usage" not in raw
+
+    def test_second_unset_is_a_no_op(self, tmp_path: Path):
+        assert unset_setting(tmp_path, "usage.display") is False
+
+
+class TestReframePct:
+    def test_used_mode_is_identity(self):
+        assert reframe_pct(62.0, "used") == (62.0, "")
+
+    def test_remaining_mode_inverts_with_left_suffix(self):
+        assert reframe_pct(62.0, "remaining") == (38.0, " left")
+
+    def test_remaining_mode_clamps_over_limit_at_zero(self):
+        assert reframe_pct(120.0, "remaining") == (0.0, " left")
+
+    def test_unknown_mode_falls_back_to_used(self):
+        assert reframe_pct(62.0, "half-baked") == (62.0, "")

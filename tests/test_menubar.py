@@ -127,6 +127,24 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
+# --- usage.display toggle (issue #125 part 1) -----------------------------------
+
+def test_usage_summary_remaining_mode_reframes_every_window():
+    got = menubar.usage_summary(_USAGE, display="remaining")
+    assert got == "5h 58% left · 7d 82% left · $ 70% left"
+
+
+def test_usage_summary_remaining_mode_clamps_over_limit_scoped_window():
+    usage = {"scoped": [{"name": "Fable", "pct": 120.0}]}
+    got = menubar.usage_summary(usage, display="remaining")
+    assert got == "Fable 0% left (!)"  # the (!) marker still keys off raw pct
+
+
+def test_format_account_label_remaining_mode():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, display="remaining")
+    assert label == "2  loc@papaya.asia  5h 58% left · 7d 82% left · $ 70% left"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -147,6 +165,12 @@ def test_format_usage_log_without_clock():
 def test_format_usage_log_partial_window():
     usage = {"seven_day": {"pct": 12.0, "clock": "Jul 3"}}
     assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 7d 12% (resets Jul 3)"
+
+
+def test_format_usage_log_remaining_mode():
+    usage = {"five_hour": {"pct": 35.0, "clock": "06:59"}}
+    got = menubar.format_usage_log("a@x.com", usage, display="remaining")
+    assert got == "usage a@x.com: 5h 65% left (resets 06:59)"
 
 
 def test_format_usage_log_none_when_no_numeric_window():
@@ -194,6 +218,12 @@ def test_format_title_both_windows():
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+
+
+def test_format_title_remaining_mode_reframes_percentages():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    got = menubar.format_title("loc@papaya.asia", _USAGE, s, display="remaining")
+    assert got == "⇄ 58% left · 82% left"
 
 
 def test_format_title_icon_only_when_off():

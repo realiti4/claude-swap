@@ -74,7 +74,14 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    USAGE_DISPLAY_USED,
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    reframe_pct,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -105,38 +112,44 @@ _FETCH_STAGGER_S = 0.25
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 
-def _format_usage_lines(usage: dict) -> list[str]:
+def _format_usage_lines(usage: dict, display: str = USAGE_DISPLAY_USED) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+    # ``display`` (the usage.display setting) reframes each pct as used or
+    # remaining via reframe_pct; the over-limit (!) marker still keys off the
+    # raw utilization, since a window is exhausted at pct >= 100 regardless of
+    # how the number is framed.
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
         limit = spend["limit"]
-        pct = spend["pct"]
+        val, suffix = reframe_pct(spend["pct"], display)
         cell = oauth.fresh_reset_strings(spend)
         if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
+            rows.append(("$$", f"{val:>3.0f}%{suffix}   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
         else:
-            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+            rows.append(("$$", f"{val:>3.0f}%{suffix}   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            val, suffix = reframe_pct(w["pct"], display)
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}"))
+                rows.append((label, f"{val:>3.0f}%{suffix}   resets {clock:<12}  in {countdown}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%"))
+                rows.append((label, f"{val:>3.0f}%{suffix}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else ""
+        val, suffix = reframe_pct(w["pct"], display)
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
-            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+            rows.append((w["name"], f"{val:>3.0f}%{suffix}   resets {clock:<12}  in {countdown}{marker}"))
         else:
-            rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+            rows.append((w["name"], f"{val:>3.0f}%{suffix}{marker}"))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
     return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
@@ -153,24 +166,27 @@ SENTINEL_NOTES = {
 }
 
 
-def last_seen_note(entry: UsageEntry) -> str | None:
+def last_seen_note(entry: UsageEntry, display: str = USAGE_DISPLAY_USED) -> str | None:
     """"last seen 53% used · 12m ago" from an entry's last-good measurement.
 
     Public: the TUI renders the same note under sentinel states (see
     ``SENTINEL_NOTES``), so both surfaces stay word-for-word identical.
+    ``display`` (the usage.display setting) reframes the percentage: ``used``
+    shows ``100 - headroom`` (the utilized pct), ``remaining`` shows the
+    headroom itself with a ``left`` suffix.
     """
     if entry.last_good is None or entry.fetched_at is None:
         return None
     headroom = oauth.account_headroom(entry.last_good)
     if headroom is None:
         return None
-    return (
-        f"last seen {100 - headroom:.0f}% used · "
-        f"{format_age(int(entry.fetched_at * 1000))}"
-    )
+    age = format_age(int(entry.fetched_at * 1000))
+    if display == "remaining":
+        return f"last seen {headroom:.0f}% left · {age}"
+    return f"last seen {100 - headroom:.0f}% used · {age}"
 
 
-def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+def _usage_entry_lines(entry: UsageEntry, display: str = USAGE_DISPLAY_USED) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
@@ -178,15 +194,17 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
+    ``display`` threads the usage.display setting through the measurement and
+    last-seen lines alike.
     """
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
-        last_seen = last_seen_note(entry)
+        last_seen = last_seen_note(entry, display)
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good)
+        lines = _format_usage_lines(entry.last_good, display)
         if (
             lines
             and entry.age_s is not None
@@ -2352,6 +2370,7 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries)
 
         print(bolded("Accounts:"))
+        display = load_usage_settings(self.backup_dir).display
         for i, (num, email, org_name, org_uuid, is_active, _) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             # NOTE: the TUI watch view (tui._watch_account_rows) parses this
@@ -2363,7 +2382,7 @@ class ClaudeAccountSwitcher:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
             else:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            for line in _usage_entry_lines(entries[str(num)], display):
                 print(f"     {line}")
 
             if show_token_status:
@@ -2513,7 +2532,8 @@ class ClaudeAccountSwitcher:
             entry = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry):
+            display = load_usage_settings(self.backup_dir).display
+            for line in _usage_entry_lines(entry, display):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")

@@ -33,6 +33,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    last_seen_note,
 )
 
 
@@ -4599,6 +4600,36 @@ class TestFormatUsageLines:
         usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
         lines = _format_usage_lines(usage)
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
+
+
+class TestUsageDisplayMode:
+    """Issue #125 part 1: usage.display reframes _format_usage_lines and
+    last_seen_note as used (default) or remaining, without touching JSON."""
+
+    def test_default_display_is_used_unchanged(self):
+        usage = {"five_hour": {"pct": 62.0}}
+        assert _format_usage_lines(usage) == _format_usage_lines(usage, "used")
+
+    def test_remaining_mode_shows_left_suffix(self):
+        usage = {"five_hour": {"pct": 62.0}, "spend": {"used": 1.0, "limit": 10.0, "pct": 12.0, "currency": "USD"}}
+        lines = _format_usage_lines(usage, "remaining")
+        assert "88% left" in lines[0]  # spend line ($$) sorts first, pct=12 -> 88 left
+        assert "38% left" in lines[1]  # 5h window, pct=62 -> 38 left
+
+    def test_remaining_mode_clamps_over_limit_at_zero(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 120.0}]}
+        lines = _format_usage_lines(usage, "remaining")
+        assert "0% left" in lines[0]
+        assert lines[0].rstrip().endswith("(!)")  # marker still keys off raw pct
+
+    def test_unknown_display_falls_back_to_used(self):
+        usage = {"five_hour": {"pct": 62.0}}
+        assert _format_usage_lines(usage, "half-baked") == _format_usage_lines(usage, "used")
+
+    def test_last_seen_note_used_vs_remaining(self):
+        entry = UsageEntry(last_good={"five_hour": {"pct": 30.0}}, fetched_at=1_000_000.0)
+        assert "30% used" in last_seen_note(entry, "used")
+        assert "70% left" in last_seen_note(entry, "remaining")
 
 
 def _read_safety_copy(switcher, entry_id: str) -> str:
