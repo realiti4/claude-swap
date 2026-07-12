@@ -11,6 +11,7 @@ from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
+    RATE_LIMIT_TRUST_MAX_AGE_S,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -154,13 +155,44 @@ class TestExtendedTrust:
         clock.advance(250)
         assert store.entries(IDENT)["1"].decision_value() is None
 
-    def test_trust_ceiling_wins_over_failure_state(self, store, clock):
+    def test_trust_ceiling_wins_over_non_429_failure_state(self, store, clock):
+        # A non-429 failure (timeout/network) past the general ceiling reads as
+        # unknown: such an error is no evidence the last_good still holds, so
+        # the unknown-path machinery must take back over.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 2
+        assert entry.decision_value() is None
+
+    def test_429_staleness_trusted_past_general_ceiling(self, store, clock):
+        # A usage-endpoint 429 throttles polling; it does NOT mean the account's
+        # real model quota changed. Candidate accounts aren't active, so their
+        # windows don't move while blocked — last_good stays accurate. Trusting
+        # it past TRUST_MAX_AGE_S (up to the wider rate-limit ceiling) keeps a
+        # rate-limited candidate a valid switch target instead of flipping it to
+        # "unknown" and triggering failover flapping between machines.
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S + 1)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         entry = store.entries(IDENT)["1"]
         assert entry.consecutive_failures == 2
+        assert entry.trust_extended
+        assert entry.decision_value() == USAGE
+
+    def test_429_staleness_still_bounded_by_rate_limit_ceiling(self, store, clock):
+        # Trust is extended for 429s but stays client-bounded (never unbounded /
+        # server-controlled): past RATE_LIMIT_TRUST_MAX_AGE_S it too reads as
+        # unknown, so a forever-throttled account eventually hits the
+        # unknown-path machinery.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        entry = store.entries(IDENT)["1"]
         assert entry.decision_value() is None
         # Display still sees the measurement + its age.
         assert entry.last_good == USAGE
@@ -210,9 +242,18 @@ class TestBackoff:
 
     def test_retry_after_floor_is_capped(self):
         # A pathological Retry-After can never park an account for hours.
-        assert usage_store._failure_backoff_s(1, 5000.0) == pytest.approx(
+        assert usage_store._failure_backoff_s(1, 50000.0) == pytest.approx(
             usage_store.RETRY_AFTER_FLOOR_CAP_S
         )
+
+    def test_hour_scale_retry_after_honored(self):
+        # The usage endpoint's burst block spans its ~1h rolling window and the
+        # server's Retry-After counts that down accurately (measured). Capping
+        # it to minutes means re-probing mid-window, which re-arms the block and
+        # never lets the token drain — so an hour-scale Retry-After must be
+        # honored, up to the (raised) safety cap.
+        assert usage_store._failure_backoff_s(1, 3600.0) == pytest.approx(3600.0)
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S >= 3600.0
 
     def test_measured_burst_block_honored_exactly(self):
         # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and

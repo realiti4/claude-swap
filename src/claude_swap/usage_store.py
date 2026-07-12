@@ -52,6 +52,19 @@ CLAIM_TTL_S = 10.0  # in-flight claim window: skip just-claimed accounts
 # trust must never be server-controlled and unbounded.
 TRUST_MAX_AGE_S = 3600.0
 
+# A usage-endpoint 429 is a polling throttle, not a change in the account's
+# real model quota: the endpoint budgets *usage requests* per token (see
+# poll_policy), independent of the 5h/7d limits it reports. A throttled
+# candidate is not active, so its windows do not move while it is blocked —
+# last_good stays accurate for the whole block. Flipping it to "unknown" at
+# TRUST_MAX_AGE_S instead makes it an unusable switch target and drives
+# failover flapping (which re-polls the throttled token and re-arms the block),
+# so 429 staleness is trusted for a wider — but still client-bounded, never
+# server-controlled — ceiling. This matches the usage endpoint's ~1h rolling
+# window (a block clears within ~an hour of quiet), with headroom for a token
+# that stays contended across machines. Non-429 failures keep TRUST_MAX_AGE_S.
+RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
+
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
@@ -70,7 +83,14 @@ BACKOFF_CAP_S = 600.0
 #   → hard block; measured: accurate, counts down, not extended by probing).
 #   Honored as the wait, up to a safety cap so a pathological header can
 #   never park an account for hours.
-RETRY_AFTER_FLOOR_CAP_S = 900.0
+# The cap spans the usage endpoint's ~1h rolling window: a saturating burst
+# blocks the token for up to a full trailing hour, and the server's Retry-After
+# reports that horizon accurately. Capping below it (the old 900s) meant
+# re-probing mid-window — each probe re-arms the block and prevents the token
+# from ever draining — so an account could stay throttled indefinitely under
+# steady polling (worst across machines sharing one token). The cap still
+# bounds a pathological header to one window, never hours.
+RETRY_AFTER_FLOOR_CAP_S = 3600.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
@@ -316,9 +336,17 @@ class UsageStore:
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
+            # A usage-endpoint 429 throttles polling without moving the
+            # account's real windows, so its last_good stays trustworthy for a
+            # wider (still client-bounded) ceiling than a non-429 failure.
+            trust_ceiling = (
+                RATE_LIMIT_TRUST_MAX_AGE_S
+                if row.get("lastError") == "http-429"
+                else TRUST_MAX_AGE_S
+            )
             trust_extended = (
                 age_s is not None
-                and age_s <= TRUST_MAX_AGE_S
+                and age_s <= trust_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
