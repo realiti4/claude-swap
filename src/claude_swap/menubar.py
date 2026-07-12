@@ -206,10 +206,12 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
 
 
 def format_account_label(
-    num, email: str, usage: dict | str | None, now: float | None = None
+    num, email: str, usage: dict | str | None, now: float | None = None,
+    alias: str | None = None,
 ) -> str:
-    """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage, now)}"
+    """Build one account row's menu label. Prepends the alias when set."""
+    label = f"{alias} ({email})" if alias else email
+    return f"{num}  {label}  {usage_summary(usage, now)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -225,15 +227,20 @@ def format_title(
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
+    active_alias: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``active_alias``, when set, is shown instead of the email's local-part
+    (still truncated to the same 12-char limit for a long alias).
+    """
     if active_email is None:
         return ICON
     if now is None:
         now = time.time()
     segments: list[str] = []
     if settings.show_account_name:
-        segments.append(_local_part(active_email))
+        segments.append(_local_part(active_alias or active_email))
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
@@ -321,28 +328,33 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
-EMPTY_SNAPSHOT: dict = {"accounts": [], "active_email": None, "active_usage": None}
+EMPTY_SNAPSHOT: dict = {
+    "accounts": [], "active_email": None, "active_usage": None, "active_alias": None,
+}
 
 
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``. The snapshot
-    itself is produced by ``SnapshotSource`` (the paced read path), so this is a
-    pure transform — no fetching, no I/O.
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias), ...],
+    "active_email": str | None, "active_usage": dict | str | None,
+    "active_alias": str | None}``. The snapshot itself is produced by
+    ``SnapshotSource`` (the paced read path), so this is a pure transform —
+    no fetching, no I/O.
     """
     accounts = []
     active_email = None
     active_usage = None
+    active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
-        accounts.append((acc.number, acc.email, acc.is_active, display, acc.usage.last_good))
+        accounts.append((acc.number, acc.email, acc.is_active, display, acc.usage.last_good, acc.alias))
         if acc.is_active:
-            active_email, active_usage = acc.email, display
+            active_email, active_usage, active_alias = acc.email, display, acc.alias
     return {
         "accounts": accounts,
         "active_email": active_email,
+        "active_alias": active_alias,
         "active_usage": active_usage,
     }
 
@@ -428,7 +440,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -538,13 +550,14 @@ def run(switcher) -> int:
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
-                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
+                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings,
+                active_alias=self.snapshot.get("active_alias"),
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, alias in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, display),
+                    format_account_label(num, email, display, alias=alias),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -581,8 +594,9 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good in accounts:
-                menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
+            for num, email, _is_active, _display, _last_good, alias in accounts:
+                label = f"{alias} ({email})" if alias else email
+                menu.add(rumps.MenuItem(f"{num}  {label}", callback=self._make_remove(num)))
             return menu
 
         def _history_menu(self, rumps):

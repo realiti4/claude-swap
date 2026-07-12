@@ -21,7 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.models import Platform, get_timestamp
+from claude_swap.models import Platform, get_timestamp, normalize_alias
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -74,15 +74,21 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
             f"invalid slot number in imported account ({email}): {raw_number!r}"
         )
 
-    # Org/uuid/added must be strings (or absent). A list/dict here would
+    # Org/uuid/added/alias must be strings (or absent). A list/dict here would
     # otherwise blow up downstream (unhashable in seen_keys, broken composite
     # key matching, garbage in sequence.json).
-    for field in ("organizationUuid", "organizationName", "uuid", "added"):
+    for field in ("organizationUuid", "organizationName", "uuid", "added", "alias"):
         if field in account and account[field] is not None:
             if not isinstance(account[field], str):
                 raise TransferError(
                     f"{field} for {email} must be a string, got {type(account[field]).__name__}"
                 )
+
+    if account.get("alias"):
+        try:
+            normalize_alias(account["alias"])
+        except ValueError as e:
+            raise TransferError(f"invalid alias for {email}: {e}") from e
 
     return email, str(raw_number)
 
@@ -220,6 +226,8 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+        if record.get("alias"):
+            entry["alias"] = record["alias"]
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -311,6 +319,7 @@ def import_accounts(
     # later in the list must not leave earlier accounts half-imported.
     normalized: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
+    seen_aliases: set[str] = set()
     for raw in accounts:
         email, exported_num = _validate_imported_account(switcher, raw)
         org_uuid = raw.get("organizationUuid", "") or ""
@@ -339,6 +348,12 @@ def import_accounts(
                 f"duplicate account in export: {email} (org={org_uuid or 'personal'})"
             )
         seen_keys.add(key)
+        alias = raw.get("alias") or None
+        if alias:
+            alias = alias.strip().lower()
+            if alias in seen_aliases:
+                raise TransferError(f"duplicate alias in export: {alias}")
+            seen_aliases.add(alias)
         normalized.append(
             {
                 "email": email,
@@ -347,6 +362,7 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
+                "alias": alias,
                 "kind": "api_key" if is_api_key else "oauth",
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -440,6 +456,26 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        if entry["alias"]:
+            # Alias is display sugar, not critical account data: a collision
+            # with an already-present *different* local account (not this
+            # import's own target/prior slot) drops the alias with a warning
+            # rather than aborting the whole import — writes already
+            # committed for earlier accounts in this pass can't be undone.
+            colliding = next(
+                (
+                    n for n, acc in data["accounts"].items()
+                    if n != target_num and acc.get("alias") == entry["alias"]
+                ),
+                None,
+            )
+            if colliding:
+                _eprint(
+                    f"Alias '{entry['alias']}' for {entry['email']} collides with "
+                    f"Account-{colliding}'s existing alias — imported without it"
+                )
+            else:
+                new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

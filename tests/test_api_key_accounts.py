@@ -229,7 +229,7 @@ class TestUsageDisplay:
 
     def test_collect_usage_short_circuits(self, temp_home: Path):
         s = _linux_switcher()
-        info = [(2, "api-key-2@token.local", "", "", False, API_KEY)]
+        info = [(2, "api-key-2@token.local", "", "", False, API_KEY, None)]
         entries = s._collect_usage_entries(info)
         assert entries["2"].sentinel == USAGE_API_KEY
         assert entries["2"].decision_value() == USAGE_API_KEY

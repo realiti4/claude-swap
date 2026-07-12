@@ -1143,6 +1143,161 @@ class TestMapCommand:
         assert "root" in capsys.readouterr().err
 
 
+class TestAliasCommand:
+    """`cswap alias` — issue #110's per-account short names."""
+
+    def _seeded_switcher_env(self, temp_home):
+        """Build a real switcher with two managed accounts."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "dev@co.com", "uuid": "u1",
+            "organizationUuid": "", "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["accounts"]["2"] = {
+            "email": "content@co.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "", "added": "2024-01-02T00:00:00Z",
+        }
+        data["sequence"] = [1, 2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_set_alias_by_number(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["1", "dev"])
+        assert "Aliased" in capsys.readouterr().out
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["alias"] == "dev"
+
+    def test_list_empty(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command([])
+        assert "No aliases set yet" in capsys.readouterr().out
+
+    def test_list_shows_entries(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["1", "dev"])
+            cli._alias_command([])
+        out = capsys.readouterr().out
+        assert "dev" in out
+        assert "dev@co.com" in out
+
+    def test_unset_alias(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["1", "dev"])
+            cli._alias_command(["1", "--unset"])
+        assert "Cleared alias" in capsys.readouterr().out
+        data = switcher._get_sequence_data()
+        assert "alias" not in data["accounts"]["1"]
+
+    def test_duplicate_alias_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["1", "dev"])
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["2", "dev"])
+        assert exc.value.code == 1
+        assert "already used" in capsys.readouterr().err
+
+    def test_purely_numeric_alias_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["1", "123"])
+        assert exc.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_unknown_identifier_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["999", "dev"])
+        assert exc.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_identifier_without_name_or_unset_is_usage_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["1"])
+        assert exc.value.code == 2
+
+    def test_unset_with_name_is_usage_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["1", "dev", "--unset"])
+        assert exc.value.code == 2
+
+    def test_name_or_unset_without_identifier_is_usage_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        # argparse can't actually produce name-without-identifier via nargs="?"
+        # positional consumption order, but --unset alone (no identifier) can.
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["--unset"])
+        assert exc.value.code == 2
+
+    def test_alias_dispatched_from_main(self, temp_home):
+        """`cswap alias` routes through main() to _alias_command."""
+        with patch("claude_swap.cli._alias_command") as alias_fn, \
+             patch.object(sys, "argv", ["claude-swap", "alias", "1", "dev"]):
+            cli.main()
+        alias_fn.assert_called_once_with(["1", "dev"])
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_alias_refuses_root(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container", return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["1", "dev"])
+        assert exc.value.code == 1
+        assert "root" in capsys.readouterr().err
+
+    def test_switch_by_alias_end_to_end(self, temp_home, capsys):
+        """The real regression this feature fixes: switch_to used to reject
+        any non-digit identifier as an invalid email before the alias table
+        was ever consulted."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["2", "dev"])
+        # Drive main()'s translated `switch dev` -> --switch-to dev, same
+        # entry point a real invocation uses, and confirm it gets PAST
+        # identifier resolution (no "Invalid email format") to the next,
+        # expected failure (no stored credentials for this fixture account).
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "switch", "dev"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        err = capsys.readouterr().err
+        assert "Invalid email format" not in err
+
+
+class TestAddAliasFlag:
+    """`cswap add --alias NAME` convenience."""
+
+    def test_add_alias_wired_to_switcher(self, temp_home):
+        with patch.object(ClaudeAccountSwitcher, "add_account") as add_fn, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "add", "--alias", "dev"]):
+            cli.main()
+        add_fn.assert_called_once_with(slot=None, alias="dev")
+
+    def test_alias_flag_without_add_is_usage_error(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "status", "--alias", "dev"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+
+
 class TestRunAutoResolve:
     """`cswap run` with no account resolves the cwd's directory mapping."""
 

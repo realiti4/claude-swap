@@ -146,6 +146,7 @@ def account_row(
     *,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
+    alias: str | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
@@ -159,6 +160,8 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if alias:
+        row["alias"] = alias
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     return row

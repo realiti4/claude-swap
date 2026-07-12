@@ -547,7 +547,7 @@ class TestFetchAccountUsageSessionProfile:
     """
 
     def _info(self, backup_creds: str) -> tuple:
-        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds)
+        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, None)
 
     def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
         """Profile creds are used with is_active=True (no refresh, no persist)."""
@@ -751,6 +751,31 @@ class TestListAccountsUsage:
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    def test_list_shows_alias_before_email_keeping_num_prefix(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """Issue #110: an aliased account renders 'alias (email)' after the
+        '  {num}: ' prefix — the prefix itself must survive intact, since the
+        TUI watch view (tui._watch_account_rows) parses it for quick-switch."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["alias"] = "dev"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "  1: dev (test@example.com) [personal] (active)" in output
+        # unaliased account 2 keeps rendering plain email, not "None (...)"
+        assert "  2: account2@example.com" in output
 
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -1389,7 +1414,7 @@ class TestActiveAccountRefresh:
             {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
             {"1": ("test@example.com", "")},
         )
-        info = (1, "test@example.com", "", "", True, self._EXPIRED)
+        info = (1, "test@example.com", "", "", True, self._EXPIRED, None)
 
         with patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
@@ -2284,7 +2309,7 @@ class TestDeadTokenQuarantine:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher)
-        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), None)]
 
         with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
             entries = switcher._collect_usage_entries(info)
@@ -2300,7 +2325,7 @@ class TestDeadTokenQuarantine:
         from claude_swap.usage_store import FetchRecord
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), None)]
 
         with patch.object(
             switcher, "_run_usage_fetches",
@@ -2458,6 +2483,210 @@ class TestResolveIdentifierAmbiguity:
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
         switcher = ClaudeAccountSwitcher()
         assert switcher._resolve_account_identifier("account1@example.com") == "1"
+
+
+# ── Issue #110: per-account aliases ──────────────────────────────────────────
+
+class TestAccountAliases:
+    """set_alias/unset_alias/list_aliases and identifier resolution via alias."""
+
+    def _switcher(self, sample_sequence_data):
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        return ClaudeAccountSwitcher()
+
+    def test_set_alias_round_trips_by_number(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        num, normalized = switcher.set_alias("1", "Dev-Box")
+        assert num == "1"
+        assert normalized == "dev-box"  # lowercased
+        assert switcher._resolve_account_identifier("dev-box") == "1"
+        assert switcher._resolve_account_identifier("Dev-Box") == "1"  # case-insensitive lookup too
+
+    def test_set_alias_by_email(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        num, _ = switcher.set_alias("account2@example.com", "content")
+        assert num == "2"
+        assert switcher._resolve_account_identifier("content") == "2"
+
+    def test_number_precedence_over_alias(self, temp_home, sample_sequence_data):
+        """A purely-numeric alias can never be set, so a slot number always
+        resolves as a slot number, never as a collision with an alias."""
+        switcher = self._switcher(sample_sequence_data)
+        with pytest.raises(ValidationError):
+            switcher.set_alias("1", "2")
+
+    def test_alias_precedence_over_email(self, temp_home, sample_sequence_data):
+        """An alias that happens to look like an unrelated email string still
+        resolves as the alias it is (aliases are checked before email match)."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+        assert switcher._resolve_account_identifier("dev") == "1"
+
+    def test_duplicate_alias_rejected(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+        with pytest.raises(ConfigError, match="already used"):
+            switcher.set_alias("2", "dev")
+
+    def test_rename_via_existing_alias_identifier(self, temp_home, sample_sequence_data):
+        """cswap alias <old> <new> — identifier can itself be an alias."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+        num, normalized = switcher.set_alias("dev", "prod")
+        assert num == "1"
+        assert normalized == "prod"
+        assert switcher._resolve_account_identifier("prod") == "1"
+        assert switcher._resolve_account_identifier("dev") is None
+
+    def test_purely_numeric_alias_rejected(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        with pytest.raises(ValidationError, match="numeric"):
+            switcher.set_alias("1", "123")
+
+    def test_alias_with_invalid_characters_rejected(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        with pytest.raises(ValidationError):
+            switcher.set_alias("1", "has space")
+        with pytest.raises(ValidationError):
+            switcher.set_alias("1", "has@at")
+
+    def test_alias_normalized_lowercase_and_trimmed(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        _, normalized = switcher.set_alias("1", "  Dev_Box.1  ")
+        assert normalized == "dev_box.1"
+
+    def test_set_alias_unknown_identifier_raises(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias("999", "dev")
+
+    def test_unset_alias_clears_and_resolution_reverts(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+        num = switcher.unset_alias("1")
+        assert num == "1"
+        assert switcher._resolve_account_identifier("dev") is None
+        assert switcher._resolve_account_identifier("1") == "1"  # slot number unaffected
+
+    def test_unset_alias_idempotent(self, temp_home, sample_sequence_data):
+        """Clearing an already-unset alias must not raise."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.unset_alias("1")  # never set — should be a silent no-op
+        switcher.unset_alias("1")
+
+    def test_list_aliases_sequence_order(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("2", "content")
+        switcher.set_alias("1", "dev")
+        assert switcher.list_aliases() == [
+            ("1", "dev", "account1@example.com"),
+            ("2", "content", "account2@example.com"),
+        ]
+
+    def test_list_aliases_empty(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        assert switcher.list_aliases() == []
+
+    def test_switch_to_accepts_alias_without_email_format_error(
+        self, temp_home, sample_sequence_data
+    ):
+        """The real bug this feature guards against: switch_to used to gate
+        every non-digit identifier through _validate_email before it ever
+        reached _resolve_account_identifier, so `cswap switch dev` failed
+        with 'Invalid email format' instead of resolving the alias."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("2", "dev")
+        with pytest.raises(SwitchError, match="no stored credentials"):
+            # Gets past identifier resolution (no ValidationError) and fails
+            # later for an unrelated, expected reason: no stored credentials
+            # for this synthetic fixture account.
+            switcher.switch_to("dev")
+
+    def test_remove_account_accepts_alias_without_email_format_error(
+        self, temp_home, sample_sequence_data
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("2", "dev")
+        with patch("builtins.input", return_value="n"):
+            switcher.remove_account("dev", assume_yes=False)
+        # Reaching the confirmation path (not a ValidationError) proves the
+        # alias resolved; the account is still present since input() was "n".
+        data = switcher._get_sequence_data()
+        assert "2" in data["accounts"]
+
+    def test_add_account_preserves_alias_on_reslot(self, temp_home, sample_sequence_data):
+        """Moving an aliased account to a new explicit slot must not silently
+        drop its alias (the gap the maintainer flagged for `cswap add`)."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "account1@example.com", "accountUuid": "u"}
+        }))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=3, assume_yes=True)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["3"]["alias"] == "dev"
+        assert "1" not in data["accounts"]
+
+    def test_add_account_alias_kwarg_sets_alias_on_new_account(
+        self, temp_home, sample_sequence_data
+    ):
+        """cswap add --alias dev convenience."""
+        switcher = self._switcher(sample_sequence_data)
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "new@example.com", "accountUuid": "u"}
+        }))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(alias="newbie")
+
+        data = switcher._get_sequence_data()
+        num = switcher._find_account_slot(data, "new@example.com", "")
+        assert data["accounts"][num]["alias"] == "newbie"
+
+    def test_add_account_alias_collision_raises(self, temp_home, sample_sequence_data):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "new@example.com", "accountUuid": "u"}
+        }))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             pytest.raises(ConfigError, match="already used"):
+            switcher.add_account(alias="dev")
+
+    def test_add_account_refresh_in_place_never_touches_alias(
+        self, temp_home, sample_sequence_data
+    ):
+        """Re-running `cswap add` for an already-managed account (the
+        refresh-credentials-in-place branch) must leave its alias untouched —
+        it never even looks at the alias field."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "at2", "refreshToken": "rt2"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "account1@example.com", "accountUuid": "u"}
+        }))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["alias"] == "dev"
 
 
 # ── Task 7: list_accounts org display ────────────────────────────────────────
@@ -5254,8 +5483,8 @@ class TestDuplicateAccountDetection:
             "accessToken": "sk", "refreshToken": "rt-shared",
         }})
         info = [
-            (1, "account1@example.com", "", "", True, same),
-            (2, "account2@example.com", "", "", False, same),
+            (1, "account1@example.com", "", "", True, same, None),
+            (2, "account2@example.com", "", "", False, same, None),
         ]
         warnings = switcher._duplicate_account_warnings(info)
         assert len(warnings) == 1
@@ -5267,8 +5496,8 @@ class TestDuplicateAccountDetection:
         sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-1"
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
-            (1, "account1@example.com", "", "", True, "creds-a"),
-            (2, "account2@example.com", "", "", False, "creds-b"),
+            (1, "account1@example.com", "", "", True, "creds-a", None),
+            (2, "account2@example.com", "", "", False, "creds-b", None),
         ]
         warnings = switcher._duplicate_account_warnings(info)
         assert len(warnings) == 1
@@ -5282,8 +5511,8 @@ class TestDuplicateAccountDetection:
         sample_sequence_data["accounts"]["2"]["uuid"] = ""
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
-            (1, "setup-token-1@token.local", "", "", True, "creds-a"),
-            (2, "setup-token-2@token.local", "", "", False, "creds-b"),
+            (1, "setup-token-1@token.local", "", "", True, "creds-a", None),
+            (2, "setup-token-2@token.local", "", "", False, "creds-b", None),
         ]
         assert switcher._duplicate_account_warnings(info) == []
 
@@ -5293,9 +5522,9 @@ class TestDuplicateAccountDetection:
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
             (1, "account1@example.com", "", "", True,
-             json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}})),
+             json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}}), None),
             (2, "account2@example.com", "", "", False,
-             json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}})),
+             json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}}), None),
         ]
         assert switcher._duplicate_account_warnings(info) == []
 
@@ -5314,7 +5543,7 @@ class TestLockstepUsageDetection:
     @staticmethod
     def _info(n=2):
         return [
-            (i, f"account{i}@example.com", "", "", i == 1, f"creds-{i}")
+            (i, f"account{i}@example.com", "", "", i == 1, f"creds-{i}", None)
             for i in range(1, n + 1)
         ]
 

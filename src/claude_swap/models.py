@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,6 +46,32 @@ class Platform(Enum):
         return cls.UNKNOWN
 
 
+#: Alias validation: letters/digits/-/_/., non-empty, not purely digits (so
+#: an alias can never collide with a slot number in _resolve_account_identifier).
+_ALIAS_RE = re.compile(r"^[a-z0-9_.-]+$")
+
+
+def normalize_alias(name: str) -> str:
+    """Lowercase and validate a proposed alias; raise ValueError if invalid.
+
+    Shared by the CLI (`cswap alias`) and `cswap add --alias` so both paths
+    enforce identical rules: letters/digits/``-``/``_``/``.`` only, and not
+    purely digits (a numeric alias would be indistinguishable from a slot
+    number in ``_resolve_account_identifier``, which checks ``isdigit()``
+    first).
+    """
+    normalized = name.strip().lower()
+    if not normalized:
+        raise ValueError("alias cannot be empty")
+    if normalized.isdigit():
+        raise ValueError(f"alias '{name}' cannot be purely numeric (reserved for slot numbers)")
+    if not _ALIAS_RE.match(normalized):
+        raise ValueError(
+            f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
+        )
+    return normalized
+
+
 @dataclass
 class AccountInfo:
     """Information about a managed account."""
@@ -55,6 +82,7 @@ class AccountInfo:
     organization_name: str
     added: str
     number: int
+    alias: str | None = None
 
     @property
     def is_organization(self) -> bool:
@@ -63,8 +91,10 @@ class AccountInfo:
 
     @property
     def display_label(self) -> str:
-        """Display label: 'email [OrgName]' or 'email [personal]'."""
+        """Display label: 'alias (email) [OrgName]' or 'email [personal]'."""
         tag = self.organization_name if self.organization_name else "personal"
+        if self.alias:
+            return f"{self.alias} ({self.email}) [{tag}]"
         return f"{self.email} [{tag}]"
 
     @classmethod
@@ -77,17 +107,21 @@ class AccountInfo:
             organization_name=data.get("organizationName", "") or "",
             added=data.get("added", ""),
             number=number,
+            alias=data.get("alias") or None,
         )
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return {
+        d = {
             "email": self.email,
             "uuid": self.uuid,
             "organizationUuid": self.organization_uuid,
             "organizationName": self.organization_name,
             "added": self.added,
         }
+        if self.alias:
+            d["alias"] = self.alias
+        return d
 
 
 @dataclass(frozen=True)
@@ -108,6 +142,7 @@ class AccountSnapshot:
     kind: str  # "oauth" | "api_key"
     switchable: bool
     usage: UsageEntry
+    alias: str | None = None
 
     @property
     def display_tag(self) -> str:

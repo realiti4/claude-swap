@@ -12,6 +12,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
+    bolded,
     dimmed,
     error,
     force_utf8_output,
@@ -322,6 +323,89 @@ def _unmap_command(argv: list[str]) -> None:
             print(f"{accent('Unmapped')} {shown}")
         else:
             print(dimmed(f"No mapping for {shown}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _alias_command(argv: list[str]) -> None:
+    """Handle `cswap alias [NUM|EMAIL|ALIAS [NAME | --unset]]`.
+
+    With no arguments, lists every set alias. With one identifier and no
+    NAME/--unset, that's a usage error (nothing to do). Pre-dispatched before
+    the main parser for the same reason as `map`/`run` (a positional
+    subcommand can't coexist with the main parser's required mutually-
+    exclusive flag group).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap alias",
+        description=(
+            "Give a managed account a short, memorable name — usable "
+            "anywhere a slot number or email is (switch, remove, run). "
+            "With no arguments, lists every set alias."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap alias                    # list current aliases
+  cswap alias 2 dev              # set (also: cswap alias user@example.com dev)
+  cswap alias dev prod           # rename an existing alias
+  cswap alias 2 --unset          # remove
+  cswap switch dev               # aliases work anywhere an identifier does
+        """,
+    )
+    parser.add_argument(
+        "identifier",
+        nargs="?",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Account to name (number, email, or its current alias). Omit to list.",
+    )
+    parser.add_argument(
+        "name",
+        nargs="?",
+        metavar="NAME",
+        help="The new alias (letters, digits, '-', '_', '.'; not purely numeric)",
+    )
+    parser.add_argument(
+        "--unset",
+        action="store_true",
+        help="Remove the identifier's alias instead of setting one",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.name is not None:
+        parser.error("--unset takes no NAME")
+    if args.identifier is not None and args.name is None and not args.unset:
+        parser.error("expected NAME (or --unset)")
+    if args.identifier is None and (args.name is not None or args.unset):
+        parser.error("NAME/--unset require an identifier")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.identifier is None:
+            aliases = switcher.list_aliases()
+            if not aliases:
+                print(dimmed("No aliases set yet."))
+                print(muted("Set one with: cswap alias <NUM|EMAIL> <NAME>"))
+                return
+            print(bolded("Aliases:"))
+            for num, alias, email in aliases:
+                print(f"  {num}: {accent(alias)} ({email})")
+            return
+
+        if args.unset:
+            account_num = switcher.unset_alias(args.identifier)
+            print(f"{accent('Cleared alias')} for Account-{account_num}")
+            return
+
+        account_num, normalized = switcher.set_alias(args.identifier, args.name)
+        print(f"{accent('Aliased')} Account-{account_num} {muted('as')} {normalized}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -684,6 +768,9 @@ def main() -> None:
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])
         return
+    if argv and argv[0] == "alias":
+        _alias_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -715,6 +802,8 @@ Commands:
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
+  %(prog)s alias <num|email> <name>   give an account a short name
+  %(prog)s alias                      list aliases
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
@@ -790,6 +879,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         type=int,
         metavar="NUM",
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
+    )
+    parser.add_argument(
+        "--alias",
+        metavar="NAME",
+        help=(
+            "Set an alias at add time (use with 'add'), equivalent to a "
+            "follow-up 'cswap alias <num> <alias>'"
+        ),
     )
     parser.add_argument(
         "--email",
@@ -951,6 +1048,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
+    if args.alias is not None and not args.add_account:
+        parser.error("--alias can only be used with 'add'")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
@@ -991,7 +1091,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot)
+            switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,

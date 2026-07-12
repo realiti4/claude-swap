@@ -77,6 +77,7 @@ def make_account(
     kind: str = "oauth",
     entry: UsageEntry | None = None,
     email: str | None = None,
+    alias: str | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -87,6 +88,7 @@ def make_account(
         kind=kind,
         switchable=switchable,
         usage=entry if entry is not None else make_entry(),
+        alias=alias,
     )
 
 
@@ -267,6 +269,25 @@ class TestFormatting:
             80,
         ).plain
         assert "last seen" not in api_key
+
+    def test_account_card_and_mini_text_show_alias_before_email(self):
+        """Issue #110: aliased accounts render 'alias (email)' in both the
+        full card (dashboard) and the minimized line (inactive accounts)."""
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        aliased = make_account(1, active=True, email="dev@example.com", alias="dev")
+        card = account_card_text(aliased, 80).plain
+        assert "dev (dev@example.com)" in card
+
+        unaliased = make_account(2, email="plain@example.com")
+        card2 = account_card_text(unaliased, 80).plain
+        assert "plain@example.com" in card2
+        assert "(plain@example.com)" not in card2  # no spurious parens without an alias
+
+        mini = mini_account_text(
+            make_account(3, email="mini@example.com", alias="short"), time.time()
+        ).plain
+        assert "short (mini@example.com)" in mini
 
     def test_window_helpers(self):
         entry = make_entry(pct5=47.0)
