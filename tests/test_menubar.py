@@ -201,6 +201,30 @@ def test_format_title_icon_only_when_off():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
 
 
+def test_format_title_scoped_appends_model_limits():
+    # title_pct="off" + title_scoped gives a title tracking only the scoped model
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_scoped=True)
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · Fable 55%"
+
+
+def test_format_title_scoped_after_windows_multiple_models():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_scoped=True)
+    usage = {
+        **_USAGE,
+        "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
+    }
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+
+
+def test_format_title_scoped_off_by_default():
+    # default settings ignore scoped windows entirely
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert not s.title_scoped
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄"
+
+
 def test_format_title_icon_only_when_no_active_account():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title(None, None, s) == "⇄"

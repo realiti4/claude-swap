@@ -45,6 +45,7 @@ class MenuBarSettings:
 
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
+    title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -243,6 +244,13 @@ def format_title(
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
             segments.append(f"{p:.0f}%")
+    if settings.title_scoped and isinstance(active_usage, dict):
+        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
+        # dropdown rows; named so multiple scoped models stay distinguishable.
+        for window in active_usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+                segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -608,6 +616,12 @@ def run(switcher) -> int:
                 title_pct.add(ch)
             menu.add(title_pct)
 
+            scoped_item = rumps.MenuItem(
+                "Show model limits in title", callback=self.on_toggle_scoped
+            )
+            scoped_item.state = 1 if self.settings.title_scoped else 0
+            menu.add(scoped_item)
+
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -746,6 +760,10 @@ def run(switcher) -> int:
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
+            self._save_and_rebuild()
+
+        def on_toggle_scoped(self, _sender):
+            self.settings.title_scoped = not self.settings.title_scoped
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
