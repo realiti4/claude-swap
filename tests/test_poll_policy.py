@@ -127,8 +127,52 @@ class TestPost429Floor:
         assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
 
     def test_slower_learned_cadence_survives_the_floor(self):
+        # A learned interval already above the floor is grown (×1.5), never
+        # dropped back to the floor.
         _, interval = _plan(
             recent_429=True, prev_interval_s=590.0, prev_usage=_usage(10)
+        )
+        assert interval == pytest.approx(590.0 * poll_policy.POST_429_BACKOFF_MULT)
+        assert interval > poll_policy.POST_429_MIN_INTERVAL_S
+
+
+class TestPost429Aimd:
+    """AIMD backoff on a contended token: while 429s recur, each successful
+    poll multiplicatively increases the interval toward a wider 429 ceiling, so
+    independent machines sharing one token each retreat and their combined poll
+    rate converges under the endpoint budget (no cross-machine coordination)."""
+
+    def test_recent_429_multiplicatively_increases_from_prev(self):
+        # A prior 360s interval, still seeing 429s, is pushed up (×1.5), not
+        # held flat at the floor.
+        _, interval = _plan(
+            recent_429=True,
+            prev_interval_s=poll_policy.POST_429_MIN_INTERVAL_S,  # 360
+            prev_usage=_usage(10),
+        )
+        assert interval > poll_policy.POST_429_MIN_INTERVAL_S
+        assert interval == pytest.approx(
+            poll_policy.POST_429_MIN_INTERVAL_S * poll_policy.POST_429_BACKOFF_MULT
+        )
+
+    def test_recent_429_ceiling_exceeds_normal_candidate_max(self):
+        # The 429 ceiling is wider than the normal candidate ceiling so a
+        # contended token can back off far enough for several machines to fit.
+        assert (
+            poll_policy.POST_429_MAX_INTERVAL_S
+            > poll_policy.CANDIDATE_MAX_INTERVAL_S
+        )
+        _, interval = _plan(
+            recent_429=True,
+            prev_interval_s=poll_policy.POST_429_MAX_INTERVAL_S,  # already at ceiling
+            prev_usage=_usage(10),
+        )
+        assert interval == poll_policy.POST_429_MAX_INTERVAL_S
+
+    def test_no_429_uses_normal_ceiling(self):
+        # Without recent 429s the wider ceiling never applies (normal cadence).
+        _, interval = _plan(
+            recent_429=False, prev_interval_s=590.0, prev_usage=_usage(10)
         )
         assert interval == poll_policy.CANDIDATE_MAX_INTERVAL_S
 
