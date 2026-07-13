@@ -33,7 +33,12 @@ from typing import TYPE_CHECKING, Callable
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import MigrationIncomplete
-from claude_swap.models import Platform, get_timestamp
+from claude_swap.models import (
+    PROVIDER_CLAUDE,
+    SEQUENCE_SCHEMA_VERSION,
+    Platform,
+    get_timestamp,
+)
 from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
 
 if TYPE_CHECKING:
@@ -492,10 +497,51 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+def tag_accounts_with_provider(switcher: "ClaudeAccountSwitcher") -> bool:
+    """Stamp an explicit ``provider`` field onto every managed account.
+
+    Pre-multi-provider installs have no ``provider`` key on account records
+    (implicitly Claude-only). This tags every such record ``"claude"`` and
+    bumps ``sequence.json``'s ``schemaVersion`` to
+    :data:`~claude_swap.models.SEQUENCE_SCHEMA_VERSION`, so Codex support (and
+    any other account-model consumer) can rely on the field always being
+    present on disk rather than defaulting it ad hoc on every read.
+
+    Runs on every platform (unlike the keyring migrations above, this has
+    nothing to do with the credential storage backend). Returns ``True``
+    (completed) once every account is tagged and the schema version is
+    current — including the benign "already tagged" case; ``False`` (skip)
+    when there's no readable sequence yet.
+    """
+    if not switcher.sequence_file.exists():
+        return False
+    data = switcher._get_sequence_data()
+    if data is None:
+        # Corrupt sequence.json. Never mark applied: a user who repairs or
+        # restores it must still get this migration.
+        return False
+
+    accounts = data.get("accounts", {})
+    changed = False
+    for record in accounts.values():
+        if "provider" not in record:
+            record["provider"] = PROVIDER_CLAUDE
+            changed = True
+    if data.get("schemaVersion") != SEQUENCE_SCHEMA_VERSION:
+        data["schemaVersion"] = SEQUENCE_SCHEMA_VERSION
+        changed = True
+
+    if changed:
+        data["lastUpdated"] = get_timestamp()
+        switcher._write_json(switcher.sequence_file, data)
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
+    ("tag_accounts_with_provider", tag_accounts_with_provider),
 ]
 
 

@@ -17,6 +17,19 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+# Provider tags for a managed account. New provider identifiers get added
+# here, not scattered through call sites, so ``AccountInfo``, migrations, and
+# adapter dispatch all read from one place.
+PROVIDER_CLAUDE = "claude"
+PROVIDER_CODEX = "codex"
+
+# ``sequence.json``'s on-disk shape version. Bumped when account records gain
+# a field every consumer must be able to rely on (see
+# ``migrations.tag_accounts_with_provider``), as opposed to ``kind``-style
+# optional fields that default per-read.
+SEQUENCE_SCHEMA_VERSION = 2
+
+
 class Platform(Enum):
     """Supported platforms."""
 
@@ -55,6 +68,7 @@ class AccountInfo:
     organization_name: str
     added: str
     number: int
+    provider: str = PROVIDER_CLAUDE
 
     @property
     def is_organization(self) -> bool:
@@ -69,7 +83,12 @@ class AccountInfo:
 
     @classmethod
     def from_dict(cls, number: int, data: dict) -> AccountInfo:
-        """Create AccountInfo from dictionary."""
+        """Create AccountInfo from dictionary.
+
+        ``provider`` defaults to ``claude`` for records written before this
+        field existed (see ``migrations.tag_accounts_with_provider``, which
+        also stamps it onto every account on disk going forward).
+        """
         return cls(
             email=data.get("email", ""),
             uuid=data.get("uuid", ""),
@@ -77,6 +96,7 @@ class AccountInfo:
             organization_name=data.get("organizationName", "") or "",
             added=data.get("added", ""),
             number=number,
+            provider=data.get("provider") or PROVIDER_CLAUDE,
         )
 
     def to_dict(self) -> dict:
@@ -87,6 +107,7 @@ class AccountInfo:
             "organizationUuid": self.organization_uuid,
             "organizationName": self.organization_name,
             "added": self.added,
+            "provider": self.provider,
         }
 
 

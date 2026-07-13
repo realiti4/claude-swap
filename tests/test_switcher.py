@@ -2211,6 +2211,34 @@ class TestAccountInfoOrgFields:
         assert personal.display_label == "u@e.com [personal]"
 
 
+class TestAccountInfoProvider:
+    def test_from_dict_defaults_untagged_to_claude(self):
+        """Records written before ``provider`` existed read back as claude."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo.from_dict(1, {
+            "email": "user@example.com", "uuid": "u", "added": "",
+        })
+        assert info.provider == "claude"
+
+    def test_from_dict_preserves_explicit_provider(self):
+        from claude_swap.models import AccountInfo
+        info = AccountInfo.from_dict(1, {
+            "email": "user@example.com", "uuid": "u", "added": "",
+            "provider": "codex",
+        })
+        assert info.provider == "codex"
+
+    def test_to_dict_round_trips_provider(self):
+        from claude_swap.models import AccountInfo
+        info = AccountInfo(
+            email="u@e.com", uuid="u", organization_uuid="", organization_name="",
+            added="", number=1, provider="codex",
+        )
+        d = info.to_dict()
+        assert d["provider"] == "codex"
+        assert AccountInfo.from_dict(1, d).provider == "codex"
+
+
 # ── Task 3: _account_exists composite key ────────────────────────────────────
 
 class TestAccountExistsCompositeKey:

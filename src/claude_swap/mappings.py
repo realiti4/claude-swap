@@ -20,9 +20,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from claude_swap.models import get_timestamp
+from claude_swap.models import PROVIDER_CLAUDE, get_timestamp
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def normalize_path(p: str | Path) -> str:
@@ -63,12 +63,23 @@ class MappingStore:
         """Exact-match lookup for a normalized path (no ancestor walk)."""
         return self.load().get(normalize_path(path))
 
-    def set(self, path: str | Path, email: str, org_uuid: str) -> None:
-        """Upsert a mapping for ``path`` and persist atomically."""
+    def set(
+        self,
+        path: str | Path,
+        email: str,
+        org_uuid: str,
+        provider: str = PROVIDER_CLAUDE,
+    ) -> None:
+        """Upsert a mapping for ``path`` and persist atomically.
+
+        ``provider`` defaults to ``claude`` so existing call sites (and
+        mappings written before this field existed) are unaffected.
+        """
         mappings = self.load()
         mappings[normalize_path(path)] = {
             "email": email,
             "organizationUuid": org_uuid or "",
+            "provider": provider,
             "added": get_timestamp(),
         }
         self._write(mappings)
@@ -81,8 +92,17 @@ class MappingStore:
         self._write(mappings)
         return True
 
-    def prune_account(self, email: str, org_uuid: str) -> int:
-        """Drop every mapping pointing at (email, org_uuid). Return count removed."""
+    def prune_account(
+        self, email: str, org_uuid: str, provider: str = PROVIDER_CLAUDE
+    ) -> int:
+        """Drop every mapping pointing at (email, org_uuid, provider).
+
+        ``provider`` defaults to ``claude`` and matches entries written
+        before the field existed (back-compat) — an (email, org_uuid) pair
+        could theoretically be reused across providers, so provider is
+        checked alongside identity rather than dropped from the match.
+        Returns the count removed.
+        """
         mappings = self.load()
         org = org_uuid or ""
         doomed = [
@@ -90,6 +110,7 @@ class MappingStore:
             for key, entry in mappings.items()
             if entry.get("email") == email
             and (entry.get("organizationUuid", "") or "") == org
+            and (entry.get("provider") or PROVIDER_CLAUDE) == provider
         ]
         for key in doomed:
             del mappings[key]

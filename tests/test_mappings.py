@@ -127,6 +127,56 @@ def test_prune_account(tmp_path: Path):
     assert store.get(c) is not None
 
 
+def test_set_defaults_provider_to_claude(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = MappingStore(tmp_path / "backup")
+    store.set(repo, "a@x.com", "")
+    assert store.get(repo)["provider"] == "claude"
+
+
+def test_set_explicit_provider(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = MappingStore(tmp_path / "backup")
+    store.set(repo, "a@x.com", "", provider="codex")
+    assert store.get(repo)["provider"] == "codex"
+
+
+def test_prune_account_scopes_by_provider(tmp_path: Path):
+    """Same (email, org) reused across providers only prunes the matching one."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+    store = MappingStore(tmp_path / "backup")
+    store.set(a, "shared@x.com", "org-1", provider="claude")
+    store.set(b, "shared@x.com", "org-1", provider="codex")
+
+    removed = store.prune_account("shared@x.com", "org-1", provider="claude")
+
+    assert removed == 1
+    assert store.get(a) is None
+    assert store.get(b) is not None
+
+
+def test_prune_account_defaults_to_claude_for_untagged_entries(tmp_path: Path):
+    """A mapping written before ``provider`` existed still prunes on default."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = MappingStore(tmp_path / "backup")
+    store.set(repo, "a@x.com", "org-1")
+    mappings = store.load()
+    key = next(iter(mappings))
+    del mappings[key]["provider"]
+    store._write(mappings)
+
+    removed = store.prune_account("a@x.com", "org-1")
+
+    assert removed == 1
+    assert store.get(repo) is None
+
+
 def test_load_missing_file_is_empty(tmp_path: Path):
     store = MappingStore(tmp_path / "backup")
     assert store.load() == {}
@@ -161,7 +211,7 @@ def test_persisted_schema(tmp_path: Path):
     store.set(repo, "a@x.com", "org-1")
 
     data = json.loads((backup / "mappings.json").read_text())
-    assert data["schemaVersion"] == 1
+    assert data["schemaVersion"] == 2
     assert normalize_path(repo) in data["mappings"]
 
 

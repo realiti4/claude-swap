@@ -46,6 +46,8 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
+    PROVIDER_CLAUDE,
+    SEQUENCE_SCHEMA_VERSION,
     AccountSnapshot,
     AccountsSnapshot,
     Platform,
@@ -890,6 +892,7 @@ class ClaudeAccountSwitcher:
         """Initialize sequence.json if it doesn't exist."""
         if not self.sequence_file.exists():
             init_data = {
+                "schemaVersion": SEQUENCE_SCHEMA_VERSION,
                 "activeAccountNumber": None,
                 "lastUpdated": get_timestamp(),
                 "sequence": [],
@@ -962,6 +965,20 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
         return "api_key" if record.get("kind") == "api_key" else "oauth"
+
+    def _account_provider(self, account_num: str | None) -> str:
+        """Stored provider for a managed slot: ``"claude"`` (default) or
+        ``"codex"``.
+
+        Slots added before this field existed have no ``provider`` and read
+        as ``"claude"`` (back-compat); ``tag_accounts_with_provider`` also
+        stamps it explicitly onto every account on disk.
+        """
+        if account_num is None:
+            return PROVIDER_CLAUDE
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        return record.get("provider") or PROVIDER_CLAUDE
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
@@ -1287,6 +1304,7 @@ class ClaudeAccountSwitcher:
             "organizationUuid": organization_uuid,
             "organizationName": organization_name,
             "added": get_timestamp(),
+            "provider": PROVIDER_CLAUDE,
         }
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -1489,6 +1507,7 @@ class ClaudeAccountSwitcher:
             "organizationUuid": "",
             "organizationName": "",
             "added": get_timestamp(),
+            "provider": PROVIDER_CLAUDE,
         }
         if is_api_key:
             record["kind"] = "api_key"

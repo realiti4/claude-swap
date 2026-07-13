@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap import migrations
+from claude_swap import migrations, models
 from claude_swap.exceptions import MigrationIncomplete
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.migrations import run_migrations
@@ -295,7 +295,7 @@ class TestFailures:
         # Source entry preserved, migration not recorded → retried next run.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.store
         assert fake.deleted == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
         # The bad/partial file must not shadow the intact keyring entry.
         assert not (
             switcher.credentials_dir / ".creds-1-a@example.com.enc"
@@ -324,7 +324,7 @@ class TestFailures:
         # The healthy account migrated; the failed one is untouched + unmarked.
         assert switcher._read_account_credentials("1", "ok@example.com") == "good"
         assert (KEYRING_SERVICE, "account-2-bad@example.com") in fake.store
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
 
     def test_partial_failure_raises_from_migration_fn(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -345,7 +345,7 @@ class TestFailures:
         # Runner swallows it and leaves it unmarked.
         with patch.dict(sys.modules, {"keyring": None}):
             run_migrations(switcher)
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
 
 
 # ---------------------------------------------------------------------------
@@ -594,3 +594,78 @@ class TestMacosKeyringToSecurity:
             run_migrations(switcher)
         state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
         assert "macos_keyring_to_security" in state["applied"]
+
+
+# ---------------------------------------------------------------------------
+# tag_accounts_with_provider — platform-agnostic (unlike the keyring
+# migrations above, this has nothing to do with the credential backend).
+# ---------------------------------------------------------------------------
+
+
+def _make_linux_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
+    """A switcher forced to LINUX, with dirs created — keeps the keyring
+    migrations' platform guards false so only the provider tag runs."""
+    switcher = ClaudeAccountSwitcher()
+    switcher.platform = Platform.LINUX
+    switcher._setup_directories()
+    return switcher
+
+
+class TestTagAccountsWithProvider:
+    def test_skip_when_no_sequence_file(self, temp_home):
+        switcher = _make_linux_switcher(temp_home)
+        assert not switcher.sequence_file.exists()
+        assert migrations.tag_accounts_with_provider(switcher) is False
+
+    def test_skip_when_sequence_corrupt(self, temp_home):
+        switcher = _make_linux_switcher(temp_home)
+        switcher.sequence_file.parent.mkdir(parents=True, exist_ok=True)
+        switcher.sequence_file.write_text("not json", encoding="utf-8")
+        assert migrations.tag_accounts_with_provider(switcher) is False
+
+    def test_tags_untagged_accounts_and_bumps_schema(self, temp_home):
+        switcher = _make_linux_switcher(temp_home)
+        _seed_sequence(
+            switcher,
+            {
+                "1": {"email": "a@example.com"},
+                "2": {"email": "b@example.com", "provider": "codex"},
+            },
+        )
+
+        assert migrations.tag_accounts_with_provider(switcher) is True
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["provider"] == "claude"
+        # Already-tagged accounts (e.g. a future Codex add) are left alone.
+        assert data["accounts"]["2"]["provider"] == "codex"
+        assert data["schemaVersion"] == models.SEQUENCE_SCHEMA_VERSION
+
+    def test_noop_when_already_tagged_and_versioned(self, temp_home):
+        switcher = _make_linux_switcher(temp_home)
+        _seed_sequence(switcher, {"1": {"email": "a@example.com", "provider": "claude"}})
+        data = switcher._get_sequence_data()
+        data["schemaVersion"] = models.SEQUENCE_SCHEMA_VERSION
+        switcher._write_json(switcher.sequence_file, data)
+        before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        assert migrations.tag_accounts_with_provider(switcher) is True
+
+        after = switcher.sequence_file.read_text(encoding="utf-8")
+        assert before == after  # no rewrite when nothing changed
+
+    def test_runner_marks_applied_and_is_idempotent(self, temp_home):
+        switcher = _make_linux_switcher(temp_home)
+        _seed_sequence(switcher, {"1": {"email": "a@example.com"}})
+
+        run_migrations(switcher)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["provider"] == "claude"
+        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        assert "tag_accounts_with_provider" in state["applied"]
+
+        # Re-running is a no-op: still tagged, no crash, no duplicate work.
+        run_migrations(switcher)
+        data_again = switcher._get_sequence_data()
+        assert data_again["accounts"]["1"]["provider"] == "claude"
