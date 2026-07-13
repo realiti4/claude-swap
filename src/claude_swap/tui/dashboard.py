@@ -92,7 +92,11 @@ class DashboardScreen(Screen):
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
         entries: MenuEntries = [
-            (f"{acc.number}  {acc.email}  [{acc.display_tag}]", f"remove:{acc.number}")
+            (
+                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
+                f"  [{acc.display_tag}]",
+                f"remove:{acc.number}",
+            )
             for acc in (snap.accounts if snap else ())
         ]
         entries.append(_BACK)

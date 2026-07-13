@@ -77,6 +77,7 @@ def make_account(
     kind: str = "oauth",
     entry: UsageEntry | None = None,
     email: str | None = None,
+    alias: str = "",
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -87,6 +88,7 @@ def make_account(
         kind=kind,
         switchable=switchable,
         usage=entry if entry is not None else make_entry(),
+        alias=alias,
     )
 
 
@@ -548,6 +550,32 @@ class TestDashboard:
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids[0] == "switch"
+
+    async def test_remove_menu_shows_alias_before_email(self, tmp_path):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, alias="dev"),
+                make_account(2, email="plain@example.com"),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import MenuItem
+
+            await menu_select(pilot, "remove-menu")
+            from textual.widgets import Static
+
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            ]
+            assert any("dev (user1@example.com)" in label for label in labels)
+            assert any("plain@example.com" in label for label in labels)
+            assert not any("(plain@example.com)" in label for label in labels)
 
     async def test_back_menu_entry_pops_submenu(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
