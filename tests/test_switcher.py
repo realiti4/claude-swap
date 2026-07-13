@@ -2239,6 +2239,20 @@ class TestAccountInfoProvider:
         assert AccountInfo.from_dict(1, d).provider == "codex"
 
 
+class TestNormalizeProvider:
+    def test_none_defaults_to_claude(self):
+        from claude_swap.models import normalize_provider
+        assert normalize_provider(None) == "claude"
+
+    def test_empty_string_defaults_to_claude(self):
+        from claude_swap.models import normalize_provider
+        assert normalize_provider("") == "claude"
+
+    def test_explicit_value_passes_through(self):
+        from claude_swap.models import normalize_provider
+        assert normalize_provider("codex") == "codex"
+
+
 # ── Task 3: _account_exists composite key ────────────────────────────────────
 
 class TestAccountExistsCompositeKey:
@@ -2265,6 +2279,67 @@ class TestAccountExistsCompositeKey:
         assert switcher._account_exists("user@example.com", "org-uuid-A") is True
         assert switcher._account_exists("user@example.com", "") is False
         assert switcher._account_exists("user@example.com", "org-uuid-B") is False
+
+
+class TestAccountExistsProviderScoped:
+    def test_same_identity_different_provider_does_not_collide(
+        self, temp_home, mock_credentials_file
+    ):
+        """A codex-tagged slot sharing (email, org) with a claude lookup must
+        not be treated as the same account (would otherwise let add_account's
+        'refresh in place' branch overwrite the wrong slot)."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "shared@example.com",
+                    "uuid": "u",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                    "provider": "codex",
+                }
+            },
+        }))
+        switcher = ClaudeAccountSwitcher()
+
+        # Default (claude) lookup must not match the codex-tagged slot.
+        assert switcher._account_exists("shared@example.com", "") is False
+        assert switcher._find_account_slot(
+            switcher._get_sequence_data(), "shared@example.com", ""
+        ) is None
+
+        # Explicitly asking for codex finds it.
+        assert switcher._account_exists(
+            "shared@example.com", "", provider="codex"
+        ) is True
+        assert switcher._find_account_slot(
+            switcher._get_sequence_data(), "shared@example.com", "", provider="codex"
+        ) == "1"
+
+    def test_provider_for_public_wrapper(self, temp_home, mock_credentials_file):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {"email": "a@x.com", "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": "", "provider": "codex"},
+                "2": {"email": "b@x.com", "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": ""},
+            },
+        }))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher.provider_for("1") == "codex"
+        assert switcher.provider_for("2") == "claude"  # untagged back-compat default
 
 
 # ── Task 4: _get_current_account returns tuple ───────────────────────────────
@@ -5769,6 +5844,38 @@ class TestRemoveAccountPrunesMappings:
         switcher.remove_account("1")
 
         assert store.get(temp_home) is None
+
+    def test_remove_account_only_prunes_matching_provider(self, temp_home, monkeypatch):
+        """Removing a claude slot must not prune a same-(email, org) mapping
+        that belongs to a different provider."""
+        from claude_swap.mappings import MappingStore
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "shared@x.com",
+            "uuid": "u1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+            "provider": "claude",
+        }
+        data["sequence"] = [1]
+        switcher._write_json(switcher.sequence_file, data)
+
+        other_dir = temp_home / "codex-project"
+        other_dir.mkdir()
+        store = MappingStore(switcher.backup_dir)
+        store.set(temp_home, "shared@x.com", "", provider="claude")
+        store.set(other_dir, "shared@x.com", "", provider="codex")
+
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        switcher.remove_account("1")
+
+        assert store.get(temp_home) is None  # claude mapping pruned
+        assert store.get(other_dir) is not None  # codex mapping untouched
 
     def _config_switcher(self, temp_home, email):
         """Write a live claude config for ``email`` and return a switcher."""

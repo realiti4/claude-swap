@@ -20,7 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from claude_swap.models import PROVIDER_CLAUDE, get_timestamp
+from claude_swap.models import PROVIDER_CLAUDE, get_timestamp, normalize_provider
 
 SCHEMA_VERSION = 2
 
@@ -110,7 +110,7 @@ class MappingStore:
             for key, entry in mappings.items()
             if entry.get("email") == email
             and (entry.get("organizationUuid", "") or "") == org
-            and (entry.get("provider") or PROVIDER_CLAUDE) == provider
+            and normalize_provider(entry.get("provider")) == provider
         ]
         for key in doomed:
             del mappings[key]

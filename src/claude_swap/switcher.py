@@ -53,6 +53,7 @@ from claude_swap.models import (
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_provider,
 )
 from claude_swap.printer import (
     abbreviate_path,
@@ -486,17 +487,24 @@ class ClaudeAccountSwitcher:
             config_file.unlink()
         self._delete_session_profile(account_num, email)
 
-    def _prune_mappings(self, email: str, org_uuid: str) -> None:
+    def _prune_mappings(
+        self, email: str, org_uuid: str, provider: str = PROVIDER_CLAUDE
+    ) -> None:
         """Drop directory mappings for an identity that no longer has a slot.
 
         Called wherever an identity leaves the account table for good
         (remove_account, add_account/add_token slot overwrite). Slot
         *migration* and --import --force keep the (email, org) identity that
-        mappings are keyed by, so they need no pruning.
+        mappings are keyed by, so they need no pruning. ``provider`` should be
+        the removed slot's own stored provider (callers read it from the
+        record being deleted) so a same-(email, org) mapping under a
+        different provider is left alone.
         """
         from claude_swap.mappings import MappingStore
 
-        pruned = MappingStore(self.backup_dir).prune_account(email, org_uuid or "")
+        pruned = MappingStore(self.backup_dir).prune_account(
+            email, org_uuid or "", provider=provider
+        )
         if pruned:
             print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
 
@@ -579,7 +587,10 @@ class ClaudeAccountSwitcher:
         email = entry.get("email", "")
         seq = self._get_sequence_data_migrated() or {}
         slot = self._find_account_slot(
-            seq, email, entry.get("organizationUuid", "") or ""
+            seq,
+            email,
+            entry.get("organizationUuid", "") or "",
+            provider=normalize_provider(entry.get("provider")),
         )
         return slot, email
 
@@ -598,7 +609,9 @@ class ClaudeAccountSwitcher:
             entry = mappings[path]
             email = entry.get("email", "")
             org_uuid = entry.get("organizationUuid", "") or ""
-            slot = self._find_account_slot(seq, email, org_uuid)
+            slot = self._find_account_slot(
+                seq, email, org_uuid, provider=normalize_provider(entry.get("provider"))
+            )
             if slot:
                 account = seq.get("accounts", {}).get(slot, {})
                 tag = self._get_display_tag(
@@ -748,6 +761,10 @@ class ClaudeAccountSwitcher:
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
+
+    def provider_for(self, account_num: str) -> str:
+        """Public wrapper: stored provider for a slot (``"claude"``/``"codex"``)."""
+        return self._account_provider(account_num)
 
     def account_email(self, account_num: str) -> str:
         """Stored email for a slot; empty string when unknown."""
@@ -938,21 +955,35 @@ class ClaudeAccountSwitcher:
 
     @staticmethod
     def _find_account_slot(
-        data: dict, email: str, organization_uuid: str
+        data: dict,
+        email: str,
+        organization_uuid: str,
+        provider: str = PROVIDER_CLAUDE,
     ) -> str | None:
-        """Return the slot key for the account matching (email, organizationUuid), else None."""
+        """Return the slot key for the account matching
+        (email, organizationUuid, provider), else None.
+
+        ``provider`` defaults to ``claude`` — every existing call site in
+        this switcher resolves identity from a *live* Claude login, so
+        without this an untagged lookup could otherwise match a
+        differently-provider'd account that happens to share the same
+        (email, organizationUuid), e.g. once Codex accounts exist.
+        """
         for num, account in data.get("accounts", {}).items():
             if (account.get("email") == email and
-                    account.get("organizationUuid", "") == organization_uuid):
+                    account.get("organizationUuid", "") == organization_uuid and
+                    normalize_provider(account.get("provider")) == provider):
                 return num
         return None
 
-    def _account_exists(self, email: str, organization_uuid: str) -> bool:
-        """Check if account exists by (email, organizationUuid) composite key."""
+    def _account_exists(
+        self, email: str, organization_uuid: str, provider: str = PROVIDER_CLAUDE
+    ) -> bool:
+        """Check if account exists by (email, organizationUuid, provider)."""
         data = self._get_sequence_data()
         if not data:
             return False
-        return self._find_account_slot(data, email, organization_uuid) is not None
+        return self._find_account_slot(data, email, organization_uuid, provider) is not None
 
     def _account_kind(self, account_num: str | None) -> str:
         """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
@@ -978,7 +1009,7 @@ class ClaudeAccountSwitcher:
             return PROVIDER_CLAUDE
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return record.get("provider") or PROVIDER_CLAUDE
+        return normalize_provider(record.get("provider"))
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
@@ -1242,6 +1273,7 @@ class ClaudeAccountSwitcher:
                         account_num,
                         existing_email,
                         existing.get("organizationUuid", "") or "",
+                        normalize_provider(existing.get("provider")),
                     )
         else:
             account_num = str(self._get_next_account_number())
@@ -1271,14 +1303,14 @@ class ClaudeAccountSwitcher:
 
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
+            d_num, d_email, d_org, d_provider = displace_slot
             self._delete_account_files(d_num, d_email)
             data = self._get_sequence_data()
             if int(d_num) in data["sequence"]:
                 data["sequence"].remove(int(d_num))
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
+            self._prune_mappings(d_email, d_org, provider=d_provider)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -1469,19 +1501,20 @@ class ClaudeAccountSwitcher:
                         account_num,
                         existing_email,
                         existing.get("organizationUuid", "") or "",
+                        normalize_provider(existing.get("provider")),
                     )
         else:
             account_num = str(self._get_next_account_number())
 
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
+            d_num, d_email, d_org, d_provider = displace_slot
             self._delete_account_files(d_num, d_email)
             data = self._get_sequence_data()
             if int(d_num) in data["sequence"]:
                 data["sequence"].remove(int(d_num))
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
+            self._prune_mappings(d_email, d_org, provider=d_provider)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -1609,7 +1642,11 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
-        self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        self._prune_mappings(
+            email,
+            account_info.get("organizationUuid", ""),
+            provider=normalize_provider(account_info.get("provider")),
+        )
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds).

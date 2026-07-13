@@ -275,7 +275,7 @@ Examples:
         if not os.path.isdir(target):
             warning(f"Warning: {target} is not an existing directory (mapping it anyway)")
         previous = store.get(target)
-        store.set(target, email, org_uuid)
+        store.set(target, email, org_uuid, provider=switcher.provider_for(account_num))
 
         shown = normalize_path(target)
         if previous and previous.get("email") != email:

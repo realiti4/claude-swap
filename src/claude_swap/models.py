@@ -30,6 +30,14 @@ PROVIDER_CODEX = "codex"
 SEQUENCE_SCHEMA_VERSION = 2
 
 
+def normalize_provider(value: str | None) -> str:
+    """Missing/falsy provider values (pre-migration records) default to
+    ``claude``. Single source of truth so ``AccountInfo.from_dict``,
+    ``ClaudeAccountSwitcher._account_provider``, and
+    ``MappingStore.prune_account`` can't drift on what "untagged" means."""
+    return value or PROVIDER_CLAUDE
+
+
 class Platform(Enum):
     """Supported platforms."""
 
@@ -96,7 +104,7 @@ class AccountInfo:
             organization_name=data.get("organizationName", "") or "",
             added=data.get("added", ""),
             number=number,
-            provider=data.get("provider") or PROVIDER_CLAUDE,
+            provider=normalize_provider(data.get("provider")),
         )
 
     def to_dict(self) -> dict:
