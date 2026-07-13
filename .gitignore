@@ -11,3 +11,7 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# taskloop planning artifacts (local-only)
+docs/planning/
+.taskloop/
