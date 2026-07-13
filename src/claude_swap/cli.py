@@ -796,6 +796,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
     )
     parser.add_argument(
+        "--provider",
+        choices=["claude", "codex"],
+        default="claude",
+        metavar="{claude,codex}",
+        help="Account provider (use with 'add' or 'add-token'). Defaults to claude",
+    )
+    parser.add_argument(
         "--email",
         metavar="EMAIL",
         help=(
@@ -955,6 +962,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
+    if args.provider != "claude" and not (args.add_account or args.add_token is not None):
+        parser.error("--provider can only be used with 'add' or 'add-token'")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
@@ -995,13 +1005,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot)
+            if args.provider == "codex":
+                switcher.add_codex_account(slot=args.slot)
+            else:
+                switcher.add_account(slot=args.slot)
         elif args.add_token is not None:
-            switcher.add_account_from_token(
-                token=args.add_token,
-                email=args.email,
-                slot=args.slot,
-            )
+            if args.provider == "codex":
+                switcher.add_codex_account_from_token(
+                    token=args.add_token,
+                    email=args.email,
+                    slot=args.slot,
+                )
+            else:
+                switcher.add_account_from_token(
+                    token=args.add_token,
+                    email=args.email,
+                    slot=args.slot,
+                )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:

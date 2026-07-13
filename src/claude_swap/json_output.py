@@ -146,6 +146,7 @@ def account_row(
     *,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
+    provider: str = "claude",
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
@@ -156,6 +157,7 @@ def account_row(
         "organizationUuid": org_uuid,
         "isOrganization": bool(org_uuid),
         "active": active,
+        "provider": provider,
         "usageStatus": status,
         "usage": usage,
     }

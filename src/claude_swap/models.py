@@ -137,6 +137,7 @@ class AccountSnapshot:
     kind: str  # "oauth" | "api_key"
     switchable: bool
     usage: UsageEntry
+    provider: str = PROVIDER_CLAUDE
 
     @property
     def display_tag(self) -> str:

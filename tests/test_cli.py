@@ -549,6 +549,56 @@ class TestCLICommands:
             token="tok", email="u@example.com", slot=3
         )
 
+    def test_add_account_provider_codex_dispatches_to_codex_method(self, temp_home: Path):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv", ["claude-swap", "--add-account", "--provider", "codex"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_codex_account"
+        ) as mock_add, patch.object(
+            ClaudeAccountSwitcher, "add_account"
+        ) as mock_add_claude:
+            cli.main()
+
+        mock_add.assert_called_once_with(slot=None)
+        mock_add_claude.assert_not_called()
+
+    def test_add_account_default_provider_dispatches_to_claude_method(self, temp_home: Path):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv", ["claude-swap", "--add-account"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account"
+        ) as mock_add, patch.object(
+            ClaudeAccountSwitcher, "add_codex_account"
+        ) as mock_add_codex:
+            cli.main()
+
+        mock_add.assert_called_once_with(slot=None)
+        mock_add_codex.assert_not_called()
+
+    def test_add_token_provider_codex_dispatches_to_codex_method(self, temp_home: Path):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv",
+            ["claude-swap", "--add-token", "sk-x", "--provider", "codex"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_codex_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(token="sk-x", email=None, slot=None)
+
+    def test_provider_without_add_flags_errors(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--provider", "codex"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--provider can only be used with 'add' or 'add-token'" in capsys.readouterr().err
+
     def test_add_token_in_help(self):
         """The add-token subcommand and the still-visible --email modifier appear."""
         result = subprocess.run(

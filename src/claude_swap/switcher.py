@@ -43,10 +43,12 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     CredentialStore,
     looks_like_api_key,
 )
+from claude_swap import codex_credentials
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     PROVIDER_CLAUDE,
+    PROVIDER_CODEX,
     SEQUENCE_SCHEMA_VERSION,
     AccountSnapshot,
     AccountsSnapshot,
@@ -264,6 +266,13 @@ class ClaudeAccountSwitcher:
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
 
+        # Codex's backup store — separate Keychain service/file prefix, no
+        # capability-cache coupling to the Claude store above (see
+        # codex_credentials.CodexCredentialStore).
+        self._codex_store = codex_credentials.CodexCredentialStore(
+            self.credentials_dir, self.platform
+        )
+
         # Set by _build_accounts_info: True when the active account's OAuth
         # credential could not be read because the macOS Keychain was unavailable
         # (locked / denied / timeout) with no fallback — so the usage row shows
@@ -468,6 +477,17 @@ class ClaudeAccountSwitcher:
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
 
+    def _read_codex_account_credentials(self, account_num: str, email: str) -> str:
+        return self._codex_store.read(account_num, email)
+
+    def _write_codex_account_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> None:
+        self._codex_store.write(account_num, email, credentials)
+
+    def _delete_codex_account_credentials(self, account_num: str, email: str) -> None:
+        self._codex_store.delete(account_num, email)
+
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
 
@@ -477,9 +497,17 @@ class ClaudeAccountSwitcher:
         removes the slot's session profile alongside the backups so a stale
         profile can never outlive its account.
 
+        Codex slots have no session-mode profile or Claude-shaped config
+        backup (both are Claude Code CLI concepts) — deleting the Codex
+        credential backup is the entire cleanup for that provider.
+
         Raises:
-            SessionError: a live session-mode instance is using this account.
+            SessionError: a live session-mode instance is using this account
+                          (claude provider only).
         """
+        if self._account_provider(account_num) == PROVIDER_CODEX:
+            self._delete_codex_account_credentials(account_num, email)
+            return
         self._ensure_no_live_session(account_num, email, "the operation")
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -693,6 +721,7 @@ class ClaudeAccountSwitcher:
                     kind=self._account_kind(n),
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
+                    provider=self._account_provider(n),
                 )
             )
         return AccountsSnapshot(
@@ -1562,6 +1591,315 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def add_codex_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
+        """Add the live Codex CLI login to managed accounts.
+
+        Mirrors :meth:`add_account`'s shape (refresh-in-place / displace /
+        overwrite-prompt flow), scoped to what Codex actually has: no
+        organization concept was found in the 0.1.1 research, so identity is
+        just (email, provider=codex) — there is no live "Codex config" to
+        back up separately, only the ``~/.codex/auth.json`` credential blob
+        itself.
+
+        Args:
+            slot: Specify the slot number to store the account in. When
+                  ``None``, auto-assigns the next available number.
+            assume_yes: Skip the overwrite-slot confirmation prompt.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+
+        identity = codex_credentials.get_current_codex_identity()
+        if identity is None:
+            raise ConfigError(
+                "No active Codex CLI login found (or it's API-key-only, "
+                "which has no derivable identity — use 'add-token' instead). "
+                "Log in with the Codex CLI first."
+            )
+        current_email, account_id = identity
+
+        current_creds = codex_credentials.read_live_auth_text()
+        if not current_creds:
+            raise CredentialReadError("Failed to read live Codex credentials")
+
+        if slot is None and self._account_exists(current_email, "", provider=PROVIDER_CODEX):
+            seq = self._get_sequence_data()
+            account_num = self._find_account_slot(
+                seq, current_email, "", provider=PROVIDER_CODEX
+            )
+            self._write_codex_account_credentials(account_num, current_email, current_creds)
+            seq["accounts"][account_num]["added"] = get_timestamp()
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
+            self._logger.info(f"Updated Codex credentials for account {account_num}: {current_email}")
+            print(
+                f"{accent('Updated Codex credentials')} for Account {account_num} "
+                f"({current_email} {muted('[codex]')})."
+            )
+            return
+
+        displace_slot = None
+        migrate_from = None
+
+        if slot is not None:
+            if slot < 1:
+                raise ConfigError("Slot number must be >= 1")
+            account_num = str(slot)
+            data = self._get_sequence_data()
+
+            if self._account_exists(current_email, "", provider=PROVIDER_CODEX):
+                old_num = self._find_account_slot(
+                    data, current_email, "", provider=PROVIDER_CODEX
+                )
+                if old_num and old_num != account_num:
+                    migrate_from = old_num
+
+            if account_num in data.get("accounts", {}):
+                existing = data["accounts"][account_num]
+                existing_email = existing.get("email", "unknown")
+                is_same = (
+                    existing_email == current_email
+                    and normalize_provider(existing.get("provider")) == PROVIDER_CODEX
+                )
+                if not is_same:
+                    existing_tag = self._get_display_tag(
+                        existing_email,
+                        existing.get("organizationName", ""),
+                        existing.get("organizationUuid", ""),
+                    )
+                    warning(f"Slot {slot} already occupied")
+                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    if not assume_yes:
+                        try:
+                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{dimmed('Cancelled')}")
+                            return
+                        if answer not in ("y", "yes"):
+                            print(dimmed("Cancelled"))
+                            return
+                    displace_slot = (
+                        account_num,
+                        existing_email,
+                        existing.get("organizationUuid", "") or "",
+                        normalize_provider(existing.get("provider")),
+                    )
+        else:
+            account_num = str(self._get_next_account_number())
+
+        if displace_slot:
+            d_num, d_email, d_org, d_provider = displace_slot
+            self._delete_account_files(d_num, d_email)
+            data = self._get_sequence_data()
+            if int(d_num) in data["sequence"]:
+                data["sequence"].remove(int(d_num))
+            del data["accounts"][d_num]
+            self._write_json(self.sequence_file, data)
+            self._prune_mappings(d_email, d_org, provider=d_provider)
+
+        if migrate_from:
+            data = self._get_sequence_data()
+            old_email = data["accounts"][migrate_from].get("email", "")
+            self._delete_account_files(migrate_from, old_email)
+            if int(migrate_from) in data["sequence"]:
+                data["sequence"].remove(int(migrate_from))
+            del data["accounts"][migrate_from]
+            self._write_json(self.sequence_file, data)
+
+        self._write_codex_account_credentials(account_num, current_email, current_creds)
+
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": current_email,
+            "uuid": account_id,
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": get_timestamp(),
+            "provider": PROVIDER_CODEX,
+        }
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Added Codex account {account_num}: {current_email}")
+        if migrate_from:
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+        print(f"{accent('Added')} Account {account_num}: {current_email} {muted('[codex]')}")
+
+    def add_codex_account_from_token(
+        self,
+        token: str,
+        email: str | None = None,
+        slot: int | None = None,
+        assume_yes: bool = False,
+    ) -> None:
+        """Register a raw Codex ``auth.json`` blob or a plain API key as a
+        new Codex account.
+
+        Mirrors :meth:`add_account_from_token` for the Codex provider.
+        ``token`` is auto-detected: text starting with ``{`` is parsed as a
+        full ``auth.json`` JSON blob (identity extracted the same way as a
+        live login, when it carries OAuth tokens); anything else is treated
+        as a raw ``OPENAI_API_KEY`` and wrapped in the same JSON shape
+        Codex's own API-key auth mode uses, so a future activation step can
+        write it back to ``~/.codex/auth.json`` unchanged.
+
+        Args:
+            token: Raw auth.json JSON text, a plain API key, ``"-"`` to read
+                   one line from stdin, or ``""`` to prompt via getpass.
+            email: Email to associate with the account. Required for a plain
+                   API key (no identity claim exists); defaults to
+                   ``codex-api-key-{slot}@token.local`` when omitted.
+            slot:  Slot number to use; auto-assigned when ``None``.
+            assume_yes: Skip the occupied-slot overwrite prompt.
+        """
+        import getpass
+
+        if token == "-":
+            token = sys.stdin.readline().rstrip("\n")
+        elif not token:
+            token = getpass.getpass("Token: ")
+        token = token.strip()
+        if not token:
+            raise ValidationError("Token cannot be empty")
+
+        if email and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+
+        self._setup_directories()
+        self._init_sequence_file()
+
+        auth_data: dict | None = None
+        if token.startswith("{"):
+            try:
+                auth_data = json.loads(token)
+            except json.JSONDecodeError:
+                raise ValidationError("Token looks like JSON but failed to parse") from None
+            if not isinstance(auth_data, dict):
+                raise ValidationError("Parsed auth.json must be a JSON object")
+            identity = codex_credentials.get_current_codex_identity(auth_data)
+            credentials = json.dumps(auth_data)
+        else:
+            identity = None
+            credentials = json.dumps(
+                {"auth_mode": "apikey", "OPENAI_API_KEY": token, "tokens": None}
+            )
+
+        if identity is not None:
+            derived_email, _account_id = identity
+            email = email or derived_email
+        if not email:
+            if slot is None:
+                slot = self._get_next_account_number()
+            email = f"codex-api-key-{slot}@token.local"
+
+        # Same collision guard as add_codex_account's refresh-in-place branch.
+        if slot is None and self._account_exists(email, "", provider=PROVIDER_CODEX):
+            seq = self._get_sequence_data()
+            account_num = self._find_account_slot(seq, email, "", provider=PROVIDER_CODEX)
+            self._write_codex_account_credentials(account_num, email, credentials)
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
+            self._logger.info(f"Updated Codex token for account {account_num}: {email}")
+            print(
+                f"{accent('Updated Codex credentials')} for Account {account_num} "
+                f"({email} {muted('[codex]')})."
+            )
+            return
+
+        displace_slot = None
+        migrate_from = None
+
+        if slot is not None:
+            if slot < 1:
+                raise ConfigError("Slot number must be >= 1")
+            account_num = str(slot)
+            data = self._get_sequence_data()
+
+            if self._account_exists(email, "", provider=PROVIDER_CODEX):
+                old_num = self._find_account_slot(data, email, "", provider=PROVIDER_CODEX)
+                if old_num and old_num != account_num:
+                    migrate_from = old_num
+
+            if account_num in data.get("accounts", {}):
+                existing = data["accounts"][account_num]
+                existing_email = existing.get("email", "unknown")
+                is_same = (
+                    existing_email == email
+                    and normalize_provider(existing.get("provider")) == PROVIDER_CODEX
+                )
+                if not is_same:
+                    existing_tag = self._get_display_tag(
+                        existing_email,
+                        existing.get("organizationName", ""),
+                        existing.get("organizationUuid", ""),
+                    )
+                    warning(f"Slot {slot} already occupied")
+                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    if not assume_yes:
+                        try:
+                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{dimmed('Cancelled')}")
+                            return
+                        if answer not in ("y", "yes"):
+                            print(dimmed("Cancelled"))
+                            return
+                    displace_slot = (
+                        account_num,
+                        existing_email,
+                        existing.get("organizationUuid", "") or "",
+                        normalize_provider(existing.get("provider")),
+                    )
+        else:
+            account_num = str(self._get_next_account_number())
+
+        if displace_slot:
+            d_num, d_email, d_org, d_provider = displace_slot
+            self._delete_account_files(d_num, d_email)
+            data = self._get_sequence_data()
+            if int(d_num) in data["sequence"]:
+                data["sequence"].remove(int(d_num))
+            del data["accounts"][d_num]
+            self._write_json(self.sequence_file, data)
+            self._prune_mappings(d_email, d_org, provider=d_provider)
+
+        if migrate_from:
+            data = self._get_sequence_data()
+            old_email = data["accounts"][migrate_from].get("email", "")
+            self._delete_account_files(migrate_from, old_email)
+            if int(migrate_from) in data["sequence"]:
+                data["sequence"].remove(int(migrate_from))
+            del data["accounts"][migrate_from]
+            self._write_json(self.sequence_file, data)
+
+        self._write_codex_account_credentials(account_num, email, credentials)
+
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": email,
+            "uuid": "",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": get_timestamp(),
+            "provider": PROVIDER_CODEX,
+        }
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Added Codex account {account_num} from token: {email}")
+        if migrate_from:
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+        print(
+            f"{accent('Added')} Account {account_num}: {email} "
+            f"{muted('[codex]')} {muted('(from token)')}"
+        )
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -1683,6 +2021,10 @@ class ClaudeAccountSwitcher:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
+            elif normalize_provider(account.get("provider")) == PROVIDER_CODEX:
+                # No live-activation concept yet (task 0.1.5) — a Codex slot
+                # is never "active" here, so always read its backup.
+                creds = self._read_codex_account_credentials(str(num), email)
             else:
                 creds = self._read_account_credentials(str(num), email)
 
@@ -2355,6 +2697,7 @@ class ClaudeAccountSwitcher:
                     entry.decision_value(),
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
+                    provider=self._account_provider(str(num)),
                 )
             )
         payload = {
@@ -2412,15 +2755,13 @@ class ClaudeAccountSwitcher:
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
-            # NOTE: the TUI watch view (tui._watch_account_rows) parses this
-            # output to map rows to accounts for quick-switch: it relies on the
-            # uncolored ``  {num}: `` prefix and the ``(active)`` marker below.
-            # Keep them intact when tweaking this line, or update that parser.
+            provider = self._account_provider(str(num))
+            provider_label = f" {muted(f'({provider})')}" if provider != PROVIDER_CLAUDE else ""
             if is_active:
                 marker = f" {bold_accent('(active)')}"
-                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{provider_label}{marker}")
             else:
-                print(f"  {num}: {email} {muted(f'[{tag}]')}")
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{provider_label}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 
