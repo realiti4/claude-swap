@@ -180,6 +180,22 @@ class CswapApp(App):
             partial(self.switcher.switch, strategy="best", json_output=True),
         )
 
+    def do_toggle_disabled(self, number: str) -> None:
+        """Hold the account out of auto-rotation, or return it — reads its
+        current state from the live snapshot to pick the direction."""
+        snap = self.snapshot
+        acc = next(
+            (a for a in (snap.accounts if snap else ()) if a.number == number), None
+        )
+        if acc is None:
+            return
+        target = not acc.disabled
+        verb = "Disable" if target else "Enable"
+        self._start_action(
+            f"{verb} account {number}",
+            partial(self.switcher.set_account_disabled, number, target),
+        )
+
     def confirm_remove(self, number: str, email: str) -> None:
         self.push_screen(
             ConfirmModal(

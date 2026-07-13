@@ -738,6 +738,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -755,6 +756,7 @@ class ClaudeAccountSwitcher:
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
                     alias=alias,
+                    disabled=self._disabled_from_data(seq_data, n),
                 )
             )
         return AccountsSnapshot(

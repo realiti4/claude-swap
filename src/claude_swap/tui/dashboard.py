@@ -78,6 +78,7 @@ class DashboardScreen(Screen):
             ("Watch accounts", "watch"),
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
+            ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
             ("Quit", "quit"),
         ]
@@ -99,6 +100,21 @@ class DashboardScreen(Screen):
             )
             for acc in (snap.accounts if snap else ())
         ]
+        entries.append(_BACK)
+        return entries
+
+    def _disable_entries(self) -> MenuEntries:
+        """One row per account, labelled with its current state and the action
+        selecting it will take (enable a disabled one, disable an active one)."""
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            action = "→ enable" if acc.disabled else "→ disable"
+            state = "  (disabled)" if acc.disabled else ""
+            entries.append(
+                (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+            )
         entries.append(_BACK)
         return entries
 
@@ -152,6 +168,12 @@ class DashboardScreen(Screen):
                 "?",
             )
             app.confirm_remove(number, email)
+        elif action_id == "disable-menu":
+            await self._push_menu("disable / enable", self._disable_entries())
+        elif action_id.startswith("disable:"):
+            number = action_id.split(":", 1)[1]
+            app.do_toggle_disabled(number)
+            await self._pop_menu()
         else:
             actions[action_id]()
 

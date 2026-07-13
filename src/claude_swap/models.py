@@ -139,6 +139,7 @@ class AccountSnapshot:
     switchable: bool
     usage: UsageEntry
     alias: str = ""
+    disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
 
     @property
     def display_tag(self) -> str:

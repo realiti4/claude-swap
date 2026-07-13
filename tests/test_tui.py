@@ -78,6 +78,7 @@ def make_account(
     entry: UsageEntry | None = None,
     email: str | None = None,
     alias: str = "",
+    disabled: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -89,6 +90,7 @@ def make_account(
         switchable=switchable,
         usage=entry if entry is not None else make_entry(),
         alias=alias,
+        disabled=disabled,
     )
 
 
@@ -145,6 +147,17 @@ class FakeSwitcher:
         self.calls.append(("remove", str(identifier), assume_yes))
         self._accounts = [a for a in self._accounts if a.number != str(identifier)]
         print(f"Removed account {identifier}")
+
+    def set_account_disabled(self, identifier: str, disabled: bool) -> None:
+        self.calls.append(("set_disabled", str(identifier), disabled))
+        self._accounts = [
+            dataclasses.replace(a, disabled=disabled)
+            if a.number == str(identifier)
+            else a
+            for a in self._accounts
+        ]
+        verb = "Disabled" if disabled else "Enabled"
+        print(f"{verb} Account-{identifier}")
 
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
@@ -482,6 +495,27 @@ class TestDashboard:
             mini_part = panel.split("user2@example.com", 1)[1]
             assert "━" not in mini_part
 
+    async def test_disabled_marker_on_active_card_and_mini(self, tmp_path):
+        # A disabled account is still shown; it's just annotated so the user
+        # can see it's held out of auto-rotation — on the full card when it's
+        # the active login, and on the one-line form otherwise.
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, disabled=True),
+                make_account(2, disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "● active" in panel  # still the active card
+            # both the active card and the mini row carry the marker
+            assert panel.count("(disabled)") == 2
+
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(
             [
@@ -538,6 +572,7 @@ class TestDashboard:
                 "watch",
                 "auto",
                 "add-menu",
+                "disable-menu",
                 "remove-menu",
                 "quit",
             ]
@@ -676,6 +711,51 @@ class TestDashboard:
             await pilot.press("n")
             await settle(pilot)
             assert not any(call[0] == "remove" for call in fake.calls)
+
+    async def test_disable_via_menu_toggles_without_confirm(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "disable-menu")
+            await menu_select(pilot, "disable:2")  # no modal — direct action
+            await settle(pilot)
+            assert ("set_disabled", "2", True) in fake.calls
+            # the submenu pops back to root after the toggle
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+            ids = [item.action_id for item in menu.query(MenuItem)]
+            assert ids[0] == "switch"
+
+    async def test_disable_menu_row_reflects_state_and_re_enables(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2, disabled=True)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "disable-menu")
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            ]
+            # the already-disabled account offers to enable; the active one to disable
+            assert any("(disabled)" in label and "enable" in label for label in labels)
+            assert any("disable" in label and "(disabled)" not in label for label in labels)
+            # selecting the disabled account flips it back on
+            await menu_select(pilot, "disable:2")
+            await settle(pilot)
+            assert ("set_disabled", "2", False) in fake.calls
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(

@@ -132,6 +132,11 @@ def test_format_account_label_with_alias():
     assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_disabled_marker():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -342,12 +347,13 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias=""):
+    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
+        self.disabled = disabled
 
 
 class _FakeSnap:
@@ -370,17 +376,17 @@ def test_adapt_snapshot_shape_and_active_selection():
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
         _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
+        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "")
-    # sentinel account: display is the human note, last_good is None
+    # (num, email, is_active, display_usage, last_good, alias, disabled)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False)
+    # sentinel account: display is the human note, last_good is None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "",
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True,
     )
 
 

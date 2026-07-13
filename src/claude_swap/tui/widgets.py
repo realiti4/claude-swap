@@ -165,6 +165,8 @@ def account_card_text(
     text.append(f"  [{acc.display_tag}]", style=MUTED)
     if acc.is_active:
         text.append("   ● active", style=f"bold {ACCENT}")
+    if acc.disabled:
+        text.append("   (disabled)", style=MUTED)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=MUTED)
@@ -233,6 +235,8 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
     else:
         text.append(acc.email, style=FOREGROUND)
     text.append(f"  [{acc.display_tag}]", style=MUTED)
+    if acc.disabled:
+        text.append("  (disabled)", style=MUTED)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
