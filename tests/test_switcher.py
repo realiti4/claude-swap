@@ -5917,6 +5917,47 @@ class TestRemoveAccountPrunesMappings:
 
         assert store.get(temp_home) is None
 
+    def test_slot_occupied_by_different_provider_is_not_treated_as_same_account(
+        self, temp_home
+    ):
+        """A codex-tagged slot sharing (email, org) with the live claude login
+        must be displaced (prompt + prune), not silently overwritten in place
+        as if it were the same account."""
+        from claude_swap.mappings import MappingStore
+
+        switcher = self._config_switcher(temp_home, "shared@x.com")
+        data = switcher._get_sequence_data()
+        data["accounts"]["3"] = {
+            "email": "shared@x.com",
+            "uuid": "codex-uuid",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+            "provider": "codex",
+        }
+        data["sequence"] = [3]
+        switcher._write_json(switcher.sequence_file, data)
+
+        other_dir = temp_home / "codex-project"
+        other_dir.mkdir()
+        store = MappingStore(switcher.backup_dir)
+        store.set(other_dir, "shared@x.com", "", provider="codex")
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y") as mock_input:
+            switcher.add_account(slot=3)
+
+        # Prompted for overwrite (not silently treated as "same account")...
+        mock_input.assert_called_once()
+        # ...and the displaced codex account's slot now holds claude, tagged correctly.
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["3"]["provider"] == "claude"
+        # ...and its mapping was pruned as part of the displacement.
+        assert store.get(other_dir) is None
+
     def test_slot_migration_keeps_mappings(self, temp_home):
         """Moving an account to another slot keeps its identity-keyed mappings."""
         from claude_swap.mappings import MappingStore

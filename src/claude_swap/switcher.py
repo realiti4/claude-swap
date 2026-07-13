@@ -1249,7 +1249,8 @@ class ClaudeAccountSwitcher:
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
                 is_same = (existing_email == current_email
-                           and existing.get("organizationUuid", "") == current_org_uuid)
+                           and existing.get("organizationUuid", "") == current_org_uuid
+                           and normalize_provider(existing.get("provider")) == PROVIDER_CLAUDE)
                 if not is_same:
                     existing_tag = self._get_display_tag(
                         existing_email,
@@ -1479,6 +1480,7 @@ class ClaudeAccountSwitcher:
                 is_same = (
                     existing_email == email
                     and existing.get("organizationUuid", "") == ""
+                    and normalize_provider(existing.get("provider")) == PROVIDER_CLAUDE
                 )
                 if not is_same:
                     existing_tag = self._get_display_tag(

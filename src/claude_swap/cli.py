@@ -274,11 +274,15 @@ Examples:
         target = args.path or os.getcwd()
         if not os.path.isdir(target):
             warning(f"Warning: {target} is not an existing directory (mapping it anyway)")
+        from claude_swap.models import normalize_provider
+
         previous = store.get(target)
-        store.set(target, email, org_uuid, provider=switcher.provider_for(account_num))
+        new_provider = switcher.provider_for(account_num)
+        store.set(target, email, org_uuid, provider=new_provider)
 
         shown = normalize_path(target)
-        if previous and previous.get("email") != email:
+        prev_provider = normalize_provider(previous.get("provider")) if previous else None
+        if previous and (previous.get("email") != email or prev_provider != new_provider):
             prev_email = previous.get("email")
             print(
                 f"{accent('Mapped')} {shown} → Account-{account_num} ({email}) "
