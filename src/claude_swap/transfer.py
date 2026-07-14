@@ -428,15 +428,22 @@ def import_accounts(
 
         if existing_slot is not None:
             if not force:
-                _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
+                # Check if the existing slot has any stored credentials.
+                # If the slot has no backup credentials, auto-overwrite
+                # instead of skipping (the slot is effectively empty).
+                existing_creds = switcher._read_account_credentials(
+                    existing_slot, entry["email"]
                 )
-                skipped += 1
-                # Even when skipped, the envelope's active account exists
-                # locally — record where so we can seed activeAccountNumber.
-                if is_envelope_active:
-                    resolved_active_slot = existing_slot
-                continue
+                if existing_creds:
+                    _eprint(
+                        f"Skipped {entry['email']} (already exists, use --force)"
+                    )
+                    skipped += 1
+                    # Even when skipped, the envelope's active account exists
+                    # locally — record where so we can seed activeAccountNumber.
+                    if is_envelope_active:
+                        resolved_active_slot = existing_slot
+                    continue
             target_num = existing_slot
             outcome = "overwrote"
             # The credential write below invalidates the slot's non-live
