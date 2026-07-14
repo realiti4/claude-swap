@@ -53,6 +53,20 @@ def get_global_config_path() -> Path:
     return base / ".claude.json"
 
 
+def get_default_global_config_path() -> Path:
+    """Return the global config path of the *default* profile.
+
+    Same legacy fallback as :func:`get_global_config_path`, but deliberately
+    ignores ``CLAUDE_CONFIG_DIR``: callers that mirror the user's real profile
+    (session sharing) must not source from another session when invoked from
+    inside one.
+    """
+    legacy = Path.home() / ".claude" / ".config.json"
+    if legacy.exists():
+        return legacy
+    return Path.home() / ".claude.json"
+
+
 def get_credentials_path() -> Path:
     """Return the path to the Claude credentials file."""
     return get_claude_config_home() / ".credentials.json"
