@@ -2915,22 +2915,17 @@ class ClaudeAccountSwitcher:
             target_disabled = self._disabled_from_data(data, target)
             if target_disabled or not self._account_is_switchable(target):
                 if target_disabled:
-                    message = f"Skipped Account-{target} (disabled)"
+                    reason = console_reason = "(disabled)"
                 else:
-                    message = (
-                        f"Skipped Account-{target} (no stored credentials/config)"
+                    reason = "(no stored credentials/config)"
+                    console_reason = (
+                        "(no stored credentials/config, re-add with "
+                        f"cswap --add-account --slot {target})"
                     )
                 if json_output:
-                    warnings.append(message)
+                    warnings.append(f"Skipped Account-{target} {reason}")
                 else:
-                    if target_disabled:
-                        print(f"{accent('Skipping')} Account-{target} (disabled)")
-                    else:
-                        print(
-                            f"{accent('Skipping')} Account-{target} "
-                            f"(no stored credentials/config, re-add with "
-                            f"cswap --add-account --slot {target})"
-                        )
+                    print(f"{accent('Skipping')} Account-{target} {console_reason}")
                 fallback = next(
                     (str(num) for num in sequence
                      if str(num) != target
