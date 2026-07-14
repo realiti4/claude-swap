@@ -167,35 +167,61 @@ class TestExtendedTrust:
         assert entry.consecutive_failures == 2
         assert entry.decision_value() is None
 
-    def test_429_staleness_trusted_past_general_ceiling(self, store, clock):
-        # A usage-endpoint 429 throttles polling; it does NOT mean the account's
-        # real model quota changed. Candidate accounts aren't active, so their
-        # windows don't move while blocked — last_good stays accurate. Trusting
-        # it past TRUST_MAX_AGE_S (up to the wider rate-limit ceiling) keeps a
-        # rate-limited candidate a valid switch target instead of flipping it to
-        # "unknown" and triggering failover flapping between machines.
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+    def _usage_resetting_at(self, clock, seconds_ahead):
+        from datetime import datetime, timezone
+
+        iso = (
+            datetime.fromtimestamp(clock.now + seconds_ahead, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        return {
+            "five_hour": {"pct": 25.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0, "resets_at": iso},
+        }
+
+    def test_429_staleness_trusted_until_window_reset(self, store, clock):
+        # A usage-endpoint 429 throttles polling; it does NOT move the account's
+        # real windows. Usage only rises within a window (monotone until reset),
+        # so last_good is a valid lower bound — trust it right up to its window
+        # reset, no matter how long the throttle lasts. Far past the general
+        # TRUST_MAX_AGE_S but still before the reset → still trusted.
+        usage = self._usage_resetting_at(clock, TRUST_MAX_AGE_S * 4)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(TRUST_MAX_AGE_S + 1)
+        clock.advance(TRUST_MAX_AGE_S + 1)  # past the general ceiling...
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         entry = store.entries(IDENT)["1"]
-        assert entry.consecutive_failures == 2
         assert entry.trust_extended
-        assert entry.decision_value() == USAGE
+        assert entry.decision_value() == usage  # ...but before the reset
 
-    def test_429_staleness_still_bounded_by_rate_limit_ceiling(self, store, clock):
-        # Trust is extended for 429s but stays client-bounded (never unbounded /
-        # server-controlled): past RATE_LIMIT_TRUST_MAX_AGE_S it too reads as
-        # unknown, so a forever-throttled account eventually hits the
-        # unknown-path machinery.
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+    def test_429_staleness_expires_at_window_reset(self, store, clock):
+        # Once the window has reset, usage is zeroed and last_good is obsolete —
+        # it reads as unknown so the unknown-path machinery takes over. This is
+        # the natural, data-driven bound (no fixed clock): trust ends exactly
+        # when the measured value can no longer hold.
+        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        clock.advance(601.0)  # past the window reset
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         entry = store.entries(IDENT)["1"]
         assert entry.decision_value() is None
-        # Display still sees the measurement + its age.
-        assert entry.last_good == USAGE
+        assert entry.last_good == usage  # display still sees it
+
+    def test_429_staleness_without_reset_info_falls_back_to_ceiling(
+        self, store, clock
+    ):
+        # Older stored data may carry no resets_at. Fall back to the fixed
+        # rate-limit ceiling so such an entry still can't be trusted forever.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no resets_at
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == USAGE  # within
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None  # past cap
 
 
 class TestBackoff:

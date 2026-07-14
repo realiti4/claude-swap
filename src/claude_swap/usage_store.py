@@ -32,7 +32,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
-from claude_swap.poll_policy import EDGE_BACKOFF_S, SERVE_TTL_S
+from claude_swap import oauth
+from claude_swap.poll_policy import (
+    EDGE_BACKOFF_S,
+    SERVE_TTL_S,
+    parse_reset_ts,
+)
 from claude_swap.settings import atomic_write_json
 
 SCHEMA_VERSION = 2
@@ -54,15 +59,19 @@ TRUST_MAX_AGE_S = 3600.0
 
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
 # real model quota: the endpoint budgets *usage requests* per token (see
-# poll_policy), independent of the 5h/7d limits it reports. A throttled
-# candidate is not active, so its windows do not move while it is blocked —
-# last_good stays accurate for the whole block. Flipping it to "unknown" at
-# TRUST_MAX_AGE_S instead makes it an unusable switch target and drives
-# failover flapping (which re-polls the throttled token and re-arms the block),
-# so 429 staleness is trusted for a wider — but still client-bounded, never
-# server-controlled — ceiling. This matches the usage endpoint's ~1h rolling
-# window (a block clears within ~an hour of quiet), with headroom for a token
-# that stays contended across machines. Non-429 failures keep TRUST_MAX_AGE_S.
+# poll_policy), independent of the 5h/7d limits it reports. It does NOT move
+# the account's real windows, and usage only rises within a window (monotone
+# until the window resets), so last_good is a valid lower bound on the true
+# usage right up to that reset. Trust it until then — data-driven, not a fixed
+# clock: flipping it to "unknown" early (the old fixed 2h ceiling) made a
+# throttled account an unusable switch target and drove failover flapping /
+# all-exhausted sleeps even while the account was plainly fine. Once the window
+# resets, usage is zeroed and last_good is obsolete → unknown. Matches Claude
+# Code's own 2.1.208 "show last-known usage when rate-limited" behavior.
+#
+# Fallback ceiling for 429-stale data that carries no resets_at (older stored
+# rows): still bounded so it can't be trusted forever. Non-429 failures always
+# use TRUST_MAX_AGE_S (a timeout/network error is no evidence last_good holds).
 RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
 
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
@@ -248,6 +257,32 @@ def due_candidate(
     return due[0][2]
 
 
+def _rate_limited_trust_ok(
+    last_good: dict | None, age_s: float | None, now: float
+) -> bool:
+    """Whether 429-stale ``last_good`` is still trustworthy for decisions.
+
+    Usage rises monotonically within a window, so a rate-limited (frozen)
+    last_good is a valid lower bound until its window resets. Three cases:
+
+    - a window reset is still ahead → trusted (the measured value can only be
+      an under-estimate of the true usage until then);
+    - every window's reset is already past → obsolete (usage was zeroed at the
+      reset; the stored value no longer describes reality) → not trusted;
+    - no reset info at all (older stored rows) → fall back to the bounded
+      RATE_LIMIT_TRUST_MAX_AGE_S so it still can't be trusted forever.
+    """
+    windows = oauth.relevant_windows(last_good) if last_good is not None else []
+    reset_tss = [
+        ts
+        for _, _, resets_at in windows
+        if (ts := parse_reset_ts(resets_at)) is not None
+    ]
+    if reset_tss:
+        return now < max(reset_tss)
+    return age_s is not None and age_s <= RATE_LIMIT_TRUST_MAX_AGE_S
+
+
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
     computed = min(
         BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S
@@ -337,16 +372,20 @@ class UsageStore:
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
             # A usage-endpoint 429 throttles polling without moving the
-            # account's real windows, so its last_good stays trustworthy for a
-            # wider (still client-bounded) ceiling than a non-429 failure.
-            trust_ceiling = (
-                RATE_LIMIT_TRUST_MAX_AGE_S
-                if row.get("lastError") == "http-429"
-                else TRUST_MAX_AGE_S
-            )
+            # account's real windows. Usage is monotone within a window, so
+            # last_good is a valid lower bound until that window resets: trust it
+            # right up to the earliest future reset (data-driven, no fixed
+            # clock). Rows with no reset info fall back to a bounded ceiling. A
+            # non-429 failure (timeout/network) is no evidence last_good still
+            # holds, so it always uses the general ceiling.
+            if row.get("lastError") == "http-429":
+                within_ceiling = _rate_limited_trust_ok(
+                    last_good if isinstance(last_good, dict) else None, age_s, now
+                )
+            else:
+                within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
             trust_extended = (
-                age_s is not None
-                and age_s <= trust_ceiling
+                within_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
