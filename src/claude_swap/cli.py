@@ -503,6 +503,15 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Send desktop notifications on account switches and when all accounts "
+            "are exhausted (default: on).  Use --no-notify to disable."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -510,11 +519,30 @@ Defaults live in settings.json in the backup root; flags override them.
     args = parser.parse_args(argv)
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.notifications import (
+        notify_all_exhausted,
+        notify_quarantined,
+        notify_switch,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
+    def _maybe_notify(event: AutoSwitchEvent) -> None:
+        """Fire a desktop notification for events the user should know about."""
+        if not args.notify or args.dry_run:
+            return
+        if event.kind == "switch":
+            from_email = (event.from_ref or {}).get("email")
+            to_email = (event.to_ref or {}).get("email")
+            notify_switch(from_email, to_email)
+        elif event.kind == "all-exhausted":
+            notify_all_exhausted(event.earliest_reset_at)
+        elif event.kind == "account-quarantined":
+            notify_quarantined(event.email, event.reason)
+
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
+        _maybe_notify(event)
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
@@ -526,6 +554,7 @@ Defaults live in settings.json in the backup root; flags override them.
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
+        _maybe_notify(event)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
