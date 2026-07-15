@@ -117,6 +117,20 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 }
 
 
+# Bundles of settings for `cswap config apply-preset NAME`, single source of
+# truth for the values docs/SETUP.md and docs/WINDOWS.md walk users through
+# by hand today.
+PRESETS: dict[str, dict[str, str]] = {
+    "max-drain": {
+        "autoswitch.threshold": "99.9",
+        "autoswitch.hysteresisPct": "0",
+        "autoswitch.cooldownSeconds": "60",
+        "autoswitch.intervalSeconds": "30",
+        "autoswitch.strategy": "best",
+    },
+}
+
+
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
 
@@ -304,6 +318,23 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     raw[spec.section] = section
     atomic_write_json(path, raw)
     return value
+
+
+def apply_preset(backup_root: Path, name: str) -> list[tuple[str, object]]:
+    """Validate and persist every key in a named preset; returns (key, value) pairs.
+
+    Raises ConfigError up front (before writing anything) for an unknown
+    preset name, same loud-failure style as `set_setting`.
+    """
+    if name not in PRESETS:
+        raise ConfigError(
+            f"unknown preset '{name}'\n"
+            f"Valid presets: {', '.join(PRESETS)}"
+        )
+    return [
+        (dotted_key, set_setting(backup_root, dotted_key, raw_value))
+        for dotted_key, raw_value in PRESETS[name].items()
+    ]
 
 
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:

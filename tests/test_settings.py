@@ -12,8 +12,10 @@ import pytest
 
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
+    PRESETS,
     SETTING_SPECS,
     AutoSwitchSettings,
+    apply_preset,
     effective_settings,
     load_settings,
     merged_with_cli,
@@ -173,6 +175,34 @@ class TestSetUnsetSetting:
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert not settings_path(tmp_path).exists()
+
+
+class TestApplyPreset:
+    def test_max_drain_writes_every_documented_key(self, tmp_path: Path):
+        applied = apply_preset(tmp_path, "max-drain")
+        assert dict(applied) == {
+            "autoswitch.threshold": 99.9,
+            "autoswitch.hysteresisPct": 0.0,
+            "autoswitch.cooldownSeconds": 60.0,
+            "autoswitch.intervalSeconds": 30.0,
+            "autoswitch.strategy": "best",
+        }
+        settings = load_settings(tmp_path)
+        assert settings.threshold == 99.9
+        assert settings.hysteresis_pct == 0.0
+        assert settings.cooldown_seconds == 60.0
+        assert settings.interval_seconds == 30.0
+        assert settings.strategy == "best"
+
+    def test_unknown_preset_raises_without_writing(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="unknown preset"):
+            apply_preset(tmp_path, "bogus")
+        assert not settings_path(tmp_path).exists()
+
+    def test_every_preset_key_is_a_real_setting(self):
+        for values in PRESETS.values():
+            for dotted_key in values:
+                assert dotted_key in SETTING_SPECS
 
 
 class TestEffectiveSettings:

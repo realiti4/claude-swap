@@ -22,9 +22,7 @@ pip install pipx
 pipx install claude-swap   # or: pip install -e .  from this repo
 cswap add                  # register account 1 (opens browser)
 cswap add                  # register account 2
-cswap config set autoswitch.threshold 99.9
-cswap config set autoswitch.hysteresisPct 0
-cswap config set autoswitch.intervalSeconds 30
+cswap config apply-preset max-drain
 cswap auto                 # start the loop — notifications on by default
 ```
 
@@ -241,6 +239,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config unset autoswitch.threshold   # back to the default
+cswap config apply-preset max-drain       # squeeze 99.9% out of each account, in one shot
 cswap config path                         # where settings.json lives
 ```
 
@@ -342,6 +341,10 @@ pipx uninstall claude-swap
 
 - Python 3.12+
 - Claude Code installed and logged in
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 

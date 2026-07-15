@@ -198,6 +198,30 @@ class TestSelectiveExport:
             export_accounts(s, str(temp_home / "x.cswap"))
 
 
+class TestExportPlaintextWarning:
+    def test_warns_on_file_destination(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+
+        export_accounts(s, str(temp_home / "one.cswap"))
+        err = capsys.readouterr().err
+        assert "unencrypted" in err
+        assert "gpg -c" in err
+
+    def test_warns_on_stdout_destination_via_stderr_not_stdout(
+        self, temp_home: Path, capsys
+    ):
+        """Stdout must stay pure JSON (pipeable) — the warning goes to stderr."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+
+        export_accounts(s, "-")
+        captured = capsys.readouterr()
+        assert "unencrypted" in captured.err
+        assert "unencrypted" not in captured.out
+        json.loads(captured.out)  # stdout is still valid, warning-free JSON
+
+
 # ---------------------------------------------------------------------------
 # Conflict / force semantics
 # ---------------------------------------------------------------------------

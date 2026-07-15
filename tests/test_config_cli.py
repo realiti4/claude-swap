@@ -140,6 +140,28 @@ class TestConfigSetGet:
             }
 
 
+class TestConfigApplyPreset:
+    def test_max_drain_sets_every_documented_key(self, temp_home, capsys):
+        code, out, _ = _run(["apply-preset", "max-drain"], capsys)
+        assert code == 0
+        for line in (
+            "autoswitch.threshold = 99.9",
+            "autoswitch.hysteresisPct = 0",
+            "autoswitch.cooldownSeconds = 60",
+            "autoswitch.intervalSeconds = 30",
+            "autoswitch.strategy = best",
+        ):
+            assert line in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["autoswitch"]["threshold"] == 99.9
+        assert raw["autoswitch"]["strategy"] == "best"
+
+    def test_unknown_preset_exits_1_without_writing(self, temp_home, capsys):
+        code, _, err = _run(["apply-preset", "bogus"], capsys)
+        assert code != 0
+        assert not _settings_file(capsys).exists()
+
+
 class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)

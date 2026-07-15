@@ -249,6 +249,12 @@ def export_accounts(
 
     serialized = json.dumps(envelope, indent=2)
 
+    _eprint(
+        "Warning: this export contains unencrypted OAuth tokens / API keys in "
+        "plaintext — anyone with the file can act as these accounts. Encrypt "
+        "it, e.g. `cswap export - | gpg -c > backup.gpg`."
+    )
+
     if destination == "-":
         sys.stdout.write(serialized)
         sys.stdout.write("\n")

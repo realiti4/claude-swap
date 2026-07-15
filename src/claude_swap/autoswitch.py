@@ -242,8 +242,7 @@ class QuarantineEvent(AutoSwitchEvent):
     def human(self) -> str:
         return (
             f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
-            f"Log in with it and run 'cswap --add-account --slot {self.number}' "
-            "to recover."
+            f"Log in with it and run 'cswap add --slot {self.number}' to recover."
         )
 
 

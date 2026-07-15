@@ -299,7 +299,7 @@ Defaults live in settings.json in the backup root; flags override them.
         elif event.kind == "all-exhausted":
             notify_all_exhausted(event.earliest_reset_at)
         elif event.kind == "account-quarantined":
-            notify_quarantined(event.email, event.reason)
+            notify_quarantined(event.number, event.email, event.reason)
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -370,7 +370,9 @@ def _config_command(argv: list[str]) -> None:
     loudly here instead of silently degrading at `cswap auto` time.
     """
     from claude_swap.settings import (
+        PRESETS,
         SETTING_SPECS,
+        apply_preset,
         effective_settings,
         format_setting_value,
         set_setting,
@@ -383,6 +385,10 @@ def _config_command(argv: list[str]) -> None:
         f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
         for spec in SETTING_SPECS.values()
     )
+    preset_lines = "\n".join(
+        f"  {name:<34}" + ", ".join(f"{k}={v}" for k, v in values.items())
+        for name, values in PRESETS.items()
+    )
     parser = argparse.ArgumentParser(
         prog="cswap config",
         description=(
@@ -394,11 +400,15 @@ def _config_command(argv: list[str]) -> None:
 Keys:
 {key_lines}
 
+Presets:
+{preset_lines}
+
 Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
   cswap config unset autoswitch.threshold   # back to the default
+  cswap config apply-preset max-drain       # squeeze 99.9% out of each account
   cswap config path                         # where settings.json lives
         """,
     )
@@ -412,7 +422,9 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
-    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{list,get,set,unset,apply-preset,path}"
+    )
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
@@ -431,6 +443,10 @@ Examples:
     p_set.add_argument("value", metavar="VALUE")
     p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
     p_unset.add_argument("key", metavar="KEY")
+    p_preset = sub.add_parser(
+        "apply-preset", help="Set every key in a named bundle (see Presets below)"
+    )
+    p_preset.add_argument("name", metavar="NAME", choices=list(PRESETS))
     sub.add_parser("path", help="Print the settings.json location")
 
     args = parser.parse_args(argv)
@@ -491,6 +507,10 @@ Examples:
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+        elif action == "apply-preset":
+            applied = apply_preset(root, args.name)
+            for key, value in applied:
+                print(f"{key} = {format_setting_value(value)}")
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))
@@ -503,6 +523,30 @@ Examples:
             file=sys.stderr if json_mode else sys.stdout,
         )
         sys.exit(130)
+
+
+def _add_accounts_batch(switcher: ClaudeAccountSwitcher, count: int) -> None:
+    """Register `count` accounts in a row, pausing between each one.
+
+    `add_account` always captures whichever account Claude Code is currently
+    logged into, so a tight loop would just re-capture the same account
+    `count` times. Pausing for an Enter keypress between iterations gives the
+    user a chance to log into Claude Code with the next account first.
+    """
+    from claude_swap.exceptions import ValidationError
+
+    for i in range(count):
+        print(dimmed(
+            f"[{i + 1}/{count}] Log into Claude Code with account {i + 1}, "
+            "then press Enter to continue (Ctrl+C to stop)..."
+        ))
+        try:
+            input()
+        except EOFError:
+            raise ValidationError(
+                "cswap add --count needs an interactive terminal (stdin is not a TTY)"
+            ) from None
+        switcher.add_account(slot=None)
 
 
 def _use_native_tls() -> None:
@@ -590,6 +634,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch user@example.com
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
+  %(prog)s add --count 3                     # add 3 accounts in a row, pausing between each
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
@@ -638,6 +683,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         type=int,
         metavar="NUM",
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        metavar="N",
+        help=(
+            "Add N accounts in a row (use with bare 'add'); pauses between "
+            "each one so you can log into Claude Code with the next account"
+        ),
     )
     parser.add_argument(
         "--email",
@@ -791,6 +845,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
+    if args.count is not None:
+        if not args.add_account:
+            parser.error("--count can only be used with bare 'add'")
+        if args.slot is not None:
+            parser.error("--count cannot be combined with --slot")
+        if args.count < 1:
+            parser.error("--count must be at least 1")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
@@ -831,7 +893,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot)
+            if args.count is not None:
+                _add_accounts_batch(switcher, args.count)
+            else:
+                switcher.add_account(slot=args.slot)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,

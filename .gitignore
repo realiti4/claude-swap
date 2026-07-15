@@ -11,3 +11,16 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# >>> MASTER AI (managed by: masterai git) >>>
+# Keeps MASTER AI toolkit files out of git so it isn't obvious this project uses it.
+# Re-include with: masterai git show   |   inspect: masterai git status
+.claude/
+CLAUDE.md
+AGENTS.md
+MASTERAI.md
+.masterai
+.masterai-applied.json
+.masterai-live/
+.mcp.json
+# <<< MASTER AI (managed by: masterai git) <<<

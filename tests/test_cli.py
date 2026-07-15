@@ -208,6 +208,44 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--slot can only be used with 'add' or 'add-token'" in capsys.readouterr().err
 
+    def test_count_flag_requires_add_account(self, capsys):
+        """--count should only be accepted alongside bare 'add'."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--count", "3"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--count can only be used with bare 'add'" in capsys.readouterr().err
+
+    def test_count_flag_rejects_slot(self, capsys):
+        """--count and --slot are mutually exclusive (slot pins one account)."""
+        with patch.object(
+            sys, "argv", ["claude-swap", "--add-account", "--count", "3", "--slot", "2"]
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--count cannot be combined with --slot" in capsys.readouterr().err
+
+    def test_count_flag_rejects_non_positive(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "--add-account", "--count", "0"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--count must be at least 1" in capsys.readouterr().err
+
+    def test_count_flag_in_help(self):
+        """--count should appear in help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "--count" in result.stdout
+
     def test_slot_flag_in_help(self):
         """--slot should appear in help output."""
         result = subprocess.run(
@@ -508,6 +546,37 @@ class TestCLICommands:
         )
         assert "add-token [TOKEN|-]" in result.stdout
         assert "--email" in result.stdout  # modifier flag stays visible
+
+
+class TestAddCountDispatch:
+    def test_count_calls_add_account_n_times_with_pauses(self, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--add-account", "--count", "2"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None), \
+             patch("builtins.input", return_value="") as mock_input:
+            cli.main()
+
+        assert mock_input.call_count == 2
+        assert switcher_cls.return_value.add_account.call_count == 2
+        switcher_cls.return_value.add_account.assert_called_with(slot=None)
+        out = capsys.readouterr().out
+        assert "1/2" in out
+        assert "2/2" in out
+
+    def test_count_eof_raises_without_adding(self, capsys):
+        """A non-interactive stdin (no TTY) must fail loudly, not silently skip."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--add-account", "--count", "2"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None), \
+             patch("builtins.input", side_effect=EOFError):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        assert "interactive terminal" in capsys.readouterr().err
+        switcher_cls.return_value.add_account.assert_not_called()
 
 
 class TestRunCommand:

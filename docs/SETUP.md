@@ -80,6 +80,12 @@ Set the threshold as high as the tool allows so rotation happens only when
 you've genuinely drained the current account:
 
 ```bash
+cswap config apply-preset max-drain
+```
+
+Equivalent to setting each key by hand:
+
+```bash
 cswap config set autoswitch.threshold 99.9
 cswap config set autoswitch.hysteresisPct 0
 cswap config set autoswitch.cooldownSeconds 60
@@ -110,8 +116,14 @@ cswap auto
 
 This runs the rotation loop in your terminal.  To run in the background:
 
-**Windows** — open a separate PowerShell window and run `cswap auto` there, or
-use the Windows Task Scheduler method in [WINDOWS.md](./WINDOWS.md).
+**Windows** — run the setup script so it starts automatically at every login
+and survives crashes/reboots without a terminal open:
+```powershell
+cd scripts\windows
+.\install-autostart.ps1
+```
+See [WINDOWS.md](./WINDOWS.md#run-in-background-without-a-terminal-window) for
+details and how to uninstall it.
 
 **macOS / Linux** — background it with:
 ```bash

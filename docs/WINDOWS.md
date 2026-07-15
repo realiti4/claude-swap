@@ -39,6 +39,12 @@ cswap list  # confirm they're all registered
 ## Recommended configuration
 
 ```powershell
+cswap config apply-preset max-drain
+```
+
+Equivalent to setting each key by hand:
+
+```powershell
 cswap config set autoswitch.threshold 99.9
 cswap config set autoswitch.hysteresisPct 0
 cswap config set autoswitch.cooldownSeconds 60
@@ -63,10 +69,31 @@ every account swap and when all accounts run out.
 
 ### Run in background (without a terminal window)
 
-**Option A — Windows Terminal in a separate tab**
-Just open a new tab and run `cswap auto` there.
+**Option A — Setup script (recommended)**
 
-**Option B — Task Scheduler (starts on login, no window)**
+This is the "set it up once and forget about it" option: it registers a
+Scheduled Task that starts `cswap auto` hidden at every login and restarts it
+automatically if it ever crashes, so nothing depends on a terminal staying
+open.
+
+```powershell
+cd C:\WORK\claude-swap\scripts\windows
+.\install-autostart.ps1              # notifications on (default)
+.\install-autostart.ps1 -NoNotify    # or suppress them
+```
+
+It also starts the task immediately, so auto-switch is live right after you
+run it — no reboot or re-login needed. To check on it later or turn it off:
+
+```powershell
+Get-ScheduledTask -TaskName "Claude Swap Auto" | Get-ScheduledTaskInfo
+.\uninstall-autostart.ps1
+```
+
+**Option B — Task Scheduler by hand**
+
+Same result as the script above, done through the GUI — useful if you'd
+rather not run a script, or want to see exactly what gets configured:
 
 1. Open **Task Scheduler** (`taskschd.msc`)
 2. **Create Basic Task** → name it `Claude Swap Auto`
@@ -74,13 +101,20 @@ Just open a new tab and run `cswap auto` there.
 4. Action: **Start a program**
    - Program: `powershell`
    - Arguments: `-WindowStyle Hidden -Command "cswap auto --no-notify"`
-5. Finish → right-click the task → **Run** to start it immediately
+5. Finish → right-click the task → **Properties** → **Settings** tab → set
+   **"Stop the task if it runs longer than"** to unchecked (the default 3-day
+   limit would silently kill a loop meant to run forever)
+6. Right-click the task → **Run** to start it immediately
 
 > Use `--no-notify` only if you don't want notifications from the background
 > task — but leaving it on (the default) means you'll be notified on every
 > switch even while the window is hidden.
 
-**Option C — PowerShell background job**
+**Option C — Windows Terminal in a separate tab**
+Just open a new tab and run `cswap auto` there. Simplest option, but it stops
+the moment that tab or terminal window closes.
+
+**Option D — PowerShell background job**
 
 ```powershell
 # Start as a background job in the current session

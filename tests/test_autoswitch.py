@@ -40,11 +40,11 @@ class FakeClock:
         self.now += seconds
 
 
-def _usage(pct: float, resets_at: str | None = None) -> dict:
+def _usage(pct: float, resets_at: str | None = None, seven_day_pct: float = 0.0) -> dict:
     window: dict = {"pct": pct}
     if resets_at:
         window["resets_at"] = resets_at
-    return {"five_hour": window, "seven_day": {"pct": 0.0}}
+    return {"five_hour": window, "seven_day": {"pct": seven_day_pct}}
 
 
 def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
@@ -177,6 +177,32 @@ class TestDecisionTable:
         assert switch.trigger == "proactive"
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
         assert harness.state()["lastSwitchTo"] == "3"
+
+    def test_seven_day_exhaustion_switches_even_with_fresh_five_hour(self, harness):
+        """The binding window is max(5h, 7d): a maxed-out weekly quota must
+        trigger a switch even while the 5-hour session window is nearly
+        empty — Claude Code fails on the weekly cap regardless of session
+        headroom, so auto-switch has to watch both, not just the 5h window."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(5, seven_day_pct=97),  # session fresh, weekly exhausted
+            "2": _usage(20, seven_day_pct=30),
+            "3": _usage(50, seven_day_pct=10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_seven_day_exhaustion_disqualifies_a_candidate_too(self, harness):
+        """A candidate must not be picked while ITS weekly window is maxed
+        out either, even if its 5-hour window looks wide open."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(95, seven_day_pct=10),
+            "2": _usage(5, seven_day_pct=99),  # tempting 5h, but weekly-exhausted
+            "3": _usage(30, seven_day_pct=15),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
 
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)

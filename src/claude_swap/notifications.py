@@ -163,11 +163,11 @@ def notify_all_exhausted(reset_at: str | None) -> None:
     notify("Claude Swap — No Tokens Left", body, urgency="critical")
 
 
-def notify_quarantined(email: str, reason: str) -> None:
+def notify_quarantined(number: str, email: str, reason: str) -> None:
     """An account was quarantined (dead token)."""
     notify(
         "Claude Account Quarantined",
         f"{email} removed from rotation.\nReason: {reason}\n"
-        "Run: cswap add --slot N  to recover.",
+        f"Run: cswap add --slot {number}  to recover.",
         urgency="normal",
     )
