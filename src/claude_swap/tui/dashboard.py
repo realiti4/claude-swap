@@ -17,8 +17,9 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -51,7 +52,7 @@ class DashboardScreen(Screen):
         Binding("k", "cursor_up", show=False),
     ]
 
-    app: "CswapApp"
+    app: CswapApp
 
     def __init__(self) -> None:
         super().__init__()
@@ -175,7 +176,7 @@ class AccountListScreen(Screen):
     selection on demand.
     """
 
-    app: "CswapApp"
+    app: CswapApp
 
     def __init__(self) -> None:
         super().__init__()
@@ -207,7 +208,7 @@ class AccountListScreen(Screen):
                 else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts):
+            for item, acc in zip(listview.query(AccountItem), snap.accounts, strict=False):
                 item.set_account(acc)
         self._flash_updated(snap, listview)
 

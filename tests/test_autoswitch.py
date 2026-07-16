@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,10 +24,10 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
-from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import FetchRecord, UsageEntry
 
 
 class FakeClock:
@@ -627,11 +628,11 @@ class TestAdaptiveScheduler:
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
     def test_exhausted_candidate_skips_to_its_reset(self, temp_home, monkeypatch):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         h = self._harness(temp_home, monkeypatch)
         reset_iso = "2026-07-05T12:00:00Z"
-        reset_ts = datetime(2026, 7, 5, 12, tzinfo=timezone.utc).timestamp()
+        reset_ts = datetime(2026, 7, 5, 12, tzinfo=UTC).timestamp()
         usage = {"1": _usage(50), "2": _usage(100, reset_iso), "3": _usage(20)}
         counts: dict[str, int] = {}
         for _ in range(3):
@@ -644,7 +645,7 @@ class TestAdaptiveScheduler:
         assert entry.next_poll_at == pytest.approx(reset_ts)
 
     def test_poll_never_scheduled_past_a_window_reset(self, temp_home, monkeypatch):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from claude_swap.autoswitch import RESET_SLACK_S
 
@@ -654,7 +655,7 @@ class TestAdaptiveScheduler:
         h = self._harness(temp_home, monkeypatch, accounts=2, interval_seconds=600)
         reset_ts = h.clock.now + 90.0
         reset_iso = (
-            datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+            datetime.fromtimestamp(reset_ts, tz=UTC)
             .isoformat()
             .replace("+00:00", "Z")
         )

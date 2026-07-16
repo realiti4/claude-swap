@@ -12,8 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import __version__
-from claude_swap import cli
+from claude_swap import __version__, cli
 
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")

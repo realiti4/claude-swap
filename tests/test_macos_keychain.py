@@ -10,7 +10,7 @@ function bodies run against a fake process.)
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -94,7 +94,7 @@ def test_set_password_small_payload_uses_security_i_stdin():
         assert "short-secret" not in args
         stdin = kwargs["input"]
         assert stdin.startswith("add-generic-password -U")
-        assert "-X " + "short-secret".encode().hex() in stdin
+        assert "-X " + b"short-secret".hex() in stdin
         # -a/-s are quoted in the stdin command line.
         assert '-a "acct"' in stdin and '-s "svc"' in stdin
 

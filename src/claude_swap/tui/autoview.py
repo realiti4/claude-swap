@@ -67,7 +67,7 @@ class AutoScreen(Screen):
         Binding("escape,q", "back", "Back"),
     ]
 
-    app: "CswapApp"
+    app: CswapApp
 
     def __init__(self) -> None:
         super().__init__()

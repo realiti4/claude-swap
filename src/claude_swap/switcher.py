@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import shutil
@@ -12,8 +11,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from claude_swap import macos_keychain
-
+from claude_swap import macos_keychain, oauth
+from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
+from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
+    CLAUDE_CODE_KEYCHAIN_SERVICE,
+    SECURITY_SERVICE,
+    ActiveCredentials,
+    CredentialStore,
+    looks_like_api_key,
+)
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -22,8 +28,6 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth
-from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
@@ -35,13 +39,6 @@ from claude_swap.json_output import (
     usage_fields,
     usage_freshness_fields,
 )
-from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
-    CLAUDE_CODE_KEYCHAIN_SERVICE,
-    SECURITY_SERVICE,
-    ActiveCredentials,
-    CredentialStore,
-    looks_like_api_key,
-)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -51,6 +48,12 @@ from claude_swap.models import (
     SwitchTransaction,
     get_timestamp,
 )
+from claude_swap.paths import (
+    get_backup_root,
+    get_global_config_path,
+    get_legacy_backup_root,
+    migrate_legacy_backup_dir,
+)
 from claude_swap.printer import (
     abbreviate_path,
     accent,
@@ -58,17 +61,10 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
-    error,
     format_age,
     ide_short_name,
     muted,
     warning,
-)
-from claude_swap.paths import (
-    get_backup_root,
-    get_global_config_path,
-    get_legacy_backup_root,
-    migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap.usage_store import (
@@ -111,7 +107,9 @@ def _format_usage_lines(usage: dict) -> list[str]:
         pct = spend["pct"]
         cell = oauth.fresh_reset_strings(spend)
         if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
+            rows.append(
+                ("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}")
+            )
         else:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
@@ -129,7 +127,9 @@ def _format_usage_lines(usage: dict) -> list[str]:
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
-            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+            rows.append(
+                (w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}")
+            )
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
@@ -342,9 +342,9 @@ class ClaudeAccountSwitcher:
         # Validate written content
         try:
             json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            raise ConfigError("Generated invalid JSON") from exc
 
         # Move to final location
         shutil.move(str(temp_path), str(path))
@@ -1011,7 +1011,9 @@ class ClaudeAccountSwitcher:
         if slot is None and self._account_exists(current_email, current_org_uuid):
             seq = self._get_sequence_data()
             account_num = self._find_account_slot(seq, current_email, current_org_uuid)
-            matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
+            matched_org_name = (
+                seq["accounts"][account_num].get("organizationName", "") if account_num else ""
+            )
 
             current_creds = self._read_credentials()
             if current_creds is None:
@@ -1023,10 +1025,10 @@ class ClaudeAccountSwitcher:
             config_path = self._get_claude_config_path()
             try:
                 current_config = config_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                raise ConfigError("Claude config file not found")
-            except PermissionError:
-                raise ConfigError("Permission denied reading Claude config")
+            except FileNotFoundError as exc:
+                raise ConfigError("Claude config file not found") from exc
+            except PermissionError as exc:
+                raise ConfigError("Permission denied reading Claude config") from exc
 
             self._write_account_credentials(account_num, current_email, current_creds)
             self._write_account_config(account_num, current_email, current_config)
@@ -1102,10 +1104,10 @@ class ClaudeAccountSwitcher:
         config_path = self._get_claude_config_path()
         try:
             current_config = config_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise ConfigError("Claude config file not found")
-        except PermissionError:
-            raise ConfigError("Permission denied reading Claude config")
+        except FileNotFoundError as exc:
+            raise ConfigError("Claude config file not found") from exc
+        except PermissionError as exc:
+            raise ConfigError("Permission denied reading Claude config") from exc
 
         # Get account UUID and org fields
         config_data = self._read_json(config_path)
@@ -1155,7 +1157,10 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
-        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        self._logger.info(
+            f"Added account {account_num}: {current_email} "
+            f"(org: {organization_uuid or 'personal'})"
+        )
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
@@ -1951,7 +1956,8 @@ class ClaudeAccountSwitcher:
                         parts.append(f"{s} session{'s' if s > 1 else ''}")
                     if counts["ide"]:
                         parts.append("IDE")
-                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+                    parts_str = dimmed(f"({', '.join(parts)})")
+                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {parts_str}")
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
@@ -2646,7 +2652,7 @@ class ClaudeAccountSwitcher:
                 try:
                     target_config_data = json.loads(target_config)
                 except json.JSONDecodeError as exc:
-                    raise SwitchError(f"Invalid backup config: {exc}")
+                    raise SwitchError(f"Invalid backup config: {exc}") from exc
                 target_oauth = target_config_data.get("oauthAccount")
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
@@ -2671,7 +2677,7 @@ class ClaudeAccountSwitcher:
                         except OSError as e:
                             raise ConfigError(
                                 f"Cannot snapshot live config before activation: {e}"
-                            )
+                            ) from e
 
                 creds_written = False
                 config_written = False
@@ -2754,10 +2760,10 @@ class ClaudeAccountSwitcher:
                         "refusing to overwrite its backup"
                     )
                 original_config = config_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                raise ConfigError("Claude config file not found")
-            except PermissionError:
-                raise ConfigError("Permission denied reading Claude config")
+            except FileNotFoundError as exc:
+                raise ConfigError("Claude config file not found") from exc
+            except PermissionError as exc:
+                raise ConfigError("Permission denied reading Claude config") from exc
 
             transaction = SwitchTransaction(
                 original_credentials=original_creds,
@@ -2831,13 +2837,13 @@ class ClaudeAccountSwitcher:
                         self._logger.info("Rollback successful")
                         raise SwitchError(
                             f"Switch failed and was rolled back: {e}"
-                        )
+                        ) from e
                     else:
                         self._logger.error("Rollback failed!")
                         raise SwitchError(
                             f"Switch failed and rollback also failed: {e}. "
                             f"Manual recovery may be needed."
-                        )
+                        ) from e
                 raise
 
         # Lock released. Safe to do network I/O and let persist callbacks

@@ -38,7 +38,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
@@ -102,7 +102,7 @@ ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× thi
 
 def _now_iso() -> str:
     return (
-        datetime.now(timezone.utc)
+        datetime.now(UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -1083,7 +1083,7 @@ class AutoSwitchEngine:
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
-                until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                until = datetime.now(UTC) + timedelta(seconds=delay)
                 self._emit(
                     SleepEvent(
                         seconds=delay,

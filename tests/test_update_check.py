@@ -6,8 +6,6 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from claude_swap.update_check import (
     CACHE_TTL,
     _detect_install_method,

@@ -8,7 +8,7 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from claude_swap import oauth
 
@@ -119,7 +119,7 @@ def usage_freshness_fields(
         return {}
     fields: dict = {
         "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            datetime.fromtimestamp(fetched_at, tz=UTC)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )

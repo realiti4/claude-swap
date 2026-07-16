@@ -49,7 +49,7 @@ class MenuBarSettings:
     auto_switch_enabled: bool = False
 
     @classmethod
-    def load(cls, path: Path) -> "MenuBarSettings":
+    def load(cls, path: Path) -> MenuBarSettings:
         """Load settings, falling back to defaults on any problem.
 
         Unknown keys are ignored; a value whose type doesn't match the field
@@ -543,7 +543,9 @@ def run(switcher) -> int:
 
         def _settings_menu(self, rumps):
             menu = rumps.MenuItem("Settings")
-            name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
+            name_item = rumps.MenuItem(
+                "Show account name in menu bar", callback=self.on_toggle_name
+            )
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
 

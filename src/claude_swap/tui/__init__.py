@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
-def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
+def run(switcher: ClaudeAccountSwitcher, start: str = "dashboard") -> int:
     """Run the TUI over an existing switcher. Returns the process exit code.
 
     ``start="watch"`` (the ``cswap watch`` command) opens directly on the

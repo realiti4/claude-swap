@@ -16,7 +16,6 @@ from textual.widgets import ListItem, Static
 
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
-from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import (
     ACCENT,
@@ -27,6 +26,7 @@ from claude_swap.tui.theme import (
     TRACK,
     severity_color,
 )
+from claude_swap.usage_store import STALE_OK_S
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -252,7 +252,7 @@ class AccountsPanel(Static):
         self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
 
     def render(self) -> Text:
-        app: "CswapApp" = self.app  # type: ignore[assignment]
+        app: CswapApp = self.app  # type: ignore[assignment]
         snap = app.snapshot
         if snap is None:
             return Text("loading…", style=MUTED)

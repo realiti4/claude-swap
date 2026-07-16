@@ -49,8 +49,8 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import SessionError
-from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
+from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.printer import accent, dimmed, muted, warning

@@ -15,7 +15,6 @@ from pathlib import Path
 from claude_swap import menubar
 from claude_swap.switcher import USAGE_API_KEY
 
-
 # --- settings ------------------------------------------------------------------
 
 def test_settings_defaults_when_file_missing(tmp_path: Path):
@@ -211,7 +210,7 @@ _NOW = 1_000_000.0
 
 
 def _iso(delta_s):  # ISO-8601 for _NOW + delta_s, UTC
-    return _dt.datetime.fromtimestamp(_NOW + delta_s, _dt.timezone.utc).isoformat()
+    return _dt.datetime.fromtimestamp(_NOW + delta_s, _dt.UTC).isoformat()
 
 
 def test_live_countdown_formats_from_resets_at():

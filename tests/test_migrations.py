@@ -23,7 +23,6 @@ from claude_swap.migrations import run_migrations
 from claude_swap.models import Platform
 from claude_swap.switcher import KEYRING_SERVICE, ClaudeAccountSwitcher
 
-
 # ---------------------------------------------------------------------------
 # Fakes / fixtures
 # ---------------------------------------------------------------------------

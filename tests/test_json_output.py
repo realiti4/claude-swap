@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from claude_swap import oauth
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -17,7 +18,6 @@ from claude_swap.json_output import (
     usage_fields,
     usage_to_json,
 )
-from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -27,7 +27,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 # --------------------------------------------------------------------------- #
 class TestJsonHelpers:
     def test_usage_to_json_maps_keys_and_preserves_raw_reset(self):
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=4, seconds=30)).isoformat()
+        resets_at = (datetime.now(UTC) + timedelta(hours=4, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {
             "five_hour": {"pct": 25.0, "resets_at": resets_at,
@@ -47,7 +47,7 @@ class TestJsonHelpers:
         assert out["spend"]["resetsAt"] == resets_at
 
     def test_usage_to_json_projects_scoped_windows(self):
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=3, seconds=30)).isoformat()
+        resets_at = (datetime.now(UTC) + timedelta(hours=3, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {
             "five_hour": {"pct": 7.0},
@@ -66,7 +66,7 @@ class TestJsonHelpers:
         # A measurement served from the store hours after its fetch still
         # carries the countdown frozen at fetch time; the JSON projection must
         # derive the live value from resets_at, same as the human view.
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        resets_at = (datetime.now(UTC) + timedelta(hours=2, minutes=30)).isoformat()
         usage = {"seven_day": {"pct": 62.0, "resets_at": resets_at,
                                "countdown": "17h 0m", "clock": "stale-clock"}}
         out = usage_to_json(usage)
@@ -88,7 +88,7 @@ class TestJsonHelpers:
         assert out["sevenDay"]["clock"] == "15:59"
 
     def test_usage_to_json_recomputes_spend_strings(self):
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
+        resets_at = (datetime.now(UTC) + timedelta(hours=2, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {"spend": {"used": 1.0, "limit": 10.0, "pct": 10.0, "currency": "USD",
                            "resets_at": resets_at,
@@ -157,7 +157,10 @@ class TestListJson:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
+             patch(
+                 "claude_swap.oauth.try_fetch_usage_for_account",
+                 return_value=oauth.UsageOutcome(usage),
+             ):
             payload = switcher.list_accounts(json_output=True)
 
         # Method itself prints nothing — the CLI serializes.
@@ -185,7 +188,10 @@ class TestListJson:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=""), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+             patch(
+                 "claude_swap.oauth.try_fetch_usage_for_account",
+                 return_value=oauth.UsageOutcome(None),
+             ):
             payload = switcher.list_accounts(json_output=True)
 
         by_num = {a["number"]: a for a in payload["accounts"]}
@@ -277,7 +283,10 @@ class TestStatusJson:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
+             patch(
+                 "claude_swap.oauth.try_fetch_usage_for_account",
+                 return_value=oauth.UsageOutcome(usage),
+             ):
             payload = switcher.status(json_output=True)
 
         assert capsys.readouterr().out == ""
@@ -335,7 +344,10 @@ def _install_patches(switcher, creds_store, configs_store, live_state):
         patch.object(switcher, "_write_credentials",
                      side_effect=lambda c: live_state.__setitem__("creds", c)),
         # Don't make network calls from the (suppressed) post-switch usage path.
-        patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)),
+        patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(None),
+        ),
     ]
     for p in patches:
         p.start()

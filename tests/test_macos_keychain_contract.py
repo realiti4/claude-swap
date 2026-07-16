@@ -30,7 +30,6 @@ from claude_swap import macos_keychain
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
-
 # ---------------------------------------------------------------------------
 # Mocked keyring tests — backup-credentials path. Run everywhere.
 # ---------------------------------------------------------------------------

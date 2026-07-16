@@ -48,7 +48,7 @@ def _parse_payload(text: str, label: str) -> dict:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise TransferError(f"{label} is not valid JSON: {exc}")
+        raise TransferError(f"{label} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise TransferError(f"{label} must be a JSON object")
     return parsed
@@ -292,7 +292,7 @@ def import_accounts(
     try:
         envelope = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise TransferError(f"export file is not valid JSON: {exc}")
+        raise TransferError(f"export file is not valid JSON: {exc}") from exc
 
     if not isinstance(envelope, dict):
         raise TransferError("export file must be a JSON object")

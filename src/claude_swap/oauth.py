@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from claude_swap.printer import warning as print_warning
 
@@ -44,7 +44,7 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     if not isinstance(expires_at, (int, float)):
         return False
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
@@ -98,7 +98,7 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp_data = json.loads(resp.read().decode())
 
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         oauth["accessToken"] = resp_data["access_token"]
         oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
         if resp_data.get("refresh_token"):
@@ -144,7 +144,7 @@ def build_token_status(credentials: str) -> str | None:
     if not isinstance(expires_at, (int, float)):
         return f"oauth: unknown expiry, refresh token {refresh_str}"
 
-    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=UTC)
     state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
     countdown, clock = format_reset(expires_utc.isoformat())
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
@@ -153,7 +153,7 @@ def build_token_status(credentials: str) -> str | None:
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     remaining = reset_utc - now
     total_seconds = max(0, int(remaining.total_seconds()))
     days, remainder = divmod(total_seconds, 86400)

@@ -10,17 +10,14 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 from claude_swap.process_detection import (
-    ClaudeSession,
-    IdeInstance,
     get_claude_dir,
     get_running_instances,
     is_pid_alive,
     list_ide_instances,
     list_sessions,
 )
-from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
-
 
 # --- get_claude_dir ---
 

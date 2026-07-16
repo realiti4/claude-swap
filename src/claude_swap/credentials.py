@@ -303,7 +303,7 @@ class CredentialStore:
         try:
             data = self._read_global_config() or {}
         except Exception as e:  # pragma: no cover - defensive
-            raise CredentialWriteError(f"Failed to read global config for update: {e}")
+            raise CredentialWriteError(f"Failed to read global config for update: {e}") from e
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -440,7 +440,7 @@ class CredentialStore:
         except CredentialWriteError:
             raise
         except Exception as e:
-            raise CredentialWriteError(f"Failed to write managed API key: {e}")
+            raise CredentialWriteError(f"Failed to write managed API key: {e}") from e
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
@@ -537,7 +537,7 @@ class CredentialStore:
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
-            raise CredentialWriteError(f"Failed to write credentials: {e}")
+            raise CredentialWriteError(f"Failed to write credentials: {e}") from e
         self._delete_active_keychain_entry()
         self._last_active_credentials_backend = "file"
 

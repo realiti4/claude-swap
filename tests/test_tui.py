@@ -12,7 +12,7 @@ import dataclasses
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -24,7 +24,6 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
 
-
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
@@ -32,7 +31,7 @@ from claude_swap.usage_store import UsageEntry
 
 def _iso_in(seconds: float) -> str:
     return (
-        (datetime.now(timezone.utc) + timedelta(seconds=seconds))
+        (datetime.now(UTC) + timedelta(seconds=seconds))
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -765,7 +764,7 @@ def fake_calls(app) -> list[tuple]:
 class _FakeEngine:
     """Stands in for AutoSwitchEngine: records construction, blocks until stop."""
 
-    instances: list["_FakeEngine"] = []
+    instances: list[_FakeEngine] = []
 
     def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
         self.settings = settings

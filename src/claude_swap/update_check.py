@@ -24,7 +24,7 @@ def _detect_install_method() -> str | None:
     """Return 'uv', 'pipx', or None if we can't tell."""
     prefix = Path(sys.prefix)
     parts = tuple(p.lower() for p in prefix.parts)
-    pairs = list(zip(parts, parts[1:]))
+    pairs = list(zip(parts, parts[1:], strict=False))
 
     if ("uv", "tools") in pairs:
         return "uv"

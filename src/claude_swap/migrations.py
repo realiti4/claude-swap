@@ -28,13 +28,14 @@ import os
 import sys
 import tempfile
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import MigrationIncomplete
 from claude_swap.models import Platform, get_timestamp
-from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
+from claude_swap.switcher import KEYRING_SERVICE
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -48,11 +49,11 @@ STATE_VERSION = 1
 # ---------------------------------------------------------------------------
 
 
-def _state_path(switcher: "ClaudeAccountSwitcher") -> Path:
+def _state_path(switcher: ClaudeAccountSwitcher) -> Path:
     return switcher.backup_dir / STATE_FILENAME
 
 
-def _load_applied(switcher: "ClaudeAccountSwitcher") -> dict:
+def _load_applied(switcher: ClaudeAccountSwitcher) -> dict:
     """Return the ``{migration_id: timestamp}`` map; {} if missing or corrupt.
 
     A missing or unparseable state file is treated as "nothing applied" so a
@@ -69,7 +70,7 @@ def _load_applied(switcher: "ClaudeAccountSwitcher") -> dict:
     return applied if isinstance(applied, dict) else {}
 
 
-def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
+def _mark_applied(switcher: ClaudeAccountSwitcher, migration_id: str) -> None:
     """Record ``migration_id`` as applied, written atomically.
 
     Preserves any previously-recorded migrations. Mirrors the mkstemp +
@@ -129,7 +130,7 @@ def _delete_keyring_quietly(
         )
 
 
-def migrate_windows_keyring_to_files(switcher: "ClaudeAccountSwitcher") -> bool:
+def migrate_windows_keyring_to_files(switcher: ClaudeAccountSwitcher) -> bool:
     """Copy Windows backup credentials from Credential Manager to files.
 
     Windows now stores per-account backup credentials as base64 files (like
@@ -287,7 +288,7 @@ def _keyring_backend_unavailable(keyring, exc: Exception) -> bool:
     return bool(candidates) and isinstance(exc, candidates)
 
 
-def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool:
+def migrate_macos_keyring_to_security(switcher: ClaudeAccountSwitcher) -> bool:
     """Move macOS backup credentials from the ``keyring`` service to the
     ``security`` service.
 
@@ -493,7 +494,7 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
 
 
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
-MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
+MIGRATIONS: list[tuple[str, Callable[[ClaudeAccountSwitcher], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
 ]
@@ -504,7 +505,7 @@ MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
 # ---------------------------------------------------------------------------
 
 
-def run_migrations(switcher: "ClaudeAccountSwitcher") -> None:
+def run_migrations(switcher: ClaudeAccountSwitcher) -> None:
     """Run any not-yet-applied migrations. Never raises.
 
     A no-op on fresh installs (backup dir not yet materialized — preserves the

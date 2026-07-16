@@ -826,7 +826,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.import_ is not None
         or args.add_token is not None
     ):
-        parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
+        parser.error(f"no command given — try '{_prog_name()} help'")
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")

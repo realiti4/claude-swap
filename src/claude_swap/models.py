@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -176,4 +175,4 @@ class SwitchTransaction:
 
 def get_timestamp() -> str:
     """Get current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

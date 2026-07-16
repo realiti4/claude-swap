@@ -7,32 +7,31 @@ import json
 import os
 import sys
 import time
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from claude_swap import macos_keychain
-from claude_swap import oauth
-from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap import macos_keychain, oauth
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.exceptions import (
-    AccountNotFoundError,
     ConfigError,
     CredentialReadError,
     ValidationError,
 )
-from claude_swap.usage_store import FetchRecord, UsageStore
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_credentials_path
-from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
-    ClaudeAccountSwitcher,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
+    ClaudeAccountSwitcher,
     _format_usage_lines,
 )
+from claude_swap.usage_store import FetchRecord, UsageStore
 
 
 def _raise_locked(*args, **kwargs):
@@ -188,7 +187,9 @@ class TestJsonOperations:
         result = switcher._read_json(test_path)
         assert result is None
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="File permissions work differently on Windows")
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="File permissions work differently on Windows"
+    )
     def test_json_file_permissions(self, temp_home: Path):
         """Test that JSON files are written with correct permissions."""
         switcher = ClaudeAccountSwitcher()
@@ -315,7 +316,9 @@ class TestDirectorySetup:
         assert switcher.configs_dir.exists()
         assert switcher.credentials_dir.exists()
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="File permissions work differently on Windows")
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="File permissions work differently on Windows"
+    )
     def test_directory_permissions(self, temp_home: Path):
         """Test that directories have correct permissions."""
         switcher = ClaudeAccountSwitcher()
@@ -763,8 +766,14 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
-             patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes"):
+             patch(
+                 "claude_swap.oauth.try_fetch_usage_for_account",
+                 return_value=oauth.UsageOutcome(None),
+             ), \
+             patch(
+                 "claude_swap.oauth.build_token_status",
+                 return_value="oauth: fresh, refresh token yes",
+             ):
             switcher.list_accounts(show_token_status=True)
 
         output = capsys.readouterr().out
@@ -1931,7 +1940,9 @@ class TestAccountInfoOrgFields:
     def test_account_info_is_organization_property(self):
         """is_organization should be determined by organizationUuid presence."""
         from claude_swap.models import AccountInfo
-        org = AccountInfo.from_dict(1, {"email": "u@e.com", "uuid": "u", "added": "", "organizationUuid": "o"})
+        org = AccountInfo.from_dict(
+            1, {"email": "u@e.com", "uuid": "u", "added": "", "organizationUuid": "o"}
+        )
         personal = AccountInfo.from_dict(2, {"email": "u@e.com", "uuid": "u", "added": ""})
         assert org.is_organization is True
         assert personal.is_organization is False
@@ -2110,8 +2121,8 @@ class TestResolveIdentifierAmbiguity:
 
     def test_raises_on_ambiguous_email(self, temp_home, sample_sequence_data_with_org):
         """Should raise ConfigError when email matches multiple accounts."""
-        from claude_swap.switcher import ClaudeAccountSwitcher
         from claude_swap.exceptions import ConfigError
+        from claude_swap.switcher import ClaudeAccountSwitcher
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
@@ -2135,8 +2146,9 @@ class TestListAccountsOrgDisplay:
     def test_shows_org_name_and_personal(self, temp_home, mock_credentials_file,
                                          sample_sequence_data_with_org, capsys):
         """list_accounts should display org name and personal tag."""
-        from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2153,7 +2165,9 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)
+        ):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -2164,8 +2178,9 @@ class TestListAccountsOrgDisplay:
     def test_active_account_detected_by_org_uuid(self, temp_home, mock_credentials_file,
                                                    sample_sequence_data_with_org, capsys):
         """Only the account matching current org_uuid should be marked (active)."""
-        from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2180,7 +2195,9 @@ class TestListAccountsOrgDisplay:
         }))
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)
+        ):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -2194,8 +2211,9 @@ class TestListAccountsOrgDisplay:
 class TestBackwardCompatibility:
     def test_old_sequence_json_without_org_fields(self, temp_home, sample_sequence_data, capsys):
         """Old sequence.json without organizationUuid should work correctly."""
-        from claude_swap.switcher import ClaudeAccountSwitcher
         from unittest.mock import patch
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         backup_dir = get_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2211,7 +2229,9 @@ class TestBackwardCompatibility:
         (temp_home / ".claude" / ".credentials.json").write_text('{"accessToken": "tok"}')
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)
+        ):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -2291,7 +2311,9 @@ class TestUpgradeMigration:
         )
 
         switcher = ClaudeAccountSwitcher()
-        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)
+        ):
             switcher.list_accounts()
 
         out = capsys.readouterr().out
@@ -2333,8 +2355,14 @@ class TestUpgradeMigration:
         data1 = switcher._get_sequence_data_migrated()
         data2 = switcher._get_sequence_data_migrated()
 
-        assert data1["accounts"]["1"]["organizationUuid"] == data2["accounts"]["1"]["organizationUuid"]
-        assert data1["accounts"]["2"]["organizationUuid"] == data2["accounts"]["2"]["organizationUuid"]
+        assert (
+            data1["accounts"]["1"]["organizationUuid"]
+            == data2["accounts"]["1"]["organizationUuid"]
+        )
+        assert (
+            data1["accounts"]["2"]["organizationUuid"]
+            == data2["accounts"]["2"]["organizationUuid"]
+        )
 
     def test_migration_skips_already_migrated(
         self, temp_home, sample_sequence_data_pre_v06
@@ -2688,7 +2716,7 @@ class TestAddAccountFromToken:
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)
-        with patch.object(switcher, "_write_account_credentials") as mock_creds, \
+        with patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_write_account_config"):
             switcher.add_account_from_token("sk-ant-oat01-abc", "user@example.com")
 
@@ -3944,9 +3972,9 @@ class TestFormatUsageLines:
         # carries the countdown frozen at fetch time; rendering must derive
         # the live value from resets_at instead (issue: "resets 15:59 in 17h"
         # printed when the reset was 15h away).
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        resets_at = (datetime.now(UTC) + timedelta(hours=2, minutes=30)).isoformat()
         usage = {
             "seven_day": {
                 "pct": 62.0,
@@ -3981,9 +4009,9 @@ class TestFormatUsageLines:
         assert "in 17h 0m" in line
 
     def test_spend_clock_recomputed_from_resets_at(self):
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         resets_at = (now + timedelta(hours=2)).isoformat()
         expected_clock = oauth.format_reset(resets_at)[1]
         usage = {

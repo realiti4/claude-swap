@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 from claude_swap import oauth
@@ -67,7 +67,7 @@ class TestFormatReset:
 
     def test_same_day_shows_time_only(self):
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(hours=2, minutes=15)
         with patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -78,7 +78,7 @@ class TestFormatReset:
 
     def test_different_day_shows_date(self):
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(days=2)
         with patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -90,7 +90,7 @@ class TestFormatReset:
 
     def test_minutes_only_when_under_one_hour(self):
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(minutes=45)
         with patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -105,7 +105,7 @@ class TestFetchUsage:
 
     def test_success(self):
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(hours=1)
         response_data = {
             "five_hour": {"utilization": 22.0, "resets_at": future.isoformat()},
@@ -170,7 +170,7 @@ class TestFetchUsage:
     def test_null_resets_at(self):
         """When resets_at is null, still return pct without clock/countdown."""
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(hours=22)
         response_data = {
             "five_hour": {"utilization": 0.0, "resets_at": None},
@@ -226,7 +226,8 @@ class TestFetchUsage:
         assert result["spend"]["currency"] == "USD"
 
     def test_extra_usage_unlimited_keeps_other_rows(self):
-        """Unlimited (monthly_limit=None) drops the spend entry without losing five_hour/seven_day."""
+        """Unlimited (monthly_limit=None) drops the spend entry without losing
+        five_hour/seven_day."""
         result = self._fetch_with_response({
             "five_hour": {"utilization": 22.0, "resets_at": None},
             "seven_day": {"utilization": 61.0, "resets_at": None},
@@ -280,7 +281,7 @@ class TestFetchUsage:
     def test_scoped_per_model_limits(self):
         """weekly_scoped entries in limits[] surface as result['scoped'] by model name."""
         from datetime import timedelta
-        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         future = fixed_now + timedelta(hours=3)
         response_data = {
             "five_hour": {"utilization": 7.0, "resets_at": None},
@@ -447,8 +448,8 @@ class TestBuildTokenStatus:
     """Test token status formatting."""
 
     def test_builds_fresh_token_status(self):
-        fixed_now = datetime(2026, 4, 2, 18, 0, 0, tzinfo=timezone.utc)
-        expires_at = int(datetime(2026, 4, 2, 19, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        fixed_now = datetime(2026, 4, 2, 18, 0, 0, tzinfo=UTC)
+        expires_at = int(datetime(2026, 4, 2, 19, 30, 0, tzinfo=UTC).timestamp() * 1000)
         credentials = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "old-access",
@@ -486,7 +487,7 @@ class TestFetchUsageForAccount:
     @staticmethod
     def _make_credentials(access="old-access", refresh="old-refresh",
                           expires_at=None, org_uuid="org-1", scopes=None):
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if scopes is None:
             scopes = ["user:profile", "user:inference", "user:sessions:claude_code"]
         return json.dumps({
@@ -523,7 +524,7 @@ class TestFetchUsageForAccount:
         return resp
 
     def test_refreshes_expired_token_before_usage_fetch(self):
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
         token_resp = MagicMock()
@@ -625,7 +626,7 @@ class TestFetchUsageForAccount:
 
     def test_refresh_failure_returns_none_gracefully(self):
         """If token refresh fails (e.g. revoked), usage returns None."""
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
         def mock_urlopen(req, timeout=0):
@@ -649,7 +650,7 @@ class TestFetchUsageForAccount:
 
     def test_refreshes_when_scopes_are_missing(self):
         """Refresh should work even when stored credentials have no scopes."""
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         credentials = self._make_credentials(
             expires_at=now_ms - 1_000,
             scopes=None,
@@ -692,7 +693,7 @@ class TestFetchUsageForAccount:
         own refresh via a lockfile on ~/.claude/ that cswap doesn't honor, so
         cswap must never touch the active account's tokens.
         """
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
         persist_mock = MagicMock()
@@ -824,9 +825,8 @@ class TestClassifyUsageError:
         assert (kind, retry) == ("http-429", None)
 
     def test_timeout(self):
-        import socket
         assert oauth._classify_usage_error(TimeoutError())[0] == "timeout"
-        assert oauth._classify_usage_error(socket.timeout())[0] == "timeout"
+        assert oauth._classify_usage_error(TimeoutError())[0] == "timeout"
         assert oauth._classify_usage_error(
             urllib.error.URLError(TimeoutError())
         )[0] == "timeout"
@@ -853,7 +853,7 @@ class TestTryFetchUsageOutcome:
     def _make_credentials() -> str:
         from datetime import timedelta
         future_ms = int(
-            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+            (datetime.now(UTC) + timedelta(hours=1)).timestamp() * 1000
         )
         return json.dumps({
             "claudeAiOauth": {
