@@ -101,11 +101,7 @@ ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× thi
 
 
 def _now_iso() -> str:
-    return (
-        datetime.now(UTC)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +169,7 @@ class PollEvent(AutoSwitchEvent):
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
-        others = ", ".join(
-            f"#{n}: {self._describe(n)}"
-            for n in self.headroom
-            if n != str(num)
-        )
+        others = ", ".join(f"#{n}: {self._describe(n)}" for n in self.headroom if n != str(num))
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
@@ -204,9 +196,7 @@ class SwitchEvent(AutoSwitchEvent):
         }
 
     def human(self) -> str:
-        src = (
-            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
-        )
+        src = f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
         dst = (
             f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
             if self.to_ref
@@ -366,9 +356,7 @@ def _window_reset_ts(window: dict) -> float | None:
     if not resets_at:
         return None
     try:
-        return datetime.fromisoformat(
-            str(resets_at).replace("Z", "+00:00")
-        ).timestamp()
+        return datetime.fromisoformat(str(resets_at).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
 
@@ -472,9 +460,7 @@ class AutoSwitchEngine:
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
-                to_release.append(
-                    (number, entry.get("email", ""), "account-replaced")
-                )
+                to_release.append((number, entry.get("email", ""), "account-replaced"))
                 continue
             creds = self.switcher.read_account_credentials(number, email_now)
             fingerprint = _refresh_fingerprint(creds) if creds else None
@@ -524,16 +510,13 @@ class AutoSwitchEngine:
         expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
         near_expiry = (
-            isinstance(expires_at, (int, float))
-            and now_ms + FRESHEN_BUFFER_MS >= expires_at
+            isinstance(expires_at, (int, float)) and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
             return "ok"
         outcome = oauth.try_refresh_oauth_credentials(creds)
         if outcome.error is None and outcome.credentials:
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
-            )
+            self.switcher.persist_backup_credentials(number, email, outcome.credentials)
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
@@ -549,9 +532,7 @@ class AutoSwitchEngine:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
-            self._emit(
-                ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
-            )
+            self._emit(ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True))
             return TickOutcome.ERROR
 
     def _tick_inner(self) -> TickOutcome:
@@ -565,16 +546,12 @@ class AutoSwitchEngine:
             # only released (state mutation) on real ticks.
             state = self._release_recovered_quarantines(state)
         quarantined = set(
-            state.get("quarantine", {})
-            if isinstance(state.get("quarantine"), dict)
-            else {}
+            state.get("quarantine", {}) if isinstance(state.get("quarantine"), dict) else {}
         )
 
         current = self.switcher.current_account_number()
         if current is None:
-            self._emit(
-                PollEvent(active=None, headroom={}, threshold=settings.threshold)
-            )
+            self._emit(PollEvent(active=None, headroom={}, threshold=settings.threshold))
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
                 # a switch would overwrite it without a backup.
@@ -594,10 +571,14 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         current_email = self.switcher.account_email(current)
-        active_ref = _ref(current, current_email) if current_email else {
-            "number": int(current),
-            "email": "",
-        }
+        active_ref = (
+            _ref(current, current_email)
+            if current_email
+            else {
+                "number": int(current),
+                "email": "",
+            }
+        )
 
         entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
         self._emit(
@@ -656,10 +637,7 @@ class AutoSwitchEngine:
                     self._emit(
                         NoSwitchEvent(
                             reason="active-idle",
-                            detail=(
-                                "token expired while Claude Code is idle; "
-                                "resumes on next use"
-                            ),
+                            detail=("token expired while Claude Code is idle; resumes on next use"),
                         )
                     )
                     return TickOutcome.NO_ACTION
@@ -679,8 +657,7 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="active-usage-unknown",
                         detail=(
-                            f"{self._unhealthy_ticks}/{settings.unhealthy_ticks} "
-                            "before failover"
+                            f"{self._unhealthy_ticks}/{settings.unhealthy_ticks} before failover"
                         ),
                     )
                 )
@@ -697,9 +674,7 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
+        oauth_candidates = [n for n in candidates if self.switcher.account_kind_for(n) != "api_key"]
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -756,9 +731,7 @@ class AutoSwitchEngine:
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
+            truly_exhausted = all(h is not None and h <= 0 for h in candidate_headrooms)
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -777,9 +750,7 @@ class AutoSwitchEngine:
             self._emit(
                 AllExhaustedEvent(
                     earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
+                        earliest.isoformat().replace("+00:00", "Z") if earliest else None
                     )
                 )
             )
@@ -875,14 +846,11 @@ class AutoSwitchEngine:
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
-                and 100.0 - active_headroom
-                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+                and 100.0 - active_headroom >= self.settings.threshold - ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
-            entries = self.switcher.usage_entries_by_account(
-                fetch={current, *candidates}
-            )
+            entries = self.switcher.usage_entries_by_account(fetch={current, *candidates})
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = {
@@ -917,9 +885,7 @@ class AutoSwitchEngine:
             return interval
         return min(tier, ACTIVE_MAX_INTERVAL_S)
 
-    def _update_poll_plans(
-        self, candidates: list[str], pre: dict, post: dict, now: float
-    ) -> None:
+    def _update_poll_plans(self, candidates: list[str], pre: dict, post: dict, now: float) -> None:
         """Adapt each just-fetched candidate's poll cadence, persisted in the
         store (survives ``--once`` engine restarts).
 
@@ -1077,9 +1043,7 @@ class AutoSwitchEngine:
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
-                self._emit(
-                    ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
-                )
+                self._emit(ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True))
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
@@ -1087,9 +1051,7 @@ class AutoSwitchEngine:
                 self._emit(
                     SleepEvent(
                         seconds=delay,
-                        until=until.isoformat(timespec="seconds").replace(
-                            "+00:00", "Z"
-                        ),
+                        until=until.isoformat(timespec="seconds").replace("+00:00", "Z"),
                     )
                 )
             self._stop.wait(delay)

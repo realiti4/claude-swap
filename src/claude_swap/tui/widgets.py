@@ -268,11 +268,7 @@ class AccountsPanel(Static):
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
-                blocks.append(
-                    account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now
-                    )
-                )
+                blocks.append(account_card_text(acc, width, threshold=app.threshold_pct, now=now))
             elif self._show_minis:
                 blocks.append(mini_account_text(acc, now))
         if not blocks:
@@ -302,9 +298,7 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        return account_card_text(
-            self._acc, self.size.width or 80, threshold=self._threshold
-        )
+        return account_card_text(self._acc, self.size.width or 80, threshold=self._threshold)
 
 
 class AccountItem(ListItem):

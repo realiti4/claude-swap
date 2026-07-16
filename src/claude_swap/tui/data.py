@@ -64,9 +64,11 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
     saved_stdin = sys.stdin
     sys.stdin = io.StringIO()
     try:
-        with printer.force_color(), contextlib.redirect_stdout(
-            buf
-        ), contextlib.redirect_stderr(buf):
+        with (
+            printer.force_color(),
+            contextlib.redirect_stdout(buf),
+            contextlib.redirect_stderr(buf),
+        ):
             try:
                 payload = fn()
             except ClaudeSwitchError as e:
@@ -77,14 +79,13 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
                 return ActionResult(False, buf.getvalue())
     finally:
         sys.stdin = saved_stdin
-    return ActionResult(
-        True, buf.getvalue(), payload if isinstance(payload, dict) else None
-    )
+    return ActionResult(True, buf.getvalue(), payload if isinstance(payload, dict) else None)
 
 
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
+
 
 def sentinel_label(sentinel: str) -> str:
     """The same wording ``cswap list`` prints for this sentinel state."""

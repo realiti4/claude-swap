@@ -70,9 +70,7 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
     raw_number = account.get("number")
     if isinstance(raw_number, bool) or not isinstance(raw_number, int) or raw_number < 1:
-        raise TransferError(
-            f"invalid slot number in imported account ({email}): {raw_number!r}"
-        )
+        raise TransferError(f"invalid slot number in imported account ({email}): {raw_number!r}")
 
     # Org/uuid/added must be strings (or absent). A list/dict here would
     # otherwise blow up downstream (unhashable in seen_keys, broken composite
@@ -108,9 +106,7 @@ def _slim_config(config_obj: dict, label: str) -> dict:
     """
     oauth = config_obj.get("oauthAccount")
     if not isinstance(oauth, dict):
-        raise TransferError(
-            f"{label} is missing oauthAccount — cannot export"
-        )
+        raise TransferError(f"{label} is missing oauthAccount — cannot export")
     return {"oauthAccount": oauth}
 
 
@@ -186,9 +182,7 @@ def export_accounts(
                         raise CredentialReadError(
                             f"no backup credentials found for account {num} ({email})"
                         )
-                    raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
-                    )
+                    raise ConfigError(f"no backup config found for account {num} ({email})")
                 _eprint(
                     f"Skipping Account-{num} ({email}): no stored "
                     f"credentials/config — re-add with: "
@@ -233,9 +227,7 @@ def export_accounts(
     # (e.g., the recorded active slot was skipped due to missing backup).
     recorded_active = sequence_data.get("activeAccountNumber")
     exported_nums = {a["number"] for a in accounts_payload}
-    active_in_payload = (
-        recorded_active if recorded_active in exported_nums else None
-    )
+    active_in_payload = recorded_active if recorded_active in exported_nums else None
 
     envelope = {
         "version": FORMAT_VERSION,
@@ -299,9 +291,7 @@ def import_accounts(
 
     version = envelope.get("version")
     if version != FORMAT_VERSION:
-        raise TransferError(
-            f"unsupported export version: {version!r} (expected {FORMAT_VERSION})"
-        )
+        raise TransferError(f"unsupported export version: {version!r} (expected {FORMAT_VERSION})")
 
     if envelope.get("encrypted") is True:
         raise TransferError(
@@ -335,9 +325,7 @@ def import_accounts(
             creds_text = creds_obj.strip()
         else:
             if not isinstance(creds_obj, dict):
-                raise TransferError(
-                    f"credentials for {email} must be a JSON object"
-                )
+                raise TransferError(f"credentials for {email} must be a JSON object")
             creds_text = json.dumps(creds_obj)
         key = (email, org_uuid)
         if key in seen_keys:
@@ -374,15 +362,12 @@ def import_accounts(
     # destination may already have an unrelated account at that slot number,
     # while the envelope's active account got allocated to a different slot.
     envelope_active = envelope.get("activeAccountNumber")
-    envelope_active_str = (
-        str(envelope_active) if isinstance(envelope_active, int) else None
-    )
+    envelope_active_str = str(envelope_active) if isinstance(envelope_active, int) else None
     resolved_active_slot: str | None = None
 
     for entry in normalized:
         is_envelope_active = (
-            envelope_active_str is not None
-            and entry["exported_num"] == envelope_active_str
+            envelope_active_str is not None and entry["exported_num"] == envelope_active_str
         )
 
         # Re-read sequence each iteration so per-account writes see prior updates
@@ -392,15 +377,11 @@ def import_accounts(
             "sequence": [],
             "accounts": {},
         }
-        existing_slot = switcher._find_account_slot(
-            data, entry["email"], entry["org_uuid"]
-        )
+        existing_slot = switcher._find_account_slot(data, entry["email"], entry["org_uuid"])
 
         if existing_slot is not None:
             if not force:
-                _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
-                )
+                _eprint(f"Skipped {entry['email']} (already exists, use --force)")
                 skipped += 1
                 # Even when skipped, the envelope's active account exists
                 # locally — record where so we can seed activeAccountNumber.
@@ -428,12 +409,8 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
+        switcher._write_account_credentials(target_num, entry["email"], entry["creds_text"])
+        switcher._write_account_config(target_num, entry["email"], entry["config_text"])
 
         data.setdefault("accounts", {})
         data.setdefault("sequence", [])
@@ -479,9 +456,7 @@ def import_accounts(
         final["lastUpdated"] = get_timestamp()
         switcher._write_json(switcher.sequence_file, final)
 
-    _eprint(
-        f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped"
-    )
+    _eprint(f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped")
 
     # If we just rewrote the stored backup for the account that is the current
     # live login, a plain switch would back the (possibly stale) live

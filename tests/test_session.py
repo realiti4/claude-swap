@@ -185,9 +185,7 @@ class TestHelpers:
 
     def test_keychain_service_name_known_vector(self, tmp_path):
         d = tmp_path / "profile"
-        expected = hashlib.sha256(
-            unicodedata.normalize("NFC", str(d)).encode()
-        ).hexdigest()[:8]
+        expected = hashlib.sha256(unicodedata.normalize("NFC", str(d)).encode()).hexdigest()[:8]
         assert keychain_service_name(d) == f"Claude Code-credentials-{expected}"
 
     def test_keychain_service_name_nfc_nfd_equal(self):
@@ -248,9 +246,7 @@ class TestResolveAccount:
 
 
 class TestBootstrap:
-    def test_happy_path(
-        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
-    ):
+    def test_happy_path(self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates):
         session_dir, num, email = manager.setup_session("2", share=False)
 
         assert (num, email) == (ACCOUNT_NUM, ACCOUNT_EMAIL)
@@ -263,10 +259,7 @@ class TestBootstrap:
         assert config["theme"] == "light"  # carried over from backup config
 
         # Rotated refresh token persisted back to backup storage.
-        assert (
-            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
-            == ROTATED_CREDS
-        )
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == ROTATED_CREDS
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
     def test_profile_permissions(self, manager, auth_status_tracks_seed, refresh_rotates):
@@ -326,8 +319,7 @@ class TestBootstrap:
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
     ):
         config_file = (
-            seeded_switcher.configs_dir
-            / f".claude-config-{ACCOUNT_NUM}-{ACCOUNT_EMAIL}.json"
+            seeded_switcher.configs_dir / f".claude-config-{ACCOUNT_NUM}-{ACCOUNT_EMAIL}.json"
         )
         config_file.unlink()
         with pytest.raises(SessionError, match="no stored config backup"):
@@ -345,9 +337,7 @@ class TestBootstrap:
             )
 
         monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         # A stale hashed-keychain entry from an earlier profile at this path.
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
@@ -367,9 +357,7 @@ class TestBootstrap:
         refresh_rotates,
         block_real_keychain,
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
         block_real_keychain.set_password(service, account, "stale")
@@ -447,9 +435,7 @@ class TestIsSessionValid:
         monkeypatch.setattr(
             session_mod.subprocess,
             "run",
-            lambda *a, **k: SimpleNamespace(
-                returncode=rc, stdout=json.dumps(payload), stderr=""
-            ),
+            lambda *a, **k: SimpleNamespace(returncode=rc, stdout=json.dumps(payload), stderr=""),
         )
         return manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
@@ -476,13 +462,9 @@ class TestIsSessionValid:
         assert not self.check(manager, tmp_path, monkeypatch, valid_payload, rc=1)
 
     def test_rejects_missing_dir(self, manager, tmp_path, monkeypatch):
-        assert not manager._is_session_valid(
-            tmp_path / "missing", ACCOUNT_EMAIL, ORG_UUID
-        )
+        assert not manager._is_session_valid(tmp_path / "missing", ACCOUNT_EMAIL, ORG_UUID)
 
-    def test_invokes_pathext_resolved_launcher(
-        self, manager, tmp_path, monkeypatch, valid_payload
-    ):
+    def test_invokes_pathext_resolved_launcher(self, manager, tmp_path, monkeypatch, valid_payload):
         """The probe must call the resolved launcher, not bare "claude".
 
         On Windows `claude` is a `.cmd` shim that a bare "claude" won't
@@ -495,9 +477,7 @@ class TestIsSessionValid:
 
         def capture_run(argv, *a, **k):
             seen_argv["argv"] = argv
-            return SimpleNamespace(
-                returncode=0, stdout=json.dumps(valid_payload), stderr=""
-            )
+            return SimpleNamespace(returncode=0, stdout=json.dumps(valid_payload), stderr="")
 
         monkeypatch.setattr(session_mod.subprocess, "run", capture_run)
         assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
@@ -645,9 +625,7 @@ def capture_exec(monkeypatch):
         raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
 
     monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
-    monkeypatch.setattr(
-        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
-    )
+    monkeypatch.setattr(session_mod.shutil, "which", lambda name: f"/fake/bin/{name}")
 
 
 class TestRun:
@@ -665,14 +643,10 @@ class TestRun:
         call = exc.value
         assert call.binary == "/fake/bin/claude"
         assert call.argv == ["/fake/bin/claude", "--resume", "--model", "x"]
-        session_dir = session_dir_for(
-            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         assert call.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
 
-    def test_fast_path_for_active_account(
-        self, manager, capture_exec, monkeypatch, capsys
-    ):
+    def test_fast_path_for_active_account(self, manager, capture_exec, monkeypatch, capsys):
         monkeypatch.setattr(
             manager.switcher,
             "_get_current_account",
@@ -703,9 +677,7 @@ class TestRun:
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
-        session_dir = session_dir_for(
-            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
         assert "overriding it for this launch" in capsys.readouterr().out
 
@@ -732,9 +704,7 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
-    def test_fast_path_keeps_env_untouched(
-        self, manager, capture_exec, monkeypatch
-    ):
+    def test_fast_path_keeps_env_untouched(self, manager, capture_exec, monkeypatch):
         """Plain-claude fast path must NOT scrub: it's normal claude behavior."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
         monkeypatch.setattr(
@@ -789,13 +759,9 @@ class TestExec:
 
 class TestGuards:
     def test_remove_account_refused_while_live(self, seeded_switcher, monkeypatch):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
-        monkeypatch.setattr(
-            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
-        )
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("prompt must not be reached"))
         with pytest.raises(SessionError, match="live session-mode"):
             seeded_switcher.remove_account(ACCOUNT_NUM)
         # Account untouched.
@@ -804,9 +770,7 @@ class TestGuards:
     def test_remove_account_cleans_session_profile(
         self, seeded_switcher, monkeypatch, block_real_keychain
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         session_dir.mkdir(parents=True)
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
@@ -819,29 +783,21 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
 
     def test_remove_account_assume_yes_skips_prompt(self, seeded_switcher, monkeypatch):
-        monkeypatch.setattr(
-            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
-        )
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("prompt must not be reached"))
         seeded_switcher.remove_account(ACCOUNT_NUM, assume_yes=True)
         data = seeded_switcher._get_sequence_data()
         assert ACCOUNT_NUM not in data["accounts"]
 
     def test_delete_account_files_chokepoint_refuses_live(self, seeded_switcher):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
         with pytest.raises(SessionError, match="live session-mode"):
             seeded_switcher._delete_account_files(ACCOUNT_NUM, ACCOUNT_EMAIL)
 
     def test_purge_refused_while_live(self, seeded_switcher, monkeypatch):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
-        monkeypatch.setattr(
-            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
-        )
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("prompt must not be reached"))
         with pytest.raises(SessionError, match="Exit them first"):
             seeded_switcher.purge()
         assert seeded_switcher.backup_dir.exists()
@@ -849,9 +805,7 @@ class TestGuards:
     def test_purge_sweeps_session_keychain_entries(
         self, seeded_switcher, monkeypatch, block_real_keychain
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         session_dir.mkdir(parents=True)
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
@@ -863,12 +817,8 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
         assert not seeded_switcher.backup_dir.exists()
 
-    def test_switch_warns_on_live_target_but_completes(
-        self, seeded_switcher, monkeypatch, capsys
-    ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+    def test_switch_warns_on_live_target_but_completes(self, seeded_switcher, monkeypatch, capsys):
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
         # Direct-activation path (no live default identity) keeps this focused.
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
@@ -888,9 +838,7 @@ class TestGuards:
         non-live session profile to re-bootstrap — otherwise the documented
         recovery path leaves `cswap run` on stale credentials that still pass
         the local reuse check."""
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         session_dir.mkdir(parents=True)
         (session_dir / ".credentials.json").write_text("stale")
         (session_dir / ".claude.json").write_text('{"projects": {}}')
@@ -898,9 +846,7 @@ class TestGuards:
         account = session_mod._keychain_account_name()
         block_real_keychain.set_password(service, account, "stale")
 
-        seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
-        )
+        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS)
 
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()  # history preserved
@@ -909,29 +855,21 @@ class TestGuards:
     def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
         self, seeded_switcher
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
         (session_dir / ".credentials.json").write_text("live session creds")
 
-        seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
-        )
+        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS)
 
         # Live copy untouched, but flagged for re-bootstrap after exit.
         assert (session_dir / ".credentials.json").read_text() == "live session creds"
         assert (session_dir / session_mod.STALE_MARKER).exists()
 
-    def test_list_skips_refresh_for_live_session_accounts(
-        self, seeded_switcher, monkeypatch
-    ):
+    def test_list_skips_refresh_for_live_session_accounts(self, seeded_switcher, monkeypatch):
         """cswap --list must not proactively refresh an account that is live in
         a session — rotating the backup copy's token could invalidate the
         session's copy."""
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
@@ -939,9 +877,7 @@ class TestGuards:
             seen[num] = is_active
             return oauth.UsageOutcome(None)
 
-        monkeypatch.setattr(
-            "claude_swap.oauth.try_fetch_usage_for_account", fake_fetch
-        )
+        monkeypatch.setattr("claude_swap.oauth.try_fetch_usage_for_account", fake_fetch)
         seeded_switcher.list_accounts()
 
         assert seen[ACCOUNT_NUM] is True  # treated like active: no refresh
@@ -950,9 +886,7 @@ class TestGuards:
     def test_invalidate_session_credentials_keeps_history(
         self, seeded_switcher, block_real_keychain
     ):
-        session_dir = session_dir_for(
-            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
+        session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         session_dir.mkdir(parents=True)
         (session_dir / ".credentials.json").write_text("old creds")
         (session_dir / ".claude.json").write_text('{"projects": {}}')
@@ -1017,12 +951,8 @@ class TestShareHistoryPosix:
         proj.mkdir(parents=True)
         (proj / "bbb.jsonl").write_text("profile-b\n")
         (session_dir / "projects" / "-home-user-other").mkdir()
-        (session_dir / "projects" / "-home-user-other" / "ccc.jsonl").write_text(
-            "profile-c\n"
-        )
-        (session_dir / "history.jsonl").write_text(
-            '{"p": "main"}\n{"p": "profile"}\n'
-        )
+        (session_dir / "projects" / "-home-user-other" / "ccc.jsonl").write_text("profile-c\n")
+        (session_dir / "history.jsonl").write_text('{"p": "main"}\n{"p": "profile"}\n')
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
@@ -1047,18 +977,14 @@ class TestShareHistoryPosix:
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
-        assert (
-            source / "projects" / "-home-user-app" / "aaa.jsonl"
-        ).read_text() == "main-a\n"
+        assert (source / "projects" / "-home-user-app" / "aaa.jsonl").read_text() == "main-a\n"
         assert (session_dir / "projects").is_symlink()
 
     def test_merge_deferred_while_profile_live(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
         (session_dir / "projects" / "x.jsonl").write_text("live\n")
-        monkeypatch.setattr(
-            session_mod, "live_sessions_for", lambda _dir: [object()]
-        )
+        monkeypatch.setattr(session_mod, "live_sessions_for", lambda _dir: [object()])
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
@@ -1124,9 +1050,7 @@ class TestShareHistoryPosix:
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
-        assert (
-            source / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).read_text() == "profile-b\n"
+        assert (source / "projects" / "-home-user-app" / "bbb.jsonl").read_text() == "profile-b\n"
         assert '{"p": "profile"}' in (source / "history.jsonl").read_text()
         assert (session_dir / "projects").readlink() == source / "projects"
 
@@ -1158,9 +1082,7 @@ class TestShareHistoryWindows:
     def test_run_rejects_flag(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
-        )
+        monkeypatch.setattr(session_mod.shutil, "which", lambda _name: "/usr/bin/claude")
 
         with pytest.raises(SessionError, match="Windows"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
@@ -1173,9 +1095,7 @@ class TestReadSessionCredentials:
         assert session_mod.read_session_credentials(tmp_path / "absent") is None
 
     def test_reads_plaintext_file_off_macos(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            Platform, "detect", classmethod(lambda cls: Platform.LINUX)
-        )
+        monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.LINUX))
         session_dir = tmp_path / "sess"
         session_dir.mkdir()
         (session_dir / ".credentials.json").write_text(

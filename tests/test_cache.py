@@ -11,20 +11,28 @@ from claude_swap.cache import MISSING, read_cache, write_cache
 class TestReadCache:
     def test_returns_data_within_ttl(self, tmp_path):
         cache_file = tmp_path / "test.json"
-        cache_file.write_text(json.dumps({
-            "timestamp": time.time(),
-            "data": {"key": "value"},
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": time.time(),
+                    "data": {"key": "value"},
+                }
+            )
+        )
 
         result = read_cache(cache_file, ttl=60)
         assert result == {"key": "value"}
 
     def test_returns_missing_when_expired(self, tmp_path):
         cache_file = tmp_path / "test.json"
-        cache_file.write_text(json.dumps({
-            "timestamp": time.time() - 100,
-            "data": {"key": "value"},
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": time.time() - 100,
+                    "data": {"key": "value"},
+                }
+            )
+        )
 
         result = read_cache(cache_file, ttl=60)
         assert result is MISSING
@@ -42,10 +50,14 @@ class TestReadCache:
 
     def test_cached_none_is_distinguishable_from_miss(self, tmp_path):
         cache_file = tmp_path / "test.json"
-        cache_file.write_text(json.dumps({
-            "timestamp": time.time(),
-            "data": None,
-        }))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": time.time(),
+                    "data": None,
+                }
+            )
+        )
 
         result = read_cache(cache_file, ttl=60)
         assert result is None

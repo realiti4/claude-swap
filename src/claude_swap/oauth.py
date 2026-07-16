@@ -80,11 +80,13 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         return RefreshOutcome(None, "no_refresh_token")
 
     try:
-        body = json.dumps({
-            "grant_type": "refresh_token",
-            "refresh_token": oauth["refreshToken"],
-            "client_id": OAUTH_CLIENT_ID,
-        }).encode()
+        body = json.dumps(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": oauth["refreshToken"],
+                "client_id": OAUTH_CLIENT_ID,
+            }
+        ).encode()
 
         req = urllib.request.Request(
             OAUTH_TOKEN_URL,
@@ -115,9 +117,7 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
         # would wrongly quarantine a live token.
-        if e.code in (400, 401, 403) and (
-            "invalid_grant" in body or "invalid_client" in body
-        ):
+        if e.code in (400, 401, 403) and ("invalid_grant" in body or "invalid_client" in body):
             return RefreshOutcome(None, "invalid_grant")
         return RefreshOutcome(None, "transient")
     except Exception as e:
@@ -128,7 +128,6 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
 def refresh_oauth_credentials(credentials: str) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
     return try_refresh_oauth_credentials(credentials).credentials
-
 
 
 def build_token_status(credentials: str) -> str | None:
@@ -258,7 +257,6 @@ def _log_usage_failure(
         cause += " (burst block — cswap's own polling cannot trigger this)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
-
 
 
 def build_usage_result(data: dict) -> dict | None:
@@ -420,12 +418,7 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
-        if (
-            e.code != 401
-            or is_active
-            or not oauth
-            or not oauth.get("refreshToken")
-        ):
+        if e.code != 401 or is_active or not oauth or not oauth.get("refreshToken"):
             _log_usage_failure(context, e, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 

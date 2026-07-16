@@ -49,9 +49,7 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
         delay=True,
     )
     file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(file_handler)
 
     # Console handler for debug mode

@@ -180,8 +180,6 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
         shutil.move(legacy, target)
         flag.unlink()
     except OSError as exc:
-        raise MigrationError(
-            f"Migration of {legacy} → {target} failed: {exc}"
-        ) from exc
+        raise MigrationError(f"Migration of {legacy} → {target} failed: {exc}") from exc
 
     return True

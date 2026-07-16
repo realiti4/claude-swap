@@ -124,9 +124,7 @@ class TestExtendedTrust:
     def test_in_backoff_past_stale_ok_is_still_trusted(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         clock.advance(STALE_OK_S)
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=480.0)}, IDENT
-        )
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=480.0)}, IDENT)
         clock.advance(60)
         entry = store.entries(IDENT)["1"]
         assert entry.age_s > STALE_OK_S
@@ -180,9 +178,7 @@ class TestBackoff:
         assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
 
     def test_retry_after_is_the_floor(self, store, clock):
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=90.0)}, IDENT
-        )
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=90.0)}, IDENT)
         entry = store.entries(IDENT)["1"]
         # First failure computes 30s, but the server asked for 90s.
         assert entry.backoff_until == pytest.approx(clock.now + 90.0)
@@ -199,9 +195,7 @@ class TestBackoff:
         # doubling to BACKOFF_CAP_S — freshness matters most during heavy burn.
         expected = [30.0, 60.0, 120.0, 120.0, 120.0]
         for i, want in enumerate(expected):
-            store.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
-            )
+            store.record({"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT)
             entry = store.entries(IDENT)["1"]
             assert entry.consecutive_failures == i + 1
             assert entry.backoff_until == pytest.approx(clock.now + want)
@@ -239,9 +233,7 @@ class TestIdentityGuard:
         assert entry.consecutive_failures == 1
 
     def test_untouched_slots_survive_subset_writes(self, store):
-        store.record(
-            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
-        )
+        store.record({"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT)
         store.record({"1": FetchRecord(error="timeout")}, {"1": IDENT["1"]})
         assert store.entries(IDENT)["2"].last_good == USAGE
 

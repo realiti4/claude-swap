@@ -58,14 +58,18 @@ class TestLoadSettings:
         assert loaded.interval_seconds == AutoSwitchSettings().interval_seconds
 
     def test_values_are_clamped(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "autoswitch": {
-                "threshold": 200,
-                "intervalSeconds": 1,
-                "hysteresisPct": -5,
-                "unhealthyTicks": 0,
-            }
-        }))
+        settings_path(tmp_path).write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "threshold": 200,
+                        "intervalSeconds": 1,
+                        "hysteresisPct": -5,
+                        "unhealthyTicks": 0,
+                    }
+                }
+            )
+        )
         loaded = load_settings(tmp_path)
         assert loaded.threshold == 99.9
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
@@ -73,17 +77,15 @@ class TestLoadSettings:
         assert loaded.unhealthy_ticks == 1
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "autoswitch": {"threshold": "high", "includeApiKeyAccounts": 1}
-        }))
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"threshold": "high", "includeApiKeyAccounts": 1}})
+        )
         loaded = load_settings(tmp_path)
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"strategy": "chaos"}})
-        )
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"strategy": "chaos"}}))
         assert load_settings(tmp_path).strategy == "best"
 
 
@@ -94,11 +96,15 @@ class TestSaveSettings:
         assert load_settings(tmp_path) == custom
 
     def test_unknown_keys_survive(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "schemaVersion": 1,
-            "futureSection": {"x": 1},
-            "autoswitch": {"threshold": 80, "futureKnob": True},
-        }))
+        settings_path(tmp_path).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "futureSection": {"x": 1},
+                    "autoswitch": {"threshold": 80, "futureKnob": True},
+                }
+            )
+        )
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
         raw = json.loads(settings_path(tmp_path).read_text())
         assert raw["futureSection"] == {"x": 1}
@@ -115,9 +121,7 @@ class TestSaveSettings:
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         spec_fields = {spec.field for spec in SETTING_SPECS.values()}
-        dataclass_fields = {
-            f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
-        }
+        dataclass_fields = {f.name for f in AutoSwitchSettings.__dataclass_fields__.values()}
         assert spec_fields == dataclass_fields
 
     def test_defaults_match_dataclass(self):
@@ -165,9 +169,7 @@ class TestSetUnsetSetting:
         assert "autoswitch" not in raw
 
     def test_unset_stamps_schema_version_on_unversioned_file(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"threshold": 80}})
-        )
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"threshold": 80}}))
         assert unset_setting(tmp_path, "autoswitch.threshold") is True
         raw = json.loads(settings_path(tmp_path).read_text())
         assert raw["schemaVersion"] == 1
@@ -235,7 +237,5 @@ class TestMergedWithCli:
         assert merged.interval_seconds == 15.0
 
     def test_boolean_override(self):
-        merged = merged_with_cli(
-            AutoSwitchSettings(), _args(include_api_key_accounts=True)
-        )
+        merged = merged_with_cli(AutoSwitchSettings(), _args(include_api_key_accounts=True))
         assert merged.include_api_key_accounts is True

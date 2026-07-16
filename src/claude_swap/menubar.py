@@ -78,6 +78,7 @@ class MenuBarSettings:
 # ---- pure display helpers (operate on the usage-window dict shape produced by
 # ---- oauth.build_usage_result / stored in UsageEntry.last_good) --------------
 
+
 def tightest_pct(usage: dict | str | None) -> float | None:
     """Highest 5h/7d utilization percentage, or None if unknown.
 
@@ -341,7 +342,7 @@ def run(switcher) -> int:
         def refresh_async(self, full=False):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time (SnapshotSource
-                        # pacing state is only touched by this single worker)
+                # pacing state is only touched by this single worker)
             self._refreshing = True
             threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
@@ -351,9 +352,7 @@ def run(switcher) -> int:
             # runs it already paces all fetching, so the display reads store-only.
             try:
                 try:
-                    raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
-                    )
+                    raw = self._snapshot_source.take(full=full, store_only=self._engine is not None)
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
@@ -550,8 +549,12 @@ def run(switcher) -> int:
             menu.add(name_item)
 
             title_pct = rumps.MenuItem("Title percentage")
-            tp_labels = {"off": "None", "5h": "Session (5h)",
-                         "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
+            tp_labels = {
+                "off": "None",
+                "5h": "Session (5h)",
+                "7d": "Weekly (7d)",
+                "both": "Both (5h · 7d)",
+            }
             for mode in TITLE_PCT_CHOICES:
                 ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
                 ch.state = 1 if self.settings.title_pct == mode else 0
@@ -606,6 +609,7 @@ def run(switcher) -> int:
                 if self._guard(lambda: self.switcher.switch_to(str(num))):
                     self._notify_switched()
                     self.refresh_async()
+
             return cb
 
         def _switch(self, strategy):
@@ -613,18 +617,23 @@ def run(switcher) -> int:
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
                     self._notify_switched()
                     self.refresh_async()
+
             return cb
 
         def _make_remove(self, num):
             def cb(_sender):
-                if rumps.alert(
-                    title="Remove account",
-                    message=f"Remove account {num}?",
-                    ok="Remove",
-                    cancel="Cancel",
-                ) == 1:  # 1 == OK
+                if (
+                    rumps.alert(
+                        title="Remove account",
+                        message=f"Remove account {num}?",
+                        ok="Remove",
+                        cancel="Cancel",
+                    )
+                    == 1
+                ):  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
                         self.refresh_async()
+
             return cb
 
         def on_add_login(self, _sender):
@@ -636,11 +645,14 @@ def run(switcher) -> int:
             # rumps.Window can render black/blank until we bring the app
             # forward. Activate before showing the input dialogs.
             import AppKit
+
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             email_win = rumps.Window(
                 title="Add account from setup-token",
                 message="Email for this token:",
-                ok="Next", cancel="Cancel", dimensions=(320, 24),
+                ok="Next",
+                cancel="Cancel",
+                dimensions=(320, 24),
             )
             email_resp = email_win.run()
             if email_resp.clicked != 1 or not email_resp.text.strip():
@@ -648,26 +660,35 @@ def run(switcher) -> int:
             token_win = rumps.Window(
                 title="Add account from setup-token",
                 message="Setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                ok="Add",
+                cancel="Cancel",
+                dimensions=(320, 24),
             )
             token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
-            if self._guard(lambda: self.switcher.add_account_from_token(
-                token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
-            )):
+            if self._guard(
+                lambda: self.switcher.add_account_from_token(
+                    token=token_resp.text.strip(),
+                    email=email_resp.text.strip(),
+                    slot=None,
+                )
+            ):
                 self.refresh_async()
 
         def on_open_log(self, _sender):
             import subprocess
+
             # Reveal the log in Finder (-R); if it doesn't exist yet, open the dir.
             target = log_path if log_path.exists() else log_path.parent
             subprocess.run(["open", "-R", str(target)], check=False)
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
-                rumps.alert(title="claude-swap",
-                            message="No active Claude Code login detected. Log in first.")
+                rumps.alert(
+                    title="claude-swap",
+                    message="No active Claude Code login detected. Log in first.",
+                )
                 return
             try:
                 self.switcher.add_account(slot=None)
@@ -678,8 +699,8 @@ def run(switcher) -> int:
                 rumps.alert(
                     title="claude-swap",
                     message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: cswap --menubar",
+                    "as a background/login agent, macOS blocks its Keychain access — "
+                    "quit and relaunch it from a Terminal with: cswap --menubar",
                 )
                 return
             except ClaudeSwitchError as e:
@@ -702,6 +723,7 @@ def run(switcher) -> int:
             def cb(_sender):
                 self.settings.title_pct = mode
                 self._save_and_rebuild()
+
             return cb
 
         def _make_interval(self, secs):
@@ -714,6 +736,7 @@ def run(switcher) -> int:
                 self.refresh_timer.interval = secs
                 self.refresh_timer.start()
                 self._save_and_rebuild()
+
             return cb
 
         def on_toggle_autoswitch(self, _sender):
@@ -734,6 +757,7 @@ def run(switcher) -> int:
                     return
                 self._restart_engine()  # apply immediately if running
                 self.rebuild_menu()
+
             return cb
 
     MenuBarApp().run()

@@ -239,14 +239,10 @@ class TestAccountNoneFallback:
     def test_none_used_as_fallback_when_email_unique(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
         _seed_sequence(switcher, {"1": {"email": "solo@example.com"}})
-        fake = FakeKeyring(
-            {(KEYRING_SERVICE, "account-None-solo@example.com"): "from-none"}
-        )
+        fake = FakeKeyring({(KEYRING_SERVICE, "account-None-solo@example.com"): "from-none"})
         with _patch_keyring(fake):
             run_migrations(switcher)
-        assert (
-            switcher._read_account_credentials("1", "solo@example.com") == "from-none"
-        )
+        assert switcher._read_account_credentials("1", "solo@example.com") == "from-none"
 
     def test_none_not_used_for_duplicate_email(self, temp_home):
         """Two org accounts share an email → account-None is ambiguous and must
@@ -259,9 +255,7 @@ class TestAccountNoneFallback:
                 "2": {"email": "dup@example.com", "organizationUuid": "org-2"},
             },
         )
-        fake = FakeKeyring(
-            {(KEYRING_SERVICE, "account-None-dup@example.com"): "ambiguous"}
-        )
+        fake = FakeKeyring({(KEYRING_SERVICE, "account-None-dup@example.com"): "ambiguous"})
         with _patch_keyring(fake):
             run_migrations(switcher)
 
@@ -285,9 +279,7 @@ class TestFailures:
         fake = FakeKeyring({(KEYRING_SERVICE, "account-1-a@example.com"): "creds-A"})
 
         # Force the verify step to disagree with the source.
-        with patch.object(
-            switcher, "_read_account_credentials", return_value="tampered"
-        ):
+        with patch.object(switcher, "_read_account_credentials", return_value="tampered"):
             with _patch_keyring(fake):
                 run_migrations(switcher)
 
@@ -296,9 +288,7 @@ class TestFailures:
         assert fake.deleted == []
         assert not (switcher.backup_dir / ".migrations.json").exists()
         # The bad/partial file must not shadow the intact keyring entry.
-        assert not (
-            switcher.credentials_dir / ".creds-1-a@example.com.enc"
-        ).exists()
+        assert not (switcher.credentials_dir / ".creds-1-a@example.com.enc").exists()
 
     def test_partial_failure_migrates_rest_and_stays_unmarked(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -462,9 +452,7 @@ class TestMacosKeyringToSecurity:
         # …and the old keyring entry was deleted only after a verified write.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.deleted
 
-    def test_denied_legacy_delete_warns_but_completes(
-        self, temp_home, block_real_keychain
-    ):
+    def test_denied_legacy_delete_warns_but_completes(self, temp_home, block_real_keychain):
         """A denied legacy-entry delete leaves a harmless orphan: the migration
         still completes (the copy is verified), but the leftover is logged —
         keyring masks the denial as PasswordDeleteError, so without the
@@ -484,9 +472,7 @@ class TestMacosKeyringToSecurity:
 
         # Copy succeeded and is authoritative; the orphan was logged.
         assert switcher._read_account_credentials("1", "a@example.com") == "sekret"
-        warnings = " ".join(
-            str(c.args[0]) for c in switcher._logger.warning.call_args_list
-        )
+        warnings = " ".join(str(c.args[0]) for c in switcher._logger.warning.call_args_list)
         assert "left behind" in warnings and username in warnings
 
     def test_precheck_skips_keyring_when_already_migrated(self, temp_home):
@@ -521,8 +507,9 @@ class TestMacosKeyringToSecurity:
         # Force the security read-back to disagree with what was written. The
         # migration reads the security service via the keychain-only helper
         # (_kc_read_backup), not the transparent .enc-wins backup methods.
-        with _patch_keyring(fake), patch.object(
-            switcher, "_kc_read_backup", side_effect=["", "WRONG"]
+        with (
+            _patch_keyring(fake),
+            patch.object(switcher, "_kc_read_backup", side_effect=["", "WRONG"]),
         ):
             with pytest.raises(MigrationIncomplete):
                 migrations.migrate_macos_keyring_to_security(switcher)
@@ -530,9 +517,7 @@ class TestMacosKeyringToSecurity:
         # Keyring entry left intact (not deleted) for the retry.
         assert (KEYRING_SERVICE, "account-1-a@example.com") not in fake.deleted
 
-    def test_fallback_to_security_when_keyring_unavailable(
-        self, temp_home, block_real_keychain
-    ):
+    def test_fallback_to_security_when_keyring_unavailable(self, temp_home, block_real_keychain):
         switcher = _make_macos_switcher(temp_home)
         _seed_sequence(switcher, {"1": {"email": "a@example.com"}})
         # Old item lives in the Keychain under the legacy service (here: the

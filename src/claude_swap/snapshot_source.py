@@ -43,9 +43,7 @@ class SnapshotSource:
         self._next_alt_mono = 0.0
         self._last: AccountsSnapshot | None = None
 
-    def take(
-        self, *, full: bool = False, store_only: bool = False
-    ) -> AccountsSnapshot:
+    def take(self, *, full: bool = False, store_only: bool = False) -> AccountsSnapshot:
         """Blocking snapshot pass; call from a thread worker."""
         if store_only:
             fetch: set[str] | None = set()

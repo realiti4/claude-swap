@@ -125,9 +125,7 @@ def _delete_keyring_quietly(
     except keyring.errors.PasswordDeleteError:
         pass  # Entry doesn't exist — fine.
     except Exception as e:  # noqa: BLE001 - best effort
-        switcher._logger.warning(
-            f"{context}: best-effort delete of {username} failed: {e}"
-        )
+        switcher._logger.warning(f"{context}: best-effort delete of {username} failed: {e}")
 
 
 def migrate_windows_keyring_to_files(switcher: ClaudeAccountSwitcher) -> bool:
@@ -162,6 +160,7 @@ def migrate_windows_keyring_to_files(switcher: ClaudeAccountSwitcher) -> bool:
 
     try:
         import keyring  # noqa: PLC0415 - only needed on the migration path
+
         # Touch the attribute we rely on so a broken backend surfaces here.
         keyring.errors.PasswordDeleteError  # noqa: B018
     except Exception as e:  # noqa: BLE001
@@ -195,9 +194,7 @@ def migrate_windows_keyring_to_files(switcher: ClaudeAccountSwitcher) -> bool:
         try:
             creds = keyring.get_password(KEYRING_SERVICE, canonical)
         except Exception as e:  # noqa: BLE001
-            switcher._logger.warning(
-                f"windows_keyring_to_files: read of {canonical} failed: {e}"
-            )
+            switcher._logger.warning(f"windows_keyring_to_files: read of {canonical} failed: {e}")
             failed += 1
             continue
 
@@ -413,9 +410,7 @@ def migrate_macos_keyring_to_security(switcher: ClaudeAccountSwitcher) -> bool:
         try:
             creds = _read_old(canonical)
         except Exception as e:  # noqa: BLE001
-            switcher._logger.warning(
-                f"macos_keyring_to_security: read of {canonical} failed: {e}"
-            )
+            switcher._logger.warning(f"macos_keyring_to_security: read of {canonical} failed: {e}")
             failed += 1
             continue
 
@@ -523,9 +518,7 @@ def run_migrations(switcher: ClaudeAccountSwitcher) -> None:
         try:
             completed = fn(switcher)
         except Exception as e:  # noqa: BLE001 - migrations must never brick the tool
-            switcher._logger.warning(
-                f"Migration {migration_id} did not complete (will retry): {e}"
-            )
+            switcher._logger.warning(f"Migration {migration_id} did not complete (will retry): {e}")
             continue
         if completed:
             try:

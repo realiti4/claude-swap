@@ -98,6 +98,7 @@ def mark_session_stale(session_dir: Path) -> None:
     except OSError:
         pass  # best-effort; worst case the old reuse behavior applies
 
+
 # Env vars that make claude bypass account OAuth entirely (verified against
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
 # for the wrong reason) AND scrubbed from the session launch env with a
@@ -129,8 +130,7 @@ def slugify_email(email: str) -> str:
     """
     normalized = unicodedata.normalize("NFC", email)
     return "".join(
-        ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_"
-        for ch in normalized
+        ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_" for ch in normalized
     )
 
 
@@ -175,9 +175,7 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
     if Platform.detect() != Platform.MACOS:
         return
     try:
-        macos_keychain.delete_password(
-            keychain_service_name(session_dir), _keychain_account_name()
-        )
+        macos_keychain.delete_password(keychain_service_name(session_dir), _keychain_account_name())
     except KeychainError:
         pass  # best-effort; absent entry is already success (rc 44)
 
@@ -261,9 +259,7 @@ class SessionManager:
         """Launch Claude Code as the given account in the current terminal."""
         claude_bin = shutil.which("claude")
         if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+            raise SessionError("'claude' was not found on PATH. Install Claude Code first.")
         if share_history and self.switcher.platform == Platform.WINDOWS:
             raise SessionError(
                 "--share-history is not supported on Windows yet: sharing uses "
@@ -307,17 +303,10 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
-        session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
-        )
+        session_dir, account_num, email = self.setup_session(identifier, share, share_history)
 
-        print(
-            f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
-        )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
+        print(f"{accent('Launching')} Account-{account_num} ({email}) {muted('[session mode]')}")
+        env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
 
@@ -369,9 +358,7 @@ class SessionManager:
         # pass the local reuse check. Honored only when no session is live —
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
-        stale = (session_dir / STALE_MARKER).exists() and not live_sessions_for(
-            session_dir
-        )
+        stale = (session_dir / STALE_MARKER).exists() and not live_sessions_for(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -381,9 +368,7 @@ class SessionManager:
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
-            if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
-                session_dir
-            ):
+            if (session_dir / STALE_MARKER).exists() and not live_sessions_for(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
@@ -404,9 +389,7 @@ class SessionManager:
 
         return session_dir, account_num, email
 
-    def _bootstrap(
-        self, session_dir: Path, account_num: str, email: str, org_uuid: str
-    ) -> None:
+    def _bootstrap(self, session_dir: Path, account_num: str, email: str, org_uuid: str) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
@@ -540,9 +523,7 @@ class SessionManager:
 
     # -- sharing ---------------------------------------------------------
 
-    def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
-    ) -> None:
+    def _sync_sharing(self, session_dir: Path, share: bool, share_history: bool = False) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
         ``share`` governs SHARED_ITEMS (customizations); ``share_history``
@@ -561,9 +542,7 @@ class SessionManager:
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
-        )
+        active_items = (SHARED_ITEMS if share else ()) + (HISTORY_ITEMS if share_history else ())
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
@@ -590,9 +569,7 @@ class SessionManager:
             src = source_root / name
             dest = session_dir / name
 
-            if name in HISTORY_ITEMS and not self._prepare_history_share(
-                src, dest, session_dir
-            ):
+            if name in HISTORY_ITEMS and not self._prepare_history_share(src, dest, session_dir):
                 continue
 
             if not src.exists():
@@ -617,12 +594,7 @@ class SessionManager:
                 dest.unlink()
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
-                print(
-                    dimmed(
-                        f"Not sharing {name}: the session profile already has "
-                        "its own copy."
-                    )
-                )
+                print(dimmed(f"Not sharing {name}: the session profile already has its own copy."))
                 continue
 
             try:
@@ -647,9 +619,7 @@ class SessionManager:
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
 
-    def _prepare_history_share(
-        self, src: Path, dest: Path, session_dir: Path
-    ) -> bool:
+    def _prepare_history_share(self, src: Path, dest: Path, session_dir: Path) -> bool:
         """Make a history item linkable; returns False to skip it this launch.
 
         Handles the two ways a history item differs from a plain shared item:
@@ -675,9 +645,7 @@ class SessionManager:
             try:
                 self._merge_history_into_source(src, dest)
             except OSError as e:
-                self._logger.warning(
-                    f"Could not merge {dest.name} into {src}: {e}"
-                )
+                self._logger.warning(f"Could not merge {dest.name} into {src}: {e}")
                 print(
                     dimmed(
                         f"Not sharing {dest.name}: merging the profile's "

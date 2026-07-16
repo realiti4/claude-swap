@@ -39,9 +39,7 @@ class CswapApp(App):
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
     busy: reactive[bool] = reactive(False)
 
-    def __init__(
-        self, switcher: ClaudeAccountSwitcher, *, start: str = "dashboard"
-    ) -> None:
+    def __init__(self, switcher: ClaudeAccountSwitcher, *, start: str = "dashboard") -> None:
         super().__init__()
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
@@ -53,9 +51,7 @@ class CswapApp(App):
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            self.threshold_pct: float | None = load_settings(switcher.backup_dir).threshold
         except Exception:
             self.threshold_pct = None
 
@@ -112,9 +108,7 @@ class CswapApp(App):
             msg = str(event.worker.error)
             if msg != self._last_refresh_error:
                 self._last_refresh_error = msg
-                self.notify(
-                    f"Refresh failed: {msg}", severity="warning", timeout=6
-                )
+                self.notify(f"Refresh failed: {msg}", severity="warning", timeout=6)
         elif event.worker.group == "action":
             self.busy = False
             self.notify(f"Action failed: {event.worker.error}", severity="error")
@@ -143,9 +137,7 @@ class CswapApp(App):
         result = run_action(fn)
         self.call_from_thread(self._action_done, label, result, show_output)
 
-    def _action_done(
-        self, label: str, result: ActionResult, show_output: bool
-    ) -> None:
+    def _action_done(self, label: str, result: ActionResult, show_output: bool) -> None:
         self.busy = False
         self.request_refresh()
         if not result.ok:

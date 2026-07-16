@@ -49,8 +49,7 @@ def test_debug_adds_console_handler(tmp_path: Path):
     try:
         assert logger.level == logging.DEBUG
         assert any(
-            isinstance(h, logging.StreamHandler)
-            and not isinstance(h, logging.FileHandler)
+            isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
             for h in logger.handlers
         )
     finally:

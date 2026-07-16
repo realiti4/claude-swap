@@ -186,9 +186,7 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
-    def _candidates_text(
-        self, snap: AccountsSnapshot, active_number: str | None
-    ) -> Text:
+    def _candidates_text(self, snap: AccountsSnapshot, active_number: str | None) -> Text:
         """Switch targets ranked by remaining headroom (best first)."""
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
@@ -200,9 +198,7 @@ class AutoScreen(Screen):
             entry.append(f"\n  {acc.number:>2}  ", style=FOREGROUND)
             entry.append(acc.email, style=FOREGROUND)
             if acc.usage.sentinel is not None:
-                entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=MUTED
-                )
+                entry.append(f"  {data.sentinel_label(acc.usage.sentinel)}", style=MUTED)
                 ranked.append((998.0, acc.number))
             elif pct is None:
                 entry.append("  usage unknown", style=MUTED)

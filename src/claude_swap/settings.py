@@ -82,39 +82,69 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
-            "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
+            "autoswitch",
+            "threshold",
+            "threshold",
+            "float",
+            50.0,
+            99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
         SettingSpec(
-            "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
+            "autoswitch",
+            "intervalSeconds",
+            "interval_seconds",
+            "float",
+            15.0,
+            3600.0,
             help="Poll interval for the cswap auto loop, in seconds",
         ),
         SettingSpec(
-            "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
+            "autoswitch",
+            "cooldownSeconds",
+            "cooldown_seconds",
+            "float",
+            0.0,
+            86400.0,
             help="Minimum seconds between proactive switches",
         ),
         SettingSpec(
-            "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
+            "autoswitch",
+            "hysteresisPct",
+            "hysteresis_pct",
+            "float",
+            0.0,
+            50.0,
             help="A target must sit this many pct below the threshold",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice", choices=("best",),
+            "autoswitch",
+            "strategy",
+            "strategy",
+            "choice",
+            choices=("best",),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
-            "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
+            "autoswitch",
+            "includeApiKeyAccounts",
+            "include_api_key_accounts",
+            "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
         ),
         SettingSpec(
-            "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
+            "autoswitch",
+            "unhealthyTicks",
+            "unhealthy_ticks",
+            "int",
+            1,
+            100,
             help="Consecutive failed polls before an account is unhealthy",
         ),
     )
 }
 
-_AUTOSWITCH_KEYS: dict[str, str] = {
-    spec.field: spec.json_key for spec in SETTING_SPECS.values()
-}
+_AUTOSWITCH_KEYS: dict[str, str] = {spec.field: spec.json_key for spec in SETTING_SPECS.values()}
 
 
 # Bundles of settings for `cswap config apply-preset NAME`, single source of
@@ -155,7 +185,9 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             if value not in spec.choices:
                 _logger.warning(
                     "settings.json: unsupported %s %r; using %r",
-                    spec.dotted, value, spec.default,
+                    spec.dotted,
+                    value,
+                    spec.default,
                 )
                 value = spec.default
             kwargs[spec.field] = value
@@ -211,16 +243,17 @@ def setting_spec(dotted_key: str) -> SettingSpec:
     """Look up a spec by dotted key; unknown keys raise with the valid list."""
     spec = SETTING_SPECS.get(dotted_key)
     if spec is None:
-        raise ConfigError(
-            f"unknown setting '{dotted_key}'\n"
-            f"Valid keys: {', '.join(SETTING_SPECS)}"
-        )
+        raise ConfigError(f"unknown setting '{dotted_key}'\nValid keys: {', '.join(SETTING_SPECS)}")
     return spec
 
 
 _BOOL_WORDS = {
-    "true": True, "1": True, "yes": True,
-    "false": False, "0": False, "no": False,
+    "true": True,
+    "1": True,
+    "yes": True,
+    "false": False,
+    "0": False,
+    "no": False,
 }
 
 
@@ -236,23 +269,18 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         parsed = _BOOL_WORDS.get(raw_value.strip().lower())
         if parsed is None:
             raise ConfigError(
-                f"{spec.dotted} expects true or false (or 1/0, yes/no), "
-                f"got '{raw_value}'"
+                f"{spec.dotted} expects true or false (or 1/0, yes/no), got '{raw_value}'"
             )
         return parsed
     if spec.kind == "choice":
         if raw_value not in spec.choices:
-            raise ConfigError(
-                f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
-            )
+            raise ConfigError(f"{spec.dotted} must be one of: {', '.join(spec.choices)}")
         return raw_value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if spec.kind == "int" else "a number"
-        raise ConfigError(
-            f"{spec.dotted} expects {noun}, got '{raw_value}'"
-        ) from None
+        raise ConfigError(f"{spec.dotted} expects {noun}, got '{raw_value}'") from None
     if not spec.lo <= value <= spec.hi:
         raise ConfigError(
             f"{spec.dotted} must be between {format_setting_value(spec.lo)} "
@@ -287,14 +315,10 @@ def _read_raw_for_write(path: Path) -> dict:
         raw = json.loads(text)
     except json.JSONDecodeError as e:
         raise ConfigError(
-            f"{path} is not valid JSON ({e}); fix or delete it before "
-            "changing settings"
+            f"{path} is not valid JSON ({e}); fix or delete it before changing settings"
         ) from e
     if not isinstance(raw, dict):
-        raise ConfigError(
-            f"{path} is not a JSON object; fix or delete it before "
-            "changing settings"
-        )
+        raise ConfigError(f"{path} is not a JSON object; fix or delete it before changing settings")
     return raw
 
 
@@ -327,10 +351,7 @@ def apply_preset(backup_root: Path, name: str) -> list[tuple[str, object]]:
     preset name, same loud-failure style as `set_setting`.
     """
     if name not in PRESETS:
-        raise ConfigError(
-            f"unknown preset '{name}'\n"
-            f"Valid presets: {', '.join(PRESETS)}"
-        )
+        raise ConfigError(f"unknown preset '{name}'\nValid presets: {', '.join(PRESETS)}")
     return [
         (dotted_key, set_setting(backup_root, dotted_key, raw_value))
         for dotted_key, raw_value in PRESETS[name].items()

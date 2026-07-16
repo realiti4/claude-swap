@@ -255,9 +255,7 @@ class TestStrategyBehaviour:
 
         assert oauth.account_headroom(USAGE_API_KEY) is None
 
-    def test_best_does_not_jump_to_api_key_even_when_exhausted(
-        self, temp_home: Path, monkeypatch
-    ):
+    def test_best_does_not_jump_to_api_key_even_when_exhausted(self, temp_home: Path, monkeypatch):
         s = _linux_switcher()
         s.add_account_from_token("sk-ant-oat01-x", slot=1)  # OAuth, switchable
         s.add_account_from_token(API_KEY, slot=2)  # API key, switchable

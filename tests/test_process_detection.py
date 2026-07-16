@@ -42,29 +42,37 @@ class TestIsPidAlive:
     # is_pid_alive() dispatches to _is_pid_alive_windows() and never calls
     # os.kill. Pin the platform so these exercise the intended path on any host.
     def test_alive_pid(self):
-        with patch("claude_swap.process_detection.sys.platform", "linux"), \
-             patch("os.kill") as mock_kill:
+        with (
+            patch("claude_swap.process_detection.sys.platform", "linux"),
+            patch("os.kill") as mock_kill,
+        ):
             mock_kill.return_value = None
             assert is_pid_alive(12345) is True
             mock_kill.assert_called_once_with(12345, 0)
 
     def test_dead_pid(self):
-        with patch("claude_swap.process_detection.sys.platform", "linux"), \
-             patch("os.kill", side_effect=OSError("No such process")):
+        with (
+            patch("claude_swap.process_detection.sys.platform", "linux"),
+            patch("os.kill", side_effect=OSError("No such process")),
+        ):
             assert is_pid_alive(12345) is False
 
     def test_permission_error_means_alive(self):
-        with patch("claude_swap.process_detection.sys.platform", "linux"), \
-             patch("os.kill", side_effect=PermissionError("Operation not permitted")):
+        with (
+            patch("claude_swap.process_detection.sys.platform", "linux"),
+            patch("os.kill", side_effect=PermissionError("Operation not permitted")),
+        ):
             assert is_pid_alive(12345) is True
 
     def test_windows_dispatches_to_ctypes_impl(self):
         """On win32, is_pid_alive() delegates to the ctypes-based helper."""
-        with patch("claude_swap.process_detection.sys.platform", "win32"), \
-             patch(
-                 "claude_swap.process_detection._is_pid_alive_windows",
-                 return_value=True,
-             ) as mock_win:
+        with (
+            patch("claude_swap.process_detection.sys.platform", "win32"),
+            patch(
+                "claude_swap.process_detection._is_pid_alive_windows",
+                return_value=True,
+            ) as mock_win,
+        ):
             assert is_pid_alive(12345) is True
             mock_win.assert_called_once_with(12345)
 
@@ -175,7 +183,8 @@ class TestListSessions:
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         _write_session(
-            sessions_dir, 5000,
+            sessions_dir,
+            5000,
             sessionId="sess-abc",
             cwd="/projects/foo",
             startedAt=1700000000000,
@@ -251,9 +260,7 @@ class TestListIdeInstances:
     def test_missing_pid_field(self, tmp_path):
         ide_dir = tmp_path / "ide"
         ide_dir.mkdir()
-        (ide_dir / "9999.lock").write_text(
-            json.dumps({"ideName": "VS Code"}), encoding="utf-8"
-        )
+        (ide_dir / "9999.lock").write_text(json.dumps({"ideName": "VS Code"}), encoding="utf-8")
 
         assert list_ide_instances(tmp_path) == []
 

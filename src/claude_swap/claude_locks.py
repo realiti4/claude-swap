@@ -126,9 +126,7 @@ def proper_lockfile(
         try:
             os.rmdir(lock_dir)
         except FileNotFoundError:
-            _logger.warning(
-                "Lock %s vanished while held (taken over as stale?)", lock_dir
-            )
+            _logger.warning("Lock %s vanished while held (taken over as stale?)", lock_dir)
         except OSError as e:
             _logger.warning("Failed to release lock %s: %s", lock_dir, e)
 

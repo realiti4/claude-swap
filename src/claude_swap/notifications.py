@@ -79,11 +79,16 @@ def _notify_windows(title: str, message: str, *, urgency: str = "normal") -> Non
             "powershell",
             "-NoProfile",
             "-NonInteractive",
-            "-WindowStyle", "Hidden",
-            "-Command", _WIN_TOAST_PS,
-            "-Title", title,
-            "-Body", message,
-            "-Sound", sound,
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            _WIN_TOAST_PS,
+            "-Title",
+            title,
+            "-Body",
+            message,
+            "-Sound",
+            sound,
         ],
         timeout=10,
         capture_output=True,
@@ -98,9 +103,9 @@ def _notify_windows(title: str, message: str, *, urgency: str = "normal") -> Non
 
 def _notify_macos(title: str, message: str) -> None:
     script = (
-        f'display notification {_osa_str(message)} '
-        f'with title {_osa_str(_APP_NAME)} '
-        f'subtitle {_osa_str(title)}'
+        f"display notification {_osa_str(message)} "
+        f"with title {_osa_str(_APP_NAME)} "
+        f"subtitle {_osa_str(title)}"
     )
     subprocess.run(
         ["osascript", "-e", script],
@@ -126,8 +131,10 @@ def _notify_linux(title: str, message: str, *, urgency: str = "normal") -> None:
     subprocess.run(
         [
             "notify-send",
-            "--app-name", _APP_NAME,
-            "--urgency", u,
+            "--app-name",
+            _APP_NAME,
+            "--urgency",
+            u,
             title,
             message,
         ],

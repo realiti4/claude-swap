@@ -115,8 +115,7 @@ class DashboardScreen(Screen):
         menu = self.query_one("#menu", ListView)
         await menu.clear()
         await menu.extend(
-            MenuItem(label, action_id, muted=(action_id == "back"))
-            for label, action_id in entries
+            MenuItem(label, action_id, muted=(action_id == "back")) for label, action_id in entries
         )
         menu.index = 0
 
@@ -203,9 +202,7 @@ class AccountListScreen(Screen):
             await listview.extend(AccountItem(acc) for acc in snap.accounts)
             self._numbers = numbers
             listview.index = (
-                self._index_after_build(snap, first_build, previous)
-                if numbers
-                else None
+                self._index_after_build(snap, first_build, previous) if numbers else None
             )
         else:
             for item, acc in zip(listview.query(AccountItem), snap.accounts, strict=False):
@@ -222,11 +219,7 @@ class AccountListScreen(Screen):
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
         return next(
-            (
-                i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
-            ),
+            (i for i, acc in enumerate(snap.accounts) if acc.number == snap.active_number),
             0,
         )
 

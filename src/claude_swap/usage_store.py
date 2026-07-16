@@ -124,10 +124,7 @@ class UsageEntry:
 
     def claimed(self, now: float) -> bool:
         """A collector stamped this entry moments ago (fetch may be in flight)."""
-        return (
-            self.last_attempt_at is not None
-            and (now - self.last_attempt_at) < CLAIM_TTL_S
-        )
+        return self.last_attempt_at is not None and (now - self.last_attempt_at) < CLAIM_TTL_S
 
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -148,9 +145,7 @@ class UsageEntry:
         return None
 
 
-def due_candidate(
-    candidates: list[str], entries: dict[str, UsageEntry], now: float
-) -> str | None:
+def due_candidate(candidates: list[str], entries: dict[str, UsageEntry], now: float) -> str | None:
     """The due candidate with the stalest data, or None.
 
     Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
@@ -185,9 +180,7 @@ def due_candidate(
 
 
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
-    computed = min(
-        BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S
-    )
+    computed = min(BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S)
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
@@ -231,9 +224,7 @@ class UsageStore:
         return rows if isinstance(rows, dict) else {}
 
     def _write_rows(self, rows: dict[str, dict]) -> None:
-        atomic_write_json(
-            self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
-        )
+        atomic_write_json(self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows})
 
     @staticmethod
     def _matches(row: object, identity: Identity) -> bool:
@@ -271,10 +262,7 @@ class UsageStore:
             trust_extended = (
                 age_s is not None
                 and age_s <= TRUST_MAX_AGE_S
-                and (
-                    consecutive_failures > 0
-                    or (next_poll_at is not None and now < next_poll_at)
-                )
+                and (consecutive_failures > 0 or (next_poll_at is not None and now < next_poll_at))
             )
             out[num] = UsageEntry(
                 last_good=last_good if isinstance(last_good, dict) else None,
@@ -317,9 +305,7 @@ class UsageStore:
         now = self.clock()
         self._mutate(identities, nums, lambda _n, row: row.update(lastAttemptAt=now))
 
-    def record(
-        self, outcomes: dict[str, FetchRecord], identities: dict[str, Identity]
-    ) -> None:
+    def record(self, outcomes: dict[str, FetchRecord], identities: dict[str, Identity]) -> None:
         """Merge fetch outcomes. Success and failure are mutually exclusive
         writers: success resets the failure fields, failure never touches
         ``lastGood``/``fetchedAt``. Sentinel records are no-ops (derived state
@@ -342,9 +328,7 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 row["lastError"] = rec.error
-                row["backoffUntil"] = now + _failure_backoff_s(
-                    failures, rec.retry_after_s
-                )
+                row["backoffUntil"] = now + _failure_backoff_s(failures, rec.retry_after_s)
 
         self._mutate(identities, effective.keys(), apply)
 

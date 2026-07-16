@@ -109,9 +109,7 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
-def usage_freshness_fields(
-    fetched_at: float | None, age_s: float | None
-) -> dict:
+def usage_freshness_fields(fetched_at: float | None, age_s: float | None) -> dict:
     """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
     old the served ``usage`` measurement is (the store may serve last-good
     data on fetch failure). Emitted only alongside a non-null ``usage``."""

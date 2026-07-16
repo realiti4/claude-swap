@@ -99,15 +99,17 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
             pid = data["pid"]
             if not is_pid_alive(pid):
                 continue
-            sessions.append(ClaudeSession(
-                pid=pid,
-                session_id=data.get("sessionId", ""),
-                cwd=data.get("cwd", ""),
-                started_at=data.get("startedAt", 0),
-                kind=data.get("kind", ""),
-                entrypoint=data.get("entrypoint", ""),
-                status=data.get("status"),
-            ))
+            sessions.append(
+                ClaudeSession(
+                    pid=pid,
+                    session_id=data.get("sessionId", ""),
+                    cwd=data.get("cwd", ""),
+                    started_at=data.get("startedAt", 0),
+                    kind=data.get("kind", ""),
+                    entrypoint=data.get("entrypoint", ""),
+                    status=data.get("status"),
+                )
+            )
         except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
             logger.debug("Skipping session file %s: %s", path, exc)
     return sessions
@@ -127,12 +129,14 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
             if pid is None or not is_pid_alive(pid):
                 continue
             port = int(path.stem)
-            instances.append(IdeInstance(
-                port=port,
-                pid=pid,
-                ide_name=data.get("ideName", "Unknown IDE"),
-                workspace_folders=data.get("workspaceFolders", []),
-            ))
+            instances.append(
+                IdeInstance(
+                    port=port,
+                    pid=pid,
+                    ide_name=data.get("ideName", "Unknown IDE"),
+                    workspace_folders=data.get("workspaceFolders", []),
+                )
+            )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
             logger.debug("Skipping IDE lockfile %s: %s", path, exc)
     return instances

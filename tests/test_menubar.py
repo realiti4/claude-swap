@@ -17,6 +17,7 @@ from claude_swap.switcher import USAGE_API_KEY
 
 # --- settings ------------------------------------------------------------------
 
+
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
@@ -48,9 +49,7 @@ def test_settings_corrupt_file_falls_back_to_defaults(tmp_path: Path):
 def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
     path.write_text(
-        json.dumps(
-            {"refresh_interval": "fast", "bogus": 1, "show_account_name": False}
-        ),
+        json.dumps({"refresh_interval": "fast", "bogus": 1, "show_account_name": False}),
         encoding="utf-8",
     )
     s = menubar.MenuBarSettings.load(path)
@@ -67,6 +66,7 @@ _USAGE = {
 
 
 # --- usage display helpers -----------------------------------------------------
+
 
 def test_tightest_pct_uses_max_window():
     assert menubar.tightest_pct(_USAGE) == 42.0
@@ -100,6 +100,7 @@ def test_format_account_label():
 
 
 # --- usage logging -------------------------------------------------------------
+
 
 def test_format_usage_log_full():
     usage = {
@@ -137,6 +138,7 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 
 # --- title ---------------------------------------------------------------------
+
 
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
@@ -197,11 +199,12 @@ def test_format_title_both_keeps_available_window():
 
 # --- reset-time helpers --------------------------------------------------------
 
+
 def test_resets_at_ts_orders_and_handles_missing():
     early = {"resets_at": "2026-06-24T07:00:00+00:00"}
     late = {"resets_at": "2026-06-26T07:00:00+00:00"}
     assert menubar._resets_at_ts(early) < menubar._resets_at_ts(late)
-    assert menubar._resets_at_ts({"pct": 5.0}) == float("inf")   # no resets_at
+    assert menubar._resets_at_ts({"pct": 5.0}) == float("inf")  # no resets_at
     assert menubar._resets_at_ts({"resets_at": "garbage"}) == float("inf")
     assert menubar._resets_at_ts(None) == float("inf")
 
@@ -220,8 +223,8 @@ def test_live_countdown_formats_from_resets_at():
 
 
 def test_live_countdown_none_when_passed_or_missing():
-    assert menubar._live_countdown({"resets_at": _iso(-60)}, _NOW) is None   # already reset
-    assert menubar._live_countdown({"pct": 5.0}, _NOW) is None               # no resets_at
+    assert menubar._live_countdown({"resets_at": _iso(-60)}, _NOW) is None  # already reset
+    assert menubar._live_countdown({"pct": 5.0}, _NOW) is None  # no resets_at
     assert menubar._live_countdown("no credentials", _NOW) is None
 
 
@@ -258,8 +261,7 @@ def test_parse_switch_history_most_recent_first():
 
 def test_parse_switch_history_respects_limit():
     lines = "\n".join(
-        f"2026-06-27 0{i}:00:00,000 - INFO - Switched from account 1 to 2"
-        for i in range(1, 6)
+        f"2026-06-27 0{i}:00:00,000 - INFO - Switched from account 1 to 2" for i in range(1, 6)
     )
     out = menubar.parse_switch_history(lines, limit=2)
     assert len(out) == 2
@@ -272,6 +274,7 @@ def test_parse_switch_history_empty_or_no_matches():
 
 
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
+
 
 class _FakeEntry:
     def __init__(self, sentinel=None, last_good=None):
@@ -293,9 +296,10 @@ class _FakeSnap:
 
 
 def test_account_display_usage_sentinel_note_last_good_or_none():
-    assert menubar._account_display_usage(
-        _FakeEntry(sentinel=USAGE_API_KEY)
-    ) == menubar.SENTINEL_NOTES[USAGE_API_KEY]
+    assert (
+        menubar._account_display_usage(_FakeEntry(sentinel=USAGE_API_KEY))
+        == menubar.SENTINEL_NOTES[USAGE_API_KEY]
+    )
     lg = {"five_hour": {"pct": 5.0}}
     assert menubar._account_display_usage(_FakeEntry(last_good=lg)) == lg
     assert menubar._account_display_usage(_FakeEntry()) is None
@@ -316,7 +320,11 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg)
     # sentinel account: display is the human note, last_good is None
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None,
+        "2",
+        "b@x.com",
+        False,
+        menubar.SENTINEL_NOTES[USAGE_API_KEY],
+        None,
     )
 
 

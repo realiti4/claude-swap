@@ -168,11 +168,14 @@ def test_calls_pass_timeout_to_subprocess():
         assert run.call_args.kwargs.get("timeout") == macos_keychain._TIMEOUT
 
 
-@pytest.mark.parametrize("fn,args", [
-    ("get_password", ("svc", "acct")),
-    ("set_password", ("svc", "acct", "secret")),
-    ("delete_password", ("svc", "acct")),
-])
+@pytest.mark.parametrize(
+    "fn,args",
+    [
+        ("get_password", ("svc", "acct")),
+        ("set_password", ("svc", "acct", "secret")),
+        ("delete_password", ("svc", "acct")),
+    ],
+)
 def test_timeout_becomes_keychain_error(fn, args):
     timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):

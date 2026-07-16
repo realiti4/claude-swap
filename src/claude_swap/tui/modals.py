@@ -26,9 +26,7 @@ class ConfirmModal(ModalScreen[bool]):
         Binding("right", "app.focus_next", show=False),
     ]
 
-    def __init__(
-        self, message: str, *, title: str = "Confirm", yes_label: str = "Yes"
-    ) -> None:
+    def __init__(self, message: str, *, title: str = "Confirm", yes_label: str = "Yes") -> None:
         super().__init__()
         self._title = title
         self._message = message
@@ -120,9 +118,7 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
             try:
                 slot = int(slot_raw)
             except ValueError:
-                self.query_one("#form-error", Static).update(
-                    "Slot must be a number."
-                )
+                self.query_one("#form-error", Static).update("Slot must be a number.")
                 return
             if slot < 1:
                 self.query_one("#form-error", Static).update("Slot must be >= 1.")

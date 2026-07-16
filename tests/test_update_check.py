@@ -26,10 +26,14 @@ def _make_pypi_response(version: str) -> MagicMock:
 def _write_cache(path, version, timestamp=None):
     """Write a cache file in the shared cache format."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "timestamp": timestamp if timestamp is not None else time.time(),
-        "data": version,
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": timestamp if timestamp is not None else time.time(),
+                "data": version,
+            }
+        )
+    )
 
 
 class TestCheckForUpdate:
@@ -196,9 +200,7 @@ class TestCheckForUpdateMessage:
         assert "cswap upgrade" not in result
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_unknown_method_suggests_cswap_instructions(
-        self, mock_urlopen, tmp_path, monkeypatch
-    ):
+    def test_unknown_method_suggests_cswap_instructions(self, mock_urlopen, tmp_path, monkeypatch):
         # Unknown install method: cswap upgrade can only show instructions.
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: None)
@@ -220,9 +222,7 @@ class TestRunSelfUpgrade:
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
-        mock_run.assert_called_once_with(
-            ["uv", "tool", "upgrade", "claude-swap"], check=False
-        )
+        mock_run.assert_called_once_with(["uv", "tool", "upgrade", "claude-swap"], check=False)
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
@@ -230,9 +230,7 @@ class TestRunSelfUpgrade:
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
-        mock_run.assert_called_once_with(
-            ["pipx", "upgrade", "claude-swap"], check=False
-        )
+        mock_run.assert_called_once_with(["pipx", "upgrade", "claude-swap"], check=False)
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
@@ -243,9 +241,7 @@ class TestRunSelfUpgrade:
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value=None)
-    def test_unknown_method_returns_1_and_prints_instructions(
-        self, mock_detect, mock_run, capsys
-    ):
+    def test_unknown_method_returns_1_and_prints_instructions(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1
         mock_run.assert_not_called()
         err = capsys.readouterr().err
@@ -253,9 +249,7 @@ class TestRunSelfUpgrade:
         assert "pipx upgrade claude-swap" in err
         assert "pip install --upgrade claude-swap" in err
 
-    @patch(
-        "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
-    )
+    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_filenotfound_returns_1(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1

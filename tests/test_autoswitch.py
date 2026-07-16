@@ -96,9 +96,11 @@ class EngineHarness:
         self.switcher._write_account_config(
             str(num),
             email,
-            json.dumps({
-                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-            }),
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+                }
+            ),
         )
         data = self.switcher._get_sequence_data()
         data["accounts"][str(num)] = {
@@ -116,23 +118,27 @@ class EngineHarness:
         self.switcher._write_json(self.switcher.sequence_file, data)
 
     def make_live(self, email: str, num: int) -> None:
-        (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
-        }))
-        (self.temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-        }))
+        (self.temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+                }
+            )
+        )
+        (self.temp_home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+                }
+            )
+        )
 
     def tick_with_usage(self, usage: dict) -> TickOutcome:
-        entries = {
-            num: _entry_for(value, self.clock.now) for num, value in usage.items()
-        }
+        entries = {num: _entry_for(value, self.clock.now) for num, value in usage.items()}
         return self.tick_with_entries(entries)
 
     def tick_with_entries(self, entries: dict[str, UsageEntry]) -> TickOutcome:
-        with patch.object(
-            self.switcher, "usage_entries_by_account", return_value=entries
-        ):
+        with patch.object(self.switcher, "usage_entries_by_account", return_value=entries):
             return self.engine.tick()
 
     def active_number(self) -> int | None:
@@ -160,18 +166,26 @@ def harness(temp_home: Path) -> EngineHarness:
 
 class TestDecisionTable:
     def test_below_threshold_is_no_action(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(50), "2": _usage(10), "3": _usage(10),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(50),
+                "2": _usage(10),
+                "3": _usage(10),
+            }
+        )
         assert outcome is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
     def test_over_threshold_switches_to_max_headroom(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(40), "3": _usage(20),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(40),
+                "3": _usage(20),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
@@ -184,11 +198,13 @@ class TestDecisionTable:
         trigger a switch even while the 5-hour session window is nearly
         empty — Claude Code fails on the weekly cap regardless of session
         headroom, so auto-switch has to watch both, not just the 5h window."""
-        outcome = harness.tick_with_usage({
-            "1": _usage(5, seven_day_pct=97),  # session fresh, weekly exhausted
-            "2": _usage(20, seven_day_pct=30),
-            "3": _usage(50, seven_day_pct=10),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(5, seven_day_pct=97),  # session fresh, weekly exhausted
+                "2": _usage(20, seven_day_pct=30),
+                "3": _usage(50, seven_day_pct=10),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
@@ -197,29 +213,33 @@ class TestDecisionTable:
     def test_seven_day_exhaustion_disqualifies_a_candidate_too(self, harness):
         """A candidate must not be picked while ITS weekly window is maxed
         out either, even if its 5-hour window looks wide open."""
-        outcome = harness.tick_with_usage({
-            "1": _usage(95, seven_day_pct=10),
-            "2": _usage(5, seven_day_pct=99),  # tempting 5h, but weekly-exhausted
-            "3": _usage(30, seven_day_pct=15),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95, seven_day_pct=10),
+                "2": _usage(5, seven_day_pct=99),  # tempting 5h, but weekly-exhausted
+                "3": _usage(30, seven_day_pct=15),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)
         assert h.engine.tick() is TickOutcome.NO_ACTION
-        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
-            "no-active-account"
-        ]
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["no-active-account"]
 
     def test_hysteresis_bar_blocks_marginal_candidates(self, harness):
         # threshold 90, hysteresis 10 → candidates must sit at <= 80% used.
         # Failing the bar is NOT exhaustion: no all-exhausted event, no
         # reset-sleep — the next tick must stay at normal cadence so the
         # at-limit escape isn't missed when the active account tops out.
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(85), "3": _usage(88),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(85),
+                "3": _usage(88),
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
         assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
@@ -232,11 +252,13 @@ class TestDecisionTable:
     def test_mixed_unknown_and_exhausted_is_not_all_exhausted(self, harness):
         # One candidate at its limit, the other unreadable this tick: usage
         # could recover any moment, so no long reset-sleep.
-        outcome = harness.tick_with_usage({
-            "1": _usage(95),
-            "2": _usage(100, "2026-07-03T12:00:00Z"),
-            "3": None,
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(100, "2026-07-03T12:00:00Z"),
+                "3": None,
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
@@ -251,14 +273,19 @@ class TestDecisionTable:
         # unknown candidate could be viable, so no long reset-sleep.
         now = harness.clock.now
         reset = "2026-07-05T12:00:00Z"
-        outcome = harness.tick_with_entries({
-            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
-            "2": UsageEntry(
-                last_good=_usage(100, reset), fetched_at=now - 400, age_s=400.0,
-                consecutive_failures=1, trust_extended=True,
-            ),
-            "3": UsageEntry(last_good=_usage(10), fetched_at=now - 400, age_s=400.0),
-        })
+        outcome = harness.tick_with_entries(
+            {
+                "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+                "2": UsageEntry(
+                    last_good=_usage(100, reset),
+                    fetched_at=now - 400,
+                    age_s=400.0,
+                    consecutive_failures=1,
+                    trust_extended=True,
+                ),
+                "3": UsageEntry(last_good=_usage(10), fetched_at=now - 400, age_s=400.0),
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
@@ -270,52 +297,59 @@ class TestDecisionTable:
         now = harness.clock.now
         reset = "2026-07-05T12:00:00Z"
         stale_exhausted = UsageEntry(
-            last_good=_usage(100, reset), fetched_at=now - 400, age_s=400.0,
-            consecutive_failures=1, trust_extended=True,
+            last_good=_usage(100, reset),
+            fetched_at=now - 400,
+            age_s=400.0,
+            consecutive_failures=1,
+            trust_extended=True,
         )
-        outcome = harness.tick_with_entries({
-            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
-            "2": stale_exhausted,
-            "3": stale_exhausted,
-        })
+        outcome = harness.tick_with_entries(
+            {
+                "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+                "2": stale_exhausted,
+                "3": stale_exhausted,
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
-        exhausted = next(
-            e for e in harness.events if isinstance(e, AllExhaustedEvent)
-        )
+        exhausted = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
         assert exhausted.earliest_reset_at == reset
 
     def test_cooldown_suppresses_proactive(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
+        harness.engine._mutate_state(lambda s: s.update(lastSwitchAt=harness.clock() - 10))
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(10),
+                "3": _usage(10),
+            }
         )
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(10),
-        })
         assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
-            "cooldown"
-        ]
+        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
 
     def test_at_limit_bypasses_cooldown(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
+        harness.engine._mutate_state(lambda s: s.update(lastSwitchAt=harness.clock() - 10))
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(100),
+                "2": _usage(10),
+                "3": _usage(50),
+            }
         )
-        outcome = harness.tick_with_usage({
-            "1": _usage(100), "2": _usage(10), "3": _usage(50),
-        })
         assert outcome is TickOutcome.SWITCHED
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
 
     def test_cooldown_expires(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock())
-        )
+        harness.engine._mutate_state(lambda s: s.update(lastSwitchAt=harness.clock()))
         harness.clock.advance(400)  # past the 300s default cooldown
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(50),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(10),
+                "3": _usage(50),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
 
     def test_unknown_active_usage_waits_then_fails_over(self, harness):
@@ -337,26 +371,38 @@ class TestDecisionTable:
         assert harness.active_number() == 1
 
     def test_all_candidates_unknown_is_no_comparison(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": None, "3": None,
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": None,
+                "3": None,
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
             "no-comparison"
         ]
 
     def test_tie_resolves_to_earliest_slot(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(30), "3": _usage(30),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(30),
+                "3": _usage(30),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
     def test_candidate_not_better_than_active_is_skipped(self, harness):
         # Active 91% used (9 headroom); candidates worse or equal → exhausted.
-        outcome = harness.tick_with_usage({
-            "1": _usage(91), "2": _usage(95), "3": _usage(99),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(91),
+                "2": _usage(95),
+                "3": _usage(99),
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
 
@@ -364,18 +410,26 @@ class TestDecisionTable:
         # Active hard at 100%; the only room anywhere is a candidate at 85%,
         # which the proactive hysteresis bar (<=80%) would reject. At-limit is
         # an escape: any account with real headroom beats a blocked one.
-        outcome = harness.tick_with_usage({
-            "1": _usage(100), "2": _usage(85), "3": _usage(97),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(100),
+                "2": _usage(85),
+                "3": _usage(97),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
 
     def test_at_limit_never_targets_another_at_limit_account(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(100), "2": _usage(100), "3": _usage(100),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(100),
+                "2": _usage(100),
+                "3": _usage(100),
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
 
@@ -405,11 +459,13 @@ class TestDecisionTable:
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):
-        outcome = harness.tick_with_usage({
-            "1": _usage(100, "2026-07-03T12:00:00Z"),
-            "2": _usage(100, "2026-07-03T10:30:00Z"),
-            "3": _usage(100, "2026-07-03T11:00:00Z"),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(100, "2026-07-03T12:00:00Z"),
+                "2": _usage(100, "2026-07-03T10:30:00Z"),
+                "3": _usage(100, "2026-07-03T11:00:00Z"),
+            }
+        )
         assert outcome is TickOutcome.BLOCKED
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
         assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
@@ -494,6 +550,7 @@ class TestAdaptiveScheduler:
                 return oauth.UsageOutcome(None, error=error)
             value = usage_by_num.get(num)
             return oauth.UsageOutcome(dict(value) if value else None)
+
         return fake
 
     def _tick(self, h, counts, usage_by_num, errors_by_num=None):
@@ -507,8 +564,7 @@ class TestAdaptiveScheduler:
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
-        for expected in ({"1": 1, "2": 1}, {"1": 2, "2": 1, "3": 1},
-                         {"1": 3, "2": 2, "3": 1}):
+        for expected in ({"1": 1, "2": 1}, {"1": 2, "2": 1, "3": 1}, {"1": 3, "2": 2, "3": 1}):
             self._tick(h, counts, usage)
             assert counts == expected, "one candidate per tick, stalest first"
             h.clock.advance(60)
@@ -517,9 +573,7 @@ class TestAdaptiveScheduler:
         # threshold 90, margin 15 → active at 80% is within the escalation band.
         h = self._harness(temp_home, monkeypatch)
         counts: dict[str, int] = {}
-        outcome = self._tick(
-            h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)}
-        )
+        outcome = self._tick(h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)})
         assert outcome is TickOutcome.NO_ACTION  # still below the threshold
         assert counts == {"1": 1, "2": 1, "3": 1}  # but everyone got refreshed
 
@@ -527,7 +581,8 @@ class TestAdaptiveScheduler:
         h = self._harness(temp_home, monkeypatch, unhealthy_ticks=1)
         counts: dict[str, int] = {}
         outcome = self._tick(
-            h, counts,
+            h,
+            counts,
             {"2": _usage(10), "3": _usage(50)},
             errors_by_num={"1": "timeout"},
         )
@@ -585,9 +640,7 @@ class TestAdaptiveScheduler:
             assert counts["1"] == expected
             h.clock.advance(60)
 
-    def test_band_jump_is_seen_at_most_one_relaxed_poll_late(
-        self, temp_home, monkeypatch
-    ):
+    def test_band_jump_is_seen_at_most_one_relaxed_poll_late(self, temp_home, monkeypatch):
         # Active at 40% (2×-interval tier) jumps into the band between polls:
         # the jump is picked up on the next tier poll and escalates the same
         # tick (candidates refreshed despite none being due).
@@ -639,9 +692,7 @@ class TestAdaptiveScheduler:
             self._tick(h, counts, usage)
             h.clock.advance(60)
         assert counts["2"] == 1  # fetched once, then parked until its reset
-        entry = h.switcher._usage_store.entries(
-            {"2": ("b@example.com", "")}
-        )["2"]
+        entry = h.switcher._usage_store.entries({"2": ("b@example.com", "")})["2"]
         assert entry.next_poll_at == pytest.approx(reset_ts)
 
     def test_poll_never_scheduled_past_a_window_reset(self, temp_home, monkeypatch):
@@ -654,17 +705,11 @@ class TestAdaptiveScheduler:
         # clamped to reset + slack rather than waiting the full interval.
         h = self._harness(temp_home, monkeypatch, accounts=2, interval_seconds=600)
         reset_ts = h.clock.now + 90.0
-        reset_iso = (
-            datetime.fromtimestamp(reset_ts, tz=UTC)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        reset_iso = datetime.fromtimestamp(reset_ts, tz=UTC).isoformat().replace("+00:00", "Z")
         usage = {"1": _usage(50), "2": _usage(40, reset_iso)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        entry = h.switcher._usage_store.entries(
-            {"2": ("b@example.com", "")}
-        )["2"]
+        entry = h.switcher._usage_store.entries({"2": ("b@example.com", "")})["2"]
         assert entry.next_poll_at == pytest.approx(reset_ts + RESET_SLACK_S)
         assert entry.poll_interval_s == 600.0  # learned cadence untouched
 
@@ -674,35 +719,40 @@ class TestAdaptiveScheduler:
         counts: dict[str, int] = {}
 
         def interval() -> float | None:
-            return h.switcher._usage_store.entries(
-                {"2": ("b@example.com", "")}
-            )["2"].poll_interval_s
+            return h.switcher._usage_store.entries({"2": ("b@example.com", "")})[
+                "2"
+            ].poll_interval_s
 
-        self._tick(h, counts, usage)          # first data point → base interval
+        self._tick(h, counts, usage)  # first data point → base interval
         assert interval() == 60.0
         h.clock.advance(60)
-        self._tick(h, counts, usage)          # unmoved → backs off ×1.5
+        self._tick(h, counts, usage)  # unmoved → backs off ×1.5
         assert interval() == 90.0
         assert counts["2"] == 2
         h.clock.advance(60)
-        self._tick(h, counts, usage)          # not due yet (90s interval)
+        self._tick(h, counts, usage)  # not due yet (90s interval)
         assert counts["2"] == 2
         h.clock.advance(60)
-        usage["2"] = _usage(20)               # moved 10 pts on another machine
+        usage["2"] = _usage(20)  # moved 10 pts on another machine
         self._tick(h, counts, usage)
         assert counts["2"] == 3
-        assert interval() == 60.0             # halved (floored at engine interval)
+        assert interval() == 60.0  # halved (floored at engine interval)
 
     def test_idle_hold_skips_candidate_polling(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch)
         # Active token locally expired while "Claude Code is running" (owner
         # patched True) → sentinel without any request.
-        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-live", "refreshToken": "rt-live",
-                "expiresAt": 1000,
-            },
-        }))
+        (h.temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-live",
+                        "refreshToken": "rt-live",
+                        "expiresAt": 1000,
+                    },
+                }
+            )
+        )
         usage = {"2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
         assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
@@ -718,17 +768,13 @@ class TestAdaptiveScheduler:
     def test_poll_event_carries_fetch_errors(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)
         counts: dict[str, int] = {}
-        self._tick(
-            h, counts, {"2": _usage(10)}, errors_by_num={"1": "http-429"}
-        )
+        self._tick(h, counts, {"2": _usage(10)}, errors_by_num={"1": "http-429"})
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert poll.fetch_errors.get("1") == "http-429"
         assert "http-429" in poll.human()
         assert poll.to_json()["fetchErrors"] == {"1": "http-429"}
 
-    def test_quarantined_candidate_never_consumes_the_poll_slot(
-        self, temp_home, monkeypatch
-    ):
+    def test_quarantined_candidate_never_consumes_the_poll_slot(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch)
         h.engine._quarantine("2", "b@example.com", "invalid_grant")
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
@@ -740,9 +786,7 @@ class TestAdaptiveScheduler:
         assert "2" not in counts
         assert counts["3"] >= 1
 
-    def test_expired_active_enters_idle_hold_even_during_backoff(
-        self, temp_home, monkeypatch
-    ):
+    def test_expired_active_enters_idle_hold_even_during_backoff(self, temp_home, monkeypatch):
         """Finding-2 regression: the owned+expired sentinel must not be hidden
         by the active row's failure backoff (e.g. a Retry-After window), or
         the engine would count unhealthy ticks toward a spurious failover."""
@@ -750,12 +794,17 @@ class TestAdaptiveScheduler:
 
         h = self._harness(temp_home, monkeypatch)
         # Active token locally expired while an owner is present.
-        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-live", "refreshToken": "rt-live",
-                "expiresAt": 1000,
-            },
-        }))
+        (h.temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-live",
+                        "refreshToken": "rt-live",
+                        "expiresAt": 1000,
+                    },
+                }
+            )
+        )
         # Active row sits in a long failure backoff → the fetch path (and its
         # own expired short-circuit) is unreachable this tick.
         h.switcher._usage_store.record(
@@ -794,9 +843,13 @@ class TestApiKeyAccounts:
         h.make_live("a@example.com", 1)
         self._mark_api_key(h, 2)
         # A qualifying OAuth candidate wins over the API key...
-        outcome = h.tick_with_usage({
-            "1": _usage(95), "2": "api key", "3": _usage(10),
-        })
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": "api key",
+                "3": _usage(10),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
@@ -807,9 +860,13 @@ class TestApiKeyAccounts:
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
         self._mark_api_key(h, 2)
-        outcome = h.tick_with_usage({
-            "1": _usage(100), "2": "api key", "3": _usage(100),
-        })
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage(100),
+                "2": "api key",
+                "3": _usage(100),
+            }
+        )
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
@@ -821,9 +878,7 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 1)
         outcome = h.tick_with_usage({"1": "api key", "2": _usage(10)})
         assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
-            "active-api-key"
-        ]
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["active-api-key"]
 
 
 class TestFreshening:
@@ -833,13 +888,15 @@ class TestFreshening:
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 60_000)
         h.make_live("a@example.com", 1)
 
-        rotated = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-2-new",
-                "refreshToken": "rt-2-new",
-                "expiresAt": int(h.clock() * 1000) + 3_600_000,
+        rotated = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-2-new",
+                    "refreshToken": "rt-2-new",
+                    "expiresAt": int(h.clock() * 1000) + 3_600_000,
+                }
             }
-        })
+        )
         live_creds_path = temp_home / ".claude" / ".credentials.json"
         live_before = live_creds_path.read_text()
         with patch(
@@ -861,9 +918,7 @@ class TestFreshening:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
         h.make_live("a@example.com", 1)
-        with patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
-        ) as mock_refresh:
+        with patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.SWITCHED
         mock_refresh.assert_not_called()
@@ -878,9 +933,13 @@ class TestFreshening:
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
         ):
-            outcome = h.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(20),
-            })
+            outcome = h.tick_with_usage(
+                {
+                    "1": _usage(95),
+                    "2": _usage(10),
+                    "3": _usage(20),
+                }
+            )
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3  # next candidate after 2 was quarantined
         q = next(e for e in h.events if isinstance(e, QuarantineEvent))
@@ -909,11 +968,10 @@ class TestFreshening:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
         h.make_live("a@example.com", 1)
-        with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
-        ) as mock_refresh:
+        with (
+            patch.object(h.switcher, "live_session_pids_for", return_value=[4242]),
+            patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as mock_refresh,
+        ):
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
@@ -924,11 +982,10 @@ class TestFreshening:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=1)  # long expired
         h.make_live("a@example.com", 1)
-        with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
-        ) as mock_refresh:
+        with (
+            patch.object(h.switcher, "live_session_pids_for", return_value=[4242]),
+            patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as mock_refresh,
+        ):
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
@@ -945,8 +1002,7 @@ class TestQuarantineLifecycle:
             harness.switcher,
             "usage_entries_by_account",
             return_value={
-                num: _entry_for(value, harness.clock.now)
-                for num, value in usage.items()
+                num: _entry_for(value, harness.clock.now) for num, value in usage.items()
             },
         ):
             outcome = fresh_engine.tick()
@@ -960,14 +1016,20 @@ class TestQuarantineLifecycle:
         harness.switcher._write_account_credentials(
             "2",
             "b@example.com",
-            json.dumps({
-                "claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"},
-            }),
+            json.dumps(
+                {
+                    "claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"},
+                }
+            ),
         )
         harness.events.clear()
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(0), "3": _usage(50),
-        })
+        outcome = harness.tick_with_usage(
+            {
+                "1": _usage(95),
+                "2": _usage(0),
+                "3": _usage(50),
+            }
+        )
         assert any(isinstance(e, UnquarantineEvent) for e in harness.events)
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
@@ -978,8 +1040,14 @@ class TestQuarantineLifecycle:
         # RMW under the state lock must preserve its quarantine entry.
         harness.engine._mutate_state(
             lambda s: s.setdefault("quarantine", {}).update(
-                {"3": {"email": "c@example.com", "reason": "invalid_grant",
-                       "at": "x", "refreshTokenFingerprint": None}}
+                {
+                    "3": {
+                        "email": "c@example.com",
+                        "reason": "invalid_grant",
+                        "at": "x",
+                        "refreshTokenFingerprint": None,
+                    }
+                }
             )
         )
         harness.engine._mutate_state(lambda s: s.update(lastSwitchAt=123.0))
@@ -1017,9 +1085,7 @@ class TestDryRunAndNoOp:
         h.engine = h._make_engine(dry_run=True)
         backup_before = h.switcher.read_account_credentials("2", "b@example.com")
 
-        with patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
-        ) as mock_refresh:
+        with patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
 
         assert outcome is TickOutcome.SWITCHED  # reported the would-switch
@@ -1035,7 +1101,8 @@ class TestDryRunAndNoOp:
         h.engine._quarantine("2", "b@example.com", "invalid_grant")
         # Replace the credential — a real tick would lift the quarantine.
         h.switcher._write_account_credentials(
-            "2", "b@example.com",
+            "2",
+            "b@example.com",
             json.dumps({"claudeAiOauth": {"accessToken": "n", "refreshToken": "n"}}),
         )
         h.events.clear()
@@ -1055,9 +1122,13 @@ class TestDryRunAndNoOp:
             "switch_to",
             return_value={"switched": False, "reason": "already-active"},
         ):
-            outcome = harness.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(50),
-            })
+            outcome = harness.tick_with_usage(
+                {
+                    "1": _usage(95),
+                    "2": _usage(10),
+                    "3": _usage(50),
+                }
+            )
         assert outcome is TickOutcome.NO_ACTION
         assert "lastSwitchAt" not in harness.state()
 
@@ -1096,8 +1167,10 @@ class TestRunLoop:
                 harness.engine.stop()
             return TickOutcome.NO_ACTION
 
-        with patch.object(harness.engine, "tick", side_effect=fake_tick), \
-             patch.object(harness.engine._stop, "wait", return_value=None):
+        with (
+            patch.object(harness.engine, "tick", side_effect=fake_tick),
+            patch.object(harness.engine._stop, "wait", return_value=None),
+        ):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
 
@@ -1111,9 +1184,10 @@ class TestRunLoop:
             harness.engine.stop()
             return TickOutcome.NO_ACTION
 
-        with patch.object(
-            harness.engine, "_tick_inner", side_effect=raising_inner
-        ), patch.object(harness.engine._stop, "wait", return_value=None):
+        with (
+            patch.object(harness.engine, "_tick_inner", side_effect=raising_inner),
+            patch.object(harness.engine._stop, "wait", return_value=None),
+        ):
             harness.engine.run_loop()
         assert len(calls) == 2
         assert any(isinstance(e, ErrorEvent) for e in harness.events)

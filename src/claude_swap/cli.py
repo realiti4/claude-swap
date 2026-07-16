@@ -391,10 +391,7 @@ def _config_command(argv: list[str]) -> None:
     )
     parser = argparse.ArgumentParser(
         prog="cswap config",
-        description=(
-            "Read and edit claude-swap settings (settings.json in the "
-            "backup root)."
-        ),
+        description=("Read and edit claude-swap settings (settings.json in the backup root)."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Keys:
@@ -422,9 +419,7 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
-    sub = parser.add_subparsers(
-        dest="action", metavar="{list,get,set,unset,apply-preset,path}"
-    )
+    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,apply-preset,path}")
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
@@ -485,9 +480,7 @@ Examples:
                     print(line if is_set else f"{line}  {dimmed('(default)')}")
         elif action == "get":
             spec = setting_spec(args.key)
-            value, is_set = next(
-                (v, s) for sp, v, s in effective_settings(root) if sp is spec
-            )
+            value, is_set = next((v, s) for sp, v, s in effective_settings(root) if sp is spec)
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
@@ -536,10 +529,12 @@ def _add_accounts_batch(switcher: ClaudeAccountSwitcher, count: int) -> None:
     from claude_swap.exceptions import ValidationError
 
     for i in range(count):
-        print(dimmed(
-            f"[{i + 1}/{count}] Log into Claude Code with account {i + 1}, "
-            "then press Enter to continue (Ctrl+C to stop)..."
-        ))
+        print(
+            dimmed(
+                f"[{i + 1}/{count}] Log into Claude Code with account {i + 1}, "
+                "then press Enter to continue (Ctrl+C to stop)..."
+            )
+        )
         try:
             input()
         except EOFError:
@@ -913,9 +908,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.switch:
             payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         elif args.switch_to:
-            payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
-            )
+            payload = switcher.switch_to(args.switch_to, json_output=args.json, force=args.force)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

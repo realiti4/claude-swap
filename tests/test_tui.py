@@ -56,8 +56,7 @@ def make_entry(
         last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(86400 * 3)}
     if scoped is not None:
         last_good["scoped"] = [
-            {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)}
-            for name, pct in scoped
+            {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)} for name, pct in scoped
         ]
     if spend is not None:
         last_good["spend"] = spend
@@ -95,9 +94,7 @@ class FakeSwitcher:
     def __init__(self, accounts: list[AccountSnapshot], backup_dir: Path):
         self._accounts = list(accounts)
         self.backup_dir = backup_dir
-        self.active = next(
-            (a.number for a in accounts if a.is_active), None
-        )
+        self.active = next((a.number for a in accounts if a.is_active), None)
         self.calls: list[tuple] = []
         self.fetch_sets: list[set[str] | None] = []
 
@@ -114,15 +111,12 @@ class FakeSwitcher:
     def current_account_number(self) -> str | None:
         return self.active
 
-    def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
-    ) -> dict:
+    def switch_to(self, identifier: str, json_output: bool = False, force: bool = False) -> dict:
         self.calls.append(("switch_to", str(identifier)))
         old = self.active
         self.active = str(identifier)
         self._accounts = [
-            dataclasses.replace(a, is_active=(a.number == self.active))
-            for a in self._accounts
+            dataclasses.replace(a, is_active=(a.number == self.active)) for a in self._accounts
         ]
         return {
             "switched": True,
@@ -186,9 +180,7 @@ async def menu_select(pilot, action_id: str) -> None:
 
     menu = pilot.app.screen.query_one("#menu", ListView)
     items = list(menu.query(MenuItem))
-    menu.index = next(
-        i for i, item in enumerate(items) if item.action_id == action_id
-    )
+    menu.index = next(i for i, item in enumerate(items) if item.action_id == action_id)
     await pilot.pause()
     await pilot.press("enter")
     await pilot.pause()
@@ -268,8 +260,7 @@ class TestFormatting:
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
         fake = FakeSwitcher(
-            accounts
-            or [make_account(1, active=True), make_account(2)],
+            accounts or [make_account(1, active=True), make_account(2)],
             tmp_path,
         )
         return fake, tui_data.SnapshotSource(fake)
@@ -511,9 +502,7 @@ class TestDashboard:
             assert menu.index == 0
 
     async def test_s_opens_switch_screen_and_enter_switches(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
@@ -536,9 +525,7 @@ class TestDashboard:
             assert app.snapshot.active_number == "2"
 
     async def test_switch_screen_escape_backs_out(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
@@ -553,9 +540,7 @@ class TestDashboard:
             assert not any(call[0] == "switch_to" for call in fake.calls)
 
     async def test_remove_via_menu_confirms_then_removes(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
@@ -569,9 +554,7 @@ class TestDashboard:
             assert ("remove", "2", True) in fake.calls
 
     async def test_remove_via_menu_cancel_is_safe(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
@@ -582,9 +565,7 @@ class TestDashboard:
             assert not any(call[0] == "remove" for call in fake.calls)
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
@@ -626,9 +607,7 @@ class TestDashboard:
             assert ("add_token", "sk-ant-oat01-test", None, 5, True) in fake.calls
 
     async def test_add_token_occupied_slot_asks_first(self, tmp_path):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await settle(pilot)
@@ -666,9 +645,7 @@ class TestDashboard:
 @pytest.mark.asyncio
 class TestWatchScreen:
     def _fake(self, tmp_path):
-        return FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        return FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
 
     async def test_w_opens_monitor_without_cursor(self, tmp_path):
         app = make_app(self._fake(tmp_path))
@@ -760,7 +737,6 @@ def fake_calls(app) -> list[tuple]:
     return app.switcher.calls
 
 
-
 class _FakeEngine:
     """Stands in for AutoSwitchEngine: records construction, blocks until stop."""
 
@@ -787,9 +763,7 @@ class _FakeEngine:
 @pytest.fixture
 def fake_engine(monkeypatch):
     _FakeEngine.instances = []
-    monkeypatch.setattr(
-        "claude_swap.tui.autoview.AutoSwitchEngine", _FakeEngine
-    )
+    monkeypatch.setattr("claude_swap.tui.autoview.AutoSwitchEngine", _FakeEngine)
     return _FakeEngine
 
 
@@ -801,9 +775,7 @@ class TestAutoScreen:
         await pilot.pause()
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
@@ -820,9 +792,7 @@ class TestAutoScreen:
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
@@ -837,12 +807,8 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
 
-    async def test_back_stops_engine_and_restores_fetching(
-        self, tmp_path, fake_engine
-    ):
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+    async def test_back_stops_engine_and_restores_fetching(self, tmp_path, fake_engine):
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
@@ -870,9 +836,7 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
-            )
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
 
 
 class TestEventText:

@@ -174,7 +174,7 @@ def abbreviate_path(path: str) -> str:
     """Replace the user's home directory prefix with ~."""
     home = str(Path.home())
     if path.startswith(home):
-        return "~" + path[len(home):]
+        return "~" + path[len(home) :]
     return path
 
 

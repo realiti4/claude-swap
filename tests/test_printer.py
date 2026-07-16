@@ -142,6 +142,7 @@ class TestLinePrinters:
 
 def test_force_color_overrides_and_restores():
     from claude_swap import printer
+
     saved = printer._colors_enabled
     try:
         printer._colors_enabled = False

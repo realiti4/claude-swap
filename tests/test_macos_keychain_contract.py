@@ -70,9 +70,7 @@ class TestBackupCredentialsSecurity:
         self, macos_switcher: ClaudeAccountSwitcher
     ):
         with patch("claude_swap.credentials.macos_keychain") as mock_kc:
-            macos_switcher._write_account_credentials(
-                "2", "alice@example.com", "secret-token"
-            )
+            macos_switcher._write_account_credentials("2", "alice@example.com", "secret-token")
 
             mock_kc.set_password.assert_called_once_with(
                 "claude-swap", "account-2-alice@example.com", "secret-token"
@@ -84,10 +82,12 @@ class TestBackupCredentialsSecurity:
         with patch("claude_swap.credentials.macos_keychain") as mock_kc:
             macos_switcher._delete_account_credentials("3", "bob@example.com")
 
-            mock_kc.delete_password.assert_has_calls([
-                call("claude-swap", "account-3-bob@example.com"),
-                call("claude-swap", "account-None-bob@example.com"),
-            ])
+            mock_kc.delete_password.assert_has_calls(
+                [
+                    call("claude-swap", "account-3-bob@example.com"),
+                    call("claude-swap", "account-None-bob@example.com"),
+                ]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +115,8 @@ def tmp_keychain(tmp_path: Path):
     shape is kept so the same code is risk-free if anyone copies it.
     """
     test_keychain = str(tmp_path / "test.keychain")
-    subprocess.run(
-        ["security", "create-keychain", "-p", "", test_keychain], check=True
-    )
-    subprocess.run(
-        ["security", "unlock-keychain", "-p", "", test_keychain], check=True
-    )
+    subprocess.run(["security", "create-keychain", "-p", "", test_keychain], check=True)
+    subprocess.run(["security", "unlock-keychain", "-p", "", test_keychain], check=True)
 
     # CI runners don't reliably have a default keychain configured (rc 1,
     # "A default keychain could not be found") — and an earlier swap/restore
@@ -132,9 +128,7 @@ def tmp_keychain(tmp_path: Path):
         text=True,
     )
     original_default = (
-        default_proc.stdout.strip().strip('"')
-        if default_proc.returncode == 0
-        else None
+        default_proc.stdout.strip().strip('"') if default_proc.returncode == 0 else None
     )
     list_proc = subprocess.run(
         ["security", "list-keychains", "-d", "user"],
@@ -148,9 +142,7 @@ def tmp_keychain(tmp_path: Path):
     ]
 
     try:
-        subprocess.run(
-            ["security", "default-keychain", "-s", test_keychain], check=True
-        )
+        subprocess.run(["security", "default-keychain", "-s", test_keychain], check=True)
         subprocess.run(
             ["security", "list-keychains", "-d", "user", "-s", test_keychain],
             check=True,
@@ -160,12 +152,8 @@ def tmp_keychain(tmp_path: Path):
         # headless runner waiting for an unlock prompt nobody can click. Remove
         # the auto-lock timeout and unlock *after* the default/search-list swap
         # (the order fastlane's setup_ci uses).
-        subprocess.run(
-            ["security", "set-keychain-settings", test_keychain], check=True
-        )
-        subprocess.run(
-            ["security", "unlock-keychain", "-p", "", test_keychain], check=True
-        )
+        subprocess.run(["security", "set-keychain-settings", test_keychain], check=True)
+        subprocess.run(["security", "unlock-keychain", "-p", "", test_keychain], check=True)
         yield test_keychain
     finally:
         # Restore the search list BEFORE the default: macOS won't report a
@@ -177,9 +165,7 @@ def tmp_keychain(tmp_path: Path):
                 check=False,
             )
         if original_default:
-            subprocess.run(
-                ["security", "default-keychain", "-s", original_default], check=False
-            )
+            subprocess.run(["security", "default-keychain", "-s", original_default], check=False)
         subprocess.run(["security", "delete-keychain", test_keychain], check=False)
 
 
@@ -233,9 +219,7 @@ def test_write_credentials_creates_user_scoped_entry(tmp_keychain: str):
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, (
-        f"security find-generic-password failed: {result.stderr}"
-    )
+    assert result.returncode == 0, f"security find-generic-password failed: {result.stderr}"
     assert result.stdout.strip() == "fake-token-write"
 
 

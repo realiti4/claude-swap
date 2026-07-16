@@ -329,6 +329,7 @@ class CredentialStore:
         cred_dir.mkdir(parents=True, exist_ok=True)
         cred_file = cred_dir / ".credentials.json"
         import tempfile
+
         fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
         try:
             os.write(fd, credentials.encode("utf-8"))
@@ -444,9 +445,7 @@ class CredentialStore:
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
-        self._last_active_credentials_backend = (
-            "keychain" if wrote_to_keychain else "file"
-        )
+        self._last_active_credentials_backend = "keychain" if wrote_to_keychain else "file"
 
     def _clear_managed_key(self) -> None:
         """Clear any active managed API key (Claude Code ``removeApiKey`` semantics).
@@ -467,6 +466,7 @@ class CredentialStore:
                 pass  # best-effort; a down Keychain can't be cleaned now
         cfg = self._read_global_config()
         if cfg is not None and cfg.get("primaryApiKey") is not None:
+
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
 
@@ -640,6 +640,7 @@ class CredentialStore:
         enc_file = self._backup_enc_path(account_num, email)
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
         import tempfile
+
         fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
         try:
             os.write(fd, encoded.encode("utf-8"))
@@ -708,9 +709,7 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
-    def _write_account_credentials(
-        self, account_num: str, email: str, credentials: str
-    ) -> None:
+    def _write_account_credentials(self, account_num: str, email: str, credentials: str) -> None:
         """Write account credentials to backup (pure I/O — no session invalidation).
 
         macOS writes the Keychain when usable, then reconciles the ``.enc`` away
