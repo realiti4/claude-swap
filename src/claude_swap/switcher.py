@@ -765,6 +765,113 @@ class ClaudeAccountSwitcher:
                 except OSError:
                     pass
 
+    def move_account(self, account: str, target: str) -> tuple[str, str, bool]:
+        """Assign ``account`` to slot number ``target`` (the general form of swap).
+
+        ``account`` is any ``NUM|EMAIL|ALIAS``; ``target`` is the destination
+        slot number. Three cases:
+
+        - target is the account's current slot -> no-op.
+        - target slot is empty -> the account is relocated there and its old
+          slot is freed. ``swap`` cannot express this (it needs two accounts).
+        - target slot is occupied -> the two accounts trade places, exactly
+          like ``swap account <occupant>``; the displaced account takes the
+          vacated slot, so nothing is ever lost.
+
+        Slot numbers may be sparse (``remove`` leaves gaps, ``add`` grows from
+        the max), so any positive number is a legal target.
+
+        Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
+        when an occupant was displaced.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        self._get_sequence_data_migrated()
+
+        target = target.strip()
+        if not target.isdigit() or int(target) < 1:
+            raise ValidationError(
+                f"Target slot must be a positive slot number, got: {target!r} "
+                f"(use `swap` to trade two accounts by identifier)"
+            )
+        target = str(int(target))  # normalize "01" -> "1"
+
+        num_src = self._resolve_account_identifier(account)
+        if not num_src:
+            raise AccountNotFoundError(f"No account found with identifier: {account}")
+
+        data = self._get_sequence_data()
+        if not (data or {}).get("accounts", {}).get(num_src):
+            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+
+        if num_src == target:
+            return num_src, target, False
+
+        if data.get("accounts", {}).get(target):
+            # Occupied target: trade places. swap_accounts re-resolves by
+            # number, re-runs the migration guard, and is already tested.
+            self.swap_accounts(num_src, target)
+            return num_src, target, True
+
+        self._relocate_account(num_src, target)
+        return num_src, target, False
+
+    def _relocate_account(self, num_src: str, target: str) -> None:
+        """Move one account from ``num_src`` to the empty slot ``target``.
+
+        The one-way counterpart of :meth:`swap_accounts`: everything keyed by
+        the slot number (credential and config backups, session profile,
+        rotation position in ``sequence``, ``activeAccountNumber``) follows the
+        account to its new number, and ``num_src`` is left empty. The caller
+        guarantees ``target`` is unoccupied.
+        """
+        data = self._get_sequence_data()
+        record = data["accounts"][num_src]
+        email = record.get("email", "")
+
+        # Relocating backups/session under a live session-mode claude would
+        # pull state out from under a running process.
+        self._ensure_no_live_session(num_src, email, "--move-account")
+
+        # Read backup material up front so a read failure aborts before any
+        # move. Missing material reads as "" (api-key or never-backed-up slot).
+        creds = self._read_account_credentials(num_src, email)
+        config = self._read_account_config(num_src, email)
+
+        # Move the session profile to the account's new slot key, best effort:
+        # a profile that cannot be moved is left behind rather than deleted, and
+        # setup_session re-bootstraps a missing one from the relocated backups.
+        src_dir = self._session_dir(num_src, email)
+        dst_dir = self._session_dir(target, email)
+        if src_dir.exists() and not dst_dir.exists():
+            try:
+                os.replace(src_dir, dst_dir)
+            except OSError as e:
+                self._logger.warning(f"Session profile move skipped during move: {e}")
+
+        # Write under the new key first, then clear the old one. The session
+        # profile is already relocated, so _delete_account_files finds nothing
+        # to prune there and only drops the stale (num_src, email) backups.
+        if creds:
+            self._write_account_credentials(target, email, creds)
+        if config:
+            self._write_account_config(target, email, config)
+        self._delete_account_files(num_src, email)
+
+        data["accounts"][target] = record
+        del data["accounts"][num_src]
+        int_src, int_target = int(num_src), int(target)
+        data["sequence"] = [
+            int_target if n == int_src else n for n in data.get("sequence", [])
+        ]
+        if data.get("activeAccountNumber") == int_src:
+            data["activeAccountNumber"] = int_target
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        self._logger.info(f"Moved slot: {num_src} ({email}) -> {target}")
+
     def slot_for_directory(self, directory: str | Path) -> tuple[str | None, str | None]:
         """Resolve a directory to its mapped account slot, for `cswap run`.
 

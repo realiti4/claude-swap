@@ -187,6 +187,7 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap swap 1 2                  # Exchange two accounts' slot numbers (list order)
+cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version
