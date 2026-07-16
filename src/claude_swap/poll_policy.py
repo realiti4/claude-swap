@@ -137,6 +137,75 @@ def parse_reset_ts(resets_at: str | None) -> float | None:
         return None
 
 
+def window_threshold(
+    label: str, threshold_5h: float, threshold_7d: float, base: float
+) -> float:
+    """The switch threshold for one window label.
+
+    5h/7d get their own per-window thresholds; any other (folded model)
+    window falls back to the account-wide ``base`` threshold.
+    """
+    if label == "5h":
+        return threshold_5h
+    if label == "7d":
+        return threshold_7d
+    return base
+
+
+def account_triggered(
+    usage: dict | None,
+    models: tuple[str, ...],
+    threshold_5h: float,
+    threshold_7d: float,
+    base: float,
+) -> bool:
+    """True if ANY relevant window is at/above its per-window threshold.
+
+    The OR'd per-window switch trigger: 5h>=threshold_5h OR 7d>=threshold_7d
+    OR any folded model window >= base. ``usage`` must be a decision-value
+    dict (unknown/sentinel usage yields no windows → not triggered; the
+    caller handles unknown-usage separately).
+    """
+    for label, pct, _ in oauth.relevant_windows(usage, models):
+        if pct >= window_threshold(label, threshold_5h, threshold_7d, base):
+            return True
+    return False
+
+
+def account_landing_ok(
+    usage: dict | None,
+    models: tuple[str, ...],
+    threshold_5h: float,
+    threshold_7d: float,
+    base: float,
+) -> bool:
+    """True if a candidate is a healthy landing: usage is known AND no
+    relevant window is at/above its threshold (so it won't re-trigger the
+    switch on the very next tick). Unknown usage (no windows) is never a
+    healthy landing.
+    """
+    if not oauth.relevant_windows(usage, models):
+        return False
+    return not account_triggered(
+        usage, models, threshold_5h, threshold_7d, base
+    )
+
+
+def soonest_7d_reset_ts(usage: dict | None, now: float) -> float | None:
+    """Future epoch when this account's 7-day window resets, or None.
+
+    The ordering key for the ``soonest-reset`` strategy — burn the account
+    whose weekly (7d) budget expires soonest first. A missing/past/unparseable
+    reset yields None (sorted last by the caller, never chosen preferentially).
+    """
+    for label, _, resets_at in oauth.relevant_windows(usage):
+        if label == "7d":
+            ts = parse_reset_ts(resets_at)
+            if ts is not None and ts > now:
+                return ts
+    return None
+
+
 def plan_after_fetch(
     *,
     prev_interval_s: float | None,

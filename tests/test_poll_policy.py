@@ -199,3 +199,79 @@ class TestBudgetInvariants:
         # (which absorbs any overshoot) is considered.
         polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
         assert polls < 27
+
+
+def _win(five_h: float, seven_d: float, seven_d_reset: str | None = None) -> dict:
+    """Usage dict with independent 5h and 7d windows."""
+    seven: dict = {"pct": seven_d}
+    if seven_d_reset:
+        seven["resets_at"] = seven_d_reset
+    return {"five_hour": {"pct": five_h}, "seven_day": seven}
+
+
+class TestWindowThreshold:
+    def test_per_window_labels(self):
+        assert poll_policy.window_threshold("5h", 95.0, 98.0, 90.0) == 95.0
+        assert poll_policy.window_threshold("7d", 95.0, 98.0, 90.0) == 98.0
+        # A folded model window falls back to the base threshold.
+        assert poll_policy.window_threshold("Fable", 95.0, 98.0, 90.0) == 90.0
+
+
+class TestAccountTriggered:
+    def test_five_hour_triggers_alone(self):
+        assert poll_policy.account_triggered(_win(95.0, 10.0), (), 95.0, 98.0, 90.0)
+
+    def test_seven_day_triggers_alone(self):
+        assert poll_policy.account_triggered(_win(10.0, 98.0), (), 95.0, 98.0, 90.0)
+
+    def test_both_below_does_not_trigger(self):
+        assert not poll_policy.account_triggered(_win(94.9, 97.9), (), 95.0, 98.0, 90.0)
+
+    def test_seven_day_between_base_and_its_threshold_does_not_trigger(self):
+        # 7d=96 would have crossed a single binding threshold of 90, but must
+        # NOT trigger under the per-window 7d threshold of 98 (the whole point
+        # of squeezing the precious weekly budget closer to the wall).
+        assert not poll_policy.account_triggered(_win(10.0, 96.0), (), 95.0, 98.0, 90.0)
+
+    def test_unknown_usage_not_triggered(self):
+        assert not poll_policy.account_triggered(None, (), 95.0, 98.0, 90.0)
+        assert not poll_policy.account_triggered("token-expired", (), 95.0, 98.0, 90.0)
+
+    def test_model_window_uses_base_threshold(self):
+        usage = {
+            "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 91.0}],
+        }
+        # Fable at 91 >= base 90 → triggered when the model is folded in.
+        assert poll_policy.account_triggered(usage, ("Fable",), 95.0, 98.0, 90.0)
+        # ...but not when no model is folded (only 5h/7d count).
+        assert not poll_policy.account_triggered(usage, (), 95.0, 98.0, 90.0)
+
+
+class TestAccountLandingOk:
+    def test_healthy_landing(self):
+        assert poll_policy.account_landing_ok(_win(50.0, 50.0), (), 95.0, 98.0, 90.0)
+
+    def test_at_threshold_is_not_a_healthy_landing(self):
+        assert not poll_policy.account_landing_ok(_win(10.0, 98.0), (), 95.0, 98.0, 90.0)
+
+    def test_unknown_usage_never_a_healthy_landing(self):
+        assert not poll_policy.account_landing_ok(None, (), 95.0, 98.0, 90.0)
+
+
+class TestSoonest7dReset:
+    def test_returns_future_seven_day_reset(self):
+        soon = datetime.fromtimestamp(NOW + 3600, tz=timezone.utc)
+        ts = poll_policy.soonest_7d_reset_ts(
+            _win(10.0, 10.0, soon.isoformat().replace("+00:00", "Z")), NOW
+        )
+        assert ts == pytest.approx(NOW + 3600)
+
+    def test_missing_reset_is_none(self):
+        assert poll_policy.soonest_7d_reset_ts(_win(10.0, 10.0), NOW) is None
+
+    def test_past_reset_is_ignored(self):
+        past = datetime.fromtimestamp(NOW - 3600, tz=timezone.utc)
+        assert poll_policy.soonest_7d_reset_ts(
+            _win(10.0, 10.0, past.isoformat().replace("+00:00", "Z")), NOW
+        ) is None

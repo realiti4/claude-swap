@@ -48,7 +48,10 @@ from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
+    account_landing_ok,
+    account_triggered,
     binding_pct,
+    soonest_7d_reset_ts,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -707,16 +710,24 @@ class AutoSwitchEngine:
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            active_value = usage.get(current)
+            # Per-window OR'd trigger: switch when 5h >= threshold_5h OR
+            # 7d >= threshold_7d (OR a folded model window >= threshold),
+            # rather than the single binding-window (max) threshold.
+            if not account_triggered(
+                active_value if isinstance(active_value, dict) else None,
+                self._models,
+                settings.threshold_5h,
+                settings.threshold_7d,
+                settings.threshold,
+            ):
                 self._emit(
                     NoSwitchEvent(
                         reason="below-threshold",
-                        # Both sides through pct_label: .0f utilization could
-                        # display an impossible "100% < 99.9%".
                         detail=(
-                            f"{pct_label(utilization)}% < "
-                            f"{pct_label(settings.threshold)}%"
+                            f"5h/7d below "
+                            f"{pct_label(settings.threshold_5h)}%/"
+                            f"{pct_label(settings.threshold_7d)}%"
                         ),
                     )
                 )
@@ -814,13 +825,39 @@ class AutoSwitchEngine:
                 # on the very next tick. At-limit and failover are escapes —
                 # any account with real headroom beats a blocked or dead one
                 # (and you can't flap back onto an account at 100%).
-                if (100.0 - h) >= settings.threshold:
-                    continue
+                cand_value = usage.get(num)
+                if not account_landing_ok(
+                    cand_value if isinstance(cand_value, dict) else None,
+                    self._models,
+                    settings.threshold_5h,
+                    settings.threshold_7d,
+                    settings.threshold,
+                ):
+                    continue  # at/over a per-window threshold — would re-trigger
                 if h - active_headroom < settings.hysteresis_pct:
                     continue  # not provably better than where we are
             qualifying.append((h, num))
-        # Best headroom first; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: -t[0])
+        if settings.strategy == "soonest-reset":
+            # Burn the most-perishable weekly budget first: order eligible
+            # accounts by soonest future 7d reset (ascending). Accounts with
+            # a readable future 7d reset come first, soonest first; any
+            # without one fall back after them, ordered by headroom. sort()
+            # is stable, so sequence order breaks any remaining ties.
+            now_ts = self.clock()
+
+            def _soonest_key(t: tuple[float, str]) -> tuple[int, float]:
+                h, num = t
+                cand_value = usage.get(num)
+                ts = soonest_7d_reset_ts(
+                    cand_value if isinstance(cand_value, dict) else None, now_ts
+                )
+                return (0, ts) if ts is not None else (1, -h)
+
+            qualifying.sort(key=_soonest_key)
+        else:
+            # "best": most binding-window headroom first; sequence order
+            # breaks ties.
+            qualifying.sort(key=lambda t: -t[0])
         ordered = [num for _, num in qualifying]
         if not ordered and api_key_candidates:
             # Last resort: metered API-key accounts (unmeasurable headroom).
@@ -1178,8 +1215,16 @@ class AutoSwitchEngine:
         """Session override from the TUI: retarget the trigger and poll
         cadence mid-run. Threshold only — the model axes (and their derived
         state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
-        self.settings = replace(self.settings, threshold=threshold)
+        and each tick snapshots ``self.settings`` once, so no locking. The
+        slider is a uniform "switch more/less eagerly" control, so it
+        retargets both per-window (5h/7d) triggers as well as the base
+        threshold (which still governs model windows + cadence escalation)."""
+        self.settings = replace(
+            self.settings,
+            threshold=threshold,
+            threshold_5h=threshold,
+            threshold_7d=threshold,
+        )
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:

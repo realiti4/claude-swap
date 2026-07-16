@@ -468,8 +468,9 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Uniform switch trigger for this run: retarget BOTH the 5h and "
+            "7d windows to this utilization (50-99.9). Omit to use the "
+            "per-window defaults (5h 95 / 7d 98)"
         ),
     )
     parser.add_argument(
@@ -550,7 +551,9 @@ Defaults live in settings.json in the backup root; flags override them.
         if not args.json:
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    "Auto-switch running: switch at 5h/7d "
+                    f"{settings.threshold_5h:.0f}%/{settings.threshold_7d:.0f}%, "
+                    f"strategy {settings.strategy}, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )

@@ -43,10 +43,26 @@ class AutoSwitchSettings:
     """
 
     threshold: float = 90.0
+    # Per-window switch triggers (OR'd): switch when 5h >= threshold_5h OR
+    # 7d >= threshold_7d (OR any folded model window >= threshold). The 7d
+    # window is the costly one (a week-long lockout), so it is squeezed
+    # closer to the wall (98) than the self-refilling 5h window (95). These
+    # supersede the single binding-window ``threshold`` for the 5h/7d
+    # trigger + landing checks; ``threshold`` still governs model windows
+    # and poll-cadence escalation. Keep the per-window values at or above
+    # ``threshold`` (the defaults 95/98 vs base 90 do): a per-window
+    # threshold set far *below* ``threshold`` can trigger before the
+    # candidate-refresh/urgent-poll escalation band opens, so a switch may
+    # run on a slightly stale candidate snapshot.
+    threshold_5h: float = 95.0
+    threshold_7d: float = 98.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # reserved for future strategies; only "best" in v1
+    # "best" = most binding-window headroom (stock). "soonest-reset" = among
+    # eligible accounts, the one whose 7-day window resets soonest (burn the
+    # most-perishable weekly budget first).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -92,7 +108,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Base threshold for folded model windows + poll-cadence "
+            "escalation (the 5h/7d trigger uses threshold5h/threshold7d)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold5h", "threshold_5h", "float", 50.0, 99.9,
+            help="Switch when the 5-hour window reaches this pct (OR'd with 7d)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold7d", "threshold_7d", "float", 50.0, 99.9,
+            help="Switch when the 7-day window reaches this pct (OR'd with 5h)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -107,8 +132,9 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="A target must beat the active account by this many pct",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice", choices=("best",),
-            help="How auto-switch picks the target account",
+            "autoswitch", "strategy", "strategy", "choice",
+            choices=("best", "soonest-reset"),
+            help="How auto-switch picks the target account (best | soonest-reset)",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -384,7 +410,6 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
     for attr, field in (
-        ("threshold", "threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
@@ -393,6 +418,15 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value
+    threshold = getattr(args, "threshold", None)
+    if threshold is not None:
+        # --threshold is a uniform "switch more/less eagerly" override for
+        # this run (mirroring the TUI slider): retarget both per-window
+        # (5h/7d) triggers as well as the base threshold, so the flag isn't
+        # silently inert against the per-window trigger it advertises.
+        overrides["threshold"] = threshold
+        overrides["threshold_5h"] = threshold
+        overrides["threshold_7d"] = threshold
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))

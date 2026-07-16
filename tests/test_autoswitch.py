@@ -68,6 +68,12 @@ class EngineHarness:
         self.switcher.platform = Platform.LINUX
         self.switcher._setup_directories()
         self.switcher._init_sequence_file()
+        # A test that sets a single ``threshold`` means it as the uniform
+        # switch point; mirror it onto the per-window 5h/7d thresholds unless
+        # the test sets those explicitly. Production defaults stay 95/98.
+        if "threshold" in settings_kwargs:
+            settings_kwargs.setdefault("threshold_5h", settings_kwargs["threshold"])
+            settings_kwargs.setdefault("threshold_7d", settings_kwargs["threshold"])
         self.settings = AutoSwitchSettings(**settings_kwargs)
         self.events: list = []
         self.clock = FakeClock()
@@ -378,9 +384,10 @@ class TestDecisionTable:
         assert harness.active_number() == 2
 
     def test_candidate_not_better_than_active_is_skipped(self, harness):
-        # Active 91% used (9 headroom); candidates worse or equal → exhausted.
+        # Active 96% 5h (triggers the 95 per-window threshold); candidates at
+        # or over a threshold → not valid landings → exhausted/blocked.
         outcome = harness.tick_with_usage({
-            "1": _usage(91), "2": _usage(95), "3": _usage(99),
+            "1": _usage(96), "2": _usage(95), "3": _usage(99),
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
@@ -1399,13 +1406,14 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["50% < 99.9%"]
+        assert details == ["5h/7d below 99.9%/99.9%"]
 
     def test_below_threshold_detail_never_shows_impossible_comparison(
         self, temp_home
     ):
-        # utilization 99.85 with threshold 99.9: .0f on the left side used
-        # to render the logically impossible "100% < 99.9%".
+        # The per-window "below X%/Y%" detail states the thresholds, not a
+        # left-side utilization, so it can never render the logically
+        # impossible "100% < 99.9%" the old single-threshold detail could.
         h = EngineHarness(temp_home, threshold=99.9)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
@@ -1414,7 +1422,7 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["99.85% < 99.9%"]
+        assert details == ["5h/7d below 99.9%/99.9%"]
 
 
 class TestTokenIdentity:
@@ -1876,3 +1884,102 @@ class TestModelAwareSwitch:
             "3": _model_usage(5, 10),
         })
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+
+def _win(five_h: float, seven_d: float, seven_d_reset: str | None = None) -> dict:
+    """Usage dict with independent 5h and 7d windows (7d may carry a reset)."""
+    seven: dict = {"pct": seven_d}
+    if seven_d_reset:
+        seven["resets_at"] = seven_d_reset
+    return {"five_hour": {"pct": five_h}, "seven_day": seven}
+
+
+def _iso(ts: float) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+class TestPerWindowTrigger:
+    """The OR'd per-window switch trigger: 5h>=95 OR 7d>=98."""
+
+    def test_seven_day_below_98_does_not_trigger(self, harness):
+        # 7d=96 would cross a single binding threshold (90) but must NOT
+        # trigger under the per-window 7d threshold (98).
+        outcome = harness.tick_with_usage({
+            "1": _win(10.0, 96.0), "2": _win(10.0, 10.0), "3": _win(10.0, 10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_seven_day_at_98_triggers_switch(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _win(10.0, 98.0), "2": _win(10.0, 10.0), "3": _win(10.0, 10.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() != 1
+
+    def test_five_hour_at_95_triggers_switch(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _win(95.0, 10.0), "2": _win(10.0, 10.0), "3": _win(10.0, 10.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() != 1
+
+    def test_candidate_at_seven_day_threshold_is_not_a_landing(self, harness):
+        # Active triggers on 5h; the only real-headroom candidate is at its
+        # 7d threshold (98) → not a valid landing → blocked, stay put.
+        outcome = harness.tick_with_usage({
+            "1": _win(96.0, 10.0), "2": _win(10.0, 98.0), "3": _win(10.0, 99.0),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+
+class TestSoonestResetStrategy:
+    """strategy=soonest-reset targets the soonest-resetting 7d window."""
+
+    def _seed3(self, temp_home, strategy):
+        h = EngineHarness(temp_home, strategy=strategy)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_picks_soonest_resetting_over_most_headroom(self, temp_home):
+        h = self._seed3(temp_home, "soonest-reset")
+        soon = _iso(1_000_000 + 7200)    # 2h
+        later = _iso(1_000_000 + 36000)  # 10h
+        outcome = h.tick_with_usage({
+            "1": _win(96.0, 10.0),               # active triggers on 5h
+            "2": _win(10.0, 10.0, later),        # MOST headroom, resets later
+            "3": _win(10.0, 50.0, soon),         # less headroom, resets SOONEST
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # soonest-reset, not most-headroom "2"
+
+    def test_best_strategy_picks_most_headroom(self, temp_home):
+        h = self._seed3(temp_home, "best")
+        soon = _iso(1_000_000 + 7200)
+        later = _iso(1_000_000 + 36000)
+        outcome = h.tick_with_usage({
+            "1": _win(96.0, 10.0),
+            "2": _win(10.0, 10.0, later),        # most headroom
+            "3": _win(10.0, 50.0, soon),         # soonest reset
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2  # most headroom, ignores reset timing
+
+    def test_missing_reset_falls_back_after_known(self, temp_home):
+        h = self._seed3(temp_home, "soonest-reset")
+        soon = _iso(1_000_000 + 7200)
+        # "2" has a known soon reset; "3" has no 7d reset → "2" chosen.
+        outcome = h.tick_with_usage({
+            "1": _win(96.0, 10.0),
+            "2": _win(10.0, 40.0, soon),
+            "3": _win(10.0, 10.0),               # no reset → after known
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2

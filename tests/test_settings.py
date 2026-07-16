@@ -217,6 +217,21 @@ class TestMergedWithCli:
         assert merged.interval_seconds == 30.0
         assert merged.cooldown_seconds == 10.0  # untouched
 
+    def test_threshold_flag_mirrors_onto_per_window_triggers(self):
+        # --threshold is a uniform override: it must retarget both the 5h and
+        # 7d per-window triggers, not just the base threshold — otherwise the
+        # flag is silently inert against the trigger it advertises.
+        base = AutoSwitchSettings()  # per-window defaults 95/98
+        merged = merged_with_cli(base, _args(threshold=70.0))
+        assert merged.threshold == 70.0
+        assert merged.threshold_5h == 70.0
+        assert merged.threshold_7d == 70.0
+
+    def test_no_threshold_flag_leaves_per_window_defaults(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(interval=30.0))
+        assert merged.threshold_5h == 95.0
+        assert merged.threshold_7d == 98.0
+
     def test_cli_values_are_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(interval=1.0))
         assert merged.interval_seconds == 15.0
