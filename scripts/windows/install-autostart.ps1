@@ -31,12 +31,19 @@ if (-not $cswap) {
 }
 
 $notifyFlag = if ($NoNotify) { " --no-notify" } else { "" }
-$command = "cswap auto$notifyFlag"
+$logPath = Join-Path $env:USERPROFILE ".claude-swap-backup\autostart-task.log"
+$command = "cswap auto$notifyFlag *>> '$logPath'"
 $argument = "-NoLogo -NoProfile -WindowStyle Hidden -Command `"$command`""
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+# S4U (not Interactive): Interactive-logon tasks run inside the user's actual
+# session and Task Scheduler tears them down on lock/disconnect/fast-switch -
+# that's what killed this task last time (exit 3221225786 = CTRL_BREAK, no
+# crash in the app log). S4U runs under the same user's security context
+# without depending on that session staying active, and needs no stored
+# password.
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -RestartCount 3 `
