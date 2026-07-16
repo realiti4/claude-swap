@@ -410,6 +410,32 @@ class ClaudeAccountSwitcher:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
+    @staticmethod
+    def _credentials_for_activation(
+        target_credentials: str, live_credentials: str | None
+    ) -> str:
+        """Use the target Claude login without restoring stale shared OAuth state."""
+        if looks_like_api_key(target_credentials):
+            return target_credentials
+
+        try:
+            target = json.loads(target_credentials)
+        except (json.JSONDecodeError, TypeError):
+            return target_credentials
+        if not isinstance(target, dict) or "claudeAiOauth" not in target:
+            return target_credentials
+
+        try:
+            live = json.loads(live_credentials) if live_credentials else {}
+        except (json.JSONDecodeError, TypeError):
+            live = {}
+        if not isinstance(live, dict):
+            live = {}
+
+        live.pop("claudeAiOauth", None)
+        live["claudeAiOauth"] = target["claudeAiOauth"]
+        return json.dumps(live)
+
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()
 
@@ -4016,18 +4042,18 @@ class ClaudeAccountSwitcher:
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # Snapshot live state so a mid-operation failure can be undone.
-                # When a live session exists, fail fast if the snapshot is
-                # unreadable rather than proceeding to overwrite without a
-                # safety net. The fresh-machine case has nothing to restore.
-                rollback_creds: str | None = None
+                # Read live state even without a Claude identity: the credential
+                # object may still contain MCP OAuth tokens that must survive the
+                # activation and be restored if a later step fails.
+                active_creds = self._read_active_credentials()
+                live_creds = active_creds.value
+                if live_creds is None or active_creds.keychain_unavailable:
+                    raise CredentialReadError(
+                        "Cannot snapshot live credentials before activation"
+                    )
+                rollback_creds = live_creds or None
                 rollback_config_text: str | None = None
                 if current_identity is not None:
-                    rollback_creds = self._read_credentials()
-                    if rollback_creds is None:
-                        raise CredentialReadError(
-                            "Cannot snapshot live credentials before activation"
-                        )
                     if config_path.exists():
                         try:
                             rollback_config_text = config_path.read_text(
@@ -4077,7 +4103,9 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(target_creds)
+                    self._write_credentials(
+                        self._credentials_for_activation(target_creds, live_creds)
+                    )
                     creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
@@ -4294,7 +4322,9 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(target_creds)
+                self._write_credentials(
+                    self._credentials_for_activation(target_creds, original_creds)
+                )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 
