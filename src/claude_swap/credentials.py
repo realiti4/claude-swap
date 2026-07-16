@@ -1,6 +1,7 @@
 """Credential storage layer for claude-swap.
 
-Owns *where* credentials live and *how* they are read/written — the macOS
+Owns *where* credentials live and *how* they are read/written — the active
+credential, per-account backups, account-independent shared OAuth state, macOS
 Keychain-vs-file routing, per-process capability detection and sticky fallback,
 and the ``.enc``-wins backup reconciliation that landed in #66. Split out of
 ``switcher.py`` so the switcher reads as account orchestration again.
@@ -40,6 +41,12 @@ from claude_swap.paths import (
 # CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
 # new security items coexist during migration (safe write → verify → delete).
 SECURITY_SERVICE = "claude-swap"
+
+# Account-independent siblings of ``claudeAiOauth`` live under this separate
+# backup identity. Keeping them outside every account slot lets them survive
+# auth-axis changes (notably OAuth → managed API key → OAuth) without making a
+# stale destination-slot snapshot authoritative again.
+SHARED_CREDENTIALS_USERNAME = "shared-oauth"
 
 # Service name of Claude Code's *active* OAuth credential in the macOS Keychain
 # (read by Claude Code itself; we read/write it when switching accounts).
@@ -99,6 +106,53 @@ def looks_like_api_key(credentials: str | None) -> bool:
     return text.startswith("sk-ant-api") and not text.startswith("{")
 
 
+def _credential_object(credentials: str | None) -> dict | None:
+    """Parse a JSON credential object, excluding managed API keys."""
+    if not credentials or looks_like_api_key(credentials):
+        return None
+    try:
+        data = json.loads(credentials)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def has_claude_oauth(credentials: str | None) -> bool:
+    """Whether credentials contain the slot-owned Claude OAuth field."""
+    data = _credential_object(credentials)
+    return data is not None and "claudeAiOauth" in data
+
+
+def shared_credential_fields(credentials: str | None) -> dict | None:
+    """Return account-independent fields from a Claude OAuth credential object.
+
+    ``None`` means the input is not a JSON credential object (missing, malformed,
+    or a managed API key). A dictionary — including ``{}`` — is authoritative:
+    every sibling of ``claudeAiOauth`` belongs to the shared store.
+    """
+    data = _credential_object(credentials)
+    if data is None:
+        return None
+    return {
+        key: value
+        for key, value in data.items()
+        if key != "claudeAiOauth"
+    }
+
+
+def merge_shared_credential_fields(
+    target_credentials: str, shared_fields: dict
+) -> str:
+    """Compose a target Claude login with independently-owned shared fields."""
+    target = _credential_object(target_credentials)
+    if target is None or "claudeAiOauth" not in target:
+        return target_credentials
+
+    composed = dict(shared_fields)
+    composed["claudeAiOauth"] = target["claudeAiOauth"]
+    return json.dumps(composed)
+
+
 def approved_form(api_key: str) -> str:
     """The value Claude Code stores in ``customApiKeyResponses.approved``.
 
@@ -123,7 +177,7 @@ class _StoreHost(Protocol):
 
 
 class CredentialStore:
-    """Owns the active and per-account backup credential stores.
+    """Owns the active, per-account, and shared credential stores.
 
     One store per switcher: the capability cache is per-process, learned from real
     ``security`` calls, and a fresh process re-evaluates from scratch.
@@ -634,6 +688,111 @@ class CredentialStore:
         regardless (see ``_read_account_credentials``).
         """
         return not self._use_keychain()
+
+    # -- account-independent shared credential backup ----------------------
+    #
+    # Claude Code stores its account login and shared OAuth integrations in one
+    # active blob. The account login is slot-owned; every sibling field is not.
+    # This store keeps those siblings alive while the active OAuth blob is absent
+    # (for example, while a managed API key is active). It follows the same
+    # Keychain-with-.enc-fallback policy as account backups.
+
+    def _shared_credentials_path(self) -> Path:
+        return self._host.credentials_dir / ".shared-oauth.enc"
+
+    def _read_shared_credentials(self) -> str | None:
+        """Read shared credential fields.
+
+        Returns their JSON object string, ``""`` when no independent snapshot has
+        been initialized, or ``None`` when a present snapshot/backend could not be
+        read safely. The distinction prevents an unavailable Keychain or corrupt
+        fallback file from being mistaken for an empty shared state.
+        """
+        enc_file = self._shared_credentials_path()
+        file_failed = False
+        if enc_file.exists():
+            try:
+                encoded = enc_file.read_text(encoding="utf-8").strip()
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except Exception as e:
+                self._host._logger.warning(
+                    f"Failed to read shared credentials file: {e}"
+                )
+                file_failed = True
+            else:
+                if decoded:
+                    return decoded
+                file_failed = True
+
+        if self._host.platform == Platform.MACOS:
+            if not self._use_keychain():
+                return None
+            try:
+                credentials = self._kc_call(
+                    macos_keychain.get_password,
+                    SECURITY_SERVICE,
+                    SHARED_CREDENTIALS_USERNAME,
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                self._host._logger.warning(
+                    f"Failed to read shared credentials from Keychain: {e}"
+                )
+                return None
+            if credentials:
+                return credentials
+
+        return None if file_failed else ""
+
+    def _write_shared_credentials(self, credentials: str) -> None:
+        """Persist shared credential fields independently of account slots."""
+        if self._use_keychain():
+            try:
+                self._kc_call(
+                    macos_keychain.set_password,
+                    SECURITY_SERVICE,
+                    SHARED_CREDENTIALS_USERNAME,
+                    credentials,
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                self._host._logger.warning(
+                    f"Shared-credential Keychain write failed, "
+                    f"falling back to file: {e}"
+                )
+            else:
+                self._reconcile_shared_file_after_keychain_write(credentials)
+                return
+
+        try:
+            self._atomic_b64_write(self._shared_credentials_path(), credentials)
+        except Exception as e:
+            self._host._logger.warning(
+                f"Failed to write shared credentials file: {e}"
+            )
+            raise
+        if self._host.platform == Platform.MACOS:
+            try:
+                macos_keychain.delete_password(
+                    SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME
+                )
+            except Exception:
+                pass
+
+    def _reconcile_shared_file_after_keychain_write(
+        self, credentials: str
+    ) -> None:
+        """Stop a fallback file from shadowing a fresh shared Keychain value."""
+        enc_file = self._shared_credentials_path()
+        if not enc_file.exists():
+            return
+        try:
+            enc_file.unlink()
+            return
+        except Exception as e:
+            self._host._logger.warning(
+                f"Could not delete shared .enc after Keychain write ({e}); "
+                "rewriting it with the fresh credentials"
+            )
+        self._atomic_b64_write(enc_file, credentials)
 
     # -- backup credential backends ---------------------------------------
     #
