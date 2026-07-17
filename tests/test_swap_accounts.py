@@ -264,6 +264,8 @@ class TestSwapAccounts:
         """chmod runs on the temp file, making the rename the final commit —
         a chmod failure must abort *without* publishing, otherwise callers
         would roll files back around already-committed metadata."""
+        if sys.platform == "win32":
+            pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         before = switcher.sequence_file.read_text(encoding="utf-8")

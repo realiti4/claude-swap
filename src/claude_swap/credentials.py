@@ -753,7 +753,17 @@ class CredentialStore:
         Linux/WSL/Windows read the ``.enc`` only.
         """
         enc_file = self._backup_enc_path(account_num, email)
-        if enc_file.exists():
+        try:
+            # Python 3.12's Path.exists() raises on an unsearchable directory
+            # where 3.13+ returns False — normalize to "missing" so every
+            # version takes the same best-effort path. Failing closed on
+            # unreadable stores is the strict pre-commit clear's job, not the
+            # reader's.
+            enc_present = enc_file.exists()
+        except OSError as e:
+            self._host._logger.warning(f"Failed to read credentials file: {e}")
+            enc_present = False
+        if enc_present:
             try:
                 encoded = enc_file.read_text(encoding="utf-8").strip()
                 # validate=True: reject non-alphabet junk (e.g. "!!!!") instead of
