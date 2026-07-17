@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
-from claude_swap.exceptions import CredentialWriteError
+from claude_swap.exceptions import CredentialError, CredentialWriteError
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -836,20 +836,75 @@ class CredentialStore:
                     enc_file.unlink()
             except Exception as e:
                 self._host._logger.warning(f"Failed to delete credentials file: {e}")
-            prev_file = self._prev_backup_path(num, email)
-            try:
-                if prev_file.exists():
-                    prev_file.unlink()
-            except Exception as e:
-                self._host._logger.warning(f"Failed to delete .prev file: {e}")
             if self._host.platform == Platform.MACOS:
                 self._delete_backup_keychain_quiet(num, email)
-                try:
-                    self._kc_delete_backup_prev(num, email)
-                except Exception as e:
-                    self._host._logger.warning(
-                        f"Failed to delete .prev from Keychain: {e}"
-                    )
+            self.delete_previous_backup(num, email)
+
+    def delete_account_credentials_strict(
+        self, account_num: str, email: str
+    ) -> None:
+        """Clear a slot key, failing closed: raise unless emptiness is assured.
+
+        For transactional pre-commit clears (the swap/move write-or-clear
+        step and rollback restoration): a destination that must be empty but
+        may still serve material is exactly the wrong-credential state the
+        transaction exists to prevent, so backend failures must abort the
+        commit rather than be logged away. A read-back alone cannot provide
+        this: the normal reader converts Keychain errors to ``""``, which
+        conflates "absent" with "unreadable" — a locked Keychain holding a
+        stale item would pass verification and resurface on unlock. So the
+        served backends are deleted with errors propagating; absence itself
+        counts as success on both (missing ``.enc``; Keychain rc 44). The
+        Keychain delete runs even when routing says file mode, for the same
+        reason. Legacy-alias and ``.prev`` sweeps stay best-effort — reads
+        never serve them. The best-effort variant remains right for
+        post-commit cleanup, where a failure only leaks an unreferenced file.
+        """
+        # Best-effort sweep first: same cruft cleanup (legacy alias, .prev,
+        # quiet Keychain) a normal delete performs.
+        self._delete_account_credentials(account_num, email)
+        # Then assure the served key really is gone, propagating failures.
+        # Unconditional unlink: exists() returns False on an inaccessible
+        # directory, which would fail open here — missing is fine
+        # (missing_ok), permission/I/O errors must abort the commit.
+        try:
+            self._backup_enc_path(account_num, email).unlink(missing_ok=True)
+            if self._host.platform == Platform.MACOS:
+                self._kc_delete_backup(account_num, email)
+        except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
+            raise CredentialError(
+                f"Could not clear stored credentials for slot {account_num} "
+                f"({email}) — aborting before commit: {e}"
+            ) from e
+        # Final belt: catches any backend view the deletes above missed.
+        if self._read_account_credentials(account_num, email):
+            raise CredentialError(
+                f"Could not clear stored credentials for slot {account_num} "
+                f"({email}) — aborting before commit"
+            )
+
+    def delete_previous_backup(self, account_num: str, email: str) -> None:
+        """Drop a slot key's retained ``.prev`` generation (both backends).
+
+        Best-effort, like retention itself. Called from full-key deletion,
+        and on its own when a key's history stops belonging to its account —
+        a renumber (swap/move) writes another account's material through the
+        key, and recovery must never resurrect the displaced generation onto
+        the key's new owner.
+        """
+        prev_file = self._prev_backup_path(account_num, email)
+        try:
+            if prev_file.exists():
+                prev_file.unlink()
+        except Exception as e:
+            self._host._logger.warning(f"Failed to delete .prev file: {e}")
+        if self._host.platform == Platform.MACOS:
+            try:
+                self._kc_delete_backup_prev(account_num, email)
+            except Exception as e:
+                self._host._logger.warning(
+                    f"Failed to delete .prev from Keychain: {e}"
+                )
 
     # -- previous-generation retention -------------------------------------
     #

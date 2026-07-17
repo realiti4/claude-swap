@@ -356,10 +356,13 @@ class ClaudeAccountSwitcher:
             temp_path.unlink()
             raise ConfigError("Generated invalid JSON")
 
-        # Move to final location
-        shutil.move(str(temp_path), str(path))
+        # Permissions go on the temp file so the rename below is the final,
+        # atomic commit: nothing can fail after the file is published (a
+        # chmod on the final path could raise with the write already live,
+        # making callers roll back around committed metadata).
         if sys.platform != "win32":
-            os.chmod(path, 0o600)
+            os.chmod(temp_path, 0o600)
+        shutil.move(str(temp_path), str(path))
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -465,6 +468,10 @@ class ClaudeAccountSwitcher:
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
+
+    def _delete_account_credentials_strict(self, account_num: str, email: str) -> None:
+        """Pre-commit clear that raises when the key still reads non-empty."""
+        self._store.delete_account_credentials_strict(account_num, email)
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
@@ -642,9 +649,10 @@ class ClaudeAccountSwitcher:
 
         Everything keyed by the slot number moves with the swap: the
         sequence records (including aliases, which belong to the account),
-        the per-slot credential and config backups, the rotation order in
-        ``sequence``, ``activeAccountNumber``, and each slot's session
-        profile directory (history preserved). Directory mappings key on
+        the per-slot credential and config backups, membership in
+        ``sequence`` (kept sorted, so rotation and ``cswap list`` order
+        follow the new numbers), ``activeAccountNumber``, and each slot's
+        session profile directory (history preserved). Directory mappings key on
         (email, org) and are unaffected. Usage-cache rows key on the slot
         number but carry the account identity, so a swapped row fails the
         identity check and self-heals on the next poll. Auto-switch
@@ -653,11 +661,32 @@ class ClaudeAccountSwitcher:
         email/fingerprint check and is released, and a dead account under
         its new number is re-caught by freshen-before-activate.
 
+        The whole resolve-validate-mutate span runs under the account lock
+        (like switch and the usage-refresh persist). The ``sequence.json``
+        write is the commit point: a failure before it rolls both slots back
+        (via durable staged copies when the backup keys overlap), and after
+        it only best-effort cleanup of stale keys remains.
+
         Returns the two resolved slot numbers ``(first_num, second_num)``.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
+        # Local I/O only from here on, so the account lock can span the whole
+        # resolve-validate-mutate sequence — a concurrent switch or usage-
+        # refresh persist (which take the same lock) can never interleave
+        # with the relocation.
+        with FileLock(self.lock_file):
+            return self._swap_accounts_locked(first, second)
+
+    def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
+        """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
+
+        Split out so ``move_account`` can resolve identifiers and dispatch
+        inside one lock acquisition (FileLock is non-reentrant): a slot
+        number resolved outside the lock could be renumbered by a concurrent
+        swap/move and target the wrong account.
+        """
         self._get_sequence_data_migrated()
 
         num_a = self._resolve_account_identifier(first)
@@ -669,9 +698,9 @@ class ClaudeAccountSwitcher:
         if num_a == num_b:
             raise ValidationError("Cannot swap an account with itself")
 
-        data = self._get_sequence_data()
-        record_a = (data or {}).get("accounts", {}).get(num_a)
-        record_b = (data or {}).get("accounts", {}).get(num_b)
+        data = self._get_sequence_data() or {}
+        record_a = data.get("accounts", {}).get(num_a)
+        record_b = data.get("accounts", {}).get(num_b)
         if not record_a:
             raise AccountNotFoundError(f"Account-{num_a} does not exist")
         if not record_b:
@@ -694,44 +723,179 @@ class ClaudeAccountSwitcher:
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
-        # Move each session profile to its owner's new slot key. When both
-        # accounts share an email the two paths swap directly, so stage the
-        # first through a temporary name.
-        self._swap_session_dirs(num_a, email_a, num_b, email_b)
+        staging: dict[str, Path] = {}
+        try:
+            if email_a == email_b:
+                # Same email: the two slots' backup keys fully overlap, so
+                # every write below overwrites the other account's material.
+                # Park durable copies first — a failure mid-write can then
+                # never leave a credential existing only in this process's
+                # memory. (Staging fails -> abort before anything changed.)
+                staging = self._stage_overlap_material(
+                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+                )
 
-        # Write under the new keys, then clear the old ones. When the emails
-        # match, the "old" keys are exactly the keys just written, so there
-        # is nothing stale to delete.
-        if creds_a:
-            self._write_account_credentials(num_b, email_a, creds_a)
-        if config_a:
-            self._write_account_config(num_b, email_a, config_a)
-        if creds_b:
-            self._write_account_credentials(num_a, email_b, creds_b)
-        if config_b:
-            self._write_account_config(num_a, email_b, config_b)
+            # Move each session profile to its owner's new slot key. When both
+            # accounts share an email the two paths swap directly, so stage the
+            # first through a temporary name.
+            self._swap_session_dirs(num_a, email_a, num_b, email_b)
+
+            # Set each destination key to its owner's exact state: write
+            # material that exists, actively clear what doesn't. An empty
+            # source must never leave the destination serving leftover
+            # material — the other account's (same-email overlap, where no
+            # separate old-key cleanup runs) or a stale file leaked by an
+            # earlier crash. The old keys are cleared only after the commit
+            # below, so the records never point at missing material.
+            if creds_a:
+                self._write_account_credentials(num_b, email_a, creds_a)
+            else:
+                self._delete_account_credentials_strict(num_b, email_a)
+            if config_a:
+                self._write_account_config(num_b, email_a, config_a)
+            else:
+                self._delete_config_backup(num_b, email_a)
+            if creds_b:
+                self._write_account_credentials(num_a, email_b, creds_b)
+            else:
+                self._delete_account_credentials_strict(num_a, email_b)
+            if config_b:
+                self._write_account_config(num_a, email_b, config_b)
+            else:
+                self._delete_config_backup(num_a, email_b)
+
+            data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
+            int_a, int_b = int(num_a), int(num_b)
+            # Renumber, then sort: sequence is kept sorted everywhere (add
+            # sorts on insert), so rotation and list order follow the new
+            # slot numbers instead of preserving the old visual positions.
+            data["sequence"] = [
+                int_b if n == int_a else int_a if n == int_b else n
+                for n in data.get("sequence", [])
+            ]
+            data["sequence"].sort()
+            active = data.get("activeAccountNumber")
+            if active == int_a:
+                data["activeAccountNumber"] = int_b
+            elif active == int_b:
+                data["activeAccountNumber"] = int_a
+            data["lastUpdated"] = get_timestamp()
+            # The commit point: _write_json's rename publishes the swap.
+            self._write_json(self.sequence_file, data)
+        except BaseException:
+            self._rollback_swap(
+                num_a, email_a, creds_a, config_a,
+                num_b, email_b, creds_b, config_b,
+                staging,
+            )
+            raise
+
+        # Post-commit cleanup, all best-effort: the records already reference
+        # the new keys only. A failure here leaks a stale file, never a wrong
+        # read — logged loudly because a stale key under a freed slot would
+        # poison a future same-email account landing on that number.
         if email_a != email_b:
-            self._delete_account_files(num_a, email_a)
-            self._delete_account_files(num_b, email_b)
-
-        data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
-        int_a, int_b = int(num_a), int(num_b)
-        data["sequence"] = [
-            int_b if n == int_a else int_a if n == int_b else n
-            for n in data.get("sequence", [])
-        ]
-        active = data.get("activeAccountNumber")
-        if active == int_a:
-            data["activeAccountNumber"] = int_b
-        elif active == int_b:
-            data["activeAccountNumber"] = int_a
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            for num, email in ((num_a, email_a), (num_b, email_b)):
+                try:
+                    self._delete_account_files(num, email)
+                except Exception as e:
+                    self._logger.error(
+                        f"Stale backup left under old key {num} ({email}): {e}"
+                    )
+        # The .prev generations retained while writing the destination keys
+        # hold the displaced material — another account's credential (or a
+        # stale one) that recovery must never resurrect onto the key's new
+        # owner. Cleared destinations already dropped theirs.
+        if creds_a:
+            self._store.delete_previous_backup(num_b, email_a)
+        if creds_b:
+            self._store.delete_previous_backup(num_a, email_b)
+        self._discard_staging(staging)
 
         self._logger.info(
             f"Swapped slots: {num_a} ({email_a}) <-> {num_b} ({email_b})"
         )
         return num_a, num_b
+
+    def _delete_config_backup(self, account_num: str, email: str) -> None:
+        """Delete one slot key's config backup file, if present.
+
+        Unconditional unlink: ``exists()`` returns False on an inaccessible
+        directory, which would fail open in the required-clear paths.
+        Missing is fine (``missing_ok``); permission/I/O errors propagate —
+        every caller either needs the abort (write-or-clear) or already
+        wraps and counts the failure (rollback, stray cleanup).
+        """
+        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        config_file.unlink(missing_ok=True)
+
+    def _discard_staging(self, staging: dict[str, Path]) -> None:
+        """Remove staged pre-swap copies, telling the user about survivors.
+
+        A staging file that cannot be removed holds plaintext credentials, so
+        a silent leak is not acceptable — and a leftover also blocks the next
+        same-email swap (staging refuses to overwrite existing files).
+        """
+        for path in staging.values():
+            try:
+                path.unlink()
+            except OSError as e:
+                self._logger.error(f"Could not remove swap staging copy: {e}")
+                warning(
+                    f"Could not remove swap staging file {path} — it holds "
+                    f"pre-swap credentials; please delete it manually."
+                )
+
+    def _stage_overlap_material(
+        self, material: dict[str, tuple[str, str]]
+    ) -> dict[str, Path]:
+        """Park slots' backup material in temp files before overlapping writes.
+
+        Used by same-email swaps, where each slot's write destroys the other
+        slot's stored material. File-based on every platform — durability
+        across a process death is the point, so the files (0600 from
+        creation, in the credentials directory, normally alive for
+        milliseconds) are created with ``O_EXCL`` and never overwrite an
+        existing staging file: a leftover from an interrupted swap may be
+        the only surviving copy of a credential, so the swap refuses and
+        points at it instead of retrying over it. A failure *here* aborts
+        the swap before anything has been overwritten.
+
+        Deliberately NOT built: a manifest-based auto-recovery (a leftover
+        cannot cheaply be told apart from post-commit cleanup residue, and
+        restoring credentials on a wrong guess is worse than stopping), and
+        Keychain-backed staging on macOS (the Keychain is the very backend
+        whose mid-write failures this protects against).
+        """
+        staged: dict[str, Path] = {}
+        try:
+            for num, (creds, config) in material.items():
+                for kind, content in (("creds", creds), ("config", config)):
+                    if not content:
+                        continue
+                    path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
+                    if path.exists():
+                        raise ConfigError(
+                            f"Found leftover staging from an interrupted swap: "
+                            f"{path}. It holds that slot's pre-swap credentials "
+                            f"and may be the only surviving copy. Verify both "
+                            f"accounts still work (`cswap list`), then delete "
+                            f"the file and retry."
+                        )
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                    staged[f"{kind}-{num}"] = path
+        except ConfigError:
+            # Leftover found: remove only what THIS call created.
+            self._discard_staging(staged)
+            raise
+        except OSError as e:
+            self._discard_staging(staged)
+            raise ConfigError(
+                f"Could not stage swap material, nothing was changed: {e}"
+            )
+        return staged
 
     def _swap_session_dirs(
         self, num_a: str, email_a: str, num_b: str, email_b: str
@@ -770,6 +934,100 @@ class ClaudeAccountSwitcher:
                 except OSError:
                     pass
 
+    def _rollback_swap(
+        self,
+        num_a: str,
+        email_a: str,
+        creds_a: str,
+        config_a: str,
+        num_b: str,
+        email_b: str,
+        creds_b: str,
+        config_b: str,
+        staging: dict[str, "Path"],
+    ) -> None:
+        """Best-effort restore of both slots after a failed swap mutation.
+
+        Runs only before the metadata commit, so restoring means putting the
+        *old* keys back. Matters most when the two accounts share an email:
+        their backup keys fully overlap, so a half-written swap has already
+        overwritten one account's material — and a key whose original was
+        empty must go back to empty rather than keep the other account's
+        credential. Every step is attempted independently; if any fails, the
+        staged pre-swap copies are kept on disk for manual recovery instead
+        of being deleted.
+        """
+        self._logger.error(
+            f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
+        )
+        failures = 0
+        # Undo the session-profile exchange (same staging trick, reversed).
+        self._swap_session_dirs(num_b, email_a, num_a, email_b)
+        overlap = email_a == email_b
+        for kind, num, email, original in (
+            ("creds", num_a, email_a, creds_a),
+            ("config", num_a, email_a, config_a),
+            ("creds", num_b, email_b, creds_b),
+            ("config", num_b, email_b, config_b),
+        ):
+            try:
+                if original:
+                    if kind == "creds":
+                        self._write_account_credentials(num, email, original)
+                    else:
+                        self._write_account_config(num, email, original)
+                elif overlap:
+                    # The overlapping key may now hold the *other* account's
+                    # material — an originally-empty slot must read empty
+                    # again, not serve someone else's credential. Strict: a
+                    # suppressed failure here must count as a failure, so
+                    # the staged copies are kept and reported.
+                    if kind == "creds":
+                        self._delete_account_credentials_strict(num, email)
+                    else:
+                        self._delete_config_backup(num, email)
+            except Exception as e:
+                failures += 1
+                self._logger.error(
+                    f"Rollback {kind} restore failed for slot {num}: {e}"
+                )
+        if email_a != email_b:
+            # Drop half-written copies under the new keys; the records still
+            # point at the old slots. (When the emails match, the "new" keys
+            # are the keys just restored — nothing stale exists.)
+            for num, email in ((num_b, email_a), (num_a, email_b)):
+                try:
+                    self._delete_account_credentials(num, email)
+                    self._delete_config_backup(num, email)
+                except Exception as e:
+                    failures += 1
+                    self._logger.error(f"Rollback cleanup failed for slot {num}: {e}")
+        if not failures:
+            # The restore writes above pushed the half-written material into
+            # the keys' retained .prev generations; both keys now hold their
+            # exact originals, so those generations are pure contamination.
+            # (On a partial rollback everything is left in place — maximum
+            # material preserved for manual recovery.)
+            for num, email, original in (
+                (num_a, email_a, creds_a),
+                (num_b, email_b, creds_b),
+            ):
+                if original:
+                    self._store.delete_previous_backup(num, email)
+        if staging:
+            if failures:
+                kept = ", ".join(str(p) for p in staging.values())
+                self._logger.error(
+                    f"Rollback incomplete — staged pre-swap copies kept for "
+                    f"manual recovery: {kept}"
+                )
+                warning(
+                    f"Swap rollback was incomplete; your pre-swap credentials "
+                    f"are preserved in: {kept}"
+                )
+            else:
+                self._discard_staging(staging)
+
     def move_account(self, account: str, target: str) -> tuple[str, str, bool]:
         """Assign ``account`` to slot number ``target`` (the general form of swap).
 
@@ -795,8 +1053,6 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        self._get_sequence_data_migrated()
-
         target = target.strip()
         if not target.isdigit() or int(target) < 1:
             raise ValidationError(
@@ -805,50 +1061,69 @@ class ClaudeAccountSwitcher:
             )
         target = str(int(target))  # normalize "01" -> "1"
 
-        num_src = self._resolve_account_identifier(account)
-        if not num_src:
-            raise AccountNotFoundError(f"No account found with identifier: {account}")
+        # Resolution and dispatch happen inside the same lock acquisition as
+        # the mutation (via the *_locked helpers — FileLock is non-reentrant):
+        # a slot number resolved outside the lock could be renumbered by a
+        # concurrent swap/move and end up moving the wrong account.
+        with FileLock(self.lock_file):
+            self._get_sequence_data_migrated()
 
-        data = self._get_sequence_data()
-        if not (data or {}).get("accounts", {}).get(num_src):
-            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+            num_src = self._resolve_account_identifier(account)
+            if not num_src:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {account}"
+                )
 
-        # `add` numbers new accounts from the highest slot, so a stray huge
-        # target would inflate every future account number.
-        max_slot = max(
-            (int(n) for n in data.get("accounts", {}) if n.isdigit()), default=0
-        )
-        cap = max(99, max_slot)
-        if int(target) > cap:
-            raise ValidationError(
-                f"Target slot {target} is out of range (1-{cap}): new accounts "
-                f"are numbered from the highest slot, so a large target would "
-                f"inflate future account numbers"
+            data = self._get_sequence_data() or {}
+            if not data.get("accounts", {}).get(num_src):
+                raise AccountNotFoundError(f"Account-{num_src} does not exist")
+
+            # `add` numbers new accounts from the highest slot, so a stray huge
+            # target would inflate every future account number.
+            max_slot = max(
+                (int(n) for n in data.get("accounts", {}) if n.isdigit()), default=0
             )
+            cap = max(99, max_slot)
+            if int(target) > cap:
+                raise ValidationError(
+                    f"Target slot {target} is out of range (1-{cap}): new accounts "
+                    f"are numbered from the highest slot, so a large target would "
+                    f"inflate future account numbers"
+                )
 
-        if num_src == target:
+            if num_src == target:
+                return num_src, target, False
+
+            if data.get("accounts", {}).get(target):
+                # Occupied target: trade places, exactly `swap num_src target`.
+                self._swap_accounts_locked(num_src, target)
+                return num_src, target, True
+
+            self._relocate_locked(num_src, target)
             return num_src, target, False
 
-        if data.get("accounts", {}).get(target):
-            # Occupied target: trade places. swap_accounts re-resolves by
-            # number, re-runs the migration guard, and is already tested.
-            self.swap_accounts(num_src, target)
-            return num_src, target, True
-
-        self._relocate_account(num_src, target)
-        return num_src, target, False
-
-    def _relocate_account(self, num_src: str, target: str) -> None:
+    def _relocate_locked(self, num_src: str, target: str) -> None:
         """Move one account from ``num_src`` to the empty slot ``target``.
 
-        The one-way counterpart of :meth:`swap_accounts`: everything keyed by
-        the slot number (credential and config backups, session profile,
-        rotation position in ``sequence``, ``activeAccountNumber``) follows the
+        The caller holds ``self.lock_file``. The one-way counterpart of
+        :meth:`_swap_accounts_locked`: everything keyed by the slot number
+        (credential and config backups, session profile, membership in
+        ``sequence`` — kept sorted — and ``activeAccountNumber``) follows the
         account to its new number, and ``num_src`` is left empty. The caller
-        guarantees ``target`` is unoccupied.
+        checks ``target`` is unoccupied; it is re-checked here as an
+        invariant. No rollback is needed: the ``sequence.json`` write is the
+        commit point — before it the old keys are untouched (strays under
+        the target key are cleaned on failure), after it only best-effort
+        cleanup of the old keys remains.
         """
-        data = self._get_sequence_data()
-        record = data["accounts"][num_src]
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(num_src)
+        if not record:
+            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+        if data.get("accounts", {}).get(target):
+            raise ValidationError(
+                f"Slot {target} is already occupied — retry the move"
+            )
         email = record.get("email", "")
 
         # Relocating backups/session under a live session-mode claude would
@@ -860,38 +1135,81 @@ class ClaudeAccountSwitcher:
         creds = self._read_account_credentials(num_src, email)
         config = self._read_account_config(num_src, email)
 
-        # Move the session profile to the account's new slot key, best effort:
-        # a profile that cannot be moved is pruned below with the old slot's
-        # backups, and setup_session re-bootstraps a missing one from the
-        # relocated backups — a skipped move costs at most this slot's history.
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
-        if src_dir.exists() and not dst_dir.exists():
+        try:
+            # Move the session profile to the account's new slot key, best
+            # effort: a profile that cannot be moved is pruned below with the
+            # old slot's backups, and setup_session re-bootstraps a missing
+            # one from the relocated backups — a skipped move costs at most
+            # this slot's history.
+            if src_dir.exists() and not dst_dir.exists():
+                try:
+                    os.replace(src_dir, dst_dir)
+                except OSError as e:
+                    self._logger.warning(
+                        f"Session profile move skipped during move: {e}"
+                    )
+
+            # Set the target key to the account's exact state: write material
+            # that exists, actively clear what doesn't — an unbacked account
+            # must not adopt stale material leaked under the target key by an
+            # earlier crash. The old key is cleared only after the commit
+            # below, so the records never point at missing material.
+            if creds:
+                self._write_account_credentials(target, email, creds)
+            else:
+                self._delete_account_credentials_strict(target, email)
+            if config:
+                self._write_account_config(target, email, config)
+            else:
+                self._delete_config_backup(target, email)
+
+            data["accounts"][target] = record
+            del data["accounts"][num_src]
+            int_src, int_target = int(num_src), int(target)
+            # Renumber, then sort: sequence is kept sorted everywhere (add
+            # sorts on insert), so rotation and list order follow the new
+            # slot number.
+            data["sequence"] = [
+                int_target if n == int_src else n for n in data.get("sequence", [])
+            ]
+            data["sequence"].sort()
+            if data.get("activeAccountNumber") == int_src:
+                data["activeAccountNumber"] = int_target
+            data["lastUpdated"] = get_timestamp()
+            # The commit point: _write_json's rename publishes the move.
+            self._write_json(self.sequence_file, data)
+        except BaseException:
+            # Pre-commit failure: the records still point at num_src and its
+            # keys are untouched — drop any strays written under the target
+            # key and put the session profile back, best effort.
             try:
-                os.replace(src_dir, dst_dir)
-            except OSError as e:
-                self._logger.warning(f"Session profile move skipped during move: {e}")
+                self._delete_account_credentials(target, email)
+                self._delete_config_backup(target, email)
+                if dst_dir.exists() and not src_dir.exists():
+                    os.replace(dst_dir, src_dir)
+            except Exception as e:
+                self._logger.error(f"Cleanup after failed move incomplete: {e}")
+            raise
 
-        # Write under the new key first, then clear the old one.
-        # _delete_account_files drops the stale (num_src, email) backups and
-        # whatever session profile is still under the old key (nothing, unless
-        # the move above was skipped).
+        # Post-commit: clear the old keys, best effort — the records now
+        # reference the target slot only. _delete_account_files drops the
+        # stale (num_src, email) backups and whatever session profile is
+        # still under the old key (nothing, unless the move above was
+        # skipped). A failure leaks a stale backup under the freed number
+        # (logged loudly: it would poison a future same-email account
+        # landing on that slot).
+        try:
+            self._delete_account_files(num_src, email)
+        except Exception as e:
+            self._logger.error(
+                f"Stale backup left under old key {num_src} ({email}): {e}"
+            )
         if creds:
-            self._write_account_credentials(target, email, creds)
-        if config:
-            self._write_account_config(target, email, config)
-        self._delete_account_files(num_src, email)
-
-        data["accounts"][target] = record
-        del data["accounts"][num_src]
-        int_src, int_target = int(num_src), int(target)
-        data["sequence"] = [
-            int_target if n == int_src else n for n in data.get("sequence", [])
-        ]
-        if data.get("activeAccountNumber") == int_src:
-            data["activeAccountNumber"] = int_target
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            # Any .prev retained while overwriting a stale target key holds
+            # that stale material, not this account's history.
+            self._store.delete_previous_backup(target, email)
 
         self._logger.info(f"Moved slot: {num_src} ({email}) -> {target}")
 
