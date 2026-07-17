@@ -280,6 +280,9 @@ def import_accounts(
         switcher: Initialized ClaudeAccountSwitcher.
         source: File path, or "-" for stdin.
         force: When True, overwrites the existing matching slot in place.
+            Without it, existing accounts are skipped — unless the slot is
+            quarantined as refresh-token-dead, which a plain import replaces
+            (auto-heal, issue #136).
 
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
@@ -397,6 +400,7 @@ def import_accounts(
     imported = 0
     skipped = 0
     overwritten = 0
+    replaced = 0
     written_slots: set[str] = set()
 
     # Track where the envelope's active account ended up locally. We can't
@@ -427,23 +431,28 @@ def import_accounts(
         )
 
         if existing_slot is not None:
-            if not force:
+            if force:
+                outcome = "overwrote"
+            elif (
+                switcher._usage_store.entries(
+                    {existing_slot: (entry["email"], entry["org_uuid"])}
+                )[existing_slot].token_dead()
+            ):
+                # Narrow auto-heal (issue #136): a plain import replaces a
+                # slot iff its identity-matched usage row is quarantined as
+                # refresh-token-dead. The verdict normally postdates the
+                # slot's last credential write, so the heal targets creds that
+                # failed after being stored (known exception and full
+                # trade-off: INVESTIGATION-import-dead-token.md). Identity-
+                # guarded — a stale row for a different account returns an
+                # empty entry — so healthy slots still require --force. Never
+                # triggered by the live store's "no credentials" state, which
+                # isn't attributable to the backup.
+                outcome = "replaced"
+            else:
                 _eprint(
                     f"Skipped {entry['email']} (already exists, use --force)"
                 )
-                # If the stored backup is quarantined as refresh-token-dead,
-                # nudge the user toward --force — that path now rewrites the
-                # creds and lifts the verdict (issue #136). Identity-guarded, so
-                # a stale row for a different account returns an empty entry.
-                if (
-                    switcher._usage_store.entries(
-                        {existing_slot: (entry["email"], entry["org_uuid"])}
-                    )[existing_slot].token_dead()
-                ):
-                    _eprint(
-                        "  └ currently quarantined — refresh token dead; "
-                        "--force replaces the backup and lifts the old verdict"
-                    )
                 skipped += 1
                 # Even when skipped, the envelope's active account exists
                 # locally — record where so we can seed activeAccountNumber.
@@ -451,7 +460,6 @@ def import_accounts(
                     resolved_active_slot = existing_slot
                 continue
             target_num = existing_slot
-            outcome = "overwrote"
             # The credential write below invalidates the slot's non-live
             # session profile (chokepoint in _write_account_credentials), so
             # the next `cswap run` re-bootstraps from the imported creds. A
@@ -515,6 +523,14 @@ def import_accounts(
         if outcome == "overwrote":
             _eprint(f"Overwrote {entry['email']} (slot {target_num})")
             overwritten += 1
+        elif outcome == "replaced":
+            # Describe the observed trigger (the quarantine verdict), not the
+            # token itself — a stale verdict can sit over newer working creds.
+            _eprint(
+                f"Replaced {entry['email']} (slot {target_num} was "
+                "quarantined: refresh token dead)"
+            )
+            replaced += 1
         else:
             _eprint(f"Imported {entry['email']} → slot {target_num}")
             imported += 1
@@ -534,9 +550,15 @@ def import_accounts(
         final["lastUpdated"] = get_timestamp()
         switcher._write_json(switcher.sequence_file, final)
 
-    _eprint(
+    # "replaced" gets its own count — the user must be able to distinguish
+    # "I forced this" from "cswap healed this". Appended only when it
+    # happened, keeping the common-case summary stable.
+    summary = (
         f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped"
     )
+    if replaced:
+        summary += f", {replaced} replaced (dead token)"
+    _eprint(summary)
 
     # If we just rewrote the stored backup for the account that is the current
     # live login, a plain switch would back the (possibly stale) live

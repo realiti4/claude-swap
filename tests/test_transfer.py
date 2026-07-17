@@ -1443,12 +1443,14 @@ class TestImportClearsDeadTokenQuarantine:
         assert not entry.token_dead()
         assert entry.auth_dead_strikes == 0
 
-    def test_plain_import_skip_keeps_quarantine_and_hints(
+    def test_plain_import_replaces_quarantined_slot(
         self, temp_home: Path, capsys
     ):
-        """A plain import that skips a still-existing quarantined account must
-        NOT touch its verdict (no creds written), and should point at --force
-        (issue #136 skip hint)."""
+        """Narrow auto-heal (issue #136 follow-up): a plain import (no --force)
+        replaces an existing slot iff its identity-matched row is quarantined
+        as refresh-token-dead — the verdict normally postdates the last
+        credential write, so the heal targets creds that failed after being
+        stored."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 2, "bob@example.com")
         ident = {"2": ("bob@example.com", "")}
@@ -1457,31 +1459,110 @@ class TestImportClearsDeadTokenQuarantine:
 
         out = temp_home / "bob.cswap"
         export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
 
         import_accounts(s, str(out), force=False)
 
         err = capsys.readouterr().err
-        assert "Skipped bob@example.com" in err
-        assert "currently quarantined — refresh token dead" in err
-        # No creds written → the verdict must stand.
-        assert s._usage_store.entries(ident)["2"].token_dead()
+        assert "Replaced bob@example.com (slot 2 was quarantined: refresh token dead)" in err
+        assert "1 replaced (dead token)" in err
+        entry = s._usage_store.entries(ident)["2"]
+        assert not entry.token_dead()
+        assert entry.auth_dead_strikes == 0
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "BOB_HEALED"
 
-    def test_plain_import_skip_of_healthy_account_emits_no_hint(
-        self, temp_home: Path, capsys
-    ):
-        """The quarantine hint is state-aware: a normal (non-quarantined) skip
-        must not print it."""
+    def test_plain_import_skips_healthy_slot(self, temp_home: Path, capsys):
+        """The heal is scoped to token_dead() only: a healthy existing account
+        keeps skipping exactly as before, creds untouched, no replaced count."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 2, "bob@example.com")
 
         out = temp_home / "bob.cswap"
         export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_NEW"
+        out.write_text(json.dumps(env))
 
         import_accounts(s, str(out), force=False)
 
         err = capsys.readouterr().err
         assert "Skipped bob@example.com" in err
-        assert "currently quarantined" not in err
+        assert "Replaced" not in err
+        assert "replaced (dead token)" not in err
+        # Creds untouched — still the seeded original, not the export's.
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "bob@example.com"
+
+    def test_plain_import_ignores_foreign_dead_row_on_slot(
+        self, temp_home: Path, capsys
+    ):
+        """The heal trigger is identity-guarded: a dead-token row left on the
+        slot by a *different* prior occupant must not fire it. Bob's own view
+        of the slot is clean, so a plain import skips and leaves his creds
+        untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        # Quarantine slot 2 under a prior occupant's identity.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")},
+            {"2": ("alice@example.com", "")},
+        )
+        # Sanity: the foreign row is invisible through Bob's identity.
+        assert not s._usage_store.entries(
+            {"2": ("bob@example.com", "")}
+        )["2"].token_dead()
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_NEW"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "Skipped bob@example.com" in err
+        assert "Replaced" not in err
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "bob@example.com"
+
+    def test_plain_import_heal_warns_about_live_session(
+        self, temp_home: Path, capsys
+    ):
+        """The heal path rewrites stored creds like --force does, so it must
+        hit the same live-session warning: a running session-mode instance
+        keeps its own credential copy until restarted via `cswap run`."""
+        import os as _os
+
+        from claude_swap.session import session_dir_for
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+
+        session_dir = session_dir_for(s.backup_dir, "2", "bob@example.com")
+        pid_dir = session_dir / "sessions"
+        pid_dir.mkdir(parents=True)
+        (pid_dir / f"{_os.getpid()}.json").write_text(
+            json.dumps({"pid": _os.getpid()})
+        )
+        (session_dir / ".credentials.json").write_text("pre-import creds")
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "live" in err
+        assert "Replaced bob@example.com" in err
+        # Live session untouched; the heal itself still completed.
+        assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
+        assert not s._usage_store.entries(ident)["2"].token_dead()
 
     def test_fresh_slot_import_creates_no_quarantine(self, temp_home: Path):
         """Importing into a brand-new slot clears nothing real (no prior row);
