@@ -369,6 +369,16 @@ def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
 
+    import AppKit
+
+    # rumps never sets an activation policy, so under a framework Python the
+    # process launches as a regular app and parks a "Python" icon in the Dock
+    # for as long as the menu bar runs. Accessory keeps the status item and
+    # dialog windows but stays out of the Dock and the Cmd-Tab switcher.
+    AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+        AppKit.NSApplicationActivationPolicyAccessory
+    )
+
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
