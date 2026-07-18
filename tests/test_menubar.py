@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import sys
 from pathlib import Path
 
+import pytest
+
 from claude_swap import menubar
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import USAGE_API_KEY
 
 
@@ -438,3 +442,19 @@ def test_format_title_reflects_passed_weekly_reset():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
     assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+
+
+# --- run() app glue ------------------------------------------------------------
+
+def test_run_without_rumps_raises_clean_error(monkeypatch):
+    """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
+
+    The module is import-safe without rumps, so the CLI's ImportError guard
+    around ``from claude_swap.menubar import run`` can never fire — the import
+    failure happens inside ``run()``. Blocking the import (a ``None`` entry in
+    ``sys.modules`` makes ``import rumps`` raise) checks that ``run()`` turns
+    it into the error type the CLI renders with the install hint.
+    """
+    monkeypatch.setitem(sys.modules, "rumps", None)
+    with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
+        menubar.run(switcher=None)
