@@ -401,6 +401,49 @@ class TestUsageRows:
         assert usage_rows(None, time.time()) == []
         assert usage_rows({}, time.time()) == []
 
+    def test_seven_day_ahead_of_pace_marker(self):
+        # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}}
+        row = usage_rows(last_good, now, now)[0]
+        assert "(ahead of pace)" in row[2]
+        assert "(ahead of pace)" in row[3]
+
+    def test_five_hour_never_shows_pace_marker(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 90.0, "resets_at": _iso_in(3600 * 4)}}
+        row = usage_rows(last_good, now, now)[0]
+        assert "pace" not in row[2]
+
+    def test_scoped_ahead_of_pace_marker(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": _iso_in(86400 * 6)}]}
+        row = usage_rows(last_good, now, now)[0]
+        assert "(ahead of pace)" in row[2]
+
+    def test_maxed_scoped_marker_wins_over_pace(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(86400 * 6)}]}
+        row = usage_rows(last_good, now, now)[0]
+        assert "(!)" in row[2]
+        assert "ahead of pace" not in row[2]
+
+    def test_no_pace_marker_without_fetched_at(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}}
+        row = usage_rows(last_good, now)[0]
+        assert "pace" not in row[2]
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its
@@ -430,6 +473,44 @@ class TestUsageRows:
 
         narrow = account_card_text(acc, 40).plain
         assert " · " not in narrow
+
+
+class TestMiniAccountText:
+    def test_seven_day_ahead_of_pace_marker(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}},
+            fetched_at=now,
+            age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "(pace)" in mini_account_text(acc, now).plain
+
+    def test_five_hour_never_shows_pace_marker(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 90.0, "resets_at": _iso_in(3600 * 4)}},
+            fetched_at=now,
+            age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "pace" not in mini_account_text(acc, now).plain
+
+    def test_no_pace_marker_without_fetched_at(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}},
+            fetched_at=None,
+            age_s=None,
+        )
+        acc = make_account(1, entry=entry)
+        assert "pace" not in mini_account_text(acc, now).plain
 
 
 class TestRunAction:

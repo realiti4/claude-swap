@@ -98,6 +98,45 @@ class TestJsonHelpers:
         assert out["spend"]["countdown"] == countdown
         assert out["spend"]["clock"] == clock
 
+    def test_usage_to_json_adds_pace_fields_when_fetched_at_given(self):
+        # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["sevenDay"]["aheadOfPace"] is True
+        assert out["sevenDay"]["expectedPct"] == pytest.approx(14.3, abs=0.1)
+        assert "projectedExhaustionAt" in out["sevenDay"]
+        assert out["sevenDay"]["willLastToReset"] is False  # 50% after 1/7 of the week won't last
+
+    def test_usage_to_json_pace_fields_on_scoped_windows(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at}]}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["scoped"][0]["aheadOfPace"] is True
+
+    def test_usage_to_json_five_hour_never_gets_pace_fields(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)).isoformat()
+        usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["fiveHour"]
+        assert "expectedPct" not in out["fiveHour"]
+
+    def test_usage_to_json_no_pace_fields_without_fetched_at(self):
+        usage = {"seven_day": {"pct": 50.0, "resets_at":
+                                (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()}}
+        out = usage_to_json(usage)
+        assert "aheadOfPace" not in out["sevenDay"]
+
+    def test_usage_to_json_no_pace_fields_within_suppression_window(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["sevenDay"]
+
     def test_usage_fields_variants(self):
         from claude_swap.json_output import (
             USAGE_KEYCHAIN_UNAVAILABLE,

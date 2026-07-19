@@ -307,6 +307,8 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
+Weekly windows (`sevenDay` and any per-model `scoped` entry — never `fiveHour`) additively carry `expectedPct`/`aheadOfPace`/`projectedExhaustionAt`/`willLastToReset` once enough of the week has elapsed to make pace meaningful: `expectedPct` is the "on schedule" usage for how far into the week you are, `aheadOfPace` is `true` only when meaningfully over that (the same signal the human views show as a `(pace)`/`(ahead of pace)` marker), and `projectedExhaustionAt`/`willLastToReset` are a linear-projection ETA and its yes/no summary for whether usage stays under 100% before the next reset — `--json`-only, since the projection has wide error bars and would look falsely precise in `cswap list`/the TUI/the menu bar.
+
 </details>
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.

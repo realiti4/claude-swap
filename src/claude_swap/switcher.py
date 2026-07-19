@@ -22,7 +22,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth
+from claude_swap import oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -106,7 +106,13 @@ _FETCH_STAGGER_S = 0.25
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 
-def _format_usage_lines(usage: dict) -> list[str]:
+def _pace_marker(window: dict, fetched_at: float | None) -> str:
+    """"  (ahead of pace)" when a weekly window is meaningfully ahead of pace, else ""."""
+    result = pace.compute_pace(window, fetched_at=fetched_at)
+    return "  (ahead of pace)" if result and result.ahead else ""
+
+
+def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
     rows: list[tuple[str, str]] = []
@@ -122,16 +128,18 @@ def _format_usage_lines(usage: dict) -> list[str]:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            # Pace only applies to the weekly (7d) window, never 5h (issue #125).
+            marker = _pace_marker(w, fetched_at) if label == "7d" else ""
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}"))
+                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%"))
+                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
-        marker = "  (!)" if w["pct"] >= 100 else ""
+        marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
@@ -187,7 +195,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good)
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at)
         if (
             lines
             and entry.age_s is not None
@@ -3286,7 +3294,7 @@ class ClaudeAccountSwitcher:
         entry = self._active_account_usage(account_num, current_email, org_uuid)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
-        status, usage = usage_fields(entry.decision_value())
+        status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
             "email": current_email,

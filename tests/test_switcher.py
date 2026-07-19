@@ -4853,6 +4853,57 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
 
+    def test_seven_day_ahead_of_pace_marker(self):
+        # 1 day elapsed of the week (resets_at 6 days out), 50% used -> far
+        # ahead of the ~14% expected at that point (issue #125).
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "(ahead of pace)" in line
+
+    def test_five_hour_never_shows_pace_marker(self):
+        # Pace applies only to weekly windows, never the 5h one (issue #125).
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)
+        usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "pace" not in line
+
+    def test_scoped_ahead_of_pace_marker_when_under_limit(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
+        line = _format_usage_lines(usage, now)[0]
+        assert "(ahead of pace)" in line
+        assert "(!)" not in line
+
+    def test_no_pace_marker_without_fetched_at(self):
+        # No fetched_at passed -> pace isn't computable, no marker (backward
+        # compatible with callers that don't supply it).
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = datetime.now(timezone.utc) + timedelta(days=6)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage)[0]
+        assert "pace" not in line
+
+    def test_no_pace_marker_within_suppression_window_after_reset(self):
+        # Just reset (elapsed ~0) -> suppressed even though pct looks "ahead".
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "pace" not in line
+
 
 def _read_safety_copy(switcher, entry_id: str) -> str:
     """Decode a preserved credential entry straight from its file (the store

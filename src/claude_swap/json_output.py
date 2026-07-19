@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from claude_swap import oauth
+from claude_swap import oauth, pace
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -50,24 +50,61 @@ def _window_to_json(entry: dict) -> dict:
     return out
 
 
-def _scoped_window_to_json(entry: dict) -> dict:
-    """Project a per-model scoped weekly window, carrying its model name."""
+def _pace_fields(entry: dict, fetched_at: float | None) -> dict:
+    """Weekly-window pace fields (issue #125): additive, JSON-only.
+
+    Emitted only when pace is computable and not suppressed (see
+    ``claude_swap.pace.compute_pace``). ``projectedExhaustionAt`` is a linear
+    ETA — wide error bars against real, bursty usage — so it's kept out of
+    every human-facing surface and only ever appears here.
+    """
+    if fetched_at is None:
+        return {}
+    result = pace.compute_pace(entry, fetched_at=fetched_at)
+    if result is None:
+        return {}
+    out: dict = {
+        "expectedPct": round(result.expected_pct, 1),
+        "aheadOfPace": result.ahead,
+    }
+    eta = pace.projected_exhaustion_ts(result, fetched_at=fetched_at)
+    if eta is not None:
+        out["projectedExhaustionAt"] = (
+            datetime.fromtimestamp(eta, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+    will_last = pace.will_last_to_reset(result)
+    if will_last is not None:
+        out["willLastToReset"] = will_last
+    return out
+
+
+def _weekly_window_to_json(entry: dict, fetched_at: float | None) -> dict:
+    """A 7d/scoped window's JSON projection, with pace fields layered in."""
     out = _window_to_json(entry)
+    out.update(_pace_fields(entry, fetched_at))
+    return out
+
+
+def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
+    """Project a per-model scoped weekly window, carrying its model name."""
+    out = _weekly_window_to_json(entry, fetched_at)
     out["name"] = entry["name"]
     return out
 
 
-def usage_to_json(usage: dict) -> dict:
+def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     """Convert the internal usage dict to its camelCase JSON projection.
 
     Sub-keys are emitted only when present in the source (the API does not always
-    return every window or pay-as-you-go spend).
+    return every window or pay-as-you-go spend). ``fetched_at`` is the
+    measurement's fetch time; passing it adds pace fields to the weekly
+    windows (``seven_day``, ``scoped``) only — never ``five_hour`` (issue #125).
     """
     out: dict = {}
     if "five_hour" in usage:
         out["fiveHour"] = _window_to_json(usage["five_hour"])
     if "seven_day" in usage:
-        out["sevenDay"] = _window_to_json(usage["seven_day"])
+        out["sevenDay"] = _weekly_window_to_json(usage["seven_day"], fetched_at)
     if "spend" in usage:
         spend = usage["spend"]
         spend_out: dict = {
@@ -83,21 +120,24 @@ def usage_to_json(usage: dict) -> dict:
             spend_out["countdown"], spend_out["clock"] = cell
         out["spend"] = spend_out
     if "scoped" in usage:
-        out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]
+        out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
     return out
 
 
-def usage_fields(entry: dict | str | None) -> tuple[str, dict | None]:
+def usage_fields(
+    entry: dict | str | None, fetched_at: float | None = None
+) -> tuple[str, dict | None]:
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
-    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed).
+    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
+    is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
     if isinstance(entry, dict):
-        return "ok", usage_to_json(entry)
+        return "ok", usage_to_json(entry, fetched_at)
     if entry == USAGE_TOKEN_EXPIRED:
         return "token_expired", None
     if entry == USAGE_API_KEY:
@@ -150,7 +190,7 @@ def account_row(
     disabled: bool = False,
 ) -> dict:
     """A full account row for ``--list``."""
-    status, usage = usage_fields(usage_entry)
+    status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
         "email": email,

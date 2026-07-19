@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
+from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.usage_store import STALE_OK_S
@@ -106,8 +107,14 @@ def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
     return reset, f"{reset} · {clock}" if clock else reset
 
 
+def _pace_suffix(window: dict, fetched_at: float | None) -> str:
+    """"(ahead of pace)" when a weekly window is meaningfully ahead, else ""."""
+    result = pace.compute_pace(window, fetched_at=fetched_at)
+    return "(ahead of pace)" if result and result.ahead else ""
+
+
 def usage_rows(
-    last_good: dict | None, now: float
+    last_good: dict | None, now: float, fetched_at: float | None = None
 ) -> list[tuple[str, float, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
     ``_format_usage_lines``.
@@ -117,7 +124,9 @@ def usage_rows(
     ``suffix``. Only windows the account actually has produce a row — an
     annual plan without a 7-day window simply has no 7d line. Order matches
     the CLI: spend, 5h, 7d, then per-model scoped windows (e.g. "Fable"),
-    the latter marked ``(!)`` at/over their limit.
+    the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
+    rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
+    week's expected usage (issue #125) — never the 5h row.
     """
     if not isinstance(last_good, dict):
         return []
@@ -133,7 +142,13 @@ def usage_rows(
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
-            rows.append((label, float(window["pct"]), reset or "", reset_full or ""))
+            suffix, suffix_full = reset or "", reset_full or ""
+            if key == "seven_day":
+                marker = _pace_suffix(window, fetched_at)
+                if marker:
+                    suffix = f"{suffix}  {marker}" if suffix else marker
+                    suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
+            rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
@@ -141,6 +156,11 @@ def usage_rows(
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
             suffix_full = f"{suffix_full}  (!)" if suffix_full else "(!)"
+        else:
+            marker = _pace_suffix(window, fetched_at)
+            if marker:
+                suffix = f"{suffix}  {marker}" if suffix else marker
+                suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
     return rows
 
@@ -187,7 +207,7 @@ def account_card_text(
                 text.append(f"└ {last_seen}", style=MUTED)
         return text
 
-    rows = usage_rows(acc.usage.last_good, now)
+    rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
     if not rows:
         text.append("\n    ")
         text.append("usage unavailable", style=MUTED)
@@ -246,6 +266,7 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
         return text
 
     last_good = acc.usage.last_good
+    fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -262,6 +283,10 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
             reset = data.reset_text(window, now)
             if reset:
                 text.append(f" ({reset})", style=MUTED)
+        elif key == "seven_day":
+            result = pace.compute_pace(window, fetched_at=fetched_at)
+            if result and result.ahead:
+                text.append(" (pace)", style=SEV_WARN)
         parts += 1
     maxed = [
         w["name"]

@@ -126,6 +126,58 @@ def test_usage_summary_none():
     assert menubar.usage_summary(None) == "usage unavailable"
 
 
+def test_usage_summary_seven_day_ahead_of_pace_marker():
+    # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+    usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert out == "7d 50% (pace) (6d 0h)"
+
+
+def test_usage_summary_five_hour_never_shows_pace_marker():
+    usage = {"five_hour": {"pct": 90.0, "resets_at": _iso(4 * 3600)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert "pace" not in out
+
+
+def test_usage_summary_scoped_ahead_of_pace_marker():
+    usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": _iso(6 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert out == "Fable 50% (pace) (6d 0h)"
+
+
+def test_usage_summary_maxed_scoped_marker_wins_over_pace():
+    # At/over the limit shows "(!)" — the more urgent signal — not "(pace)".
+    usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(6 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert "(!)" in out
+    assert "pace" not in out
+
+
+def test_usage_summary_no_pace_marker_without_fetched_at():
+    usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW)
+    assert "pace" not in out
+
+
+def test_usage_summary_no_pace_marker_on_window_rolled_to_zero():
+    # A weekly window whose resets_at has already passed (stale cache, not
+    # refetched since the actual reset) is rolled to a display pct of 0% —
+    # pace must be computed against that rolled 0%, not the raw stale pct,
+    # or the display would show "7d 0% (pace)" (a marker paired with a
+    # percentage it doesn't correspond to).
+    usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-3 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
+    assert "pace" not in out
+    assert "7d 0%" in out
+
+
+def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
+    usage = {"scoped": [{"name": "Fable", "pct": 95.0, "resets_at": _iso(-3 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
+    assert "pace" not in out
+    assert "Fable 0%" in out
+
+
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
@@ -345,9 +397,10 @@ def test_parse_switch_history_empty_or_no_matches():
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
 
 class _FakeEntry:
-    def __init__(self, sentinel=None, last_good=None):
+    def __init__(self, sentinel=None, last_good=None, fetched_at=None):
         self.sentinel = sentinel
         self.last_good = last_good
+        self.fetched_at = fetched_at
 
 
 class _FakeAcct:
@@ -379,18 +432,19 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
+        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
         _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False)
-    # sentinel account: display is the human note, last_good is None; disabled carried through
+    assert snap["active_usage_fetched_at"] == 123.0
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
     )
 
 
