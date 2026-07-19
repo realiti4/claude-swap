@@ -4362,7 +4362,7 @@ class ClaudeAccountSwitcher:
                 # Snapshot live state so a mid-operation failure can be undone.
                 # When a live session exists, fail fast if the snapshot is
                 # unreadable rather than proceeding to overwrite without a
-                # safety net. The fresh-machine case has nothing to restore.
+                # safety net.
                 rollback_creds: str | None = None
                 rollback_config_text: str | None = None
                 if current_identity is not None:
@@ -4380,19 +4380,25 @@ class ClaudeAccountSwitcher:
                             raise ConfigError(
                                 f"Cannot snapshot live config before activation: {e}"
                             )
+                else:
+                    # No config identity does not mean no live credential: a
+                    # wiped or half-written ~/.claude.json can orphan a live
+                    # item whose machine-shared MCP state must still reach
+                    # the composer below (#135) — and the rollback, should
+                    # activation fail partway. Best-effort read: "" (absent)
+                    # and None (read error) both mean nothing to compose or
+                    # restore, exactly the old fresh-machine behavior.
+                    rollback_creds = self._read_credentials() or None
 
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no
-                # surviving copy — stash it first. For an unmanaged login the
-                # stash is the only copy anywhere; for --force it guards
-                # against the "stale" live login actually being the fresher
-                # generation. A failed stash aborts, except under --force
-                # where the user explicitly asked for the overwrite.
-                if (
-                    rollback_creds
-                    and rollback_creds != target_creds
-                    and current_identity is not None
-                ):
+                # surviving copy — stash it first. For an unmanaged or
+                # config-orphaned live login the stash is the only copy
+                # anywhere; for --force it guards against the "stale" live
+                # login actually being the fresher generation. A failed stash
+                # aborts, except under --force where the user explicitly
+                # asked for the overwrite.
+                if rollback_creds and rollback_creds != target_creds:
                     try:
                         self._stash_live_credential(
                             rollback_creds,
@@ -4598,7 +4604,10 @@ class ClaudeAccountSwitcher:
                     )
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
-                    # these bytes. Refresh only the config backup.
+                    # these bytes. Refresh only the config backup. (Rare since
+                    # #145: activation composes live shared MCP state into the
+                    # written credential, so live bytes match the slot's only
+                    # when nothing was composed in.)
                     self._write_account_config(
                         current_account, current_email, original_config
                     )

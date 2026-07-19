@@ -5799,15 +5799,18 @@ class TestDirectActivationPreservation:
     invariant II requires the displaced credential to be stashed first."""
 
     def _setup(self, temp_home, live_identity_email="untracked@example.com"):
+        # live_identity_email=None leaves ~/.claude.json absent entirely: a
+        # live credential without any config identity (wiped/crashed login).
         config_path = temp_home / ".claude.json"
-        config_path.write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": live_identity_email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        }))
+        if live_identity_email is not None:
+            config_path.write_text(json.dumps({
+                "oauthAccount": {
+                    "emailAddress": live_identity_email,
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }))
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.LINUX
         switcher._setup_directories()
@@ -5871,6 +5874,24 @@ class TestDirectActivationPreservation:
                 "1", emit_output=False, force_activate=True
             )
         assert any("--force" in w for w in op["warnings"])
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
+
+    def test_orphaned_live_login_without_config_identity_is_stashed(
+        self, temp_home
+    ):
+        # ~/.claude.json is gone but a live login remains: there is no
+        # config identity, yet the displaced credential still needs its
+        # safety copy — previously the missing identity skipped both the
+        # stash and the rollback snapshot.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert _read_safety_copy(switcher, entry_id) == orphaned
+        assert entries[entry_id]["reason"] == "displaced-live-login"
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
 
@@ -5956,6 +5977,51 @@ class TestSharedOAuthCredentialPreservation:
         )
 
         assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+
+    def test_direct_activation_without_config_identity_composes_live_state(
+        self, temp_home
+    ):
+        # A wiped or half-written ~/.claude.json orphans the live credential:
+        # no config identity, but the live item still holds the machine's
+        # MCP state — direct activation must compose it in, not clobber it.
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "one@example.com",
+                    "uuid": "uuid-one",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+            },
+        })
+        switcher._write_account_credentials("1", "one@example.com", json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-one", "refreshToken": "rt-one"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        }))
+        switcher._write_account_config("1", "one@example.com", json.dumps({
+            "oauthAccount": {
+                "emailAddress": "one@example.com", "accountUuid": "uuid-one",
+            },
+        }))
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live_path.write_text(json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }))
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        assert json.loads(live_path.read_text()) == {
+            "claudeAiOauth": {"accessToken": "sk-one", "refreshToken": "rt-one"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
 
     def test_api_key_live_state_activates_target_verbatim(self, temp_home):
         # While a managed API key is active there is no live OAuth object to

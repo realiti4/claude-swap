@@ -36,6 +36,8 @@ from claude_swap.paths import (
     get_global_config_path,
 )
 
+_logger = logging.getLogger("claude-swap")
+
 # Service name for per-account backup credentials now managed via the ``security``
 # CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
 # new security items coexist during migration (safe write → verify → delete).
@@ -126,6 +128,14 @@ SHARED_CREDENTIAL_KEYS = frozenset({
     "pluginSecrets",
 })
 
+# Account-scoped siblings cswap knows about, named so the unrecognized-key
+# probe below doesn't flag them: claudeAiOauth is the login itself,
+# trustedDeviceToken is enrolled per (device, account) at /login.
+ACCOUNT_CREDENTIAL_KEYS = frozenset({
+    "claudeAiOauth",
+    "trustedDeviceToken",
+})
+
 
 def shared_credential_fields(credentials: str | None) -> dict | None:
     """Return the machine-shared fields of a Claude OAuth credential object.
@@ -140,6 +150,18 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
     data = _credential_object(credentials)
     if data is None:
         return None
+    if "claudeAiOauth" in data:
+        # A sibling key cswap doesn't know defaults to slot-owned (fails
+        # safe), but silently: if Claude Code grows a new *shared* key,
+        # that default quietly reintroduces the stale-restore papercut for
+        # it — leave a trace so it gets noticed.
+        unrecognized = data.keys() - SHARED_CREDENTIAL_KEYS - ACCOUNT_CREDENTIAL_KEYS
+        if unrecognized:
+            _logger.debug(
+                "Live credential has sibling keys cswap does not recognize "
+                "(a newer Claude Code?), treating them as slot-owned: %s",
+                sorted(unrecognized),
+            )
     return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
 
 
