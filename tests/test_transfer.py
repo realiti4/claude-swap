@@ -1168,6 +1168,61 @@ class TestSlimVsFullConfig:
                 assert "appleTerminalBackupPath" not in live
 
 
+class TestSlimVsFullCredentials:
+    """#135 follow-up: default exports carry only the account's own login.
+    Machine-shared MCP/plugin OAuth state is owned by whichever machine the
+    export lands on, and the device-bound trustedDeviceToken is meaningless
+    off-device — neither belongs in a cross-machine file."""
+
+    _SIBLINGED_CREDS = {
+        "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        "mcpOAuth": {"linear": {"refreshToken": "mcp-rt"}},
+        "trustedDeviceToken": "device-token-a",
+        "someFutureField": {"value": 1},
+    }
+
+    def test_default_export_keeps_only_claude_ai_oauth(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(
+            s, 1, "alice@example.com", "org-a", creds=self._SIBLINGED_CREDS
+        )
+
+        out = temp_home / "slim.cswap"
+        export_accounts(s, str(out))
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == {
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"}
+        }
+
+    def test_full_export_keeps_entire_credential_object(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(
+            s, 1, "alice@example.com", "org-a", creds=self._SIBLINGED_CREDS
+        )
+
+        out = temp_home / "full.cswap"
+        export_accounts(s, str(out), full=True)
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == self._SIBLINGED_CREDS
+
+    def test_legacy_shape_without_claude_ai_oauth_exports_verbatim(
+        self, temp_home: Path
+    ):
+        # Pre-claudeAiOauth blobs (top-level tokens) have no sibling keys to
+        # strip and must keep round-tripping untouched.
+        legacy = {"accessToken": "tok-legacy", "refreshToken": "rt-legacy"}
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a", creds=legacy)
+
+        out = temp_home / "legacy.cswap"
+        export_accounts(s, str(out))
+        env = json.loads(out.read_text())
+
+        assert env["accounts"][0]["credentials"] == legacy
+
+
 # ---------------------------------------------------------------------------
 # Issue #41: tolerate broken slots in export
 # ---------------------------------------------------------------------------

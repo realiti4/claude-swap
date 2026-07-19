@@ -268,12 +268,12 @@ Move account data between machines or back it up:
 ```bash
 cswap export backup.cswap                    # All accounts to a file
 cswap export backup.cswap --account 2        # One account
-cswap export backup.cswap --full             # Include full local ~/.claude.json (same-PC backup)
+cswap export backup.cswap --full             # Include full ~/.claude.json and credential object (same-PC backup)
 cswap import backup.cswap                    # Skips accounts that already exist
 cswap import backup.cswap --force            # Overwrite existing
 ```
 
-The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
+The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 

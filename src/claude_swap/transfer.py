@@ -121,6 +121,22 @@ def _slim_config(config_obj: dict, label: str) -> dict:
     return {"oauthAccount": oauth}
 
 
+def _slim_credentials(creds_obj: dict) -> dict:
+    """Reduce an OAuth credential object to the account's own login.
+
+    The siblings of ``claudeAiOauth`` are either machine-shared MCP/plugin
+    OAuth state — owned by whichever machine the export lands on and
+    replaced from the live credential at activation anyway (#135) — or
+    device-bound (``trustedDeviceToken``), meaningless off-device. Both are
+    secret surface with no cross-machine value. Legacy shapes without
+    ``claudeAiOauth`` export verbatim; ``--full`` (same-PC backup) skips
+    this and keeps the whole blob.
+    """
+    if "claudeAiOauth" not in creds_obj:
+        return creds_obj
+    return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
@@ -133,8 +149,10 @@ def export_accounts(
         switcher: Initialized ClaudeAccountSwitcher.
         destination: File path, or "-" for stdout.
         account: Optional NUM|EMAIL to limit export to a single account.
-        full: When True, include the entire ~/.claude.json snapshot per
-            account (same-PC backup). Default False writes only oauthAccount.
+        full: When True, include the entire ~/.claude.json snapshot and the
+            entire credential object per account (same-PC backup). Default
+            False writes only oauthAccount and the account's own
+            claudeAiOauth login.
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -211,6 +229,12 @@ def export_accounts(
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
         is_api_key = looks_like_api_key(creds_text)
+        if is_api_key:
+            creds_payload: Any = creds_text.strip()
+        else:
+            creds_payload = _parse_payload(creds_text, f"credentials for {email}")
+            if not full:
+                creds_payload = _slim_credentials(creds_payload)
         entry: dict[str, Any] = {
             "number": int(num),
             "email": email,
@@ -218,11 +242,7 @@ def export_accounts(
             "organizationUuid": org_uuid,
             "organizationName": record.get("organizationName", "") or "",
             "added": record.get("added", ""),
-            "credentials": (
-                creds_text.strip()
-                if is_api_key
-                else _parse_payload(creds_text, f"credentials for {email}")
-            ),
+            "credentials": creds_payload,
             "config": config_obj,
         }
         if is_api_key:
