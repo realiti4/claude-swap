@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 
 from claude_swap import pace
 
-NOW = 1_000_000.0
+NOW = 1_700_000_000.0  # a realistic epoch; keeps NOW-minus-several-weeks positive
+                        # (datetime.fromtimestamp rejects negative timestamps on Windows)
 DAY = 86400.0
 WEEK = pace.WEEKLY_PERIOD_S
 
