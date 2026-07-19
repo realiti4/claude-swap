@@ -140,3 +140,30 @@ class TestWillLastToReset:
         result = pace.compute_pace(window, fetched_at=NOW)
         assert result is not None
         assert pace.will_last_to_reset(result) is True
+
+
+class TestAheadVsWillLastRelationship:
+    """Pin that will_last_to_reset is the marker's signal with no threshold."""
+
+    def test_will_last_flips_exactly_at_expected_pct(self):
+        # Linear projection crosses 100% exactly when actual exceeds expected
+        # (projected total = 100 × actual/expected), threshold not involved.
+        for days in (1.0, 2.5, 4.0, 6.0):
+            resets_at = NOW + (7.0 - days) * DAY
+            expected = (days * DAY / WEEK) * 100.0
+            over = pace.compute_pace(_window(expected + 0.5, resets_at), fetched_at=NOW)
+            under = pace.compute_pace(_window(expected - 0.5, resets_at), fetched_at=NOW)
+            assert over is not None and under is not None
+            assert pace.will_last_to_reset(over) is False
+            assert pace.will_last_to_reset(under) is True
+
+    def test_slightly_ahead_reads_wont_last_with_no_marker(self):
+        # The deliberate in-between band: over expected by less than
+        # AHEAD_THRESHOLD_PCT keeps the UI silent while the JSON projection
+        # already says the window won't last — scripts get the sensitive
+        # signal, the UI gets the noise-gated one.
+        window = _window(25.0, NOW + 6 * DAY)  # expected ~14.3, delta ~10.7
+        result = pace.compute_pace(window, fetched_at=NOW)
+        assert result is not None
+        assert result.ahead is False
+        assert pace.will_last_to_reset(result) is False

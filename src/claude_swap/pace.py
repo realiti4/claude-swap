@@ -34,7 +34,10 @@ SUPPRESS_AFTER_RESET_S = 24 * 3600.0
 
 # Minimum (actual - expected) percentage-point gap before showing a marker.
 # Below this, "ahead of pace" is within normal usage variance and would just
-# add noise to already-dense usage rows.
+# add noise to already-dense usage rows. A flat gap also means the marker
+# cannot fire once expected passes (100 - threshold) — the last ~day of the
+# week — since pct tops out at 100. Deliberate: by then the percentage itself
+# tells the story, and a maxed window is the switcher's job anyway.
 AHEAD_THRESHOLD_PCT = 15.0
 
 
@@ -138,6 +141,14 @@ def will_last_to_reset(pace: PaceResult) -> bool | None:
     assumption, but it's still a projection with the same wide error bars
     against bursty real usage, so it stays out of every human-facing surface.
     Returns None when there's no measurable rate to extrapolate from.
+
+    Relationship to the ``(ahead)`` marker: at a constant rate the projected
+    total is ``100 × actual/expected``, so this is False exactly when the
+    window is over expected *at all* — the marker's signal with no threshold.
+    A window can therefore report ``willLastToReset: false`` while showing no
+    marker: the marker additionally requires being ``AHEAD_THRESHOLD_PCT``
+    over expected. Deliberate — scripts get the sensitive signal, the UI gets
+    the noise-gated one.
     """
     if pace.actual_pct <= 0:
         return True  # no usage yet — nothing to run out of before reset

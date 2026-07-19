@@ -309,7 +309,7 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
-Weekly windows (`sevenDay` and any per-model `scoped` entry — never `fiveHour`) additively carry `expectedPct`/`aheadOfPace`/`projectedExhaustionAt`/`willLastToReset` once enough of the week has elapsed to make pace meaningful: `expectedPct` is the "on schedule" usage for how far into the week you are, `aheadOfPace` is `true` only when meaningfully over that (the same signal the human views show as a `(pace)`/`(ahead of pace)` marker), and `projectedExhaustionAt`/`willLastToReset` are a linear-projection ETA and its yes/no summary for whether usage stays under 100% before the next reset — `--json`-only, since the projection has wide error bars and would look falsely precise in `cswap list`/the TUI/the menu bar.
+Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
 </details>
 
