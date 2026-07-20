@@ -13,6 +13,7 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    _oauth_account_capacity_fields,
     account_row,
     error_envelope,
     usage_fields,
@@ -161,15 +162,45 @@ class TestJsonHelpers:
             "error": {"type": "SwitchError", "message": "boom"},
         }
 
-    def test_account_row_includes_alias_when_set(self):
-        from claude_swap.json_output import account_row
+    def test_oauth_account_capacity_fields_admits_known_values(self):
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-test",
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_20x",
+            }
+        })
+        assert _oauth_account_capacity_fields(creds) == {
+            "subscriptionType": "max",
+            "rateLimitMultiplier": 20,
+        }
 
+    def test_oauth_account_capacity_fields_treats_fields_independently(self):
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-test",
+                "subscriptionType": "pro",
+                "rateLimitTier": "unknown-tier",
+            }
+        })
+        assert _oauth_account_capacity_fields(creds) == {"subscriptionType": "pro"}
+
+    @pytest.mark.parametrize("credentials", [
+        "not-json",
+        json.dumps({"apiKey": "sk-ant-api-key"}),
+        json.dumps({"claudeAiOauth": []}),
+        json.dumps({"claudeAiOauth": {"subscriptionType": "PRO", "rateLimitTier": 5}}),
+        json.dumps({"claudeAiOauth": {"subscriptionType": [], "rateLimitTier": {}}}),
+        json.dumps({"claudeAiOauth": {"subscriptionType": "enterprise", "rateLimitTier": "burst"}}),
+    ])
+    def test_oauth_account_capacity_fields_omits_malformed_or_unknown_values(self, credentials: str):
+        assert _oauth_account_capacity_fields(credentials) == {}
+
+    def test_account_row_includes_alias_when_set(self):
         row = account_row(1, "a@x.com", "", "", True, None, alias="dev")
         assert row["alias"] == "dev"
 
     def test_account_row_omits_alias_when_unset(self):
-        from claude_swap.json_output import account_row
-
         row = account_row(1, "a@x.com", "", "", True, None)
         assert "alias" not in row
 
@@ -222,6 +253,48 @@ class TestListJson:
         assert acct1["active"] is True
         assert acct1["usageStatus"] == "ok"
         assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+
+    def test_list_payload_includes_capacity_metadata_without_token_leakage(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-active-secret",
+                "subscriptionType": "pro",
+                "rateLimitTier": "default_claude_ai",
+            }
+        })
+        backup_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-backup-secret",
+                "subscriptionType": "bogus",
+                "rateLimitTier": "default_claude_max_5x",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        def read_account_credentials(num: str, email: str) -> str:
+            return backup_creds if str(num) == "2" else ""
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", side_effect=read_account_credentials), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[1]["subscriptionType"] == "pro"
+        assert by_num[1]["rateLimitMultiplier"] == 1
+        assert "subscriptionType" not in by_num[2]
+        assert by_num[2]["rateLimitMultiplier"] == 5
+        serialized = json.dumps(payload)
+        assert "sk-active-secret" not in serialized
+        assert "sk-backup-secret" not in serialized
 
     def test_list_payload_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,

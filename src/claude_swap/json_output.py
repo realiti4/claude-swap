@@ -151,6 +151,33 @@ def usage_fields(
     return "unavailable", None
 
 
+_RATE_LIMIT_MULTIPLIERS = {
+    "default_claude_ai": 1,
+    "default_claude_max_5x": 5,
+    "default_claude_max_20x": 20,
+}
+
+
+def _oauth_account_capacity_fields(credentials: str | None) -> dict:
+    """Additive account-capacity metadata from a Claude AI OAuth credential."""
+    oauth_data = oauth.extract_oauth_data(credentials) if credentials else None
+    if not oauth_data:
+        return {}
+    out: dict = {}
+    subscription_type = oauth_data.get("subscriptionType")
+    if isinstance(subscription_type, str) and subscription_type in {"pro", "max"}:
+        out["subscriptionType"] = subscription_type
+    rate_limit_tier = oauth_data.get("rateLimitTier")
+    multiplier = (
+        _RATE_LIMIT_MULTIPLIERS.get(rate_limit_tier)
+        if isinstance(rate_limit_tier, str)
+        else None
+    )
+    if multiplier is not None:
+        out["rateLimitMultiplier"] = multiplier
+    return out
+
+
 def account_ref(number: int | None, email: str) -> dict:
     """A minimal account reference, used for switch ``from``/``to``."""
     return {"number": number, "email": email}
@@ -184,6 +211,7 @@ def account_row(
     active: bool,
     usage_entry: dict | str | None,
     *,
+    credentials: str | None = None,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     alias: str = "",
@@ -201,6 +229,7 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    row.update(_oauth_account_capacity_fields(credentials))
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so

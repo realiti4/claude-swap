@@ -320,6 +320,8 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
+An account row also carries additive optional account-metadata fields sourced only from that row's existing `claudeAiOauth` credential object: `subscriptionType` (admitted only for exact lower-case `"pro"` and `"max"`) and `rateLimitMultiplier` (`"default_claude_ai"` → `1`, `"default_claude_max_5x"` → `5`, `"default_claude_max_20x"` → `20`). Unknown, malformed, or absent values are simply omitted, and the two fields are independent.
+
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
