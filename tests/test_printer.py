@@ -14,8 +14,10 @@ from claude_swap import printer
 def _reset_color_cache():
     """Reset the color detection cache before each test."""
     printer._colors_enabled = None
+    printer._theme = "dark"
     yield
     printer._colors_enabled = None
+    printer._theme = "dark"
 
 
 class TestColorDetection:
@@ -107,6 +109,34 @@ class TestStyling:
         assert "\033[1m" in result
         assert "\033[38;5;173m" in result
         assert "(active)" in result
+
+
+class TestThemePalette:
+    """Tests for set_theme and the per-theme color palette."""
+
+    def test_light_theme_changes_accent(self, monkeypatch):
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        printer._colors_enabled = None
+        printer.set_theme("light")
+        assert "38;2;149;76;42" in printer.accent("x")   # #954c2a
+        printer.set_theme("dark")
+        assert "38;5;173" in printer.accent("x")
+
+    def test_light_theme_error_uses_light_red(self, monkeypatch, capsys):
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        printer._colors_enabled = None
+        printer.set_theme("light")
+        printer.error("boom")
+        assert "38;2;173;49;40" in capsys.readouterr().err   # #ad3128
+
+    def test_unknown_theme_falls_back_to_dark(self, monkeypatch):
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        printer._colors_enabled = None
+        printer.set_theme("bogus")
+        assert "38;5;173" in printer.accent("x")
 
 
 class TestLinePrinters:

@@ -14,8 +14,10 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
+    UiSettings,
     effective_settings,
     load_settings,
+    load_ui_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -110,18 +112,50 @@ class TestSaveSettings:
         assert mode == 0o600
 
 
+class TestUiSettings:
+    def test_missing_file_defaults_to_auto(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path) == UiSettings(theme="auto")
+
+    def test_reads_auto(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "auto"}}))
+        assert load_ui_settings(tmp_path).theme == "auto"
+
+    def test_reads_light(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "light"}}))
+        assert load_ui_settings(tmp_path).theme == "light"
+
+    def test_unknown_theme_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
+        assert load_ui_settings(tmp_path).theme == "auto"
+
+    def test_set_and_unset_ui_theme(self, tmp_path: Path):
+        assert set_setting(tmp_path, "ui.theme", "light") == "light"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "ui": {"theme": "light"}}
+        assert unset_setting(tmp_path, "ui.theme") is True
+        assert "ui" not in json.loads(settings_path(tmp_path).read_text())
+
+    def test_set_rejects_bad_choice(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="dark, light"):
+            set_setting(tmp_path, "ui.theme", "purple")
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
-        spec_fields = {spec.field for spec in SETTING_SPECS.values()}
-        dataclass_fields = {
+        by_section: dict[str, set[str]] = {}
+        for spec in SETTING_SPECS.values():
+            by_section.setdefault(spec.section, set()).add(spec.field)
+        assert by_section["autoswitch"] == {
             f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
         }
-        assert spec_fields == dataclass_fields
+        assert by_section["ui"] == {
+            f.name for f in UiSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        defaults = AutoSwitchSettings()
+        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
         for spec in SETTING_SPECS.values():
-            assert spec.default == getattr(defaults, spec.field)
+            assert spec.default == getattr(sources[spec.section], spec.field)
 
 
 class TestSetUnsetSetting:
