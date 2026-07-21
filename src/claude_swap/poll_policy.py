@@ -82,6 +82,20 @@ EDGE_BACKOFF_S = 300.0
 POST_429_MIN_INTERVAL_S = 360.0
 RECENT_429_WINDOW_S = 3600.0
 
+# AIMD on a contended token. The usage endpoint's per-token budget is shared
+# across every machine polling the same account, and none of them can see the
+# others (there is no cross-machine coordination, and the endpoint exposes no
+# remaining-request count — only a Retry-After once already blocked). So while
+# 429s recur on a token, each successful poll multiplicatively grows the
+# interval (×POST_429_BACKOFF_MULT) toward POST_429_MAX_INTERVAL_S — wider than
+# the normal candidate ceiling so several machines can each back off far enough
+# that their combined rate fits under the budget. Movement (a real success run
+# with no recent 429) decays it back down. This is TCP-style congestion control:
+# a token gets fair-shared by reaction alone, with no machine count or shared
+# state to configure.
+POST_429_BACKOFF_MULT = 1.5
+POST_429_MAX_INTERVAL_S = 1800.0
+
 # The engine escalates to a full candidate refresh when the active account is
 # within this margin of the threshold (decision policy, but the urgent-mode
 # cadence keys on the same band, so it lives with the cadence numbers).
@@ -188,7 +202,12 @@ def plan_after_fetch(
     ):
         interval = URGENT_INTERVAL_S
     if recent_429:
-        interval = max(interval, POST_429_MIN_INTERVAL_S)
+        # AIMD additive-increase: grow the interval multiplicatively from the
+        # last one toward the wider 429 ceiling, so machines sharing a
+        # contended token each retreat until their combined rate fits the
+        # budget. Floored at POST_429_MIN_INTERVAL_S for the first 429.
+        increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
+        interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
 
     next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
     headroom = oauth.account_headroom(new_usage, models)

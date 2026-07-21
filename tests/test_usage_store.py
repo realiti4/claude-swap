@@ -11,6 +11,7 @@ from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
+    RATE_LIMIT_TRUST_MAX_AGE_S,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -154,16 +155,153 @@ class TestExtendedTrust:
         clock.advance(250)
         assert store.entries(IDENT)["1"].decision_value() is None
 
-    def test_trust_ceiling_wins_over_failure_state(self, store, clock):
+    def test_trust_ceiling_wins_over_non_429_failure_state(self, store, clock):
+        # A non-429 failure (timeout/network) past the general ceiling reads as
+        # unknown: such an error is no evidence the last_good still holds, so
+        # the unknown-path machinery must take back over.
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         entry = store.entries(IDENT)["1"]
         assert entry.consecutive_failures == 2
         assert entry.decision_value() is None
-        # Display still sees the measurement + its age.
-        assert entry.last_good == USAGE
+
+    def _usage_resetting_at(self, clock, seconds_ahead):
+        from datetime import datetime, timezone
+
+        iso = (
+            datetime.fromtimestamp(clock.now + seconds_ahead, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        return {
+            "five_hour": {"pct": 25.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0, "resets_at": iso},
+        }
+
+    def test_429_staleness_trusted_until_window_reset(self, store, clock):
+        # A usage-endpoint 429 throttles polling; it does NOT move the account's
+        # real windows. Usage only rises within a window (monotone until reset),
+        # so last_good is a valid lower bound — trust it up to its reset, as long
+        # as that reset is within the client-side ceiling. Reset inside the
+        # ceiling → trusted right up to it, past the general TRUST_MAX_AGE_S.
+        reset_ahead = (TRUST_MAX_AGE_S + RATE_LIMIT_TRUST_MAX_AGE_S) / 2  # < ceiling
+        usage = self._usage_resetting_at(clock, reset_ahead)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S + 1)  # past the general ceiling...
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.trust_extended
+        assert entry.decision_value() == usage  # ...but before the reset
+
+    def test_429_staleness_expires_at_window_reset(self, store, clock):
+        # Once the window has reset, usage is zeroed and last_good is obsolete —
+        # it reads as unknown so the unknown-path machinery takes over. This is
+        # the natural, data-driven bound (no fixed clock): trust ends exactly
+        # when the measured value can no longer hold.
+        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(601.0)  # past the window reset
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.decision_value() is None
+        assert entry.last_good == usage  # display still sees it
+
+    def test_429_staleness_without_reset_info_falls_back_to_ceiling(
+        self, store, clock
+    ):
+        # Older stored data may carry no resets_at. Fall back to the fixed
+        # rate-limit ceiling so such an entry still can't be trusted forever.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no resets_at
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == USAGE  # within
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None  # past cap
+
+
+class TestRateLimitTrustBounds:
+    """The 429-stale trust must be bounded even with reset metadata present:
+    (a) clamped to a client-side ceiling so a far-future/malformed resets_at
+    can't grant indefinite trust, (b) keyed on the EARLIEST future reset (any
+    relevant window reset invalidates the snapshot), and (c) robust to partial
+    metadata (a window missing resets_at must not let a longer window's reset
+    override the ceiling).
+    """
+
+    def _usage(self, clock, five_h_ahead, seven_d_ahead):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            if ahead is None:
+                return None
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        five = {"pct": 25.0}
+        if five_h_ahead is not None:
+            five["resets_at"] = iso(five_h_ahead)
+        seven = {"pct": 10.0}
+        if seven_d_ahead is not None:
+            seven["resets_at"] = iso(seven_d_ahead)
+        return {"five_hour": five, "seven_day": seven}
+
+    def test_far_future_reset_is_clamped_to_the_ceiling(self, store, clock):
+        # A malformed/far-future resets_at (year 2099) must NOT grant unbounded
+        # trust: the client-side ceiling caps it.
+        far = 10 * 365 * 24 * 3600.0  # ~10 years
+        usage = self._usage(clock, far, far)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        # past the ceiling → no longer trusted, despite the far-future reset
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_trust_keys_on_earliest_future_reset(self, store, clock):
+        # 5h resets soon, 7d resets far ahead. The snapshot is invalid once the
+        # SOONER window rolls over (usage zeroes there), so trust must end at the
+        # earliest reset, not the latest.
+        usage = self._usage(clock, 600.0, 100 * 3600.0)  # 5h: 10min, 7d: far
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(601.0)  # past the 5h reset, long before the 7d one
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_partial_metadata_still_bounded_by_ceiling(self, store, clock):
+        # 5h has NO resets_at (a shape the server actually sends); 7d resets far
+        # ahead. The missing-reset window must not let the far 7d reset grant
+        # near-unbounded trust — the ceiling still applies.
+        usage = self._usage(clock, None, 100 * 3600.0)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_ceiling_wins_when_reset_is_beyond_it(self, store, clock):
+        # Reset farther out than the ceiling: trusted up to the ceiling, then
+        # unknown — the ceiling, not the reset, is the bound.
+        usage = self._usage(
+            clock, RATE_LIMIT_TRUST_MAX_AGE_S * 3, RATE_LIMIT_TRUST_MAX_AGE_S * 3
+        )
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S - 60)  # just inside the ceiling
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == usage
+        clock.advance(120)  # now just past the ceiling
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
 
 
 class TestBackoff:
@@ -210,9 +348,19 @@ class TestBackoff:
 
     def test_retry_after_floor_is_capped(self):
         # A pathological Retry-After can never park an account for hours.
-        assert usage_store._failure_backoff_s(1, 5000.0) == pytest.approx(
+        assert usage_store._failure_backoff_s(1, 50000.0) == pytest.approx(
             usage_store.RETRY_AFTER_FLOOR_CAP_S
         )
+
+    def test_hour_scale_retry_after_honored(self):
+        # The usage endpoint's burst block spans its ~1h rolling window and the
+        # server's Retry-After counts that down to a fixed deadline (measured;
+        # probing does not re-arm it). Capping it to minutes just re-probes two
+        # or three times inside a block that lasts the full window anyway —
+        # wasted requests — so an hour-scale Retry-After is honored whole, up to
+        # the (raised) safety cap.
+        assert usage_store._failure_backoff_s(1, 3600.0) == pytest.approx(3600.0)
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S >= 3600.0
 
     def test_measured_burst_block_honored_exactly(self):
         # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and
@@ -486,6 +634,182 @@ class TestLast429Marker:
     def test_non_429_failures_leave_the_marker_alone(self, store, clock):
         store.record({"1": FetchRecord(error="timeout")}, IDENT)
         assert store.entries(IDENT)["1"].last_429_at is None
+
+
+class TestRecent429AcrossHonoredBlock:
+    """The AIMD floor/growth keys on "did this token 429 recently?". A 429 with
+    an hour-scale Retry-After is honored as one backoff spanning the whole
+    block, so there is exactly one stamp and no attempts until it lifts. The
+    "recent" test must still be True at the first post-block success — otherwise
+    the very cap raise that stops mid-window re-probing also silently disables
+    the AIMD growth and the POST_429 floor, and N machines never converge.
+    """
+
+    def _recent_429(self, entry: UsageEntry, now: float) -> bool:
+        # Mirror the scheduler's gate (switcher._persist_poll_plans). Extracted
+        # onto the entry so it can be exercised through the store, which is the
+        # only place the last429At/backoff timing interaction is real.
+        return entry.recent_429(now)
+
+    def test_recent_429_true_at_first_success_after_hour_block(
+        self, store, clock
+    ):
+        # 429 with a full-hour Retry-After: honored as a single 3600s backoff.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        # The next attempt can only run once the backoff lifts — advance to the
+        # earliest eligible moment, exactly what the engine does.
+        clock.advance(before.backoff_until - clock.now)
+        # First post-block success is being processed: the pre-fetch snapshot
+        # must still count as "recently 429'd" so the plan keeps the floor.
+        assert self._recent_429(before, clock.now) is True
+
+    def test_recent_429_false_once_window_truly_elapsed(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        # Well past both the backoff and any reasonable recency window.
+        clock.advance(7200)
+        assert self._recent_429(before, clock.now) is False
+
+    def test_short_retry_after_recency_still_expires_normally(self, store, clock):
+        # A short (Retry-After: 0) block anchors on its (short) 429 backoff and
+        # so recency still elapses within a bounded window of the block — the
+        # hour-scale anchoring must not leave a short block "recent" forever.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        clock.advance(before.backoff_until - clock.now)  # EDGE_BACKOFF_S later
+        assert self._recent_429(before, clock.now) is True  # just lifted
+        clock.advance(usage_store.RECENT_429_WINDOW_S)  # a full window on
+        assert self._recent_429(before, clock.now) is False
+
+    def test_unrelated_timeout_does_not_re_arm_recency(self, store, clock):
+        # Regression: the backoff anchor must fire only while the LIVE backoff is
+        # a 429 backoff. A token that 429'd long ago (window fully elapsed) then
+        # hits an unrelated timeout gets a fresh backoffUntil but keeps its old
+        # last429At; recency must stay False (the timeout is not a 429), or the
+        # post-429 floor/urgent-suppression would spuriously re-engage.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(400)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # recover
+        clock.advance(usage_store.RECENT_429_WINDOW_S + 5000)  # 429 long gone
+        assert self._recent_429(store.entries(IDENT)["1"], clock.now) is False
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)  # unrelated
+        before = store.entries(IDENT)["1"]
+        assert before.last_error == "timeout"
+        assert before.last_429_at is not None  # stamp survives, but…
+        clock.advance(before.backoff_until - clock.now)  # at the timeout's expiry
+        assert self._recent_429(before, clock.now) is False  # …not re-armed
+
+
+class TestHourScale429FloorEngagesThroughStore:
+    """End-to-end through the store: a 429 with an hour-scale Retry-After, then
+    the first post-block success, must still yield a post-429-floored plan. This
+    is the integration the unit tests (which pass recent_429 directly) can't
+    catch — it exercises the last429At/backoff-timing/recent_429 chain the
+    scheduler actually runs (switcher._persist_poll_plans).
+    """
+
+    def _plan_after_first_success(self, store, clock, legacy_recency: bool):
+        from claude_swap import poll_policy
+
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        clock.advance(before.backoff_until - clock.now)  # earliest eligible
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        after = store.entries(IDENT)["1"]
+        if legacy_recency:
+            recent = (
+                before.last_429_at is not None
+                and (clock.now - before.last_429_at)
+                < poll_policy.RECENT_429_WINDOW_S
+            )
+        else:
+            recent = before.recent_429(clock.now)
+        nxt, interval = poll_policy.plan_after_fetch(
+            prev_interval_s=before.poll_interval_s,
+            prev_usage=before.last_good,
+            new_usage=after.last_good,
+            is_active=False,
+            threshold=90.0,
+            models=(),
+            recent_429=recent,
+            now=clock.now,
+            rng=lambda: 0.5,
+        )
+        return recent, interval
+
+    def test_floor_engages_at_first_post_block_success(self, store, clock):
+        from claude_swap import poll_policy
+
+        recent, interval = self._plan_after_first_success(
+            store, clock, legacy_recency=False
+        )
+        assert recent is True
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
+
+    def test_legacy_recency_would_drop_the_floor(self, store, clock):
+        # Documents the regression the fix closes: with the old inline recency
+        # (measured from the 429 stamp), the first post-block success sees
+        # recent_429=False and the POST_429 floor never engages.
+        from claude_swap import poll_policy
+
+        recent, interval = self._plan_after_first_success(
+            store, clock, legacy_recency=True
+        )
+        assert recent is False
+        assert interval < poll_policy.POST_429_MIN_INTERVAL_S
+
+    def test_repeated_429_episodes_converge_to_the_wide_ceiling(
+        self, store, clock
+    ):
+        # The real convergence dynamic, driven end-to-end through the store:
+        # each 429 episode (429 → honored backoff → first post-block success)
+        # contributes one AIMD growth step, and successive episodes push the
+        # persisted interval up to POST_429_MAX_INTERVAL_S. This is what lets N
+        # machines sharing a token back off far enough to fit the budget — and
+        # it only works because recent_429 is True at each episode's first
+        # success (the fix). Uses short (60s) blocks so the episodes are quick;
+        # the growth is independent of the block length.
+        from claude_swap import poll_policy
+
+        intervals = []
+        for _ in range(6):
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=60.0)}, IDENT
+            )
+            before = store.entries(IDENT)["1"]
+            clock.advance(before.backoff_until - clock.now)
+            store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+            after = store.entries(IDENT)["1"]
+            nxt, interval = poll_policy.plan_after_fetch(
+                prev_interval_s=before.poll_interval_s,
+                prev_usage=before.last_good,
+                new_usage=after.last_good,
+                is_active=False,
+                threshold=90.0,
+                models=(),
+                recent_429=before.recent_429(clock.now),
+                now=clock.now,
+                rng=lambda: 0.5,
+            )
+            store.set_poll_plan({"1": (nxt, interval)}, IDENT)
+            intervals.append(interval)
+            clock.advance(10)  # brief gap before the next episode
+
+        assert intervals == sorted(intervals)  # monotonic growth
+        assert intervals[-1] == poll_policy.POST_429_MAX_INTERVAL_S  # converged
+        # and it climbed strictly while below the ceiling (real AIMD, not a jump)
+        assert intervals[0] < intervals[2] < poll_policy.POST_429_MAX_INTERVAL_S
 
 
 class TestClaimTrustBridge:
