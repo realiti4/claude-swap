@@ -127,10 +127,103 @@ class TestPost429Floor:
         assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
 
     def test_slower_learned_cadence_survives_the_floor(self):
+        # A learned interval already above the floor is grown (×1.5), never
+        # dropped back to the floor.
         _, interval = _plan(
             recent_429=True, prev_interval_s=590.0, prev_usage=_usage(10)
         )
+        assert interval == pytest.approx(590.0 * poll_policy.POST_429_BACKOFF_MULT)
+        assert interval > poll_policy.POST_429_MIN_INTERVAL_S
+
+
+class TestPost429Aimd:
+    """AIMD backoff on a contended token: while 429s recur, each successful
+    poll multiplicatively increases the interval toward a wider 429 ceiling, so
+    independent machines sharing one token each retreat and their combined poll
+    rate converges under the endpoint budget (no cross-machine coordination)."""
+
+    def test_recent_429_multiplicatively_increases_from_prev(self):
+        # A prior 360s interval, still seeing 429s, is pushed up (×1.5), not
+        # held flat at the floor.
+        _, interval = _plan(
+            recent_429=True,
+            prev_interval_s=poll_policy.POST_429_MIN_INTERVAL_S,  # 360
+            prev_usage=_usage(10),
+        )
+        assert interval > poll_policy.POST_429_MIN_INTERVAL_S
+        assert interval == pytest.approx(
+            poll_policy.POST_429_MIN_INTERVAL_S * poll_policy.POST_429_BACKOFF_MULT
+        )
+
+    def test_recent_429_ceiling_exceeds_normal_candidate_max(self):
+        # The 429 ceiling is wider than the normal candidate ceiling so a
+        # contended token can back off far enough for several machines to fit.
+        assert (
+            poll_policy.POST_429_MAX_INTERVAL_S
+            > poll_policy.CANDIDATE_MAX_INTERVAL_S
+        )
+        _, interval = _plan(
+            recent_429=True,
+            prev_interval_s=poll_policy.POST_429_MAX_INTERVAL_S,  # already at ceiling
+            prev_usage=_usage(10),
+        )
+        assert interval == poll_policy.POST_429_MAX_INTERVAL_S
+
+    def test_no_429_uses_normal_ceiling(self):
+        # Without recent 429s the wider ceiling never applies (normal cadence).
+        _, interval = _plan(
+            recent_429=False, prev_interval_s=590.0, prev_usage=_usage(10)
+        )
         assert interval == poll_policy.CANDIDATE_MAX_INTERVAL_S
+
+    def _converge_trajectory(self, recent_429: bool, rounds: int = 12):
+        # Deterministic evolution of the interval under a sustained contended
+        # token: each successful poll re-plans with the same recent_429 flag and
+        # unmoved usage (movement decay would only shorten it — the worst case
+        # for convergence is an unmoving account that just keeps 429ing). rng at
+        # the midpoint so jitter is exactly 1.0 and the trajectory is exact.
+        prev = None
+        traj = []
+        for _ in range(rounds):
+            _, interval = _plan(
+                recent_429=recent_429,
+                prev_interval_s=prev,
+                prev_usage=_usage(10),
+                new_usage=_usage(10),
+            )
+            traj.append(interval)
+            prev = interval
+        return traj
+
+    def test_sustained_429_grows_the_interval_to_the_wide_ceiling(self):
+        # THE convergence property: while 429s recur, the interval must keep
+        # growing (×MULT) until it reaches POST_429_MAX_INTERVAL_S. This is what
+        # lets N machines sharing one token each back off far enough that their
+        # combined rate drops under the budget — the deadlock cannot clear
+        # without it.
+        traj = self._converge_trajectory(recent_429=True)
+        # strictly increasing until it saturates at the wide ceiling
+        assert traj[-1] == poll_policy.POST_429_MAX_INTERVAL_S
+        assert traj == sorted(traj)  # monotonic non-decreasing
+        # actually reaches the ceiling within the simulated rounds
+        assert max(traj) == poll_policy.POST_429_MAX_INTERVAL_S
+        # each pre-ceiling step grew by the multiplier (AIMD multiplicative incr)
+        for a, b in zip(traj, traj[1:]):
+            if b < poll_policy.POST_429_MAX_INTERVAL_S:
+                assert b == pytest.approx(a * poll_policy.POST_429_BACKOFF_MULT)
+
+    def test_without_recency_the_interval_is_capped_at_the_narrow_ceiling(self):
+        # The failure mode the recency bug caused: if recent_429 is False on the
+        # post-block success (the pre-fix behavior after an honored hour-scale
+        # Retry-After), the interval can never exceed CANDIDATE_MAX_INTERVAL_S.
+        # N machines then jam at 600s each and their combined rate can sit above
+        # the budget forever — a permanent deadlock the AIMD is meant to break.
+        traj = self._converge_trajectory(recent_429=False)
+        assert max(traj) == poll_policy.CANDIDATE_MAX_INTERVAL_S
+        assert (
+            poll_policy.CANDIDATE_MAX_INTERVAL_S
+            < poll_policy.POST_429_MAX_INTERVAL_S
+        )
 
 
 class TestResetCapping:

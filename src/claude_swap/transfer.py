@@ -96,6 +96,10 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
 def _atomic_write_file(path: Path, content: str) -> None:
     """Write text atomically with 0600 perms — same pattern as switcher._write_json."""
+    if path.is_dir():
+        raise TransferError(
+            f"export destination must be a file path, not a directory: {path}"
+        )
     temp_path = path.with_suffix(f".{os.getpid()}.tmp")
     temp_path.write_text(content, encoding="utf-8")
     if sys.platform != "win32":

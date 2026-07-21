@@ -32,7 +32,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
-from claude_swap.poll_policy import EDGE_BACKOFF_S, SERVE_TTL_S
+from claude_swap import oauth
+from claude_swap.poll_policy import (
+    EDGE_BACKOFF_S,
+    RECENT_429_WINDOW_S,
+    SERVE_TTL_S,
+    parse_reset_ts,
+)
 from claude_swap.settings import atomic_write_json
 
 SCHEMA_VERSION = 2
@@ -52,6 +58,23 @@ CLAIM_TTL_S = 10.0  # in-flight claim window: skip just-claimed accounts
 # trust must never be server-controlled and unbounded.
 TRUST_MAX_AGE_S = 3600.0
 
+# A usage-endpoint 429 is a polling throttle, not a change in the account's
+# real model quota: the endpoint budgets *usage requests* per token (see
+# poll_policy), independent of the 5h/7d limits it reports. It does NOT move
+# the account's real windows, and usage only rises within a window (monotone
+# until the window resets), so last_good is a valid lower bound on the true
+# usage right up to that reset. Trust it until then — data-driven, not a fixed
+# clock: flipping it to "unknown" early (the old fixed 2h ceiling) made a
+# throttled account an unusable switch target and drove failover flapping /
+# all-exhausted sleeps even while the account was plainly fine. Once the window
+# resets, usage is zeroed and last_good is obsolete → unknown. Matches Claude
+# Code's own 2.1.208 "show last-known usage when rate-limited" behavior.
+#
+# Fallback ceiling for 429-stale data that carries no resets_at (older stored
+# rows): still bounded so it can't be trusted forever. Non-429 failures always
+# use TRUST_MAX_AGE_S (a timeout/network error is no evidence last_good holds).
+RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
+
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
@@ -70,7 +93,17 @@ BACKOFF_CAP_S = 600.0
 #   → hard block; measured: accurate, counts down, not extended by probing).
 #   Honored as the wait, up to a safety cap so a pathological header can
 #   never park an account for hours.
-RETRY_AFTER_FLOOR_CAP_S = 900.0
+# The cap spans the usage endpoint's ~1h rolling window: a saturating burst
+# blocks the token for up to a full trailing hour, and the server's Retry-After
+# reports that horizon accurately — it counts down to a fixed wall-clock
+# deadline and is NOT re-armed by probing (measured: three probes in one
+# episode all reported the same deadline). Capping below it (the old 900s) just
+# meant re-probing two or three times inside a block that was going to last the
+# full window anyway — wasted requests against the very budget we are trying to
+# let recover, with no benefit. Honoring the whole Retry-After spends one
+# request per block instead. The cap still bounds a pathological header to one
+# window, never hours.
+RETRY_AFTER_FLOOR_CAP_S = 3600.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
@@ -153,6 +186,38 @@ class UsageEntry:
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
 
+    def recent_429(self, now: float) -> bool:
+        """Whether this token 429'd recently enough to keep the post-429 cadence.
+
+        Recency is measured from when the 429's honored backoff *lifts*, not
+        from the 429 itself. An hour-scale Retry-After is honored as one long
+        backoff during which no attempt runs, so the only 429 stamp is at the
+        block's start; measuring recency from the stamp would make the first
+        post-block success (which can't happen until the backoff lifts) see a
+        window that has already fully elapsed — the AIMD growth and the
+        POST_429 floor would never engage, and machines sharing the token could
+        not converge. Anchoring on the backoff's end keeps "recent" true across
+        the first post-block success while a short (``Retry-After: 0``) block
+        still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
+        anchor so it clears once the saturated window has aged out.
+        """
+        if self.last_429_at is None:
+            return False
+        anchor = self.last_429_at
+        # Use the backoff anchor only while the LIVE backoff is a 429 backoff.
+        # last429At is never cleared, but backoffUntil/lastError are rewritten by
+        # any later failure — so without the lastError guard an unrelated timeout
+        # on a token that 429'd long ago would install a fresh backoffUntil and
+        # spuriously re-arm the post-429 cadence. Success clears lastError and
+        # backoffUntil; only a 429 sets last429At and backoffUntil together.
+        if (
+            self.last_error == "http-429"
+            and self.backoff_until is not None
+            and self.backoff_until > anchor
+        ):
+            anchor = self.backoff_until
+        return now < anchor + RECENT_429_WINDOW_S
+
     def claimed(self, now: float) -> bool:
         """A collector stamped this entry moments ago (fetch may be in flight)."""
         return (
@@ -228,6 +293,57 @@ def due_candidate(
     return due[0][2]
 
 
+def _rate_limited_trust_ok(
+    last_good: dict | None,
+    age_s: float | None,
+    now: float,
+    models: tuple[str, ...] = (),
+) -> bool:
+    """Whether 429-stale ``last_good`` is still trustworthy for decisions.
+
+    Usage rises monotonically within a window, so a rate-limited (frozen)
+    last_good is a valid lower bound until its window resets — but only up to a
+    client-side ceiling, so a far-future or malformed ``resets_at`` can never
+    grant unbounded trust. The bound is:
+
+        now < min(earliest future relevant-window reset, age-ceiling)
+
+    - **earliest** relevant-window reset (not latest): once the *soonest*
+      window rolls over, usage there is zeroed and the whole snapshot is
+      obsolete — a later window's reset can't rescue it. So if the earliest
+      known reset is already in the past, the value is untrusted outright,
+      regardless of any farther-future window.
+    - **age-ceiling** (``RATE_LIMIT_TRUST_MAX_AGE_S`` past ``last_good``): the
+      hard client-side cap. It applies whether or not any reset is known, so
+      even an all-``resets_at`` response — including a far-future or malformed
+      one — is bounded, matching the ~1h stale fallback Claude Code itself uses.
+      Rows with no reset info at all fall back to it alone.
+
+    A window carrying no ``resets_at`` simply contributes no timestamp; it never
+    extends trust, so partial metadata can only tighten the bound, never loosen
+    it. ``models`` selects the per-model scoped windows that also gate the
+    account, so their resets are considered too (matching the scheduler's view).
+    """
+    if age_s is None:
+        return False
+    ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
+    windows = (
+        oauth.relevant_windows(last_good, models)
+        if last_good is not None
+        else []
+    )
+    resets = [
+        ts
+        for _, _, resets_at in windows
+        if (ts := parse_reset_ts(resets_at)) is not None
+    ]
+    if resets:
+        # The soonest window to roll over invalidates the snapshot; never trust
+        # past it, and never past the client-side ceiling.
+        return now < min(min(resets), ceiling)
+    return now < ceiling
+
+
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
     computed = min(
         BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S
@@ -292,9 +408,18 @@ class UsageStore:
 
     # -- read model -----------------------------------------------------------
 
-    def entries(self, identities: dict[str, Identity]) -> dict[str, UsageEntry]:
+    def entries(
+        self,
+        identities: dict[str, Identity],
+        models: tuple[str, ...] = (),
+    ) -> dict[str, UsageEntry]:
         """Identity-guarded snapshot for the given slots (empty entry when the
-        row is missing or belongs to a different account)."""
+        row is missing or belongs to a different account).
+
+        ``models`` are the configured scoped-window model names; they let the
+        429-stale trust bound also honor per-model (e.g. Fable) window resets,
+        matching the scheduler's window view. Omitted (``()``) for callers that
+        only read timestamps/last-good and never consult scoped resets."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -316,9 +441,24 @@ class UsageStore:
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
+            # A usage-endpoint 429 throttles polling without moving the
+            # account's real windows. Usage is monotone within a window, so
+            # last_good is a valid lower bound until that window resets: trust it
+            # right up to the earliest future reset (data-driven, no fixed
+            # clock). Rows with no reset info fall back to a bounded ceiling. A
+            # non-429 failure (timeout/network) is no evidence last_good still
+            # holds, so it always uses the general ceiling.
+            if row.get("lastError") == "http-429":
+                within_ceiling = _rate_limited_trust_ok(
+                    last_good if isinstance(last_good, dict) else None,
+                    age_s,
+                    now,
+                    models,
+                )
+            else:
+                within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
             trust_extended = (
-                age_s is not None
-                and age_s <= TRUST_MAX_AGE_S
+                within_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
