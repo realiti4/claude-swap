@@ -354,10 +354,11 @@ class TestBackoff:
 
     def test_hour_scale_retry_after_honored(self):
         # The usage endpoint's burst block spans its ~1h rolling window and the
-        # server's Retry-After counts that down accurately (measured). Capping
-        # it to minutes means re-probing mid-window, which re-arms the block and
-        # never lets the token drain — so an hour-scale Retry-After must be
-        # honored, up to the (raised) safety cap.
+        # server's Retry-After counts that down to a fixed deadline (measured;
+        # probing does not re-arm it). Capping it to minutes just re-probes two
+        # or three times inside a block that lasts the full window anyway —
+        # wasted requests — so an hour-scale Retry-After is honored whole, up to
+        # the (raised) safety cap.
         assert usage_store._failure_backoff_s(1, 3600.0) == pytest.approx(3600.0)
         assert usage_store.RETRY_AFTER_FLOOR_CAP_S >= 3600.0
 

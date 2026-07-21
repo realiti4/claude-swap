@@ -95,11 +95,14 @@ BACKOFF_CAP_S = 600.0
 #   never park an account for hours.
 # The cap spans the usage endpoint's ~1h rolling window: a saturating burst
 # blocks the token for up to a full trailing hour, and the server's Retry-After
-# reports that horizon accurately. Capping below it (the old 900s) meant
-# re-probing mid-window — each probe re-arms the block and prevents the token
-# from ever draining — so an account could stay throttled indefinitely under
-# steady polling (worst across machines sharing one token). The cap still
-# bounds a pathological header to one window, never hours.
+# reports that horizon accurately — it counts down to a fixed wall-clock
+# deadline and is NOT re-armed by probing (measured: three probes in one
+# episode all reported the same deadline). Capping below it (the old 900s) just
+# meant re-probing two or three times inside a block that was going to last the
+# full window anyway — wasted requests against the very budget we are trying to
+# let recover, with no benefit. Honoring the whole Retry-After spends one
+# request per block instead. The cap still bounds a pathological header to one
+# window, never hours.
 RETRY_AFTER_FLOOR_CAP_S = 3600.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
