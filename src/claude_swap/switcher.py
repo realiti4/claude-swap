@@ -2863,11 +2863,7 @@ class ClaudeAccountSwitcher:
             before, after = pre.get(num), post.get(num)
             if after is None or after.fetched_at is None:
                 continue
-            recent_429 = (
-                before is not None
-                and before.last_429_at is not None
-                and (now - before.last_429_at) < poll_policy.RECENT_429_WINDOW_S
-            )
+            recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,

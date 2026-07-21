@@ -35,6 +35,7 @@ from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
+    RECENT_429_WINDOW_S,
     SERVE_TTL_S,
     parse_reset_ts,
 )
@@ -181,6 +182,38 @@ class UsageEntry:
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
+
+    def recent_429(self, now: float) -> bool:
+        """Whether this token 429'd recently enough to keep the post-429 cadence.
+
+        Recency is measured from when the 429's honored backoff *lifts*, not
+        from the 429 itself. An hour-scale Retry-After is honored as one long
+        backoff during which no attempt runs, so the only 429 stamp is at the
+        block's start; measuring recency from the stamp would make the first
+        post-block success (which can't happen until the backoff lifts) see a
+        window that has already fully elapsed — the AIMD growth and the
+        POST_429 floor would never engage, and machines sharing the token could
+        not converge. Anchoring on the backoff's end keeps "recent" true across
+        the first post-block success while a short (``Retry-After: 0``) block
+        still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
+        anchor so it clears once the saturated window has aged out.
+        """
+        if self.last_429_at is None:
+            return False
+        anchor = self.last_429_at
+        # Use the backoff anchor only while the LIVE backoff is a 429 backoff.
+        # last429At is never cleared, but backoffUntil/lastError are rewritten by
+        # any later failure — so without the lastError guard an unrelated timeout
+        # on a token that 429'd long ago would install a fresh backoffUntil and
+        # spuriously re-arm the post-429 cadence. Success clears lastError and
+        # backoffUntil; only a 429 sets last429At and backoffUntil together.
+        if (
+            self.last_error == "http-429"
+            and self.backoff_until is not None
+            and self.backoff_until > anchor
+        ):
+            anchor = self.backoff_until
+        return now < anchor + RECENT_429_WINDOW_S
 
     def claimed(self, now: float) -> bool:
         """A collector stamped this entry moments ago (fetch may be in flight)."""
