@@ -1297,6 +1297,7 @@ class ClaudeAccountSwitcher:
 
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
+        wrote_target = False
         try:
             # Move the session profile to the account's new slot key, best
             # effort: a profile that cannot be moved is pruned below with the
@@ -1316,11 +1317,19 @@ class ClaudeAccountSwitcher:
             # must not adopt stale material leaked under the target key by an
             # earlier crash. The old key is cleared only after the commit
             # below, so the records never point at missing material.
+            # ``wrote_target`` gates the failure cleanup: only a write can
+            # leave half-written strays. A failed *clear* must leave the
+            # target key exactly as fail-closed found it — cleanup after it
+            # would re-run the delete best-effort, destroying on one backend
+            # (Keychain) the pre-existing material whose failed removal on
+            # the other (file) just aborted the move.
             if creds:
+                wrote_target = True
                 self._write_account_credentials(target, email, creds)
             else:
                 self._delete_account_credentials_strict(target, email)
             if config:
+                wrote_target = True
                 self._write_account_config(target, email, config)
             else:
                 self._delete_config_backup(target, email)
@@ -1343,10 +1352,12 @@ class ClaudeAccountSwitcher:
         except BaseException:
             # Pre-commit failure: the records still point at num_src and its
             # keys are untouched — drop any strays written under the target
-            # key and put the session profile back, best effort.
+            # key (only when a write ran; see ``wrote_target`` above) and put
+            # the session profile back, best effort.
             try:
-                self._delete_account_credentials(target, email)
-                self._delete_config_backup(target, email)
+                if wrote_target:
+                    self._delete_account_credentials(target, email)
+                    self._delete_config_backup(target, email)
                 if dst_dir.exists() and not src_dir.exists():
                     os.replace(dst_dir, src_dir)
             except Exception as e:
