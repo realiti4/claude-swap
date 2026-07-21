@@ -235,7 +235,13 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+The app uses a direct native AppKit status item and transient popover through PyObjC Cocoa, rather than a menu-bar wrapper. It shows every account's 5h / 7d / spend usage and exposes the TUI's add / disable-enable / remove / refresh actions. Its refresh timer requests a store-backed snapshot; the shared usage store still controls API pacing, so open popovers do not create an independent polling loop.
+
+Use **Make active** to change the global Claude Code login. The app asks for confirmation before that global switch. **Session** appears for inactive OAuth accounts and opens a new Terminal window running `cswap run <account>`: that account is isolated to the new Terminal session, while your existing terminals and VS Code keep their current global login. The active account stays on its default profile, which prevents two refresh-token copies from drifting. API-key accounts do not support session mode. A session uses your normal Claude setup but keeps its own chat history unless you later choose `--share-history`.
+
+macOS may ask to allow claude-swap, or its Python host, to control Terminal the first time you launch a session. Approve the Automation prompt. If it was denied, re-enable the relevant app under **System Settings → Privacy & Security → Automation**, then try **Session** again.
+
+Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
 </details>
 

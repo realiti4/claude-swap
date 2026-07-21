@@ -355,9 +355,9 @@ class SessionManager:
             )
         else:
             # Same-account fast path: never create a second credential copy
-            # for the account that is already the active default login —
-            # two copies of one account can drift if the server rotates the
-            # refresh token.
+            # for the account that is already the active default login — two
+            # copies of one account can drift if the server rotates its refresh
+            # token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
                 print(
