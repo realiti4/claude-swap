@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -499,15 +498,10 @@ def test_format_title_reflects_passed_weekly_reset():
 
 # --- run() app glue ------------------------------------------------------------
 
-def test_run_without_rumps_raises_clean_error(monkeypatch):
-    """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
+def test_run_without_appkit_raises_clean_error(monkeypatch):
+    """A missing native AppKit runtime surfaces as ClaudeSwitchError."""
+    from claude_swap import menubar_appkit
 
-    The module is import-safe without rumps, so the CLI's ImportError guard
-    around ``from claude_swap.menubar import run`` can never fire — the import
-    failure happens inside ``run()``. Blocking the import (a ``None`` entry in
-    ``sys.modules`` makes ``import rumps`` raise) checks that ``run()`` turns
-    it into the error type the CLI renders with the install hint.
-    """
-    monkeypatch.setitem(sys.modules, "rumps", None)
+    monkeypatch.setattr(menubar_appkit, "APPKIT_AVAILABLE", False)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)

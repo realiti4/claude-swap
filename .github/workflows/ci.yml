@@ -46,6 +46,28 @@ jobs:
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest
 
+  macos-menubar:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install menu-bar dependencies
+        run: uv sync --extra menubar --locked
+
+      - name: Verify native AppKit runtime
+        run: uv run python -c "import AppKit; print(AppKit.__file__)"
+
+      - name: Run native menu-bar smoke and pure tests
+        # conftest.py replaces Keychain and keyring access with in-memory fakes,
+        # so these run without credentials or a real Claude login.
+        run: uv run pytest tests/test_menubar_appkit.py tests/test_menubar.py tests/test_menubar_viewmodel.py tests/test_menubar_controller.py
+
   macos-keychain:
     runs-on: macos-latest
 

@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-menubar = ["rumps>=0.4.0"]
+menubar = ["pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
