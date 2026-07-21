@@ -5,7 +5,11 @@ description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "keyring>=25.0.0",
+    # Windows-only: needed solely by the one-time keyring -> files migration
+    # (migrations.py) for users upgrading from <=0.10.x. macOS/Linux never
+    # import it on the hot path; the macOS migration has a security-CLI
+    # fallback and the legacy purge sweep no-ops when it's absent.
+    "keyring>=25.0.0; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
 ]
