@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import plistlib
 import sys
 from pathlib import Path
 
@@ -18,6 +19,50 @@ import pytest
 from claude_swap import menubar
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import USAGE_API_KEY
+
+
+# --- notification identity -----------------------------------------------------
+
+def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    info.write_bytes(plistlib.dumps({"ExistingKey": "kept"}))
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert result == info
+    data = plistlib.loads(info.read_bytes())
+    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
+    assert data["CFBundleName"] == "claude-swap"
+    assert data["ExistingKey"] == "kept"
+
+
+def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    # truncated XML plist: plistlib raises ExpatError, not InvalidFileException
+    info.write_bytes(
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<plist version="1.0"><dict><key>CFBundle'
+    )
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert result == info
+    data = plistlib.loads(info.read_bytes())
+    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
+    assert data["CFBundleName"] == "claude-swap"
+    assert not (executable.parent / "Info.plist.tmp").exists()
+
+
+def test_notification_identity_is_noop_off_macos(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    assert menubar.ensure_notification_identity(
+        executable, platform="linux"
+    ) is None
+    assert not (executable.parent / "Info.plist").exists()
 
 
 # --- settings ------------------------------------------------------------------
