@@ -1384,6 +1384,7 @@ class ClaudeAccountSwitcher:
             num: (info.get("email", ""), info.get("organizationUuid", "") or "")
             for num, info in data.get("accounts", {}).items()
         }
+        # No models needed: only fetched_at is read, never scoped-window trust.
         return {
             num: entry.fetched_at
             for num, entry in self._usage_store.entries(identities).items()
@@ -2794,13 +2795,16 @@ class ClaudeAccountSwitcher:
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
         }
         info_by_num = {str(info[0]): info for info in accounts_info}
+        # Scoped-window models so the 429-stale trust bound honors per-model
+        # (e.g. Fable) resets, matching the poll planner's window view.
+        _threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
 
-        entries = store.entries(identities)
+        entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -2825,7 +2829,7 @@ class ClaudeAccountSwitcher:
             for num, record in records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
-            entries = store.entries(identities)
+            entries = store.entries(identities, models)
             self._persist_poll_plans(
                 records, pre, entries, info_by_num, identities
             )
@@ -2891,6 +2895,7 @@ class ClaudeAccountSwitcher:
         try:
             identities = {number: (email, org_uuid or "")}
             now = self._usage_store.clock()
+            # No models needed: only fetched_at/next_poll_at is read here.
             entry = self._usage_store.entries(identities).get(number)
             if entry is None or entry.fetched_at is None:
                 return

@@ -183,10 +183,11 @@ class TestExtendedTrust:
     def test_429_staleness_trusted_until_window_reset(self, store, clock):
         # A usage-endpoint 429 throttles polling; it does NOT move the account's
         # real windows. Usage only rises within a window (monotone until reset),
-        # so last_good is a valid lower bound — trust it right up to its window
-        # reset, no matter how long the throttle lasts. Far past the general
-        # TRUST_MAX_AGE_S but still before the reset → still trusted.
-        usage = self._usage_resetting_at(clock, TRUST_MAX_AGE_S * 4)
+        # so last_good is a valid lower bound — trust it up to its reset, as long
+        # as that reset is within the client-side ceiling. Reset inside the
+        # ceiling → trusted right up to it, past the general TRUST_MAX_AGE_S.
+        reset_ahead = (TRUST_MAX_AGE_S + RATE_LIMIT_TRUST_MAX_AGE_S) / 2  # < ceiling
+        usage = self._usage_resetting_at(clock, reset_ahead)
         store.record({"1": FetchRecord(usage=usage)}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S + 1)  # past the general ceiling...
@@ -222,6 +223,85 @@ class TestExtendedTrust:
         clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() is None  # past cap
+
+
+class TestRateLimitTrustBounds:
+    """The 429-stale trust must be bounded even with reset metadata present:
+    (a) clamped to a client-side ceiling so a far-future/malformed resets_at
+    can't grant indefinite trust, (b) keyed on the EARLIEST future reset (any
+    relevant window reset invalidates the snapshot), and (c) robust to partial
+    metadata (a window missing resets_at must not let a longer window's reset
+    override the ceiling).
+    """
+
+    def _usage(self, clock, five_h_ahead, seven_d_ahead):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            if ahead is None:
+                return None
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        five = {"pct": 25.0}
+        if five_h_ahead is not None:
+            five["resets_at"] = iso(five_h_ahead)
+        seven = {"pct": 10.0}
+        if seven_d_ahead is not None:
+            seven["resets_at"] = iso(seven_d_ahead)
+        return {"five_hour": five, "seven_day": seven}
+
+    def test_far_future_reset_is_clamped_to_the_ceiling(self, store, clock):
+        # A malformed/far-future resets_at (year 2099) must NOT grant unbounded
+        # trust: the client-side ceiling caps it.
+        far = 10 * 365 * 24 * 3600.0  # ~10 years
+        usage = self._usage(clock, far, far)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        # past the ceiling → no longer trusted, despite the far-future reset
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_trust_keys_on_earliest_future_reset(self, store, clock):
+        # 5h resets soon, 7d resets far ahead. The snapshot is invalid once the
+        # SOONER window rolls over (usage zeroes there), so trust must end at the
+        # earliest reset, not the latest.
+        usage = self._usage(clock, 600.0, 100 * 3600.0)  # 5h: 10min, 7d: far
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(601.0)  # past the 5h reset, long before the 7d one
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_partial_metadata_still_bounded_by_ceiling(self, store, clock):
+        # 5h has NO resets_at (a shape the server actually sends); 7d resets far
+        # ahead. The missing-reset window must not let the far 7d reset grant
+        # near-unbounded trust — the ceiling still applies.
+        usage = self._usage(clock, None, 100 * 3600.0)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_ceiling_wins_when_reset_is_beyond_it(self, store, clock):
+        # Reset farther out than the ceiling: trusted up to the ceiling, then
+        # unknown — the ceiling, not the reset, is the bound.
+        usage = self._usage(
+            clock, RATE_LIMIT_TRUST_MAX_AGE_S * 3, RATE_LIMIT_TRUST_MAX_AGE_S * 3
+        )
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S - 60)  # just inside the ceiling
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == usage
+        clock.advance(120)  # now just past the ceiling
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
 
 
 class TestBackoff:

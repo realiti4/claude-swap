@@ -291,29 +291,54 @@ def due_candidate(
 
 
 def _rate_limited_trust_ok(
-    last_good: dict | None, age_s: float | None, now: float
+    last_good: dict | None,
+    age_s: float | None,
+    now: float,
+    models: tuple[str, ...] = (),
 ) -> bool:
     """Whether 429-stale ``last_good`` is still trustworthy for decisions.
 
     Usage rises monotonically within a window, so a rate-limited (frozen)
-    last_good is a valid lower bound until its window resets. Three cases:
+    last_good is a valid lower bound until its window resets — but only up to a
+    client-side ceiling, so a far-future or malformed ``resets_at`` can never
+    grant unbounded trust. The bound is:
 
-    - a window reset is still ahead → trusted (the measured value can only be
-      an under-estimate of the true usage until then);
-    - every window's reset is already past → obsolete (usage was zeroed at the
-      reset; the stored value no longer describes reality) → not trusted;
-    - no reset info at all (older stored rows) → fall back to the bounded
-      RATE_LIMIT_TRUST_MAX_AGE_S so it still can't be trusted forever.
+        now < min(earliest future relevant-window reset, age-ceiling)
+
+    - **earliest** relevant-window reset (not latest): once the *soonest*
+      window rolls over, usage there is zeroed and the whole snapshot is
+      obsolete — a later window's reset can't rescue it. So if the earliest
+      known reset is already in the past, the value is untrusted outright,
+      regardless of any farther-future window.
+    - **age-ceiling** (``RATE_LIMIT_TRUST_MAX_AGE_S`` past ``last_good``): the
+      hard client-side cap. It applies whether or not any reset is known, so
+      even an all-``resets_at`` response — including a far-future or malformed
+      one — is bounded, matching the ~1h stale fallback Claude Code itself uses.
+      Rows with no reset info at all fall back to it alone.
+
+    A window carrying no ``resets_at`` simply contributes no timestamp; it never
+    extends trust, so partial metadata can only tighten the bound, never loosen
+    it. ``models`` selects the per-model scoped windows that also gate the
+    account, so their resets are considered too (matching the scheduler's view).
     """
-    windows = oauth.relevant_windows(last_good) if last_good is not None else []
-    reset_tss = [
+    if age_s is None:
+        return False
+    ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
+    windows = (
+        oauth.relevant_windows(last_good, models)
+        if last_good is not None
+        else []
+    )
+    resets = [
         ts
         for _, _, resets_at in windows
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
-    if reset_tss:
-        return now < max(reset_tss)
-    return age_s is not None and age_s <= RATE_LIMIT_TRUST_MAX_AGE_S
+    if resets:
+        # The soonest window to roll over invalidates the snapshot; never trust
+        # past it, and never past the client-side ceiling.
+        return now < min(min(resets), ceiling)
+    return now < ceiling
 
 
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
@@ -380,9 +405,18 @@ class UsageStore:
 
     # -- read model -----------------------------------------------------------
 
-    def entries(self, identities: dict[str, Identity]) -> dict[str, UsageEntry]:
+    def entries(
+        self,
+        identities: dict[str, Identity],
+        models: tuple[str, ...] = (),
+    ) -> dict[str, UsageEntry]:
         """Identity-guarded snapshot for the given slots (empty entry when the
-        row is missing or belongs to a different account)."""
+        row is missing or belongs to a different account).
+
+        ``models`` are the configured scoped-window model names; they let the
+        429-stale trust bound also honor per-model (e.g. Fable) window resets,
+        matching the scheduler's window view. Omitted (``()``) for callers that
+        only read timestamps/last-good and never consult scoped resets."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -413,7 +447,10 @@ class UsageStore:
             # holds, so it always uses the general ceiling.
             if row.get("lastError") == "http-429":
                 within_ceiling = _rate_limited_trust_ok(
-                    last_good if isinstance(last_good, dict) else None, age_s, now
+                    last_good if isinstance(last_good, dict) else None,
+                    age_s,
+                    now,
+                    models,
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
