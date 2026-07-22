@@ -9,6 +9,7 @@ flows) — no scraping, no real credentials, no network.
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 import threading
 import time
@@ -282,6 +283,15 @@ class TestFormatting:
             80,
         ).plain
         assert "last seen" not in api_key
+
+    def test_account_card_uses_light_palette_when_passed(self):
+        from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
+        from claude_swap.tui.widgets import account_card_text
+
+        acc = make_account(1, active=True, entry=make_entry(pct5=95.0))
+        text = account_card_text(acc, 100, palette=Palette.from_theme(CSWAP_LIGHT))
+        styles = {str(span.style) for span in text.spans}
+        assert any(ACCENT_LIGHT in s for s in styles)  # active marker uses light accent
 
     def test_window_helpers(self):
         entry = make_entry(pct5=47.0)
@@ -655,6 +665,7 @@ class TestDashboard:
                 "add-menu",
                 "disable-menu",
                 "remove-menu",
+                "theme-menu",
                 "quit",
             ]
             # nest into Add (index 3), then back out with escape
@@ -692,6 +703,29 @@ class TestDashboard:
             assert any("dev (user1@example.com)" in label for label in labels)
             assert any("plain@example.com" in label for label in labels)
             assert not any("(plain@example.com)" in label for label in labels)
+
+    async def test_remove_menu_label_renders_bracket_tag_literally(self, tmp_path):
+        # The remove menu labels each account with `[{display_tag}]`, and an
+        # org name of "red" makes that literally "[red]" — a valid Rich
+        # color markup tag. MenuItem must render it as text, not consume it
+        # as styling (which would silently drop the tag from the label).
+        fake = FakeSwitcher(
+            [dataclasses.replace(make_account(1, active=True), org_name="red")],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            await menu_select(pilot, "remove-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [
+                item.query_one(Static).render().plain for item in menu.query(MenuItem)
+            ]
+            assert any("[red]" in label for label in labels)
 
     async def test_back_menu_entry_pops_submenu(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -1278,6 +1312,18 @@ class TestEventText:
 
         assert event.human() in event_text(event).plain
 
+    def test_event_text_uses_light_accent_for_switch(self):
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
+
+        event = SwitchEvent(
+            trigger="proactive",
+            from_ref={"number": 1, "email": "a@x.com"},
+            to_ref={"number": 2, "email": "b@x.com"},
+        )
+        text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
+        assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
+
 
 # ---------------------------------------------------------------------------
 # accounts_snapshot on the real switcher
@@ -1361,3 +1407,75 @@ class TestBareInvocation:
             cli.main()
         assert excinfo.value.code == 0
         assert launched["start"] == "watch"
+
+
+# ---------------------------------------------------------------------------
+# Theme wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestThemeWiring:
+    async def test_mount_selects_light_theme_from_settings(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"theme": "light"}}))
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.theme == "cswap-light"
+
+    async def test_auto_setting_uses_detected_light(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"theme": "auto"}}))
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        from claude_swap.tui.app import CswapApp
+        app = CswapApp(fake, detected="light")
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.theme == "cswap-light"
+
+    async def test_auto_setting_no_detection_falls_back_to_dark(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"theme": "auto"}}))
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        from claude_swap.tui.app import CswapApp
+        app = CswapApp(fake, detected=None)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.theme == "cswap-dark"
+
+    async def test_toggle_cycles_dark_light_auto(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"theme": "dark"}}))
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        from claude_swap.tui.app import CswapApp
+        app = CswapApp(fake, detected="light")
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.theme == "cswap-dark"          # setting dark
+            app.action_toggle_theme(); await pilot.pause()
+            assert app.theme == "cswap-light"          # → light
+            app.action_toggle_theme(); await pilot.pause()
+            assert app.theme == "cswap-light"          # → auto, detected=light
+            assert json.loads((tmp_path / "settings.json").read_text())["ui"]["theme"] == "auto"
+            app.action_toggle_theme(); await pilot.pause()
+            assert app.theme == "cswap-dark"           # → back to dark
+
+    async def test_theme_menu_marks_current_and_applies(self, tmp_path):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import MenuItem
+
+        fake = FakeSwitcher([make_account("1", active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            assert app._theme_name == "auto"  # default
+            await menu_select(pilot, "theme-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [it.query_one(Static).render().plain for it in menu.query(MenuItem)]
+            assert any("dark" in lbl for lbl in labels)
+            assert any("light" in lbl for lbl in labels)
+            current = next(lbl for lbl in labels if "auto" in lbl)
+            assert "●" in current  # the current theme is marked
+            await menu_select(pilot, "theme:light")
+            assert app._theme_name == "light"
+            assert app.theme == "cswap-light"
+

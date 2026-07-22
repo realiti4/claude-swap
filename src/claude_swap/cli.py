@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from claude_swap import __version__
+from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
@@ -19,6 +19,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.settings import load_ui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -843,6 +844,16 @@ def main() -> None:
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
+    try:
+        from claude_swap.appearance import cli_should_probe, cli_theme
+        # `run` execs a child that takes over the terminal, and `--json`
+        # must stay machine-readable — never probe (and emit the OSC query)
+        # in either case.
+        probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
+        name = cli_theme(load_ui_settings(paths.get_backup_root()).theme, colors=probe)
+        printer.set_theme(name)
+    except Exception:
+        pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":

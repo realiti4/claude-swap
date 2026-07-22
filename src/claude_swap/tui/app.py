@@ -11,17 +11,19 @@ from __future__ import annotations
 from functools import partial
 
 from textual.app import App
+from textual.binding import Binding
 from textual.reactive import reactive
 from textual.worker import WorkerState
 
+from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import load_settings
+from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
-from claude_swap.tui.theme import CSWAP_DARK
+from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
 class CswapApp(App):
@@ -30,9 +32,9 @@ class CswapApp(App):
     TITLE = "claude-swap"
     CSS_PATH = "cswap.tcss"
     # No command palette: actions live in the dashboard's nested menu, in
-    # their own context — not in a global searchable list. This also drops
-    # Textual's system commands (theme picker included; there is one theme).
+    # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
+    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
 
@@ -40,11 +42,16 @@ class CswapApp(App):
     busy: reactive[bool] = reactive(False)
 
     def __init__(
-        self, switcher: ClaudeAccountSwitcher, *, start: str = "dashboard"
+        self,
+        switcher: ClaudeAccountSwitcher,
+        *,
+        start: str = "dashboard",
+        detected: str | None = None,
     ) -> None:
         super().__init__()
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
+        self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
         self._store_only = False
         self._full_next = False
@@ -58,10 +65,18 @@ class CswapApp(App):
             ).threshold
         except Exception:
             self.threshold_pct = None
+        try:
+            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+        except Exception:
+            self._theme_name = "auto"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
-        self.theme = "cswap-dark"
+        self.register_theme(CSWAP_LIGHT)
+        resolved = self._resolved_theme()
+        # We own the theme; $TEXTUAL_THEME is intentionally not honoured.
+        self.theme = f"cswap-{resolved}"
+        printer.set_theme(resolved)
         self.push_screen(DashboardScreen())
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
@@ -288,3 +303,31 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    # -- theme --------------------------------------------------------------
+
+    def _resolved_theme(self) -> str:
+        """Concrete 'dark'/'light' for the current setting; auto → detected → dark."""
+        if self._theme_name == "auto":
+            return self._detected or "dark"
+        return self._theme_name
+
+    def apply_theme(self, name: str) -> None:
+        """Switch the live theme: TUI + captured printer output + persistence.
+
+        ``name`` is the setting; ``auto`` resolves against the pre-driver
+        detection (never re-probes mid-session)."""
+        self._theme_name = name
+        resolved = self._resolved_theme()
+        self.theme = f"cswap-{resolved}"
+        printer.set_theme(resolved)
+        try:
+            set_setting(self.switcher.backup_dir, "ui.theme", name)
+        except Exception as exc:  # persistence is best-effort; never crash the UI
+            self.notify(f"Could not save theme: {exc}", severity="warning")
+
+    def action_toggle_theme(self) -> None:
+        order = ("dark", "light", "auto")
+        nxt = order[(order.index(self._theme_name) + 1) % len(order)]
+        self.apply_theme(nxt)
+        self.notify(f"Theme: {nxt}")

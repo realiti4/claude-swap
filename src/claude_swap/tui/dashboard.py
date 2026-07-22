@@ -80,6 +80,7 @@ class DashboardScreen(Screen):
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
+            ("Theme…", "theme-menu"),
             ("Quit", "quit"),
         ]
 
@@ -115,6 +116,16 @@ class DashboardScreen(Screen):
             entries.append(
                 (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
             )
+        entries.append(_BACK)
+        return entries
+
+    def _theme_entries(self) -> MenuEntries:
+        """dark / light / auto, with the active setting marked."""
+        current = self.app._theme_name
+        entries: MenuEntries = [
+            (f"{'●' if name == current else ' '} {name}", f"theme:{name}")
+            for name in ("dark", "light", "auto")
+        ]
         entries.append(_BACK)
         return entries
 
@@ -168,6 +179,13 @@ class DashboardScreen(Screen):
                 "?",
             )
             app.confirm_remove(number, email)
+        elif action_id == "theme-menu":
+            await self._push_menu("theme", self._theme_entries())
+        elif action_id.startswith("theme:"):
+            name = action_id.split(":", 1)[1]
+            app.apply_theme(name)
+            app.notify(f"Theme: {name}")
+            await self._pop_menu()
         elif action_id == "disable-menu":
             await self._push_menu("disable / enable", self._disable_entries())
         elif action_id.startswith("disable:"):
