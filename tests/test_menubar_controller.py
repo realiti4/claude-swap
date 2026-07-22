@@ -5,7 +5,9 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import patch
 
+from claude_swap.autoswitch import SwitchEvent
 from claude_swap.macos_terminal import TerminalLaunchResult
 from claude_swap.menubar_controller import MenuBarController
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
@@ -25,19 +27,40 @@ class _SnapshotSource:
 class _Switcher:
     def __init__(self, backup_dir: Path) -> None:
         self.backup_dir = backup_dir
+        self.config_path = backup_dir / ".claude.json"
         self.calls: list[tuple[object, ...]] = []
         self.current_account: tuple[str, str] | None = ("one@example.test", "")
+        self.current_account_reads = 0
+        self.probe_threads: list[int] = []
+        self.switch_to_result: dict[str, object] = {
+            "switched": True,
+            "message": "Switched to Account-2 (two@example.test)",
+            "warnings": [],
+        }
+        self.switch_result: dict[str, object] = {
+            "switched": True,
+            "message": "Switched account",
+            "warnings": [],
+        }
+
+    def _get_claude_config_path(self) -> Path:
+        self.probe_threads.append(threading.get_ident())
+        return self.config_path
 
     def _get_current_account(self) -> tuple[str, str] | None:
+        self.current_account_reads += 1
+        self.probe_threads.append(threading.get_ident())
         return self.current_account
 
-    def switch_to(self, slot: str, *, json_output: bool = False) -> dict[str, bool]:
+    def switch_to(self, slot: str, *, json_output: bool = False) -> dict[str, object]:
         self.calls.append(("switch_to", slot, json_output))
-        return {"switched": True}
+        return self.switch_to_result
 
-    def switch(self, *, strategy: str | None = None, json_output: bool = False) -> dict[str, bool]:
+    def switch(
+        self, *, strategy: str | None = None, json_output: bool = False
+    ) -> dict[str, object]:
         self.calls.append(("switch", strategy, json_output))
-        return {"switched": True}
+        return self.switch_result
 
     def add_account(self, *, slot: int | None = None) -> None:
         self.calls.append(("add_account", slot))
@@ -73,6 +96,14 @@ def _snapshot() -> AccountsSnapshot:
 
 def _wait_for(event: threading.Event) -> None:
     assert event.wait(1), "serialized worker did not complete"
+
+
+def _wait_until(predicate: Callable[[], bool]) -> None:
+    for _ in range(100):
+        if predicate():
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("condition did not become true")
 
 
 def test_make_active_calls_only_direct_switch_to(tmp_path: Path) -> None:
@@ -125,6 +156,88 @@ def test_rotate_uses_json_output_without_implicitly_capturing_a_login(tmp_path: 
     controller.stop()
 
 
+def test_json_switch_noop_message_and_warnings_are_rendered(tmp_path: Path) -> None:
+    switcher = _Switcher(tmp_path)
+    switcher.switch_result = {
+        "switched": False,
+        "message": "Already on the account with the most remaining quota.",
+        "warnings": ["Skipped Account-2 (disabled)"],
+    }
+    messages: list[tuple[str, str]] = []
+    notified = threading.Event()
+    controller = MenuBarController(switcher, snapshot_source=_SnapshotSource(_snapshot()))
+
+    def message(title: str, detail: str) -> None:
+        messages.append((title, detail))
+        notified.set()
+
+    controller.bind_ui(lambda _model, _title: None, message)
+    controller.rotate("best")
+
+    _wait_for(notified)
+    assert messages == [
+        (
+            "Account unchanged",
+            "Already on the account with the most remaining quota. "
+            "Warning: Skipped Account-2 (disabled)",
+        )
+    ]
+    controller.stop()
+
+
+def test_live_session_warning_is_rendered_after_json_switch(tmp_path: Path) -> None:
+    switcher = _Switcher(tmp_path)
+    live_session_warning = (
+        "Account-2 has a live session-mode Claude instance; its credential copy "
+        "can go stale."
+    )
+    switcher.switch_to_result = {
+        "switched": True,
+        "message": "Switched to Account-2 (two@example.test)",
+        "warnings": [live_session_warning],
+    }
+    messages: list[tuple[str, str]] = []
+    notified = threading.Event()
+    controller = MenuBarController(switcher, snapshot_source=_SnapshotSource(_snapshot()))
+
+    def message(title: str, detail: str) -> None:
+        messages.append((title, detail))
+        notified.set()
+
+    controller.bind_ui(lambda _model, _title: None, message)
+    controller.make_active("2")
+
+    _wait_for(notified)
+    assert messages[0][0] == "Switch warning"
+    assert messages[0][1].startswith(live_session_warning)
+    assert messages[0][1].endswith("Switch takes effect within about 30 seconds.")
+    controller.stop()
+
+
+def test_auto_switch_event_renders_credential_drift_warning(tmp_path: Path) -> None:
+    switcher = _Switcher(tmp_path)
+    messages: list[tuple[str, str]] = []
+    controller = MenuBarController(switcher, snapshot_source=_SnapshotSource(_snapshot()))
+    controller.bind_ui(
+        lambda _model, _title: None,
+        lambda title, detail: messages.append((title, detail)),
+    )
+    warning = "Live session credential copy can drift."
+
+    controller._handle_engine_event(
+        SwitchEvent(
+            trigger="proactive",
+            from_ref={"number": 1, "email": "one@example.test"},
+            to_ref={"number": 2, "email": "two@example.test"},
+            warnings=[warning],
+        )
+    )
+
+    assert messages[0][0] == "Auto-switch warning"
+    assert messages[0][1].startswith(warning)
+    controller.stop()
+
+
 def test_snapshot_refresh_uses_store_only_while_engine_is_running(tmp_path: Path) -> None:
     switcher = _Switcher(tmp_path)
     source = _SnapshotSource(_snapshot())
@@ -132,15 +245,16 @@ def test_snapshot_refresh_uses_store_only_while_engine_is_running(tmp_path: Path
     controller = MenuBarController(switcher, snapshot_source=source)
     controller.bind_ui(lambda _model, _title: rendered.set(), lambda _title, _message: None)
     rendered.clear()
-    # The controller only needs presence to choose the SnapshotSource read mode.
-    controller._engine = object()  # type: ignore[assignment]
+    # The controller only needs a tracked engine thread to choose store-only mode.
+    engine = object()
+    controller._engine_threads[engine] = threading.current_thread()  # type: ignore[index]
 
     controller.refresh_async(full=True)
 
     _wait_for(rendered)
     assert source.calls == [(True, True)]
     assert controller.view_model.active_number == "1"
-    controller._engine = None
+    controller._engine_threads.pop(engine)  # type: ignore[arg-type]
     controller.stop()
 
 
@@ -196,6 +310,45 @@ def test_external_unmanaged_login_refreshes_once_without_a_watcher_loop(tmp_path
     controller.stop()
 
 
+def test_external_account_probe_stats_before_parsing_and_runs_off_main_thread(
+    tmp_path: Path,
+) -> None:
+    switcher = _Switcher(tmp_path)
+    switcher.config_path.write_text('{"oauthAccount": {}}', encoding="utf-8")
+    source = _SnapshotSource(_snapshot())
+    rendered = threading.Event()
+    controller = MenuBarController(switcher, snapshot_source=source)
+    controller.bind_ui(lambda _model, _title: rendered.set(), lambda _title, _message: None)
+    controller._worker_succeeded(_snapshot())
+    rendered.clear()
+    main_thread = threading.get_ident()
+
+    controller.detect_external_active_account()
+    _wait_until(
+        lambda: switcher.current_account_reads == 1
+        and not controller._active_probe_in_flight
+    )
+    controller.detect_external_active_account()
+    _wait_until(lambda: not controller._active_probe_in_flight)
+
+    assert switcher.current_account_reads == 1
+    assert switcher.probe_threads
+    assert all(thread_id != main_thread for thread_id in switcher.probe_threads)
+    assert source.calls == []
+
+    switcher.current_account = ("two@example.test", "")
+    switcher.config_path.write_text(
+        '{"oauthAccount": {"emailAddress": "two@example.test"}}',
+        encoding="utf-8",
+    )
+    controller.detect_external_active_account()
+
+    _wait_for(rendered)
+    assert switcher.current_account_reads == 2
+    assert source.calls == [(False, False)]
+    controller.stop()
+
+
 def test_explicit_refresh_surfaces_a_snapshot_error(tmp_path: Path) -> None:
     class FailingSnapshotSource:
         def take(self, *, full: bool = False, store_only: bool = False) -> AccountsSnapshot:
@@ -216,20 +369,53 @@ def test_explicit_refresh_surfaces_a_snapshot_error(tmp_path: Path) -> None:
     controller.stop()
 
 
-def test_stop_waits_for_the_auto_switch_thread_before_terminating(tmp_path: Path) -> None:
+def test_engine_restart_waits_for_old_thread_and_quit_waits_for_replacement(
+    tmp_path: Path,
+) -> None:
+    instances: list[ControlledEngine] = []
+
+    class ControlledEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.entered = threading.Event()
+            self.stop_called = threading.Event()
+            self.release = threading.Event()
+            instances.append(self)
+
+        def run_loop(self) -> None:
+            self.entered.set()
+            assert self.release.wait(1), "engine credential operation was not released"
+
+        def stop(self) -> None:
+            self.stop_called.set()
+
     switcher = _Switcher(tmp_path)
     controller = MenuBarController(switcher, snapshot_source=_SnapshotSource(_snapshot()))
-    completed = threading.Event()
-    with controller._state_lock:
-        controller._engine_running = True
+    controller.settings.auto_switch_enabled = True
 
-    controller.stop(completed.set)
+    with patch("claude_swap.menubar_controller.AutoSwitchEngine", ControlledEngine):
+        controller._start_engine_worker()
+        old = instances[0]
+        _wait_for(old.entered)
 
-    assert not completed.is_set()
-    with controller._state_lock:
-        controller._engine_running = False
-    controller._notify_when_idle()
-    assert completed.is_set()
+        controller.settings.auto_switch_enabled = False
+        controller._stop_engine_worker()
+        assert old.stop_called.is_set()
+
+        controller.settings.auto_switch_enabled = True
+        controller._start_engine_worker()
+        assert len(instances) == 1
+
+        old.release.set()
+        _wait_until(lambda: len(instances) == 2 and instances[1].entered.is_set())
+        replacement = instances[1]
+        completed = threading.Event()
+
+        controller.stop(completed.set)
+
+        assert replacement.stop_called.is_set()
+        assert not completed.is_set()
+        replacement.release.set()
+        _wait_for(completed)
 
 
 def test_load_history_renders_updated_history_on_main_dispatch(tmp_path: Path) -> None:

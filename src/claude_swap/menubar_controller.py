@@ -42,13 +42,15 @@ MessageCallback = Callable[[str, str], None]
 MainDispatcher = Callable[[Callable[[], None]], None]
 TerminalLauncher = Callable[[str], TerminalLaunchResult]
 RevealLog = Callable[[Path], None]
+ConfigSignature = tuple[Path, int | None, int | None, int | None]
 
 
 @dataclass(frozen=True)
 class ActiveAccountProbe:
-    """The active global identity read by the lightweight external-switch watcher."""
+    """Result of checking whether the global config changed on disk."""
 
-    identity: tuple[str, str] | None
+    config_changed: bool
+    identity: tuple[str, str] | None = None
 
 
 def _run_reveal_log(path: Path) -> None:
@@ -97,13 +99,15 @@ class MenuBarController:
         self._refreshing = False
         self._active_probe_in_flight = False
         self._active_identity: tuple[str, str] | None = None
+        self._active_config_signature: ConfigSignature | None = None
+        self._active_config_signature_initialized = False
         self._pending_work = 0
         self._stop_when_idle: Callable[[], None] | None = None
         self._stopped = False
         self._engine: AutoSwitchEngine | None = None
-        self._engine_thread: threading.Thread | None = None
-        self._engine_running = False
+        self._engine_threads: dict[AutoSwitchEngine, threading.Thread] = {}
         self._engine_starting = False
+        self._engine_restart_requested = False
         self._snapshot: AccountsSnapshot | None = None
         self._view_model = MenuBarPopoverViewModel((), None)
         self._title = format_title(None, None, self.settings)
@@ -160,8 +164,10 @@ class MenuBarController:
         with self._state_lock:
             self._stopped = True
             self._stop_when_idle = when_idle
-            engine, self._engine = self._engine, None
-        if engine is not None:
+            self._engine = None
+            self._engine_restart_requested = False
+            engines = tuple(self._engine_threads)
+        for engine in engines:
             engine.stop()
         if self._owns_executor and isinstance(self._executor, ThreadPoolExecutor):
             self._executor.shutdown(wait=False, cancel_futures=True)
@@ -184,10 +190,7 @@ class MenuBarController:
             if self._stopped or self._active_probe_in_flight:
                 return
             self._active_probe_in_flight = True
-        self._submit(
-            lambda: ActiveAccountProbe(self.switcher._get_current_account()),
-            self._active_probe_failed,
-        )
+        self._submit(self._active_probe_worker, self._active_probe_failed)
 
     def make_active(self, slot: str) -> None:
         """Explicitly activate a selected slot using only ``switch_to``."""
@@ -336,7 +339,8 @@ class MenuBarController:
             if (
                 not self._stopped
                 or self._pending_work != 0
-                or self._engine_running
+                or self._engine_starting
+                or bool(self._engine_threads)
                 or self._stop_when_idle is None
             ):
                 return
@@ -358,8 +362,10 @@ class MenuBarController:
             return
         if isinstance(result, ActiveAccountProbe):
             with self._state_lock:
-                changed = result.identity != self._active_identity
                 self._active_probe_in_flight = False
+                if not result.config_changed:
+                    return
+                changed = result.identity != self._active_identity
                 self._active_identity = result.identity
             if changed:
                 self.refresh_async()
@@ -375,17 +381,41 @@ class MenuBarController:
             else:
                 self._notify("Couldn't launch isolated session", result.error_message or "Terminal launch failed.")
             return
-        if isinstance(result, dict) and result.get("switched"):
-            self._notify("Account switched", "Switch takes effect within about 30 seconds.")
+        if isinstance(result, dict) and isinstance(result.get("switched"), bool):
+            self._render_switch_result(result)
         self._render()
         self.refresh_async()
 
     def _refresh_worker(self, full: bool) -> AccountsSnapshot:
         with self._state_lock:
-            store_only = self._engine is not None or self._engine_starting
+            store_only = bool(self._engine_threads) or self._engine_starting
         snapshot = self.snapshot_source.take(full=full, store_only=store_only)
         self._log_usage(snapshot)
         return snapshot
+
+    def _active_probe_worker(self) -> ActiveAccountProbe:
+        """Stat the global config and parse its identity only after it changes."""
+        config_path = self.switcher._get_claude_config_path()
+        try:
+            stat = config_path.stat()
+            signature = (config_path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            signature = (config_path, None, None, None)
+
+        with self._state_lock:
+            changed = (
+                not self._active_config_signature_initialized
+                or signature != self._active_config_signature
+            )
+            if changed:
+                self._active_config_signature = signature
+                self._active_config_signature_initialized = True
+        if not changed:
+            return ActiveAccountProbe(config_changed=False)
+        return ActiveAccountProbe(
+            config_changed=True,
+            identity=self.switcher._get_current_account(),
+        )
 
     def _refresh_failed(self, error: BaseException, *, user_requested: bool = False) -> None:
         with self._state_lock:
@@ -408,6 +438,31 @@ class MenuBarController:
 
     def _history_failed(self, error: BaseException) -> None:
         self._notify("Switch history unavailable", str(error))
+
+    def _render_switch_result(self, result: dict) -> None:
+        """Surface structured switch messages that JSON mode does not print."""
+        switched = result["switched"] is True
+        message = result.get("message")
+        fallback = "Switch completed." if switched else "No account change was made."
+        detail = message if isinstance(message, str) and message else fallback
+        warnings = result.get("warnings")
+        warning_messages = (
+            [item for item in warnings if isinstance(item, str) and item]
+            if isinstance(warnings, list)
+            else []
+        )
+        if switched:
+            if warning_messages:
+                detail = f"{' '.join(warning_messages)} {detail}"
+                title = "Switch warning"
+            else:
+                title = "Account switched"
+            detail = f"{detail} Switch takes effect within about 30 seconds."
+        else:
+            title = "Account unchanged"
+            if warning_messages:
+                detail = f"{detail} Warning: {' '.join(warning_messages)}"
+        self._notify(title, detail)
 
     def _terminal_complete(self, error: BaseException) -> None:
         self._notify("Couldn't launch isolated session", str(error))
@@ -432,7 +487,17 @@ class MenuBarController:
 
     def _start_engine_worker(self) -> None:
         with self._state_lock:
-            if self._engine is not None or self._engine_starting:
+            if (
+                self._stopped
+                or not self.settings.auto_switch_enabled
+                or self._engine is not None
+                or self._engine_starting
+            ):
+                return
+            if self._engine_threads:
+                # A disabled engine may still be finishing a credential operation.
+                # Its finalizer starts the replacement only after that thread exits.
+                self._engine_restart_requested = True
                 return
             self._engine_starting = True
         try:
@@ -446,15 +511,24 @@ class MenuBarController:
                 target=self._run_engine, args=(engine,), daemon=True, name="claude-swap-auto"
             )
             with self._state_lock:
-                if self._stopped:
+                if self._stopped or not self.settings.auto_switch_enabled:
+                    engine.stop()
                     return
                 self._engine = engine
-                self._engine_thread = thread
-                self._engine_running = True
-            thread.start()
+                self._engine_threads[engine] = thread
+                self._engine_restart_requested = False
+            try:
+                thread.start()
+            except BaseException:
+                with self._state_lock:
+                    if self._engine is engine:
+                        self._engine = None
+                    self._engine_threads.pop(engine, None)
+                raise
         finally:
             with self._state_lock:
                 self._engine_starting = False
+            self._notify_when_idle()
 
     def _run_engine(self, engine: AutoSwitchEngine) -> None:
         try:
@@ -465,13 +539,23 @@ class MenuBarController:
             with self._state_lock:
                 if self._engine is engine:
                     self._engine = None
-                self._engine_thread = None
-                self._engine_running = False
+                self._engine_threads.pop(engine, None)
+                restart = (
+                    self._engine_restart_requested
+                    and not self._engine_threads
+                    and not self._stopped
+                    and self.settings.auto_switch_enabled
+                )
+                if restart:
+                    self._engine_restart_requested = False
+            if restart:
+                self._submit(self._start_engine_worker, self._settings_failed)
             self._notify_when_idle()
 
     def _stop_engine_worker(self) -> None:
         with self._state_lock:
             engine, self._engine = self._engine, None
+            self._engine_restart_requested = False
         if engine is not None:
             engine.stop()
 
@@ -480,7 +564,19 @@ class MenuBarController:
 
     def _handle_engine_event(self, event: AutoSwitchEvent) -> None:
         if event.kind == "switch" and not getattr(event, "dry_run", False):
-            self._notify("Auto-switched account", event.human())
+            warnings = getattr(event, "warnings", [])
+            warning_messages = (
+                [item for item in warnings if isinstance(item, str) and item]
+                if isinstance(warnings, list)
+                else []
+            )
+            detail = event.human()
+            if warning_messages:
+                detail = f"{' '.join(warning_messages)} {detail}"
+                title = "Auto-switch warning"
+            else:
+                title = "Auto-switched account"
+            self._notify(title, detail)
             self.refresh_async()
         elif event.kind in {"account-quarantined", "all-exhausted", "config-warning"}:
             self._notify("claude-swap", event.human())
