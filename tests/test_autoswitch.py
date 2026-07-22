@@ -2062,6 +2062,30 @@ class TestConsumeFirstStrategy:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
+    def test_api_key_only_peers_below_threshold_is_no_action(self, temp_home):
+        # Same exit-code parity when the only alternatives are included
+        # API-key accounts: they're never consume-first targets (no weekly
+        # window), so a healthy below-threshold tick must stay
+        # NO_ACTION/below-threshold — not fall through to a false
+        # BLOCKED/no-comparison from the empty OAuth ranking.
+        h = EngineHarness(
+            temp_home, strategy="consume-first", include_api_key_accounts=True
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_SOON),
+            "2": "api key",
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
     def test_skips_sooner_account_that_is_exhausted(self, temp_home):
         h = self._harness(temp_home)
         # #2 resets soonest but is itself at its limit (no headroom) -> ignored;

@@ -809,23 +809,30 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
-        if not oauth_candidates and not api_key_candidates:
-            if trigger == "consume-first" and active_headroom is not None:
-                # Healthy below-threshold account, nobody to compare against —
-                # the same state `best` reports as below-threshold NO_ACTION
-                # before ever reaching candidate selection. Keep the exit-code
-                # contract identical across strategies: cron wrappers keying on
-                # BLOCKED must not see false "blocked" from the flag alone.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-threshold",
-                        detail=(
-                            f"{pct_label(100.0 - active_headroom)}% < "
-                            f"{pct_label(settings.threshold)}%"
-                        ),
-                    )
+        if (
+            trigger == "consume-first"
+            and not oauth_candidates
+            and active_headroom is not None
+        ):
+            # Healthy below-threshold account with no OAuth peer to compare
+            # against — the same state `best` reports as below-threshold
+            # NO_ACTION before ever reaching candidate selection. API-key
+            # candidates don't change the outcome: they have no weekly window
+            # to consume, so a consume-first nudge never targets them. Keep
+            # the exit-code contract identical across strategies: cron
+            # wrappers keying on BLOCKED must not see false "blocked" from
+            # the flag alone.
+            self._emit(
+                NoSwitchEvent(
+                    reason="below-threshold",
+                    detail=(
+                        f"{pct_label(100.0 - active_headroom)}% < "
+                        f"{pct_label(settings.threshold)}%"
+                    ),
                 )
-                return TickOutcome.NO_ACTION
+            )
+            return TickOutcome.NO_ACTION
+        if not oauth_candidates and not api_key_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
