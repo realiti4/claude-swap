@@ -35,6 +35,41 @@ from claude_swap.session import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 ACCOUNT_EMAIL = "account2@example.com"
+def _link_dir(link: Path, target: Path) -> None:
+    """Create a reparse-point directory link, using the platform's
+    no-privilege primitive: a real junction on Windows, a symlink elsewhere.
+
+    Junctions need no privilege, but POSIX symlinks on Windows need
+    SeCreateSymbolicLinkPrivilege (Developer Mode/admin). Stubbing a junction
+    with a symlink therefore fails on a default Windows box — so on Windows we
+    stand in for a junction with an actual junction.
+    """
+    if sys.platform == "win32":
+        session_mod._create_junction(target, link)
+    else:
+        link.symlink_to(target)
+
+
+def _symlink_privilege() -> bool:
+    """Whether this host can create file symlinks at all."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        probe = Path(d) / "probe"
+        try:
+            probe.symlink_to(Path(d) / "nonexistent")
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+
+HAS_SYMLINK_PRIVILEGE = _symlink_privilege()
+requires_symlink = pytest.mark.skipif(
+    not HAS_SYMLINK_PRIVILEGE,
+    reason="needs symlink privilege (Windows Developer Mode/admin)",
+)
+
+
 ACCOUNT_NUM = "2"
 ORG_UUID = "org-uuid-2"
 
@@ -1548,11 +1583,12 @@ def fake_junction(monkeypatch):
     flows are exercisable on any host. _is_reparse_link then detects it as a
     link exactly as it would a real junction."""
 
-    def as_symlink(src, dest):
-        dest.symlink_to(src)
+    def as_link(src, dest):
+        _link_dir(dest, src)
 
-    monkeypatch.setattr(session_mod, "_create_junction", as_symlink)
-    return as_symlink
+    if sys.platform != "win32":
+        monkeypatch.setattr(session_mod, "_create_junction", as_link)
+    return as_link
 
 
 class TestShareHistoryWindows:
@@ -1572,6 +1608,7 @@ class TestShareHistoryWindows:
         mgr.switcher._write_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL, CONFIG)
         return source, session_dir, mgr
 
+    @requires_symlink
     def test_links_projects_and_history(self, win):
         source, session_dir, mgr = win
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -1697,6 +1734,7 @@ class TestShareHistoryWindows:
         assert "projects" in manifest["items"]
         assert "history.jsonl" not in manifest["items"]
 
+    @requires_symlink
     def test_can_create_file_symlink_probes_and_cleans_up(self, win):
         """The Windows privilege probe creates then removes a throwaway link."""
         source, session_dir, mgr = win
@@ -1769,6 +1807,7 @@ class TestJunctionSafety:
     faked lstat since real junctions need Windows.
     """
 
+    @requires_symlink
     def test_is_reparse_link_true_for_symlink(self, tmp_path):
         target = tmp_path / "t"
         target.mkdir()
@@ -1811,7 +1850,7 @@ class TestJunctionSafety:
         profile = tmp_path / "profile"
         profile.mkdir()
         (profile / "own.txt").write_text("disposable")
-        (profile / "projects").symlink_to(outside)  # stands in for a junction
+        _link_dir(profile / "projects", outside)  # stands in for a junction
 
         session_mod.safe_rmtree(profile)
 
@@ -1823,7 +1862,7 @@ class TestJunctionSafety:
         outside.mkdir()
         (outside / "precious.txt").write_text("keep me")
         link = tmp_path / "projects"
-        link.symlink_to(outside)
+        _link_dir(link, outside)
 
         session_mod.SessionManager._remove_managed(link)
 
@@ -1838,7 +1877,7 @@ class TestJunctionSafety:
         (outside / "aaa.jsonl").write_text("real conversation")
         session_dir = tmp_path / "profile"
         session_dir.mkdir()
-        (session_dir / "projects").symlink_to(outside)  # stands in for a junction
+        _link_dir(session_dir / "projects", outside)  # stands in for a junction
 
         manager._cleanup_failed_session(session_dir)
 
@@ -1855,7 +1894,7 @@ class TestJunctionSafety:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         session_dir.mkdir(parents=True)
-        (session_dir / "projects").symlink_to(outside)
+        _link_dir(session_dir / "projects", outside)
 
         seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
 
@@ -1870,7 +1909,7 @@ class TestJunctionSafety:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         session_dir.mkdir(parents=True)
-        (session_dir / "projects").symlink_to(outside)
+        _link_dir(session_dir / "projects", outside)
 
         monkeypatch.setattr("builtins.input", lambda *a: "y")
         seeded_switcher.purge()
