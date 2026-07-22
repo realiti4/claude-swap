@@ -597,6 +597,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--strategy",
+        choices=("best", "consume-first"),
+        default=None,
+        help=(
+            "Target selection: 'best' (most quota left; default) or "
+            "'consume-first' (proactively use the account whose weekly window "
+            "resets soonest)"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",

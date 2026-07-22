@@ -1876,3 +1876,114 @@ class TestModelAwareSwitch:
             "3": _model_usage(5, 10),
         })
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+
+# --- consume-first strategy ----------------------------------------------------
+
+# Weekly-reset instants in ascending order (all valid ISO-8601, absolute).
+_R_SOON = "2024-01-05T00:00:00Z"
+_R_LATER = "2024-01-08T00:00:00Z"
+_R_LATEST = "2024-01-10T00:00:00Z"
+
+
+def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
+    """Usage with an explicit 7-day window (utilization + optional reset)."""
+    seven: dict = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+class TestConsumeFirstStrategy:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_below_threshold_switches_to_soonest_weekly_reset(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),    # active resets later
+            "2": _usage7(10, 10, _R_SOON),     # soonest -> consume first
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_stays_when_active_already_resets_soonest(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_SOON),     # active is soonest -> stay
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_over_threshold_prefers_soonest_reset_over_max_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        # Active over threshold -> must move. #2 has LESS headroom but resets
+        # sooner; #3 has more headroom but resets latest. consume-first -> #2.
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(50, 40, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)  # default cooldown 300s
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert h.active_number() == 2  # switched to soonest
+        h.events.clear()
+        # Now a sooner account (#3) appears, but we're within cooldown.
+        outcome = h.tick_with_usage({
+            "2": _usage7(20, 20, _R_LATER),
+            "1": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_skips_sooner_account_that_is_exhausted(self, temp_home):
+        h = self._harness(temp_home)
+        # #2 resets soonest but is itself at its limit (no headroom) -> ignored;
+        # #3 resets later but has room and is sooner than active -> switch there.
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST),   # active resets latest
+            "2": _usage7(100, 100, _R_SOON),   # soonest but exhausted
+            "3": _usage7(10, 10, _R_LATER),    # sooner than active, has room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_best_strategy_unaffected_below_threshold(self, temp_home):
+        # Regression: default (best) still holds below threshold even when a
+        # peer resets sooner — consume-first behavior must be opt-in.
+        h = EngineHarness(temp_home)  # strategy defaults to "best"
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]

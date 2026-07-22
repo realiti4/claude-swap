@@ -369,6 +369,20 @@ _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
 
 
+def _seven_day_reset_ts(usage: dict | str | None) -> float | None:
+    """Epoch of an account's 7-day (weekly) window reset, or None if unknown.
+
+    The consume-first strategy ranks by this — the weekly window is the
+    perishable quota (the 5-hour one recycles too fast to be worth planning
+    around).
+    """
+    if isinstance(usage, dict):
+        window = usage.get("seven_day")
+        if isinstance(window, dict):
+            return _parse_reset_ts(window.get("resets_at"))
+    return None
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -709,19 +723,26 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-threshold",
-                        # Both sides through pct_label: .0f utilization could
-                        # display an impossible "100% < 99.9%".
-                        detail=(
-                            f"{pct_label(utilization)}% < "
-                            f"{pct_label(settings.threshold)}%"
-                        ),
+                if settings.strategy != "consume-first":
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="below-threshold",
+                            # Both sides through pct_label: .0f utilization could
+                            # display an impossible "100% < 99.9%".
+                            detail=(
+                                f"{pct_label(utilization)}% < "
+                                f"{pct_label(settings.threshold)}%"
+                            ),
+                        )
                     )
-                )
-                return TickOutcome.NO_ACTION
-            trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                    return TickOutcome.NO_ACTION
+                # consume-first: below the threshold we still proactively move to
+                # whichever account's weekly window resets soonest, to burn the
+                # most-perishable quota first. Candidate selection decides whether
+                # a sooner-resetting account with room actually exists.
+                trigger = "consume-first"
+            else:
+                trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
@@ -770,7 +791,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger == "proactive" and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -795,7 +816,13 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        qualifying: list[tuple[float, str]] = []
+        consume_first = settings.strategy == "consume-first"
+        # consume-first ranks by soonest weekly reset; a proactive (below-
+        # threshold) target must reset strictly sooner than where we are.
+        active_reset_ts = (
+            _seven_day_reset_ts(usage.get(current)) if consume_first else None
+        )
+        qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -804,29 +831,59 @@ class AutoSwitchEngine:
             any_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
-            if trigger == "proactive" and active_headroom is not None:
-                # Hysteresis guards only the proactive case: two accounts
-                # hovering at the line must not ping-pong. The gate is
-                # relative — the candidate must beat the active account by
-                # the full margin (a one-way move like 99%→89% qualifies;
-                # near-line pairs can't flap back) — and the landing must be
-                # healthy: an account at/over the threshold would re-trigger
-                # on the very next tick. At-limit and failover are escapes —
-                # any account with real headroom beats a blocked or dead one
-                # (and you can't flap back onto an account at 100%).
+            reset_ts = _seven_day_reset_ts(usage.get(num)) if consume_first else None
+            if trigger in ("proactive", "consume-first"):
+                # Landing must be healthy: an account at/over the threshold
+                # would re-trigger on the very next tick. At-limit and failover
+                # are escapes that skip this whole block — any account with real
+                # headroom beats a blocked or dead one.
                 if (100.0 - h) >= settings.threshold:
                     continue
-                if h - active_headroom < settings.hysteresis_pct:
-                    continue  # not provably better than where we are
-            qualifying.append((h, num))
-        # Best headroom first; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: -t[0])
+                if consume_first:
+                    # Purely proactive on reset ordering: below the threshold,
+                    # only move to accounts whose weekly window resets sooner
+                    # than the active one (above the threshold we must move, so
+                    # any healthy account qualifies and the sort picks soonest).
+                    if trigger == "consume-first" and (
+                        reset_ts is None
+                        or active_reset_ts is None
+                        or reset_ts >= active_reset_ts
+                    ):
+                        continue
+                elif active_headroom is not None:
+                    # best: the candidate must beat the active account by the
+                    # full hysteresis margin (a one-way move like 99%→89%
+                    # qualifies; near-line pairs can't flap back).
+                    if h - active_headroom < settings.hysteresis_pct:
+                        continue
+            if consume_first:
+                # Soonest weekly reset first (unknown resets sort last), most
+                # headroom breaks ties, then sequence order.
+                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+            else:
+                key = (-h,)
+            qualifying.append((key, num))
+        # Ascending by the strategy's key; list order (sequence order) breaks ties.
+        qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
-        if not ordered and api_key_candidates:
-            # Last resort: metered API-key accounts (unmeasurable headroom).
+        if not ordered and api_key_candidates and trigger != "consume-first":
+            # Last resort when we must move: metered API-key accounts
+            # (unmeasurable headroom). Never for a below-threshold consume-first
+            # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
         if not ordered:
+            if trigger == "consume-first":
+                # Active already holds the soonest-resetting quota (or no sooner
+                # account has room) — nothing to consume elsewhere yet. Staying
+                # put is the correct outcome, not a block.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="already-consuming-soonest",
+                        detail="active account's weekly window resets first",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not any_known:
                 self._emit(
                     NoSwitchEvent(
