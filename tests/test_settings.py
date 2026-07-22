@@ -113,8 +113,10 @@ class TestSaveSettings:
 
 
 class TestUiSettings:
-    def test_missing_file_defaults_to_auto(self, tmp_path: Path):
-        assert load_ui_settings(tmp_path) == UiSettings(theme="auto")
+    def test_missing_file_defaults(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path) == UiSettings(
+            theme="auto", watch_style="classic"
+        )
 
     def test_reads_auto(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "auto"}}))
@@ -128,6 +130,34 @@ class TestUiSettings:
         settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
         assert load_ui_settings(tmp_path).theme == "auto"
 
+    def test_reads_classic(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"watchStyle": "classic"}})
+        )
+        assert load_ui_settings(tmp_path).watch_style == "classic"
+
+    def test_reads_meters(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"watchStyle": "meters"}})
+        )
+        assert load_ui_settings(tmp_path).watch_style == "meters"
+
+    def test_unknown_style_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"watchStyle": "hologram"}})
+        )
+        assert load_ui_settings(tmp_path).watch_style == "classic"
+
+    def test_bad_theme_keeps_good_watch_style(self, tmp_path: Path):
+        # Each ui key falls back independently: garbage theme must not
+        # discard a valid watchStyle.
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"theme": "purple", "watchStyle": "meters"}})
+        )
+        loaded = load_ui_settings(tmp_path)
+        assert loaded.theme == "auto"
+        assert loaded.watch_style == "meters"
+
     def test_set_and_unset_ui_theme(self, tmp_path: Path):
         assert set_setting(tmp_path, "ui.theme", "light") == "light"
         raw = json.loads(settings_path(tmp_path).read_text())
@@ -135,9 +165,20 @@ class TestUiSettings:
         assert unset_setting(tmp_path, "ui.theme") is True
         assert "ui" not in json.loads(settings_path(tmp_path).read_text())
 
-    def test_set_rejects_bad_choice(self, tmp_path: Path):
+    def test_set_and_unset_ui_watch_style(self, tmp_path: Path):
+        assert set_setting(tmp_path, "ui.watchStyle", "meters") == "meters"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "ui": {"watchStyle": "meters"}}
+        assert unset_setting(tmp_path, "ui.watchStyle") is True
+        assert "ui" not in json.loads(settings_path(tmp_path).read_text())
+
+    def test_set_rejects_bad_theme(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
+
+    def test_set_rejects_bad_watch_style(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="classic, meters"):
+            set_setting(tmp_path, "ui.watchStyle", "hologram")
 
 
 class TestSettingSpecs:

@@ -20,7 +20,12 @@ from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
-from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
+from claude_swap.tui.dashboard import (
+    ClassicWatchScreen,
+    DashboardScreen,
+    MeterWatchScreen,
+    watch_screen,
+)
 from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
@@ -65,10 +70,14 @@ class CswapApp(App):
             ).threshold
         except Exception:
             self.threshold_pct = None
+        # Appearance settings; a bad/missing value falls back per-field.
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            ui = load_ui_settings(switcher.backup_dir)
+            self._theme_name = ui.theme
+            self._watch_style = ui.watch_style
         except Exception:
             self._theme_name = "auto"
+            self._watch_style = "classic"
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -80,7 +89,7 @@ class CswapApp(App):
         self.push_screen(DashboardScreen())
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
-            self.push_screen(WatchScreen())
+            self.push_screen(watch_screen(self._watch_style))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self._tick()
 
@@ -300,9 +309,24 @@ class CswapApp(App):
         self.push_screen(AutoScreen())
 
     def action_open_watch(self) -> None:
-        if isinstance(self.screen, WatchScreen):
+        if isinstance(self.screen, (ClassicWatchScreen, MeterWatchScreen)):
             return
-        self.push_screen(WatchScreen())
+        self.push_screen(watch_screen(self._watch_style))
+
+    def action_toggle_watch_style(self) -> None:
+        """Swap the live watch layout (classic ↔ meters) and persist it, so
+        you can preview either from the watch screen without editing config."""
+        if not isinstance(self.screen, (ClassicWatchScreen, MeterWatchScreen)):
+            return
+        new = "classic" if self._watch_style == "meters" else "meters"
+        self._watch_style = new
+        try:
+            set_setting(self.switcher.backup_dir, "ui.watchStyle", new)
+        except Exception as exc:  # persistence is best-effort; never crash the UI
+            self.notify(f"Could not save watch style: {exc}", severity="warning")
+        self.pop_screen()
+        self.push_screen(watch_screen(new))
+        self.notify(f"Watch: {new}")
 
     # -- theme --------------------------------------------------------------
 

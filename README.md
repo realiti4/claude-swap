@@ -159,6 +159,8 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
+The watch monitor defaults to the horizontal usage-bar cards above. For a compact, glanceable view — a responsive grid of vertical gradient meters — press **`Ctrl+V`** inside the watch screen to flip between the two live, or set the default up front with `cswap config set ui.watchStyle meters` (classic | meters).
+
 ### Theme
 
 The TUI ships a dark theme and a light theme, both WCAG AA-contrast checked, plus `auto` (the default), which follows the terminal's background via an OSC 11 query. Pick one from the root menu's **Theme…** entry (the current one is marked), press `Ctrl+T` inside the TUI to cycle `dark → light → auto` live, or set it up front:
@@ -264,6 +266,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set ui.watchStyle meters     # cswap watch layout: classic bars (default) or vertical meters
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
