@@ -85,7 +85,10 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # by every surface. The engine escalates to a full candidate refresh only
 # when a switch could actually be near: active utilization within
 # ESCALATION_MARGIN_PCT of the threshold, or active usage unknown (failover
-# needs fresh candidate data).
+# needs fresh candidate data). The consume-first trigger can fire outside
+# that escalation band; there it decides provisionally on the stored
+# snapshot and escalates at commit time, when a switch would actually fire
+# (the two-phase commit in _tick_inner).
 
 
 def _now_iso() -> str:
@@ -369,22 +372,42 @@ _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
 
 
-def _seven_day_reset_ts(usage: dict | str | None) -> float | None:
-    """Epoch of an account's 7-day (weekly) window reset, or None if unknown.
+def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
+    """Epoch of an account's 7-day (weekly) window reset, or None if unknown
+    or already past.
 
     The consume-first strategy ranks by this — the weekly window is the
     perishable quota (the 5-hour one recycles too fast to be worth planning
-    around).
+    around). A stale snapshot can carry a ``resets_at`` that has since
+    elapsed; treated as a real instant it would sort the *just-rolled-over*
+    account (the least perishable quota of all) as "soonest", so past ==
+    unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
+    tolerance, not ranking input — padding here would turn a genuinely
+    imminent reset into a false reset-unknown hold.
     """
     if isinstance(usage, dict):
         window = usage.get("seven_day")
         if isinstance(window, dict):
-            return _parse_reset_ts(window.get("resets_at"))
+            ts = _parse_reset_ts(window.get("resets_at"))
+            if ts is not None and ts > now:
+                return ts
     return None
 
 
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
+
+
+def _headroom_by_account(
+    usage: dict[str, dict | str | None], models: tuple[str, ...]
+) -> dict[str, float | None]:
+    """Per-account headroom derived from decision values."""
+    return {
+        num: oauth.account_headroom(
+            value if isinstance(value, dict) else None, models
+        )
+        for num, value in usage.items()
+    }
 
 
 class AutoSwitchEngine:
@@ -840,55 +863,48 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
-        active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current)) if consume_first else None
+        ordered, any_known, active_reset_ts = self._rank_candidates(
+            trigger=trigger,
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=settings,
+            now=self.clock(),
         )
-        qualifying: list[tuple[tuple, str]] = []
-        any_known = False
-        for num in oauth_candidates:
-            h = headroom.get(num)
-            if h is None:
-                continue
-            any_known = True
-            if h <= 0:
-                continue  # itself at its limit — never a target
-            reset_ts = _seven_day_reset_ts(usage.get(num)) if consume_first else None
-            if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold:
-                    continue
-                if consume_first:
-                    # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
-                    ):
-                        continue
-                elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
-                        continue
-            if consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
-            else:
-                key = (-h,)
-            qualifying.append((key, num))
-        # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: t[0])
-        ordered = [num for _, num in qualifying]
+
+        if trigger == "consume-first" and ordered:
+            # Two-phase commit: the provisional pick may have ridden a
+            # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
+            # decides below the threshold, where the collector only escalates
+            # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
+            # A switch is imminent, so spend the fetches now and re-decide on
+            # fresh data.
+            # reserve() serves just-fetched accounts from the store, so this
+            # is cheap in-tick and plan-bounded across ticks. The trigger is
+            # deliberately NOT re-classified if the fresh active crossed the
+            # threshold: a still-qualifying sooner target switches anyway,
+            # and otherwise the next tick escalates normally and escapes.
+            entries = self.switcher.usage_entries_by_account(
+                fetch={current, *candidates}
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = _headroom_by_account(usage, self._models)
+            active_headroom = headroom.get(current)
+            ordered, any_known, active_reset_ts = self._rank_candidates(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=self.clock(),
+            )
+
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
@@ -977,6 +993,25 @@ class AutoSwitchEngine:
         transient_failure = False
         for num in ordered:
             email = self.switcher.account_email(num)
+            if trigger == "consume-first":
+                # The phase-2 refetch is best-effort: the collector refuses
+                # accounts in failure backoff or claimed by a concurrent
+                # poller, which then serve their stored entries. Consume-first
+                # is opportunistic, not an escape — never act on stale data
+                # or slide to a worse-ranked target; hold and retry next tick.
+                entry = entries.get(num)
+                if entry is None or not entry.fresh(self.clock()):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="stale-usage",
+                            detail=(
+                                f"account {num} usage could not be refreshed "
+                                "this tick (backoff or a concurrent poller); "
+                                "retrying"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
@@ -1010,6 +1045,78 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _rank_candidates(
+        self,
+        *,
+        trigger: str,
+        consume_first: bool,
+        oauth_candidates: list[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        current: str,
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        now: float,
+    ) -> tuple[list[str], bool, float | None]:
+        """Filter and rank OAuth candidates for this tick's trigger.
+
+        Returns ``(ordered, any_known, active_reset_ts)``. Pure — no emits,
+        no state writes — so the consume-first two-phase commit can run it
+        twice per tick: on the stored snapshot to decide provisionally, then
+        on the escalated refetch to re-verify before switching.
+        """
+        # consume-first ranks by soonest weekly reset; a proactive (below-
+        # threshold) target must reset strictly sooner than where we are.
+        active_reset_ts = (
+            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+        )
+        qualifying: list[tuple[tuple, str]] = []
+        any_known = False
+        for num in oauth_candidates:
+            h = headroom.get(num)
+            if h is None:
+                continue
+            any_known = True
+            if h <= 0:
+                continue  # itself at its limit — never a target
+            reset_ts = (
+                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+            )
+            if trigger in ("proactive", "consume-first"):
+                # Landing must be healthy: an account at/over the threshold
+                # would re-trigger on the very next tick. At-limit and failover
+                # are escapes that skip this whole block — any account with real
+                # headroom beats a blocked or dead one.
+                if (100.0 - h) >= settings.threshold:
+                    continue
+                if consume_first:
+                    # Purely proactive on reset ordering: below the threshold,
+                    # only move to accounts whose weekly window resets sooner
+                    # than the active one (above the threshold we must move, so
+                    # any healthy account qualifies and the sort picks soonest).
+                    if trigger == "consume-first" and (
+                        reset_ts is None
+                        or active_reset_ts is None
+                        or reset_ts >= active_reset_ts
+                    ):
+                        continue
+                elif active_headroom is not None:
+                    # best: the candidate must beat the active account by the
+                    # full hysteresis margin (a one-way move like 99%→89%
+                    # qualifies; near-line pairs can't flap back).
+                    if h - active_headroom < settings.hysteresis_pct:
+                        continue
+            if consume_first:
+                # Soonest weekly reset first (unknown resets sort last), most
+                # headroom breaks ties, then sequence order.
+                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+            else:
+                key = (-h,)
+            qualifying.append((key, num))
+        # Ascending by the strategy's key; list order (sequence order) breaks ties.
+        qualifying.sort(key=lambda t: t[0])
+        return [num for _, num in qualifying], any_known, active_reset_ts
+
     # -- adaptive usage scheduling ---------------------------------------------
 
     def _collect_scheduled_usage(
@@ -1029,7 +1136,16 @@ class AutoSwitchEngine:
         before any switch decision when a switch could be near: active
         utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
         active usage unknown (failover must not run on stale candidate data).
-        Candidate selection never runs on the pre-escalation snapshot.
+        At-limit, proactive, and ordinary unknown-usage failover selection
+        never runs on the pre-escalation snapshot — those triggers imply the
+        escalation condition (the deliberate exception: an owned-and-expired
+        active is excluded above, so a post-idle-hold failover can run
+        without escalating). The consume-first trigger can fire outside the
+        escalation band, so it instead decides *provisionally* on the stored
+        snapshot and, only when a switch would fire, re-runs an escalated
+        collection and re-verifies the choice in ``_tick_inner`` (two-phase
+        commit), plus a per-target ``UsageEntry.fresh`` gate before
+        performing.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.
@@ -1113,12 +1229,7 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
-        headroom = {
-            num: oauth.account_headroom(
-                value if isinstance(value, dict) else None, self._models
-            )
-            for num, value in usage.items()
-        }
+        headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
 
     def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:

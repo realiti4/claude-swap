@@ -881,6 +881,92 @@ class TestAdaptiveScheduler:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["active-idle"]
 
+    def test_consume_first_hold_never_escalates_below_threshold(
+        self, temp_home, monkeypatch
+    ):
+        """Flat-traffic guard: a below-threshold consume-first tick that ends
+        in a hold (no switch would fire) keeps the O(1) baseline — the
+        phase-2 escalation is reserved for ticks that would actually switch.
+        The fetch-set spy also catches an accidental all-candidates request
+        that reserve() would have served from the store without HTTP."""
+        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        # Active resets soonest -> every tick holds already-consuming-soonest.
+        # five_hour 50 mirrors the baseline-cadence test's active plan.
+        usage = {
+            "1": _usage7(50, 20, _R_SOON),
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        counts: dict[str, int] = {}
+        fetch_sets: list[set] = []
+        real_collect = h.switcher.usage_entries_by_account
+
+        def spying_collect(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return real_collect(*args, **kwargs)
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=spying_collect
+        ):
+            for _ in range(4):  # t0, t60, t120, t180
+                outcome = self._tick(h, counts, usage)
+                assert outcome is TickOutcome.NO_ACTION
+                h.clock.advance(60)
+        # (a) HTTP volume identical to the baseline cadence under `best`.
+        assert counts == {"1": 2, "2": 1, "3": 1}
+        # (b) no collection ever requested the all-candidates escalation set.
+        assert {"1", "2", "3"} not in fetch_sets
+
+    def test_consume_first_stale_target_holds_then_switches(
+        self, temp_home, monkeypatch
+    ):
+        """Stale-after-escalation: when the phase-2 refetch cannot freshen the
+        chosen target (Retry-After backoff), the freshness gate holds with
+        stale-usage instead of switching on old data; once the backoff lapses
+        a later tick freshens the target and the switch lands."""
+        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        counts: dict[str, int] = {}
+        # Populate the store while the active account resets soonest (holds).
+        view_a = {
+            "1": _usage7(50, 20, _R_SOON),
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        self._tick(h, counts, view_a)          # t0: fetches 1, 2
+        h.clock.advance(60)
+        self._tick(h, counts, view_a)          # t60: fetches 3
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # #2 enters a Retry-After backoff; its stored entry ages past the
+        # serve TTL (180s) while staying inside decision trust (300s).
+        h.switcher._usage_store.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=600.0)},
+            {"2": ("b@example.com", "")},
+        )
+        h.clock.advance(181)                   # t241
+        h.events.clear()
+        # The active refetch now reports the LATEST reset, so stored #2
+        # (age 241: decision-trusted, no longer fresh) is the provisional
+        # pick — but phase 2 cannot freshen it through the backoff.
+        view_b = {
+            "1": _usage7(50, 20, _R_LATEST),
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome = self._tick(h, counts, view_b)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-usage" in reasons
+        assert counts["2"] == 1  # the backoff kept every refetch off #2
+        # Backoff lapses -> a later tick freshens #2 and the switch lands.
+        h.events.clear()
+        h.clock.advance(700)
+        outcome = self._tick(h, counts, view_b)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
 
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
@@ -1881,6 +1967,9 @@ class TestModelAwareSwitch:
 # --- consume-first strategy ----------------------------------------------------
 
 # Weekly-reset instants in ascending order (all valid ISO-8601, absolute).
+# The 2024 dates are all far in the FUTURE relative to FakeClock's epoch
+# (1_000_000.0 ≈ 1970-01-12); _R_PAST is before it.
+_R_PAST = "1970-01-10T00:00:00Z"
 _R_SOON = "2024-01-05T00:00:00Z"
 _R_LATER = "2024-01-08T00:00:00Z"
 _R_LATEST = "2024-01-10T00:00:00Z"
@@ -2114,3 +2203,147 @@ class TestConsumeFirstStrategy:
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
             "below-threshold"
         ]
+
+    def test_candidate_with_past_reset_is_not_selected(self, temp_home):
+        # A stale snapshot whose resets_at has already elapsed means the
+        # weekly window just rolled over — the LEAST perishable quota. It
+        # must rank as unknown, never as "soonest".
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_PAST),     # inverted pick pre-fix
+            "3": _usage7(10, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.to_ref == {"number": 3, "email": "c@example.com"}
+
+    def test_active_past_reset_holds_reset_unknown(self, temp_home):
+        # The active account's own reset can be stale too: past == unknown,
+        # which lands on the existing reset-unknown hold.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_PAST),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-unknown"]
+
+    def _two_phase_tick(
+        self, h: EngineHarness, stored: dict, fresh: dict
+    ) -> tuple[TickOutcome, list[set]]:
+        """Drive one tick where stored-snapshot collections serve ``stored``
+        and the all-candidates escalation serves ``fresh``.
+
+        These ticks run outside the escalation band (utilization far below
+        threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
+        on its own and the only all-candidates call a tick can make is the
+        consume-first phase-2 refetch — the returned fetch sets prove whether
+        it happened.
+        """
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            view = fresh if requested == {"1", "2", "3"} else stored
+            return {
+                num: _entry_for(value, h.clock.now)
+                for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+        return outcome, fetch_sets
+
+    def test_two_phase_refetch_disqualifies_stale_pick(self, temp_home):
+        # The stored snapshot ranks #2; the phase-2 refetch shows it
+        # exhausted. The tick must re-decide on the fresh data and hold.
+        h = self._harness(temp_home)
+        stored = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        fresh = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(100, 100, _R_SOON),   # burned out since the snapshot
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+        assert fetch_sets.count({"1", "2", "3"}) == 1  # phase 2 fired once
+
+    def test_two_phase_refetch_confirms_switch(self, temp_home):
+        # Fresh data agrees with the stored pick: the switch proceeds through
+        # the freshness gate (entries served by phase 2 are age-0).
+        h = self._harness(temp_home)
+        view = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert {"1", "2", "3"} in fetch_sets
+
+    def test_two_phase_refetch_reranks_to_fresh_best(self, temp_home):
+        # Phase 2 is a full re-rank, not a yes/no check on the provisional
+        # target: #2 stays eligible on fresh data, but #3 now resets sooner
+        # and must win.
+        h = self._harness(temp_home)
+        stored = {
+            "1": _usage7(20, 20, _R_LATEST),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATER),
+        }
+        fresh = {
+            "1": _usage7(20, 20, _R_LATEST),
+            "2": _usage7(10, 10, _R_LATER),    # still sooner than active
+            "3": _usage7(10, 10, _R_SOON),     # but #3 is now soonest
+        }
+        outcome, _ = self._two_phase_tick(h, stored, fresh)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_threshold_crossed_in_phase_two_holds_then_escapes_next_tick(
+        self, temp_home
+    ):
+        # Deliberate design pin: phase 2 never re-classifies the trigger
+        # mid-tick. When the fresh active is over the threshold with no
+        # strictly-sooner candidate, the tick holds; the NEXT tick classifies
+        # at-limit and escapes normally (no freshness gate on escapes).
+        h = self._harness(temp_home)
+        stored = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        fresh = {
+            "1": _usage7(100, 20, _R_LATER),   # crossed while the snapshot aged
+            "2": _usage7(10, 10, _R_LATEST),   # no longer strictly sooner
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert {"1", "2", "3"} in fetch_sets
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+        h.events.clear()
+        outcome = h.tick_with_usage(fresh)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
