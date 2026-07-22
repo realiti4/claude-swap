@@ -1647,13 +1647,15 @@ class ClaudeAccountSwitcher:
         Keychain first: the hashed service name is derived from the dir path
         and can't be recomputed once the dir is gone.
         """
-        from claude_swap.session import delete_macos_keychain_entry
+        from claude_swap.session import delete_macos_keychain_entry, safe_rmtree
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        # safe_rmtree, not shutil.rmtree: a shared profile can hold a projects/
+        # junction into ~/.claude, which a plain rmtree would recurse through.
+        safe_rmtree(session_dir)
         self._logger.info(
             f"Removed session profile for account {account_num} at {session_dir}"
         )
@@ -4851,6 +4853,8 @@ class ClaudeAccountSwitcher:
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't
         # be recomputed once the directories are deleted.
+        from claude_swap.session import safe_rmtree
+
         if session_dirs:
             from claude_swap.session import delete_macos_keychain_entry
 
@@ -4867,14 +4871,17 @@ class ClaudeAccountSwitcher:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            shutil.rmtree(self.backup_dir)
+            # safe_rmtree, not shutil.rmtree: the backup dir holds session
+            # profiles whose projects/ may be junctions into ~/.claude — a
+            # plain rmtree would recurse through them and delete real history.
+            safe_rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).
         if legacy_distinct and legacy.exists():
             try:
-                shutil.rmtree(legacy)
+                safe_rmtree(legacy)
                 removed_items.append(f"Legacy directory: {legacy}")
             except OSError:
                 pass

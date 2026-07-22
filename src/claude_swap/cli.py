@@ -158,7 +158,11 @@ Examples:
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default). On Windows, projects/ is "
+            "shared with a directory junction and history.jsonl with a file "
+            "symlink (the latter needs Developer Mode/admin; without it, only "
+            "history.jsonl is skipped). A one-time safety backup of your "
+            "history is taken under the backup dir first."
         ),
     )
     parser.add_argument(
