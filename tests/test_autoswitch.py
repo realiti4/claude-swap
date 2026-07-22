@@ -1959,6 +1959,109 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
 
+    def test_locked_recheck_stops_concurrent_engine(self, temp_home):
+        """The under-lock cooldown recheck in _perform must cover consume-first.
+
+        The tick-level gate reads state *before* the lock, so an engine that
+        read state before another engine's switch passes it on a stale
+        snapshot; only the recheck inside _perform serializes the two. Drive a
+        loser engine through _perform with a stale pre-lock read and a usage
+        view that ranks a different target, and assert it backs off instead of
+        double-switching inside the cooldown window.
+        """
+        h = self._harness(temp_home)  # default cooldown 300s
+        loser = h._make_engine()
+        # Winner: 1 -> 2 (soonest reset), records lastSwitchAt.
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert h.active_number() == 2
+        h.events.clear()
+        # Loser's first (pre-lock) state read predates the winner's write; its
+        # usage view ranks #3 soonest, so it reaches _perform for a different
+        # target and only the locked recheck can stop it.
+        real_read = loser._read_state
+        calls: list[bool] = []
+
+        def racing_read() -> dict:
+            calls.append(True)
+            return {} if len(calls) == 1 else real_read()
+
+        entries = {
+            num: _entry_for(value, h.clock.now)
+            for num, value in {
+                "2": _usage7(20, 20, _R_LATER),
+                "1": _usage7(10, 10, _R_LATEST),
+                "3": _usage7(10, 10, _R_SOON),
+            }.items()
+        }
+        with patch.object(loser, "_read_state", side_effect=racing_read):
+            with patch.object(
+                h.switcher, "usage_entries_by_account", return_value=entries
+            ):
+                outcome = loser.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2  # no double-switch
+        assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_reset_unknown_when_active_reset_missing(self, temp_home):
+        # Active has no seven_day.resets_at: the strictly-sooner filter skips
+        # every candidate, so the strategy is inert — say so, instead of the
+        # false "already consuming soonest".
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),              # no reset timestamp
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-unknown"]
+
+    def test_unreadable_candidates_stay_no_comparison(self, temp_home):
+        # Every candidate unreadable this tick is a BLOCKED no-comparison for
+        # any strategy — consume-first must not relabel it as a healthy hold.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": None,
+            "3": None,
+        })
+        assert outcome is TickOutcome.BLOCKED
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-comparison"]
+
+    def test_exhausted_candidates_hold_without_false_reset_claim(self, temp_home):
+        # All candidates at their limit while the active account is healthy:
+        # staying put is right, but the detail must not claim the active
+        # account resets first.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(100, 100, _R_SOON),
+            "3": _usage7(100, 100, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        holds = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in holds] == ["already-consuming-soonest"]
+        assert holds[0].detail == "no sooner-resetting account with room to spare"
+
+    def test_single_account_below_threshold_is_no_action(self, temp_home):
+        # Exit-code parity with `best`: a healthy below-threshold tick with
+        # zero candidates is NO_ACTION/below-threshold, not BLOCKED/
+        # no-candidates — cron wrappers key on the documented exit codes.
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage7(20, 20, _R_SOON)})
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
     def test_skips_sooner_account_that_is_exhausted(self, temp_home):
         h = self._harness(temp_home)
         # #2 resets soonest but is itself at its limit (no headroom) -> ignored;

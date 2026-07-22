@@ -196,7 +196,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -810,6 +810,22 @@ class AutoSwitchEngine:
             else []
         )
         if not oauth_candidates and not api_key_candidates:
+            if trigger == "consume-first" and active_headroom is not None:
+                # Healthy below-threshold account, nobody to compare against —
+                # the same state `best` reports as below-threshold NO_ACTION
+                # before ever reaching candidate selection. Keep the exit-code
+                # contract identical across strategies: cron wrappers keying on
+                # BLOCKED must not see false "blocked" from the flag alone.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        detail=(
+                            f"{pct_label(100.0 - active_headroom)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -873,18 +889,9 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
-            if trigger == "consume-first":
-                # Active already holds the soonest-resetting quota (or no sooner
-                # account has room) — nothing to consume elsewhere yet. Staying
-                # put is the correct outcome, not a block.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="already-consuming-soonest",
-                        detail="active account's weekly window resets first",
-                    )
-                )
-                return TickOutcome.NO_ACTION
             if not any_known:
+                # No candidate readable this tick — true for every strategy,
+                # and must not be dressed up as a consume-first hold.
                 self._emit(
                     NoSwitchEvent(
                         reason="no-comparison",
@@ -892,6 +899,36 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "consume-first":
+                # Below the threshold and healthy: staying put is a correct
+                # outcome, never a block. Distinguish *why* nothing qualified
+                # so an opted-in user can see the strategy working (or inert).
+                if active_reset_ts is None:
+                    # The strictly-sooner filter skips every candidate when the
+                    # active account's weekly reset is unknown — without this
+                    # reason the strategy would look enabled while doing
+                    # nothing, with no way to tell.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reset-unknown",
+                            detail=(
+                                "active account's weekly reset time is "
+                                "unknown; consume-first is idle until it "
+                                "is reported"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                # Covers both "everyone resets later" and "sooner ones have no
+                # room" — don't claim the active account resets first when the
+                # real story may be exhausted candidates.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="already-consuming-soonest",
+                        detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             # "All exhausted" (and its hours-long reset sleep) only when it's
             # literally true: every candidate's usage is known and at its
             # limit. A candidate that merely failed the proactive hysteresis
@@ -1099,7 +1136,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger == "proactive" and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
