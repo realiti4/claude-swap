@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 from claude_swap.models import get_timestamp
+from claude_swap.fsutil import replace_with_retry
 
 SCHEMA_VERSION = 1
 
@@ -132,7 +133,7 @@ class MappingStore:
                 os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
-            os.replace(tmp, self.path)
+            replace_with_retry(tmp, self.path)
         except OSError:
             try:
                 os.unlink(tmp)
