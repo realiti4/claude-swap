@@ -1939,9 +1939,20 @@ class TestWindowsRealJunctions:
         assert not profile.exists()  # profile fully gone
         assert (outside / "aaa.jsonl").read_text() == "real conversation"  # spared
 
+    @pytest.mark.xfail(
+        strict=False,
+        reason="stdlib shutil.rmtree junction-following is Windows/Python "
+        "version-dependent: observed SAFE on Windows Server 2022 / CPython 3.12 "
+        "(target survives), historically it recursed through junctions. "
+        "safe_rmtree is safe regardless — see "
+        "test_safe_rmtree_spares_real_junction_target.",
+    )
     def test_stdlib_rmtree_would_follow_junction(self, tmp_path):
-        """Documents WHY safe_rmtree exists: plain shutil.rmtree deletes through
-        a junction. If a future Python fixes this, this test flips and we learn."""
+        """Documents the historical hazard that motivates safe_rmtree: on some
+        Windows/Python versions plain shutil.rmtree recurses THROUGH a junction
+        and destroys the target's contents. xfail(strict=False) so it never
+        gates CI — it XFAILs where stdlib is safe and XPASSes where the hazard
+        is live, keeping a live hazard visible either way."""
         import shutil
 
         outside = tmp_path / "outside"
@@ -1955,7 +1966,7 @@ class TestWindowsRealJunctions:
             shutil.rmtree(profile)
         except OSError:
             pass
-        # The hazard: the junction's target contents get destroyed by stdlib.
+        # The historical hazard: stdlib destroys the junction's target contents.
         assert not (outside / "data.txt").exists()
 
     def test_materialize_real_junction_and_symlink(self, win_mgr, tmp_path):

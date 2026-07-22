@@ -202,10 +202,12 @@ def _create_junction(src: Path, dest: Path) -> None:
 def safe_rmtree(path: Path) -> None:
     """Recursively delete *path*, never traversing a reparse point.
 
-    ``shutil.rmtree`` recurses into Windows junctions (they are not symlinks),
-    so deleting a profile or purging the backup dir could delete the real
-    ``~/.claude`` history a junction points at. This removes any reparse point
-    as a link and only recurses into genuine directories. Best-effort.
+    On some Windows/Python versions ``shutil.rmtree`` recurses *through* a
+    junction (they are not symlinks) and deletes the real ``~/.claude`` history
+    a profile's ``projects/`` junction points at; on others it errors on the
+    junction instead, leaving a partial tree. This removes any reparse point as
+    a link and only recurses into genuine directories, so it is both safe and
+    complete regardless of the platform's rmtree behavior. Best-effort.
     """
     if _is_reparse_link(path):
         _remove_link(path)
