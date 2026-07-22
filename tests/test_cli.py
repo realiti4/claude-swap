@@ -572,8 +572,17 @@ class TestRunCommand:
             def __init__(self, switcher):
                 calls.append(("init", switcher))
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
-                calls.append(("run", identifier, claude_args, share, share_history))
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                share_all=False,
+            ):
+                calls.append(
+                    ("run", identifier, claude_args, share, share_history, share_all)
+                )
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
@@ -584,32 +593,36 @@ class TestRunCommand:
 
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False) in calls
+        assert ("run", "user@example.com", [], True, False, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True) in calls
+        assert ("run", "2", [], True, True, False) in calls
 
     def test_no_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
+
+    def test_share_all_flag(self):
+        calls = self._dispatch(["run", "2", "--share-all"])
+        assert ("run", "2", [], True, False, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False) in calls
+        assert ("run", "2", ["--no-share"], True, False, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -649,7 +662,7 @@ class TestRunCommand:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(self, identifier, claude_args, share=True, share_history=False, share_all=False):
                 from claude_swap.exceptions import SessionError
 
                 raise SessionError("boom")
@@ -663,6 +676,120 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`env` is POSIX-only")
+class TestEnvCommand:
+    """`cswap env` pre-dispatch: eval-safe stdout, share-all defaults, guards."""
+
+    RESOLVED = ("2", "user@example.com", "org-2")
+
+    def _dispatch(
+        self,
+        argv: list[str],
+        session_dir="/tmp/profile",
+        current=None,
+        mapping=None,
+    ):
+        calls = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def setup_session(
+                self, identifier, share, share_history=False, share_all=False
+            ):
+                calls.append(("setup", identifier, share, share_history, share_all))
+                return Path(session_dir), "2", "user@example.com"
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "env", *argv]):
+            switcher = switcher_cls.return_value
+            switcher.resolve_account.return_value = self.RESOLVED
+            switcher._get_current_account.return_value = current
+            if mapping is not None:
+                switcher.slot_for_directory.return_value = mapping
+            cli.main()
+        return calls
+
+    def test_env_defaults_to_share_all(self, capsys):
+        calls = self._dispatch(["2"])
+        assert ("setup", "2", True, False, True) in calls
+        assert capsys.readouterr().out == "export CLAUDE_CONFIG_DIR=/tmp/profile\n"
+
+    def test_env_stdout_is_eval_safe(self, capsys):
+        """Bootstrap chatter (printer writes to stdout) must land on stderr."""
+        self._dispatch(["2"])
+        captured = capsys.readouterr()
+        assert captured.out == "export CLAUDE_CONFIG_DIR=/tmp/profile\n"
+        assert "session profile ready" in captured.err
+
+    def test_env_quotes_awkward_paths(self, capsys):
+        self._dispatch(["2"], session_dir="/tmp/pro file")
+        assert capsys.readouterr().out == "export CLAUDE_CONFIG_DIR='/tmp/pro file'\n"
+
+    def test_env_no_share_all_falls_back(self):
+        calls = self._dispatch(["2", "--no-share-all", "--share-history"])
+        assert ("setup", "2", True, True, False) in calls
+
+    def test_env_same_account_prints_nothing_and_skips_bootstrap(self, capsys):
+        """Target == active default login: bootstrapping would fork the live
+        refresh-token family (rotation then logs the other copy out), and no
+        override is needed anyway — exit 0 with empty stdout."""
+        with pytest.raises(SystemExit) as excinfo:
+            self._dispatch(["2"], current=("user@example.com", "org-2"))
+        captured = capsys.readouterr()
+        assert excinfo.value.code == 0
+        assert captured.out == ""
+        assert "already the active default login" in captured.err
+
+    def test_env_resolves_directory_mapping(self, capsys):
+        calls = self._dispatch([], mapping=("3", "user@example.com"))
+        assert [c[1] for c in calls] == ["3"]
+        assert capsys.readouterr().out == "export CLAUDE_CONFIG_DIR=/tmp/profile\n"
+
+    def test_env_unmapped_directory_exits_3_with_empty_stdout(self, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            self._dispatch([], mapping=(None, None))
+        assert excinfo.value.code == 3
+        assert capsys.readouterr().out == ""
+
+    def test_env_error_exits_1_with_empty_stdout(self, capsys):
+        class FailingSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def setup_session(
+                self, identifier, share, share_history=False, share_all=False
+            ):
+                from claude_swap.exceptions import SessionError
+
+                raise SessionError("boom")
+
+        with patch("claude_swap.session.SessionManager", FailingSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "env", "2"]):
+            switcher_cls.return_value.resolve_account.return_value = self.RESOLVED
+            switcher_cls.return_value._get_current_account.return_value = None
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        captured = capsys.readouterr()
+        assert excinfo.value.code == 1
+        assert captured.out == ""
+        assert "boom" in captured.err
+
+    def test_main_help_mentions_env(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "env [num|email]" in result.stdout
 
 
 class TestSubcommandAliases:
@@ -751,7 +878,7 @@ class TestSubcommandAliases:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(self, identifier, claude_args, share=True, share_history=False, share_all=False):
                 calls.append((identifier, claude_args, share))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
@@ -1290,7 +1417,7 @@ class TestRunAutoResolve:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(self, identifier, claude_args, share=True, share_history=False, share_all=False):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
             def exec_default(self, claude_args):
