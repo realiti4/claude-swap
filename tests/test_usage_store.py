@@ -397,11 +397,27 @@ class TestIdentityGuard:
 
 class TestClaims:
     def test_claim_marks_in_flight(self, store, clock):
-        store.claim(["1"], IDENT)
+        claims = store.claim(["1"], IDENT)
         entry = store.entries(IDENT)["1"]
+        assert set(claims) == {"1"}
         assert entry.claimed(clock.now)
         clock.advance(CLAIM_TTL_S + 1)
         assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_legacy_last_attempt_claim_is_honored_during_schema_overlap(
+        self, store, clock
+    ):
+        store.claim(["1"], IDENT)
+        raw = json.loads(store.path.read_text())
+        row = raw["accounts"]["1"]
+        row.pop("claimId")
+        row.pop("claimUntil")
+        store.path.write_text(json.dumps(raw))
+
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        clock.advance(11)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
     def test_claim_does_not_touch_measurement(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
@@ -410,6 +426,142 @@ class TestClaims:
         entry = store.entries(IDENT)["1"]
         assert entry.last_good == USAGE
         assert entry.age_s == 100.0
+
+    def test_live_claim_outlasts_urgent_poll_interval(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert set(claims) == {"1"}
+        clock.advance(61)
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    def test_record_releases_long_claim_immediately(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims) == {"1"}
+        assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_failure_releases_claim(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.record({"1": FetchRecord(error="timeout")}, IDENT, claims) == {
+            "1"
+        }
+        entry = store.entries(IDENT)["1"]
+        assert not entry.claimed(clock.now)
+        assert entry.last_error == "timeout"
+
+    def test_sentinel_releases_claim_without_persisting_state(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        claimed_at = store.entries(IDENT)["1"].last_attempt_at
+        clock.advance(1)
+        assert store.record(
+            {"1": FetchRecord(sentinel="token expired")}, IDENT, claims
+        ) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert not entry.claimed(clock.now)
+        assert entry.last_attempt_at == claimed_at
+        assert entry.sentinel is None
+        assert entry.last_good is None
+
+    def test_expired_writer_cannot_clear_or_overwrite_new_lease(self, store, clock):
+        first = store.reserve(["1"], IDENT, respect_plans=True)
+        clock.advance(CLAIM_TTL_S + 1)
+        second = store.reserve(["1"], IDENT, respect_plans=True)
+        assert first["1"] != second["1"]
+
+        assert store.record(
+            {"1": FetchRecord(error="timeout")}, IDENT, first
+        ) == set()
+        entry = store.entries(IDENT)["1"]
+        assert entry.claimed(clock.now)
+        assert entry.last_error is None
+
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, second
+        ) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == USAGE
+
+    def test_stale_writer_cannot_replace_a_rebound_identity(self, store, clock):
+        stale_claim = store.reserve(["1"], IDENT, respect_plans=True)
+        rebound = {"1": ("new@x.com", "org-new")}
+        assert set(store.reserve(["1"], rebound, respect_plans=True)) == {"1"}
+
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, stale_claim
+        ) == set()
+        entry = store.entries(rebound)["1"]
+        assert entry.claimed(clock.now)
+        assert entry.last_good is None
+
+    def test_partial_records_can_reuse_their_explicit_claims(self, store):
+        claims = store.reserve(["1", "2"], IDENT, respect_plans=True)
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims) == {
+            "1"
+        }
+        assert store.entries(IDENT)["2"].claimed(store.clock())
+
+        assert store.record({"2": FetchRecord(usage=USAGE)}, IDENT, claims) == {
+            "2"
+        }
+        entries = store.entries(IDENT)
+        assert entries["1"].last_good == USAGE
+        assert entries["2"].last_good == USAGE
+
+    def test_mixed_record_accepts_only_the_current_claim(self, store, clock):
+        first = store.reserve(["1", "2"], IDENT, respect_plans=True)
+        clock.advance(CLAIM_TTL_S + 1)
+        second = store.reserve(["1"], IDENT, respect_plans=True)
+        assert first["1"] != second["1"]
+
+        outcomes = {
+            "1": FetchRecord(error="timeout"),
+            "2": FetchRecord(usage=USAGE),
+        }
+        assert store.record(outcomes, IDENT, first) == {"2"}
+        entries = store.entries(IDENT)
+        assert entries["1"].last_error is None
+        assert entries["1"].claimed(clock.now)
+        assert entries["2"].last_good == USAGE
+
+    def test_unfenced_record_cannot_overwrite_a_live_claim(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.record({"1": FetchRecord(error="timeout")}, IDENT) == set()
+        entry = store.entries(IDENT)["1"]
+        assert entry.claimed(clock.now)
+        assert entry.last_error is None
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims) == {
+            "1"
+        }
+
+    def test_credential_refresh_revokes_an_old_fetch_claim(self, store, clock):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.clear_dead_token(["1"], IDENT)
+        assert store.record(
+            {"1": FetchRecord(error="invalid_grant")}, IDENT, claims
+        ) == set()
+        entry = store.entries(IDENT)["1"]
+        assert not entry.claimed(clock.now)
+        assert not entry.token_dead()
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_success_commits_its_new_plan_without_a_duplicate_window(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 60.0, 60.0)}, IDENT)
+        clock.advance(61)
+        claims = store.reserve(["1"], IDENT, respect_plans=False)
+        assert set(claims) == {"1"}
+
+        next_poll = clock.now + 300.0
+        store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            claims,
+            {"1": (next_poll, 300.0)},
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == next_poll
+        assert entry.poll_interval_s == 300.0
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
 
 class TestSentinels:
@@ -562,23 +714,23 @@ class TestReserve:
         clock.advance(SERVE_TTL_S + CLAIM_TTL_S + 1)
 
     def test_reserve_wins_and_stamps(self, store):
-        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
         # The stamp is the claim: an immediate second reservation loses —
         # this is the double-fetch race the old read-then-claim flow allowed.
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
-        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
     def test_fresh_entry_not_won(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         clock.advance(CLAIM_TTL_S + 1)  # claim expired, entry still fresh
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
 
     def test_respect_plans_waits_for_next_poll(self, store, clock):
         self._stale(store, clock)
         store.set_poll_plan({"1": (clock.now + 300.0, 300.0)}, IDENT)
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         clock.advance(301)
-        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
     def test_scheduler_beats_the_ttl_when_due(self, store, clock):
         # Urgent cadence: a due plan wins even inside the serve TTL for the
@@ -586,35 +738,35 @@ class TestReserve:
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         store.set_poll_plan({"1": (clock.now + 60.0, 60.0)}, IDENT)
         clock.advance(61)
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
-        assert store.reserve(["1"], IDENT, respect_plans=False) == ["1"]
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert set(store.reserve(["1"], IDENT, respect_plans=False)) == {"1"}
 
     def test_scheduler_may_fetch_a_not_due_stale_entry(self, store, clock):
         # Escalation semantics: an explicit set bypasses a future nextPollAt
         # when the entry has gone stale.
         self._stale(store, clock)
         store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
-        assert store.reserve(["1"], IDENT, respect_plans=False) == ["1"]
+        assert set(store.reserve(["1"], IDENT, respect_plans=False)) == {"1"}
 
     def test_backoff_blocks_both_modes(self, store, clock):
         store.record({"1": FetchRecord(error="timeout")}, IDENT)
-        clock.advance(CLAIM_TTL_S + 1)  # claim gone, 30s backoff still on
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
-        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+        clock.advance(BACKOFF_BASE_S - 1)  # completed claim gone, backoff still on
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
     def test_dead_token_never_won(self, store, clock):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
-        assert store.reserve(["1"], IDENT, respect_plans=True) == []
-        assert store.reserve(["1"], IDENT, respect_plans=False) == []
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
     def test_unknown_row_and_identity_mismatch_win(self, store, clock):
-        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
         # Slot reused by a different account: the old row is invisible and
         # replaced, so the new identity is fetch-eligible immediately.
         store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
         other = {"2": ("new@x.com", "org-9")}
-        assert store.reserve(["2"], other, respect_plans=True) == ["2"]
+        assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
 
 
 class TestLast429Marker:
@@ -821,7 +973,7 @@ class TestClaimTrustBridge:
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         store.set_poll_plan({"1": (clock.now + 400.0, 400.0)}, IDENT)
         clock.advance(401)  # poll-due, age > STALE_OK_S
-        assert store.reserve(["1"], IDENT, respect_plans=True) == ["1"]
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
         entry = store.entries(IDENT)["1"]
         assert entry.trust_extended
         assert entry.decision_value() == USAGE

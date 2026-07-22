@@ -16,17 +16,19 @@ overlaid on the read model (``UsageEntry.sentinel``) — never written to disk,
 so a stale sentinel can't outlive the condition that produced it.
 
 Locking protocol (never holds the lock across network I/O):
-(a) lock → read, decide/claim the fetch set (stamp ``lastAttemptAt``) → unlock;
+(a) lock → read, decide/claim the fetch set (stamp ``claimUntil``) → unlock;
 (b) fetch with no lock held;
-(c) lock → re-read, merge outcomes, write → unlock.
-The claim stamp lets concurrent collectors skip accounts another process
-started fetching moments ago; a crashed claimer just ages out.
+(c) lock → re-read, merge outcomes, clear the claim, write → unlock.
+The bounded lease lets concurrent collectors skip accounts another process is
+still fetching; a completed fetch releases it immediately and a crashed claimer
+ages out.
 """
 
 from __future__ import annotations
 
 import json
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,7 +50,12 @@ SCHEMA_VERSION = 2
 # without fetching) doubles as the per-token sustained-rate governor: see
 # poll_policy's module docstring for the measured budget it must stay under.
 STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
-CLAIM_TTL_S = 10.0  # in-flight claim window: skip just-claimed accounts
+# Covers the bounded refresh + usage path, the full inventory's stagger, and
+# executor queueing, so another surface cannot reclaim a request that is still
+# in flight. A crashed collector waiting 90s remains below the provider-safe
+# polling interval.
+CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
+LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 
 # Deliberate staleness (failure backoff, scheduler-chosen cadence) extends
 # decision trust past STALE_OK_S, but never past this ceiling: a forever-failing
@@ -179,6 +186,9 @@ class UsageEntry:
     # scheduler itself chose the cadence (within nextPollAt). Capped at
     # TRUST_MAX_AGE_S. Computed by UsageStore.entries().
     trust_extended: bool = False
+    # Appended to preserve positional compatibility for the older read-model
+    # fields while exposing whether a fetch lease is currently live.
+    claim_until: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -219,10 +229,13 @@ class UsageEntry:
         return now < anchor + RECENT_429_WINDOW_S
 
     def claimed(self, now: float) -> bool:
-        """A collector stamped this entry moments ago (fetch may be in flight)."""
+        """Whether another collector's bounded fetch lease is still live."""
+        if self.claim_until is not None:
+            return now < self.claim_until
+        # Additive-schema compatibility for rows claimed by an older process.
         return (
             self.last_attempt_at is not None
-            and (now - self.last_attempt_at) < CLAIM_TTL_S
+            and (now - self.last_attempt_at) < LEGACY_CLAIM_TTL_S
         )
 
     def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
@@ -428,6 +441,7 @@ class UsageStore:
             if not self._matches(row, identity):
                 out[num] = UsageEntry()
                 continue
+            assert isinstance(row, dict)
             fetched_at = row.get("fetchedAt")
             if not isinstance(fetched_at, (int, float)):
                 fetched_at = None
@@ -436,6 +450,7 @@ class UsageStore:
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
+            claim_until = _num_or_none(row.get("claimUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
@@ -457,15 +472,20 @@ class UsageStore:
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
+            live_claim = (
+                now < claim_until
+                if claim_until is not None
+                else (
+                    last_attempt_at is not None
+                    and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
+                )
+            )
             trust_extended = (
                 within_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
-                    or (
-                        last_attempt_at is not None
-                        and (now - last_attempt_at) < CLAIM_TTL_S
-                    )
+                    or live_claim
                 )
             )
             out[num] = UsageEntry(
@@ -481,6 +501,7 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 trust_extended=trust_extended,
+                claim_until=claim_until,
             )
         return out
 
@@ -503,13 +524,25 @@ class UsageStore:
                 mutator(num, rows[num])
             self._write_rows(rows)
 
-    def claim(self, nums: Iterable[str], identities: dict[str, Identity]) -> None:
-        """Stamp ``lastAttemptAt`` on the slots about to be fetched."""
+    def claim(
+        self, nums: Iterable[str], identities: dict[str, Identity]
+    ) -> dict[str, str]:
+        """Lease the slots about to be fetched, returning their fencing ids."""
         nums = list(nums)
         if not nums:
-            return
+            return {}
         now = self.clock()
-        self._mutate(identities, nums, lambda _n, row: row.update(lastAttemptAt=now))
+        claims = {num: uuid.uuid4().hex for num in nums}
+        self._mutate(
+            identities,
+            nums,
+            lambda num, row: row.update(
+                lastAttemptAt=now,
+                claimId=claims[num],
+                claimUntil=now + CLAIM_TTL_S,
+            ),
+        )
+        return claims
 
     def reserve(
         self,
@@ -517,9 +550,9 @@ class UsageStore:
         identities: dict[str, Identity],
         *,
         respect_plans: bool,
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
-        ``lastAttemptAt`` in one locked pass, returning only the slots won.
+        a bounded lease in one locked pass, returning slot → fencing id.
 
         Deciding eligibility on a lock-free :meth:`entries` read and then
         claiming separately lets two collectors both pass the check and both
@@ -537,9 +570,9 @@ class UsageStore:
         """
         nums = list(nums)
         if not nums:
-            return []
+            return {}
         now = self.clock()
-        won: list[str] = []
+        won: dict[str, str] = {}
         with self._lock():
             rows = self._read_rows()
             for num in nums:
@@ -547,32 +580,57 @@ class UsageStore:
                 row = rows.get(num)
                 if not self._matches(row, identity):
                     rows[num] = row = self._fresh_row(identity)
-                elif not _row_eligible(row, now, respect_plans):
-                    continue
+                else:
+                    assert isinstance(row, dict)
+                    if not _row_eligible(row, now, respect_plans):
+                        continue
+                claim_id = uuid.uuid4().hex
                 row["lastAttemptAt"] = now
-                won.append(num)
+                row["claimId"] = claim_id
+                row["claimUntil"] = now + CLAIM_TTL_S
+                won[num] = claim_id
             if won:
                 self._write_rows(rows)
         return won
 
     def record(
-        self, outcomes: dict[str, FetchRecord], identities: dict[str, Identity]
-    ) -> None:
-        """Merge fetch outcomes. Success and failure are mutually exclusive
-        writers: success resets the failure fields, failure never touches
-        ``lastGood``/``fetchedAt``. Sentinel records are no-ops (derived state
-        lives only in the collector's overlay)."""
-        effective = {n: r for n, r in outcomes.items() if r.sentinel is None}
-        if not effective:
-            return
+        self,
+        outcomes: dict[str, FetchRecord],
+        identities: dict[str, Identity],
+        claims: dict[str, str] | None = None,
+        plans: dict[str, tuple[float | None, float | None]] | None = None,
+    ) -> set[str]:
+        """Merge outcomes fenced by the leases that produced them.
+
+        A late writer whose lease or slot identity was replaced is ignored
+        without touching the newer row. Success and failure are mutually
+        exclusive writers: success resets the failure fields, failure never
+        touches ``lastGood``/``fetchedAt``. A supplied success plan commits
+        in the same transaction as its measurement. Sentinel records clear
+        only the claim and are otherwise never persisted. Returns the accepted
+        slots.
+        """
+        if not outcomes:
+            return set()
         now = self.clock()
+        accepted: set[str] = set()
 
         def apply(num: str, row: dict) -> None:
-            rec = effective[num]
+            accepted.add(num)
+            rec = outcomes[num]
+            row["claimId"] = None
+            row["claimUntil"] = 0.0
+            if rec.sentinel is not None:
+                return
             row["lastAttemptAt"] = now
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
+                # Replace the old, possibly due plan in the outcome transaction
+                # so no collector can slip into a record→replan gap.
+                plan = plans.get(num) if plans is not None else None
+                if plan is not None:
+                    row["nextPollAt"], row["pollIntervalS"] = plan
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
@@ -594,7 +652,30 @@ class UsageStore:
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
 
-        self._mutate(identities, effective.keys(), apply)
+        with self._lock():
+            rows = self._read_rows()
+            for num in outcomes:
+                identity = identities[num]
+                row = rows.get(num)
+                expected: str | None = None
+                if claims is not None:
+                    expected = claims.get(num)
+                    if (
+                        expected is None
+                        or not self._matches(row, identity)
+                        or not isinstance(row, dict)
+                        or row.get("claimId") != expected
+                    ):
+                        continue
+                elif isinstance(row, dict) and row.get("claimId") is not None:
+                    continue
+                elif not self._matches(row, identity):
+                    rows[num] = row = self._fresh_row(identity)
+                assert isinstance(row, dict)
+                apply(num, row)
+            if accepted:
+                self._write_rows(rows)
+        return accepted
 
     def set_poll_plan(
         self,
@@ -627,6 +708,8 @@ class UsageStore:
             return
 
         def apply(_num: str, row: dict) -> None:
+            row["claimId"] = None
+            row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["consecutiveFailures"] = 0
             row["lastError"] = None
@@ -647,9 +730,17 @@ def _row_eligible(row: dict, now: float, respect_plans: bool) -> bool:
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
         return False
-    last_attempt = _num_or_none(row.get("lastAttemptAt"))
-    if last_attempt is not None and (now - last_attempt) < CLAIM_TTL_S:
-        return False
+    claim_until = _num_or_none(row.get("claimUntil"))
+    if claim_until is not None:
+        if now < claim_until:
+            return False
+    else:
+        last_attempt = _num_or_none(row.get("lastAttemptAt"))
+        if (
+            last_attempt is not None
+            and (now - last_attempt) < LEGACY_CLAIM_TTL_S
+        ):
+            return False
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
