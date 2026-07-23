@@ -334,6 +334,54 @@ def _unmap_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _statusline_command(argv: list[str]) -> None:
+    """Handle `cswap statusline` — print the active account for a status line.
+
+    Made to drop into Claude Code's ``statusLine.command`` (or any shell
+    prompt): it prints one short line naming the account cswap's live login is
+    on, so which account a session uses is always visible. Reads only local
+    state, never the network, and never exits non-zero on the render path — a
+    status line must not slow down or break the host prompt.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} statusline",
+        description=(
+            "Print the active Claude account, for a shell or Claude Code "
+            "status line."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Add to Claude Code's settings.json:
+  "statusLine": { "type": "command", "command": "cswap statusline" }
+        """,
+    )
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Show the full email instead of the alias / email local-part",
+    )
+    parser.add_argument(
+        "--icon",
+        metavar="ICON",
+        default="⇄",
+        help="Leading icon (default: ⇄)",
+    )
+    parser.add_argument(
+        "--no-icon", action="store_true", help="Omit the leading icon"
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        email, alias = ClaudeAccountSwitcher().active_account_display()
+    except Exception:
+        return  # never break the host status line
+    if not email:
+        return  # no live login — print nothing
+    label = email if args.email else (alias or email.split("@", 1)[0])
+    prefix = "" if args.no_icon else f"{args.icon} "
+    print(f"{prefix}{label}")
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -890,6 +938,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "statusline":
+        _statusline_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -935,6 +986,7 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s statusline                 print the active account for a status line
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
