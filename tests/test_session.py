@@ -61,6 +61,8 @@ CONFIG = json.dumps(
             "organizationUuid": ORG_UUID,
         },
         "theme": "light",
+        # Only share-all bootstrap (seed_full_config) may carry this over.
+        "projects": {"/some/repo": {"hasTrustDialogAccepted": True}},
     }
 )
 
@@ -642,6 +644,90 @@ class TestSharingPosix:
         mgr._sync_sharing(session_dir, share=True)
 
         assert (session_dir / "settings.json").readlink() == source / "settings.json"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="share-all is POSIX-only")
+class TestShareAll:
+    """share-all mode: everything in ~/.claude symlinks except NEVER_SHARED."""
+
+    def test_links_everything_except_denylist(self, share_setup):
+        source, session_dir, mgr = share_setup
+        for extra_dir in ("plugins", "hooks", "todos", "file-history"):
+            (source / extra_dir).mkdir()
+        (source / "chrome-profiles.json").write_text("{}")
+        (source / ".credentials.json").write_text("secret")
+        (source / ".claude.json").write_text("{}")
+        for private_dir in ("sessions", "ide", "statsig", "backups"):
+            (source / private_dir).mkdir()
+
+        mgr._sync_sharing(session_dir, share=True, share_all=True)
+
+        for shared in (
+            "settings.json",
+            "CLAUDE.md",
+            "skills",
+            "plugins",
+            "hooks",
+            "todos",
+            "file-history",
+            "chrome-profiles.json",
+            "projects",       # HISTORY_ITEMS: seeded empty in source, linked
+            "history.jsonl",
+        ):
+            assert (session_dir / shared).is_symlink(), shared
+        for private in (
+            ".credentials.json",
+            ".claude.json",
+            "sessions",
+            "ide",
+            "statsig",
+            "backups",
+        ):
+            assert not (session_dir / private).exists(), private
+
+    def test_share_all_manifest_survives_reload(self, share_setup):
+        """Dynamic names must round-trip the manifest (its read filter)."""
+        source, session_dir, mgr = share_setup
+        (source / "todos").mkdir()
+        mgr._sync_sharing(session_dir, share=True, share_all=True)
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "todos" in manifest["items"]
+
+        # Back to the standard set: dynamic links are pruned, allowlist stays.
+        mgr._sync_sharing(session_dir, share=True, share_all=False)
+        assert not (session_dir / "todos").exists()
+        assert (session_dir / "settings.json").is_symlink()
+
+    def test_share_all_never_touches_real_profile_data(self, share_setup):
+        source, session_dir, mgr = share_setup
+        (source / "todos").mkdir()
+        (session_dir / "todos").mkdir()
+        (session_dir / "todos" / "t.json").write_text("profile-own data")
+
+        mgr._sync_sharing(session_dir, share=True, share_all=True)
+        assert not (session_dir / "todos").is_symlink()
+
+        mgr._sync_sharing(session_dir, share=True, share_all=False)
+        assert (session_dir / "todos" / "t.json").read_text() == "profile-own data"
+
+    def test_share_all_bootstrap_seeds_full_config(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+    ):
+        session_dir, num, email = manager.setup_session(
+            ACCOUNT_NUM, share=True, share_all=True
+        )
+        config = json.loads((session_dir / ".claude.json").read_text())
+        assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
+        assert config["hasCompletedOnboarding"] is True
+        # Full snapshot carried over (project trust survives).
+        assert config["projects"] == {"/some/repo": {"hasTrustDialogAccepted": True}}
+
+    def test_standard_bootstrap_stays_minimal(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+    ):
+        session_dir, num, email = manager.setup_session(ACCOUNT_NUM, share=False)
+        config = json.loads((session_dir / ".claude.json").read_text())
+        assert "projects" not in config  # only share-all seeds the full snapshot
 
 
 class TestSharingWindowsMode:

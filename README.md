@@ -155,6 +155,47 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Pin a whole shell to an account (`cswap env`)
+
+`cswap env` does everything `cswap run` does *except* launch claude: it
+bootstraps (or reuses) the account's session profile and prints a single
+`export CLAUDE_CONFIG_DIR=...` line on stdout — everything else goes to
+stderr, so the output is safe to `eval`. After that, every `claude` in the
+shell (including your own wrappers and scripts) runs as that account; no
+launcher wrapper needed.
+
+```bash
+eval "$(cswap env 2)"           # this shell is now account 2
+eval "$(cswap env)"             # resolve from the directory mapping (cswap map)
+```
+
+`env` defaults to `--share-all`: the profile symlinks **everything** in
+`~/.claude` — skills, plugins, hooks, settings, `projects/` (transcripts /
+`--resume`) and `history.jsonl` — except credentials and per-profile state
+(`.claude.json` is seeded once from the account's stored config snapshot, so
+project trust and MCP approvals carry over). The profile is effectively
+auth-only; there is one set of files for all accounts. `--share-all` is also
+available on `cswap run`. POSIX only.
+
+If the target account already **is** your default login, `env` prints
+nothing and exits 0 (no override needed — and bootstrapping would fork the
+live login's refresh-token family, logging running claudes out).
+
+Hook it to a directory (re-evaluated on every `cd`, this shell only) — e.g.
+in `.zshrc`/`.bashrc`:
+
+```sh
+__claude_account_eval() {
+    case "$PWD/" in
+    "$HOME/work/"*) [ -n "${CLAUDE_CONFIG_DIR:-}" ] || eval "$(cswap env 2)" ;;
+    *) unset CLAUDE_CONFIG_DIR ;;
+    esac
+}
+# zsh:  autoload -Uz add-zsh-hook && add-zsh-hook chpwd __claude_account_eval
+# bash: PROMPT_COMMAND="__claude_account_eval${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+__claude_account_eval
+```
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.

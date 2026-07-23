@@ -85,6 +85,54 @@ HISTORY_ITEMS = (
     "history.jsonl",
 )
 
+# share-all mode (`run --share-all`, and the default for `cswap env`): instead
+# of the SHARED_ITEMS allowlist, symlink EVERYTHING found in ~/.claude except
+# what must stay per-profile. Only correctness exclusions live here:
+#   .credentials.json — per-account credentials are the whole point of a
+#     session profile (on macOS the profile's hashed keychain entry pairs it);
+#   .claude.json — claude rewrites it atomically (temp+rename), which would
+#     sever a symlink and silently fork the file; share-all bootstrap seeds a
+#     real copy from the account's stored config snapshot instead;
+#   sessions/, ide/ — per-instance PID/lock files; cswap's own live-session
+#     detection reads them *per profile*, so sharing would cross-wire it;
+#   statsig/ — account-scoped telemetry/feature-flag caches;
+#   backups/ — claude's own .claude.json backups, per-profile by nature;
+#   .cswap-* — this profile's own cswap markers and manifest.
+NEVER_SHARED_NAMES = frozenset(
+    {
+        ".credentials.json",
+        ".claude.json",
+        "sessions",
+        "ide",
+        "statsig",
+        "backups",
+        ".DS_Store",
+    }
+)
+NEVER_SHARED_PREFIXES = (".cswap-",)
+
+
+def share_all_eligible(name: str) -> bool:
+    """Whether share-all mode may symlink this ~/.claude entry."""
+    if name in NEVER_SHARED_NAMES:
+        return False
+    return not name.startswith(NEVER_SHARED_PREFIXES)
+
+
+def share_all_items(source_root: Path) -> tuple[str, ...]:
+    """Dynamic share list: everything in ~/.claude that isn't NEVER_SHARED.
+
+    Unioned with the static lists so history items keep their seed-if-missing
+    treatment (and the SHARED_ITEMS set stays covered) even when the source
+    entry doesn't exist yet.
+    """
+    try:
+        entries = sorted(os.listdir(source_root))
+    except OSError:
+        entries = []
+    dynamic = [name for name in entries if share_all_eligible(name)]
+    return tuple(dict.fromkeys((*dynamic, *SHARED_ITEMS, *HISTORY_ITEMS)))
+
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
 SHARE_MANIFEST = ".cswap-shared.json"
@@ -325,6 +373,7 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        share_all: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal."""
         claude_bin = shutil.which("claude")
@@ -337,6 +386,10 @@ class SessionManager:
                 "--share-history is not supported on Windows yet: sharing uses "
                 "re-synced copies there, which would fork the history instead "
                 "of sharing it."
+            )
+        if share_all and self.switcher.platform == Platform.WINDOWS:
+            raise SessionError(
+                "--share-all is not supported on Windows: it is symlink-based."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -376,7 +429,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, share_all
         )
 
         print(
@@ -440,7 +493,11 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        share_all: bool = False,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -459,7 +516,7 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, share_all)
             return session_dir, account_num, email
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
@@ -471,11 +528,14 @@ class SessionManager:
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
-                self._sync_sharing(session_dir, share, share_history)
+                self._sync_sharing(session_dir, share, share_history, share_all)
                 return session_dir, account_num, email
 
-            self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            self._bootstrap(
+                session_dir, account_num, email, org_uuid,
+                seed_full_config=share_all,
+            )
+            self._sync_sharing(session_dir, share, share_history, share_all)
 
             if not self._is_session_valid(session_dir, email, org_uuid):
                 self._cleanup_failed_session(session_dir)
@@ -489,7 +549,12 @@ class SessionManager:
         return session_dir, account_num, email
 
     def _bootstrap(
-        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+        self,
+        session_dir: Path,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        seed_full_config: bool = False,
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
         # Claude reads the keychain before the plaintext file — a stale hashed
@@ -552,6 +617,12 @@ class SessionManager:
                 existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
             except (json.JSONDecodeError, OSError):
                 existing = {}
+        if seed_full_config:
+            # share-all bootstrap: start from the account's full stored
+            # .claude.json snapshot (its project-trust map, MCP approvals,
+            # onboarding state) so the profile doesn't re-prompt for all of
+            # it; anything the profile accumulated itself still wins.
+            existing = {**config_data, **existing}
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
@@ -625,7 +696,11 @@ class SessionManager:
     # -- sharing ---------------------------------------------------------
 
     def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
+        self,
+        session_dir: Path,
+        share: bool,
+        share_history: bool = False,
+        share_all: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
@@ -634,6 +709,8 @@ class SessionManager:
         on the adoption marker); ``share_history`` governs HISTORY_ITEMS
         (conversation history) — independent concerns, so ``--no-share
         --share-history`` gives a bare profile with unified history.
+        ``share_all`` supersedes both with the dynamic everything-except-
+        NEVER_SHARED list (POSIX only).
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
@@ -644,27 +721,36 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
-        self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
+        # History and share-all links are POSIX-only (run() rejects the flags
+        # on Windows; this also drops any links left by a POSIX→Windows
+        # profile move).
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
-        )
+            share_all = False
+        self._sync_mcp_servers(session_dir, share or share_all)
         source_root = Path.home() / ".claude"
+        if share_all:
+            active_items = share_all_items(source_root)
+        else:
+            active_items = (SHARED_ITEMS if share else ()) + (
+                HISTORY_ITEMS if share_history else ()
+            )
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
-        # For history items that holds even when the manifest claims them:
-        # a stale manifest (lock-free launches race) must never be able to
-        # delete real conversation history — only ever unlink symlinks.
+        # For history and share-all items that holds even when the manifest
+        # claims them: a stale manifest (lock-free launches race) must never
+        # be able to delete real user data — only ever unlink symlinks.
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if (
+                    name not in SHARED_ITEMS
+                    and dest.exists()
+                    and not dest.is_symlink()
+                ):
                     continue
                 self._remove_managed(dest)
         if not active_items:
@@ -1032,8 +1118,13 @@ class SessionManager:
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             items = data.get("items", [])
-            # Only ever act on names we could have created.
-            return [i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS]
+            # Only ever act on names we could have created (the static lists,
+            # or anything share-all mode is allowed to link).
+            return [
+                i
+                for i in items
+                if i in SHARED_ITEMS + HISTORY_ITEMS or share_all_eligible(i)
+            ]
         except (OSError, json.JSONDecodeError, AttributeError):
             return []
 
