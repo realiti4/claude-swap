@@ -3139,7 +3139,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
-        for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -3151,6 +3151,7 @@ class ClaudeAccountSwitcher:
                 account_row(
                     num, email, org_name, org_uuid, is_active,
                     entry.decision_value(),
+                    credentials=creds,
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     alias=alias,
