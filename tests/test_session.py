@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import stat
 import sys
 import unicodedata
 from pathlib import Path
@@ -21,6 +23,7 @@ from claude_swap.session import (
     MCP_MIRROR_MARKER,
     SHARE_MANIFEST,
     SessionManager,
+    _is_reparse_link,
     _probe_env,
     keychain_service_name,
     live_sessions_for,
@@ -32,6 +35,41 @@ from claude_swap.session import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 ACCOUNT_EMAIL = "account2@example.com"
+def _link_dir(link: Path, target: Path) -> None:
+    """Create a reparse-point directory link, using the platform's
+    no-privilege primitive: a real junction on Windows, a symlink elsewhere.
+
+    Junctions need no privilege, but POSIX symlinks on Windows need
+    SeCreateSymbolicLinkPrivilege (Developer Mode/admin). Stubbing a junction
+    with a symlink therefore fails on a default Windows box — so on Windows we
+    stand in for a junction with an actual junction.
+    """
+    if sys.platform == "win32":
+        session_mod._create_junction(target, link)
+    else:
+        link.symlink_to(target)
+
+
+def _symlink_privilege() -> bool:
+    """Whether this host can create file symlinks at all."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        probe = Path(d) / "probe"
+        try:
+            probe.symlink_to(Path(d) / "nonexistent")
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+
+HAS_SYMLINK_PRIVILEGE = _symlink_privilege()
+requires_symlink = pytest.mark.skipif(
+    not HAS_SYMLINK_PRIVILEGE,
+    reason="needs symlink privilege (Windows Developer Mode/admin)",
+)
+
+
 ACCOUNT_NUM = "2"
 ORG_UUID = "org-uuid-2"
 
@@ -1375,7 +1413,9 @@ def history_setup(share_setup, temp_home: Path):
     return source, session_dir, mgr
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="exercises POSIX symlink specifics"
+)
 class TestShareHistoryPosix:
     def test_not_shared_by_default(self, history_setup):
         source, session_dir, mgr = history_setup
@@ -1537,25 +1577,459 @@ class TestShareHistoryPosix:
         assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
 
 
+@pytest.fixture
+def fake_junction(monkeypatch):
+    """Make _create_junction build a POSIX symlink so Windows history-share
+    flows are exercisable on any host. _is_reparse_link then detects it as a
+    link exactly as it would a real junction."""
+
+    def as_link(src, dest):
+        _link_dir(dest, src)
+
+    if sys.platform != "win32":
+        monkeypatch.setattr(session_mod, "_create_junction", as_link)
+    return as_link
+
+
 class TestShareHistoryWindows:
-    def test_sync_never_links_history_in_copy_mode(self, history_setup):
+    """Windows history sharing: junction (projects/) + file symlink
+    (history.jsonl), with a pre-emptive safety backup and graceful degradation.
+    Exercised on any host by stubbing the junction primitive (see fake_junction).
+    """
+
+    @pytest.fixture
+    def win(self, history_setup, fake_junction):
         source, session_dir, mgr = history_setup
         mgr.switcher.platform = Platform.WINDOWS
+        # seeded_switcher persisted creds/config under the macOS backend; the
+        # bootstrap path (test_run_no_longer_rejects) reads via the now-Windows
+        # file backend, so re-persist them there.
+        mgr.switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, CREDS)
+        mgr.switcher._write_account_config(ACCOUNT_NUM, ACCOUNT_EMAIL, CONFIG)
+        return source, session_dir, mgr
+
+    @requires_symlink
+    def test_links_projects_and_history(self, win):
+        source, session_dir, mgr = win
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
+        # projects/ shared via (stubbed) junction, history.jsonl via symlink.
+        assert _is_reparse_link(session_dir / "projects")
+        assert (session_dir / "projects").resolve() == (source / "projects").resolve()
+        assert (session_dir / "history.jsonl").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert {"projects", "history.jsonl"} <= set(manifest["items"])
+        # Customizations are still copies on Windows, not links.
+        assert (session_dir / "settings.json").is_file()
+        assert not _is_reparse_link(session_dir / "settings.json")
+
+    def test_writes_through_junction_to_shared_source(self, win):
+        """The whole point: a write inside the profile lands in ~/.claude."""
+        source, session_dir, mgr = win
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        (session_dir / "projects" / "-home-user-app" / "new.jsonl").write_text(
+            "written-in-session\n"
+        )
+        assert (
+            source / "projects" / "-home-user-app" / "new.jsonl"
+        ).read_text() == "written-in-session\n"
+
+    def test_backup_taken_before_first_link(self, win):
+        source, session_dir, mgr = win
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        marker = json.loads(
+            (mgr.switcher.backup_dir / session_mod.HISTORY_BACKUP_MARKER).read_text()
+        )
+        assert set(marker["items"]) == {"projects", "history.jsonl"}
+        backup = Path(marker["location"])
+        assert (
+            backup / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        assert (backup / "history.jsonl").read_text() == '{"p": "main"}\n'
+
+    def test_backup_is_one_time(self, win):
+        source, session_dir, mgr = win
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        backups_root = (
+            mgr.switcher.backup_dir / session_mod.HISTORY_BACKUP_DIRNAME
+        )
+        first = sorted(p.name for p in backups_root.iterdir())
+
+        # Second launch: marker present → no new snapshot dir is created.
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert sorted(p.name for p in backups_root.iterdir()) == first
+
+    def test_backup_failure_declines_history_sharing(self, win, monkeypatch, capsys):
+        source, session_dir, mgr = win
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(session_mod.shutil, "copytree", boom)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # History declined, but customizations still shared and no crash.
         assert not (session_dir / "projects").exists()
+        assert (session_dir / "settings.json").is_file()
+        assert "couldn't back up" in capsys.readouterr().out
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
         assert "projects" not in manifest["items"]
 
-    def test_run_rejects_flag(self, history_setup, monkeypatch):
-        source, session_dir, mgr = history_setup
-        mgr.switcher.platform = Platform.WINDOWS
+    def test_no_file_symlink_privilege_keeps_own_history(
+        self, win, monkeypatch, capsys
+    ):
+        """Default Windows (no symlink privilege): history.jsonl is NOT merged
+        away — the account keeps its own prompt history — while projects/ still
+        shares. Regression test for the destructive-merge-before-failed-link
+        bug."""
+        source, session_dir, mgr = win
         monkeypatch.setattr(
-            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
+            session_mod.SessionManager,
+            "_can_create_file_symlink",
+            lambda self, d: False,
         )
+        # The profile has its own prompt history, predating the flag.
+        (session_dir / "history.jsonl").write_text('{"p": "profile-own"}\n')
+        source_hist_before = (source / "history.jsonl").read_text()
 
-        with pytest.raises(SessionError, match="Windows"):
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # projects/ still shared...
+        assert _is_reparse_link(session_dir / "projects")
+        # ...but the profile keeps its OWN history.jsonl: not merged, not linked.
+        assert not _is_reparse_link(session_dir / "history.jsonl")
+        assert (session_dir / "history.jsonl").read_text() == '{"p": "profile-own"}\n'
+        # Source history untouched — no destructive merge happened.
+        assert (source / "history.jsonl").read_text() == source_hist_before
+        assert "Developer Mode or admin" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "projects" in manifest["items"]
+        assert "history.jsonl" not in manifest["items"]
+
+    def test_file_symlink_race_failure_degrades(self, win, monkeypatch, capsys):
+        """Probe says capable but the create still fails (race backstop):
+        history.jsonl skipped, projects/ shared, launch not aborted."""
+        source, session_dir, mgr = win
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_can_create_file_symlink",
+            lambda self, d: True,
+        )
+        real_create = session_mod.SessionManager._create_link
+
+        def create(self, src, dest, kind):
+            if kind == "file_symlink":
+                raise OSError(1314, "A required privilege is not held")
+            return real_create(self, src, dest, kind)
+
+        monkeypatch.setattr(session_mod.SessionManager, "_create_link", create)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert _is_reparse_link(session_dir / "projects")  # conversations shared
+        assert not (session_dir / "history.jsonl").exists()  # gracefully skipped
+        assert "could not be created" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "projects" in manifest["items"]
+        assert "history.jsonl" not in manifest["items"]
+
+    @requires_symlink
+    def test_can_create_file_symlink_probes_and_cleans_up(self, win):
+        """The Windows privilege probe creates then removes a throwaway link."""
+        source, session_dir, mgr = win
+        # Linux host allows symlinks, so with platform forced to Windows the
+        # probe succeeds and leaves no trace.
+        assert mgr._can_create_file_symlink(session_dir) is True
+        assert not (session_dir / ".cswap-symlink-probe").exists()
+
+    def test_idempotent(self, win):
+        source, session_dir, mgr = win
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        target_before = (session_dir / "projects").resolve()
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        assert (session_dir / "projects").resolve() == target_before
+
+    def test_toggle_off_removes_junction_keeps_real_history(self, win):
+        source, session_dir, mgr = win
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+        mgr._sync_sharing(session_dir, share=True, share_history=False)
+
+        assert not (session_dir / "projects").exists()  # junction gone
+        assert not (session_dir / "history.jsonl").exists()
+        # The shared source history is never touched.
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+
+    def test_run_no_longer_rejects(
+        self, win, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        source, session_dir, mgr = win
+        with pytest.raises(_ExecCalled) as exc:
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+        # Reached exec — no Windows rejection — with the session config dir.
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
+    def test_bootstrap_validation_failure_preserves_shared_history(
+        self, win, refresh_rotates, monkeypatch
+    ):
+        """The headline safeguard: a share step links projects/ (junction),
+        then validation fails and the profile is torn down — the shared
+        ~/.claude history must survive (cleanup must not recurse the junction)."""
+        source, session_dir, mgr = win
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+
+        with pytest.raises(SessionError, match="failed"):
+            mgr.setup_session(ACCOUNT_NUM, share=True, share_history=True)
+
+        assert not session_dir.exists()  # rolled back
+        # Shared source history is intact — cleanup removed the link, not target.
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        assert (source / "history.jsonl").read_text() == '{"p": "main"}\n'
+
+
+class TestJunctionSafety:
+    """Reparse-aware helpers: never delete or merge through a link's target.
+
+    POSIX symlinks stand in for Windows junctions here (both are reparse
+    points); the reparse-tag branch of _is_reparse_link is unit-tested with a
+    faked lstat since real junctions need Windows.
+    """
+
+    @requires_symlink
+    def test_is_reparse_link_true_for_symlink(self, tmp_path):
+        target = tmp_path / "t"
+        target.mkdir()
+        link = tmp_path / "l"
+        link.symlink_to(target)
+        assert _is_reparse_link(link)
+
+    def test_is_reparse_link_false_for_real(self, tmp_path):
+        (tmp_path / "d").mkdir()
+        (tmp_path / "f").write_text("x")
+        assert not _is_reparse_link(tmp_path / "d")
+        assert not _is_reparse_link(tmp_path / "f")
+        assert not _is_reparse_link(tmp_path / "missing")
+
+    def test_is_reparse_link_detects_junction_via_reparse_tag(
+        self, tmp_path, monkeypatch
+    ):
+        """A junction is not a symlink but carries a mount-point reparse tag."""
+        junction = tmp_path / "j"
+        junction.mkdir()  # a real dir standing in for the junction path
+        tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+        monkeypatch.setattr(session_mod, "_REPARSE_TAGS", frozenset({tag}))
+        real_lstat = os.lstat
+        # st_mode of a directory so is_symlink() (checked first) returns False,
+        # forcing the reparse-tag branch — how a real junction behaves.
+        monkeypatch.setattr(
+            session_mod.os,
+            "lstat",
+            lambda p: SimpleNamespace(st_mode=stat.S_IFDIR, st_reparse_tag=tag)
+            if Path(p) == junction
+            else real_lstat(p),
+        )
+        assert _is_reparse_link(junction)
+
+    def test_safe_rmtree_does_not_follow_link(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep me")
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "own.txt").write_text("disposable")
+        _link_dir(profile / "projects", outside)  # stands in for a junction
+
+        session_mod.safe_rmtree(profile)
+
+        assert not profile.exists()  # profile fully removed
+        assert (outside / "precious.txt").read_text() == "keep me"  # target intact
+
+    def test_remove_managed_on_link_keeps_target(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep me")
+        link = tmp_path / "projects"
+        _link_dir(link, outside)
+
+        session_mod.SessionManager._remove_managed(link)
+
+        assert not link.exists()
+        assert (outside / "precious.txt").read_text() == "keep me"
+
+    def test_cleanup_failed_session_does_not_follow_link(
+        self, manager, tmp_path
+    ):
+        outside = tmp_path / "real-history"
+        outside.mkdir()
+        (outside / "aaa.jsonl").write_text("real conversation")
+        session_dir = tmp_path / "profile"
+        session_dir.mkdir()
+        _link_dir(session_dir / "projects", outside)  # stands in for a junction
+
+        manager._cleanup_failed_session(session_dir)
+
+        assert not session_dir.exists()
+        assert (outside / "aaa.jsonl").read_text() == "real conversation"
+
+    def test_delete_session_profile_does_not_follow_link(
+        self, seeded_switcher, tmp_path
+    ):
+        outside = tmp_path / "real-history"
+        outside.mkdir()
+        (outside / "aaa.jsonl").write_text("real conversation")
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        _link_dir(session_dir / "projects", outside)
+
+        seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert not session_dir.exists()
+        assert (outside / "aaa.jsonl").read_text() == "real conversation"
+
+    def test_purge_does_not_follow_link(self, seeded_switcher, tmp_path, monkeypatch):
+        outside = tmp_path / "real-history"
+        outside.mkdir()
+        (outside / "aaa.jsonl").write_text("real conversation")
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        _link_dir(session_dir / "projects", outside)
+
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        seeded_switcher.purge()
+
+        assert not seeded_switcher.backup_dir.exists()
+        assert (outside / "aaa.jsonl").read_text() == "real conversation"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="real junctions/reparse points require Windows"
+)
+class TestWindowsRealJunctions:
+    """Exercise the REAL _winapi junction syscalls on Windows CI (windows-latest).
+
+    Everything runs under tmp_path — never the real ~/.claude — so this is safe
+    to run automatically. The rest of the Windows suite stubs _create_junction
+    with a symlink; this class is the proof the genuine reparse-point paths work.
+    """
+
+    @pytest.fixture
+    def win_mgr(self, tmp_path):
+        switcher = SimpleNamespace(
+            platform=Platform.WINDOWS,
+            backup_dir=tmp_path / "backup",
+            _logger=logging.getLogger("cswap-win-real-test"),
+        )
+        (tmp_path / "backup").mkdir()
+        return SessionManager(switcher)
+
+    def test_create_detect_and_remove_junction(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("precious")
+        link = tmp_path / "link"
+
+        session_mod._create_junction(target, link)
+
+        assert _is_reparse_link(link)  # junction detected despite not being a symlink
+        assert not link.is_symlink()  # ...and it genuinely is NOT a symlink
+        assert (link / "keep.txt").read_text() == "precious"  # reads through it
+
+        session_mod._remove_link(link)
+        assert not link.exists()
+        assert (target / "keep.txt").read_text() == "precious"  # target untouched
+
+    def test_write_through_junction_reaches_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        session_mod._create_junction(target, link)
+
+        (link / "written.txt").write_text("via junction")
+        assert (target / "written.txt").read_text() == "via junction"
+
+    def test_safe_rmtree_spares_real_junction_target(self, tmp_path):
+        outside = tmp_path / "real-history"
+        outside.mkdir()
+        (outside / "aaa.jsonl").write_text("real conversation")
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "own.txt").write_text("disposable")
+        session_mod._create_junction(outside, profile / "projects")
+
+        session_mod.safe_rmtree(profile)
+
+        assert not profile.exists()  # profile fully gone
+        assert (outside / "aaa.jsonl").read_text() == "real conversation"  # spared
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason="stdlib shutil.rmtree junction-following is Windows/Python "
+        "version-dependent: observed SAFE on Windows Server 2022 / CPython 3.12 "
+        "(target survives), historically it recursed through junctions. "
+        "safe_rmtree is safe regardless — see "
+        "test_safe_rmtree_spares_real_junction_target.",
+    )
+    def test_stdlib_rmtree_would_follow_junction(self, tmp_path):
+        """Documents the historical hazard that motivates safe_rmtree: on some
+        Windows/Python versions plain shutil.rmtree recurses THROUGH a junction
+        and destroys the target's contents. xfail(strict=False) so it never
+        gates CI — it XFAILs where stdlib is safe and XPASSes where the hazard
+        is live, keeping a live hazard visible either way."""
+        import shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "data.txt").write_text("x")
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        session_mod._create_junction(outside, profile / "j")
+
+        try:
+            shutil.rmtree(profile)
+        except OSError:
+            pass
+        # The historical hazard: stdlib destroys the junction's target contents.
+        assert not (outside / "data.txt").exists()
+
+    def test_materialize_real_junction_and_symlink(self, win_mgr, tmp_path):
+        src_dir = tmp_path / "src-projects"
+        src_dir.mkdir()
+        (src_dir / "a.jsonl").write_text("conv")
+        dest_dir = tmp_path / "profile" / "projects"
+        dest_dir.parent.mkdir()
+
+        win_mgr._materialize_share("projects", src_dir, dest_dir)
+        assert _is_reparse_link(dest_dir)
+        assert (dest_dir / "a.jsonl").read_text() == "conv"
+        # Idempotent: a second call leaves the same junction in place.
+        win_mgr._materialize_share("projects", src_dir, dest_dir)
+        assert _is_reparse_link(dest_dir)
+
+    def test_can_create_file_symlink_probe_real(self, win_mgr, tmp_path):
+        """On the GitHub windows-latest runner (admin) this is True; either way
+        the probe must leave no throwaway file behind."""
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        result = win_mgr._can_create_file_symlink(profile)
+        assert isinstance(result, bool)
+        assert not (profile / ".cswap-symlink-probe").exists()
 
 
 class TestReadSessionCredentials:

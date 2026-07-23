@@ -130,7 +130,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>
 
-- With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. On macOS/Linux/WSL this uses symlinks; on **Windows** `projects/` is shared with a directory junction (no admin needed) and `history.jsonl` with a file symlink (which needs Developer Mode or an elevated shell — without it only `history.jsonl` is skipped and a note is printed, while your conversations in `projects/` still share). The first time you enable it on Windows, a one-time safety copy of your existing history is written under the backup directory (`history-backups/`).
 - User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
 
