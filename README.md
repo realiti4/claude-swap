@@ -258,6 +258,14 @@ cswap menubar --uninstall-service   # stop it and remove the plist
 
 The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to `~/Library/Logs/com.cswap.menubar.{log,err}`. It pins the `cswap` console script, whose path survives an upgrade — but the running process keeps the old build until it restarts, so after `cswap upgrade` either re-run `--install-service` or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`.
 
+*Settings → Account rows* picks how each account is drawn. **Compact** (the default) is one free-text line per account. The other three lay every account on one shared column grid, so the same window sits at the same place on every row and you can compare down a column instead of reading across:
+
+- **Columns** — one column per usage window, with the window names in a dimmed header instead of repeated on every row.
+- **Columns with bars** — the same grid with a small progress bar in front of each number.
+- **Binding limit first** — leads with the window that's actually closest to blocking you, and dims the rest as context.
+
+Percentages turn orange past 80% and red past 95%, so a pool of idle accounts stays monochrome and colour means something. Spend is never coloured — an exhausted budget caps cost, it doesn't block a request. *Show reset times* adds a second, dimmed line with each window's countdown, aligned under its own percentage.
+
 </details>
 
 ## Advanced
