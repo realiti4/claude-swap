@@ -79,6 +79,53 @@ class TestSchema:
         assert entry.decision_value() == USAGE
 
 
+def _usage7(pct7: float, pct5: float = 5.0) -> dict:
+    return {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+
+
+class TestPrevWeeklySample:
+    """The prior weekly sample rolled forward for burn-rate estimation."""
+
+    def test_none_before_two_samples(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.prev_seven_day_pct is None
+        assert entry.prev_fetched_at is None
+
+    def test_rolls_prior_sample_forward(self, store, clock):
+        first_at = clock.now
+        store.record({"1": FetchRecord(usage=_usage7(10.0))}, IDENT)
+        clock.advance(600)
+        store.record({"1": FetchRecord(usage=_usage7(18.0))}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.prev_seven_day_pct == 10.0
+        assert entry.prev_fetched_at == first_at
+        # Each further success advances prev to the immediately prior sample.
+        second_at = clock.now
+        clock.advance(600)
+        store.record({"1": FetchRecord(usage=_usage7(25.0))}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.prev_seven_day_pct == 18.0
+        assert entry.prev_fetched_at == second_at
+
+    def test_failure_leaves_prev_untouched(self, store, clock):
+        store.record({"1": FetchRecord(usage=_usage7(10.0))}, IDENT)
+        clock.advance(600)
+        store.record({"1": FetchRecord(usage=_usage7(18.0))}, IDENT)
+        clock.advance(60)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.prev_seven_day_pct == 10.0  # a failure never rolls prev
+        assert entry.last_good == _usage7(18.0)
+
+    def test_window_less_success_does_not_point_prev_at_gap(self, store, clock):
+        store.record({"1": FetchRecord(usage=_usage7(10.0))}, IDENT)
+        clock.advance(600)
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 30.0}})}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.prev_seven_day_pct is None
+
+
 class TestStaleOnError:
     def test_failure_preserves_last_good(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
