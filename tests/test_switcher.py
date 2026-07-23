@@ -1516,6 +1516,37 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()   # adopted, not consumed
         write_live.assert_not_called()     # nothing to persist
 
+    def test_lock_reread_never_adopts_a_wiped_live_credential(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A CC ``invalid_grant`` wipe (tokens emptied, metadata kept) can land
+        between the pre-lock read and the under-lock re-read. A wiped blob
+        with a future ``expiresAt`` must not take the adopt branch — resyncing
+        it would copy the empty tokens over the slot's backup. It is also not
+        ours to consume (fingerprint can't match the backup) → defer."""
+        switcher = self._switcher(sample_sequence_data)
+        wiped_future = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=wiped_future), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()   # nothing consumed
+        write_backup.assert_not_called()   # the wipe never reaches the backup
+        mock_fetch.assert_not_called()
+
     def test_unattributed_lineage_never_consumes_a_generation(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -5595,6 +5626,68 @@ class TestProvenanceGuard:
         # Nothing moved: live store, outgoing backup both untouched.
         assert live_state["creds"] == mystery
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+
+    def test_wiped_live_credential_never_overwrites_a_token_bearing_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Claude Code reacts to ``invalid_grant`` by emptying the live
+        store's token fields in place (observed on 2.1.181: wrapper and
+        metadata kept, ``accessToken``/``refreshToken`` → ``""``). Such a
+        blob resolves to nobody (no access token → oracle silent), so the
+        unresolved fail-open used to copy it over the slot's backup —
+        destroying the only surviving refresh token. A wiped live credential
+        must never be written into a slot."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        wiped = json.dumps({"claudeAiOauth": {
+            "accessToken": "", "refreshToken": "",
+            "expiresAt": 1000, "scopes": ["user:profile"],
+            "subscriptionType": "max",
+        }})
+        live_state = {"creds": wiped}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        # The backup survived; the switch itself completed onto account 2.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert json.loads(live_state["creds"])["claudeAiOauth"][
+            "accessToken"] == "sk-stale-2"
+        # Nothing worth stashing in an empty blob.
+        assert switcher.list_unclaimed_credentials() == {}
+        # The user is told the slot needs a fresh login.
+        assert any("log in" in w.lower() for w in op["warnings"])
+
+    def test_wiped_live_matching_wiped_backup_stays_quiet(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Byte-identical wiped live and backup: the slot already lost its
+        tokens before this switch — nothing left to protect, no new warning
+        (the damage predates the switch and re-login surfaces elsewhere)."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        wiped = json.dumps({"claudeAiOauth": {
+            "accessToken": "", "refreshToken": "", "expiresAt": 1000,
+        }})
+        creds_store[("1", "test@example.com")] = wiped
+        live_state = {"creds": wiped}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == wiped
+        assert op["warnings"] == []
 
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,

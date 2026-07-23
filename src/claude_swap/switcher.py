@@ -2608,8 +2608,16 @@ class ClaudeAccountSwitcher:
                     identity = self._get_current_account()
                     if identity is None or identity[0] != email:
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                if live_oauth and not oauth.is_oauth_token_expired(
-                    live_oauth.get("expiresAt")
+                if (
+                    live_oauth
+                    # A CC invalid_grant wipe empties the token fields in
+                    # place but keeps metadata (observed on 2.1.181), so a
+                    # blob can look "non-expired" while holding no tokens —
+                    # adopting it would resync empty tokens over the backup.
+                    and live_oauth.get("accessToken")
+                    and not oauth.is_oauth_token_expired(
+                        live_oauth.get("expiresAt")
+                    )
                 ):
                     # Someone (a live CC) already rotated it — adopt, consume
                     # nothing. Mirrors CC's race-resolved path. Resync the
@@ -4182,6 +4190,14 @@ class ClaudeAccountSwitcher:
         - ``"foreign-synced"`` — resolved to another managed slot whose
           stored backup already holds this exact lineage; nothing needs
           preserving, nothing may be written.
+        - ``"wiped"``          — an OAuth blob whose token fields are all
+          empty: Claude Code's ``invalid_grant`` reaction empties
+          ``accessToken``/``refreshToken`` in place, keeping the wrapper and
+          metadata (observed live on 2.1.181). No token → the identity
+          oracle is structurally silent, so this used to fall to
+          ``"unresolved"`` and the fail-open backup copied the empty tokens
+          over the slot's only surviving refresh token. Never written into
+          any slot; nothing worth preserving either.
         - ``"alien"``          — a *structurally complete* identity (uuid +
           email + organization) that matches no managed slot (unmanaged
           login, recycled email wearing a managed address, or an email+org
@@ -4205,6 +4221,11 @@ class ClaudeAccountSwitcher:
             == oauth.credential_fingerprint(original_creds)
         ):
             return ("own-family", None)
+        live_oauth = oauth.extract_oauth_data(original_creds)
+        if live_oauth is not None and not (
+            live_oauth.get("accessToken") or live_oauth.get("refreshToken")
+        ):
+            return ("wiped", None)
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
             return ("unresolved", None)
@@ -4663,6 +4684,29 @@ class ClaudeAccountSwitcher:
                         f"credential already matches Account-{foreign_slot}'s "
                         "stored backup, so nothing was written into "
                         f"Account-{current_account}."
+                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                elif kind == "wiped":
+                    # Claude Code emptied the live token fields in place
+                    # (its invalid_grant reaction). The blob carries nothing
+                    # to preserve and writing it would replace the slot's
+                    # only surviving refresh token with empty strings — the
+                    # exact destruction chain observed in the field. Config
+                    # backup only; the slot's credential backup is the
+                    # recovery path.
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    msg = (
+                        "The live credential's tokens were wiped (Claude "
+                        "Code clears them when a refresh is rejected). "
+                        f"Account-{current_account}'s stored backup was "
+                        "kept. If the account cannot authenticate after "
+                        "switching back, log in with Claude Code and run: "
+                        "cswap add"
                     )
                     if emit_output:
                         warning(msg)
