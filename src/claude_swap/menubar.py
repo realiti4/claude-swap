@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +35,12 @@ ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+# How each account row is laid out. "compact" is the original free-text line;
+# the rest share one column grid across all accounts (see build_account_table),
+# except "focus", which leads with each account's binding window.
+ROW_STYLE_CHOICES: tuple[str, ...] = ("compact", "columns", "bars", "focus")
+# Layouts built on the shared column grid; "show reset times" applies to these.
+GRID_ROW_STYLES: tuple[str, ...] = ("columns", "bars")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 
@@ -97,6 +103,8 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    row_style: str = "compact"  # one of ROW_STYLE_CHOICES
+    show_resets: bool = False  # second, dimmed line with reset countdowns
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -286,6 +294,518 @@ def format_account_label(
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+
+
+# ---- aligned table rows (the "columns" / "detailed" row styles) --------------
+#
+# The compact style formats each row independently, so nothing lines up: a
+# proportional menu font plus per-account text of different lengths means the
+# reader has to parse every row to compare two numbers. These helpers instead
+# lay every account out on one shared column grid — which requires looking at
+# all accounts at once (a model column exists only if some account reports it),
+# so this works on the account list, not on a single row.
+
+MAXED_MARKER = "!"   # window at/over its limit — the usual reason to switch
+AHEAD_MARKER = "\u2191"   # weekly window running ahead of an even burn-down pace
+RESETS_CAPTION = "resets in"  # leads the dimmed second line of a detailed row
+SPEND_HEADER = "$"
+
+# Utilization thresholds behind the severity tint. Only the constrained end is
+# tinted: a pool of mostly-idle accounts should stay monochrome, with colour
+# reserved for the rows that are actually running out.
+WARNING_PCT = 80.0
+CRITICAL_PCT = 95.0
+
+@dataclass(frozen=True)
+class TableColumn:
+    """One column of the aligned account table."""
+
+    key: str            # "num" | "name" | "window"
+    title: str          # header text; "" for the num/name columns
+    right_aligned: bool
+
+
+@dataclass(frozen=True)
+class TableRow:
+    """One account's cells, the countdowns beneath them, and their severities."""
+
+    cells: tuple[str, ...]
+    resets: tuple[str, ...]             # same length as cells; "" where there's nothing
+    severities: tuple[str | None, ...]  # None | "warning" | "critical", per cell
+    values: tuple[float | None, ...]    # the raw percentage behind a cell, for bars
+
+
+def severity_for(pct: float | None) -> str | None:
+    """Severity tint for a utilization percentage, or None to leave it plain."""
+    if pct is None:
+        return None
+    if pct >= CRITICAL_PCT:
+        return "critical"
+    if pct >= WARNING_PCT:
+        return "warning"
+    return None
+
+
+NAME_LIMIT = 26  # characters; one long address must not push every number right
+
+
+def truncate_name(name: str, limit: int = NAME_LIMIT) -> str:
+    """Shorten an over-long account name, keeping the part that identifies it.
+
+    The name column is as wide as its widest entry, so a single long address
+    would push every percentage on every row to the right. Drops the domain
+    first (it's usually the redundant part), then hard-truncates.
+    """
+    if len(name) <= limit:
+        return name
+    local, _, domain = name.partition("@")
+    if domain and len(local) <= limit:
+        shortened = f"{local}@…"
+        if len(shortened) <= limit:
+            return shortened
+    return name[: limit - 1] + "…"
+
+
+def _pct_text(window: dict, *, ahead: bool = False, marker: bool = True) -> str:
+    """A percentage cell, with the at-limit / ahead-of-pace marker appended.
+
+    ``marker=False`` for spend: an exhausted budget caps cost, it doesn't block
+    a request, so flagging it like a maxed rate-limit window would misread.
+    """
+    pct = window["pct"]
+    if marker and pct >= 100:
+        return f"{pct:.0f}%{MAXED_MARKER}"
+    return f"{pct:.0f}%{AHEAD_MARKER if (marker and ahead) else ''}"
+
+
+def _scoped_windows(usage: dict, now: float) -> dict[str, dict]:
+    """Named per-model weekly windows of one account, keyed by model name."""
+    out: dict[str, dict] = {}
+    for window in usage.get("scoped") or []:
+        window = _rolled_weekly_window(window, now)
+        if (
+            isinstance(window, dict)
+            and isinstance(window.get("pct"), (int, float))
+            and window.get("name")
+        ):
+            out[window["name"]] = window
+    return out
+
+
+def account_table_model_names(accounts, now: float | None = None) -> tuple[str, ...]:
+    """Per-model window names in column order (deduplicated, first-seen order)."""
+    if now is None:
+        now = time.time()
+    names: list[str] = []
+    for _num, _email, _active, usage, *_rest in accounts:
+        if isinstance(usage, dict):
+            for name in _scoped_windows(usage, now):
+                if name not in names:
+                    names.append(name)
+    return tuple(names)
+
+
+def account_table_columns(accounts, now: float | None = None) -> tuple[TableColumn, ...]:
+    """The column grid shared by every account row.
+
+    One column per usage window, with the window's name carried in the column
+    *header* rather than repeated on every row. Model and spend columns appear
+    only when at least one account reports them, so a pool without per-model
+    limits doesn't carry empty columns around.
+    """
+    if now is None:
+        now = time.time()
+    columns = [
+        # The slot number leads the row, before the first tab, so it has no tab
+        # stop of its own and is simply left-aligned.
+        TableColumn("num", "", False),
+        TableColumn("name", "", False),
+        TableColumn("window", "5h", True),
+        TableColumn("window", "7d", True),
+    ]
+    for name in account_table_model_names(accounts, now):
+        columns.append(TableColumn("window", name, True))
+    for _num, _email, _active, usage, *_rest in accounts:
+        spend = usage.get("spend") if isinstance(usage, dict) else None
+        if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+            columns.append(TableColumn("window", SPEND_HEADER, True))
+            break
+    return tuple(columns)
+
+
+def account_table_header(columns: tuple[TableColumn, ...]) -> tuple[str, ...]:
+    """Header cells for the column grid (blank over the num/name columns)."""
+    return tuple(column.title for column in columns)
+
+
+def build_account_table(accounts, now: float | None = None) -> list[TableRow]:
+    """Lay every account out on the shared column grid.
+
+    Accounts whose usage is a sentinel string ("re-login needed", "no
+    credentials", …) or missing carry that message in their *name* cell instead:
+    the window columns are right-aligned percentage columns, and a sentence
+    dropped into one would run backwards across the row.
+    """
+    if now is None:
+        now = time.time()
+    columns = account_table_columns(accounts, now)
+    model_names = account_table_model_names(accounts, now)
+    width = len(columns)
+    rows: list[TableRow] = []
+
+    for num, email, _is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
+        name = f"{alias} ({email})" if alias else truncate_name(email)
+        if disabled:
+            name += "  (disabled)"
+        cells = [str(num), name] + [""] * (width - 2)
+        resets = [""] * width
+        severities: list[str | None] = [None] * width
+        values: list[float | None] = [None] * width
+
+        if not isinstance(usage, dict):
+            message = usage if isinstance(usage, str) else "usage unavailable"
+            cells[1] = f"{name} — {message}"
+            rows.append(TableRow(tuple(cells), tuple(resets), tuple(severities),
+                                 tuple(values)))
+            continue
+
+        def place(index: int, window: dict, *, ahead: bool = False, tint: bool = True,
+                  marker: bool = True) -> None:
+            cells[index] = _pct_text(window, ahead=ahead, marker=marker)
+            values[index] = float(window["pct"])
+            if tint:
+                severities[index] = severity_for(window["pct"])
+            countdown = _live_countdown(window, now)
+            if countdown:
+                resets[index] = countdown
+
+        five = usage.get("five_hour")
+        if isinstance(five, dict) and isinstance(five.get("pct"), (int, float)):
+            place(2, five)
+
+        seven = _rolled_weekly_window(usage.get("seven_day"), now)
+        if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)):
+            pace_result = pace.compute_pace(seven, fetched_at=fetched_at)
+            place(3, seven, ahead=bool(pace_result and pace_result.ahead))
+
+        scoped = _scoped_windows(usage, now)
+        for offset, model in enumerate(model_names):
+            window = scoped.get(model)
+            if window is None:
+                continue
+            pace_result = pace.compute_pace(window, fetched_at=fetched_at)
+            place(4 + offset, window, ahead=bool(pace_result and pace_result.ahead))
+
+        spend = usage.get("spend")
+        if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+            index = 4 + len(model_names)
+            if index < width and columns[index].title == SPEND_HEADER:
+                # Spend is a budget, not a rate-limit window: it never blocks a
+                # request, so it carries neither tint nor at-limit marker.
+                place(index, spend, tint=False, marker=False)
+
+        rows.append(TableRow(tuple(cells), tuple(resets), tuple(severities),
+                             tuple(values)))
+
+    return rows
+
+
+def build_focus_table(accounts, now: float | None = None) -> list[TableRow]:
+    """Rows that lead with each account's *binding* window.
+
+    Answers "which account can I use right now" directly: the window closest to
+    its limit is what actually blocks you, so it comes first and carries the
+    tint; everything else trails behind it as dimmed context.
+    """
+    if now is None:
+        now = time.time()
+    model_names = account_table_model_names(accounts, now)
+    rows: list[TableRow] = []
+
+    for num, email, _is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
+        name = f"{alias} ({email})" if alias else truncate_name(email)
+        if disabled:
+            name += "  (disabled)"
+        if not isinstance(usage, dict):
+            message = usage if isinstance(usage, str) else "usage unavailable"
+            rows.append(TableRow((str(num), f"{name} — {message}", "", ""),
+                                 ("", "", "", ""), (None,) * 4, (None,) * 4))
+            continue
+
+        windows: list[tuple[str, dict]] = []
+        five = usage.get("five_hour")
+        if isinstance(five, dict) and isinstance(five.get("pct"), (int, float)):
+            windows.append(("5h", five))
+        seven = _rolled_weekly_window(usage.get("seven_day"), now)
+        if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)):
+            windows.append(("7d", seven))
+        scoped = _scoped_windows(usage, now)
+        for model in model_names:
+            if model in scoped:
+                windows.append((model, scoped[model]))
+
+        if not windows:
+            rows.append(TableRow((str(num), f"{name} — usage unavailable", "", ""),
+                                 ("", "", "", ""), (None,) * 4, (None,) * 4))
+            continue
+
+        # Spend is excluded from the binding choice — it caps cost, not requests.
+        label, window = max(windows, key=lambda item: item[1]["pct"])
+        binding = f"{label} {_pct_text(window)}"
+        rest = " · ".join(
+            f"{other_label} {other['pct']:.0f}%"
+            for other_label, other in windows
+            if other_label != label
+        )
+        spend = usage.get("spend")
+        if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+            rest = f"{rest} · $ {spend['pct']:.0f}%" if rest else f"$ {spend['pct']:.0f}%"
+        countdown = _live_countdown(window, now) or ""
+        rows.append(TableRow(
+            (str(num), name, binding, rest),
+            ("", "", countdown, ""),
+            (None, None, severity_for(window["pct"]), None),
+            (None, None, float(window["pct"]), None),
+        ))
+
+    return rows
+
+
+def focus_table_columns() -> tuple[TableColumn, ...]:
+    """Column grid for the focus style: number, name, binding window, the rest."""
+    return (
+        TableColumn("num", "", False),
+        TableColumn("name", "", False),
+        TableColumn("window", "", False),
+        TableColumn("rest", "", False),
+    )
+
+
+# ---- attributed-string layout (needs AppKit; passed in, never imported here) --
+
+def _bar_image(AppKit, pct: float, font, fill_color, track_color):
+    """A small rounded progress bar, drawn to fit one line of ``font``.
+
+    Drawn rather than spelled with block glyphs (▁ █ ▌): those have no coverage
+    in the menu font, so they fall back to whatever face does have them and come
+    out at inconsistent widths — and ▁ renders as a hairline on the baseline, so
+    an empty bar reads as an underscore. Sizing from the font's point size keeps
+    the bar proportional at any system font size.
+    """
+    point = font.pointSize()
+    height = max(4.0, round(point * 0.42))
+    width = round(point * 4.6)
+    image = AppKit.NSImage.alloc().initWithSize_((width, height))
+    image.lockFocus()
+    radius = height / 2.0
+    track_color.setFill()
+    AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        ((0, 0), (width, height)), radius, radius).fill()
+    filled = max(0.0, min(100.0, pct)) / 100.0 * width
+    if filled > 0:
+        # Never thinner than the cap radius, or a few-percent bar disappears.
+        filled = max(filled, height)
+        fill_color.setFill()
+        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            ((0, 0), (filled, height)), radius, radius).fill()
+    image.unlockFocus()
+    return image
+
+
+def _bar_attachment(AppKit, image, font):
+    """The bar image as an attributed string, sitting on the text baseline."""
+    attachment = AppKit.NSTextAttachment.alloc().init()
+    cell = AppKit.NSTextAttachmentCell.alloc().initImageCell_(image)
+    attachment.setAttachmentCell_(cell)
+    return AppKit.NSAttributedString.attributedStringWithAttachment_(attachment)
+
+
+def build_attributed_rows(
+    AppKit,
+    rows: list[TableRow],
+    columns: tuple[TableColumn, ...],
+    header_cells: tuple[str, ...] = (),
+    *,
+    with_resets: bool = False,
+    bars: bool = False,
+    font_size: float | None = None,
+):
+    """Lay the rows out as attributed strings. Returns ``(titles, header)``.
+
+    AppKit does the alignment: one shared ``NSParagraphStyle`` whose tab stops
+    are measured from the widest cell per column, so columns line up under the
+    proportional menu font instead of needing a monospaced one. Every measure is
+    taken in the font the text is actually drawn in and every gap is expressed
+    in that font's own space width, so the whole grid scales with the system
+    font size instead of assuming one screen's metrics.
+
+    ``AppKit`` is a parameter rather than an import: this module stays
+    import-safe (and unit-testable) without pyobjc, exactly like the rumps glue.
+    """
+    # ``font_size`` exists so the layout can be rendered at sizes other than
+    # this machine's current one (previews, review at accessibility sizes).
+    size = AppKit.NSFont.systemFontSize() if font_size is None else font_size
+    small_size = (
+        AppKit.NSFont.smallSystemFontSize() if font_size is None else max(9.0, font_size - 2)
+    )
+    font = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+        size, AppKit.NSFontWeightRegular
+    )
+    small_font = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+        small_size, AppKit.NSFontWeightRegular
+    )
+    colors = {
+        "warning": AppKit.NSColor.systemOrangeColor(),
+        "critical": AppKit.NSColor.systemRedColor(),
+    }
+
+    def width(text, f):
+        if not text:
+            return 0.0
+        return AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            text, {AppKit.NSFontAttributeName: f}
+        ).size().width
+
+    # A bar is drawn art, not text: reserve its width (plus a space) on top of
+    # the percentage it precedes.
+    bar_width = (
+        _bar_image(AppKit, 0.0, font,
+                   AppKit.NSColor.labelColor(),
+                   AppKit.NSColor.quaternaryLabelColor()).size().width + width(" ", font)
+        if bars else 0.0
+    )
+
+    window_indexes = [i for i, c in enumerate(columns) if c.key == "window"]
+    if bars and window_indexes:
+        # Each window cell is right-aligned on its tab stop, so a wider
+        # percentage ("37%" vs "0%") would push its bar further left and leave
+        # the bars' left edges ragged. Pad the numbers to a common width with
+        # FIGURE SPACE, which is exactly one digit wide in this font.
+        pad_to = max(
+            (len(row.cells[i]) for row in rows for i in window_indexes
+             if row.values[i] is not None),
+            default=0,
+        )
+        rows = [
+            replace(row, cells=tuple(
+                cell.rjust(pad_to, "\u2007")
+                if (i in window_indexes and row.values[i] is not None) else cell
+                for i, cell in enumerate(row.cells)
+            ))
+            for row in rows
+        ]
+
+    widths = []
+    for index in range(len(columns)):
+        widest = width(header_cells[index], small_font) if header_cells else 0.0
+        extra = bar_width if (bars and columns[index].key == "window") else 0.0
+        for row in rows:
+            cell = width(row.cells[index], font)
+            widest = max(widest, cell + (extra if row.values[index] is not None else 0.0))
+            if with_resets:
+                widest = max(widest, width(row.resets[index], small_font))
+        widths.append(widest)
+    if with_resets and len(widths) > 1:
+        widths[1] = max(widths[1], width(RESETS_CAPTION, small_font))
+
+    # Give every window column the same width — an even rhythm reads far better
+    # than columns that each hug their own widest value, and it keeps a "0%"
+    # column from collapsing next to a "100%!" one.
+    if window_indexes and header_cells:
+        uniform = max(widths[i] for i in window_indexes)
+        for i in window_indexes:
+            widths[i] = uniform
+
+    gap = width("  ", font)            # after the slot number, and in focus rows
+    column_gap = width("     ", font)  # between window columns: room to breathe
+    paragraph = AppKit.NSMutableParagraphStyle.alloc().init()
+    stops = []
+    x = widths[0] + gap  # the slot number leads the row, before the first tab
+    for index in range(1, len(columns)):
+        if columns[index].right_aligned:
+            x += widths[index]
+            stops.append(AppKit.NSTextTab.alloc().initWithTextAlignment_location_options_(
+                AppKit.NSTextAlignmentRight, x, {}))
+        else:
+            stops.append(AppKit.NSTextTab.alloc().initWithTextAlignment_location_options_(
+                AppKit.NSTextAlignmentLeft, x, {}))
+            x += widths[index]
+        x += column_gap if columns[index].key == "window" else gap
+    paragraph.setTabStops_(stops)
+    # Without this, any text past the last stop falls back to the default 28pt
+    # interval and the grid breaks.
+    paragraph.setDefaultTabInterval_(gap)
+
+    def line(cells, f, color=None):
+        attributes = {
+            AppKit.NSFontAttributeName: f,
+            AppKit.NSParagraphStyleAttributeName: paragraph,
+        }
+        if color is not None:
+            attributes[AppKit.NSForegroundColorAttributeName] = color
+        return AppKit.NSMutableAttributedString.alloc().initWithString_attributes_(
+            "\t".join(cells).rstrip("\t"), attributes)
+
+    titles = []
+    for row in rows:
+        attributed = line(row.cells, font)
+        # Ranges are located by walking the joined string, so a cell's own text
+        # length (bar glyphs, markers) can't shift the offsets.
+        # Cell start offsets in the joined string, walked forward once. Trailing
+        # empty cells are stripped from the string, but that only shortens the
+        # tail — every non-empty cell keeps the offset computed here.
+        offsets = []
+        offset = 0
+        for cell in row.cells:
+            offsets.append(offset)
+            offset += len(cell) + 1  # + the tab that follows it
+        for index, cell in enumerate(row.cells):
+            if cell and row.severities[index] in colors:
+                attributed.addAttribute_value_range_(
+                    AppKit.NSForegroundColorAttributeName,
+                    colors[row.severities[index]], (offsets[index], len(cell)))
+        if bars:
+            # Insert back-to-front so the earlier offsets stay valid.
+            for index in reversed(range(len(row.cells))):
+                value = row.values[index]
+                if value is None or columns[index].key != "window":
+                    continue
+                severity = row.severities[index]
+                fill = colors.get(severity, AppKit.NSColor.secondaryLabelColor())
+                bar = AppKit.NSMutableAttributedString.alloc().initWithAttributedString_(
+                    _bar_attachment(
+                        AppKit,
+                        _bar_image(AppKit, value, font, fill,
+                                   AppKit.NSColor.quaternaryLabelColor()),
+                        font,
+                    )
+                )
+                bar.appendAttributedString_(
+                    AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                        " ", {AppKit.NSFontAttributeName: font}))
+                attributed.insertAttributedString_atIndex_(bar, offsets[index])
+        if not header_cells and len(row.cells) == 4 and row.cells[3]:
+            # Focus style: the trailing context recedes so the binding window,
+            # which is the whole point of the row, carries the eye.
+            start = len(row.cells[0]) + 1 + len(row.cells[1]) + 1 + len(row.cells[2]) + 1
+            attributed.addAttribute_value_range_(
+                AppKit.NSForegroundColorAttributeName,
+                AppKit.NSColor.secondaryLabelColor(),
+                (start, len(row.cells[3])))
+        if with_resets and any(row.resets):
+            resets = list(row.resets)
+            resets[1] = RESETS_CAPTION
+            attributed.appendAttributedString_(
+                AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                    "\n", {AppKit.NSParagraphStyleAttributeName: paragraph}))
+            attributed.appendAttributedString_(
+                line(resets, small_font, AppKit.NSColor.secondaryLabelColor()))
+        titles.append(attributed)
+
+    header = None
+    if header_cells and any(header_cells):
+        header = line(header_cells, small_font, AppKit.NSColor.secondaryLabelColor())
+    return titles, header
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -655,18 +1175,29 @@ def run(switcher) -> int:
                 alias=self.snapshot.get("active_alias"),
             )
             self.menu.clear()
+            accounts = self.snapshot["accounts"]
+            aligned, header = self._aligned_titles(accounts)
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            if header is not None:
+                # A disabled item: it names the columns, it isn't a target.
+                head = rumps.MenuItem("  ", callback=None)
+                head._menuitem.setAttributedTitle_(header)
+                account_items.append(head)
+            for index, (num, email, is_active, display, _last_good, alias, disabled, fetched_at) in enumerate(accounts):
                 item = rumps.MenuItem(
                     format_account_label(
                         num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
                     ),
                     callback=self._make_switch_to(num),
                 )
+                # The plain label above stays the item's rumps key (unique per
+                # account); the attributed title only changes what's drawn.
+                if aligned is not None:
+                    item._menuitem.setAttributedTitle_(aligned[index])
                 item.state = 1 if is_active else 0
                 account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+            if not accounts:
+                account_items = [rumps.MenuItem("No managed accounts", callback=None)]
 
             self.menu = [
                 *account_items,
@@ -685,6 +1216,32 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+
+        def _aligned_titles(self, accounts):
+            """Attributed titles for the account rows, plus an optional header.
+
+            Returns ``(titles, header)``; both ``None`` for the compact style,
+            which stays plain text. The layout itself lives in
+            :func:`build_attributed_rows` so it can be rendered — and reviewed —
+            without a running menu.
+            """
+            style_name = self.settings.row_style
+            if style_name not in GRID_ROW_STYLES + ("focus",) or not accounts:
+                return None, None
+            now = time.time()
+            if style_name == "focus":
+                columns = focus_table_columns()
+                rows = build_focus_table(accounts, now)
+                header_cells = ()
+            else:
+                columns = account_table_columns(accounts, now)
+                rows = build_account_table(accounts, now)
+                header_cells = account_table_header(columns)
+            return build_attributed_rows(
+                AppKit, rows, columns, header_cells,
+                with_resets=self.settings.show_resets and style_name in GRID_ROW_STYLES,
+                bars=style_name == "bars",
+            )
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
@@ -737,6 +1294,24 @@ def run(switcher) -> int:
 
         def _settings_menu(self, rumps):
             menu = rumps.MenuItem("Settings")
+
+            rows = rumps.MenuItem("Account rows")
+            row_labels = {
+                "compact": "Compact (one line)",
+                "columns": "Columns",
+                "bars": "Columns with bars",
+                "focus": "Binding limit first",
+            }
+            for style in ROW_STYLE_CHOICES:
+                ch = rumps.MenuItem(row_labels[style], callback=self._make_row_style(style))
+                ch.state = 1 if self.settings.row_style == style else 0
+                rows.add(ch)
+            rows.add(None)
+            resets_item = rumps.MenuItem("Show reset times", callback=self.on_toggle_resets)
+            resets_item.state = 1 if self.settings.show_resets else 0
+            rows.add(resets_item)
+            menu.add(rows)
+
             name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
@@ -909,6 +1484,16 @@ def run(switcher) -> int:
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
             self._save_and_rebuild()
+
+        def on_toggle_resets(self, _sender):
+            self.settings.show_resets = not self.settings.show_resets
+            self._save_and_rebuild()
+
+        def _make_row_style(self, style):
+            def cb(_sender):
+                self.settings.row_style = style
+                self._save_and_rebuild()
+            return cb
 
         def _make_title_pct(self, mode):
             def cb(_sender):
