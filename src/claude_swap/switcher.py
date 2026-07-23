@@ -2816,28 +2816,29 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
-        to_fetch = store.reserve(
+        claims = store.reserve(
             requested, identities, respect_plans=fetch is None
         )
 
-        if to_fetch:
+        if claims:
             pre = entries
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in to_fetch]
+                [info_by_num[num] for num in claims]
             )
-            store.record(records, identities)
-            for num, record in records.items():
+            plans = self._plans_after_fetch(records, pre, info_by_num)
+            accepted = store.record(records, identities, claims, plans)
+            accepted_records = {
+                num: record for num, record in records.items() if num in accepted
+            }
+            for num, record in accepted_records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
             entries = store.entries(identities, models)
-            self._persist_poll_plans(
-                records, pre, entries, info_by_num, identities
-            )
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
             # so surface "re-login needed" in *this* pass instead of leaving the
             # slot looking merely refresh-failed until the next refresh notices.
-            for num in to_fetch:
+            for num in accepted:
                 if entries[num].token_dead():
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
@@ -2846,40 +2847,36 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
         }
 
-    def _persist_poll_plans(
+    def _plans_after_fetch(
         self,
         records: dict[str, FetchRecord],
         pre: dict[str, UsageEntry],
-        post: dict[str, UsageEntry],
         info_by_num: dict[str, tuple],
-        identities: dict[str, tuple[str, str]],
-    ) -> None:
-        """Adapt and persist the cadence of every slot just fetched
-        successfully, so the next collector — whichever surface it runs in —
-        inherits the plan. Failures are paced by the store's backoff instead
-        and keep their (now past-due) plan for when the backoff lifts."""
+    ) -> dict[str, tuple[float | None, float | None]]:
+        """Build successful-fetch cadence updates for atomic outcome commit.
+
+        Failures are paced by the store's backoff and keep their past-due plan
+        for when the backoff lifts.
+        """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
                 continue
-            before, after = pre.get(num), post.get(num)
-            if after is None or after.fetched_at is None:
-                continue
+            before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
-                new_usage=after.last_good,
+                new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
                 threshold=threshold,
                 models=models,
                 recent_429=recent_429,
                 now=now,
             )
-        if plans:
-            self._usage_store.set_poll_plan(plans, identities)
+        return plans
 
     def _replan_new_active(self, number: str, email: str, org_uuid: str) -> None:
         """Pull the just-activated account's poll plan to the active floor.
