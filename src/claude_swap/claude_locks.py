@@ -58,10 +58,6 @@ TOUCH_INTERVAL_S = 3.0
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
 DEFAULT_TIMEOUT_S = 9.0
 
-# Backwards-compatible alias: the old single staleness constant. Kept because
-# tests and external callers may monkeypatch it; the config path still uses it.
-STALENESS_S = CONFIG_STALENESS_S
-
 _logger = logging.getLogger("claude-swap")
 
 
@@ -89,7 +85,7 @@ def proper_lockfile(
     lock_dir: Path,
     *,
     timeout: float | None = None,
-    staleness: float = STALENESS_S,
+    staleness: float = CONFIG_STALENESS_S,
 ):
     """Acquire a proper-lockfile-compatible directory lock.
 
