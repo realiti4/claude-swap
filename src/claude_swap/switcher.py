@@ -1266,6 +1266,32 @@ class ClaudeAccountSwitcher:
         )
         return slot, email
 
+    def slot_for_identifier(
+        self, identifier: str
+    ) -> tuple[str | None, str | None]:
+        """Resolve a NUM|ALIAS|EMAIL to (slot, email), for pin-file launches.
+
+        A soft counterpart to :meth:`resolve_account`: an unknown, empty, or
+        ambiguous identifier returns ``(None, None)`` instead of raising, so a
+        project pin that names a since-removed (or mistyped) account lets
+        ``cswap run`` fall back to the default rather than aborting the launch.
+        """
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return None, None
+        try:
+            num = self._resolve_account_identifier(identifier)
+        except ConfigError:
+            # Ambiguous email — can't pick a slot unattended.
+            return None, None
+        if not num:
+            return None, None
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(num))
+        if not record:
+            return None, None
+        return str(num), record.get("email", "")
+
     def list_mappings(self) -> None:
         """Print all directory → account mappings (for `cswap map`)."""
         from claude_swap.mappings import MappingStore
