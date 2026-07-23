@@ -202,6 +202,7 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
+cswap autostart on              # Start the macOS menu bar at login (bare: status; `off` to remove)
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
@@ -249,6 +250,16 @@ cswap menubar
 ```
 
 Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+
+`cswap menubar` runs in the foreground, so it stops when its terminal closes. *Settings → Start at login* keeps it around: it writes a launchd LaunchAgent (`~/Library/LaunchAgents/com.claude-swap.menubar.plist`) that starts the menu bar at every login and restarts it if it ever crashes — but never after you quit it from the menu. The same toggle is available headlessly, which is the easier route when setting up a second Mac over SSH:
+
+```bash
+cswap autostart          # on / off, and where the LaunchAgent lives
+cswap autostart on       # takes effect at the next login
+cswap autostart off
+```
+
+Reinstalling (`uv tool upgrade`, a move to another Python) relocates the executable the LaunchAgent points at; the menu bar re-points it on its next launch, so autostart survives updates.
 
 </details>
 

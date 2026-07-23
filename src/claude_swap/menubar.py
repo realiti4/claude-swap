@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import autostart, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -468,6 +468,18 @@ def run(switcher) -> int:
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
+    # launchd writes the login item's stdout/stderr here — kept apart from the
+    # switch log so a crash trace never interleaves with switch history.
+    agent_log_path = switcher.backup_dir / "menubar-agent.log"
+
+    # A reinstall (uv/pipx upgrade, a move to another Python) relocates the
+    # console script the login item launches, which would leave autostart
+    # silently dead. Re-point it on every launch instead.
+    if autostart.is_enabled() and autostart.is_stale():
+        try:
+            autostart.enable(log_path=agent_log_path)
+        except autostart.AutostartError as exc:
+            logging.getLogger("claude-swap").warning("Could not refresh login item: %s", exc)
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -776,6 +788,13 @@ def run(switcher) -> int:
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
 
+            # App lifecycle, not a display preference — separated so the block
+            # above reads as "what the menu bar shows" and this as "when it runs".
+            menu.add(None)
+            login_item = rumps.MenuItem("Start at login", callback=self.on_toggle_login_item)
+            login_item.state = 1 if autostart.is_enabled() else 0
+            menu.add(login_item)
+
             return menu
 
         # ---- callbacks --------------------------------------------------------
@@ -927,6 +946,23 @@ def run(switcher) -> int:
                 self.refresh_timer.start()
                 self._save_and_rebuild()
             return cb
+
+        def on_toggle_login_item(self, _sender):
+            # State lives in the filesystem (the LaunchAgent plist), not in
+            # menubar_settings.json — launchd is the source of truth, and a
+            # settings copy could disagree with it after a manual edit.
+            try:
+                if autostart.is_enabled():
+                    autostart.disable()
+                    message = "The menu bar will no longer start at login."
+                else:
+                    autostart.enable(log_path=agent_log_path)
+                    message = "The menu bar will start automatically at the next login."
+            except autostart.AutostartError as e:
+                rumps.alert(title="claude-swap", message=str(e))
+                return
+            rumps.notification("claude-swap", "Start at login", message)
+            self.rebuild_menu()
 
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
