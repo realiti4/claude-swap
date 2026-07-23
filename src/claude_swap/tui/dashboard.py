@@ -354,8 +354,19 @@ class WatchScreen(AccountListScreen):
         self._selecting = False
 
     def on_mount(self) -> None:
-        self.query_one("#list-title", Static).update(self._WATCH_TITLE)
+        self.watch(self.app, "refresh_status", self._on_refresh_status)
+        self.query_one("#list-title", Static).update(self._title_text())
         super().on_mount()
+
+    def _title_text(self) -> str:
+        if self._selecting:
+            return self._SELECT_TITLE
+        status = self.app.refresh_status
+        return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
+
+    def _on_refresh_status(self, status: str) -> None:
+        if not self._selecting:
+            self.query_one("#list-title", Static).update(self._title_text())
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "select_highlighted" and not self._selecting:
@@ -382,7 +393,7 @@ class WatchScreen(AccountListScreen):
         else:
             listview.index = None
             self.set_focus(None)
-            title.update(self._WATCH_TITLE)
+            title.update(self._title_text())
         self.refresh_bindings()
 
     def action_toggle_select(self) -> None:
