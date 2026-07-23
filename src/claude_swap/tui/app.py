@@ -8,6 +8,8 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from functools import partial
 
 from textual.app import App
@@ -21,7 +23,7 @@ from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-from claude_swap.tui.data import ActionResult, SnapshotSource, run_action
+from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
@@ -39,6 +41,7 @@ class CswapApp(App):
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
 
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
+    refresh_status: reactive[str] = reactive("")
     busy: reactive[bool] = reactive(False)
 
     def __init__(
@@ -55,7 +58,11 @@ class CswapApp(App):
         self.source = SnapshotSource(switcher)
         self._store_only = False
         self._full_next = False
-        self._refreshing = False
+        self._normal_refreshing = False
+        self._store_refreshing = False
+        self._normal_started_at: float | None = None
+        self._refresh_generation = 0
+        self._applied_generation = 0
         self._last_refresh_error = ""
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
@@ -82,32 +89,113 @@ class CswapApp(App):
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
+        self.set_interval(1.0, self._update_refresh_status)
         self._tick()
 
     # -- snapshot poll loop ---------------------------------------------------
 
     def _tick(self) -> None:
-        """Start a refresh pass unless one is already in flight."""
-        if self._refreshing:
+        """Start one eligible refresh lane.
+
+        Normal mode prefers the fetch-enabled lane. When that lane is blocked,
+        the poll tick may still observe another process's store update through
+        one store-only lane. Auto mode already has an engine fetching, so it
+        launches only store-only snapshots.
+        """
+        if self._store_only:
+            self._start_store_refresh()
+        elif not self._normal_refreshing:
+            full, self._full_next = self._full_next, False
+            self._start_normal_refresh(full=full)
+        else:
+            self._start_store_refresh()
+
+    def _start_normal_refresh(self, *, full: bool) -> None:
+        if self._normal_refreshing:
             return
-        self._refreshing = True
-        full, self._full_next = self._full_next, False
+        self._normal_refreshing = True
+        self._normal_started_at = time.time()
+        generation = self._next_refresh_generation()
+        self._update_refresh_status()
         self.run_worker(
-            partial(self._refresh_blocking, full, self._store_only),
+            partial(self._refresh_blocking, generation, "normal", full, False),
             thread=True,
-            group="refresh",
+            group="refresh-normal",
             exit_on_error=False,
             name="snapshot-refresh",
         )
 
-    def _refresh_blocking(self, full: bool, store_only: bool) -> None:
-        snap = self.source.take(full=full, store_only=store_only)
-        self.call_from_thread(self._apply_snapshot, snap)
+    def _start_store_refresh(self) -> None:
+        if self._store_refreshing:
+            return
+        self._store_refreshing = True
+        generation = self._next_refresh_generation()
+        self._update_refresh_status()
+        self.run_worker(
+            partial(self._refresh_blocking, generation, "store", False, True),
+            thread=True,
+            group="refresh-store",
+            exit_on_error=False,
+            name="snapshot-store-refresh",
+        )
 
-    def _apply_snapshot(self, snap: AccountsSnapshot) -> None:
-        self._refreshing = False
+    def _next_refresh_generation(self) -> int:
+        self._refresh_generation += 1
+        return self._refresh_generation
+
+    def _refresh_blocking(
+        self, generation: int, lane: str, full: bool, store_only: bool
+    ) -> None:
+        snap = self.source.take(full=full, store_only=store_only)
+        self.call_from_thread(self._apply_snapshot, generation, lane, snap)
+
+    def _apply_snapshot(
+        self, generation: int, lane: str, snap: AccountsSnapshot
+    ) -> None:
+        if lane == "normal":
+            self._normal_refreshing = False
+            self._normal_started_at = None
+        else:
+            self._store_refreshing = False
         self._last_refresh_error = ""
-        self.snapshot = snap
+        if generation >= self._applied_generation:
+            self._applied_generation = generation
+            self.snapshot = snap
+        elif self.snapshot is not None:
+            # A later-started store repaint owns account metadata, but the
+            # older worker may have completed a genuinely newer provider fetch.
+            # SnapshotSource has already rejected per-account regressions, so
+            # merge its canonical usage rows without restoring stale metadata.
+            current = self.snapshot
+            incoming = {acc.number: acc for acc in snap.accounts}
+            accounts = tuple(
+                replace(acc, usage=other.usage)
+                if (
+                    (other := incoming.get(acc.number)) is not None
+                    and (acc.email, acc.org_uuid, acc.kind)
+                    == (other.email, other.org_uuid, other.kind)
+                )
+                else acc
+                for acc in current.accounts
+            )
+            self.snapshot = replace(
+                current,
+                accounts=accounts,
+                taken_at=max(current.taken_at, snap.taken_at),
+            )
+        self._update_refresh_status()
+
+    def _update_refresh_status(self) -> None:
+        parts: list[str] = []
+        now = time.time()
+        if self.snapshot is not None:
+            age = max(0.0, now - self.snapshot.taken_at)
+            parts.append(f"snapshot {format_duration(age)} ago")
+        if self._normal_refreshing and self._normal_started_at is not None:
+            elapsed = now - self._normal_started_at
+            if elapsed >= self.POLL_INTERVAL_S:
+                parts.append(f"refreshing {format_duration(elapsed)}")
+        self.refresh_status = " · ".join(parts)
 
     def request_refresh(self, *, full: bool = False) -> None:
         if full:
@@ -122,13 +210,19 @@ class CswapApp(App):
     def on_worker_state_changed(self, event) -> None:
         if event.state is not WorkerState.ERROR:
             return
-        if event.worker.group == "refresh":
-            self._refreshing = False
+        if event.worker.group in {"refresh-normal", "refresh-store"}:
+            if event.worker.group == "refresh-normal":
+                self._normal_refreshing = False
+                self._normal_started_at = None
+            else:
+                self._store_refreshing = False
+            self._update_refresh_status()
             msg = str(event.worker.error)
             if msg != self._last_refresh_error:
                 self._last_refresh_error = msg
+                lane = "store refresh" if event.worker.group == "refresh-store" else "refresh"
                 self.notify(
-                    f"Refresh failed: {msg}", severity="warning", timeout=6
+                    f"{lane.capitalize()} failed: {msg}", severity="warning", timeout=6
                 )
         elif event.worker.group == "action":
             self.busy = False
