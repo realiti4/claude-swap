@@ -1545,6 +1545,30 @@ class ClaudeAccountSwitcher:
         """Whether ``~/.claude.json`` carries any live account identity."""
         return self._get_current_account() is not None
 
+    def active_account_display(self) -> tuple[str | None, str | None]:
+        """``(email, alias)`` of the live account, for a status line.
+
+        Returns the managed slot's email and alias when the live login is one
+        cswap manages (so the alias is available), the raw login email with no
+        alias when it isn't, and ``(None, None)`` when there is no live login.
+        Reads only local state and never raises — it is called on every prompt
+        render, so a transient read error must degrade to "no account" rather
+        than break the host shell's status line.
+        """
+        try:
+            num = self.current_account_number()
+            if num is not None:
+                acct = (self._get_sequence_data() or {}).get(
+                    "accounts", {}
+                ).get(str(num), {})
+                return (acct.get("email") or None, acct.get("alias") or None)
+            identity = self._get_current_account()
+            if identity is not None:
+                return (identity[0] or None, None)
+        except Exception:
+            return (None, None)
+        return (None, None)
+
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
