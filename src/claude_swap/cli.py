@@ -944,6 +944,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s list --token-status
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
@@ -969,7 +970,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     parser.add_argument(
         "--token-status",
         action="store_true",
-        help="Show OAuth token expiry state (use with 'list')",
+        help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
         "--json",

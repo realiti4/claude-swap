@@ -215,6 +215,17 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     return [dimmed(detail)]
 
 
+def _label_token_status(source: str, credentials: str) -> str | None:
+    """Return ``oauth.build_token_status`` relabelled by credential source."""
+    status = oauth.build_token_status(credentials)
+    if status is None:
+        return None
+    prefix = "oauth: "
+    if status.startswith(prefix):
+        return f"{source}: {status.removeprefix(prefix)}"
+    return f"{source}: {status}"
+
+
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
     """Best-effort purge of legacy ``KEYRING_SERVICE`` entries via ``keyring``.
 
@@ -1604,6 +1615,37 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import session_dir_for
 
         return session_dir_for(self.backup_dir, account_num, email)
+
+    def _token_status_lines(
+        self, account_info: tuple[int, str, str, str, bool, str, str]
+    ) -> list[str]:
+        """Source-labelled token-status lines for one account's display row."""
+        num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        if looks_like_api_key(creds):
+            return []
+        if is_active:
+            line = _label_token_status("active profile", creds)
+            return [line] if line is not None else []
+
+        from claude_swap.session import (
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        lines: list[str] = []
+        session_dir = self._session_dir(str(num), email)
+        session_creds = read_session_credentials(session_dir)
+        if session_creds:
+            if session_identity_drifted(session_dir, email, org_uuid):
+                lines.append("session profile: ignored (different account)")
+            else:
+                line = _label_token_status("session profile", session_creds)
+                if line is not None:
+                    lines.append(line)
+        backup_line = _label_token_status("stored backup", creds)
+        if backup_line is not None:
+            lines.append(backup_line)
+        return lines
 
     def _live_session_pids(self, account_num: str, email: str) -> list[int]:
         """PIDs of Claude instances running against an account's session profile."""
@@ -3224,9 +3266,8 @@ class ClaudeAccountSwitcher:
                 print(f"     {line}")
 
             if show_token_status:
-                token_status = oauth.build_token_status(accounts_info[i][5])
-                if token_status:
-                    print(f"     {dimmed('•')} {muted(token_status)}")
+                for line in self._token_status_lines(accounts_info[i]):
+                    print(f"     {dimmed('•')} {muted(line)}")
             if i < len(accounts_info) - 1:
                 print()
 

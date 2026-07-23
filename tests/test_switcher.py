@@ -1082,11 +1082,122 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
              patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes"):
             switcher.list_accounts(show_token_status=True)
 
         output = capsys.readouterr().out
-        assert "oauth: fresh, refresh token yes" in output
+        assert "active profile: fresh, refresh token yes" in output
+        assert "stored backup: fresh, refresh token yes" in output
+
+    def test_token_status_lines_for_active_account_use_active_profile(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        with patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes") as build:
+            lines = switcher._token_status_lines(
+                (1, "active@example.com", "", "", True, "active-creds", "")
+            )
+
+        assert lines == ["active profile: fresh, refresh token yes"]
+        build.assert_called_once_with("active-creds")
+
+    def test_token_status_lines_preserve_api_key_silence(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        with patch("claude_swap.session.read_session_credentials") as read_session, \
+             patch("claude_swap.oauth.build_token_status") as build:
+            lines = switcher._token_status_lines(
+                (2, "key@example.com", "", "", False, "sk-ant-api03-test", "")
+            )
+
+        assert lines == []
+        read_session.assert_not_called()
+        build.assert_not_called()
+
+    def test_token_status_lines_prefer_matching_session_profile_then_backup(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        def build_status(credentials: str) -> str | None:
+            return {
+                "session-creds": "oauth: fresh, refresh token yes",
+                "backup-creds": "oauth: expired, refresh token yes",
+            }.get(credentials)
+
+        with patch("claude_swap.session.read_session_credentials", return_value="session-creds") as read_session, \
+             patch("claude_swap.session.session_identity_drifted", return_value=False) as drifted, \
+             patch("claude_swap.oauth.build_token_status", side_effect=build_status) as build:
+            lines = switcher._token_status_lines(
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+            )
+
+        assert lines == [
+            "session profile: fresh, refresh token yes",
+            "stored backup: expired, refresh token yes",
+        ]
+        read_session.assert_called_once()
+        drifted.assert_called_once()
+        assert build.call_args_list == [call("session-creds"), call("backup-creds")]
+
+    def test_token_status_lines_ignore_drifted_session_profile(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        with patch("claude_swap.session.read_session_credentials", return_value="session-creds") as read_session, \
+             patch("claude_swap.session.session_identity_drifted", return_value=True) as drifted, \
+             patch(
+                 "claude_swap.oauth.build_token_status",
+                 return_value="oauth: expired, refresh token yes",
+             ) as build:
+            lines = switcher._token_status_lines(
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+            )
+
+        assert lines == [
+            "session profile: ignored (different account)",
+            "stored backup: expired, refresh token yes",
+        ]
+        read_session.assert_called_once()
+        drifted.assert_called_once()
+        build.assert_called_once_with("backup-creds")
+
+    def test_token_status_lines_without_session_show_only_backup(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        with patch("claude_swap.session.read_session_credentials", return_value=None) as read_session, \
+             patch("claude_swap.session.session_identity_drifted") as drifted, \
+             patch(
+                 "claude_swap.oauth.build_token_status",
+                 return_value="oauth: fresh, refresh token yes",
+             ) as build:
+            lines = switcher._token_status_lines(
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+            )
+
+        assert lines == ["stored backup: fresh, refresh token yes"]
+        read_session.assert_called_once()
+        drifted.assert_not_called()
+        build.assert_called_once_with("backup-creds")
+
+    def test_token_status_lines_are_read_only(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+
+        with patch("claude_swap.session.read_session_credentials", return_value="session-creds"), \
+             patch("claude_swap.session.session_identity_drifted", return_value=False), \
+             patch(
+                 "claude_swap.oauth.build_token_status",
+                 side_effect=["oauth: fresh, refresh token yes", "oauth: expired, refresh token yes"],
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch, \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup:
+            switcher._token_status_lines(
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+            )
+
+        refresh.assert_not_called()
+        fetch.assert_not_called()
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
 
     def test_list_uses_cached_usage(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
