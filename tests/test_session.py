@@ -9,6 +9,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -1612,3 +1613,32 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
+
+    def test_owner_read_allows_file_when_keychain_item_is_absent(
+        self, tmp_path, macos_platform
+    ):
+        session_dir = tmp_path / "sess"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text("seed")
+
+        result = session_mod.read_session_owner_credentials(session_dir)
+
+        assert result.value == "seed"
+        assert result.keychain_unavailable is False
+
+    def test_owner_read_fails_closed_when_keychain_is_unreadable(
+        self, tmp_path, macos_platform, monkeypatch
+    ):
+        session_dir = tmp_path / "sess"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text("stale-seed")
+        monkeypatch.setattr(
+            session_mod.macos_keychain,
+            "get_password",
+            Mock(side_effect=session_mod.KeychainError("locked")),
+        )
+
+        result = session_mod.read_session_owner_credentials(session_dir)
+
+        assert result.value is None
+        assert result.keychain_unavailable is True

@@ -36,6 +36,11 @@ def get_claude_config_home() -> Path:
     env = os.environ.get("CLAUDE_CONFIG_DIR")
     if env:
         return Path(env)
+    return get_default_claude_config_home()
+
+
+def get_default_claude_config_home() -> Path:
+    """Return the default profile directory, ignoring ``CLAUDE_CONFIG_DIR``."""
     return Path.home() / ".claude"
 
 
@@ -61,7 +66,7 @@ def get_default_global_config_path() -> Path:
     (session sharing) must not source from another session when invoked from
     inside one.
     """
-    legacy = Path.home() / ".claude" / ".config.json"
+    legacy = get_default_claude_config_home() / ".config.json"
     if legacy.exists():
         return legacy
     return Path.home() / ".claude.json"
@@ -70,6 +75,11 @@ def get_default_global_config_path() -> Path:
 def get_credentials_path() -> Path:
     """Return the path to the Claude credentials file."""
     return get_claude_config_home() / ".credentials.json"
+
+
+def get_default_credentials_path() -> Path:
+    """Return the default profile credential path, ignoring config overrides."""
+    return get_default_claude_config_home() / ".credentials.json"
 
 
 def get_legacy_backup_root() -> Path:
