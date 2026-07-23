@@ -66,6 +66,7 @@ _SUBCOMMAND_FLAGS = {
     "tui": "--tui",
     "watch": "--watch",
     "menubar": "--menubar",
+    "autostart": "--autostart",
 }
 
 
@@ -849,6 +850,57 @@ def _use_native_tls() -> None:
         pass
 
 
+def _autostart_command(mode: str, switcher, *, json_mode: bool) -> int:
+    """Handle `cswap autostart [on|off]` — the menu bar's login item.
+
+    Shares one implementation with the menu bar's "Start at login" toggle, so a
+    headless setup (over SSH, or from a provisioning script) produces exactly
+    the same LaunchAgent the GUI would write. Returns the process exit code.
+    """
+    from claude_swap import autostart
+
+    if sys.platform != "darwin":
+        error("Autostart is only available on macOS.")
+        return 1
+
+    path = autostart.launch_agent_path()
+    if mode == "on":
+        autostart.enable(log_path=switcher.backup_dir / "menubar-agent.log")
+    elif mode == "off":
+        if not autostart.disable(path):
+            if json_mode:
+                print(json.dumps({"enabled": False, "changed": False}, indent=2))
+            else:
+                print(muted("Autostart was not enabled."))
+            return 0
+
+    enabled = autostart.is_enabled(path)
+    if json_mode:
+        print(json.dumps(
+            {
+                "enabled": enabled,
+                "label": autostart.LAUNCH_AGENT_LABEL,
+                "path": str(path),
+                "command": autostart.installed_command(path),
+            },
+            indent=2,
+        ))
+        return 0
+
+    if not enabled:
+        print(f"Autostart: {bolded('off')}")
+        print(muted(f"Enable with: {_prog_name()} autostart on"))
+        return 0
+    print(f"Autostart: {bolded('on')}")
+    print(muted(f"  {path}"))
+    if mode == "on":
+        # launchd loads ~/Library/LaunchAgents at login; the plist is not
+        # bootstrapped now, so say plainly when it first takes effect.
+        print(muted("  Takes effect at the next login. Start it now with: "
+                    f"{_prog_name()} menubar"))
+    return 0
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -935,6 +987,7 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s autostart [on|off]         start the menu bar at login (bare: status)
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1118,6 +1171,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--autostart",
+        metavar="on|off",
+        nargs="?",
+        const="status",
+        choices=("on", "off", "status"),
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1145,6 +1206,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.tui
         or args.watch
         or args.menubar
+        or args.autostart is not None
         or args.upgrade
         or args.remove_account is not None
         or args.disable_account is not None
@@ -1159,8 +1221,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
-    if args.json and not (args.list or args.status or args.switch or args.switch_to):
-        parser.error("--json can only be used with 'list', 'status', or 'switch'")
+    if args.json and not (
+        args.list or args.status or args.switch or args.switch_to
+        or args.autostart is not None
+    ):
+        parser.error(
+            "--json can only be used with 'list', 'status', 'switch', or 'autostart'"
+        )
 
     if args.json and args.token_status:
         # Token status is not part of the JSON v1 schema; reject rather than
@@ -1297,6 +1364,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.menubar import run as menubar_run
 
             sys.exit(menubar_run(switcher))
+        elif args.autostart is not None:
+            sys.exit(_autostart_command(args.autostart, switcher, json_mode=args.json))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
