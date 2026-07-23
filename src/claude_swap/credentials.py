@@ -29,6 +29,7 @@ from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import CredentialError, CredentialWriteError
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -445,7 +446,7 @@ class CredentialStore:
             os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
             os.close(fd)
             fd = -1
-            os.replace(tmp_path, str(path))
+            replace_with_retry(tmp_path, str(path))
             if sys.platform != "win32":
                 os.chmod(str(path), 0o600)
         except BaseException:
@@ -468,7 +469,7 @@ class CredentialStore:
             os.write(fd, credentials.encode("utf-8"))
             os.close(fd)
             fd = -1
-            os.replace(tmp_path, str(cred_file))
+            replace_with_retry(tmp_path, str(cred_file))
             if sys.platform != "win32":
                 os.chmod(str(cred_file), 0o600)
         except BaseException:
@@ -803,7 +804,7 @@ class CredentialStore:
             os.write(fd, encoded.encode("utf-8"))
             os.close(fd)
             fd = -1
-            os.replace(tmp_path, str(enc_file))
+            replace_with_retry(tmp_path, str(enc_file))
             if sys.platform != "win32":
                 os.chmod(str(enc_file), 0o600)
         except BaseException:

@@ -58,6 +58,7 @@ from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
 from claude_swap.settings import atomic_write_json
+from claude_swap.fsutil import replace_with_retry
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1046,7 +1047,7 @@ class SessionManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
-            os.replace(tmp, manifest_path)
+            replace_with_retry(tmp, manifest_path)
         except OSError:
             try:
                 os.unlink(tmp)

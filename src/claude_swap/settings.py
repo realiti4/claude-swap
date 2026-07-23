@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
+from claude_swap.fsutil import replace_with_retry
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -453,7 +454,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(path))
         if sys.platform != "win32":
             os.chmod(str(path), 0o600)
     except BaseException:
