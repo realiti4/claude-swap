@@ -173,15 +173,21 @@ The plain CLI output (outside the TUI) follows the same `ui.theme` setting. With
 
 Toggling the theme live inside the TUI only affects new output — auto-view log lines already printed keep the colors they were written with; only lines added after the switch pick up the new theme.
 
-### Refresh expired tokens
+### Recover an expired token
 
-If an account's token expires, log back into Claude Code with that account and re-run:
+Recovery is explicit and automation-friendly:
 
 ```bash
-cswap add
+cswap recover 2 --json
 ```
 
-This will update the stored credentials without creating a duplicate.
+For an ordinary expired OAuth token, this asks the **live Claude Code profile that already owns the credential** to refresh it, then verifies that same profile still has the matching identity and a non-expired OAuth credential. It makes one minimal Haiku request, which may be billable. Recovery serializes commands for a slot and rereads the owner immediately before launch, but a manual `/login` or other external profile change after that final read can still race the canary; the mandatory post-run identity check detects the resulting drift. Recovery never runs implicitly from `list`, `status`, `watch`, `auto`, or the TUI, never restores a stale backup, and never starts browser login. `cswap list --json` performs the later usage observation through its normal collector protocol.
+
+The JSON `recoveryStatus` is one of `recovered`, `not_needed`, `retry_later`, or `human_required`. `human_required` is the safe limit for a missing or ambiguous owner, profile drift, setup tokens/API keys, missing or dead refresh tokens, and identity mismatches. In that case, log into Claude Code as the account yourself and re-run:
+
+```bash
+cswap add --slot 2
+```
 
 ### Other commands
 
@@ -191,6 +197,7 @@ cswap auto                      # Auto-switch when nearing rate limits (see abov
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap status                    # Show current account
+cswap recover 2 --json          # Explicitly recover an owner-held expired OAuth token
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
 cswap remove 2                  # Remove an account
@@ -292,13 +299,14 @@ If an imported account is the one you're currently logged in as, activate the im
 
 ### JSON output for scripting
 
-Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Explicit recovery is JSON-only. Useful for scripting auto-swap and quota tracking.
 
 ```bash
 cswap list --json                   # all accounts with usage/quota
 cswap status --json                 # current active account
 cswap switch --strategy best --json # switch, then report the result
 cswap switch 2 --json
+cswap recover 2 --json              # one PII-free recovery result
 ```
 
 <details>
@@ -316,7 +324,7 @@ cswap switch 2 --json
 }
 ```
 
-Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`. Recovery reports `{"schemaVersion":1,"operation":"recover","accountNumber":2,"recoveryStatus":"recovered"}` without email, paths, process IDs, or provider output.
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 

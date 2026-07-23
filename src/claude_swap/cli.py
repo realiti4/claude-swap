@@ -218,11 +218,72 @@ Examples:
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
-    """Refuse to run as root outside a container (shared by run/map/unmap)."""
+    """Refuse to run as root outside a container (shared by pre-dispatch commands)."""
     if sys.platform != "win32":
         if os.geteuid() == 0 and not switcher._is_running_in_container():
             error("Error: Do not run this script as root (unless running in a container)")
             sys.exit(1)
+
+
+def _recovery_failure_payload() -> dict:
+    """Sanitized existing-style error envelope for pre-operation failures."""
+    return {
+        "schemaVersion": 1,
+        "error": {
+            "type": "RecoveryError",
+            "message": "Recovery could not be started.",
+        },
+    }
+
+
+def _recover_command(argv: list[str]) -> None:
+    """Handle the explicit, JSON-only ``cswap recover NUM|EMAIL --json``."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} recover",
+        description=(
+            "Ask the live Claude Code profile that owns an expired OAuth token "
+            "to refresh it with one minimal noninteractive request."
+        ),
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL", help="Account to recover")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Emit one stable, machine-readable recovery result",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # Keep stdout machine-readable when a caller did request JSON, even if
+        # the rest of the invocation is malformed. argparse diagnostics remain
+        # on stderr and retain their normal exit code.
+        if exc.code and "--json" in argv:
+            print(json.dumps(_recovery_failure_payload(), indent=2))
+        raise
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if (
+            sys.platform != "win32"
+            and os.geteuid() == 0
+            and not switcher._is_running_in_container()
+        ):
+            print(json.dumps(_recovery_failure_payload(), indent=2))
+            sys.exit(1)
+        payload = switcher.recover(args.account)
+    except KeyboardInterrupt:
+        print("Operation cancelled", file=sys.stderr)
+        sys.exit(130)
+    except Exception:
+        # The target may itself be an email address. Never echo it (or an
+        # exception that could contain it) into automation output.
+        payload = _recovery_failure_payload()
+        print(json.dumps(payload, indent=2))
+        sys.exit(1)
+
+    print(json.dumps(payload, indent=2))
 
 
 def _map_command(argv: list[str]) -> None:
@@ -872,6 +933,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "recover":
+        _recover_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -913,6 +977,7 @@ Commands:
   %(prog)s status                     show current account
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
+  %(prog)s recover <num|email> --json recover an owner-held expired token
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
@@ -944,6 +1009,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s recover 2 --json                 # explicit one-request token recovery
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
