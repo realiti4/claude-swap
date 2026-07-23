@@ -317,9 +317,13 @@ class TestListJson:
         if expected_status == "ok":
             assert row["usage"]["fiveHour"]["pct"] == 25.0
             assert row["usageAgeSeconds"] >= age_s
+            assert "lastGoodUsage" not in row
         else:
             assert row["usage"] is None
             assert "usageFetchedAt" not in row
+            assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+            assert row["lastGoodAgeSeconds"] >= age_s
+            assert row["lastGoodFetchedAt"].endswith("Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -363,6 +367,37 @@ class TestStatusJson:
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
         assert payload["totalManagedAccounts"] == 2
+
+    def test_status_managed_includes_display_grade_last_good(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        import time as time_mod
+
+        from claude_swap.usage_store import UsageEntry
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        fetched_at = time_mod.time() - 4000
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 25.0}},
+            fetched_at=fetched_at,
+            age_s=4000.0,
+        )
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_active_account_usage", return_value=entry):
+            payload = switcher.status(json_output=True)
+
+        active = payload["active"]
+        assert active["usageStatus"] == "unavailable"
+        assert active["usage"] is None
+        assert active["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+        assert active["lastGoodAgeSeconds"] == 4000.0
 
     def test_status_managed_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,

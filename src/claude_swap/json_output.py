@@ -176,6 +176,22 @@ def usage_freshness_fields(
     return fields
 
 
+def last_good_usage_fields(
+    usage: dict | None, fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Display-grade last-good usage, separate from decision-grade ``usage``."""
+    if not isinstance(usage, dict) or fetched_at is None:
+        return {}
+    freshness = usage_freshness_fields(fetched_at, age_s)
+    out = {
+        "lastGoodUsage": usage_to_json(usage, fetched_at),
+        "lastGoodFetchedAt": freshness["usageFetchedAt"],
+    }
+    if "usageAgeSeconds" in freshness:
+        out["lastGoodAgeSeconds"] = freshness["usageAgeSeconds"]
+    return out
+
+
 def account_row(
     number: int,
     email: str,
@@ -186,6 +202,7 @@ def account_row(
     *,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
+    last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
 ) -> dict:
@@ -209,6 +226,12 @@ def account_row(
         row["disabled"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    else:
+        row.update(
+            last_good_usage_fields(
+                last_good_usage, usage_fetched_at, usage_age_s
+            )
+        )
     return row
 
 
