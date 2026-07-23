@@ -1491,3 +1491,67 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestAutostartCommand:
+    """`cswap autostart [on|off]` — the menu bar's login item, headlessly."""
+
+    def _run(self, argv, tmp_path, capsys, platform="darwin"):
+        agent = tmp_path / "Library" / "LaunchAgents" / "com.claude-swap.menubar.plist"
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.autostart.launch_agent_path", return_value=agent), \
+             patch("claude_swap.autostart.subprocess.run"), \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch.object(cli.sys, "platform", platform), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = tmp_path / "backup"
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        return excinfo.value.code, capsys.readouterr(), agent
+
+    def test_translate_subcommand(self):
+        assert cli._translate_subcommand(["autostart"]) == ["--autostart"]
+        assert cli._translate_subcommand(["autostart", "on"]) == ["--autostart", "on"]
+
+    def test_status_when_disabled(self, tmp_path, capsys):
+        code, out, agent = self._run(["autostart"], tmp_path, capsys)
+        assert code == 0
+        assert "off" in out.out
+        assert not agent.exists()
+
+    def test_on_writes_the_login_item(self, tmp_path, capsys):
+        code, out, agent = self._run(["autostart", "on"], tmp_path, capsys)
+        assert code == 0
+        assert agent.exists()
+        assert "next login" in out.out
+
+    def test_off_removes_it(self, tmp_path, capsys):
+        self._run(["autostart", "on"], tmp_path, capsys)
+        code, out, agent = self._run(["autostart", "off"], tmp_path, capsys)
+        assert code == 0
+        assert not agent.exists()
+
+    def test_off_when_never_enabled_is_not_an_error(self, tmp_path, capsys):
+        code, out, _ = self._run(["autostart", "off"], tmp_path, capsys)
+        assert code == 0
+        assert "not enabled" in out.out
+
+    def test_json_status(self, tmp_path, capsys):
+        self._run(["autostart", "on"], tmp_path, capsys)
+        code, out, _ = self._run(["autostart", "--json"], tmp_path, capsys)
+        payload = json.loads(out.out)
+        assert code == 0
+        assert payload["enabled"] is True
+        assert payload["label"] == "com.claude-swap.menubar"
+
+    def test_rejects_unknown_mode(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "autostart", "sometimes"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_refuses_on_non_macos(self, tmp_path, capsys):
+        code, out, agent = self._run(["autostart", "on"], tmp_path, capsys, platform="linux")
+        assert code == 1
+        assert "only available on macOS" in out.err
+        assert not agent.exists()
