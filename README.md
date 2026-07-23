@@ -250,6 +250,14 @@ cswap menubar
 
 Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
+*Settings → Account rows* picks how each account is drawn. **Compact** (the default) is one free-text line per account. The other three lay every account on one shared column grid, so the same window sits at the same place on every row and you can compare down a column instead of reading across:
+
+- **Columns** — one column per usage window, with the window names in a dimmed header instead of repeated on every row.
+- **Columns with bars** — the same grid with a small progress bar in front of each number.
+- **Binding limit first** — leads with the window that's actually closest to blocking you, and dims the rest as context.
+
+Percentages turn orange past 80% and red past 95%, so a pool of idle accounts stays monochrome and colour means something. Spend is never coloured — an exhausted budget caps cost, it doesn't block a request. *Show reset times* adds a second, dimmed line with each window's countdown, aligned under its own percentage.
+
 </details>
 
 ## Advanced
