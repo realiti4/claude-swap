@@ -556,3 +556,222 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+# --- aligned account table (the grid + focus row styles) -----------------------
+
+def _account(num, email, usage, *, active=False, alias=None, disabled=False):
+    """A snapshot account tuple in the shape rebuild_menu iterates."""
+    return (num, email, active, usage, None, alias, disabled, None)
+
+
+_TABLE_ACCOUNTS = [
+    _account(1, "a@x.de", {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 91.0},
+                           "scoped": [{"name": "Fable", "pct": 90.0}]}),
+    _account(2, "b@x.de", {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 3.0},
+                           "scoped": [{"name": "Fable", "pct": 0.0}],
+                           "spend": {"pct": 58.0}}, active=True),
+]
+
+
+def test_table_has_one_column_per_window_not_per_label():
+    cols = menubar.account_table_columns(_TABLE_ACCOUNTS)
+    # num, name, then exactly one column each for 5h, 7d, Fable, spend
+    assert [c.title for c in cols] == ["", "", "5h", "7d", "Fable", "$"]
+    assert [c.right_aligned for c in cols] == [False, False, True, True, True, True]
+
+
+def test_header_carries_the_window_names():
+    cols = menubar.account_table_columns(_TABLE_ACCOUNTS)
+    assert menubar.account_table_header(cols) == ("", "", "5h", "7d", "Fable", "$")
+
+
+def test_table_omits_columns_nobody_reports():
+    plain = [_account(1, "a@x.de", {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 6.0}})]
+    assert [c.title for c in menubar.account_table_columns(plain)] == ["", "", "5h", "7d"]
+
+
+def test_table_model_columns_are_shared_and_deduplicated():
+    assert menubar.account_table_model_names(_TABLE_ACCOUNTS) == ("Fable",)
+
+
+def test_table_rows_carry_only_numbers():
+    rows = menubar.build_account_table(_TABLE_ACCOUNTS)
+    assert rows[0].cells == ("1", "a@x.de", "0%", "91%", "90%", "")
+    assert rows[1].cells == ("2", "b@x.de", "19%", "3%", "0%", "58%")
+
+
+def test_table_row_keeps_grid_width_when_a_window_is_missing():
+    accounts = _TABLE_ACCOUNTS + [_account(3, "c@x.de", {"five_hour": {"pct": 7.0},
+                                                         "seven_day": {"pct": 8.0}})]
+    rows = menubar.build_account_table(accounts)
+    assert len({len(r.cells) for r in rows}) == 1  # one shared grid
+    assert rows[2].cells[4:] == ("", "")           # no Fable, no spend for this one
+
+
+def test_table_marks_a_maxed_window():
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 100.0}})]
+    )
+    assert rows[0].cells[3] == "100%" + menubar.MAXED_MARKER
+
+
+def test_table_alias_and_disabled_marker_stay_in_the_name_cell():
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", _USAGE, alias="dev", disabled=True)]
+    )
+    assert rows[0].cells[1] == "dev (a@x.de)  (disabled)"
+
+
+def test_table_sentinel_usage_rides_in_the_name_cell():
+    # The window columns are right-aligned percentages; a sentence dropped into
+    # one would run backwards across the row.
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", "re-login needed"), _TABLE_ACCOUNTS[1]]
+    )
+    assert rows[0].cells[1] == "a@x.de — re-login needed"
+    assert set(rows[0].cells[2:]) == {""}
+    assert set(rows[0].values) == {None}
+
+
+def test_table_missing_usage_reads_as_unavailable():
+    rows = menubar.build_account_table([_account(1, "a@x.de", None)])
+    assert rows[0].cells[1] == "a@x.de — usage unavailable"
+
+
+def test_table_resets_line_up_under_their_percentages():
+    now = 1_000_000.0
+    resets = _dt.datetime.fromtimestamp(now + 3600, _dt.timezone.utc).isoformat()
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 10.0, "resets_at": resets},
+                                "seven_day": {"pct": 20.0}})],
+        now=now,
+    )
+    assert rows[0].cells[2] == "10%"
+    assert rows[0].resets[2] == "1h 0m"   # same index as the 5h percentage
+    assert set(rows[0].resets) == {"", "1h 0m"}
+
+
+# --- severity tint -------------------------------------------------------------
+
+@pytest.mark.parametrize("pct,expected", [
+    (0.0, None), (79.9, None),
+    (80.0, "warning"), (94.9, "warning"),
+    (95.0, "critical"), (100.0, "critical"),
+    (None, None),
+])
+def test_severity_thresholds(pct, expected):
+    assert menubar.severity_for(pct) == expected
+
+
+def test_row_severities_track_their_cells():
+    rows = menubar.build_account_table(_TABLE_ACCOUNTS)
+    # 0% / 91% / 90% -> none / warning / warning (both under the 95% mark),
+    # and nothing on the num+name columns
+    assert rows[0].severities == (None, None, None, "warning", "warning", None)
+
+
+def test_row_severity_turns_critical_past_the_threshold():
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 94.0}})]
+    )
+    assert rows[0].severities[2:] == ("critical", "warning")
+
+
+def test_spend_is_never_tinted():
+    # Spend caps cost, not requests — a full budget doesn't block anything.
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 1.0}, "seven_day": {"pct": 2.0},
+                                "spend": {"pct": 99.0}})]
+    )
+    assert rows[0].cells[-1] == "99%"
+    assert rows[0].severities[-1] is None
+
+
+# --- numeric values (what the drawn bars are sized from) -----------------------
+
+def test_rows_carry_the_raw_percentage_behind_each_cell():
+    rows = menubar.build_account_table(_TABLE_ACCOUNTS)
+    assert rows[0].values == (None, None, 0.0, 91.0, 90.0, None)
+    assert rows[1].values == (None, None, 19.0, 3.0, 0.0, 58.0)
+
+
+def test_values_are_none_where_a_window_is_missing():
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 6.0}})]
+    )
+    assert rows[0].values == (None, None, 5.0, 6.0)
+
+
+# --- name truncation -----------------------------------------------------------
+
+def test_short_names_are_untouched():
+    assert menubar.truncate_name("mk@vsjwl.de") == "mk@vsjwl.de"
+
+
+def test_long_name_drops_the_domain_first():
+    # The domain is the redundant part; the local part identifies the account.
+    assert menubar.truncate_name("someone@a-very-long-company-domain.example") == "someone@…"
+
+
+def test_name_too_long_even_without_a_domain_is_hard_truncated():
+    name = menubar.truncate_name("a" * 60)
+    assert len(name) == menubar.NAME_LIMIT
+    assert name.endswith("…")
+
+
+def test_truncation_keeps_one_long_address_from_widening_every_row():
+    rows = menubar.build_account_table([
+        _account(1, "very.long.address@some-long-company-domain.example",
+                 {"five_hour": {"pct": 1.0}, "seven_day": {"pct": 2.0}}),
+        _account(2, "b@x.de", {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 4.0}}),
+    ])
+    assert len(rows[0].cells[1]) <= menubar.NAME_LIMIT
+
+
+# --- focus style ---------------------------------------------------------------
+
+def test_focus_leads_with_the_binding_window():
+    rows = menubar.build_focus_table(_TABLE_ACCOUNTS)
+    assert rows[0].cells[2] == "7d 91%"          # tightest of 0 / 91 / 90
+    assert rows[1].cells[2] == "5h 19%"          # tightest of 19 / 3 / 0
+
+
+def test_focus_trails_the_remaining_windows():
+    rows = menubar.build_focus_table(_TABLE_ACCOUNTS)
+    assert rows[0].cells[3] == "5h 0% · Fable 90%"
+    assert rows[1].cells[3] == "7d 3% · Fable 0% · $ 58%"
+
+
+def test_focus_tints_only_the_binding_cell():
+    rows = menubar.build_focus_table(_TABLE_ACCOUNTS)
+    assert rows[0].severities == (None, None, "warning", None)
+
+
+def test_focus_ignores_spend_when_choosing_the_binding_window():
+    # A 99% budget must not outrank a 3% rate-limit window.
+    rows = menubar.build_focus_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 2.0},
+                                "spend": {"pct": 99.0}})]
+    )
+    assert rows[0].cells[2] == "5h 3%"
+
+
+def test_focus_handles_a_sentinel_account():
+    rows = menubar.build_focus_table([_account(1, "a@x.de", "no credentials")])
+    assert rows[0].cells[1] == "a@x.de — no credentials"
+    assert rows[0].severities == (None, None, None, None)
+
+
+def test_focus_columns_are_all_left_aligned():
+    assert [c.right_aligned for c in menubar.focus_table_columns()] == [False] * 4
+
+
+def test_spend_carries_no_at_limit_marker():
+    # An exhausted budget caps cost, it doesn't block a request.
+    rows = menubar.build_account_table(
+        [_account(1, "a@x.de", {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 1.0},
+                                "spend": {"pct": 100.0}})]
+    )
+    assert rows[0].cells[2] == "100%" + menubar.MAXED_MARKER  # the 5h window
+    assert rows[0].cells[-1] == "100%"                        # spend, unmarked
