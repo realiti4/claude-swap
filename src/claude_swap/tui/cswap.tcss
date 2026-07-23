@@ -76,6 +76,13 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     color: $secondary;
 }
 
+#meters {
+    width: 1fr;
+    height: 1fr;
+    background: $background;
+    padding: 1 2 0 1;
+}
+
 /* -- auto screen ---------------------------------------------------------- */
 
 #auto-top {

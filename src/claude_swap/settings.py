@@ -61,9 +61,12 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    color theme (``auto`` follows terminal-background detection); ``watch_style``
+    selects the ``cswap watch`` layout (``classic`` horizontal-bar account list
+    or ``meters`` vertical gradient-meter grid)."""
 
     theme: str = "auto"
+    watch_style: str = "classic"
 
 
 _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
@@ -80,7 +83,7 @@ class SettingSpec:
 
     section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
+    field: str  # snake_case dataclass field
     kind: str  # "float" | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
@@ -137,6 +140,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "ui", "watchStyle", "watch_style", "choice", choices=("classic", "meters"),
+            help="cswap watch layout: classic bars or vertical meters",
         ),
     )
 }
@@ -231,20 +238,31 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    """Load the ui section; missing/corrupt file or unknown value → default.
+
+    Each key falls back independently: a bad ``theme`` doesn't discard a good
+    ``watchStyle`` and vice versa.
+    """
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
     if not isinstance(section, dict):
         return default
-    theme = section.get("theme", default.theme)
-    if theme not in SETTING_SPECS["ui.theme"].choices:
-        _logger.warning(
-            "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
-        )
-        return default
-    return UiSettings(theme=theme)
+
+    def _choice(json_key: str, dotted: str, fallback: str) -> str:
+        value = section.get(json_key, fallback)
+        if value not in SETTING_SPECS[dotted].choices:
+            _logger.warning(
+                "settings.json: unsupported %s %r; using %r",
+                dotted, value, fallback,
+            )
+            return fallback
+        return value
+
+    return UiSettings(
+        theme=_choice("theme", "ui.theme", default.theme),
+        watch_style=_choice("watchStyle", "ui.watchStyle", default.watch_style),
+    )
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
