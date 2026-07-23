@@ -179,6 +179,13 @@ class UsageEntry:
     # scheduler itself chose the cadence (within nextPollAt). Capped at
     # TRUST_MAX_AGE_S. Computed by UsageStore.entries().
     trust_extended: bool = False
+    # The weekly-window sample immediately preceding ``last_good``, rolled
+    # forward on each successful record (see UsageStore.record). The autoswitch
+    # engine measures the active account's burn rate (Δ7d_pct / Δt) from this
+    # pair to project how much of a candidate's perishable quota is reachable
+    # before it resets. Both None until a slot has two successful 7d samples.
+    prev_seven_day_pct: float | None = None
+    prev_fetched_at: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -432,6 +439,13 @@ class UsageStore:
             if not isinstance(fetched_at, (int, float)):
                 fetched_at = None
             last_good = row.get("lastGood")
+            prev = row.get("prev")
+            prev_seven_day_pct = (
+                _num_or_none(prev.get("sevenDayPct")) if isinstance(prev, dict) else None
+            )
+            prev_fetched_at = (
+                _num_or_none(prev.get("fetchedAt")) if isinstance(prev, dict) else None
+            )
             age_s = (now - fetched_at) if fetched_at is not None else None
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
@@ -481,6 +495,8 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 trust_extended=trust_extended,
+                prev_seven_day_pct=prev_seven_day_pct,
+                prev_fetched_at=prev_fetched_at,
             )
         return out
 
@@ -571,6 +587,21 @@ class UsageStore:
             rec = effective[num]
             row["lastAttemptAt"] = now
             if rec.error is None:
+                # Roll the outgoing weekly sample into ``prev`` so the engine
+                # can measure this account's burn rate across the two most
+                # recent successes. Only when both samples carry a 7d
+                # utilization and the clock advanced — a same-instant or
+                # window-less pair yields no usable rate, so leave any earlier
+                # ``prev`` untouched rather than pointing it at a gap.
+                prev_pct = seven_day_pct(row.get("lastGood"))
+                prev_at = _num_or_none(row.get("fetchedAt"))
+                if (
+                    prev_pct is not None
+                    and prev_at is not None
+                    and prev_at < now
+                    and seven_day_pct(rec.usage) is not None
+                ):
+                    row["prev"] = {"sevenDayPct": prev_pct, "fetchedAt": prev_at}
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 row["consecutiveFailures"] = 0
@@ -637,6 +668,22 @@ class UsageStore:
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def seven_day_pct(usage: dict | str | None) -> float | None:
+    """Weekly-window utilization percent from a decision value, or None.
+
+    Shared by the store (rolling the ``prev`` sample) and the autoswitch
+    engine (burn-rate estimation and the reachable-quota projection) so both
+    read the 7-day window the same way.
+    """
+    if isinstance(usage, dict):
+        window = usage.get("seven_day")
+        if isinstance(window, dict):
+            pct = window.get("pct")
+            if isinstance(pct, (int, float)):
+                return float(pct)
+    return None
 
 
 def _row_eligible(row: dict, now: float, respect_plans: bool) -> bool:

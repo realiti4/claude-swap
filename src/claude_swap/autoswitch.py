@@ -52,7 +52,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate
+from claude_swap.usage_store import UsageEntry, due_candidate, seven_day_pct
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -76,6 +76,26 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# consume-first burn-rate projection. Plain soonest-first parks on the
+# account whose weekly window resets soonest, but weekly quota can only be
+# drained *through* the 5-hour window, so an account can reset soonest yet
+# hold more perishable quota than is reachable before it resets. When the
+# active account's burn rate has been measured, a proactive move onto a
+# sooner-resetting account is gated on how much of its quota is actually
+# reachable: ``reachable = min(remaining_pct, burn_rate * hours_to_reset)``.
+# Below MIN_REACHABLE_PCT the move spends a cooldown to realize almost
+# nothing (the soonest window is too imminent to exploit / structurally
+# stranded), so the engine holds and lets the next-soonest, drainable
+# account be considered instead. With no measured rate the gate is inert and
+# the strategy degrades to plain soonest-first — the merged behavior.
+MIN_REACHABLE_PCT = 5.0
+# The two samples behind a burn rate must straddle a sane interval: shorter
+# is sampling noise; longer predates the current active stint (only the
+# active account burns quota) and would understate the rate. Outside the
+# band the rate is treated as unmeasured (gate inert).
+BURN_RATE_MIN_DT_S = 30.0
+BURN_RATE_MAX_DT_S = 3 * 60 * 60.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -863,7 +883,8 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
-        ordered, any_known, active_reset_ts = self._rank_candidates(
+        burn_rate = self._active_burn_rate(entries.get(current))
+        ordered, any_known, active_reset_ts, stranded = self._rank_candidates(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
@@ -873,6 +894,7 @@ class AutoSwitchEngine:
             active_headroom=active_headroom,
             settings=settings,
             now=self.clock(),
+            burn_rate=burn_rate,
         )
 
         if trigger == "consume-first" and ordered:
@@ -893,7 +915,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
-            ordered, any_known, active_reset_ts = self._rank_candidates(
+            burn_rate = self._active_burn_rate(entries.get(current))
+            ordered, any_known, active_reset_ts, stranded = self._rank_candidates(
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
@@ -903,6 +926,7 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=self.clock(),
+                burn_rate=burn_rate,
             )
 
         if not ordered and api_key_candidates and trigger != "consume-first":
@@ -938,6 +962,23 @@ class AutoSwitchEngine:
                                 "active account's weekly reset time is "
                                 "unknown; consume-first is idle until it "
                                 "is reported"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                if stranded:
+                    # A sooner-resetting account exists, but at the active
+                    # account's measured burn rate too little of its perishable
+                    # quota is reachable before it resets to be worth a switch —
+                    # keep consuming here rather than chase a window we can't
+                    # meaningfully drain.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reset-too-imminent",
+                            detail=(
+                                "the sooner-resetting account can't be "
+                                "meaningfully drained before it resets at the "
+                                "current burn rate; holding"
                             ),
                         )
                     )
@@ -1045,6 +1086,33 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _active_burn_rate(self, entry: UsageEntry | None) -> float | None:
+        """The active account's weekly burn rate in pct-per-hour, or None.
+
+        Only the active account burns quota, so its own two most recent
+        successful samples measure the workload throughput consume-first uses
+        to project how much of a candidate's perishable quota is reachable
+        before reset. Returns None — leaving the burn-rate gate inert, so the
+        strategy stays plain soonest-first — unless the samples straddle a sane
+        interval (see ``BURN_RATE_MIN_DT_S``/``BURN_RATE_MAX_DT_S``) and show
+        real forward burn (a non-positive delta is idle time or a window that
+        just reset, neither a usable rate).
+        """
+        if entry is None:
+            return None
+        cur_pct = seven_day_pct(entry.last_good)
+        if cur_pct is None or entry.fetched_at is None:
+            return None
+        if entry.prev_seven_day_pct is None or entry.prev_fetched_at is None:
+            return None
+        dt = entry.fetched_at - entry.prev_fetched_at
+        if not (BURN_RATE_MIN_DT_S <= dt <= BURN_RATE_MAX_DT_S):
+            return None
+        delta = cur_pct - entry.prev_seven_day_pct
+        if delta <= 0:
+            return None
+        return delta / (dt / 3600.0)
+
     def _rank_candidates(
         self,
         *,
@@ -1057,13 +1125,20 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
-    ) -> tuple[list[str], bool, float | None]:
+        burn_rate: float | None = None,
+    ) -> tuple[list[str], bool, float | None, bool]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
-        Returns ``(ordered, any_known, active_reset_ts)``. Pure — no emits,
-        no state writes — so the consume-first two-phase commit can run it
-        twice per tick: on the stored snapshot to decide provisionally, then
-        on the escalated refetch to re-verify before switching.
+        Returns ``(ordered, any_known, active_reset_ts, stranded)``. Pure — no
+        emits, no state writes — so the consume-first two-phase commit can run
+        it twice per tick: on the stored snapshot to decide provisionally, then
+        on the escalated refetch to re-verify before switching. Running it on
+        the fresh phase-2 data also re-derives ``reachable`` from the just-
+        fetched utilizations, so the burn-rate gate re-checks for free.
+
+        ``stranded`` is True when the burn-rate gate held back every otherwise-
+        qualifying sooner-resetting candidate (see ``burn_rate``): the caller
+        distinguishes that hold from "already resets soonest".
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -1072,6 +1147,7 @@ class AutoSwitchEngine:
         )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
+        stranded = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -1100,6 +1176,23 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                    # Burn-rate gate: reset_ts is known and future here. If the
+                    # active account's burn rate has been measured, only move
+                    # when enough of this candidate's perishable quota is
+                    # reachable before it resets — otherwise the switch spends a
+                    # cooldown to realize almost nothing (imminent / stranded).
+                    # No rate → gate inert → plain soonest-first (merged path).
+                    if (
+                        trigger == "consume-first"
+                        and burn_rate is not None
+                        and reset_ts is not None
+                    ):
+                        hours_to_reset = (reset_ts - now) / 3600.0
+                        remaining = 100.0 - (seven_day_pct(usage.get(num)) or 0.0)
+                        reachable = min(remaining, burn_rate * hours_to_reset)
+                        if reachable < MIN_REACHABLE_PCT:
+                            stranded = True
+                            continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -1115,7 +1208,10 @@ class AutoSwitchEngine:
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
-        return [num for _, num in qualifying], any_known, active_reset_ts
+        # A candidate that qualified overrides the stranded hold: the gate only
+        # matters when it held back *every* sooner option.
+        stranded = stranded and not qualifying
+        return [num for _, num in qualifying], any_known, active_reset_ts, stranded
 
     # -- adaptive usage scheduling ---------------------------------------------
 
