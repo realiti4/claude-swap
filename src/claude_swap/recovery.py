@@ -53,14 +53,17 @@ CANARY_TIMEOUT_S = 60.0
 CANARY_TERMINATE_GRACE_S = 2.0
 
 # Only process-launch essentials cross the boundary. In particular, proxy,
-# provider, model, and auth variables do not reach the canary.
+# provider, model, and auth variables do not reach the canary. USER and LOGNAME
+# are load-bearing inputs to Claude's macOS Keychain account lookup.
 _POSIX_ENV_ALLOWLIST = frozenset({
     "HOME",
     "PATH",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
+    "LOGNAME",
     "TMPDIR",
+    "USER",
 })
 _WINDOWS_ENV_ALLOWLIST = frozenset({
     "APPDATA",

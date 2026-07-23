@@ -237,6 +237,8 @@ class TestCanary:
         monkeypatch.setattr(recovery.shutil, "which", lambda _name: "/bin/claude")
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         monkeypatch.setenv("PATH", "/sealed/bin")
+        monkeypatch.setenv("USER", "keychain-owner")
+        monkeypatch.setenv("LOGNAME", "keychain-owner")
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/wrong/profile")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
@@ -263,6 +265,8 @@ class TestCanary:
         assert "ANTHROPIC_BASE_URL" not in kwargs["env"]
         assert kwargs["env"]["HOME"] == str(tmp_path / "home")
         assert kwargs["env"]["PATH"] == "/sealed/bin"
+        assert kwargs["env"]["USER"] == "keychain-owner"
+        assert kwargs["env"]["LOGNAME"] == "keychain-owner"
         assert set(kwargs["env"]) <= recovery._POSIX_ENV_ALLOWLIST
         assert not Path(kwargs["cwd"]).exists()
 
