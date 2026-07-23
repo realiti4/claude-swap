@@ -97,6 +97,13 @@ KEYRING_SERVICE = "claude-code"
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
+# When set, restricts *automatic* account selection (the auto-switch engine and
+# bare `cswap switch` rotation) to just the listed accounts — an allowlist that
+# complements the per-account `cswap disable` blocklist. Value is a comma- or
+# whitespace-separated list of slot numbers, aliases, or emails. Explicit
+# `cswap switch <num|email>` targets are unaffected. Unset/blank = no restriction.
+ROTATE_ONLY_ENV = "CLAUDE_SWAP_ROTATE_ONLY"
+
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
 # instant (request hygiene; see issue #85).
@@ -1430,14 +1437,74 @@ class ClaudeAccountSwitcher:
         disabled (``cswap disable``). Disabled slots stay managed and remain
         valid explicit ``cswap switch <num|email>`` targets — they are only
         held out of automatic rotation and the usage-aware strategies.
+
+        When the :data:`ROTATE_ONLY_ENV` (``CLAUDE_SWAP_ROTATE_ONLY``) allowlist
+        is set, the result is further narrowed to accounts it names — so you can
+        let auto-switch rotate across a chosen pool while leaving every other
+        managed account untouched.
         """
         data = self._get_sequence_data() or {}
+        allow = self._rotate_allowlist_numbers(data)
         return [
             str(num)
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
+            and (allow is None or str(num) in allow)
         ]
+
+    @staticmethod
+    def _parse_rotate_only_env() -> list[str] | None:
+        """Tokens from ``CLAUDE_SWAP_ROTATE_ONLY``, or ``None`` when unset/blank.
+
+        Splits on commas and whitespace so ``a@x.com,b@x.com``,
+        ``a@x.com b@x.com``, and newline-separated values all parse. Returns
+        ``None`` (no restriction) when the variable is absent or holds no
+        non-blank token.
+        """
+        raw = os.environ.get(ROTATE_ONLY_ENV)
+        if raw is None:
+            return None
+        tokens = [t for t in re.split(r"[,\s]+", raw.strip()) if t]
+        return tokens or None
+
+    def _rotate_allowlist_numbers(self, data: dict) -> set[str] | None:
+        """Slots the ``CLAUDE_SWAP_ROTATE_ONLY`` allowlist resolves to.
+
+        ``None`` means "no allowlist" (env unset/blank) — callers must treat
+        that as *no restriction*, distinct from an empty set (every token was a
+        typo, so nothing rotates). Each token matches a slot number, alias, then
+        email; an email shared by several accounts includes them all.
+        Unresolvable tokens are skipped with a debug log rather than raised —
+        this runs on the auto-switch hot path, where a typo should only narrow
+        rotation, never crash the engine.
+        """
+        tokens = self._parse_rotate_only_env()
+        if tokens is None:
+            return None
+        accounts = data.get("accounts", {})
+        sequence = {str(n) for n in data.get("sequence", [])}
+        allow: set[str] = set()
+        unresolved: list[str] = []
+        for token in tokens:
+            matched = False
+            if token.isdigit() and token in sequence:
+                allow.add(token)
+                matched = True
+            else:
+                for num, acct in accounts.items():
+                    if acct.get("alias") == token or acct.get("email") == token:
+                        allow.add(str(num))
+                        matched = True
+            if not matched:
+                unresolved.append(token)
+        if unresolved:
+            self._logger.debug(
+                "%s: ignoring unresolved account identifiers: %s",
+                ROTATE_ONLY_ENV,
+                ", ".join(unresolved),
+            )
+        return allow
 
     @staticmethod
     def _disabled_from_data(data: dict, account_num: str) -> bool:
