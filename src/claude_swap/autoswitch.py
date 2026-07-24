@@ -52,7 +52,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate
+from claude_swap.usage_store import due_candidate, exhausted_plan_oversleeps
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -65,9 +65,10 @@ _logger = logging.getLogger("claude-swap")
 FRESHEN_BUFFER_MS = 10 * 60 * 1000
 
 # Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
-# with the rest of the cadence numbers): never trust one long sleep (laptops
-# suspend, clocks drift) — cap and re-evaluate.
-MAX_SLEEP_S = 6 * 3600.0
+# with the rest of the cadence numbers). Recheck at the exhausted-account poll
+# cadence: providers can grant quota before the previously reported reset, and
+# a long engine sleep must not suppress the fetch that discovers it.
+MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
 NO_RESET_FALLBACK_S = 300.0
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
@@ -952,7 +953,7 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-            # "All exhausted" (and its hours-long reset sleep) only when it's
+            # "All exhausted" (and its bounded reset-aware sleep) only when it's
             # literally true: every candidate's usage is known and at its
             # limit. A candidate that merely failed the proactive hysteresis
             # gate, or one whose usage is unreadable this tick, can become
@@ -1176,9 +1177,8 @@ class AutoSwitchEngine:
         # an urgent plan (60s while burning near the band) actually fetches.
         # A candidate-style plan (slower than any active plan can be) left
         # over from a role change the switcher never saw (e.g. a manual
-        # login) is overridden past the active age cap — but an exhausted
-        # account stays parked at its reset: its numbers cannot move until
-        # then, and the passed reset itself makes the plan due.
+        # login) is overridden past the active age cap. Exhausted accounts
+        # carry their own bounded plan and become due normally.
         stale_candidate_plan = (
             active_pre is not None
             and active_pre.age_s is not None
@@ -1187,10 +1187,15 @@ class AutoSwitchEngine:
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
         )
+        overslept_exhausted_plan = (
+            active_pre is not None
+            and exhausted_plan_oversleeps(active_pre, now, self._models)
+        )
         if (
             active_pre is None
             or active_pre.age_s is None
             or stale_candidate_plan
+            or overslept_exhausted_plan
             or (
                 active_pre.next_poll_at is not None
                 and now >= active_pre.next_poll_at
@@ -1202,7 +1207,7 @@ class AutoSwitchEngine:
         ):
             plan.add(current)
         if self._idle_hold_since is None:
-            pick = due_candidate(candidates, pre, now)
+            pick = due_candidate(candidates, pre, now, self._models)
             if pick is not None:
                 plan.add(pick)
         entries = self.switcher.usage_entries_by_account(fetch=plan)

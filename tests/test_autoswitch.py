@@ -664,15 +664,11 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
-    def test_exhausted_active_stays_parked_at_its_reset(
+    def test_exhausted_active_is_rechecked_before_its_reset(
         self, temp_home, monkeypatch
     ):
         from datetime import datetime, timezone
 
-        # The role-change age cap must not defeat reset parking: an exhausted
-        # account's numbers cannot move before the reset, so even a
-        # candidate-style slow interval leaves it parked (no candidates here,
-        # so escalation cannot refetch it either).
         h = self._harness(temp_home, monkeypatch, accounts=1)
         reset_ts = h.clock.now + 7200.0
         reset_iso = (
@@ -683,14 +679,39 @@ class TestAdaptiveScheduler:
         usage = {"1": _usage(100, reset_iso)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        assert counts["1"] == 1  # measured once, parked at the reset
-        h.switcher._usage_store.set_poll_plan(
-            {"1": (reset_ts, 600.0)}, {"1": ("a@example.com", "")}
-        )
+        assert counts["1"] == 1
         for _ in range(3):
-            h.clock.advance(400)  # well past the age cap each tick
+            h.clock.advance(400)
             self._tick(h, counts, usage)
-        assert counts["1"] == 1  # never re-fetched before the reset
+        assert counts["1"] == 2
+
+    def test_engine_repairs_legacy_reset_parked_active_plan(
+        self, temp_home, monkeypatch
+    ):
+        from datetime import datetime, timezone
+
+        h = self._harness(temp_home, monkeypatch, accounts=1)
+        reset_ts = h.clock.now + 86_400.0
+        reset_iso = (
+            datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        usage = {"1": _usage(100, reset_iso)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.switcher._usage_store.set_poll_plan(
+            {"1": (reset_ts, 300.0)}, {"1": ("a@example.com", "")}
+        )
+
+        h.clock.advance(400)
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
+        entry = h.switcher._usage_store.entries(
+            {"1": ("a@example.com", "")}
+        )["1"]
+        assert entry.next_poll_at is not None
+        assert entry.next_poll_at < reset_ts
 
     def test_band_jump_is_seen_at_most_one_poll_late(
         self, temp_home, monkeypatch
@@ -738,22 +759,26 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
-    def test_exhausted_candidate_skips_to_its_reset(self, temp_home, monkeypatch):
-        from datetime import datetime, timezone
-
+    def test_exhausted_candidate_keeps_a_bounded_poll_plan(
+        self, temp_home, monkeypatch
+    ):
         h = self._harness(temp_home, monkeypatch)
         reset_iso = "2026-07-05T12:00:00Z"
-        reset_ts = datetime(2026, 7, 5, 12, tzinfo=timezone.utc).timestamp()
         usage = {"1": _usage(50), "2": _usage(100, reset_iso), "3": _usage(20)}
         counts: dict[str, int] = {}
         for _ in range(3):
             self._tick(h, counts, usage)
             h.clock.advance(60)
-        assert counts["2"] == 1  # fetched once, then parked until its reset
+        assert counts["2"] == 1
         entry = h.switcher._usage_store.entries(
             {"2": ("b@example.com", "")}
         )["2"]
-        assert entry.next_poll_at == pytest.approx(reset_ts)
+        assert entry.poll_interval_s == poll_policy.EXHAUSTED_INTERVAL_S
+        assert entry.next_poll_at is not None
+        assert entry.next_poll_at <= (
+            entry.fetched_at
+            + poll_policy.EXHAUSTED_INTERVAL_S * (1 + poll_policy.JITTER_FRAC)
+        )
 
     def test_poll_never_scheduled_past_a_window_reset(self, temp_home, monkeypatch):
         from datetime import datetime, timezone
@@ -1386,10 +1411,10 @@ class TestRunLoop:
         assert finished
         assert len(ticks) == 2
 
-    def test_blocked_with_reset_sleeps_until_reset(self, harness):
+    def test_blocked_with_reset_rechecks_at_exhausted_cadence(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 1800
         delay = harness.engine._next_delay(TickOutcome.BLOCKED)
-        assert 1700 < delay <= 1800
+        assert delay == poll_policy.EXHAUSTED_INTERVAL_S
 
     def test_blocked_exhausted_without_reset_uses_fallback(self, harness):
         harness.engine._sleep_until_ts = None
@@ -1408,7 +1433,10 @@ class TestRunLoop:
 
     def test_sleep_cap(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 50 * 3600
-        assert harness.engine._next_delay(TickOutcome.BLOCKED) == 6 * 3600
+        assert (
+            harness.engine._next_delay(TickOutcome.BLOCKED)
+            == poll_policy.EXHAUSTED_INTERVAL_S
+        )
 
 
 class TestSessionThreshold:

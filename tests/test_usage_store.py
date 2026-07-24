@@ -497,6 +497,32 @@ class TestDueCandidate:
         # "2" is stalest but not yet due per auto's learned plan → "3" wins.
         assert due_candidate(["2", "3"], entries, self.NOW) == "3"
 
+    def test_reset_parked_exhausted_plan_is_due_for_repair(self):
+        exhausted = {"seven_day": {"pct": 100.0}}
+        entries = {
+            "2": UsageEntry(
+                last_good=exhausted,
+                fetched_at=self.NOW - 400,
+                age_s=400.0,
+                next_poll_at=self.NOW + 86_400,
+                poll_interval_s=300.0,
+            )
+        }
+        assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_bounded_exhausted_plan_is_not_due_early(self):
+        exhausted = {"seven_day": {"pct": 100.0}}
+        entries = {
+            "2": UsageEntry(
+                last_good=exhausted,
+                fetched_at=self.NOW - 400,
+                age_s=400.0,
+                next_poll_at=self.NOW + 600,
+                poll_interval_s=600.0,
+            )
+        }
+        assert due_candidate(["2"], entries, self.NOW) is None
+
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
 

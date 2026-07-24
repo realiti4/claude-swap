@@ -82,6 +82,7 @@ from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
     UsageStore,
+    exhausted_plan_oversleeps,
     with_sentinel,
 )
 
@@ -2816,9 +2817,29 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
-        to_fetch = store.reserve(
-            requested, identities, respect_plans=fetch is None
-        )
+        if fetch is None:
+            # Repair reset-parked plans written by releases that stopped
+            # polling exhausted accounts until their advertised reset. A
+            # legitimate plan is bounded by its learned interval (plus jitter
+            # and reset slack); a much later one would leave last-good usage
+            # unavailable for hours and miss an early provider-side grant.
+            now = store.clock()
+            overslept = [
+                num
+                for num in requested
+                if exhausted_plan_oversleeps(entries[num], now, models)
+            ]
+            overslept_set = set(overslept)
+            to_fetch = store.reserve(
+                [num for num in requested if num not in overslept_set],
+                identities,
+                respect_plans=True,
+            )
+            to_fetch.extend(
+                store.reserve(overslept, identities, respect_plans=False)
+            )
+        else:
+            to_fetch = store.reserve(requested, identities, respect_plans=False)
 
         if to_fetch:
             pre = entries
