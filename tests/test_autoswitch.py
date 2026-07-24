@@ -504,9 +504,6 @@ class TestAdaptiveScheduler:
         for num in range(1, accounts + 1):
             h.seed(num, emails[num - 1])
         h.make_live("a@example.com", 1)
-        # Deterministic owner detection: Claude Code "running" → the active
-        # account is fetched hands-off (is_active=True), never refreshed.
-        monkeypatch.setattr(h.switcher, "_active_cc_running", lambda: True)
         monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
         return h
 
@@ -807,25 +804,36 @@ class TestAdaptiveScheduler:
 
     def test_idle_hold_skips_candidate_polling(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch)
-        # Active token locally expired while "Claude Code is running" (owner
-        # patched True) → sentinel without any request.
+        # Active token locally expired. The first tick now ATTEMPTS the
+        # locked refresh (the fix's whole point); when it fails transiently
+        # (network down), the row enters a failure backoff and subsequent
+        # ticks surface the expired sentinel statically → idle-hold, with no
+        # candidate slot spent.
         (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {
                 "accessToken": "sk-live", "refreshToken": "rt-live",
                 "expiresAt": 1000,
             },
         }))
+        # The slot backup must be expired too — a non-expired backup would be
+        # restored without any POST (no failure, no backoff, no hold).
+        h.seed(1, "a@example.com", expires_at=1000)
         usage = {"2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
-        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
-        h.clock.advance(60)
-        counts.clear()
-        # Hold established → the next tick polls nothing at all: the active
-        # fetch short-circuits locally and no candidate slot is spent.
-        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "network"),
+        ):
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+            h.clock.advance(10)  # still inside the 30s failure backoff
+            counts.clear()
+            # Backoff established → the next tick polls nothing at all: the
+            # active row is gated, the sentinel surfaces statically, and no
+            # candidate slot is spent.
+            assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
         assert counts == {}
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert set(reasons) == {"active-idle"}
+        assert reasons[-1] == "active-idle"
 
     def test_poll_event_carries_fetch_errors(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)

@@ -279,6 +279,11 @@ class ClaudeAccountSwitcher:
         # "keychain unavailable" instead of a misleading "no credentials".
         self._active_keychain_unavailable = False
 
+        # Accounts already warned about an unattributable active credential —
+        # the condition persists across collect passes and would otherwise
+        # log every tick. Cleared when the condition clears.
+        self._provenance_warned: set[str] = set()
+
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
         # lazily to avoid a circular import, and self-contained so it never
@@ -2485,21 +2490,8 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
 
-    def _active_cc_running(self) -> bool:
-        """Whether any default-profile Claude Code instance is running.
-
-        Fails closed: if instance detection raises, assume an owner may exist so we
-        never refresh the live credential out from under a running Claude Code.
-        """
-        try:
-            sessions, ides = get_running_instances()
-            return bool(sessions or ides)
-        except Exception:
-            self._logger.debug("Failed to detect running Claude instances", exc_info=True)
-            return True
-
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str
+        self, account_num: str, email: str, creds: str, org_uuid: str = ""
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -2519,9 +2511,14 @@ class ClaudeAccountSwitcher:
 
         Two invariants:
 
-        - **Provenance (issue #117)**: only a credential whose refresh-token
-          lineage matches the slot's stored backup is refreshed. Rotating
-          bytes we can't attribute could poison the slot.
+        - **Provenance (issue #117)**: a live credential is only CONSUMED
+          (its grant POSTed) when its lineage matches the slot's stored
+          backup. Unattributable live bytes are never consumed — but when
+          they are *dead* (expired) and the slot's own backup still holds a
+          usable credential, the backup is restored to the live store: the
+          backup is by definition the slot's credential, so no foreign
+          lineage can be poisoned by it (measured field case: a stale
+          cross-machine sync landing an already-superseded credential).
         - **Never discard a consumed generation**: once the refresh grant is
           POSTed, the successor is persisted unconditionally (active store +
           slot backup; backup even survives a failing live write). A consumed
@@ -2533,34 +2530,54 @@ class ClaudeAccountSwitcher:
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
 
+        force_refresh = False
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
             )
-            return FetchRecord(
-                usage=outcome.usage,
-                error=outcome.error,
-                retry_after_s=outcome.retry_after_s,
-            )
+            if outcome.error != "http-401":
+                return FetchRecord(
+                    usage=outcome.usage,
+                    error=outcome.error,
+                    retry_after_s=outcome.retry_after_s,
+                )
+            # A locally-valid token the server rejects: revoked out-of-band
+            # (measured: a sibling machine rotating a synced lineage kills
+            # the predecessor access token before its expiresAt) or clock
+            # skew. Mirror CC's own 401 reaction — refresh — instead of
+            # letting the store's failure backoff loop a dead token for
+            # hours until it expires locally.
+            force_refresh = True
 
-        # Expired. Provenance guard (issue #117): refresh only a credential we
-        # can attribute to this slot — byte-equal to the backup or the same
-        # refresh-token lineage. Checked here for the cheap early exit, and
-        # AGAIN under the lock: a `cswap switch` completing between this check
-        # and lock acquisition replaces the live credential with another
-        # slot's, and POSTing that foreign grant would rotate the other
-        # slot's lineage and write its successor into this slot's backup.
+        # Expired (or server-rejected). Attribution against the slot's
+        # stored backup decides HOW to recover, never whether to give up
+        # outright: attributable live → refresh it; unattributable live but
+        # usable backup → restore the backup (the slot's own credential —
+        # the stranded-live and stale-sync shapes both heal here).
         backup = self._read_account_credentials(account_num, email)
         backup_fp = oauth.credential_fingerprint(backup)
-        if creds != backup and (
-            oauth.credential_fingerprint(creds) != backup_fp
-        ):
-            self._logger.warning(
-                "Active credential does not match Account-%s's stored "
-                "backup; skipping its refresh (provenance unknown).",
-                account_num,
-            )
+        backup_oauth = oauth.extract_oauth_data(backup)
+        backup_usable = bool(
+            backup_oauth
+            and backup_oauth.get("accessToken")
+            and backup_oauth.get("refreshToken")
+        )
+        attributable = creds == backup or (
+            oauth.credential_fingerprint(creds) == backup_fp
+        )
+        if not attributable and not backup_usable:
+            # Nothing safe to consume and nothing to restore from. Warn once
+            # per condition, not per collect pass.
+            if account_num not in self._provenance_warned:
+                self._provenance_warned.add(account_num)
+                self._logger.warning(
+                    "Active credential does not match Account-%s's stored "
+                    "backup and the backup is unusable; cannot refresh "
+                    "(provenance unknown).",
+                    account_num,
+                )
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        self._provenance_warned.discard(account_num)
 
         # Claude Code's own sequence: locks → re-read → decide → POST →
         # persist unconditionally → release. A concurrently refreshing CC is
@@ -2583,37 +2600,46 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
-                live = self._read_credentials() or ""
+                live = self._read_credentials()
+                if live is None:
+                    # Read ERROR (locked keychain, unreadable store) — not
+                    # absence. The store may hold a newer credential we
+                    # cannot see; guessing here could consume a superseded
+                    # grant. Defer to the next pass.
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 live_oauth = oauth.extract_oauth_data(live) if live else None
                 # Under-lock TOCTOU guards. A `cswap switch` or `/login`
-                # completing between the pre-lock provenance check and lock
+                # completing between the pre-lock attribution and lock
                 # acquisition replaces the live credential (and the config
                 # identity). Two independent checks, because rotation and
                 # switching move different markers:
-                # - identity (config oauthAccount): a switch/login changes
-                #   it; a CC token rotation does not. Mismatch → the live
-                #   store now belongs to another account — nothing here is
-                #   ours to adopt, consume, or overwrite.
-                # - lineage (refresh-token fingerprint): distinguishes "our
-                #   lineage, rotated/drifted" from foreign bytes wearing the
-                #   right identity (e.g. an external sync) when deciding
-                #   whether a grant may be CONSUMED.
-                # The identity check runs even when the live blob is empty or
-                # non-OAuth (live_oauth None): a switch to an API-key account
-                # landing in the gap leaves exactly that shape, and consuming
-                # our grant then would clobber the other account's live
-                # store. An empty live WITH our identity (CC cleared the
-                # credential) still passes — that is the recovery case.
+                # - identity (config oauthAccount, email AND organization —
+                #   two managed slots may share an email across orgs): a
+                #   switch/login changes it; a CC token rotation does not.
+                #   Mismatch → the live store now belongs to another account
+                #   — nothing here is ours to adopt, consume, or overwrite.
+                #   Runs even when the live blob is empty or non-OAuth
+                #   (live_oauth None): a switch to an API-key account landing
+                #   in the gap leaves exactly that shape. An empty live WITH
+                #   our identity (CC cleared the credential) still passes —
+                #   that is a recovery case.
+                # - lineage (refresh-token fingerprint): decides whether the
+                #   live bytes may be CONSUMED or must be replaced from the
+                #   backup.
                 identity = self._get_current_account()
-                if identity is None or identity[0] != email:
+                if identity is None or identity != (email, org_uuid or ""):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 if (
                     live_oauth
+                    and live != creds
                     # A CC invalid_grant wipe empties the token fields in
-                    # place but keeps metadata (observed on 2.1.181), so a
-                    # blob can look "non-expired" while holding no tokens —
-                    # adopting it would resync empty tokens over the backup.
+                    # place but keeps metadata (observed on 2.1.181), and an
+                    # external writer can land an accessToken-only blob —
+                    # either way a "non-expired" look without a full token
+                    # pair must not be adopted (the resync would replace the
+                    # backup's only refresh token).
                     and live_oauth.get("accessToken")
+                    and live_oauth.get("refreshToken")
                     and not oauth.is_oauth_token_expired(
                         live_oauth.get("expiresAt")
                     )
@@ -2622,7 +2648,7 @@ class ClaudeAccountSwitcher:
                     # nothing. Mirrors CC's race-resolved path. Resync the
                     # slot backup so the rotated lineage stays attributable
                     # at the NEXT expiry (rotation changes the fingerprint,
-                    # so without this the provenance guard would refuse every
+                    # so without this the attribution would refuse every
                     # future refresh until a switch resyncs it).
                     working = live
                     try:
@@ -2635,50 +2661,101 @@ class ClaudeAccountSwitcher:
                             "resyncs it.", account_num,
                         )
                 else:
-                    # Consuming a grant needs lineage attribution, not just
-                    # identity: same-lineage live (access-token drift) or the
-                    # pre-verified creds. Same-identity foreign-lineage bytes
-                    # (an external sync landed mid-flight) are not ours to
-                    # consume — bail conservatively.
-                    if live_oauth is not None:
-                        live_fp = oauth.credential_fingerprint(live)
-                        if live != creds and live_fp != backup_fp:
-                            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                        refresh_input = (
-                            live if live_oauth.get("refreshToken") else creds
-                        )
-                    else:
-                        refresh_input = creds
-                    result = oauth.try_refresh_oauth_credentials(refresh_input)
-                    if result.error == "invalid_grant" or (
-                        result.error is None and not result.credentials
+                    # Pick the credential whose grant may be consumed:
+                    # - live, when its lineage matches the backup (rotated /
+                    #   drifted bytes of this slot);
+                    # - the backup itself, when the live bytes moved to a
+                    #   foreign-but-dead lineage or were cleared (restore);
+                    # - what the collector read, as the last resort.
+                    # Foreign live bytes that appeared only mid-flight (live
+                    # differs from what the collector read AND from the
+                    # backup lineage) mean an actor is mutating the store
+                    # right now — defer rather than fight it.
+                    restore_source = None
+                    if live_oauth is not None and (
+                        oauth.credential_fingerprint(live) == backup_fp
                     ):
-                        # Server-rejected grant: the lineage is dead. Surface
-                        # it as an ERROR so the store advances auth strikes,
-                        # applies backoff, and the quarantine scan flips the
-                        # account to "re-login needed" — a bare sentinel is a
-                        # no-op to the store and would re-POST the dead grant
-                        # every pass.
-                        return FetchRecord(error="invalid_grant")
-                    if result.error is not None:
-                        # Transient (network) failure: backoff via the store.
-                        return FetchRecord(error="refresh-failed")
-                    working = result.credentials
-                    # The grant is consumed — the successor MUST survive in
-                    # at least one store. Attempt both; tolerate either
-                    # failing alone.
+                        # Live is the slot's own lineage (possibly drifted) —
+                        # its bytes are the freshest copy of the grant.
+                        refresh_input = (
+                            live if live_oauth.get("refreshToken") else
+                            (backup if backup_usable else creds)
+                        )
+                    elif not live:
+                        # CC cleared the live store — recover from the
+                        # backup's grant.
+                        refresh_input = backup if backup_usable else creds
+                    elif live == creds:
+                        # Nothing moved since the collector read, but the
+                        # bytes don't match the backup's lineage (a stranded
+                        # consumed generation, or a stale external sync).
+                        # The backup is the slot's real credential — restore
+                        # or refresh from it, never POST the dead live grant.
+                        refresh_input = backup if backup_usable else creds
+                    else:
+                        # Live moved mid-flight to bytes that are neither
+                        # what the collector read nor the backup's lineage —
+                        # another actor is mutating the store; defer.
+                        return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                    input_oauth = oauth.extract_oauth_data(refresh_input)
+                    if (
+                        refresh_input == backup
+                        and backup_usable
+                        and not force_refresh
+                        and input_oauth
+                        and not oauth.is_oauth_token_expired(
+                            input_oauth.get("expiresAt")
+                        )
+                    ):
+                        # The backup already holds a live, non-expired
+                        # credential (a prior locked refresh persisted it but
+                        # the live write failed, stranding the live store on
+                        # the consumed generation). Restore it — no POST, no
+                        # generation consumed.
+                        restore_source = backup
+                        working = backup
+                    else:
+                        result = oauth.try_refresh_oauth_credentials(
+                            refresh_input
+                        )
+                        if result.error in (
+                            "invalid_grant", "no_refresh_token"
+                        ) or (
+                            result.error is None and not result.credentials
+                        ):
+                            # Permanently unrefreshable: dead lineage or a
+                            # credential with no refresh token at all.
+                            # Surface it as an ERROR so the store advances
+                            # auth strikes, applies backoff, and the
+                            # quarantine scan flips the account to
+                            # "re-login needed" — a bare sentinel is a no-op
+                            # to the store and would re-POST every pass.
+                            return FetchRecord(
+                                error=result.error or "invalid_grant"
+                            )
+                        if result.error is not None:
+                            # Transient (network) failure: backoff via store.
+                            return FetchRecord(error="refresh-failed")
+                        working = result.credentials
+                    # The credential must reach the stores — after a POST the
+                    # grant is consumed and the successor MUST survive in at
+                    # least one of them. Attempt both; tolerate either
+                    # failing alone. (For a restore, the backup already holds
+                    # it; only the live store needs the write.)
                     backup_ok = live_ok = True
-                    try:
-                        self._write_account_credentials(
-                            account_num, email, working
-                        )
-                    except Exception:
-                        backup_ok = False
-                        self._logger.warning(
-                            "Backup write failed after a consumed refresh "
-                            "for account %s; attempting the active store.",
-                            account_num,
-                        )
+                    if restore_source is None:
+                        try:
+                            self._write_account_credentials(
+                                account_num, email, working
+                            )
+                        except Exception:
+                            backup_ok = False
+                            self._logger.warning(
+                                "Backup write failed after a consumed "
+                                "refresh for account %s; attempting the "
+                                "active store.",
+                                account_num,
+                            )
                     try:
                         # _write_credentials can touch ~/.claude.json (via
                         # _clear_managed_key) — the config lock covers just
@@ -2689,14 +2766,17 @@ class ClaudeAccountSwitcher:
                     except Exception:
                         live_ok = False
                         self._logger.warning(
-                            "Active-store write failed after a consumed "
-                            "refresh for account %s%s.", account_num,
+                            "Active-store write failed after a %s for "
+                            "account %s%s.",
+                            "backup restore" if restore_source is not None
+                            else "consumed refresh",
+                            account_num,
                             "" if backup_ok
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
                         )
                     if not live_ok:
-                        # Live still holds the consumed token — don't serve
+                        # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         except LockError:
@@ -2709,6 +2789,15 @@ class ClaudeAccountSwitcher:
                 "Credential locks held elsewhere; deferring the "
                 "active-token refresh for account %s to the next pass.",
                 account_num,
+            )
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        except Exception:
+            # _fetch_account_usage promises never to raise into the collect
+            # pass (a raising worker would kill the whole pass for every
+            # account). Config/lock-file I/O errors land here.
+            self._logger.warning(
+                "Active-token refresh for account %s failed unexpectedly; "
+                "deferring to the next pass.", account_num, exc_info=True,
             )
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
@@ -2755,7 +2844,7 @@ class ClaudeAccountSwitcher:
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds)
+            return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
             with FileLock(self.lock_file):
@@ -2883,24 +2972,6 @@ class ClaudeAccountSwitcher:
         for num in info_by_num:
             if num not in sentinels and entries[num].token_dead():
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
-        # An expired ACTIVE credential whose row sits in a failure backoff
-        # cannot reach the fetch path (and its locked refresh) this tick.
-        # Surface the expired state so the auto engine idle-holds instead of
-        # counting the gap toward a spurious failover (Finding 2); when the
-        # backoff lifts, the fetch path refreshes the token and the sentinel
-        # clears itself. Store clock: honors injected test clocks.
-        now = store.clock()
-        for num, info in info_by_num.items():
-            if num in sentinels or not info[4]:  # info[4] = is_active
-                continue
-            entry = entries[num]
-            if entry.backoff_until is None or entry.backoff_until <= now:
-                continue
-            active_oauth = oauth.extract_oauth_data(info[5])
-            if active_oauth and oauth.is_oauth_token_expired(
-                active_oauth.get("expiresAt")
-            ):
-                sentinels[num] = USAGE_TOKEN_EXPIRED
         requested = [
             num
             for num in info_by_num
@@ -2909,6 +2980,22 @@ class ClaudeAccountSwitcher:
         to_fetch = store.reserve(
             requested, identities, respect_plans=fetch is None
         )
+        # An expired ACTIVE credential that cannot reach the fetch path (and
+        # its locked refresh) this tick — failure backoff, a concurrent
+        # collector's claim, poll-plan gate — must still surface the expired
+        # state so the auto engine idle-holds instead of counting the gap
+        # toward a spurious failover (Finding 2). When the gate lifts, the
+        # fetch path refreshes the token and the sentinel clears itself.
+        for num, info in info_by_num.items():
+            if num in sentinels or not info[4]:  # info[4] = is_active
+                continue
+            if num in to_fetch:
+                continue  # the fetch path will handle (or sentinel) it now
+            active_oauth = oauth.extract_oauth_data(info[5])
+            if active_oauth and oauth.is_oauth_token_expired(
+                active_oauth.get("expiresAt")
+            ):
+                sentinels[num] = USAGE_TOKEN_EXPIRED
 
         if to_fetch:
             pre = entries

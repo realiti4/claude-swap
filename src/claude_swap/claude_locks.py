@@ -56,6 +56,8 @@ TOUCH_INTERVAL_S = 3.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
 # (sub-second to a few seconds); its config lock for a local RMW. 9s of
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
+# Note this is a PER-LOCK budget: claude_credentials_lock acquires two locks
+# sequentially, so its worst case is ~2x this value.
 DEFAULT_TIMEOUT_S = 9.0
 
 _logger = logging.getLogger("claude-swap")
