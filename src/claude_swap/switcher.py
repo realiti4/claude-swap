@@ -16,9 +16,9 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
-    ClaudeCodeLockTimeout,
     ConfigError,
     CredentialReadError,
+    LockError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -2598,10 +2598,15 @@ class ClaudeAccountSwitcher:
                 #   lineage, rotated/drifted" from foreign bytes wearing the
                 #   right identity (e.g. an external sync) when deciding
                 #   whether a grant may be CONSUMED.
-                if live_oauth is not None:
-                    identity = self._get_current_account()
-                    if identity is None or identity[0] != email:
-                        return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                # The identity check runs even when the live blob is empty or
+                # non-OAuth (live_oauth None): a switch to an API-key account
+                # landing in the gap leaves exactly that shape, and consuming
+                # our grant then would clobber the other account's live
+                # store. An empty live WITH our identity (CC cleared the
+                # credential) still passes — that is the recovery case.
+                identity = self._get_current_account()
+                if identity is None or identity[0] != email:
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 if (
                     live_oauth
                     # A CC invalid_grant wipe empties the token fields in
@@ -2694,11 +2699,14 @@ class ClaudeAccountSwitcher:
                         # Live still holds the consumed token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        except ClaudeCodeLockTimeout:
-            # A live holder (CC mid-refresh) — its rotation lands on its own;
-            # try again next tick rather than steal or wait unboundedly.
+        except LockError:
+            # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)
+            # or another cswap operation holding the account FileLock. Either
+            # way the credential is being handled; try again next tick rather
+            # than steal, wait unboundedly, or raise through the never-raises
+            # fetch contract.
             self._logger.info(
-                "Claude Code is refreshing credentials; deferring the "
+                "Credential locks held elsewhere; deferring the "
                 "active-token refresh for account %s to the next pass.",
                 account_num,
             )

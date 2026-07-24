@@ -1547,6 +1547,83 @@ class TestActiveAccountRefresh:
         write_backup.assert_not_called()   # the wipe never reaches the backup
         mock_fetch.assert_not_called()
 
+    def test_non_oauth_live_with_moved_identity_is_never_clobbered(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A switch to an API-key account landing between the pre-lock check
+        and lock acquisition leaves a non-OAuth live blob (live_oauth None) —
+        the identity guard must still run, or the consume path would POST our
+        grant and clobber the other account's live store."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(
+                 switcher, "_read_credentials",
+                 return_value="sk-ant-api03-somekey",
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_get_current_account",
+                 return_value=("console-api@token.local", ""),
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()
+        write_live.assert_not_called()
+        mock_fetch.assert_not_called()
+
+    def test_empty_live_with_matching_identity_still_recovers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """An empty live store whose config identity is still ours (CC fully
+        cleared the credential) is the recovery case: consume the backup's
+        grant and restore the live store."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel is None
+        write_live.assert_called_once_with(self._REFRESHED)
+
+    def test_filelock_contention_defers_instead_of_raising(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """cswap's own account FileLock contending (another cswap operation in
+        flight) must defer like a CC lock timeout — _fetch_account_usage's
+        never-raises contract is what keeps the collect pass alive."""
+        from claude_swap.exceptions import LockError
+
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch("claude_swap.switcher.FileLock",
+                   side_effect=LockError("held elsewhere")), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()
+        mock_fetch.assert_not_called()
+
     def test_unattributed_lineage_never_consumes_a_generation(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
