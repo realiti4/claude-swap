@@ -1846,6 +1846,46 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         mock_refresh.assert_not_called()
 
+    def test_server_rejected_token_lock_contention_still_surfaces_the_401(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Every pre-consumption defer (lock contention here) of a 401'd but
+        locally-valid token must surface the 401 record, not the 'token
+        expired' sentinel — same contract as the no-recovery bail-out."""
+        from claude_swap.claude_locks import oauth_refresh_lock_dir
+
+        switcher = self._switcher(sample_sequence_data)
+        valid_but_revoked = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-revoked", "refreshToken": "rt-orig",
+                "expiresAt": 9999999999000,
+            }
+        })
+        lock = oauth_refresh_lock_dir()
+        lock.mkdir(parents=True)  # fresh mtime = live holder
+        try:
+            with patch.object(
+                     switcher, "_read_credentials",
+                     return_value=valid_but_revoked,
+                 ), \
+                 patch.object(
+                     switcher, "_read_account_credentials",
+                     return_value=valid_but_revoked,
+                 ), \
+                 patch("claude_swap.claude_locks.DEFAULT_TIMEOUT_S", 0.3), \
+                 patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+                 patch("claude_swap.oauth.try_fetch_usage_for_account",
+                       return_value=oauth.UsageOutcome(None, error="http-401")):
+                result = switcher._fetch_active_usage(
+                    "1", "test@example.com", valid_but_revoked
+                )
+        finally:
+            lock.rmdir()
+
+        assert result.error == "http-401"
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()
+
     def test_no_refresh_token_is_permanent_not_transient(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):

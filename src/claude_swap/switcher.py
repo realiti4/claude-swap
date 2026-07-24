@@ -2530,6 +2530,14 @@ class ClaudeAccountSwitcher:
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
 
+        # Every defer before the grant is consumed routes through this: a
+        # genuinely expired token earns the sentinel, but a locally-valid
+        # server-401'd one (force_refresh set) must surface its 401 record —
+        # the store then paces retries with backoff/strike accounting instead
+        # of "token expired" mislabeling an unexpired token.
+        def _defer(record: "FetchRecord | None") -> "FetchRecord":
+            return record or FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+
         force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
@@ -2581,10 +2589,7 @@ class ClaudeAccountSwitcher:
                     "(provenance unknown).",
                     account_num,
                 )
-            # A server-rejected (not locally expired) token surfaces its 401
-            # so the store paces the retries; only a genuinely expired one
-            # earns the sentinel.
-            return force_refresh or FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return _defer(force_refresh)
         self._provenance_warned.discard(account_num)
 
         # Claude Code's own sequence: locks → re-read → decide → POST →
@@ -2614,7 +2619,7 @@ class ClaudeAccountSwitcher:
                     # absence. The store may hold a newer credential we
                     # cannot see; guessing here could consume a superseded
                     # grant. Defer to the next pass.
-                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                    return _defer(force_refresh)
                 live_oauth = oauth.extract_oauth_data(live) if live else None
                 # Under-lock TOCTOU guards. A `cswap switch` or `/login`
                 # completing between the pre-lock attribution and lock
@@ -2636,7 +2641,7 @@ class ClaudeAccountSwitcher:
                 #   backup.
                 identity = self._get_current_account()
                 if identity is None or identity != (email, org_uuid or ""):
-                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                    return _defer(force_refresh)
                 if (
                     live_oauth
                     and live != creds
@@ -2704,7 +2709,7 @@ class ClaudeAccountSwitcher:
                         # Live moved mid-flight to bytes that are neither
                         # what the collector read nor the backup's lineage —
                         # another actor is mutating the store; defer.
-                        return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                        return _defer(force_refresh)
                     input_oauth = oauth.extract_oauth_data(refresh_input)
                     if (
                         refresh_input == backup
@@ -2798,7 +2803,7 @@ class ClaudeAccountSwitcher:
                 "active-token refresh for account %s to the next pass.",
                 account_num,
             )
-            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return _defer(force_refresh)
         except Exception:
             # _fetch_account_usage promises never to raise into the collect
             # pass (a raising worker would kill the whole pass for every
@@ -2807,7 +2812,7 @@ class ClaudeAccountSwitcher:
                 "Active-token refresh for account %s failed unexpectedly; "
                 "deferring to the next pass.", account_num, exc_info=True,
             )
-            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return _defer(force_refresh)
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
