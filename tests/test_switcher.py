@@ -1810,6 +1810,42 @@ class TestActiveAccountRefresh:
         write_live.assert_called_once_with(self._REFRESHED)
         assert fetch_calls == [valid_but_revoked, self._REFRESHED]
 
+    def test_server_rejected_token_with_no_recovery_surfaces_the_401(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A locally-valid token the server 401s, with an unattributable live
+        credential AND an unusable backup, has no recovery path — the 401
+        must reach the store as an ERROR (backoff, strike accounting), not a
+        'token expired' sentinel that mislabels an unexpired token and
+        re-fetches every pass forever."""
+        switcher = self._switcher(sample_sequence_data)
+        valid_but_revoked = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-revoked", "refreshToken": "rt-foreign",
+                "expiresAt": 9999999999000,
+            }
+        })
+        dead_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
+        })
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=valid_but_revoked
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=dead_backup
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None, error="http-401")):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", valid_but_revoked
+            )
+
+        assert result.error == "http-401"
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()
+
     def test_no_refresh_token_is_permanent_not_transient(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):

@@ -2530,7 +2530,7 @@ class ClaudeAccountSwitcher:
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
 
-        force_refresh = False
+        force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
@@ -2546,8 +2546,13 @@ class ClaudeAccountSwitcher:
             # the predecessor access token before its expiresAt) or clock
             # skew. Mirror CC's own 401 reaction — refresh — instead of
             # letting the store's failure backoff loop a dead token for
-            # hours until it expires locally.
-            force_refresh = True
+            # hours until it expires locally. Kept as the fallback record:
+            # when no recovery path exists the 401 must reach the store as
+            # an ERROR (backoff, strike accounting), not a "token expired"
+            # sentinel mislabeling an unexpired token.
+            force_refresh = FetchRecord(
+                error=outcome.error, retry_after_s=outcome.retry_after_s,
+            )
 
         # Expired (or server-rejected). Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
@@ -2576,7 +2581,10 @@ class ClaudeAccountSwitcher:
                     "(provenance unknown).",
                     account_num,
                 )
-            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            # A server-rejected (not locally expired) token surfaces its 401
+            # so the store paces the retries; only a genuinely expired one
+            # earns the sentinel.
+            return force_refresh or FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         self._provenance_warned.discard(account_num)
 
         # Claude Code's own sequence: locks → re-read → decide → POST →
