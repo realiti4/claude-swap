@@ -121,8 +121,9 @@ AUTH_DEAD_STRIKES = 1
 # Fetch errors that prove the stored credential is permanently unusable (vs.
 # transient 429/timeout/network). Only these advance the dead-token strike
 # count; everything else leaves it untouched (a transient error is no evidence
-# the token is alive *or* dead).
-PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant"})
+# the token is alive *or* dead). "no_refresh_token" is equally unretryable:
+# a credential with no refresh token cannot be healed by any retry.
+PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token"})
 
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]

@@ -130,7 +130,9 @@ def usage_fields(
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
-    (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
+    (active token expired and the refresh was deferred this pass — lock
+    contention, unattributable lineage, or a failed persist; retried
+    automatically), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``

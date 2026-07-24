@@ -768,12 +768,12 @@ class AutoSwitchEngine:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
-                # Expired while an owner (Claude Code / live session) holds the
-                # credential: CC refreshes on every API request, so expired +
-                # owner present proves Claude has been idle since expiry — no
-                # quota burn, nothing to switch for. Self-heals on next use;
-                # crawl slowly instead of burning failover ticks (Finding 2 of
-                # the usage-lapse investigation).
+                # Expired and the refresh could not complete this pass (lock
+                # contention, unattributable lineage, failed persist, or the
+                # row's failure backoff gating the fetch). The locked-refresh
+                # path retries on later passes — no quota burn, nothing to
+                # switch for yet; crawl slowly instead of burning failover
+                # ticks (Finding 2 of the usage-lapse investigation).
                 now = self.clock()
                 if self._idle_hold_since is None:
                     self._idle_hold_since = now
