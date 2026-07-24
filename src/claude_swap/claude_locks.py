@@ -163,17 +163,19 @@ def claude_credentials_lock(*, timeout: float | None = None):
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
     """
-    with proper_lockfile(
-        oauth_refresh_lock_dir(),
-        timeout=timeout,
-        staleness=CREDENTIALS_STALENESS_S,
-    ):
-        with proper_lockfile(
+    with (
+        proper_lockfile(
+            oauth_refresh_lock_dir(),
+            timeout=timeout,
+            staleness=CREDENTIALS_STALENESS_S,
+        ),
+        proper_lockfile(
             credentials_lock_dir(),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
-        ):
-            yield
+        ),
+    ):
+        yield
 
 
 @contextmanager

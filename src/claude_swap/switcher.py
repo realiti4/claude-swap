@@ -103,11 +103,6 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # instant (request hygiene; see issue #85).
 _FETCH_STAGGER_S = 0.25
 
-# Bounded wait for Claude Code's credential-refresh locks before giving up on
-# an active-token refresh for this tick. CC holds them for one token-endpoint
-# round trip; a healthy hold is seconds. Patchable in tests.
-CLAUDE_LOCK_TIMEOUT_S = 9.0
-
 # Show a "· Xm ago" age note on displayed usage older than this. Inside the
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
@@ -2570,7 +2565,6 @@ class ClaudeAccountSwitcher:
         # Claude Code's own sequence: locks → re-read → decide → POST →
         # persist unconditionally → release. A concurrently refreshing CC is
         # serialized here and adopts our rotation on its next locked re-read.
-        working = None
         try:
             # Lock order matches the switch path (switch_to): cswap's own
             # account lock first, then Claude Code's. FileLock excludes
@@ -2587,7 +2581,7 @@ class ClaudeAccountSwitcher:
             # below (the one step that can touch ~/.claude.json).
             with (
                 FileLock(self.lock_file),
-                claude_credentials_lock(timeout=CLAUDE_LOCK_TIMEOUT_S),
+                claude_credentials_lock(),
             ):
                 live = self._read_credentials() or ""
                 live_oauth = oauth.extract_oauth_data(live) if live else None
@@ -2685,7 +2679,7 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
-                        with claude_config_lock(timeout=CLAUDE_LOCK_TIMEOUT_S):
+                        with claude_config_lock():
                             self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False

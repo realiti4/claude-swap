@@ -1607,7 +1607,7 @@ class TestActiveAccountRefresh:
                  patch.object(
                      switcher, "_read_account_credentials", return_value=self._EXPIRED
                  ), \
-                 patch("claude_swap.switcher.CLAUDE_LOCK_TIMEOUT_S", 0.3), \
+                 patch("claude_swap.claude_locks.DEFAULT_TIMEOUT_S", 0.3), \
                  patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
                  patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
                 result = switcher._fetch_active_usage(
@@ -1700,7 +1700,7 @@ class TestActiveAccountRefresh:
                               return_value=self._EXPIRED), \
                  patch.object(switcher, "_read_credentials",
                               return_value=self._EXPIRED), \
-                 patch("claude_swap.switcher.CLAUDE_LOCK_TIMEOUT_S", 0.3), \
+                 patch("claude_swap.claude_locks.DEFAULT_TIMEOUT_S", 0.3), \
                  patch("claude_swap.oauth.try_fetch_usage_for_account",
                        return_value=oauth.UsageOutcome(None)):
                 switcher.list_accounts()
