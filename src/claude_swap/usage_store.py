@@ -78,6 +78,11 @@ RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
+# Bound the shift so 2**(n-1) can't grow into an int that overflows float once
+# a persistently-failing account's failure count climbs unbounded. The result
+# already saturates at BACKOFF_CAP_S by shift 5 (30 · 2^5 > 600), so any cap
+# above that is behaviour-preserving; 20 leaves generous headroom.
+BACKOFF_MAX_SHIFT = 20
 
 # The usage endpoint enforces a per-access-token request budget on
 # non-first-party User-Agents (proven 2026-07-11: an idle token, polling
@@ -346,7 +351,8 @@ def _rate_limited_trust_ok(
 
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
     computed = min(
-        BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S
+        BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
+        BACKOFF_CAP_S,
     )
     if retry_after_s is None:
         return computed
