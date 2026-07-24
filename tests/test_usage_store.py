@@ -317,6 +317,12 @@ class TestBackoff:
     def test_backoff_cap(self):
         assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
 
+    def test_backoff_does_not_overflow_on_huge_failure_count(self):
+        # A persistently-failing account grows consecutive_failures unbounded;
+        # 2**(n-1) must not build an int that overflows float on multiply.
+        for n in (1024, 10_000, 10_000_000):
+            assert usage_store._failure_backoff_s(n, None) == BACKOFF_CAP_S
+
     def test_retry_after_is_the_floor(self, store, clock):
         store.record(
             {"1": FetchRecord(error="http-429", retry_after_s=90.0)}, IDENT
