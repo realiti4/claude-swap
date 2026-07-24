@@ -35,7 +35,10 @@ from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
+    EXHAUSTED_INTERVAL_S,
+    JITTER_FRAC,
     RECENT_429_WINDOW_S,
+    RESET_SLACK_S,
     SERVE_TTL_S,
     parse_reset_ts,
 )
@@ -253,8 +256,37 @@ class UsageEntry:
         return None
 
 
+def exhausted_plan_oversleeps(
+    entry: UsageEntry,
+    now: float,
+    models: tuple[str, ...] = (),
+) -> bool:
+    """Whether an exhausted row carries an obsolete reset-parked plan.
+
+    Current plans are bounded by their learned interval, jitter, and reset
+    slack. A deadline beyond that envelope came from the reset-parking policy
+    and must be treated as due so upgraded collectors self-heal it.
+    """
+    headroom = oauth.account_headroom(entry.last_good, models)
+    if (
+        headroom is None
+        or headroom > 0
+        or entry.next_poll_at is None
+    ):
+        return False
+    interval = max(
+        entry.poll_interval_s or EXHAUSTED_INTERVAL_S,
+        EXHAUSTED_INTERVAL_S,
+    )
+    latest_normal_poll = now + interval * (1.0 + JITTER_FRAC) + RESET_SLACK_S
+    return entry.next_poll_at > latest_normal_poll
+
+
 def due_candidate(
-    candidates: list[str], entries: dict[str, UsageEntry], now: float
+    candidates: list[str],
+    entries: dict[str, UsageEntry],
+    now: float,
+    models: tuple[str, ...] = (),
 ) -> str | None:
     """The due candidate with the stalest data, or None.
 
@@ -281,7 +313,11 @@ def due_candidate(
             continue  # dead refresh-token: quarantined, needs a re-login
         if entry.in_backoff(now):
             continue
-        if entry.next_poll_at is not None and now < entry.next_poll_at:
+        if (
+            entry.next_poll_at is not None
+            and now < entry.next_poll_at
+            and not exhausted_plan_oversleeps(entry, now, models)
+        ):
             continue
         if entry.fetched_at is None:
             due.append((0, 0.0, num))

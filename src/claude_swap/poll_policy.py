@@ -62,6 +62,14 @@ ACTIVE_MAX_INTERVAL_S = 300.0
 CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
 
+# Exhaustion is stable enough to poll slowly, but not to stop polling until a
+# reported reset. Quota grants and provider-side corrections can make an
+# account usable before that timestamp, and decision-grade status must not age
+# into "unavailable" while the scheduler is deliberately waiting. Six-minute
+# polling stays below the measured per-token budget and detects recovery
+# promptly; a nearer reported reset still pulls the next poll forward.
+EXHAUSTED_INTERVAL_S = 600.0
+
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an
 # unmoved one backs off toward its ceiling.
@@ -173,8 +181,9 @@ def plan_after_fetch(
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
-    reset (+ ``RESET_SLACK_S``), and an at-limit account skips straight to
-    the reset that frees it (the learned interval is kept for its return).
+    reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
+    poll instead of sleeping until that reset, so an early provider-side
+    quota grant is observed and its decision-grade status stays current.
     """
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
@@ -209,12 +218,18 @@ def plan_after_fetch(
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
         interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
 
-    next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:
+        # Keep probing exhausted accounts: Anthropic can grant/reset quota
+        # before the previously advertised timestamp. Preserve a wider
+        # post-429 interval if congestion control already selected one.
+        interval = max(interval, EXHAUSTED_INTERVAL_S)
+
+    next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
+    if headroom is not None and headroom <= 0:
         reset_ts = limiting_reset_ts(new_usage, models)
-        if reset_ts is not None and reset_ts > next_poll:
-            next_poll = reset_ts
+        if reset_ts is not None:
+            next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
     else:
         reset_ts = earliest_future_reset_ts(new_usage, now, models)
         if reset_ts is not None:

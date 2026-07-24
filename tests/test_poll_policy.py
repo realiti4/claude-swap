@@ -240,11 +240,26 @@ class TestResetCapping:
         assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
         assert interval == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
-    def test_at_limit_skips_straight_to_its_reset(self):
+    def test_at_limit_keeps_bounded_polling_before_distant_reset(self):
         reset_ts = NOW + 7_200.0
         next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
-        assert next_poll == pytest.approx(reset_ts)
-        assert interval == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        assert next_poll == pytest.approx(NOW + interval)
+        assert next_poll < reset_ts
+
+    def test_at_limit_poll_is_pulled_to_an_imminent_reset(self):
+        reset_ts = NOW + 90.0
+        next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
+
+    def test_active_at_limit_uses_same_bounded_recovery_probe(self):
+        reset_ts = NOW + 7_200.0
+        next_poll, interval = _plan(
+            new_usage=_usage(100, self._iso(reset_ts)), is_active=True
+        )
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        assert next_poll == pytest.approx(NOW + interval)
 
 
 class TestJitter:

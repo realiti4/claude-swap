@@ -1246,6 +1246,58 @@ class TestListAccountsUsage:
         output = capsys.readouterr().out
         assert "25%" in output  # account 1 served from the store
 
+    def test_on_demand_pass_repairs_reset_parked_exhausted_plan(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """An exhausted plan from an older release must not suppress polling
+        until a distant reset or let decision-grade status age unavailable."""
+        import time as time_mod
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        ident1 = {"1": ("test@example.com", "")}
+        backdated = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
+        )
+        exhausted = {
+            "five_hour": {"pct": 25},
+            "seven_day": {"pct": 100, "resets_at": "2099-01-01T00:00:00Z"},
+        }
+        backdated.record({"1": FetchRecord(usage=exhausted)}, ident1)
+        switcher._usage_store.set_poll_plan(
+            {"1": (time_mod.time() + 86_400.0, 300.0)}, ident1
+        )
+
+        refreshed = {
+            "five_hour": {"pct": 5},
+            "seven_day": {"pct": 10},
+        }
+        with patch.object(
+            switcher,
+            "_read_active_credentials",
+            return_value=ActiveCredentials(active_creds, False),
+        ), patch.object(
+            switcher, "_read_account_credentials", return_value=backup_creds
+        ), patch.object(
+            switcher, "_active_cc_running", return_value=True
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(refreshed),
+        ) as mock_fetch:
+            switcher.list_accounts()
+
+        assert mock_fetch.call_count == 2  # repaired account 1 plus empty account 2
+        output = capsys.readouterr().out
+        assert "10%" in output
+        entry = switcher._usage_store.entries(ident1)["1"]
+        assert entry.next_poll_at is not None
+        assert entry.next_poll_at < time_mod.time() + 86_400.0
+
     def test_replan_new_active_pulls_candidate_plan_to_floor(
         self, temp_home: Path, mock_claude_config: Path
     ):
