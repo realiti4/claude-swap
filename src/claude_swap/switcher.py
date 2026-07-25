@@ -1104,6 +1104,10 @@ class ClaudeAccountSwitcher:
             if (account.get("email") == email and
                     account.get("organizationUuid", "") == organization_uuid):
                 return num
+        if not organization_uuid:
+            for num, account in data.get("accounts", {}).items():
+                if account.get("email") == email:
+                    return num
         return None
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
