@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2347,3 +2348,155 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+def _reset_in(hours: float, *, base: float = 1_000_000.0) -> str:
+    """ISO weekly-reset instant ``hours`` after the FakeClock epoch.
+
+    The 2024 _R_* constants sit ~54 years past the clock, so
+    ``burn_rate * hours_to_reset`` is effectively unbounded there — useless for
+    exercising the reachable-quota gate. These land the reset a controlled few
+    hours out, where the projection actually bites.
+    """
+    ts = base + hours * 3600.0
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestConsumeFirstBurnRate:
+    """The burn-rate projection layered on consume-first: don't park on a
+    sooner-resetting account whose perishable quota can't be drained before it
+    resets, and degrade to plain soonest-first when no rate is measured."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _tick(
+        self,
+        h: EngineHarness,
+        usage: dict,
+        *,
+        active: str = "1",
+        prev_pct: float | None = None,
+        prev_dt: float = 3600.0,
+    ) -> TickOutcome:
+        """Drive one tick. When ``prev_pct`` is given, the active account
+        carries a prior weekly sample so the engine measures a burn rate of
+        ``(active_7d - prev_pct) / (prev_dt / 3600)`` pct-per-hour. The same
+        view feeds both commit phases (this exercises the gate, not staleness),
+        and — unlike ``_entry_for`` — preserves ``prev`` across the phase-2
+        refetch, mirroring what the store returns in production."""
+        now = h.clock.now
+
+        def build(fetch=None):
+            out = {}
+            for num, value in usage.items():
+                if num == active and prev_pct is not None and isinstance(value, dict):
+                    out[num] = UsageEntry(
+                        last_good=value,
+                        fetched_at=now,
+                        age_s=0.0,
+                        prev_seven_day_pct=prev_pct,
+                        prev_fetched_at=now - prev_dt,
+                    )
+                else:
+                    out[num] = _entry_for(value, now)
+            return out
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=build
+        ):
+            return h.engine.tick()
+
+    def test_holds_when_soonest_reset_is_unreachable(self, temp_home):
+        # Active burns ~4%/h (7d 16 -> 20 over the last hour). The soonest
+        # account (#2) resets in 1h, so only ~4% of its 90% remaining is
+        # reachable — below MIN_REACHABLE_PCT. #3 resets later than the active
+        # account, so it's filtered. Nothing to switch to: hold, don't chase.
+        h = self._harness(temp_home)
+        outcome = self._tick(
+            h,
+            {
+                "1": _usage7(5, 20, _reset_in(5)),
+                "2": _usage7(10, 10, _reset_in(1)),   # soonest but stranded
+                "3": _usage7(10, 10, _reset_in(8)),   # resets after active
+            },
+            prev_pct=16.0,
+        )
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-too-imminent"]
+
+    def test_later_but_drainable_beats_soonest_but_stranded(self, temp_home):
+        # Same ~4%/h burn. #2 resets in 1h (reachable ~4% < gate); #3 resets in
+        # 3h (reachable ~12% > gate) and is still sooner than the active
+        # account (6h). The stranded soonest loses to the drainable later one.
+        h = self._harness(temp_home)
+        outcome = self._tick(
+            h,
+            {
+                "1": _usage7(5, 20, _reset_in(6)),
+                "2": _usage7(10, 10, _reset_in(1)),   # soonest, stranded
+                "3": _usage7(10, 10, _reset_in(3)),   # later, drainable
+            },
+            prev_pct=16.0,
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_no_burn_data_degrades_to_soonest_first(self, temp_home):
+        # Identical layout to the drainable test, but the active account has no
+        # prior sample -> no measured rate -> the gate is inert and the merged
+        # soonest-first rule picks #2 (resets in 1h).
+        h = self._harness(temp_home)
+        outcome = self._tick(
+            h,
+            {
+                "1": _usage7(5, 20, _reset_in(6)),
+                "2": _usage7(10, 10, _reset_in(1)),
+                "3": _usage7(10, 10, _reset_in(3)),
+            },
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_idle_active_has_no_rate_and_stays_soonest_first(self, temp_home):
+        # A flat weekly sample (20 -> 20) is idle time, not a burn rate, so the
+        # gate stays inert and soonest-first still wins even though #2 is close
+        # to reset.
+        h = self._harness(temp_home)
+        outcome = self._tick(
+            h,
+            {
+                "1": _usage7(5, 20, _reset_in(6)),
+                "2": _usage7(10, 10, _reset_in(1)),
+                "3": _usage7(10, 10, _reset_in(3)),
+            },
+            prev_pct=20.0,
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_drainable_soonest_still_switches(self, temp_home):
+        # A fast burn (7d 5 -> 20 over the hour = 15%/h) makes even the 1h-out
+        # #2 drainable (reachable ~15% > gate), so the gate must not block the
+        # ordinary soonest-first switch.
+        h = self._harness(temp_home)
+        outcome = self._tick(
+            h,
+            {
+                "1": _usage7(5, 20, _reset_in(6)),
+                "2": _usage7(10, 10, _reset_in(1)),
+                "3": _usage7(10, 10, _reset_in(3)),
+            },
+            prev_pct=5.0,
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
