@@ -87,6 +87,9 @@ RECENT_429_WINDOW_S = 3600.0
 # cadence keys on the same band, so it lives with the cadence numbers).
 ESCALATION_MARGIN_PCT = 15.0
 
+# Maximum interval for an exhausted account before decision trust staleness expires:
+EXHAUSTED_MAX_INTERVAL_S = 3000.0
+
 # Never schedule a poll later than a known window reset (+ slack): stored
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
@@ -195,7 +198,7 @@ def plan_after_fetch(
     if headroom is not None and headroom <= 0:
         reset_ts = limiting_reset_ts(new_usage, models)
         if reset_ts is not None and reset_ts > next_poll:
-            next_poll = reset_ts
+            next_poll = min(reset_ts, now + EXHAUSTED_MAX_INTERVAL_S)
     else:
         reset_ts = earliest_future_reset_ts(new_usage, now, models)
         if reset_ts is not None:
