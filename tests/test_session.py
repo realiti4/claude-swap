@@ -1745,8 +1745,8 @@ class TestShareHistoryPosix:
         second = tmp_path / "second.jsonl"
         second.write_text("second-loser\n")
 
-        landed_first = mgr._quarantine(first, rel, run_dir)
-        landed_second = mgr._quarantine(second, rel, run_dir)
+        landed_first = mgr._quarantine(first, rel, run_dir, "profile")
+        landed_second = mgr._quarantine(second, rel, run_dir, "profile")
 
         assert landed_first != landed_second
         assert landed_first.read_text() == "first-loser\n"
@@ -1773,7 +1773,7 @@ class TestShareHistoryPosix:
         assert run_dir is not None
         assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
         assert "2026-07-21" in (
-            run_dir / "-home-user-app" / "aaa.jsonl"
+            run_dir / "shared" / "-home-user-app" / "aaa.jsonl"
         ).read_text()
 
     def test_merge_return_counts_when_target_wins(self, history_setup, tmp_path):
@@ -1795,7 +1795,7 @@ class TestShareHistoryPosix:
         assert run_dir is not None
         assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
         assert "2026-07-21" in (
-            run_dir / "-home-user-app" / "aaa.jsonl"
+            run_dir / "profile" / "-home-user-app" / "aaa.jsonl"
         ).read_text()
 
     def test_no_transcript_is_ever_deleted(self, history_setup):
@@ -1822,6 +1822,56 @@ class TestShareHistoryPosix:
         } | {shared.read_text()}
         assert any("2026-07-21" in b for b in bodies)
         assert any("2026-07-23" in b for b in bodies)
+
+    def test_quarantine_records_provenance_in_path_profile_wins(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        # Profile copy is newer — it wins, shared copy is quarantined.
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-21T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The shared-side loser should be under .../shared/, not .../profile/.
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        quarantine_path = quarantined[0]
+        assert "/shared/" in str(quarantine_path)
+        assert "/profile/" not in str(quarantine_path)
+        assert "2026-07-21" in quarantine_path.read_text()
+
+    def test_quarantine_records_provenance_in_path_target_wins(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        # Target (shared) copy is newer — it wins, profile copy is quarantined.
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The profile-side loser should be under .../profile/, not .../shared/.
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        quarantine_path = quarantined[0]
+        assert "/profile/" in str(quarantine_path)
+        assert "/shared/" not in str(quarantine_path)
+        assert "2026-07-21" in quarantine_path.read_text()
 
 
 class TestShareHistoryWindows:

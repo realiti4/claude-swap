@@ -1175,9 +1175,15 @@ class SessionManager:
             )
         )
 
-    def _quarantine(self, path: Path, rel: Path, run_dir: Path) -> Path:
-        """Move a losing copy under ``run_dir``, never over an existing file."""
-        dest = run_dir / rel
+    def _quarantine(self, path: Path, rel: Path, run_dir: Path, side: str) -> Path:
+        """Move a losing copy under ``run_dir``, never over an existing file.
+
+        ``side`` is which tree the loser came from — ``"shared"`` or ``"profile"`` —
+        because both sides otherwise land at the same relative path and the operator
+        reconciling two disjoint halves of one session would have no way to tell which
+        half is which.
+        """
+        dest = run_dir / side / rel
         _mkdir_private(dest.parent)
         if dest.exists():
             counter = 2
@@ -1235,12 +1241,12 @@ class SessionManager:
                         # Park the incumbent first: a crash between the two
                         # leaves the shared path empty, and the next run moves
                         # the profile copy in cleanly.
-                        self._quarantine(target, rel, quarantine_root())
+                        self._quarantine(target, rel, quarantine_root(), "shared")
                         _mkdir_private(target.parent)
                         shutil.move(str(path), str(target))
                         moved += 1
                     else:
-                        self._quarantine(path, rel, quarantine_root())
+                        self._quarantine(path, rel, quarantine_root(), "profile")
                     quarantined += 1
                     continue
                 _mkdir_private(target.parent)
