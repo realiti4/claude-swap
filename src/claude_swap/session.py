@@ -1458,7 +1458,12 @@ class SessionManager:
         ``history.jsonl`` merges by appending lines not already present.
         ``dest`` is removed once empty; any failure raises OSError and leaves
         remaining files in place for the next try. Returns
-        ``(moved, quarantined, run_dir)``.
+        ``(moved, quarantined, run_dir)``: ``moved`` counts files relocated
+        into ``src`` — a plain (non-colliding) move, or the winning half of a
+        collision; ``quarantined`` counts losers parked instead of dropped. A
+        collision where the profile copy wins increments *both* for the one
+        file pair (the winner is moved, the incumbent is quarantined), so
+        callers must not sum the two counters as "files handled".
         """
         run_dir: Path | None = None
         moved = 0
