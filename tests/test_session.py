@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
     SessionError,
     ValidationError,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_global_config_path
 from claude_swap.session import (
@@ -1888,6 +1889,34 @@ class TestShareHistoryPosix:
         assert calls["n"] >= 2, "liveness must be re-checked under the lock"
         assert (proj / "bbb.jsonl").exists(), "migration must not have run"
         assert not (session_dir / "projects").is_symlink()
+
+    def test_migration_does_not_deadlock_against_the_bootstrap_lock(
+        self, history_setup, monkeypatch
+    ):
+        """setup_session calls _sync_sharing while still holding
+        switcher.lock_file (its re-validate-under-lock and post-bootstrap
+        paths). Migration must not try to re-acquire that same lock: flock
+        is per-fd, not per-process, so a second open of the same lock file
+        from inside this same process would self-block rather than proceed,
+        timing out into an error instead of migrating.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        # Fail fast instead of hanging the suite if the regression reappears.
+        monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
+
+        # Simulate the bootstrap lock already being held around this call,
+        # exactly as setup_session holds it across its _sync_sharing calls.
+        with FileLock(mgr.switcher.lock_file):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        merged = source / "projects" / "-home-user-app"
+        assert merged.joinpath("aaa.jsonl").read_text() == "main-a\n"
+        assert merged.joinpath("bbb.jsonl").read_text() == "profile-b\n"
+        assert (session_dir / "projects").readlink() == source / "projects"
 
     def test_toggle_off_removes_links_keeps_data(self, history_setup):
         source, session_dir, mgr = history_setup
