@@ -2025,6 +2025,77 @@ class TestShareHistoryPosix:
         assert (proj / "bbb.jsonl").exists()
         assert not (session_dir / "projects").is_symlink()
 
+    def _lock_that_lets_a_peer_finish_first(self, monkeypatch, on_acquire):
+        """Stand in for the migration lock a peer is already holding.
+
+        The precondition that decided to merge (``dest.exists() and not
+        dest.is_symlink()``) is evaluated *before* the wait, so whatever the
+        peer did while we queued has to be re-checked once we hold the lock.
+        """
+
+        class PeerFinishedFirst:
+            def __init__(self, path, timeout=None):
+                pass
+
+            def __enter__(self):
+                on_acquire()
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(session_mod, "FileLock", PeerFinishedFirst)
+
+    def test_peer_removed_dest_while_we_waited_on_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """The peer migrated and removed the profile's copy. Merging a dest
+        that is no longer there raises FileNotFoundError and reports "merging
+        failed" for what was in fact a successful migration."""
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+        self._lock_that_lets_a_peer_finish_first(
+            monkeypatch,
+            lambda: session_mod.shutil.rmtree(session_dir / "projects"),
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_symlink()
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+
+    def test_peer_linked_dest_while_we_waited_on_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """The peer got all the way to the symlink. dest.is_dir() follows it,
+        so the merge would walk ~/.claude/projects against itself: every
+        shared transcript collides with itself, gets quarantined, and the
+        shared directory is emptied out underneath the link."""
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        def peer_migrated_and_linked():
+            session_mod.shutil.rmtree(session_dir / "projects")
+            (session_dir / "projects").symlink_to(source / "projects")
+
+        self._lock_that_lets_a_peer_finish_first(
+            monkeypatch, peer_migrated_and_linked
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert not (mgr.switcher.backup_dir / "history-conflicts").exists()
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        assert (session_dir / "projects").readlink() == source / "projects"
+
     def test_toggle_off_removes_links_keeps_data(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr._sync_sharing(session_dir, share=True, share_history=True)

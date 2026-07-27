@@ -1400,6 +1400,7 @@ class SessionManager:
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
         """
+        merged = False
         if dest.exists() and not dest.is_symlink():
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
@@ -1428,34 +1429,47 @@ class SessionManager:
                     if not profile_is_quiescent(session_dir):
                         self._report_deferral(session_dir, dest)
                         return False
-                    try:
-                        moved, quarantined, run_dir = (
-                            self._merge_history_into_source(src, dest)
-                        )
-                    except OSError as e:
-                        self._logger.warning(
-                            f"Could not merge {dest.name} into {src}: {e}"
-                        )
-                        print(
-                            dimmed(
-                                f"Not sharing {dest.name}: merging the profile's "
-                                "existing history failed (see log)."
+                    # Re-check the precondition too, not just liveness: it was
+                    # evaluated before the wait, and the peer we queued behind
+                    # may have migrated this very item. Merging a dest it
+                    # removed raises FileNotFoundError and reports a peer's
+                    # success as our failure; merging one it replaced with a
+                    # symlink is worse, since dest.is_dir() follows the link
+                    # and the walk would quarantine every shared transcript
+                    # against itself. Either way there is nothing left to
+                    # merge, and the generic loop can link as normal.
+                    if dest.exists() and not dest.is_symlink():
+                        try:
+                            moved, quarantined, run_dir = (
+                                self._merge_history_into_source(src, dest)
                             )
+                        except OSError as e:
+                            self._logger.warning(
+                                f"Could not merge {dest.name} into {src}: {e}"
+                            )
+                            print(
+                                dimmed(
+                                    f"Not sharing {dest.name}: merging the "
+                                    "profile's existing history failed "
+                                    "(see log)."
+                                )
+                            )
+                            return False
+                        # HISTORY_ITEMS holds two entries (projects,
+                        # history.jsonl), so this runs up to twice per launch —
+                        # accumulate rather than overwrite, and keep the first
+                        # quarantine dir a run produces (the file-merge branch
+                        # never quarantines, so at most one of the two calls
+                        # sets it).
+                        prev_moved, prev_quarantined, prev_run_dir = (
+                            self._last_merge_counts
                         )
-                        return False
-                    # HISTORY_ITEMS holds two entries (projects, history.jsonl),
-                    # so this runs up to twice per launch — accumulate rather
-                    # than overwrite, and keep the first quarantine dir a run
-                    # produces (the file-merge branch never quarantines, so at
-                    # most one of the two calls sets it).
-                    prev_moved, prev_quarantined, prev_run_dir = (
-                        self._last_merge_counts
-                    )
-                    self._last_merge_counts = (
-                        prev_moved + moved,
-                        prev_quarantined + quarantined,
-                        prev_run_dir if prev_run_dir is not None else run_dir,
-                    )
+                        self._last_merge_counts = (
+                            prev_moved + moved,
+                            prev_quarantined + quarantined,
+                            prev_run_dir if prev_run_dir is not None else run_dir,
+                        )
+                        merged = True
             except LockError:
                 # A peer is migrating this same profile right now — the
                 # timeout means "still busy", not "broken", so this degrades
@@ -1463,12 +1477,13 @@ class SessionManager:
                 # launch.
                 self._report_deferral(session_dir, dest)
                 return False
-            print(
-                dimmed(
-                    f"Merged the profile's existing {dest.name} into "
-                    f"{src} — conversation history is now shared."
+            if merged:
+                print(
+                    dimmed(
+                        f"Merged the profile's existing {dest.name} into "
+                        f"{src} — conversation history is now shared."
+                    )
                 )
-            )
         if not src.exists():
             # Fresh ~/.claude (or first run): seed an empty share target so
             # the generic loop below has something to link.
