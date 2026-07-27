@@ -26,6 +26,7 @@ from claude_swap.exceptions import (
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_global_config_path
+from claude_swap.process_detection import ClaudeSession
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
@@ -1856,8 +1857,16 @@ class TestShareHistoryPosix:
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
         (session_dir / "projects" / "x.jsonl").write_text("live\n")
+        blocker = ClaudeSession(
+            pid=1,
+            session_id="live",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
         monkeypatch.setattr(
-            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
+            session_mod, "scan_live_sessions", lambda _dir: ([blocker], 0)
         )
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -1868,6 +1877,33 @@ class TestShareHistoryPosix:
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
         assert "projects" not in manifest["items"]
 
+    def test_deferral_names_the_blocking_session_and_the_command(
+        self, history_setup, monkeypatch, capsys
+    ):
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        blocker = ClaudeSession(
+            pid=63802,
+            session_id="abc",
+            cwd="/Users/matt/Documents/GitHub/soribashi",
+            started_at=1785041704563,
+            kind="interactive",
+            entrypoint="cli",
+        )
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda p: ([blocker], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert "63802" in out
+        assert "soribashi" in out
+        assert "cswap run 2 --share-history" in out
+
     def test_migration_rechecks_liveness_under_the_lock(
         self, history_setup, monkeypatch
     ):
@@ -1877,11 +1913,19 @@ class TestShareHistoryPosix:
         (proj / "bbb.jsonl").write_text("profile-b\n")
 
         calls = {"n": 0}
+        blocker = ClaudeSession(
+            pid=2,
+            session_id="a-session",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
 
         def fake_scan(path):
             # Quiescent on the pre-lock check, busy once the lock is held.
             calls["n"] += 1
-            return ([], 0) if calls["n"] == 1 else (["a-session"], 0)
+            return ([], 0) if calls["n"] == 1 else ([blocker], 0)
 
         monkeypatch.setattr(session_mod, "scan_live_sessions", fake_scan)
         mgr._sync_sharing(session_dir, share=True, share_history=True)
