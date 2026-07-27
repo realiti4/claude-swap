@@ -1647,6 +1647,52 @@ class TestShareHistoryPosix:
         assert landed_first.read_text() == "first-loser\n"
         assert landed_second.read_text() == "second-loser\n"
 
+    def test_merge_return_counts_when_profile_copy_wins(
+        self, history_setup, tmp_path
+    ):
+        _, _, mgr = history_setup
+        src = tmp_path / "shared" / "projects"
+        dest = tmp_path / "profile" / "projects"
+        (src / "-home-user-app").mkdir(parents=True)
+        (dest / "-home-user-app").mkdir(parents=True)
+        (src / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+        (dest / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        moved, quarantined, run_dir = mgr._merge_history_into_source(src, dest)
+
+        assert (moved, quarantined) == (1, 1)
+        assert run_dir is not None
+        assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
+        assert "2026-07-21" in (
+            run_dir / "-home-user-app" / "aaa.jsonl"
+        ).read_text()
+
+    def test_merge_return_counts_when_target_wins(self, history_setup, tmp_path):
+        _, _, mgr = history_setup
+        src = tmp_path / "shared" / "projects"
+        dest = tmp_path / "profile" / "projects"
+        (src / "-home-user-app").mkdir(parents=True)
+        (dest / "-home-user-app").mkdir(parents=True)
+        (src / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+        (dest / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        moved, quarantined, run_dir = mgr._merge_history_into_source(src, dest)
+
+        assert (moved, quarantined) == (0, 1)
+        assert run_dir is not None
+        assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
+        assert "2026-07-21" in (
+            run_dir / "-home-user-app" / "aaa.jsonl"
+        ).read_text()
+
     def test_no_transcript_is_ever_deleted(self, history_setup):
         source, session_dir, mgr = history_setup
         shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
@@ -1659,9 +1705,15 @@ class TestShareHistoryPosix:
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
 
+        # The merge must actually have happened (not silently skipped): the
+        # profile's projects/ is a symlink into the shared tree, so its own
+        # copy of aaa.jsonl no longer exists to double-count as "kept".
+        assert (session_dir / "projects").is_symlink()
         bodies = {
             p.read_text()
-            for p in mgr.switcher.backup_dir.rglob("aaa.jsonl")
+            for p in (mgr.switcher.backup_dir / "history-conflicts").rglob(
+                "aaa.jsonl"
+            )
         } | {shared.read_text()}
         assert any("2026-07-21" in b for b in bodies)
         assert any("2026-07-23" in b for b in bodies)
