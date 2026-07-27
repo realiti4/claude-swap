@@ -1867,6 +1867,28 @@ class TestShareHistoryPosix:
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
         assert "projects" not in manifest["items"]
 
+    def test_migration_rechecks_liveness_under_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        calls = {"n": 0}
+
+        def fake_scan(path):
+            # Quiescent on the pre-lock check, busy once the lock is held.
+            calls["n"] += 1
+            return ([], 0) if calls["n"] == 1 else (["a-session"], 0)
+
+        monkeypatch.setattr(session_mod, "scan_live_sessions", fake_scan)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert calls["n"] >= 2, "liveness must be re-checked under the lock"
+        assert (proj / "bbb.jsonl").exists(), "migration must not have run"
+        assert not (session_dir / "projects").is_symlink()
+
     def test_toggle_off_removes_links_keeps_data(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr._sync_sharing(session_dir, share=True, share_history=True)
