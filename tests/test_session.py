@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1541,6 +1542,14 @@ class TestShareHistoryPosix:
         assert "63802" in out
         assert "soribashi" in out
         assert "cswap run 2 --share-history" in out
+        # Pin the epoch-ms -> local-time conversion itself, not just the
+        # surrounding text — a timezone bug (UTC mislabeled as local) or an
+        # off-by-1000 that still lands in a plausible-looking date would slip
+        # past a loose "2026-" substring check.
+        expected_started = datetime.fromtimestamp(
+            blocker.started_at / 1000, tz=timezone.utc
+        ).astimezone()
+        assert f"{expected_started:%Y-%m-%d %H:%M}" in out
 
     def test_migration_rechecks_liveness_under_the_lock(
         self, history_setup, monkeypatch
