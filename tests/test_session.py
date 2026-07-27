@@ -1918,6 +1918,60 @@ class TestShareHistoryPosix:
         assert merged.joinpath("bbb.jsonl").read_text() == "profile-b\n"
         assert (session_dir / "projects").readlink() == source / "projects"
 
+    def test_last_merge_counts_accumulate_across_history_items(self, history_setup):
+        """_prepare_history_share runs once per HISTORY_ITEMS entry (projects,
+        then history.jsonl), each merge assigning into the same field. A
+        profile with real history in both must not have the projects/ counts
+        (and its quarantine dir) clobbered by the history.jsonl merge that
+        runs right after — the file-merge branch never quarantines and always
+        reports (0, 0, None), so an overwrite would silently lose both.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        # A genuine collision in projects/: profile copy is newer, so it
+        # wins — moved in, incumbent quarantined (moved=1, quarantined=1).
+        (source / "projects" / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+        # Real profile-side history.jsonl too, merged by the separate
+        # (0, 0, None)-always file-merge branch, right after projects/.
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        moved, quarantined, run_dir = mgr._last_merge_counts
+        assert (moved, quarantined) == (1, 1)
+        assert run_dir is not None, "the quarantine directory must not be lost"
+
+    def test_migration_lock_timeout_degrades_instead_of_raising(
+        self, history_setup, monkeypatch
+    ):
+        """A LockError from the per-profile migration lock must degrade like
+        every other failure in this function (dimmed message, return False)
+        rather than escape and abort the launch — a lock timeout means a
+        peer is still working on this profile, which is expected, not broken.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        # Fail fast instead of waiting out the real 30s timeout.
+        monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
+
+        # Hold the per-profile migration lock open, simulating a peer already
+        # migrating this same profile.
+        with FileLock(session_dir / session_mod.MIGRATION_LOCK):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Degraded, not raised: no migration happened, nothing linked.
+        assert (proj / "bbb.jsonl").exists()
+        assert not (session_dir / "projects").is_symlink()
+
     def test_toggle_off_removes_links_keeps_data(self, history_setup):
         source, session_dir, mgr = history_setup
         mgr._sync_sharing(session_dir, share=True, share_history=True)

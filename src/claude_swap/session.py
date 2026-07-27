@@ -54,9 +54,11 @@ from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    LockError,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -116,6 +118,11 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+# Per-profile lock serializing concurrent history migrations of the same
+# profile. Permanent once created (like the markers above), so it is a named
+# constant rather than an inline literal — a later rename would orphan it.
+MIGRATION_LOCK = ".cswap-migration.lock"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -1087,6 +1094,10 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
+        # Reset per call: _prepare_history_share accumulates into this as it
+        # runs (once per HISTORY_ITEMS entry), so a launch with nothing to
+        # migrate must not report counts left over from a previous one.
+        self._last_merge_counts = (0, 0, None)
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
@@ -1410,27 +1421,48 @@ class SessionManager:
             # because it is a different file. The bootstrap lock protects
             # credential and profile setup — a different concern from moving
             # transcripts.
-            with FileLock(
-                session_dir / ".migration.lock", timeout=_MIGRATION_LOCK_TIMEOUT
-            ):
-                if not profile_is_quiescent(session_dir):
-                    self._report_deferral(session_dir, dest)
-                    return False
-                try:
-                    self._last_merge_counts = self._merge_history_into_source(
-                        src, dest
-                    )
-                except OSError as e:
-                    self._logger.warning(
-                        f"Could not merge {dest.name} into {src}: {e}"
-                    )
-                    print(
-                        dimmed(
-                            f"Not sharing {dest.name}: merging the profile's "
-                            "existing history failed (see log)."
+            try:
+                with FileLock(
+                    session_dir / MIGRATION_LOCK, timeout=_MIGRATION_LOCK_TIMEOUT
+                ):
+                    if not profile_is_quiescent(session_dir):
+                        self._report_deferral(session_dir, dest)
+                        return False
+                    try:
+                        moved, quarantined, run_dir = (
+                            self._merge_history_into_source(src, dest)
                         )
+                    except OSError as e:
+                        self._logger.warning(
+                            f"Could not merge {dest.name} into {src}: {e}"
+                        )
+                        print(
+                            dimmed(
+                                f"Not sharing {dest.name}: merging the profile's "
+                                "existing history failed (see log)."
+                            )
+                        )
+                        return False
+                    # HISTORY_ITEMS holds two entries (projects, history.jsonl),
+                    # so this runs up to twice per launch — accumulate rather
+                    # than overwrite, and keep the first quarantine dir a run
+                    # produces (the file-merge branch never quarantines, so at
+                    # most one of the two calls sets it).
+                    prev_moved, prev_quarantined, prev_run_dir = (
+                        self._last_merge_counts
                     )
-                    return False
+                    self._last_merge_counts = (
+                        prev_moved + moved,
+                        prev_quarantined + quarantined,
+                        prev_run_dir if prev_run_dir is not None else run_dir,
+                    )
+            except LockError:
+                # A peer is migrating this same profile right now — the
+                # timeout means "still busy", not "broken", so this degrades
+                # exactly like every other deferral instead of aborting the
+                # launch.
+                self._report_deferral(session_dir, dest)
+                return False
             print(
                 dimmed(
                     f"Merged the profile's existing {dest.name} into "
