@@ -1080,7 +1080,20 @@ class SessionManager:
             # The pre-check above is a cheap early out; the authoritative one
             # runs under the lock, so a launch that starts in between cannot
             # have its transcripts moved mid-write.
-            with FileLock(self.switcher.lock_file, timeout=_MIGRATION_LOCK_TIMEOUT):
+            #
+            # A per-profile lock, not switcher.lock_file: the risk being
+            # serialized here is two concurrent migrations of the *same*
+            # profile racing target.exists() against shutil.move. A
+            # per-profile lock covers exactly that, is finer-grained than the
+            # global lock (an unrelated account's migration is never
+            # blocked), and cannot deadlock against setup_session's bootstrap
+            # lock (which is still held across this call on some paths)
+            # because it is a different file. The bootstrap lock protects
+            # credential and profile setup — a different concern from moving
+            # transcripts.
+            with FileLock(
+                session_dir / ".migration.lock", timeout=_MIGRATION_LOCK_TIMEOUT
+            ):
                 if live_sessions_for(session_dir):
                     self._report_deferral(session_dir, dest)
                     return False
