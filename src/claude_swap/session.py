@@ -148,6 +148,10 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # default 10s acquire used by the switch paths.
 _BOOTSTRAP_LOCK_TIMEOUT = 30.0
 
+# Migration moves every transcript in a profile, so it waits longer than the
+# bootstrap for a peer to finish rather than bailing and leaving a half state.
+_MIGRATION_LOCK_TIMEOUT = 30.0
+
 
 def slugify_email(email: str) -> str:
     """Filesystem-safe slug for an email address.
@@ -433,6 +437,9 @@ class SessionManager:
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
+        # Filled by the most recent merge so the launch can report counts
+        # without re-deriving them from the filesystem.
+        self._last_merge_counts: tuple[int, int, Path | None] = (0, 0, None)
 
     # -- launch ----------------------------------------------------------
 
@@ -1068,26 +1075,30 @@ class SessionManager:
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
             if live_sessions_for(session_dir):
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name} yet: another session is "
-                        "using this profile — retrying on the next launch."
-                    )
-                )
+                self._report_deferral(session_dir, dest)
                 return False
-            try:
-                self._merge_history_into_source(src, dest)
-            except OSError as e:
-                self._logger.warning(
-                    f"Could not merge {dest.name} into {src}: {e}"
-                )
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name}: merging the profile's "
-                        "existing history failed (see log)."
+            # The pre-check above is a cheap early out; the authoritative one
+            # runs under the lock, so a launch that starts in between cannot
+            # have its transcripts moved mid-write.
+            with FileLock(self.switcher.lock_file, timeout=_MIGRATION_LOCK_TIMEOUT):
+                if live_sessions_for(session_dir):
+                    self._report_deferral(session_dir, dest)
+                    return False
+                try:
+                    self._last_merge_counts = self._merge_history_into_source(
+                        src, dest
                     )
-                )
-                return False
+                except OSError as e:
+                    self._logger.warning(
+                        f"Could not merge {dest.name} into {src}: {e}"
+                    )
+                    print(
+                        dimmed(
+                            f"Not sharing {dest.name}: merging the profile's "
+                            "existing history failed (see log)."
+                        )
+                    )
+                    return False
             print(
                 dimmed(
                     f"Merged the profile's existing {dest.name} into "
@@ -1110,6 +1121,14 @@ class SessionManager:
                 self._logger.warning(f"Could not create {src}: {e}")
                 return False
         return True
+
+    def _report_deferral(self, session_dir: Path, dest: Path) -> None:
+        print(
+            dimmed(
+                f"Not sharing {dest.name} yet: another session is "
+                "using this profile — retrying on the next launch."
+            )
+        )
 
     def _quarantine(self, path: Path, rel: Path, run_dir: Path) -> Path:
         """Move a losing copy under ``run_dir``, never over an existing file."""
