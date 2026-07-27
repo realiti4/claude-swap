@@ -2740,3 +2740,63 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+
+class TestSurvivorSelection:
+    """Which of two same-named transcripts wins a merge collision."""
+
+    def _write(self, path: Path, lines: list[str]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{line}\n" for line in lines))
+        return path
+
+    def test_last_timestamp_scans_past_untimestamped_trailer(self, tmp_path):
+        # ~99% of real transcripts end on an untimestamped state line.
+        f = self._write(tmp_path / "a.jsonl", [
+            '{"type": "user", "timestamp": "2026-07-22T01:33:08.788Z"}',
+            '{"type": "last-prompt", "prompt": "hi"}',
+        ])
+        assert session_mod._last_timestamp(f) == "2026-07-22T01:33:08.788Z"
+
+    def test_last_timestamp_none_when_absent(self, tmp_path):
+        f = self._write(tmp_path / "a.jsonl", ['{"type": "last-prompt"}'])
+        assert session_mod._last_timestamp(f) is None
+
+    def test_last_timestamp_skips_unparseable_lines(self, tmp_path):
+        f = self._write(tmp_path / "a.jsonl", [
+            '{"timestamp": "2026-07-01T00:00:00.000Z"}',
+            "not json at all",
+        ])
+        assert session_mod._last_timestamp(f) == "2026-07-01T00:00:00.000Z"
+
+    def test_later_timestamp_wins(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-21T20:39:55.399Z"}'] * 5)
+        cand = self._write(tmp_path / "c.jsonl", [
+            '{"timestamp": "2026-07-23T18:03:53.827Z"}'])
+        # Shorter but newer still wins: a compacted continuation must not lose.
+        assert session_mod._profile_copy_wins(target, cand) is True
+
+    def test_earlier_timestamp_loses(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-23T18:03:53.827Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", [
+            '{"timestamp": "2026-07-21T20:39:55.399Z"}'] * 99)
+        assert session_mod._profile_copy_wins(target, cand) is False
+
+    def test_untimestamped_loses_to_timestamped(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", ['{"type": "mode"}'] * 50)
+        assert session_mod._profile_copy_wins(target, cand) is False
+
+    def test_neither_timestamped_falls_back_to_line_count(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", ["# a"])
+        cand = self._write(tmp_path / "c.jsonl", ["# a", "# b"])
+        assert session_mod._profile_copy_wins(target, cand) is True
+
+    def test_exact_tie_keeps_the_target(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        assert session_mod._profile_copy_wins(target, cand) is False

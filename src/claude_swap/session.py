@@ -484,6 +484,62 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
+def _last_timestamp(path: Path) -> str | None:
+    """Last ISO-8601 ``timestamp`` in a JSONL transcript, scanning backwards.
+
+    Claude closes nearly every transcript with untimestamped state lines
+    (``last-prompt``, ``mode``, ``ai-title``, ``file-history-snapshot``), so
+    reading only the final line finds a timestamp in about 1% of real files.
+    Scanning back finds one within a line or two. Values are ISO-8601 Zulu
+    with milliseconds, so lexical comparison is chronological.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            stamp = entry.get("timestamp")
+            if isinstance(stamp, str) and stamp:
+                return stamp
+    return None
+
+
+def _line_count(path: Path) -> int:
+    """Lines in a file; 0 when it cannot be read (so it never wins a tiebreak)."""
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return 0
+
+
+def _profile_copy_wins(target: Path, candidate: Path) -> bool:
+    """Whether the profile's ``candidate`` should replace the shared ``target``.
+
+    A same-named pair is *not* the same session: a transcript that straddled
+    an un-share event exists in both trees under one UUID with different
+    content. Order, applied in full so the outcome is deterministic: later
+    last-timestamp, then having a timestamp at all, then more lines, then the
+    incumbent. The loser is quarantined either way, never dropped.
+    """
+    target_stamp = _last_timestamp(target)
+    candidate_stamp = _last_timestamp(candidate)
+    if target_stamp != candidate_stamp:
+        if target_stamp is None:
+            return True
+        if candidate_stamp is None:
+            return False
+        return candidate_stamp > target_stamp
+    return _line_count(candidate) > _line_count(target)
+
+
 def _probe_env(session_dir: Path) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
