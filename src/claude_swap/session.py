@@ -1168,10 +1168,61 @@ class SessionManager:
         return True
 
     def _report_deferral(self, session_dir: Path, dest: Path) -> None:
-        print(
-            dimmed(
-                f"Not sharing {dest.name} yet: another session is "
-                "using this profile — retrying on the next launch."
+        """Explain a skipped migration loudly enough to be noticed.
+
+        The old one-line dimmed print was scrolled away by Claude's startup
+        banner and never logged, so a profile could sit unshared for days
+        with the flag passed on every launch and no visible signal.
+        """
+        blockers = live_sessions_for(session_dir)
+        account = session_dir.name
+        slot = account.split("-")[0]
+        warning(f"share-history: {account} keeps its own {dest.name} for now.")
+        if blockers:
+            for live in blockers:
+                started = datetime.fromtimestamp(
+                    live.started_at / 1000, tz=timezone.utc
+                ).astimezone()
+                print(
+                    dimmed(
+                        f"   pid {live.pid}  {live.cwd}  "
+                        f"(since {started:%Y-%m-%d %H:%M})"
+                    )
+                )
+            print(
+                dimmed(
+                    "   Sessions started here will not appear in "
+                    "`claude --resume` under other accounts."
+                )
+            )
+            print(
+                dimmed(
+                    f"   Close them, then relaunch:  cswap run {slot} --share-history"
+                )
+            )
+        else:
+            # No live session in *this* profile — the migration lock is held
+            # by a peer cswap process instead (e.g. a concurrent launch
+            # already merging this same profile's history). Nothing to
+            # close; the only useful action is to retry once it is done.
+            print(
+                dimmed(
+                    "   Another process is migrating this profile's "
+                    "history right now."
+                )
+            )
+            print(
+                dimmed(
+                    f"   Once it finishes, relaunch:  cswap run {slot} --share-history"
+                )
+            )
+        self._logger.warning(
+            f"History migration deferred for {account}: "
+            f"{len(blockers)} live session(s)"
+            + (
+                ": " + ", ".join(f"pid {b.pid} ({b.cwd})" for b in blockers)
+                if blockers
+                else " (migration lock held by a peer process)"
             )
         )
 
