@@ -1583,6 +1583,89 @@ class TestShareHistoryPosix:
         # Real history is user data even when the manifest claims it.
         assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
 
+    def test_collision_keeps_newer_profile_copy_and_quarantines_target(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-21T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "2026-07-23" in shared.read_text()
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        assert "2026-07-21" in quarantined[0].read_text()
+
+    def test_collision_keeps_newer_target_and_quarantines_profile_copy(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "2026-07-23" in shared.read_text()
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        assert "2026-07-21" in quarantined[0].read_text()
+
+    def test_quarantine_never_overwrites_an_earlier_quarantine(
+        self, history_setup, tmp_path
+    ):
+        # Two runs inside one timestamp granule land in the same run dir, so
+        # the uniquify path is exercised directly rather than through a merge.
+        source, session_dir, mgr = history_setup
+        run_dir = mgr.switcher.backup_dir / "history-conflicts" / "same-granule"
+        run_dir.mkdir(parents=True)
+        rel = Path("-home-user-app") / "aaa.jsonl"
+
+        first = tmp_path / "first.jsonl"
+        first.write_text("first-loser\n")
+        second = tmp_path / "second.jsonl"
+        second.write_text("second-loser\n")
+
+        landed_first = mgr._quarantine(first, rel, run_dir)
+        landed_second = mgr._quarantine(second, rel, run_dir)
+
+        assert landed_first != landed_second
+        assert landed_first.read_text() == "first-loser\n"
+        assert landed_second.read_text() == "second-loser\n"
+
+    def test_no_transcript_is_ever_deleted(self, history_setup):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        bodies = {
+            p.read_text()
+            for p in mgr.switcher.backup_dir.rglob("aaa.jsonl")
+        } | {shared.read_text()}
+        assert any("2026-07-21" in b for b in bodies)
+        assert any("2026-07-23" in b for b in bodies)
+
 
 class TestShareHistoryWindows:
     def test_sync_never_links_history_in_copy_mode(self, history_setup):

@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -93,6 +94,11 @@ HISTORY_ITEMS = (
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
 SHARE_MANIFEST = ".cswap-shared.json"
+
+# Where a losing copy of a same-named transcript is parked. Never a delete:
+# a UUID collision after an un-share means two different halves of one
+# session, not a duplicate.
+QUARANTINE_DIRNAME = "history-conflicts"
 
 # Deferred-invalidation marker: backup credentials changed while a session was
 # live (we never pull credentials out from under a running claude), so the
@@ -1105,16 +1111,48 @@ class SessionManager:
                 return False
         return True
 
-    @staticmethod
-    def _merge_history_into_source(src: Path, dest: Path) -> None:
+    def _quarantine(self, path: Path, rel: Path, run_dir: Path) -> Path:
+        """Move a losing copy under ``run_dir``, never over an existing file."""
+        dest = run_dir / rel
+        _mkdir_private(dest.parent)
+        if dest.exists():
+            counter = 2
+            while True:
+                candidate = dest.parent / f"{dest.stem}.{counter}{dest.suffix}"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                counter += 1
+        shutil.move(str(path), str(dest))
+        self._logger.info(f"Quarantined colliding history file to {dest}")
+        return dest
+
+    def _merge_history_into_source(
+        self, src: Path, dest: Path
+    ) -> tuple[int, int, Path | None]:
         """Move the profile's own history at ``dest`` into ``src``.
 
-        Directories merge file-by-file (transcript filenames are UUIDs, so
-        collisions mean identical sessions — first writer wins and the
-        duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        Directories merge file-by-file. A name collision does *not* mean the
+        same session: a transcript that straddled an un-share event exists in
+        both trees under one UUID with different content, so the loser is
+        quarantined rather than dropped (see ``_profile_copy_wins``).
+        ``history.jsonl`` merges by appending lines not already present.
+        ``dest`` is removed once empty; any failure raises OSError and leaves
+        remaining files in place for the next try. Returns
+        ``(moved, quarantined, run_dir)``.
         """
+        run_dir: Path | None = None
+        moved = 0
+        quarantined = 0
+
+        def quarantine_root() -> Path:
+            nonlocal run_dir
+            if run_dir is None:
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+                run_dir = self.switcher.backup_dir / QUARANTINE_DIRNAME / stamp
+                _mkdir_private(run_dir)
+            return run_dir
+
         if dest.is_dir():
             _mkdir_private(src)
             for path in sorted(dest.rglob("*"), reverse=True):
@@ -1124,10 +1162,21 @@ class SessionManager:
                     path.rmdir()  # children already moved (reverse walk)
                     continue
                 if target.exists():
-                    path.unlink()
+                    if _profile_copy_wins(target, path):
+                        # Park the incumbent first: a crash between the two
+                        # leaves the shared path empty, and the next run moves
+                        # the profile copy in cleanly.
+                        self._quarantine(target, rel, quarantine_root())
+                        _mkdir_private(target.parent)
+                        shutil.move(str(path), str(target))
+                        moved += 1
+                    else:
+                        self._quarantine(path, rel, quarantine_root())
+                    quarantined += 1
                     continue
                 _mkdir_private(target.parent)
                 shutil.move(str(path), str(target))
+                moved += 1
             dest.rmdir()
         else:
             existing: set[str] = set()
@@ -1145,6 +1194,7 @@ class SessionManager:
                 with src.open("a", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
             dest.unlink()
+        return moved, quarantined, run_dir
 
     @staticmethod
     def _read_manifest(manifest_path: Path) -> list[str]:
