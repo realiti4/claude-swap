@@ -729,10 +729,15 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
+        if self.switcher.account_kind_for(current) == "api_key":
+            # Unconditional: ``includeApiKeyAccounts`` decides whether an API-key
+            # slot is an eligible *target*, not whether the active one has a quota
+            # — it never does. Gating this exemption on the setting meant the
+            # users who opted API-key slots into rotation were the only ones who
+            # reached the usage path with them, where "usage unknown" counts as
+            # unhealthy: three ticks later the engine failed over off a perfectly
+            # working key, found every OAuth account at its limit, declared all
+            # accounts exhausted and slept for hours.
             self._emit(
                 NoSwitchEvent(
                     reason="active-api-key",

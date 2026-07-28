@@ -1088,6 +1088,45 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    def test_active_api_key_idles_engine_when_included_in_rotation(self, temp_home):
+        """includeApiKeyAccounts picks targets; it must not start watching quota.
+
+        An API key reports no usage, so counting that as "unhealthy" burned the
+        failover ticks and dropped the engine off a working key.
+        """
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "active-api-key"
+        ]
+
+    def test_active_api_key_never_fails_over_when_oauth_is_exhausted(self, temp_home):
+        """The exact regression: every OAuth account at its limit, key still fine.
+
+        Three unhealthy ticks used to trigger failover, find nothing with room,
+        and put the engine to sleep for hours instead of just staying on the key.
+        """
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+
+        outcomes = [
+            h.tick_with_usage({"1": "api key", "2": _usage(100)}) for _ in range(4)
+        ]
+
+        assert outcomes == [TickOutcome.NO_ACTION] * 4
+        assert h.active_number() == 1
+        assert {e.reason for e in h.events if isinstance(e, NoSwitchEvent)} == {
+            "active-api-key"
+        }
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
