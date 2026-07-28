@@ -25,10 +25,19 @@ A manifest records what cswap created so removal never touches user data.
 History sharing (``--share-history``, opt-in): additionally links
 ``projects/`` (conversation transcripts — what ``claude --resume`` lists) and
 ``history.jsonl`` (prompt history) from ``~/.claude``, so all accounts see one
-unified conversation history. POSIX-only: Windows shares by re-synced copy,
-which would fork history rather than share it. If the profile already
-accumulated its own history, it is merged into ``~/.claude`` first so nothing
-disappears from ``--resume``.
+unified conversation history. On POSIX these are symlinks; on Windows — where
+a re-synced copy would *fork* history on first write — ``projects/`` is shared
+with a directory junction (no privilege required) and ``history.jsonl`` with a
+file symlink (needs Developer Mode/admin; if that is unavailable it is skipped
+with a warning while ``projects/`` still shares). Before the first Windows link
+a one-time safety copy of the real history is taken under the backup dir. If
+the profile already accumulated its own history, it is merged into ``~/.claude``
+first so nothing disappears from ``--resume``.
+
+Junctions are reparse points that ``os.path.islink`` does not report, so every
+place that must distinguish a cswap-created link from real user data uses
+:func:`_is_reparse_link`, and profile/backup deletion uses :func:`safe_rmtree`
+to avoid ever recursing through a junction into the shared ``~/.claude``.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -40,10 +49,12 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -78,8 +89,10 @@ SHARED_ITEMS = (
     "agents",
 )
 
-# Conversation-history items linked additionally under --share-history.
-# POSIX symlinks only: Windows copy-mode would fork history, not share it.
+# Conversation-history items shared additionally under --share-history.
+# Always linked, never copied, so history is genuinely shared rather than
+# forked: POSIX symlinks, or on Windows a junction (projects/) + a file
+# symlink (history.jsonl). See _desired_link_kind.
 HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
@@ -106,6 +119,119 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+# One-time safety snapshot of the real ~/.claude history, taken under the
+# backup dir before the first Windows share link, plus the marker recording it
+# so the (potentially large) copy is never repeated.
+HISTORY_BACKUP_DIRNAME = "history-backups"
+HISTORY_BACKUP_MARKER = ".cswap-history-backup.json"
+
+# Reparse tags meaning "this path redirects elsewhere": a Windows symlink or a
+# junction (mount point). Empty off Windows. os.path.islink() reports symlinks
+# but NOT junctions, so any junction-aware check must consult the reparse tag.
+_REPARSE_TAGS = frozenset(
+    tag
+    for tag in (
+        getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
+        getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
+    )
+    if tag is not None
+)
+
+
+def _fs_timestamp() -> str:
+    """UTC timestamp safe for filenames (no ``:`` — illegal on Windows)."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _is_reparse_link(path: Path) -> bool:
+    """True for a POSIX/Windows symlink OR a Windows junction.
+
+    The sharing code must tell a cswap-created link from real user data
+    everywhere it might delete or merge. ``Path.is_symlink()`` alone misses
+    junctions (reparse points, not symlinks), which would let ``rmtree`` or the
+    history merge traverse into the shared ``~/.claude`` target.
+    """
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        # Don't conclude "not a link" yet: fall through to the reparse-tag
+        # probe. safe_rmtree's no-recurse-through-junction guarantee rests on
+        # this never yielding a false negative for a junction.
+        pass
+    if not _REPARSE_TAGS:
+        return False  # non-Windows: a symlink is the only kind of link
+    try:
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+    except OSError:
+        return False
+    return tag in _REPARSE_TAGS
+
+
+def _remove_link(path: Path) -> None:
+    """Remove a symlink or junction without following it. Best-effort.
+
+    ``os.unlink`` handles POSIX symlinks and Windows file symlinks; a Windows
+    junction is a directory reparse point that only ``os.rmdir`` removes. Try
+    unlink first, fall back to rmdir — neither touches the link's target.
+    """
+    try:
+        os.unlink(path)
+        return
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def _create_junction(src: Path, dest: Path) -> None:
+    """Create a Windows directory junction at *dest* pointing to *src*.
+
+    Junctions need no privilege (unlike symlinks) and work on NTFS, so they
+    back projects/ sharing. Isolated here so tests can stub it on any host; the
+    ``_winapi`` import is Windows-only and deliberately lazy.
+    """
+    import _winapi
+
+    _winapi.CreateJunction(str(src), str(dest))
+
+
+def safe_rmtree(path: Path) -> None:
+    """Recursively delete *path*, never traversing a reparse point.
+
+    On some Windows/Python versions ``shutil.rmtree`` recurses *through* a
+    junction (they are not symlinks) and deletes the real ``~/.claude`` history
+    a profile's ``projects/`` junction points at; on others it errors on the
+    junction instead, leaving a partial tree. This removes any reparse point as
+    a link and only recurses into genuine directories, so it is both safe and
+    complete regardless of the platform's rmtree behavior. Best-effort.
+    """
+    if _is_reparse_link(path):
+        _remove_link(path)
+        return
+    if not path.is_dir():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        for child in path.iterdir():
+            if _is_reparse_link(child):
+                _remove_link(child)
+            elif child.is_dir():
+                safe_rmtree(child)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+        path.rmdir()
+    except OSError:
+        pass
 
 
 def mark_session_stale(session_dir: Path) -> None:
@@ -331,12 +457,6 @@ class SessionManager:
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
-            )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -574,7 +694,10 @@ class SessionManager:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone.
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        # safe_rmtree, never shutil.rmtree: a share step may already have laid
+        # down a projects/ junction, and a plain rmtree would recurse through
+        # it and delete the real ~/.claude history.
+        safe_rmtree(session_dir)
 
     # -- validation ------------------------------------------------------
 
@@ -645,43 +768,58 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
-        if self.switcher.platform == Platform.WINDOWS:
+
+        source_root = Path.home() / ".claude"
+
+        # History sharing works on every platform now: POSIX via symlinks,
+        # Windows via a junction (projects/) + file symlink (history.jsonl).
+        # Before the first Windows link, take a one-time safety snapshot of
+        # the real history; if that can't be made, decline history sharing for
+        # this launch rather than risk it.
+        if share_history and not self._ensure_history_backup(source_root):
             share_history = False
+
         active_items = (SHARED_ITEMS if share else ()) + (
             HISTORY_ITEMS if share_history else ()
         )
-        source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
 
-        # A flag turned off since last launch: remove the links we created
-        # for it (never plain files/dirs the user accumulated themselves).
-        # For history items that holds even when the manifest claims them:
-        # a stale manifest (lock-free launches race) must never be able to
-        # delete real conversation history — only ever unlink symlinks.
+        # A flag turned off since last launch: remove the links/copies we
+        # created for it (never plain files/dirs the user accumulated). For
+        # history items that holds even when the manifest claims them: a stale
+        # manifest (lock-free launches race) must never delete real history —
+        # only ever remove a link we own (symlink OR junction).
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if (
+                    name in HISTORY_ITEMS
+                    and dest.exists()
+                    and not _is_reparse_link(dest)
+                ):
                     continue
                 self._remove_managed(dest)
         if not active_items:
             manifest_path.unlink(missing_ok=True)
             return
 
-        use_symlinks = self.switcher.platform != Platform.WINDOWS
         new_managed: list[str] = []
 
         for name in active_items:
             src = source_root / name
             dest = session_dir / name
 
-            if name in HISTORY_ITEMS and not self._prepare_history_share(
-                src, dest, session_dir
-            ):
-                continue
+            if name in HISTORY_ITEMS:
+                # Gate the destructive merge behind link feasibility: never move
+                # the profile's own history into ~/.claude if the link that
+                # would replace it can't be created (default Windows: no file-
+                # symlink privilege). Otherwise the account loses sight of its
+                # own history to a global file it isn't linked to.
+                if not self._history_link_feasible(name, src, dest, session_dir):
+                    continue
+                if not self._prepare_history_share(src, dest, session_dir):
+                    continue
 
             if not src.exists():
                 # Source vanished (or never existed): prune our own entry.
@@ -689,21 +827,10 @@ class SessionManager:
                     self._remove_managed(dest)
                 continue
 
-            if dest.is_symlink():
-                if name not in managed:
-                    managed = [*managed, name]  # adopt: only cswap links here
-                if use_symlinks:
-                    try:
-                        if dest.readlink() != src:
-                            dest.unlink()
-                            dest.symlink_to(src)
-                    except OSError:
-                        continue
-                    new_managed.append(name)
-                    continue
-                # Platform moved POSIX → Windows: replace link with a copy.
-                dest.unlink()
-            elif dest.exists() and name not in managed:
+            existing_link = _is_reparse_link(dest)
+            if existing_link and name not in managed:
+                managed = [*managed, name]  # adopt: only cswap links here
+            elif not existing_link and dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
                 print(
                     dimmed(
@@ -714,19 +841,25 @@ class SessionManager:
                 continue
 
             try:
-                if use_symlinks:
-                    if dest.exists():
-                        self._remove_managed(dest)
-                    dest.symlink_to(src)
-                else:
-                    if dest.exists():
-                        self._remove_managed(dest)
-                    if src.is_dir():
-                        shutil.copytree(src, dest)
-                    else:
-                        shutil.copy2(src, dest)
+                self._materialize_share(name, src, dest)
             except OSError as e:
-                self._logger.warning(f"Failed to share {name} into session: {e}")
+                if name == "history.jsonl" and (
+                    self.switcher.platform == Platform.WINDOWS
+                ):
+                    # Backstop: _history_link_feasible already gated the common
+                    # no-privilege case, so reaching here means the link failed
+                    # after the probe said it would succeed (a race). projects/
+                    # still shares; never fail the launch over history.jsonl.
+                    warning(
+                        "Not sharing history.jsonl: the file symlink could not "
+                        "be created (see log). Your conversations (projects/) "
+                        "are still shared; your prompt history is preserved in "
+                        "~/.claude/history.jsonl and the safety backup."
+                    )
+                else:
+                    self._logger.warning(
+                        f"Failed to share {name} into session: {e}"
+                    )
                 continue
             new_managed.append(name)
 
@@ -734,6 +867,178 @@ class SessionManager:
         # write the manifest atomically so a concurrent reader never sees a
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
+
+    def _desired_link_kind(self, name: str) -> str:
+        """How a shared item is materialized on this platform.
+
+        POSIX shares everything by symlink. Windows re-syncs customizations as
+        copies (safe — the default profile is the source of truth) but *links*
+        history so it is genuinely shared: a directory junction for
+        ``projects/`` (no privilege) and a file symlink for ``history.jsonl``.
+        """
+        if self.switcher.platform != Platform.WINDOWS:
+            return "symlink"
+        if name in HISTORY_ITEMS:
+            return "junction" if name == "projects" else "file_symlink"
+        return "copy"
+
+    def _materialize_share(self, name: str, src: Path, dest: Path) -> None:
+        """Create/refresh ``dest`` as the platform-appropriate share of ``src``.
+
+        Idempotent: an already-correct link is left in place; a copy is
+        re-synced; a link pointing elsewhere (or a leftover from a
+        cross-platform profile move) is replaced. Raises ``OSError`` on a
+        failed filesystem operation for the caller to handle.
+        """
+        kind = self._desired_link_kind(name)
+        if kind == "copy":
+            if dest.exists() or _is_reparse_link(dest):
+                self._remove_managed(dest)
+            if src.is_dir():
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            return
+        # Link kinds: symlink | junction | file_symlink.
+        if _is_reparse_link(dest):
+            if self._link_points_to(dest, src, kind):
+                return  # already correct — no-op
+            self._remove_managed(dest)
+        elif dest.exists():
+            # A managed copy left by a Windows→POSIX profile move; replace it.
+            self._remove_managed(dest)
+        self._create_link(src, dest, kind)
+
+    @staticmethod
+    def _link_points_to(dest: Path, src: Path, kind: str) -> bool:
+        """Whether the existing link at ``dest`` already targets ``src``."""
+        if kind == "symlink":
+            try:
+                return dest.readlink() == src
+            except OSError:
+                return False
+        # Junctions/file symlinks: a junction's readlink can carry a \\?\
+        # prefix, so compare resolved targets rather than string-matching.
+        try:
+            return dest.resolve() == src.resolve()
+        except OSError:
+            return False
+
+    def _create_link(self, src: Path, dest: Path, kind: str) -> None:
+        """Create the requested link kind at ``dest`` → ``src``."""
+        if kind == "junction":
+            _create_junction(src, dest)
+        else:  # symlink | file_symlink
+            dest.symlink_to(src)
+
+    def _history_link_feasible(
+        self, name: str, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Whether it is safe to run the destructive history merge for ``name``.
+
+        Only ``history.jsonl`` on Windows can be blocked: its share is a file
+        symlink, which needs Developer Mode/admin. If we can neither create one
+        nor already have one, return False so the caller skips the item BEFORE
+        merging — the account keeps its own prompt history rather than losing
+        sight of it. ``projects/`` (a junction, no privilege) and every POSIX
+        case are always feasible.
+        """
+        if name != "history.jsonl" or self.switcher.platform != Platform.WINDOWS:
+            return True
+        # An existing symlink keeps working without privilege (privilege is
+        # only needed to *create* one), so a re-sync of an already-shared
+        # profile stays feasible.
+        if _is_reparse_link(dest) and self._link_points_to(
+            dest, src, "file_symlink"
+        ):
+            return True
+        if self._can_create_file_symlink(session_dir):
+            return True
+        warning(
+            "Not sharing history.jsonl: creating a file symlink needs Windows "
+            "Developer Mode or admin. Your conversations (projects/) are still "
+            "shared; this account keeps its own prompt history."
+        )
+        return False
+
+    def _can_create_file_symlink(self, session_dir: Path) -> bool:
+        """Probe whether this process may create a file symlink in the profile.
+
+        Always True off Windows. On Windows, creating a throwaway symlink is the
+        only reliable check for the Developer-Mode/admin privilege; it is cheap
+        and the probe is cleaned up either way.
+        """
+        if self.switcher.platform != Platform.WINDOWS:
+            return True
+        probe = session_dir / ".cswap-symlink-probe"
+        try:
+            if _is_reparse_link(probe) or probe.exists():
+                _remove_link(probe)
+            probe.symlink_to("cswap-probe-target")  # dangling target is fine
+            _remove_link(probe)
+            return True
+        except OSError:
+            _remove_link(probe)  # best-effort cleanup of a partial probe
+            return False
+
+    def _ensure_history_backup(self, source_root: Path) -> bool:
+        """One-time safety snapshot of real history before the first share.
+
+        Returns True when it is safe to proceed with history sharing (backup
+        done, already taken, or not needed), False when a backup was required
+        but failed — the caller then declines history sharing for this launch.
+
+        POSIX linking is non-destructive and matches long-standing behavior, so
+        the gate only binds on Windows, where junctions introduce the delete/
+        merge footguns the snapshot protects against. The marker makes it a
+        one-time cost.
+        """
+        if self.switcher.platform != Platform.WINDOWS:
+            return True
+        marker = self.switcher.backup_dir / HISTORY_BACKUP_MARKER
+        if marker.exists():
+            return True
+        try:
+            stamp = _fs_timestamp()
+            dest_root = (
+                self.switcher.backup_dir / HISTORY_BACKUP_DIRNAME / stamp
+            )
+            backed_up: list[str] = []
+            for name in HISTORY_ITEMS:
+                source = source_root / name
+                if not source.exists() or _is_reparse_link(source):
+                    continue  # nothing real to protect
+                target = dest_root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
+                backed_up.append(name)
+            atomic_write_json(
+                marker,
+                {
+                    "schemaVersion": 1,
+                    "backedUpAt": stamp,
+                    "location": str(dest_root),
+                    "items": backed_up,
+                },
+            )
+            if backed_up:
+                print(
+                    dimmed(
+                        f"Backed up your Claude history to {dest_root} before "
+                        "enabling sharing."
+                    )
+                )
+            return True
+        except OSError as e:
+            self._logger.warning(f"History backup failed: {e}")
+            warning(
+                "Not sharing history: couldn't back up your existing history "
+                "first (see log)."
+            )
+            return False
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
@@ -938,8 +1243,10 @@ class SessionManager:
         even when the manifest claims the entry is managed: a stale manifest
         (lock-free launches race) must never let the generic loop delete it.
         """
-        if dest.exists() and not dest.is_symlink():
+        if dest.exists() and not _is_reparse_link(dest):
             # Real per-account history accumulated before the flag existed.
+            # (A junction/symlink is already-shared, not real data to merge —
+            # _is_reparse_link catches junctions that is_symlink would miss.)
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
             if live_sessions_for(session_dir):
@@ -1055,12 +1362,18 @@ class SessionManager:
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:
-        """Remove a cswap-created share entry (link or copy), never user data
-        beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
+        """Remove a cswap-created share entry (link, junction, or copy), never
+        the data a link points at — callers guarantee `dest` is manifest-listed
+        or a reparse link."""
         try:
-            if dest.is_symlink() or dest.is_file():
+            if _is_reparse_link(dest):
+                # Symlink or junction: drop the link itself, never its target.
+                _remove_link(dest)
+            elif dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():
+                # A real managed copy (Windows SHARED_ITEMS); no junctions live
+                # inside it, so a plain rmtree is safe here.
                 shutil.rmtree(dest, ignore_errors=True)
         except OSError:
             pass
