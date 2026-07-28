@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
+from claude_swap.api_key_helper import ApiKeyHelperChannel
 from claude_swap.exceptions import CredentialError, CredentialWriteError
 from claude_swap.models import Platform
 from claude_swap.paths import (
@@ -234,6 +235,16 @@ class CredentialStore:
         # pending re-probe (never failed, or forced to file mode deliberately).
         self._keychain_disabled_until: float = 0.0
         self._last_active_credentials_backend: str | None = None
+
+    @property
+    def _api_key_helper(self) -> ApiKeyHelperChannel:
+        """The ``apiKeyHelper`` channel that carries a key switch into live sessions.
+
+        Built per access, not cached: the channel is stateless, and its logger has
+        to come from the host *at call time* like every other host-sourced value
+        (see ``_StoreHost``).
+        """
+        return ApiKeyHelperChannel(self._host._logger)
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -511,6 +522,11 @@ class CredentialStore:
           Keychain "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``),
           then clear the OAuth credential (Keychain item + ``.credentials.json``).
 
+        Both branches also toggle the ``apiKeyHelper`` hook, which is what makes a
+        key switch visible to sessions that are *already running* — Claude Code
+        never re-reads ``primaryApiKey``, but it does re-run that helper. See
+        ``api_key_helper`` for why it has to be toggled rather than left installed.
+
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
@@ -576,6 +592,19 @@ class CredentialStore:
         except Exception as e:
             raise CredentialWriteError(f"Failed to write managed API key: {e}")
 
+        if wrote_to_keychain:
+            # Keychain users deliberately keep no plaintext key on disk, and this
+            # channel needs one to hand to the helper script — so they keep the
+            # restart-to-pick-up behaviour. Drop any helper left over from a spell
+            # in file mode, which would otherwise keep serving that older key.
+            self._api_key_helper.remove()
+        else:
+            # Hand the key to already-running sessions *before* the OAuth
+            # credential goes away, so a live session is never left holding
+            # neither axis (see ``api_key_helper``). Best-effort: a failure here
+            # only means those sessions need a restart.
+            self._api_key_helper.install(api_key)
+
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
         if self._host.platform == Platform.MACOS and not wrote_to_keychain:
@@ -597,7 +626,12 @@ class CredentialStore:
         ``customApiKeyResponses.approved`` untouched — ``removeApiKey`` doesn't clear
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
+
+        Also unregisters the ``apiKeyHelper`` hook. That is not housekeeping: an
+        installed helper outranks the OAuth credential the caller just wrote, so
+        leaving it would pin every running session to the key we are clearing.
         """
+        self._api_key_helper.remove()
         if self._host.platform == Platform.MACOS:
             try:
                 macos_keychain.delete_password(
