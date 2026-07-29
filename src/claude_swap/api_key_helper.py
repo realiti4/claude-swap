@@ -40,10 +40,22 @@ Two constraints shape the implementation:
   alone and logs why, rather than hijacking the hook. Those users keep the old
   restart-to-pick-up behaviour instead of silently losing their helper.
 
-Everything here is best-effort. The authoritative write is still
-``primaryApiKey`` (which is what a *newly started* session reads); this channel
-only decides whether sessions that are already running have to be restarted, so
-no failure in it may fail a switch.
+When this channel is live it is also the *only* place the key is stored: the
+``primaryApiKey`` write is dropped rather than kept as a belt-and-braces copy.
+That is deliberate, and it is what makes the switch *away* from an API-key
+account land too. ``primaryApiKey`` is memoized for the lifetime of a process
+and cleared only by that process's own ``/login`` / ``/logout``, so any session
+that starts while it is set is pinned to that key permanently — activating an
+OAuth account later removes the value from the file but cannot touch the memo,
+and a managed key outranks the claude.ai credential. Sessions started during a
+spell on an API-key account would otherwise keep billing it while ``cswap
+status`` reported the subscription account. A newly started session reads the
+helper just as readily, so nothing is lost by making it the sole home.
+
+Everything here is still best-effort: when the channel is unavailable (Windows,
+a foreign helper, an I/O failure) the caller falls back to writing
+``primaryApiKey`` and those sessions keep the old restart-to-pick-up behaviour.
+No failure in it may fail a switch.
 """
 
 from __future__ import annotations
@@ -152,6 +164,29 @@ class ApiKeyHelperChannel:
                 self.key_path.unlink()
         except OSError as e:
             self._logger.warning(f"Could not remove the active-API-key file: {e}")
+
+    def active_key(self) -> str:
+        """The key this channel is currently serving, or "" when it isn't.
+
+        A read source, not a probe: when the helper holds the key it is the only
+        copy on disk, so ``_read_managed_key`` has to be able to find it here or
+        cswap would report an active API-key account as having no credential.
+
+        Ownership is checked against ``settings.json`` rather than the key file's
+        mere existence: ``remove()`` unregisters the hook before unlinking the
+        file, and a foreign helper's registration means the key file left behind
+        by an older cswap is not what Claude Code is reading.
+        """
+        try:
+            registered = self._read_settings(self.settings_path).get(SETTINGS_KEY)
+        except ValueError:
+            return ""
+        if registered != str(self.script_path):
+            return ""
+        try:
+            return self.key_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     def supported(self) -> bool:
         """Whether this channel can run here.

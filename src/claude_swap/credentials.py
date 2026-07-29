@@ -403,7 +403,11 @@ class CredentialStore:
 
         macOS Keychain "Claude Code" (when usable) first, then ``~/.claude.json``
         ``primaryApiKey`` — mirroring Claude Code's
-        ``getApiKeyFromConfigOrMacOSKeychain``.
+        ``getApiKeyFromConfigOrMacOSKeychain`` — and finally the ``apiKeyHelper``
+        key file, which is where the key actually lives whenever that channel is
+        live (see ``api_key_helper``). Without that last source an active
+        API-key account would read as an empty slot, since it is deliberately
+        the *only* copy on disk.
         """
         if self._use_keychain():
             try:
@@ -422,7 +426,7 @@ class CredentialStore:
             key = cfg.get("primaryApiKey")
             if isinstance(key, str) and key:
                 return key
-        return ""
+        return self._api_key_helper.active_key()
 
     def _read_global_config(self) -> dict | None:
         """Read and parse ``~/.claude.json``, or None when absent/unreadable."""
@@ -519,8 +523,10 @@ class CredentialStore:
           then clear any managed key (Keychain "Claude Code" + ``primaryApiKey``;
           ``approved`` left intact, as ``removeApiKey`` does).
         - **API key** → record ``key[-20:]`` in ``approved`` and store the key (macOS
-          Keychain "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``),
-          then clear the OAuth credential (Keychain item + ``.credentials.json``).
+          Keychain "Claude Code" when usable, else the ``apiKeyHelper`` key file,
+          falling back to ``~/.claude.json`` ``primaryApiKey`` only when neither
+          channel is available), then clear the OAuth credential (Keychain item +
+          ``.credentials.json``).
 
         Both branches also toggle the ``apiKeyHelper`` hook, which is what makes a
         key switch visible to sessions that are *already running* — Claude Code
@@ -542,8 +548,11 @@ class CredentialStore:
         Always records ``key[-20:]`` in ``customApiKeyResponses.approved`` (Claude
         Code does this on every platform, even on Keychain success — otherwise it
         re-prompts to approve the key). Stores the key in the macOS Keychain when
-        usable, else ``~/.claude.json`` ``primaryApiKey`` (matching ``saveApiKey``'s
-        keychain-then-config fallback). Finally clears the OAuth credential.
+        usable, else in the ``apiKeyHelper`` key file, falling back to
+        ``~/.claude.json`` ``primaryApiKey`` (``saveApiKey``'s own
+        keychain-then-config behaviour) only when neither channel is available —
+        see ``api_key_helper`` for why a stored ``primaryApiKey`` pins every
+        session started alongside it. Finally clears the OAuth credential.
 
         Raises:
             CredentialWriteError: If persisting the key fails.
@@ -567,6 +576,20 @@ class CredentialStore:
 
         approved = approved_form(api_key)
 
+        # Hand the key to already-running sessions *first*, before the OAuth
+        # credential goes away, so a live session is never left holding neither
+        # axis (see ``api_key_helper``). Best-effort: a False only means those
+        # sessions need a restart, and it decides the storage below.
+        if wrote_to_keychain:
+            # Keychain users deliberately keep no plaintext key on disk, and this
+            # channel needs one to hand to the helper script — so they keep the
+            # restart-to-pick-up behaviour. Drop any helper left over from a spell
+            # in file mode, which would otherwise keep serving that older key.
+            self._api_key_helper.remove()
+            helper_live = False
+        else:
+            helper_live = self._api_key_helper.install(api_key)
+
         def _mutate(cfg: dict) -> None:
             responses = cfg.get("customApiKeyResponses")
             if not isinstance(responses, dict):
@@ -579,10 +602,28 @@ class CredentialStore:
             responses["approved"] = approved_list
             responses.setdefault("rejected", [])
             cfg["customApiKeyResponses"] = responses
-            if wrote_to_keychain:
-                # Keychain holds the key; keep it out of plaintext config.
+            if wrote_to_keychain or helper_live:
+                # The Keychain or the helper holds the key; keep it out of
+                # plaintext config. Not just hygiene — this is what makes the
+                # *next* switch reach running sessions. ``primaryApiKey`` is
+                # read from an in-memory snapshot of ``~/.claude.json`` and the
+                # resolved key is memoized for the lifetime of the process,
+                # cleared only by that process's own /login or /logout. Every
+                # session that starts while it is set is therefore pinned to
+                # this key permanently: activating an OAuth account later
+                # removes the value from the file but cannot touch the memo,
+                # and a managed key outranks the claude.ai credential, so those
+                # sessions keep billing the metered key while ``cswap status``
+                # reports the subscription account. The helper has no such memo
+                # — Claude Code re-runs it on a TTL and it dies with the hook —
+                # and a newly started session reads it just as readily, so it
+                # is the better home for the key on both axes.
                 cfg.pop("primaryApiKey", None)
             else:
+                # No live channel (Windows, a foreign helper, an I/O failure):
+                # fall back to the field a newly started session reads and
+                # accept that running ones need a restart — and that the pin
+                # above applies to them until they do.
                 cfg["primaryApiKey"] = api_key
 
         try:
@@ -591,19 +632,6 @@ class CredentialStore:
             raise
         except Exception as e:
             raise CredentialWriteError(f"Failed to write managed API key: {e}")
-
-        if wrote_to_keychain:
-            # Keychain users deliberately keep no plaintext key on disk, and this
-            # channel needs one to hand to the helper script — so they keep the
-            # restart-to-pick-up behaviour. Drop any helper left over from a spell
-            # in file mode, which would otherwise keep serving that older key.
-            self._api_key_helper.remove()
-        else:
-            # Hand the key to already-running sessions *before* the OAuth
-            # credential goes away, so a live session is never left holding
-            # neither axis (see ``api_key_helper``). Best-effort: a failure here
-            # only means those sessions need a restart.
-            self._api_key_helper.install(api_key)
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()

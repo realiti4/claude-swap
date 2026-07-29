@@ -9,12 +9,14 @@ display, the ``cswap run`` session guard, and export/import of raw keys.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import session as session_mod
+from claude_swap.api_key_helper import ApiKeyHelperChannel
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -54,6 +56,12 @@ def _macos_switcher() -> ClaudeAccountSwitcher:
 
 def _read_global_config() -> dict:
     return json.loads(get_global_config_path().read_text(encoding="utf-8"))
+
+
+def _helper() -> ApiKeyHelperChannel:
+    """A fresh channel: it resolves every path at call time, so it reads
+    whatever the switcher under test just wrote under the patched HOME."""
+    return ApiKeyHelperChannel(logging.getLogger("test"))
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +154,52 @@ class TestWriteCredentialsLinux:
         cred_file.parent.mkdir(parents=True, exist_ok=True)
         cred_file.write_text(OAUTH_JSON, encoding="utf-8")
 
-        # Activate the API key: primaryApiKey + approved set, OAuth file cleared.
+        # Activate the API key: the helper holds it, approved is recorded, the
+        # OAuth file is cleared — and primaryApiKey is deliberately NOT written,
+        # because a session that starts alongside one memoizes it for its whole
+        # lifetime and can never be switched off it again.
         s._write_credentials(API_KEY)
         cfg = _read_global_config()
-        assert cfg["primaryApiKey"] == API_KEY
+        assert "primaryApiKey" not in cfg
+        assert _helper().active_key() == API_KEY
         assert API_KEY[-20:] in cfg["customApiKeyResponses"]["approved"]
         assert not cred_file.exists()
+        # cswap must still be able to read back the credential it just activated.
+        assert s._read_credentials() == API_KEY
 
-        # Switch back to OAuth: file restored, primaryApiKey dropped, approved kept.
+        # Switch back to OAuth: file restored, helper unregistered, approved kept.
         s._write_credentials(OAUTH_JSON)
         assert cred_file.read_text(encoding="utf-8") == OAUTH_JSON
         cfg = _read_global_config()
         assert "primaryApiKey" not in cfg
+        assert _helper().active_key() == ""
         assert API_KEY[-20:] in cfg["customApiKeyResponses"]["approved"]
+
+    def test_activate_key_falls_back_to_config_without_the_helper(
+        self, temp_home: Path
+    ):
+        """A foreign apiKeyHelper is left alone, so the key needs its old home.
+
+        Those users keep the restart-to-pick-up behaviour rather than silently
+        losing their own helper — and must still get a working switch.
+        """
+        s = _linux_switcher()
+        settings = _helper().settings_path
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            json.dumps({"apiKeyHelper": "/opt/mine/print-key.sh"}), encoding="utf-8"
+        )
+
+        s._write_credentials(API_KEY)
+
+        cfg = _read_global_config()
+        assert cfg["primaryApiKey"] == API_KEY
+        assert s._read_credentials() == API_KEY
+        # Their helper is untouched, and ours never claimed the key.
+        assert json.loads(settings.read_text(encoding="utf-8"))["apiKeyHelper"] == (
+            "/opt/mine/print-key.sh"
+        )
+        assert _helper().active_key() == ""
 
     def test_read_credentials_returns_active_key(self, temp_home: Path):
         s = _linux_switcher()
