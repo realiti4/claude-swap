@@ -75,6 +75,7 @@ from claude_swap.paths import (
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
 )
+from claude_swap import pinned_sessions
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
@@ -3356,6 +3357,16 @@ class ClaudeAccountSwitcher:
                     if counts["ide"]:
                         parts.append("IDE")
                     print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+
+            # A switch cannot reach a session that memoized a managed API key,
+            # so the only honest thing to do is name them. Silence here reads as
+            # "everything is on the active account" when it is not.
+            lines = pinned_sessions.warning_lines(pinned_sessions.find_pinned(sessions))
+            if lines:
+                print()
+                warning(lines[0])
+                for line in lines[1:]:
+                    print(muted(line))
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 

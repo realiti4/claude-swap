@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
+from claude_swap import pinned_sessions
 from claude_swap.api_key_helper import ApiKeyHelperChannel
 from claude_swap.exceptions import CredentialError, CredentialWriteError
 from claude_swap.models import Platform
@@ -623,8 +624,11 @@ class CredentialStore:
                 # No live channel (Windows, a foreign helper, an I/O failure):
                 # fall back to the field a newly started session reads and
                 # accept that running ones need a restart — and that the pin
-                # above applies to them until they do.
+                # above applies to them until they do. Recorded so `cswap
+                # status` can name the sessions it pins instead of leaking
+                # silently; see ``pinned_sessions``.
                 cfg["primaryApiKey"] = api_key
+                pinned_sessions.open_spell(self._host.current_account_number() or "?")
 
         try:
             self._update_global_config(_mutate)
@@ -677,6 +681,10 @@ class CredentialStore:
                 self._update_global_config(_drop)
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
+            else:
+                # Every session started while it was readable is now pinned to a
+                # key that is no longer the active account.
+                pinned_sessions.close_spell()
 
     def _clear_oauth_credential(self) -> None:
         """Clear the active OAuth credential — Keychain item and plaintext file.
