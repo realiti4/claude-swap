@@ -1076,23 +1076,30 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_active_api_key_idles_engine(self, temp_home):
+    def test_active_api_key_returns_to_subscription_with_room(self, temp_home):
+        """An API-key slot is last resort, so it is given back as soon as it can.
+
+        Nothing else can make this move: the key has no utilization of its own
+        to cross the threshold, so the normal proactive path never fires and the
+        engine used to bill metered requests until a human switched by hand.
+        """
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
         h.seed(2, "b@example.com")
         h.make_live("key@token.local", 1)
         self._mark_api_key(h, 1)
         outcome = h.tick_with_usage({"1": "api key", "2": _usage(10)})
-        assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
-            "active-api-key"
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == [
+            "api-key-return"
         ]
 
-    def test_active_api_key_idles_engine_when_included_in_rotation(self, temp_home):
-        """includeApiKeyAccounts picks targets; it must not start watching quota.
+    def test_active_api_key_returns_when_included_in_rotation(self, temp_home):
+        """The return does not depend on includeApiKeyAccounts either.
 
-        An API key reports no usage, so counting that as "unhealthy" burned the
-        failover ticks and dropped the engine off a working key.
+        That setting picks whether a key is an eligible *target*; leaving it is
+        unconditional, exactly as the quota exemption around it is.
         """
         h = EngineHarness(temp_home, include_api_key_accounts=True)
         h.seed(1, "key@token.local")
@@ -1100,10 +1107,73 @@ class TestApiKeyAccounts:
         h.make_live("key@token.local", 1)
         self._mark_api_key(h, 1)
         outcome = h.tick_with_usage({"1": "api key", "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_active_api_key_idles_when_no_subscription_has_room(self, temp_home):
+        """Recovered-but-still-hot does not count: 85% fails the 80% ceiling.
+
+        Returning to an account that is already past threshold-minus-hysteresis
+        would cross the threshold on its first requests and bounce straight back
+        onto the key.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(85)})
         assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
             "active-api-key"
         ]
+
+    def test_active_api_key_never_returns_to_another_api_key(self, temp_home):
+        """Swapping one metered key for another is not the improvement here.
+
+        Account 2 is handed a readable low utilization on purpose. A key
+        normally reports none, so the headroom filter would reject it and hide
+        whether the kind is checked at all — but a stale or hand-edited store
+        entry can supply one, and that must not be enough to land on it.
+        """
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "other-key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({
+            "1": "api key", "2": _usage(5), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_active_api_key_return_respects_cooldown(self, temp_home):
+        """The move onto the key sets the cooldown; the return honours it.
+
+        Without this an account that recovers a second after the switch onto the
+        key would ping-pong the pair at tick cadence.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "cooldown"
+        ]
+        # ...and takes it once the cooldown has elapsed.
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        assert h.tick_with_usage({"1": "api key", "2": _usage(10)}) is (
+            TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 2
 
     def test_active_api_key_never_fails_over_when_oauth_is_exhausted(self, temp_home):
         """The exact regression: every OAuth account at its limit, key still fine.
