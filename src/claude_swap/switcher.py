@@ -434,6 +434,9 @@ class ClaudeAccountSwitcher:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
+    def _clear_managed_key(self) -> None:
+        self._store._clear_managed_key()
+
     def _prepare_credentials_for_activation(
         self, target_credentials: str, live_credentials: str | None
     ) -> str:
@@ -1974,6 +1977,13 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Add current account to managed accounts.
 
+        The captured account also becomes the active one, so this reconciles the
+        auth axis the way a switch does: the live login is OAuth (an API-key login
+        is rejected above), so any managed key left behind by the previously active
+        account is cleared — most importantly the ``apiKeyHelper`` hook, which
+        outranks the OAuth credential and which Claude Code's own ``/login`` cannot
+        clean up because it does not know cswap installed it.
+
         Args:
             slot: Specify the slot number to store the account in.
                   When None, auto-assigns the next available number.
@@ -2018,6 +2028,16 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            # Capturing a login *activates* it, so the managed key of the account
+            # that was active until now has to be cleared exactly as a switch onto
+            # OAuth clears it. Claude Code's own ``/login`` drops ``primaryApiKey``
+            # but knows nothing about the ``apiKeyHelper`` hook cswap installed,
+            # and that hook outranks the OAuth credential: left in place it pins
+            # every session — the ones already running and every new one — to the
+            # old key, while cswap reports the captured account as active. Cleared
+            # before the config snapshot below so the previous account's key is not
+            # copied into this slot's backup either.
+            self._clear_managed_key()
 
             config_path = self._get_claude_config_path()
             try:
@@ -2127,6 +2147,9 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        # Activating the captured login clears the previous account's managed key,
+        # for the reason spelled out in the refresh-in-place branch above.
+        self._clear_managed_key()
 
         config_path = self._get_claude_config_path()
         try:

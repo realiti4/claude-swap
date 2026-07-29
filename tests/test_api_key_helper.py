@@ -25,7 +25,11 @@ import pytest
 
 from claude_swap.api_key_helper import SETTINGS_KEY, ApiKeyHelperChannel
 from claude_swap.models import Platform
-from claude_swap.paths import get_claude_config_home
+from claude_swap.paths import (
+    get_claude_config_home,
+    get_credentials_path,
+    get_global_config_path,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
@@ -301,3 +305,93 @@ def test_a_keychain_backed_key_keeps_no_plaintext_helper(temp_home, block_real_k
         else {}
     )
     assert SETTINGS_KEY not in settings
+
+
+# ---------------------------------------------------------------------------
+# Adopting a live login (``cswap add``)
+# ---------------------------------------------------------------------------
+
+
+def _login_as(email: str) -> None:
+    """Stand in for a Claude Code ``/login``: OAuth credential + identity on disk.
+
+    Mirrors what Claude Code itself leaves behind, including dropping
+    ``primaryApiKey`` (its ``removeApiKey``) — the point being that its login has
+    no way to clean up the ``apiKeyHelper`` hook, which is cswap's to own.
+    """
+    get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+    get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+    config_path = get_global_config_path()
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else {}
+    )
+    config.pop("primaryApiKey", None)
+    config["oauthAccount"] = {
+        "emailAddress": email,
+        "accountUuid": "uuid-" + email,
+        "organizationUuid": "",
+        "organizationName": "",
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_adding_a_live_login_unregisters_an_api_key_accounts_hook(temp_home, capsys):
+    """``add`` activates the captured account, so the old hook must not survive it.
+
+    Regression: the helper outranks the OAuth credential, so an ``add`` that left
+    it registered reported the new account as active while every session — the
+    ones already running *and* every new one — kept billing the previous
+    account's key.
+    """
+    switcher = _linux_switcher()
+    switcher._store._write_credentials(API_KEY)  # an API-key account is active
+    helper = ApiKeyHelperChannel(logging.getLogger("test"))
+    assert _settings(helper)[SETTINGS_KEY] == str(helper.script_path)
+
+    _login_as("new@example.com")
+    switcher.add_account()
+
+    assert SETTINGS_KEY not in _settings(helper)
+    assert not helper.key_path.exists()
+    seq = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+    assert seq["accounts"][str(seq["activeAccountNumber"])]["email"] == "new@example.com"
+
+
+def test_adding_a_live_login_clears_a_residual_managed_key(temp_home, capsys):
+    """Mutual exclusion holds however the key got left behind, not just via the hook."""
+    switcher = _linux_switcher()
+    switcher._store._write_credentials(API_KEY)
+
+    _login_as("new@example.com")
+    # A key Claude Code's own login did not clear (e.g. written by another tool).
+    config_path = get_global_config_path()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["primaryApiKey"] = API_KEY
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    switcher.add_account()
+
+    assert "primaryApiKey" not in json.loads(
+        config_path.read_text(encoding="utf-8")
+    )
+    # ...and it is not carried into the new slot's config backup either.
+    backup = next(switcher.configs_dir.glob(".claude-config-*-new@example.com.json"))
+    assert "primaryApiKey" not in json.loads(backup.read_text(encoding="utf-8"))
+
+
+def test_re_adding_the_active_account_also_unregisters_the_hook(temp_home, capsys):
+    """The refresh-in-place branch of ``add`` activates a slot the same way."""
+    switcher = _linux_switcher()
+    _login_as("existing@example.com")
+    switcher.add_account()
+    switcher._store._write_credentials(API_KEY)  # switch away to an API-key account
+    helper = ApiKeyHelperChannel(logging.getLogger("test"))
+    assert _settings(helper)[SETTINGS_KEY] == str(helper.script_path)
+
+    _login_as("existing@example.com")
+    switcher.add_account()  # re-add the same account: refreshes it in place
+
+    assert SETTINGS_KEY not in _settings(helper)
+    assert not helper.key_path.exists()

@@ -33,7 +33,8 @@ Two constraints shape the implementation:
   (it forces the API-key axis for the whole session), so leaving it in place
   would pin every session to the key and break the OAuth accounts. It is
   installed when an API-key account is activated and removed when an OAuth one
-  is.
+  is — including the activation ``add_account`` performs when it captures a live
+  ``/login`` as a new account, which Claude Code cannot clean up itself.
 - **A foreign ``apiKeyHelper`` is never touched.** If ``settings.json`` already
   points somewhere else, that is the user's own auth plumbing: cswap leaves it
   alone and logs why, rather than hijacking the hook. Those users keep the old
