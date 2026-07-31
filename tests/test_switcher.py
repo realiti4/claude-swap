@@ -786,10 +786,10 @@ class TestFetchAccountUsageSessionProfile:
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         mock_fetch.assert_not_called()
 
-    def test_expired_session_credentials_without_live_session_falls_back(
+    def test_expired_session_credentials_without_live_session_remain_owned(
         self, temp_home: Path
     ):
-        """No live session: the backup path (with refresh machinery) still runs."""
+        """An idle profile still owns its lineage; never test a stale backup."""
         switcher = ClaudeAccountSwitcher()
         backup = _oauth_creds("sk-backup", 7200)
         session = _oauth_creds("sk-session", -60)
@@ -797,15 +797,32 @@ class TestFetchAccountUsageSessionProfile:
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.session.read_session_credentials",
                    return_value=session), \
+             patch("claude_swap.session.read_session_identity",
+                   return_value=("test@example.com", "org-uuid")), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_expired_session_without_refresh_token_falls_back(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+        session = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-session", "expiresAt": 1,
+        }})
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.session.read_session_identity",
+                   return_value=("test@example.com", "org-uuid")), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as fetch:
             record = switcher._fetch_account_usage(self._info(backup))
 
         assert record.usage == {"five_hour": {"pct": 9}}
-        args, kwargs = mock_fetch.call_args
-        assert args[2] == backup
-        assert kwargs.get("is_active") is False
-        assert kwargs.get("persist_credentials") is not None
+        assert fetch.call_args.args[2] == backup
 
     def test_no_session_profile_uses_backup_path(self, temp_home: Path):
         """Accounts without a session profile behave exactly as before."""
@@ -3818,6 +3835,48 @@ class TestDeadTokenQuarantine:
 
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
         fetch.assert_not_called()  # quarantined: no endless 401/429 loop
+
+    def test_backup_dead_but_expired_session_owner_surfaces_token_expired(
+        self, temp_home
+    ):
+        from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = _oauth_creds("sk-session", -60)
+
+        with patch(
+            "claude_swap.session.read_session_credentials", return_value=session
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch.object(switcher, "_run_usage_fetches") as run:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_TOKEN_EXPIRED
+        run.assert_not_called()
+
+    def test_dead_backup_with_unreadable_session_identity_stays_relogin_required(
+        self, temp_home
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = _oauth_creds("sk-session", -60)
+
+        with patch(
+            "claude_swap.session.read_session_credentials", return_value=session
+        ), patch(
+            "claude_swap.session.read_session_identity", return_value=None
+        ):
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
     def test_relogin_surfaces_same_pass_on_invalid_grant(self, temp_home):
         # A fetch that returns invalid_grant crosses the dead threshold this pass;

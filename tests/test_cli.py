@@ -82,6 +82,7 @@ class TestCLI:
         assert "switch <num|email>" in result.stdout
         assert "list " in result.stdout
         assert "status " in result.stdout
+        assert "recover <num|email> --json" in result.stdout
         # The legacy `--flag` spellings still work but are hidden from the
         # options section; only the "keep working" note may mention them.
         options_section = result.stdout.split("Flags combine with subcommands:")[0]
@@ -773,6 +774,73 @@ class TestSubcommandAliases:
         assert "Multi-Account Switcher" in result.stdout
         assert "Commands:" in result.stdout
         assert "keep working" in result.stdout
+
+
+class TestRecoverCommand:
+    def test_dispatches_and_serializes_one_json_object(self, capsys):
+        payload = {
+            "schemaVersion": 1,
+            "operation": "recover",
+            "accountNumber": 2,
+            "recoveryStatus": "recovered",
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "recover", "2", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.recover.return_value = payload
+            cli.main()
+
+        switcher_cls.return_value.recover.assert_called_once_with("2")
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_json_flag_is_required(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "recover", "2"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--json" in capsys.readouterr().err
+
+    def test_malformed_json_invocation_still_emits_one_object(self, capsys):
+        with patch.object(
+            sys,
+            "argv",
+            ["claude-swap", "recover", "2", "--json", "--unknown"],
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "schemaVersion": 1,
+            "error": {
+                "type": "RecoveryError",
+                "message": "Recovery could not be started.",
+            },
+        }
+
+    def test_handled_failure_is_parseable_and_does_not_echo_pii(self, capsys):
+        from claude_swap.exceptions import ConfigError
+
+        private = "private-user@example.com"
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "recover", private, "--json"]
+             ), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.recover.side_effect = ConfigError(
+                f"owner {private} at /private/path failed"
+            )
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["error"]["type"] == "RecoveryError"
+        assert payload["error"]["message"] == "Recovery could not be started."
+        assert private not in out
+        assert "/private/path" not in out
 
 
 class TestJsonOutputCli:

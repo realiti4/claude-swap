@@ -461,6 +461,9 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
+    def _read_default_profile_credentials(self) -> ActiveCredentials:
+        return self._store._read_default_profile_credentials()
+
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
@@ -615,6 +618,13 @@ class ClaudeAccountSwitcher:
             os.chmod(config_file, 0o600)
 
     # -- public accessors for session mode (claude_swap.session) ---------
+
+    def recover(self, identifier: str) -> dict:
+        """Ask the credential-owning Claude profile to refresh an expired token."""
+        from claude_swap.recovery import recover_account
+
+        account_num, email, org_uuid = self.resolve_account(identifier)
+        return recover_account(self, account_num, email, org_uuid)
 
     def resolve_account(self, identifier: str) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
@@ -3315,6 +3325,7 @@ class ClaudeAccountSwitcher:
 
         from claude_swap.session import (
             read_session_credentials,
+            read_session_identity,
             session_identity_drifted,
         )
 
@@ -3355,16 +3366,19 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                     )
-                if has_live_session:
-                    # The live claude refreshes lazily on its next API call;
-                    # requesting now would just 401 (same rule as the owned
-                    # active account in _fetch_active_usage).
+                # A provably matching profile remains the credential owner
+                # while idle. Its expired access token needs Claude's native
+                # refresh; falling back to the backup can test a consumed
+                # generation and falsely quarantine the whole account. A live
+                # process already proves profile ownership; an idle profile
+                # must carry exact identity plus refresh material.
+                if session_oauth.get("refreshToken") and (
+                    has_live_session
+                    or read_session_identity(session_dir)
+                    == (email, org_uuid or "")
+                ):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                session_creds = None
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
@@ -3432,12 +3446,37 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
-        # drives the "re-login needed" display and (via ``num not in sentinels``
-        # below) stops the endless fetch loop that would otherwise 401/429 forever.
-        for num in info_by_num:
-            if num not in sentinels and entries[num].token_dead():
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+        # Dead refresh-token lineage: quarantine. A matching session profile
+        # supersedes the backup, though: an invalid_grant recorded from that
+        # consumed backup generation says nothing about the owner-held session
+        # lineage. Surface its expired owner credential for native recovery
+        # instead of falsely requiring a browser re-login.
+        from claude_swap.session import (
+            read_session_credentials,
+            read_session_identity,
+        )
+
+        for num, info in info_by_num.items():
+            if num in sentinels or not entries[num].token_dead():
+                continue
+            account_num, email, _, org_uuid, is_active, _, _ = info
+            if not is_active:
+                session_dir = self._session_dir(str(account_num), email)
+                session_creds = read_session_credentials(session_dir)
+                session_oauth = oauth.extract_oauth_data(session_creds or "")
+                if (
+                    session_oauth
+                    and session_oauth.get("accessToken")
+                    and session_oauth.get("refreshToken")
+                    and read_session_identity(session_dir)
+                    == (email, org_uuid or "")
+                    and oauth.is_oauth_token_expired(
+                        session_oauth.get("expiresAt")
+                    )
+                ):
+                    sentinels[num] = USAGE_TOKEN_EXPIRED
+                    continue
+            sentinels[num] = USAGE_RELOGIN_REQUIRED
         requested = [
             num
             for num in info_by_num
