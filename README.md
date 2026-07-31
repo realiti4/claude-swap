@@ -353,6 +353,16 @@ setup-token. It switches like any other account; since API keys have no subscrip
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
 
+Because those keys bill metered usage rather than draw on a plan, `cswap auto`
+treats them as a last resort in both directions. Opted in with
+`autoswitch.includeApiKeyAccounts`, a key is only ever chosen once no
+subscription account can take the traffic — and once the engine is on one it
+returns to the first subscription account whose utilization falls
+`hysteresisPct` below the threshold, without waiting for a quota it does not
+have to cross. Note the key itself is never watched for health while it is
+active: it reports no usage, and treating that as "unhealthy" would fail the
+engine off a perfectly working key.
+
 ## Uninstall
 
 Remove all data:

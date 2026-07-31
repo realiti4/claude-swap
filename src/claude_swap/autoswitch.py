@@ -796,17 +796,26 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
-            self._emit(
-                NoSwitchEvent(
-                    reason="active-api-key",
-                    detail="API-key accounts have no quota to watch",
-                )
+        if self.switcher.account_kind_for(current) == "api_key":
+            # Unconditional: ``includeApiKeyAccounts`` decides whether an API-key
+            # slot is an eligible *target*, not whether the active one has a quota
+            # — it never does. Gating this exemption on the setting meant the
+            # users who opted API-key slots into rotation were the only ones who
+            # reached the usage path with them, where "usage unknown" counts as
+            # unhealthy: three ticks later the engine failed over off a perfectly
+            # working key, found every OAuth account at its limit, declared all
+            # accounts exhausted and slept for hours.
+            #
+            # Exempt from the *quota* machinery is not parked, though: an API-key
+            # slot is the last resort the ranking already treats it as, and it
+            # bills metered money for as long as it stays active. Returning to a
+            # subscription account has to happen here or nowhere — the key has no
+            # utilization of its own to ever cross the threshold and trigger the
+            # normal path, so the old unconditional NO_ACTION sat on it until a
+            # human noticed.
+            return self._return_to_subscription(
+                current, quarantined, headroom, settings, state
             )
-            return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
         if active_headroom is not None:
@@ -1058,6 +1067,71 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
+        return self._freshen_and_switch(ordered, trigger, entries)
+
+    def _return_to_subscription(
+        self,
+        current: str,
+        quarantined: set[str],
+        headroom: dict[str, float | None],
+        settings: AutoSwitchSettings,
+        state: dict,
+    ) -> TickOutcome:
+        """Leave a last-resort API-key account once a subscription has room.
+
+        The mirror of the last-resort rule in candidate selection: an API-key
+        slot is only ever a target when no OAuth account can take the traffic,
+        so it must be given back the moment one can. Candidates are ranked by
+        headroom (best first) and must clear the threshold by ``hysteresis_pct``
+        — a barely-recovered account would otherwise cross the threshold on its
+        first requests and bounce straight back onto the metered key.
+
+        Only OAuth candidates qualify: moving from one metered key to another is
+        never the improvement this exists to make. Cooldown applies, as it does
+        to any other proactive move.
+        """
+        ceiling = settings.threshold - settings.hysteresis_pct
+        candidates = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num != current
+            and num not in quarantined
+            and self.switcher.account_kind_for(num) != "api_key"
+            and (h := headroom.get(num)) is not None
+            and (100.0 - h) < ceiling
+        ]
+        if not candidates:
+            self._emit(
+                NoSwitchEvent(
+                    reason="active-api-key",
+                    detail=(
+                        "API-key accounts have no quota to watch; no "
+                        "subscription account is under "
+                        f"{pct_label(ceiling)}% to return to yet"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+        if self._in_cooldown(state):
+            self._emit(NoSwitchEvent(reason="cooldown"))
+            return TickOutcome.NO_ACTION
+        candidates.sort(key=lambda n: headroom[n] or 0.0, reverse=True)
+        return self._freshen_and_switch(candidates, "api-key-return")
+
+    def _freshen_and_switch(
+        self,
+        ordered: list[str],
+        trigger: str,
+        entries: dict | None = None,
+    ) -> TickOutcome:
+        """Freshen each ranked target in turn and activate the first that holds.
+
+        Quarantines a target whose credential is dead or belongs to someone
+        else and slides to the next; a transient (network) failure across every
+        target is reported as such rather than as "no viable target", because
+        the two want different retry behaviour upstream.
+        """
+        entries = entries or {}
         transient_failure = False
         for num in ordered:
             email = self.switcher.account_email(num)
