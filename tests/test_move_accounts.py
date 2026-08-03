@@ -164,10 +164,10 @@ class TestMoveAccount:
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", failing_unlink)
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(Path, "unlink", failing_unlink)
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.move_account("2", "5")
 
         # Metadata was never committed: the account is intact under its
         # original number and the stale key stays unreferenced.
@@ -185,6 +185,10 @@ class TestMoveAccount:
         if sys.platform == "win32" or os.geteuid() == 0:
             pytest.skip("needs POSIX permission semantics (non-root)")
         switcher = ClaudeAccountSwitcher()
+        # This test is specifically about an inaccessible file-backend
+        # directory. On macOS the default backend is Keychain, so force the
+        # file path instead of accidentally testing a different store.
+        switcher.platform = Platform.LINUX
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials(
             "5", "account2@example.com", "stale-foreign"
@@ -230,12 +234,12 @@ class TestMoveAccount:
         def locked(*args, **kwargs):
             raise macos_keychain.KeychainError("keychain locked (injected)")
 
-        monkeypatch.setattr(macos_keychain, "get_password", locked)
-        monkeypatch.setattr(macos_keychain, "delete_password", locked)
+        with monkeypatch.context() as patcher:
+            patcher.setattr(macos_keychain, "get_password", locked)
+            patcher.setattr(macos_keychain, "delete_password", locked)
 
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.move_account("2", "5")
 
         # Nothing committed; the stale item survived but stays unreferenced.
         data = switcher._get_sequence_data()
@@ -261,10 +265,12 @@ class TestMoveAccount:
                 raise OSError("disk full (injected)")
             return real_write_json(self, path, data)
 
-        monkeypatch.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
-        with pytest.raises(OSError):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                ClaudeAccountSwitcher, "_write_json", failing_write_json
+            )
+            with pytest.raises(OSError):
+                switcher.move_account("2", "5")
 
         assert (
             switcher._read_account_credentials("2", "account2@example.com")
