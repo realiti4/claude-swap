@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import unicodedata
 from pathlib import Path
@@ -151,6 +152,28 @@ def auth_status_tracks_seed(monkeypatch):
 
 
 @pytest.fixture
+def auth_status_220_tracks_seed(monkeypatch):
+    """Claude 2.1.220's first-party subscription auth-status schema."""
+    probe_envs: list[dict] = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        probe_envs.append(env)
+        config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        if (config_dir / ".credentials.json").exists():
+            payload = {
+                "loggedIn": True,
+                "authMethod": "oauth_token",
+                "apiProvider": "firstParty",
+            }
+        else:
+            payload = {"loggedIn": False, "authMethod": "none"}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+    return probe_envs
+
+
+@pytest.fixture
 def refresh_rotates(monkeypatch):
     calls: list[str] = []
 
@@ -158,7 +181,9 @@ def refresh_rotates(monkeypatch):
         calls.append(creds)
         return ROTATED_CREDS
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+    monkeypatch.setattr(
+        session_mod, "refresh_oauth_credentials", fake_refresh, raising=False
+    )
     return calls
 
 
@@ -312,6 +337,178 @@ class TestResolveAccount:
 
 
 class TestBootstrap:
+    @staticmethod
+    def _seed_existing_profile(manager: SessionManager) -> Path:
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        return session_dir
+
+    def test_bootstrap_never_refreshes_backup_credentials(
+        self,
+        manager,
+        seeded_switcher,
+        auth_status_tracks_seed,
+        monkeypatch,
+    ):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            session_mod,
+            "refresh_oauth_credentials",
+            lambda creds: calls.append(creds) or ROTATED_CREDS,
+            raising=False,
+        )
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert calls == []
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+
+    def test_claude_220_status_bootstraps_without_churn(
+        self,
+        manager,
+        seeded_switcher,
+        auth_status_220_tracks_seed,
+        monkeypatch,
+    ):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            session_mod,
+            "refresh_oauth_credentials",
+            lambda creds: calls.append(creds) or ROTATED_CREDS,
+            raising=False,
+        )
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        manager.setup_session("2", share=False)
+
+        assert calls == []
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+
+    @pytest.mark.parametrize("probe_result", ["nonzero", "malformed", "timeout"])
+    def test_ambiguous_probe_reuses_existing_profile_without_mutation(
+        self, manager, monkeypatch, probe_result
+    ):
+        session_dir = self._seed_existing_profile(manager)
+        before = {
+            path.name: path.read_bytes()
+            for path in session_dir.iterdir()
+            if path.is_file()
+        }
+        bootstraps: list[Path] = []
+        monkeypatch.setattr(
+            manager,
+            "_bootstrap",
+            lambda target, *args: bootstraps.append(target),
+        )
+
+        def ambiguous(*args, **kwargs):
+            if probe_result == "timeout":
+                raise subprocess.TimeoutExpired(args[0], 10)
+            if probe_result == "malformed":
+                return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="changed CLI")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", ambiguous)
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert got == session_dir
+        assert bootstraps == []
+        assert {
+            path.name: path.read_bytes()
+            for path in session_dir.iterdir()
+            if path.is_file()
+        } == before
+
+    def test_live_profile_is_never_rebuilt_when_probe_reports_logged_out(
+        self, manager, monkeypatch
+    ):
+        session_dir = self._seed_existing_profile(manager)
+        make_live(session_dir)
+        bootstraps: list[Path] = []
+        monkeypatch.setattr(
+            manager,
+            "_bootstrap",
+            lambda target, *args: bootstraps.append(target),
+        )
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            ),
+        )
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert got == session_dir
+        assert bootstraps == []
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_confirmed_invalid_existing_profile_is_preserved(
+        self, manager, monkeypatch
+    ):
+        session_dir = self._seed_existing_profile(manager)
+        bootstraps: list[Path] = []
+        monkeypatch.setattr(
+            manager,
+            "_bootstrap",
+            lambda target, *args: bootstraps.append(target),
+        )
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session("2", share=False)
+
+        assert bootstraps == []
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_indeterminate_post_bootstrap_probe_keeps_seeded_profile(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setattr(
+            session_mod,
+            "refresh_oauth_credentials",
+            lambda creds: pytest.fail("bootstrap must not refresh OAuth"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=1, stdout="", stderr="unknown auth command"
+            ),
+        )
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
     def test_happy_path(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
     ):
@@ -319,17 +516,18 @@ class TestBootstrap:
 
         assert (num, email) == (ACCOUNT_NUM, ACCOUNT_EMAIL)
         creds_path = session_dir / ".credentials.json"
-        assert creds_path.read_text() == ROTATED_CREDS
+        assert creds_path.read_text() == CREDS
 
         config = json.loads((session_dir / ".claude.json").read_text())
         assert config["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
         assert config["hasCompletedOnboarding"] is True
         assert config["theme"] == "light"  # carried over from backup config
 
-        # Rotated refresh token persisted back to backup storage.
+        # Bootstrap is a copy only: Claude owns all refreshes after seeding.
+        assert refresh_rotates == []
         assert (
             seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
-            == ROTATED_CREDS
+            == CREDS
         )
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
@@ -352,13 +550,20 @@ class TestBootstrap:
         assert len(refresh_rotates) == refresh_calls_after_bootstrap  # no new refresh
         assert (session_dir / ".credentials.json").read_text() == first_creds
 
-    def test_refresh_failure_uses_stored_creds(
+    def test_bootstrap_ignores_refresh_helpers(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            session_mod,
+            "refresh_oauth_credentials",
+            lambda c: calls.append(c) or None,
+            raising=False,
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
-        assert "Could not refresh" in capsys.readouterr().out
+        assert calls == []
+        assert "Could not refresh" not in capsys.readouterr().out
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
@@ -373,6 +578,7 @@ class TestBootstrap:
             session_mod,
             "refresh_oauth_credentials",
             lambda c: refresh_calls.append(c) or None,
+            raising=False,
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)
@@ -397,7 +603,7 @@ class TestBootstrap:
         with pytest.raises(SessionError, match="no stored config backup"):
             manager.setup_session("2", share=False)
 
-    def test_validation_failure_cleans_up(
+    def test_validation_failure_preserves_seeded_profile(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates, block_real_keychain
     ):
         # Auth status never reports logged in → post-bootstrap validation fails.
@@ -420,7 +626,8 @@ class TestBootstrap:
         with pytest.raises(SessionError, match="failed\\s+validation"):
             manager.setup_session("2", share=False)
 
-        assert not session_dir.exists()
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
         assert block_real_keychain.get_password(service, account) is None
 
     def test_stale_keychain_entry_deleted_before_seed(
@@ -455,8 +662,8 @@ class TestBootstrap:
 
         manager.setup_session("2", share=False)
 
-        # Re-bootstrapped: fresh (refreshed) creds, marker cleared.
-        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        # Re-bootstrapped from the explicitly updated backup, marker cleared.
+        assert (session_dir / ".credentials.json").read_text() == CREDS
         assert not (session_dir / session_mod.STALE_MARKER).exists()
 
     def test_stale_marker_preserved_while_session_still_live(
@@ -482,7 +689,7 @@ class TestBootstrap:
         config = json.loads((session_dir / ".claude.json").read_text())
         config["projects"] = {"/some/project": {"history": ["x"]}}
         (session_dir / ".claude.json").write_text(json.dumps(config))
-        (session_dir / ".credentials.json").unlink()
+        seeded_switcher._invalidate_session_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
 
         manager.setup_session("2", share=False)
 
@@ -1344,6 +1551,7 @@ class TestGuards:
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()  # history preserved
         assert block_real_keychain.get_password(service, account) is None
+        assert (session_dir / session_mod.STALE_MARKER).exists()
 
     def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
         self, seeded_switcher
@@ -1404,6 +1612,7 @@ class TestGuards:
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()
         assert block_real_keychain.get_password(service, account) is None
+        assert (session_dir / session_mod.STALE_MARKER).exists()
 
 
 # ---------------------------------------------------------------------------

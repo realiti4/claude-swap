@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import shutil
@@ -65,7 +64,6 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
-    error,
     format_age,
     ide_short_name,
     muted,
@@ -1804,21 +1802,22 @@ class ClaudeAccountSwitcher:
             )
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
-        """Drop a session profile's credential material, keeping its history.
+        """Mark a session profile for a deliberate credential reseed.
 
         The next `cswap run` fails the reuse check and re-bootstraps from
         backup; the bootstrap merges .claude.json, so the profile's own
-        projects/history survive. Used when backup credentials change under
-        an existing profile (e.g. --import --force).
+        projects/history survive. The marker is the authorization for
+        setup_session to mutate an existing profile; without it, a failed or
+        changed local auth probe is never allowed to delete profile state.
         """
-        from claude_swap.session import STALE_MARKER, delete_macos_keychain_entry
+        from claude_swap.session import delete_macos_keychain_entry, mark_session_stale
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
-        (session_dir / STALE_MARKER).unlink(missing_ok=True)
+        mark_session_stale(session_dir)
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )

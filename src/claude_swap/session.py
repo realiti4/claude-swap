@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -58,7 +59,6 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
@@ -141,6 +141,12 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
 _BOOTSTRAP_LOCK_TIMEOUT = 30.0
+
+
+class _SessionValidation(Enum):
+    VALID = "valid"
+    INVALID = "invalid"
+    INDETERMINATE = "indeterminate"
 
 
 def slugify_email(email: str) -> str:
@@ -503,6 +509,16 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
+        # A running Claude process owns this profile's credential lineage.
+        # Never probe-and-rebuild underneath it: even an explicit local
+        # "logged out" result may be a transient Keychain read, while deleting
+        # the profile entry is guaranteed to disrupt every process sharing it.
+        if live_sessions_for(session_dir):
+            if session_identity_drifted(session_dir, email, org_uuid):
+                raise self._validation_error(account_num, email)
+            self._sync_sharing(session_dir, share, share_history)
+            return session_dir, account_num, email
+
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
         # pass the local reuse check. Honored only when no session is live —
@@ -512,36 +528,65 @@ class SessionManager:
             session_dir
         )
 
-        # Cheap reuse check without the lock: most launches hit this.
-        if not stale and self._is_session_valid(session_dir, email, org_uuid):
+        # Cheap reuse check without the lock: most launches hit this. Probe
+        # failures and unknown schemas are advisory, not permission to destroy
+        # a profile that Claude may still be able to use.
+        validation = self._session_validation(session_dir, email, org_uuid)
+        if not stale and validation is not _SessionValidation.INVALID:
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
-            # Re-evaluate the marker under the lock, then re-check validity:
-            # another `cswap run` may have bootstrapped while we waited.
-            if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
-                session_dir
-            ):
-                self.switcher._invalidate_session_credentials(account_num, email)
-                (session_dir / STALE_MARKER).unlink(missing_ok=True)
-            if self._is_session_valid(session_dir, email, org_uuid):
+            # Another `cswap run` may have launched while we waited. A live
+            # profile wins over every local validation result and stale marker;
+            # the marker remains for the first launch after all owners exit.
+            if live_sessions_for(session_dir):
+                if session_identity_drifted(session_dir, email, org_uuid):
+                    raise self._validation_error(account_num, email)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
+            stale = (session_dir / STALE_MARKER).exists()
+            validation = self._session_validation(session_dir, email, org_uuid)
+            if not stale and validation is not _SessionValidation.INVALID:
+                self._sync_sharing(session_dir, share, share_history)
+                return session_dir, account_num, email
+
+            # An existing profile is only reseeded after a credential-writing
+            # operation explicitly marks it stale. A confirmed logout or wrong
+            # identity without that marker is surfaced to the caller and left
+            # byte-for-byte intact, preventing a retry loop from repeatedly
+            # deleting Keychain state.
+            if not stale and session_dir.is_dir():
+                raise self._validation_error(account_num, email)
+
+            if stale:
+                self.switcher._invalidate_session_credentials(account_num, email)
+
             self._bootstrap(session_dir, account_num, email, org_uuid)
+            (session_dir / STALE_MARKER).unlink(missing_ok=True)
             self._sync_sharing(session_dir, share, share_history)
 
-            if not self._is_session_valid(session_dir, email, org_uuid):
-                self._cleanup_failed_session(session_dir)
-                raise SessionError(
-                    f"Session profile for Account-{account_num} ({email}) failed "
-                    f"validation. Log in with that account and re-add it: "
-                    f"cswap --add-account --slot {account_num}"
-                )
+            # A clear logged-out / wrong-account result is still an error, but
+            # never cleanup: the profile may hold the only current generation.
+            # An unreadable command or future schema is allowed through so
+            # Claude itself remains the authority on whether it can run.
+            if (
+                self._session_validation(session_dir, email, org_uuid)
+                is _SessionValidation.INVALID
+            ):
+                raise self._validation_error(account_num, email)
         # Lock released here, before any exec.
 
         return session_dir, account_num, email
+
+    @staticmethod
+    def _validation_error(account_num: str, email: str) -> SessionError:
+        return SessionError(
+            f"Session profile for Account-{account_num} ({email}) failed "
+            f"validation. Log in with that account and re-add it: "
+            f"cswap --add-account --slot {account_num}"
+        )
 
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
@@ -557,23 +602,6 @@ class SessionManager:
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
-
-        # One refresh so the profile starts with a fresh access token; persist
-        # a possibly-rotated refresh token back to backup so future switches
-        # and runs see the latest. Failure is non-fatal: the stored token may
-        # still be valid, and claude refreshes on its own at runtime.
-        # Setup-token accounts (--add-token) have no refresh token by design —
-        # skip silently instead of warning about a flow that can't happen.
-        if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
-                self.switcher.write_account_credentials(account_num, email, creds)
-            else:
-                warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
-                )
 
         config_text = self.switcher.read_account_config(account_num, email)
         try:
@@ -618,29 +646,20 @@ class SessionManager:
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
 
-    @staticmethod
-    def _has_refresh_token(creds: str) -> bool:
-        try:
-            return bool(json.loads(creds).get("claudeAiOauth", {}).get("refreshToken"))
-        except (json.JSONDecodeError, AttributeError):
-            return True  # unknown shape — let the refresh attempt decide
-
-    def _cleanup_failed_session(self, session_dir: Path) -> None:
-        # Keychain first: claude may have partially migrated the seed, and the
-        # hashed service name can't be recomputed once the dir is gone.
-        delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
-
     # -- validation ------------------------------------------------------
 
-    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
-        """Whether claude sees the profile as logged in with the right identity.
+    def _session_validation(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> _SessionValidation:
+        """How confidently Claude reports this profile's OAuth identity.
 
         Local check only (`claude auth status` makes no API call): a revoked
-        but unexpired token still passes and fails on first real use.
+        but unexpired token still passes and fails on first real use. Command
+        failures and unfamiliar schemas are indeterminate, never invalid: a
+        local compatibility probe must not become authority to delete tokens.
         """
         if not session_dir.is_dir():
-            return False
+            return _SessionValidation.INVALID
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
         # FileNotFoundError, which the handler below turns into a false
@@ -655,27 +674,61 @@ class SessionManager:
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return False
+            return _SessionValidation.INDETERMINATE
         if result.returncode != 0:
-            return False
+            return _SessionValidation.INDETERMINATE
         try:
             status = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return False
-        if status.get("loggedIn") is not True:
-            return False
-        # Verified against claude 2.1.175; an env API key reports a different
-        # method, and the probe env already drops those vars anyway.
-        if status.get("authMethod") != "claude.ai":
-            return False
-        if status.get("email") != email:
-            return False
+        except (json.JSONDecodeError, TypeError):
+            return _SessionValidation.INDETERMINATE
+        if not isinstance(status, dict):
+            return _SessionValidation.INDETERMINATE
+
+        logged_in = status.get("loggedIn")
+        if logged_in is False:
+            return _SessionValidation.INVALID
+        if logged_in is not True:
+            return _SessionValidation.INDETERMINATE
+
+        # Claude <=2.1.212 reported ``claude.ai`` with email/org inline.
+        # Claude 2.1.220 reports first-party subscriptions as ``oauth_token``
+        # and omits identity. Unknown future methods are advisory rather than
+        # false negatives; known non-OAuth methods remain a genuine mismatch.
+        auth_method = status.get("authMethod")
+        if auth_method == "oauth_token":
+            provider = status.get("apiProvider")
+            if provider not in (None, "firstParty"):
+                return _SessionValidation.INDETERMINATE
+        elif auth_method == "claude.ai":
+            pass
+        elif auth_method in {"apiKey", "api_key", "none"}:
+            return _SessionValidation.INVALID
+        else:
+            return _SessionValidation.INDETERMINATE
+
+        status_email = status.get("email")
+        status_org = status.get("orgId")
+        if not status_email:
+            identity = read_session_identity(session_dir)
+            if identity is None:
+                return _SessionValidation.INDETERMINATE
+            status_email, profile_org = identity
+            status_org = status_org or profile_org
+
+        if status_email != email:
+            return _SessionValidation.INVALID
         # Lenient org check: only when both sides have a value, so schema
         # drift degrades to email-only validation instead of false negatives.
-        status_org = status.get("orgId")
         if status_org and org_uuid and status_org != org_uuid:
-            return False
-        return True
+            return _SessionValidation.INVALID
+        return _SessionValidation.VALID
+
+    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
+        """Compatibility wrapper for callers that only need a strict bool."""
+        return (
+            self._session_validation(session_dir, email, org_uuid)
+            is _SessionValidation.VALID
+        )
 
     # -- sharing ---------------------------------------------------------
 
