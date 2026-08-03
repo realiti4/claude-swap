@@ -723,21 +723,39 @@ class TestRunCommand:
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
         launch_log = tmp_path / "launch.log"
-        fake_claude = fake_bin / "claude"
-        fake_claude.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = auth ] && [ "$2" = status ]; then\n'
-            "  printf '%s\\n' "
-            "'{\"loggedIn\":true,\"authMethod\":\"oauth_token\",'"
-            "'\"apiProvider\":\"firstParty\"}'\n"
-            "  exit 0\n"
-            "fi\n"
-            'printf \'%s|%s\\n\' "$CLAUDE_CONFIG_DIR" "$*" '
-            '>> "$CSWAP_E2E_LOG"\n'
-            "exit 0\n",
+        fake_program = fake_bin / "fake_claude.py"
+        fake_program.write_text(
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "if sys.argv[1:3] == ['auth', 'status']:\n"
+            "    print(json.dumps({\n"
+            "        'loggedIn': True,\n"
+            "        'authMethod': 'oauth_token',\n"
+            "        'apiProvider': 'firstParty',\n"
+            "    }))\n"
+            "    raise SystemExit(0)\n"
+            "with Path(os.environ['CSWAP_E2E_LOG']).open('a') as handle:\n"
+            "    handle.write(\n"
+            "        os.environ.get('CLAUDE_CONFIG_DIR', '')\n"
+            "        + '|' + ' '.join(sys.argv[1:]) + '\\n'\n"
+            "    )\n",
             encoding="utf-8",
         )
-        fake_claude.chmod(0o755)
+        if sys.platform == "win32":
+            fake_claude = fake_bin / "claude.cmd"
+            fake_claude.write_text(
+                f'@"{sys.executable}" "{fake_program}" %*\r\n', encoding="utf-8"
+            )
+        else:
+            fake_claude = fake_bin / "claude"
+            fake_claude.write_text(
+                f'#!{sys.executable}\nexec(compile(open({str(fake_program)!r}).read(), '
+                f'{str(fake_program)!r}, "exec"))\n',
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
 
         wrapper = tmp_path / "cswap_e2e.py"
         wrapper.write_text(
