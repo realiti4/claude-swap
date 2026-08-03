@@ -23,4 +23,6 @@ MASTERAI.md
 .masterai-applied.json
 .masterai-live/
 .mcp.json
+context/
+CLAUDE.local.md
 # <<< MASTER AI (managed by: masterai git) <<<
