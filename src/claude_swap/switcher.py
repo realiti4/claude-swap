@@ -3441,16 +3441,13 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                     )
-                if has_live_session:
-                    # The live claude refreshes lazily on its next API call;
-                    # requesting now would just 401 (same rule as the owned
-                    # active account in _fetch_active_usage).
-                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                # The profile remains the credential authority while idle:
+                # Claude may have rotated its refresh-token family without
+                # synchronizing the stored backup. Falling back on expiry can
+                # therefore POST a consumed predecessor and falsely quarantine
+                # a healthy account as invalid_grant. Native Claude refreshes
+                # the profile lazily on its next real API call.
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,

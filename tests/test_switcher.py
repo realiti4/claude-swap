@@ -786,10 +786,15 @@ class TestFetchAccountUsageSessionProfile:
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         mock_fetch.assert_not_called()
 
-    def test_expired_session_credentials_without_live_session_falls_back(
+    def test_expired_session_credentials_without_live_session_stay_authoritative(
         self, temp_home: Path
     ):
-        """No live session: the backup path (with refresh machinery) still runs."""
+        """An idle profile still owns the newest refresh-token generation.
+
+        Falling back to its stored backup would POST the consumed predecessor,
+        falsely record ``invalid_grant``, and quarantine a healthy account.
+        Native Claude refreshes the profile on its next real turn instead.
+        """
         switcher = ClaudeAccountSwitcher()
         backup = _oauth_creds("sk-backup", 7200)
         session = _oauth_creds("sk-session", -60)
@@ -797,15 +802,11 @@ class TestFetchAccountUsageSessionProfile:
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.session.read_session_credentials",
                    return_value=session), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             record = switcher._fetch_account_usage(self._info(backup))
 
-        assert record.usage == {"five_hour": {"pct": 9}}
-        args, kwargs = mock_fetch.call_args
-        assert args[2] == backup
-        assert kwargs.get("is_active") is False
-        assert kwargs.get("persist_credentials") is not None
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
 
     def test_no_session_profile_uses_backup_path(self, temp_home: Path):
         """Accounts without a session profile behave exactly as before."""
