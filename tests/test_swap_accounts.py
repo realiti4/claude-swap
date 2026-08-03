@@ -181,12 +181,12 @@ class TestSwapAccounts:
                 raise OSError("disk full (injected)")
             return real_write(self, num, email, creds)
 
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
-        )
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         # Both originals are back under their pre-swap keys, and the account
         # table was never renumbered.
@@ -217,12 +217,12 @@ class TestSwapAccounts:
                 raise OSError("disk full (injected, persistent)")
             return real_write(self, num, email, creds)
 
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
-        )
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         # Slot 1's stored copy was never touched; slot 2's store now holds
         # the wrong material (restore failed), but the staged copy has it.
@@ -246,10 +246,12 @@ class TestSwapAccounts:
         def failing_write_json(self, path, data):
             raise OSError("disk full (injected)")
 
-        monkeypatch.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                ClaudeAccountSwitcher, "_write_json", failing_write_json
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         assert switcher._read_account_credentials("1", email) == "creds-org"
         assert switcher._read_account_credentials("2", email) == ""
@@ -273,10 +275,10 @@ class TestSwapAccounts:
         def failing_chmod(path, mode):
             raise OSError("chmod denied (injected)")
 
-        monkeypatch.setattr("claude_swap.switcher.os.chmod", failing_chmod)
-        with pytest.raises(OSError):
-            switcher._write_json(switcher.sequence_file, {"x": 1})
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            with pytest.raises(OSError):
+                switcher._write_json(switcher.sequence_file, {"x": 1})
 
         assert switcher.sequence_file.read_text(encoding="utf-8") == before
 
@@ -359,10 +361,10 @@ class TestSwapAccounts:
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", failing_unlink)
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(Path, "unlink", failing_unlink)
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.swap_accounts("1", "2")
 
         # Table unrenumbered, slot 1's credential intact, and the rollback
         # reverted the half-written copy under the shared key.
