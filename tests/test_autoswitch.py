@@ -1159,6 +1159,49 @@ class TestPreWarm:
         mock_ping.assert_not_called()
         assert h.state() == {}
 
+    def test_failed_ping_backs_off_honoring_retry_after(self, temp_home):
+        # Regression for the 2026-08-03 incident: an unguarded retry loop
+        # hammered a burst-blocked account every tick for hours. A failure
+        # must not be retried again before the server's own Retry-After.
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(False, error="http-429", retry_after_s=7625.0),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 1
+            # Well within the server's stated wait: must not retry yet.
+            h.clock.advance(60.0)
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 1
+            # Past it: eligible again.
+            h.clock.advance(7625.0)
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 2
+
+    def test_failed_ping_without_retry_after_uses_exponential_backoff(self, temp_home):
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(False, error="network", retry_after_s=None),
+        ) as mock_ping:
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 1
+            # First backoff is short (BACKOFF_BASE_S=30s) — still blocked well
+            # before that.
+            h.clock.advance(5.0)
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 1
+            h.clock.advance(30.0)
+            h.tick_with_usage({"1": _usage(20), "2": _usage(0)})
+            assert mock_ping.call_count == 2
+
 
 class TestQuarantineLifecycle:
     def test_quarantine_persists_across_engine_instances(self, harness):

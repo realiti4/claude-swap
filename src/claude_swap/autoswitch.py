@@ -48,7 +48,7 @@ from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate
+from claude_swap.usage_store import BACKOFF_BASE_S, BACKOFF_CAP_S, due_candidate
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -103,6 +103,24 @@ ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× thi
 # account within this long of our own last successful ping (see
 # AutoSwitchEngine._prewarm_idle_reserves).
 PREWARM_GUARD_S = 5 * 3600.0
+
+
+def _prewarm_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
+    """Backoff before retrying a failed pre-warm ping.
+
+    Unlike the usage-check backoff (``usage_store``'s, which caps a server
+    Retry-After at ``RETRY_AFTER_FLOOR_CAP_S`` because fresher decision data
+    has real switching value), nothing is waiting on a pre-warm ping —
+    honoring the server's full Retry-After costs nothing, and doing anything
+    less would repeat the exact rapid-retry pattern this codebase already
+    documents as what trips the burst rule in the first place (incident
+    2026-08-03: an unguarded retry loop here hammered a burst-blocked account
+    every tick for hours). No Retry-After at all (network/timeout): the same
+    modest exponential used for usage-check failures.
+    """
+    if retry_after_s is not None and retry_after_s > 0:
+        return retry_after_s
+    return min(BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S)
 
 
 def _now_iso() -> str:
@@ -1034,16 +1052,25 @@ class AutoSwitchEngine:
         extra fetch — so a candidate whose data happens to be stale here
         simply gets caught on a later tick once its own poll comes due.
 
-        Guarded by ``PREWARM_GUARD_S`` (the fixed window length) against
-        re-pinging the same account: a tick cadence of tens of seconds would
-        otherwise refire on the same idle-looking cached entry repeatedly
-        before the adaptive scheduler ever refreshes that candidate's data
-        and sees the ping already took effect. Recorded in the same state
-        file as cooldown/quarantine, under the same lock.
+        Guarded two ways, both persisted under ``state["preWarm"][num]`` in
+        the same state file as cooldown/quarantine, under the same lock:
+
+        - ``lastPingAt`` + ``PREWARM_GUARD_S`` (the fixed window length):
+          never re-ping an account whose window we already started —
+          without this, a tick cadence of tens of seconds would refire on
+          the same idle-looking cached entry repeatedly before the adaptive
+          scheduler ever refreshes that candidate's data and sees the ping
+          already took effect.
+        - ``backoffUntil`` on a *failed* ping (:func:`_prewarm_backoff_s`):
+          without this, the same tick cadence retries a failing ping just as
+          relentlessly as a successful one would have been guarded — this is
+          exactly what caused the 2026-08-03 incident (an unguarded retry
+          loop tripped and then kept hammering a real account's burst-rate
+          block for hours before it was noticed).
         """
         state = self._read_state()
-        last_pinged = state.get("preWarmed")
-        last_pinged = last_pinged if isinstance(last_pinged, dict) else {}
+        records = state.get("preWarm")
+        records = records if isinstance(records, dict) else {}
         now = self.clock()
         for num in self.switcher.switchable_account_numbers():
             if num == active_number or num in quarantined:
@@ -1052,8 +1079,13 @@ class AutoSwitchEngine:
                 continue
             if not _is_truly_idle(usage.get(num)):
                 continue
-            guarded_since = last_pinged.get(num)
-            if isinstance(guarded_since, (int, float)) and now - guarded_since < PREWARM_GUARD_S:
+            record = records.get(num)
+            record = record if isinstance(record, dict) else {}
+            last_ping = record.get("lastPingAt")
+            if isinstance(last_ping, (int, float)) and now - last_ping < PREWARM_GUARD_S:
+                continue
+            backoff_until = record.get("backoffUntil")
+            if isinstance(backoff_until, (int, float)) and now < backoff_until:
                 continue
             email = self.switcher.account_email(num)
             if not email or self.switcher.live_session_pids_for(num, email):
@@ -1066,11 +1098,24 @@ class AutoSwitchEngine:
             )
             if outcome.ok:
 
-                def record(state: dict, n=num, t=now) -> None:
-                    state.setdefault("preWarmed", {})[n] = t
+                def record_success(state: dict, n=num, t=now) -> None:
+                    state.setdefault("preWarm", {})[n] = {"lastPingAt": t}
 
-                self._mutate_state(record)
+                self._mutate_state(record_success)
                 self._emit(PreWarmEvent(number=num, email=email))
+            else:
+                failures = int(record.get("consecutiveFailures") or 0) + 1
+                until = now + _prewarm_backoff_s(failures, outcome.retry_after_s)
+
+                def record_failure(
+                    state: dict, n=num, last_ping=last_ping, until=until, failures=failures
+                ) -> None:
+                    entry = {"backoffUntil": until, "consecutiveFailures": failures}
+                    if last_ping is not None:
+                        entry["lastPingAt"] = last_ping
+                    state.setdefault("preWarm", {})[n] = entry
+
+                self._mutate_state(record_failure)
 
     # -- helpers --------------------------------------------------------------
 
