@@ -18,10 +18,12 @@ from claude_swap.autoswitch import (
     ErrorEvent,
     NoSwitchEvent,
     PollEvent,
+    PreWarmEvent,
     QuarantineEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _is_truly_idle,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.models import Platform
@@ -990,6 +992,119 @@ class TestFreshening:
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
         assert h.active_number() == 1
+
+
+class TestIsTrulyIdle:
+    def test_no_window_at_all_is_idle(self):
+        assert _is_truly_idle(_usage(0)) is True
+
+    def test_active_window_is_not_idle(self):
+        assert _is_truly_idle(_usage(0, resets_at="2026-01-01T00:00:00Z")) is False
+
+    def test_nonzero_usage_without_reset_is_not_idle(self):
+        # Shouldn't happen per the API contract, but never treat it as safe.
+        assert _is_truly_idle({"five_hour": {"pct": 5}}) is False
+
+    def test_sentinel_is_not_idle(self):
+        assert _is_truly_idle("api key") is False
+
+    def test_unknown_is_not_idle(self):
+        assert _is_truly_idle(None) is False
+
+
+class TestPreWarm:
+    def test_disabled_by_default_never_pings(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(0)})
+        assert outcome is TickOutcome.SWITCHED
+        mock_ping.assert_not_called()
+        assert not any(isinstance(e, PreWarmEvent) for e in h.events)
+
+    def test_pings_only_the_truly_idle_bystander(self, temp_home):
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")  # switch target: best headroom
+        # Idle 5h window but a bad 7-day figure — so it's a true bystander
+        # (not the switch target) despite five_hour reading idle.
+        h.seed(3, "c@example.com")
+        h.seed(4, "d@example.com")  # mid-window already: not idle, skipped
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(True),
+        ) as mock_ping:
+            outcome = h.tick_with_usage(
+                {
+                    "1": _usage(95),
+                    "2": _usage(10),
+                    "3": _usage(0, seven_day_pct=95),
+                    "4": _usage(30, resets_at="2026-01-01T00:00:00Z"),
+                }
+            )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        mock_ping.assert_called_once()
+        assert mock_ping.call_args[0][0] == "3"
+        pings = [e for e in h.events if isinstance(e, PreWarmEvent)]
+        assert [p.number for p in pings] == ["3"]
+
+    def test_skips_live_session_owned_bystander(self, temp_home):
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        def fake_live_sessions(number, _email):
+            return [4242] if number == "3" else []
+
+        with (
+            patch.object(h.switcher, "live_session_pids_for", side_effect=fake_live_sessions),
+            patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping,
+        ):
+            outcome = h.tick_with_usage(
+                {"1": _usage(95), "2": _usage(10), "3": _usage(0, seven_day_pct=95)}
+            )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        mock_ping.assert_not_called()
+
+    def test_skips_api_key_bystander(self, temp_home):
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        with patch("claude_swap.autoswitch.oauth.try_prewarm_account") as mock_ping:
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        mock_ping.assert_not_called()
+
+    def test_failed_ping_emits_no_event(self, temp_home):
+        h = EngineHarness(temp_home, pre_warm_reserves=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_prewarm_account",
+            return_value=oauth.PingOutcome(False, error="http-429"),
+        ) as mock_ping:
+            outcome = h.tick_with_usage(
+                {"1": _usage(95), "2": _usage(10), "3": _usage(0, seven_day_pct=95)}
+            )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        mock_ping.assert_called_once()
+        assert not any(isinstance(e, PreWarmEvent) for e in h.events)
 
 
 class TestQuarantineLifecycle:

@@ -866,6 +866,100 @@ class TestFetchUsageForAccount:
         assert "cswap --add-account" in output
 
 
+class TestTryPrewarmAccount:
+    """Test the pre-warm ping (oauth.try_prewarm_account)."""
+
+    @staticmethod
+    def _make_credentials(access="old-access", refresh="old-refresh", expires_at=None):
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": access,
+                    "refreshToken": refresh,
+                    "expiresAt": expires_at if expires_at is not None else now_ms + 3_600_000,
+                },
+            }
+        )
+
+    @staticmethod
+    def _message_response():
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"type": "message", "content": []}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_success_posts_minimal_message_with_oauth_headers(self):
+        credentials = self._make_credentials()
+
+        def mock_urlopen(req, timeout=0):
+            assert req.full_url == "https://api.anthropic.com/v1/messages"
+            assert req.get_header("Authorization") == "Bearer old-access"
+            assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+            body = json.loads(req.data)
+            assert body["max_tokens"] == 1
+            assert body["model"] == oauth.PREWARM_MODEL
+            return self._message_response()
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            outcome = oauth.try_prewarm_account("1", "test@example.com", credentials)
+
+        assert outcome.ok is True
+        assert outcome.error is None
+
+    def test_expired_token_is_refreshed_first(self):
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+        persist_mock = MagicMock()
+
+        token_resp = MagicMock()
+        token_resp.read.return_value = json.dumps(
+            {"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600}
+        ).encode()
+        token_resp.__enter__ = lambda s: s
+        token_resp.__exit__ = MagicMock(return_value=False)
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                return token_resp
+            assert req.get_header("Authorization") == "Bearer new-access"
+            return self._message_response()
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            outcome = oauth.try_prewarm_account(
+                "1", "test@example.com", credentials, persist_credentials=persist_mock
+            )
+
+        assert outcome.ok is True
+        persist_mock.assert_called_once()
+
+    def test_http_error_is_classified_and_reported(self):
+        import email.message
+
+        credentials = self._make_credentials()
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages",
+            429,
+            "Too Many Requests",
+            hdrs=email.message.Message(),
+            fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_prewarm_account("1", "test@example.com", credentials)
+
+        assert outcome.ok is False
+        assert outcome.error == "http-429"
+
+    def test_no_access_token_fails_without_a_request(self):
+        credentials = json.dumps({"claudeAiOauth": {}})
+        with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            outcome = oauth.try_prewarm_account("1", "test@example.com", credentials)
+        assert outcome.ok is False
+        assert outcome.error == "no-access-token"
+        mock_urlopen.assert_not_called()
+
+
 class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 

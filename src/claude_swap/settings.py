@@ -47,6 +47,7 @@ class AutoSwitchSettings:
     strategy: str = "best"  # reserved for future strategies; only "best" in v1
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    pre_warm_reserves: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,13 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             1,
             100,
             help="Consecutive failed polls before an account is unhealthy",
+        ),
+        SettingSpec(
+            "autoswitch",
+            "preWarmReserves",
+            "pre_warm_reserves",
+            "bool",
+            help="After a proactive switch, ping other idle accounts to start their 5h window",
         ),
     )
 }
