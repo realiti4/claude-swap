@@ -2011,6 +2011,52 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num), {})
         return "api_key" if record.get("kind") == "api_key" else "oauth"
 
+    def _reject_foreign_credential_capture(
+        self, creds: str, email: str, org_uuid: str
+    ) -> None:
+        """Guard for ``add_account``: the stored token must be THIS account's.
+
+        ``add_account`` reads the IDENTITY from ``.claude.json``'s
+        ``oauthAccount`` and the CREDENTIAL from the keychain/file store.
+        Those are two different sources and nothing made them agree.
+
+        Measured in the field: a session registered ``j.lee8@ax.samsung.com``
+        and the slot received a different account's token — an ssh session had
+        ``.claude.json`` renamed to the new profile while the live keychain
+        item still held the original account's credential. The slot ends up
+        LABELLED one account and CONTAINING another, so every later switch to
+        it logs the wrong user in and ``--status`` shows a name that is not
+        whose token is stored. Nothing surfaces the disagreement.
+
+        ``fetch_oauth_profile`` already answers exactly this ("whose token is
+        this") and the autoswitch identity oracle already uses it.
+
+        ADVISORY, in the same direction the oracle is everywhere else: a
+        ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
+        "wrong", and must not block a registration that worked before this
+        guard existed. Only a resolved identity that DISAGREES refuses.
+        """
+        token = oauth.extract_access_token(creds)
+        if not token:
+            return
+        profile = oauth.fetch_oauth_profile(token)
+        if not profile:
+            return                      # unresolvable, not wrong
+        seen = (profile.get("email") or "").strip()
+        if not seen:
+            return                      # uuid-only resolution says nothing here
+        seen_org = (profile.get("organizationUuid") or "").strip()
+        if seen.lower() == email.lower() and seen_org == (org_uuid or ""):
+            return
+        raise ConfigError(
+            f"The stored credential does not belong to {email}: the token "
+            f"resolves to {seen}. Nothing was changed. This happens when the "
+            f"config names one account while the credential store still holds "
+            f"another's token (e.g. a renamed .claude.json over a live "
+            f"keychain item). Log in as {email} in THIS environment, then "
+            f"re-run."
+        )
+
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
 
@@ -2358,6 +2404,9 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        self._reject_foreign_credential_capture(
+            current_creds, current_email, current_org_uuid
+        )
 
         config_path = self._get_claude_config_path()
         try:
