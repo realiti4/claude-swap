@@ -162,10 +162,13 @@ def test_CONTROL_expired_own_credential_still_registers_after_a_refresh(
     temp_home: Path, mock_claude_config: Path,
 ):
     """Same refresh-then-verify path, agreeing identity: registration must
-    still succeed. Also proves the guard's refresh never leaks into the
-    stored credential -- the STORED bytes are the original (still-expired)
-    ones, not the refreshed ones; the guard only borrows a fresh token to
-    resolve identity, it does not persist anything."""
+    still succeed, and the credential it stores is the one it VERIFIED.
+
+    A refresh grant may return a rotated ``refresh_token``, and accepting one
+    retires its predecessor server-side. Storing the pre-refresh bytes would
+    leave the slot holding a refresh token the server has already invalidated,
+    so the next switch's refresh reads as a dead lineage. ``session.py``
+    persists its own refresh result for exactly this reason."""
     s = _switcher(temp_home, mock_claude_config, "ax@example.com")
     EXPIRED_OWN = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-ant-oat01-MINE-STALE", "refreshToken": "rt-mine",
@@ -183,8 +186,10 @@ def test_CONTROL_expired_own_credential_still_registers_after_a_refresh(
 
     assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
     stored = s._read_account_credentials("7", "ax@example.com")
-    assert "MINE-STALE" in stored and "MINE-FRESH" not in stored, (
-        "the guard's refresh must not leak into the stored credential"
+    assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-mine-2", (
+        "the refresh grant may ROTATE the refresh token, which invalidates the "
+        "old one server-side; storing the pre-refresh bytes leaves the slot "
+        "holding a refresh token the server has already retired"
     )
 
 
