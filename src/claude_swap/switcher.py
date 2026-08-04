@@ -2011,6 +2011,97 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num), {})
         return "api_key" if record.get("kind") == "api_key" else "oauth"
 
+    def _reject_foreign_credential_capture(
+        self, creds: str, email: str, org_uuid: str
+    ) -> str:
+        """Guard for ``add_account``: the stored token must be THIS account's.
+
+        ``add_account`` reads the IDENTITY from ``.claude.json``'s
+        ``oauthAccount`` and the CREDENTIAL from the keychain/file store.
+        Those are two different sources and nothing made them agree.
+
+        Measured in the field: a session registered ``j.lee8@ax.samsung.com``
+        and the slot received a different account's token — an ssh session had
+        ``.claude.json`` renamed to the new profile while the live keychain
+        item still held the original account's credential. The slot ends up
+        LABELLED one account and CONTAINING another, so every later switch to
+        it logs the wrong user in and ``--status`` shows a name that is not
+        whose token is stored. Nothing surfaces the disagreement.
+
+        ``fetch_oauth_profile`` already answers exactly this ("whose token is
+        this") and the autoswitch identity oracle already uses it. An expired
+        ACCESS token is not "already dead": a live refresh token revives it
+        (cswap itself does exactly this at switch time -- session.py's
+        ``_bootstrap``), so this guard refreshes first and resolves identity
+        from the refreshed token. That refresh is used only to ask the
+        question; its result is never persisted here. Only a credential with
+        no refresh token at all -- or one whose refresh itself fails -- is
+        truly unresolvable.
+
+        ADVISORY, in the same direction the oracle is everywhere else: a
+        ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
+        "wrong", and must not block a registration that worked before this
+        guard existed. Only a resolved identity that DISAGREES refuses. One
+        level down, ``organizationUuid: None`` means the profile response
+        carried no organization block at all — structurally ABSENT, not
+        "personal". That is unverifiable ONLY about the org, exactly like the
+        class's own ``_resolved_matches_slot_identity``: its
+        ``if r_org is None: return None`` sits inside the branch where the
+        email already matches, so it never excuses a disagreeing email --
+        only a matching email gets the benefit of an absent org.
+        """
+        token = oauth.extract_access_token(creds)
+        if not token:
+            return creds
+        oauth_data = oauth.extract_oauth_data(creds)
+        if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            # refresh_oauth_credentials already no-ops (no network) when there
+            # is no refresh token to use -- one None-check covers both "truly
+            # dead" and "refresh attempt failed".
+            refreshed = oauth.refresh_oauth_credentials(creds)
+            if not refreshed:
+                return creds                  # unresolvable, not wrong
+            token = oauth.extract_access_token(refreshed)
+            if not token:
+                return creds
+            # Accepting a rotated refresh token retires its predecessor
+            # server-side, so the bytes that were VERIFIED are the bytes to
+            # store -- the same reason session.py persists its refresh result.
+            creds = refreshed
+        profile = oauth.fetch_oauth_profile(token)
+        if not profile:
+            return creds                      # unresolvable, not wrong
+        seen = (profile.get("email") or "").strip()
+        if not seen:
+            return creds                      # uuid-only resolution says nothing here
+        same_email = seen.lower() == email.lower()
+        if not same_email:
+            raise ConfigError(
+                f"The stored credential does not belong to {email}: the token "
+                f"resolves to {seen}. Nothing was changed. This happens when the "
+                f"config names one account while the credential store still holds "
+                f"another's token (e.g. a renamed .claude.json over a live "
+                f"keychain item). Log in as {email} in THIS environment, then "
+                f"re-run."
+            )
+        resolved_org = profile.get("organizationUuid")
+        if resolved_org is None:
+            return creds                      # structurally absent -- unverifiable
+        seen_org = resolved_org.strip()
+        if seen_org == (org_uuid or ""):
+            return creds
+        # Same address, different org: naming the address twice says
+        # nothing (it's the address that agrees) -- name the two
+        # organizations that disagree instead.
+        raise ConfigError(
+            f"The stored credential for {email} belongs to organization "
+            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
+            f"Nothing was changed. Two accounts can share an email "
+            f"across organizations. Log in as {email} in the "
+            f"{org_uuid or 'personal'} organization in THIS environment, "
+            f"then re-run."
+        )
+
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
 
@@ -2249,6 +2340,9 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            current_creds = self._reject_foreign_credential_capture(
+                current_creds, current_email, current_org_uuid
+            )
 
             config_path = self._get_claude_config_path()
             try:
@@ -2358,6 +2452,9 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        current_creds = self._reject_foreign_credential_capture(
+            current_creds, current_email, current_org_uuid
+        )
 
         config_path = self._get_claude_config_path()
         try:
