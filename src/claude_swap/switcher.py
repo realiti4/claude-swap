@@ -2029,25 +2029,52 @@ class ClaudeAccountSwitcher:
         whose token is stored. Nothing surfaces the disagreement.
 
         ``fetch_oauth_profile`` already answers exactly this ("whose token is
-        this") and the autoswitch identity oracle already uses it.
+        this") and the autoswitch identity oracle already uses it. An already
+        expired token skips the fetch entirely -- it cannot resolve anyway,
+        so the request would be pure network overhead on a path that runs on
+        every add/refresh.
 
         ADVISORY, in the same direction the oracle is everywhere else: a
         ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
         "wrong", and must not block a registration that worked before this
-        guard existed. Only a resolved identity that DISAGREES refuses.
+        guard existed. Only a resolved identity that DISAGREES refuses. The
+        same holds one level down: ``organizationUuid: None`` means the
+        profile response carried no organization block at all — structurally
+        ABSENT, not "personal" — so it is unverifiable too, exactly like the
+        class's own ``_resolved_matches_slot_identity`` treats it
+        (``if r_org is None: return None``).
         """
         token = oauth.extract_access_token(creds)
         if not token:
             return
+        oauth_data = oauth.extract_oauth_data(creds)
+        if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            return                      # already dead, cannot resolve anyway
         profile = oauth.fetch_oauth_profile(token)
         if not profile:
             return                      # unresolvable, not wrong
         seen = (profile.get("email") or "").strip()
         if not seen:
             return                      # uuid-only resolution says nothing here
-        seen_org = (profile.get("organizationUuid") or "").strip()
-        if seen.lower() == email.lower() and seen_org == (org_uuid or ""):
+        resolved_org = profile.get("organizationUuid")
+        if resolved_org is None:
+            return                      # structurally absent -- unverifiable
+        seen_org = resolved_org.strip()
+        same_email = seen.lower() == email.lower()
+        if same_email and seen_org == (org_uuid or ""):
             return
+        if same_email:
+            # Same address, different org: naming the address twice says
+            # nothing (it's the address that agrees) -- name the two
+            # organizations that disagree instead.
+            raise ConfigError(
+                f"The stored credential for {email} belongs to organization "
+                f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
+                f"Nothing was changed. Two accounts can share an email "
+                f"across organizations. Log in as {email} in the "
+                f"{org_uuid or 'personal'} organization in THIS environment, "
+                f"then re-run."
+            )
         raise ConfigError(
             f"The stored credential does not belong to {email}: the token "
             f"resolves to {seen}. Nothing was changed. This happens when the "
@@ -2295,6 +2322,9 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            self._reject_foreign_credential_capture(
+                current_creds, current_email, current_org_uuid
+            )
 
             config_path = self._get_claude_config_path()
             try:

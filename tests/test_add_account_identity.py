@@ -102,6 +102,27 @@ def test_CONTROL_unresolvable_profile_still_registers(
     assert data["accounts"]["7"]["email"] == "ax@example.com"
 
 
+def test_expired_token_skips_the_profile_fetch(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """An already-expired token cannot resolve anyway (the API rejects it
+    with a 401 that the oracle already treats as unresolvable) -- so the
+    fetch is pure overhead on this path. Skipping it must not change the
+    ADVISORY contract: the registration still succeeds exactly as an
+    unresolvable profile would."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-EXPIRED", "refreshToken": "rt-expired",
+        "expiresAt": 1}})  # 1ms since epoch: far in the past
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED), \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        s.add_account(slot=7, assume_yes=True)
+
+    mock_fetch.assert_not_called()
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+
+
 def test_same_email_different_org_is_still_a_mismatch(
     temp_home: Path, mock_claude_config: Path,
 ):
@@ -131,6 +152,174 @@ def test_same_email_different_org_is_still_a_mismatch(
         "DEFECT: a token from a DIFFERENT organization was accepted for this "
         "slot because only the email was compared"
     )
+
+
+def test_add_refuses_a_foreign_credential_on_refresh_in_place(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The REFRESH-IN-PLACE branch (``slot=None``, account already registered)
+    must refuse a foreign token exactly like the CREATE branch does.
+
+    Not a corner: the menu bar's "Refresh credentials", the TUI's "Add
+    current login", and a plain `cswap` switch's auto-add all take this
+    branch. Here the slot already carries the RIGHT label, so an unguarded
+    refresh silently swaps in another account's bytes underneath a label
+    that still reads correctly -- the exact field defect this module exists
+    to close.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE", "refreshToken": "rt-mine",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=OWN), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-other", "email": "other@example.com",
+                             "organizationUuid": ""}):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account()  # slot=None -> refresh-in-place
+
+    stored = s._read_account_credentials("7", "ax@example.com")
+    assert "THEIRS" not in stored, (
+        "DEFECT: refresh-in-place stored another account's token under the "
+        "slot's correct label"
+    )
+
+
+def test_CONTROL_refresh_in_place_still_accepts_the_owning_token(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Same branch, agreeing identities: a routine credential refresh (e.g.
+    after re-login) must still work. Without this the refusal above could
+    pass by refusing every refresh-in-place."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE", "refreshToken": "rt-mine",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=OWN), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    OWN_ROTATED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE-ROTATED", "refreshToken": "rt-mine-2",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=OWN_ROTATED), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account()  # slot=None -> refresh-in-place, same account
+
+    stored = s._read_account_credentials("7", "ax@example.com")
+    assert "MINE-ROTATED" in stored
+
+
+def test_org_slot_registers_when_the_resolved_profile_has_no_org(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """A resolved identity with ``organizationUuid: None`` means the profile
+    response carried NO organization block -- structurally ABSENT, not "this
+    token is personal". The guard's own sibling comparator
+    (``_resolved_matches_slot_identity``) treats that input as unverifiable
+    (``if r_org is None: return None``) and never condemns on it. The guard
+    must agree: coercing ``None`` to ``""`` before comparing against an org
+    slot's real org uuid turns "unverifiable" into "refused".
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-A")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": None}):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+
+
+def test_CONTROL_org_slot_still_registers_when_the_org_matches(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Beside the test above: a fully-resolved, AGREEING org must still
+    register. Without this a blanket "never refuse" could pass the None case
+    by refusing nothing at all."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-A")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": "org-A"}):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+
+
+def test_CONTROL_org_slot_still_refuses_a_different_email(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Beside the test above: a fully-resolved identity that disagrees on
+    EMAIL must still refuse. Without this a blanket "never refuse" could pass
+    the None case by refusing nothing at all."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-A")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-o", "email": "other@example.com",
+                             "organizationUuid": "org-A"}):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_org_mismatch_message_names_both_organizations(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """When only the org differs, ``seen == email``, so a message built from
+    the email alone reads as if the SAME address disagreed with itself. It
+    must name the two conflicting organizations instead, the way
+    ``_reject_live_api_key_capture`` and the stash path name their specific
+    conflicting values."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-A")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax2", "email": "ax@example.com",
+                             "organizationUuid": "org-B"}):
+        with pytest.raises((ConfigError, ValidationError)) as e:
+            s.add_account(slot=7, assume_yes=True)
+
+    msg = str(e.value)
+    assert "org-A" in msg and "org-B" in msg, (
+        f"the org-mismatch refusal must name both organizations, got: {msg!r}"
+    )
+
+
+def test_email_mismatch_message_still_names_both_addresses(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """CONTROL for the message test above: when the EMAIL differs, the
+    message is coherent today (it names the two different addresses) -- this
+    must not regress while fixing the org arm."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-other", "email": "other@example.com",
+                             "organizationUuid": ""}):
+        with pytest.raises((ConfigError, ValidationError)) as e:
+            s.add_account(slot=7, assume_yes=True)
+
+    msg = str(e.value)
+    assert "ax@example.com" in msg and "other@example.com" in msg
 
 
 def test_CONTROL_personal_account_empty_org_still_registers(
