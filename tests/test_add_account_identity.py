@@ -39,20 +39,25 @@ def _switcher(temp_home, mock_claude_config, email, org=""):
     return s
 
 
+@pytest.mark.parametrize("foreign_org", ["", None], ids=["org-empty", "org-none"])
 def test_add_refuses_a_credential_whose_owner_is_a_different_account(
-    temp_home: Path, mock_claude_config: Path,
+    temp_home: Path, mock_claude_config: Path, foreign_org,
 ):
     """The config claims ax@; the live token resolves to somebody else.
 
     add_account must refuse rather than label the slot with the config's
-    claim while storing the other account's token.
+    claim while storing the other account's token -- whether or not the
+    resolved profile carries an organization block at all. A structurally
+    absent org (``organizationUuid: None``, what a PERSONAL account's
+    profile response looks like -- no ``organization`` key at all) says
+    nothing about the ORG, but a disagreeing EMAIL is still a disagreement.
     """
     s = _switcher(temp_home, mock_claude_config, "ax@example.com")
 
     with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
          patch("claude_swap.oauth.fetch_oauth_profile",
                return_value={"uuid": "u-other", "email": "other@example.com",
-                             "organizationUuid": ""}):
+                             "organizationUuid": foreign_org}):
         with pytest.raises((ConfigError, ValidationError)) as e:
             s.add_account(slot=7)
 
@@ -102,20 +107,100 @@ def test_CONTROL_unresolvable_profile_still_registers(
     assert data["accounts"]["7"]["email"] == "ax@example.com"
 
 
-def test_expired_token_skips_the_profile_fetch(
+def test_expired_token_with_no_refresh_token_skips_the_profile_fetch(
     temp_home: Path, mock_claude_config: Path,
 ):
-    """An already-expired token cannot resolve anyway (the API rejects it
-    with a 401 that the oracle already treats as unresolvable) -- so the
-    fetch is pure overhead on this path. Skipping it must not change the
-    ADVISORY contract: the registration still succeeds exactly as an
-    unresolvable profile would."""
+    """An access token that is expired AND carries no refresh token really is
+    dead -- there is nothing left to revive it with, so the fetch is skipped
+    and the registration proceeds exactly as an unresolvable profile would
+    (the guard is advisory)."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED_NO_REFRESH = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-EXPIRED", "expiresAt": 1}})  # no refreshToken
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_NO_REFRESH), \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        s.add_account(slot=7, assume_yes=True)
+
+    mock_fetch.assert_not_called()
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+
+
+def test_add_refuses_an_expired_foreign_credential_a_refresh_would_revive(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """An expired ACCESS token is not "already dead" when a refresh token is
+    present: cswap itself revives exactly such credentials at switch time
+    (``session.py``'s ``_bootstrap``). So the guard must refresh before
+    giving up, then resolve identity from the REFRESHED token -- merely
+    dropping the skip is not enough, since ``fetch_oauth_profile`` on the
+    still-expired original token would just 401 and return None (advisory,
+    fail-open), silently storing the foreign credential either way."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED_FOREIGN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-THEIRS-STALE", "refreshToken": "rt-theirs",
+        "expiresAt": 1}})
+    REFRESHED_FOREIGN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-THEIRS-FRESH", "refreshToken": "rt-theirs-2",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_FOREIGN), \
+         patch("claude_swap.oauth.refresh_oauth_credentials",
+               return_value=REFRESHED_FOREIGN) as mock_refresh, \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-other", "email": "other@example.com",
+                             "organizationUuid": ""}) as mock_fetch:
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    mock_refresh.assert_called_once_with(EXPIRED_FOREIGN)
+    mock_fetch.assert_called_once_with("sk-ant-oat01-THEIRS-FRESH")
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_CONTROL_expired_own_credential_still_registers_after_a_refresh(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Same refresh-then-verify path, agreeing identity: registration must
+    still succeed. Also proves the guard's refresh never leaks into the
+    stored credential -- the STORED bytes are the original (still-expired)
+    ones, not the refreshed ones; the guard only borrows a fresh token to
+    resolve identity, it does not persist anything."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED_OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE-STALE", "refreshToken": "rt-mine",
+        "expiresAt": 1}})
+    REFRESHED_OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-MINE-FRESH", "refreshToken": "rt-mine-2",
+        "expiresAt": 99999999999000}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_OWN), \
+         patch("claude_swap.oauth.refresh_oauth_credentials", return_value=REFRESHED_OWN), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
+    stored = s._read_account_credentials("7", "ax@example.com")
+    assert "MINE-STALE" in stored and "MINE-FRESH" not in stored, (
+        "the guard's refresh must not leak into the stored credential"
+    )
+
+
+def test_CONTROL_expired_credential_whose_refresh_fails_still_registers(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Fail-open direction: when the refresh itself cannot resolve anything
+    (dead refresh token, network down), the guard must not block -- exactly
+    like an unresolved profile fetch doesn't."""
     s = _switcher(temp_home, mock_claude_config, "ax@example.com")
     EXPIRED = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-EXPIRED", "refreshToken": "rt-expired",
-        "expiresAt": 1}})  # 1ms since epoch: far in the past
+        "accessToken": "sk-ant-oat01-STALE", "refreshToken": "rt-dead",
+        "expiresAt": 1}})
 
     with patch.object(s, "_read_capture_credentials", return_value=EXPIRED), \
+         patch("claude_swap.oauth.refresh_oauth_credentials", return_value=None), \
          patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
         s.add_account(slot=7, assume_yes=True)
 
@@ -154,11 +239,14 @@ def test_same_email_different_org_is_still_a_mismatch(
     )
 
 
+@pytest.mark.parametrize("foreign_org", ["", None], ids=["org-empty", "org-none"])
 def test_add_refuses_a_foreign_credential_on_refresh_in_place(
-    temp_home: Path, mock_claude_config: Path,
+    temp_home: Path, mock_claude_config: Path, foreign_org,
 ):
     """The REFRESH-IN-PLACE branch (``slot=None``, account already registered)
-    must refuse a foreign token exactly like the CREATE branch does.
+    must refuse a foreign token exactly like the CREATE branch does -- again
+    regardless of whether the resolved profile's org is structurally absent
+    (personal account) or empty.
 
     Not a corner: the menu bar's "Refresh credentials", the TUI's "Add
     current login", and a plain `cswap` switch's auto-add all take this
@@ -181,7 +269,7 @@ def test_add_refuses_a_foreign_credential_on_refresh_in_place(
     with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
          patch("claude_swap.oauth.fetch_oauth_profile",
                return_value={"uuid": "u-other", "email": "other@example.com",
-                             "organizationUuid": ""}):
+                             "organizationUuid": foreign_org}):
         with pytest.raises((ConfigError, ValidationError)):
             s.add_account()  # slot=None -> refresh-in-place
 

@@ -2029,59 +2029,73 @@ class ClaudeAccountSwitcher:
         whose token is stored. Nothing surfaces the disagreement.
 
         ``fetch_oauth_profile`` already answers exactly this ("whose token is
-        this") and the autoswitch identity oracle already uses it. An already
-        expired token skips the fetch entirely -- it cannot resolve anyway,
-        so the request would be pure network overhead on a path that runs on
-        every add/refresh.
+        this") and the autoswitch identity oracle already uses it. An expired
+        ACCESS token is not "already dead": a live refresh token revives it
+        (cswap itself does exactly this at switch time -- session.py's
+        ``_bootstrap``), so this guard refreshes first and resolves identity
+        from the refreshed token. That refresh is used only to ask the
+        question; its result is never persisted here. Only a credential with
+        no refresh token at all -- or one whose refresh itself fails -- is
+        truly unresolvable.
 
         ADVISORY, in the same direction the oracle is everywhere else: a
         ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
         "wrong", and must not block a registration that worked before this
-        guard existed. Only a resolved identity that DISAGREES refuses. The
-        same holds one level down: ``organizationUuid: None`` means the
-        profile response carried no organization block at all — structurally
-        ABSENT, not "personal" — so it is unverifiable too, exactly like the
-        class's own ``_resolved_matches_slot_identity`` treats it
-        (``if r_org is None: return None``).
+        guard existed. Only a resolved identity that DISAGREES refuses. One
+        level down, ``organizationUuid: None`` means the profile response
+        carried no organization block at all — structurally ABSENT, not
+        "personal". That is unverifiable ONLY about the org, exactly like the
+        class's own ``_resolved_matches_slot_identity``: its
+        ``if r_org is None: return None`` sits inside the branch where the
+        email already matches, so it never excuses a disagreeing email --
+        only a matching email gets the benefit of an absent org.
         """
         token = oauth.extract_access_token(creds)
         if not token:
             return
         oauth_data = oauth.extract_oauth_data(creds)
         if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
-            return                      # already dead, cannot resolve anyway
+            # refresh_oauth_credentials already no-ops (no network) when there
+            # is no refresh token to use -- one None-check covers both "truly
+            # dead" and "refresh attempt failed".
+            refreshed = oauth.refresh_oauth_credentials(creds)
+            if not refreshed:
+                return                  # unresolvable, not wrong
+            token = oauth.extract_access_token(refreshed)
+            if not token:
+                return
         profile = oauth.fetch_oauth_profile(token)
         if not profile:
             return                      # unresolvable, not wrong
         seen = (profile.get("email") or "").strip()
         if not seen:
             return                      # uuid-only resolution says nothing here
+        same_email = seen.lower() == email.lower()
+        if not same_email:
+            raise ConfigError(
+                f"The stored credential does not belong to {email}: the token "
+                f"resolves to {seen}. Nothing was changed. This happens when the "
+                f"config names one account while the credential store still holds "
+                f"another's token (e.g. a renamed .claude.json over a live "
+                f"keychain item). Log in as {email} in THIS environment, then "
+                f"re-run."
+            )
         resolved_org = profile.get("organizationUuid")
         if resolved_org is None:
             return                      # structurally absent -- unverifiable
         seen_org = resolved_org.strip()
-        same_email = seen.lower() == email.lower()
-        if same_email and seen_org == (org_uuid or ""):
+        if seen_org == (org_uuid or ""):
             return
-        if same_email:
-            # Same address, different org: naming the address twice says
-            # nothing (it's the address that agrees) -- name the two
-            # organizations that disagree instead.
-            raise ConfigError(
-                f"The stored credential for {email} belongs to organization "
-                f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
-                f"Nothing was changed. Two accounts can share an email "
-                f"across organizations. Log in as {email} in the "
-                f"{org_uuid or 'personal'} organization in THIS environment, "
-                f"then re-run."
-            )
+        # Same address, different org: naming the address twice says
+        # nothing (it's the address that agrees) -- name the two
+        # organizations that disagree instead.
         raise ConfigError(
-            f"The stored credential does not belong to {email}: the token "
-            f"resolves to {seen}. Nothing was changed. This happens when the "
-            f"config names one account while the credential store still holds "
-            f"another's token (e.g. a renamed .claude.json over a live "
-            f"keychain item). Log in as {email} in THIS environment, then "
-            f"re-run."
+            f"The stored credential for {email} belongs to organization "
+            f"{seen_org or 'personal'}, not {org_uuid or 'personal'}. "
+            f"Nothing was changed. Two accounts can share an email "
+            f"across organizations. Log in as {email} in the "
+            f"{org_uuid or 'personal'} organization in THIS environment, "
+            f"then re-run."
         )
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
