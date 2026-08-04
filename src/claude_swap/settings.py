@@ -47,7 +47,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    strategy: str = (
+        "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    )
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +59,17 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # 0 (default) = disabled. Otherwise: skip a *proactive* switch (active
+    # account over the threshold but not yet at its hard limit) when the
+    # account's own binding window will reset within this many minutes —
+    # ride it to ~100% instead of jumping to a fresh account that didn't
+    # need touching, since the headroom being "saved" would be wiped out by
+    # the reset anyway. Set it >= your 5h window's length (e.g. 300+) to
+    # stop the 5h window from ever triggering an early switch while still
+    # letting the 7d window (which doesn't recycle for days) switch
+    # normally. Never suppresses "at-limit"/failover — those mean the
+    # account is already unusable, so moving is strictly an improvement.
+    grace_before_reset_minutes: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -103,40 +116,90 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
-            "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
+            "autoswitch",
+            "threshold",
+            "threshold",
+            "float",
+            50.0,
+            99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
         SettingSpec(
-            "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
+            "autoswitch",
+            "intervalSeconds",
+            "interval_seconds",
+            "float",
+            15.0,
+            3600.0,
             help="Poll interval for the cswap auto loop, in seconds",
         ),
         SettingSpec(
-            "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
+            "autoswitch",
+            "cooldownSeconds",
+            "cooldown_seconds",
+            "float",
+            0.0,
+            86400.0,
             help="Minimum seconds between proactive switches",
         ),
         SettingSpec(
-            "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
+            "autoswitch",
+            "hysteresisPct",
+            "hysteresis_pct",
+            "float",
+            0.0,
+            50.0,
             help="A target must beat the active account by this many pct",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice",
+            "autoswitch",
+            "strategy",
+            "strategy",
+            "choice",
             choices=("best", "consume-first"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
-            "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
+            "autoswitch",
+            "includeApiKeyAccounts",
+            "include_api_key_accounts",
+            "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
         ),
         SettingSpec(
-            "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
+            "autoswitch",
+            "unhealthyTicks",
+            "unhealthy_ticks",
+            "int",
+            1,
+            100,
             help="Consecutive failed polls before an account is unhealthy",
         ),
         SettingSpec(
-            "autoswitch", "model", "model", "string",
+            "autoswitch",
+            "model",
+            "model",
+            "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
-            "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
+            "autoswitch",
+            "graceBeforeResetMinutes",
+            "grace_before_reset_minutes",
+            "float",
+            0.0,
+            1440.0,
+            help=(
+                "Skip a proactive switch when the active account's binding "
+                "window resets within this many minutes (0=disabled)"
+            ),
+        ),
+        SettingSpec(
+            "ui",
+            "theme",
+            "theme",
+            "choice",
+            choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
     )
@@ -188,12 +251,16 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
-            kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
+            kwargs[spec.field] = (
+                value if isinstance(value, str) and value else spec.default
+            )
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
                     "settings.json: unsupported %s %r; using %r",
-                    spec.dotted, value, spec.default,
+                    spec.dotted,
+                    value,
+                    spec.default,
                 )
                 value = spec.default
             kwargs[spec.field] = value
@@ -242,7 +309,8 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     if theme not in SETTING_SPECS["ui.theme"].choices:
         _logger.warning(
             "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
+            theme,
+            default.theme,
         )
         return default
     return UiSettings(theme=theme)
@@ -267,15 +335,18 @@ def setting_spec(dotted_key: str) -> SettingSpec:
     spec = SETTING_SPECS.get(dotted_key)
     if spec is None:
         raise ConfigError(
-            f"unknown setting '{dotted_key}'\n"
-            f"Valid keys: {', '.join(SETTING_SPECS)}"
+            f"unknown setting '{dotted_key}'\nValid keys: {', '.join(SETTING_SPECS)}"
         )
     return spec
 
 
 _BOOL_WORDS = {
-    "true": True, "1": True, "yes": True,
-    "false": False, "0": False, "no": False,
+    "true": True,
+    "1": True,
+    "yes": True,
+    "false": False,
+    "0": False,
+    "no": False,
 }
 
 
@@ -313,9 +384,7 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if spec.kind == "int" else "a number"
-        raise ConfigError(
-            f"{spec.dotted} expects {noun}, got '{raw_value}'"
-        ) from None
+        raise ConfigError(f"{spec.dotted} expects {noun}, got '{raw_value}'") from None
     if not spec.lo <= value <= spec.hi:
         raise ConfigError(
             f"{spec.dotted} must be between {format_setting_value(spec.lo)} "
@@ -352,13 +421,11 @@ def _read_raw_for_write(path: Path) -> dict:
         raw = json.loads(text)
     except json.JSONDecodeError as e:
         raise ConfigError(
-            f"{path} is not valid JSON ({e}); fix or delete it before "
-            "changing settings"
+            f"{path} is not valid JSON ({e}); fix or delete it before changing settings"
         ) from e
     if not isinstance(raw, dict):
         raise ConfigError(
-            f"{path} is not a JSON object; fix or delete it before "
-            "changing settings"
+            f"{path} is not a JSON object; fix or delete it before changing settings"
         )
     return raw
 
@@ -421,8 +488,13 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     return rows
 
 
-def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
-    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
+def cli_overrides(args) -> dict:
+    """Non-None ``cswap auto`` CLI-flag overrides, keyed by ``AutoSwitchSettings``
+    field name. Shared by ``merged_with_cli`` (startup) and the auto-loop's
+    settings.json hot-reload (``AutoSwitchEngine._maybe_reload_settings``), so a
+    flag passed at launch keeps winning over a later file edit exactly as it
+    does at startup.
+    """
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
@@ -431,13 +503,30 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("grace_before_reset", "grace_before_reset_minutes"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value
+    return overrides
+
+
+def apply_overrides(
+    settings: AutoSwitchSettings, overrides: dict
+) -> AutoSwitchSettings:
+    """Replace fields in ``settings`` from ``overrides`` (field-name keyed),
+    re-clamped into range. The single place both CLI-arg merging and the
+    settings.json hot-reload path build a merged ``AutoSwitchSettings``, so
+    they can never apply overrides differently.
+    """
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))
+
+
+def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
+    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
+    return apply_overrides(settings, cli_overrides(args))
 
 
 def atomic_write_json(path: Path, data: dict) -> None:

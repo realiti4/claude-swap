@@ -85,6 +85,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 ```bash
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
+cswap auto --grace-before-reset 300   # ride an about-to-reset account to ~100%%
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -103,6 +104,8 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+- **Reset grace** (`--grace-before-reset MINUTES`, or `cswap config set autoswitch.graceBeforeResetMinutes 300`): skip a *proactive* switch (over the threshold, but not yet at the hard limit) when the active account's own binding window is about to reset anyway — any headroom a switch would "save" gets wiped out by the reset regardless, so it only spends quota on an account that didn't need touching. Set it to your 5h window's length or more (e.g. `300`) to stop the fast-cycling 5h window from ever triggering an early switch, while the 7d window — which doesn't recycle for days — still switches normally, since its reset is almost never inside the grace window. Off (`0`) by default; never applies once an account is already at its hard limit, where moving is strictly an improvement.
+- A running `cswap auto` loop picks up `cswap config set` / hand edits to `settings.json` made from another terminal without needing a restart (a `settings-reloaded` event is logged when it does); any `--flag` passed at launch keeps overriding the file, same as at startup.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
