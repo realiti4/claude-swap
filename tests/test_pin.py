@@ -539,6 +539,51 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
 
+    def test_clear_wiring_reads_the_receipt_where_the_pin_now_writes_it(
+        self, tmp_path, monkeypatch
+    ):
+        """Same removal, receipt in its NEW home.
+
+        `_cswapPinWiredKeys` / `…Saved` moved out of `.claude.json` into the
+        account store: the `env` block is Claude Code's boot interface and
+        cannot move, but the bookkeeping is cswap's own and does not belong in
+        the user's file. `_wired` above builds the OLD shape, so every other
+        test here exercises the fallback; this one is the forward path.
+
+        It is the same load-bearing property as `test_clear_wiring_works_
+        without_the_extra` — an uninstalled pin must not strand a wiring — and
+        it would fail silently the same way: `clear_wiring` returns False, the
+        proxy vars stay, and every launch dials a dead port.
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import _ledger_path, clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        port = _dead_port()
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {
+            "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+            "CSWAP_PIN_PORT": str(port),
+            "UNRELATED": "keep me",
+        }}))  # NO receipt in the config — the new pin does not put one there
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://127.0.0.1:9901"},
+        }))
+
+        assert clear_wiring(ClaudeAccountSwitcher()) is True, (
+            "the host could not see a wiring the current pin wrote — an "
+            "uninstalled pin would strand it"
+        )
+        env = json.loads(cfg.read_text())["env"]
+        assert "CSWAP_PIN_PORT" not in env
+        assert env["UNRELATED"] == "keep me"
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
+
     def test_clearing_an_unwired_config_is_a_no_op(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
         from claude_swap.pin import clear_wiring

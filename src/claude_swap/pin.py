@@ -589,7 +589,79 @@ def _clear_pin_record(switcher) -> None:
         pass
 
 
-def _wire_mark_of(raw: object) -> list | None:
+# -- where the receipt lives -------------------------------------------------
+#
+# The pin writes proxy vars into `.claude.json`'s `env` block and needs a
+# receipt saying WHICH keys are its own, so unwiring restores exactly what it
+# displaced and touches nothing else.
+#
+# THE ENV BLOCK CANNOT MOVE. Claude Code reads it out of `.claude.json` at
+# boot; that file IS the interface. THE RECEIPT CAN, and should: it is
+# bookkeeping only cswap reads, and `.claude.json` is the user's file — every
+# key we leave in it is one more thing a human editing that file can trip
+# over, and two of them (`_cswapPinWiredKeys`, `_cswapPinWiredKeysSaved`) are
+# opaque unless you know this code.
+#
+# READ BOTH, WRITE NEW. The sidecar is authoritative when present; the config
+# is still read for the copy every existing install has. A pin OLDER than this
+# change keeps writing the config key, and it must keep working — so this is
+# not a migration with a cutover, it is two readers and one writer, and the
+# old location stays readable indefinitely.
+_LEDGER_FILE = "pin-wiring.json"
+
+
+def _ledger_path(config_path):
+    """The sidecar receipt for ``config_path``, under the account store.
+
+    KEYED BY CONFIG PATH, because there are two configs. `cswap run` from a
+    normal terminal wires `~/.claude.json`; from inside a session terminal it
+    wires that session's `CLAUDE_CONFIG_DIR` copy. One sidecar for both would
+    have the second wiring's receipt overwrite the first's, and unwiring would
+    then restore the wrong displaced values into the wrong file — worse than
+    the config key it replaces, which at least travelled WITH its config.
+    """
+    import hashlib
+
+    from claude_swap.paths import get_backup_root
+
+    key = hashlib.sha256(str(config_path).encode("utf-8")).hexdigest()[:16]
+    return get_backup_root() / "pin-wiring" / f"{key}.json"
+
+
+def _read_ledger(config_path) -> dict | None:
+    """The sidecar receipt, or None when there is none to read."""
+    try:
+        raw = json.loads(_ledger_path(config_path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — absent/unreadable is not "wired"
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _clear_ledger(config_path) -> None:
+    """Record "not wired" in the sidecar. Best-effort, never raises.
+
+    WRITES AN EMPTY MARKER rather than deleting the file. `_wire_mark_of`
+    treats a sidecar that says "not wired" as an ANSWER and stops there; a
+    DELETED sidecar is a miss, and the read falls through to the config — so
+    unlinking would let an old config key that a failed earlier write left
+    behind resurrect a wiring this call just removed.
+    """
+    path = None
+    try:
+        path = _ledger_path(config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({_WIRE_MARK: []}), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 — the config write is what matters
+        if path is not None:
+            try:
+                path.with_name(f"{path.name}.{os.getpid()}.tmp").unlink()
+            except OSError:
+                pass
+
+
+def _wire_mark_of(raw: object, config_path=None) -> list | None:
     """The marker THIS module wrote, or None. The single reader.
 
     ``_wiring_present`` and ``_clear_wiring_locked`` both answer "is it
@@ -598,11 +670,44 @@ def _wire_mark_of(raw: object) -> list | None:
     change in a future cswap-pin) therefore satisfied the first and not the
     second, so `--clear` reported "could not remove the wiring — re-run once
     it frees up" forever: nothing was contended and nothing ever converged.
+
+    That single-reader property is what makes the sidecar safe to add: the
+    "read both locations" rule is written HERE, once, so every caller gets it
+    without knowing the receipt moved.
     """
+    if config_path is not None:
+        side = _read_ledger(config_path)
+        if side is not None:
+            ours = side.get(_WIRE_MARK)
+            if isinstance(ours, list) and ours:
+                return ours
+            # A sidecar that exists and says "not wired" is an ANSWER, not a
+            # miss: `--clear` writes it. Falling through to the config here
+            # would resurrect a receipt the clear deliberately emptied.
+            if _WIRE_MARK in side:
+                return None
     if not isinstance(raw, dict):
         return None
     ours = raw.get(_WIRE_MARK)
     return ours if isinstance(ours, list) and ours else None
+
+
+def _saved_of(raw: object, config_path=None) -> dict:
+    """What the wiring displaced, from wherever the receipt lives.
+
+    Same read-both rule as :func:`_wire_mark_of`, and it must stay paired with
+    it: reading the marker from the sidecar and the displaced values from the
+    config would restore one wiring's values over another's keys.
+    """
+    if config_path is not None:
+        side = _read_ledger(config_path)
+        if side is not None and _WIRE_MARK in side:
+            saved = side.get(f"{_WIRE_MARK}Saved")
+            return dict(saved) if isinstance(saved, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    saved = raw.get(f"{_WIRE_MARK}Saved")
+    return dict(saved) if isinstance(saved, dict) else {}
 
 
 def _wiring_present(_switcher) -> bool:
@@ -669,7 +774,7 @@ def wired_config_paths(_switcher=None) -> list:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
             continue
-        if _wire_mark_of(raw) is not None:
+        if _wire_mark_of(raw, path) is not None:
             wired.append(path)
     return wired
 
@@ -683,18 +788,21 @@ def _clear_wiring_locked(switcher, path) -> bool:
     if not isinstance(raw, dict):
         return False
 
-    ours = _wire_mark_of(raw)
+    ours = _wire_mark_of(raw, path)
     if ours is None:
         return False  # nothing of ours in there
 
     env = raw.get("env")
     env = dict(env) if isinstance(env, dict) else {}
-    saved = raw.get(f"{_WIRE_MARK}Saved")
-    saved = dict(saved) if isinstance(saved, dict) else {}
+    saved = _saved_of(raw, path)
     for key in ours:
         env.pop(key, None)
     env.update(saved)
 
+    # BOTH LOCATIONS, always. The receipt may live in either (see
+    # `_wire_mark_of`), and clearing only the one we read from leaves the other
+    # claiming a wiring whose proxy vars are already gone — which every
+    # "is it wired" caller then believes.
     raw.pop(_WIRE_MARK, None)
     raw.pop(f"{_WIRE_MARK}Saved", None)
     if env:
@@ -711,6 +819,12 @@ def _clear_wiring_locked(switcher, path) -> bool:
         switcher._write_json(path, raw)
     except (OSError, ConfigError):
         return False
+    # AFTER the config write, never before. This is the receipt for what the
+    # config still holds; dropping it first and then failing to write the
+    # config would leave the proxy vars in place with nothing recording that
+    # they are ours — unremovable except by hand, the exact failure
+    # `clear_wiring` exists to prevent.
+    _clear_ledger(path)
     return True
 
 
@@ -947,7 +1061,7 @@ def _port_of_config(path) -> int | None:
         # opinion on one fact. It is the stricter test — a marker must be a
         # NON-EMPTY list — and asking it here is what makes "names a port" and
         # "is wired" the same question everywhere.
-        if _wire_mark_of(raw) is None:
+        if _wire_mark_of(raw, path) is None:
             return None
         env = raw.get("env") or {}
         port = int(env.get("CSWAP_PIN_PORT") or 0)
