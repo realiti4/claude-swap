@@ -1591,45 +1591,25 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         assert "○ cloud" not in account_card_text(acc, 80).plain
 
 
-class TestLiveImplIsCachedOffTheRenderPath:
+class TestAMidSessionInstallNeedsNoRestart:
     """``_live_impl`` backs ``is_available``/``pinned_email``, both called on
     every TUI render (AccountsPanel, AccountCard, dashboard._root_entries) —
-    not just on the poll. 0.168ms/call for
-    ``invalidate_caches()``+``find_spec`` with the extra absent, scaling with
-    ``sys.path`` length. A TTL well under the poll cadence removes that per
-    call while still catching a mid-session install."""
+    not just on the poll.
 
-    def test_repeated_calls_within_the_ttl_resolve_only_once(self, monkeypatch):
+    It used to memoise behind a 1.0s TTL, which cost a module-level cache, a
+    ``global``, and an autouse conftest fixture to reset between tests. What
+    it bought, measured: 185us per uncached call, 6 calls per render tick with
+    3 accounts and 13 with 10 — 1.11ms and 2.40ms against a POLL_INTERVAL_S of
+    3000ms, i.e. 0.04-0.08% of one tick. The state was not worth 0.08%.
+
+    What actually has to hold is the USER-VISIBLE contract the TTL existed to
+    protect: installing the extra while the TUI is open must be seen without a
+    restart. That is asserted directly here, so it stays covered no matter how
+    the resolution is (or is not) memoised.
+    """
+
+    def test_an_install_mid_session_is_seen_with_no_restart(self, monkeypatch):
         from claude_swap import pin
-
-        calls = []
-
-        def counted():
-            calls.append(1)
-            return object()
-
-        monkeypatch.setattr(pin, "_impl", counted)
-        for _ in range(5):
-            pin._live_impl()
-        assert len(calls) == 1, (
-            f"_impl() was resolved {len(calls)} times for 5 calls inside the "
-            "TTL — the render path is paying the resolution cost per widget"
-        )
-
-    def test_an_install_mid_session_is_still_seen_once_the_ttl_elapses(
-        self, monkeypatch
-    ):
-        """The cache must not make `cswap pin` need a TUI restart. Simulated
-        with a fake clock rather than a real sleep: the TTL only has to be
-        SHORTER than the poll cadence, not any particular wall-clock value,
-        and a real sleep would make this test's runtime hostage to that
-        constant."""
-        import time as _time
-
-        from claude_swap import pin
-
-        fake_now = [0.0]
-        monkeypatch.setattr(_time, "monotonic", lambda: fake_now[0])
 
         installed = [False]
 
@@ -1640,32 +1620,43 @@ class TestLiveImplIsCachedOffTheRenderPath:
 
         monkeypatch.setattr(pin, "_impl", resolves_once_installed)
         assert pin._live_impl() is None, "resolved before the install happened"
+        assert not pin.is_available(), "the pin surface showed with no extra"
 
-        installed[0] = True  # the install lands mid-TTL-window
-        assert pin._live_impl() is None, (
-            "a cache that resolves an install before its own TTL elapses is "
-            "answering from luck, not from the cache contract"
-        )
-
-        fake_now[0] += pin._LIVE_IMPL_CACHE_TTL_S + 0.01
+        installed[0] = True  # the install lands while the TUI is open
         assert pin._live_impl() is not None, (
-            "the extra was installed but the TUI still needs a restart to see it"
+            "the extra was installed but the TUI still needs a restart to see "
+            "it — a feature that needs a restart to appear reads as broken"
         )
+        assert pin.is_available(), "is_available did not follow _live_impl"
 
-    def test_the_ttl_stays_under_one_poll_interval(self):
-        """The mechanism-level test above expires the cache by construction —
-        it would pass even with a TTL of an hour. Pin the actual VALUE against
-        the TUI's poll cadence so a install is seen within one poll tick, not
-        eventually."""
-        from claude_swap.tui.app import CswapApp
+        # AND THE OTHER DIRECTION, which is what makes this test able to fail.
+        # A memo that never expires still passes the half above: the first
+        # call caches None, the second resolves fresh. Only an UNINSTALL —
+        # a resolution that must go stale in the opposite direction — proves
+        # nothing is being held. Measured: a never-expiring memo passes the
+        # first half in isolation and fails here.
+        installed[0] = False  # e.g. `uv tool install` without the extra
+        assert pin._live_impl() is None, (
+            "the extra went away and the pin surface is still showing — the "
+            "resolution is memoised somewhere and the menu row is a lie"
+        )
+        assert not pin.is_available()
 
+    def test_a_broken_extra_is_no_pin_rather_than_a_raise(self, monkeypatch):
+        """The render path must never take the view down.
+
+        `_impl` raises for a broken install (its whole reason for existing is
+        to tell "absent" from "broken"), and every caller here is a badge or a
+        menu row. None is the honest answer for both.
+        """
         from claude_swap import pin
 
-        assert pin._LIVE_IMPL_CACHE_TTL_S < CswapApp.POLL_INTERVAL_S, (
-            "the cache outlives a poll interval — a mid-session install would "
-            "need more than one refresh_root_menu tick to appear"
-        )
+        def boom():
+            raise RuntimeError("cryptography is broken")
 
+        monkeypatch.setattr(pin, "_impl", boom)
+        assert pin._live_impl() is None
+        assert pin.is_available() is False
 
 class TestSafeRedaction:
     """``_safe`` is the only security-relevant helper in this file, and

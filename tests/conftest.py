@@ -442,14 +442,3 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
 
 
-@pytest.fixture(autouse=True)
-def _reset_pin_live_impl_cache():
-    """``pin._live_impl`` caches its resolution for a short TTL (the render-path
-    cost fix). Reset the bare module-level cache before every test so one
-    test's monkeypatched ``pin._impl`` can never leak into the next through a
-    still-warm cache — tests run far faster than the TTL would otherwise
-    expire on its own. Being autouse, this fixture's own pre-test reset is
-    what the NEXT test relies on too, so nothing after the yield is needed."""
-    from claude_swap import pin
-
-    pin._live_impl_cache = (float("-inf"), None)

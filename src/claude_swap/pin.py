@@ -202,21 +202,6 @@ def _impl() -> ModuleType:
     return importlib.import_module("cswap_pin.proxy")
 
 
-# Both display helpers (is_available/pinned_email) are called on every TUI
-# RENDER — AccountsPanel.render, AccountCard.render, and twice per
-# dashboard._root_entries — not just on the poll, and _live_impl's
-# invalidate_caches()+find_spec costs ~0.168ms/call with the extra absent,
-# scaling with sys.path length. A TTL well under the TUI's
-# poll cadence (POLL_INTERVAL_S = 3.0 in tui/app.py) removes that from every
-# render while still noticing a mid-session install: dashboard.refresh_root_menu
-# re-renders on every poll tick, so a cache younger than one poll interval is
-# stale for at most one render, never for the rest of the session — no
-# restart required. Tests must reset this between runs (see conftest.py); it
-# is bare module state so nothing else has to plumb a cache handle through.
-_LIVE_IMPL_CACHE_TTL_S = 1.0
-_live_impl_cache: tuple[float, ModuleType | None] = (float("-inf"), None)
-
-
 def _live_impl() -> ModuleType | None:
     """The implementation if it is usable RIGHT NOW, else None. Never raises.
 
@@ -230,25 +215,23 @@ def _live_impl() -> ModuleType | None:
     invisible without it — the "I installed it and the menu is still missing"
     case.
 
-    Cached for ``_LIVE_IMPL_CACHE_TTL_S`` (see the module-level comment) so a
-    render burst pays for the resolution once, not once per widget.
+    NOT MEMOISED, deliberately. A 1.0s TTL lived here, with a module-level
+    cache, a ``global``, and an autouse conftest fixture to reset it between
+    tests. Measured against what it bought: 185us per uncached call, and a
+    render tick makes 6 calls at 3 accounts / 13 at 10 — 1.11ms and 2.40ms
+    against POLL_INTERVAL_S of 3000ms, so 0.04-0.08% of one tick. It also
+    made the thing it was supposed to protect worse: an install landing
+    INSIDE the TTL window was invisible until the window expired, and the
+    test that "proved" otherwise advanced a fake clock past the TTL, so it
+    asserted the cache's own contract rather than the user's.
     """
     import importlib
-    import time as _time
-
-    global _live_impl_cache
-    cached_at, cached = _live_impl_cache
-    now = _time.monotonic()
-    if now - cached_at < _LIVE_IMPL_CACHE_TTL_S:
-        return cached
 
     importlib.invalidate_caches()
     try:
-        resolved = _impl()
+        return _impl()
     except Exception:  # noqa: BLE001
-        resolved = None
-    _live_impl_cache = (now, resolved)
-    return resolved
+        return None
 
 
 def is_available() -> bool:
