@@ -1363,14 +1363,37 @@ def configured_port(switcher) -> int | None:
         saved = raw.get("port") if isinstance(raw, dict) else None
     except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
         pass
-    for value in (os.environ.get("CSWAP_PIN_PORT"), saved):
+    # THE ENV VAR HAS TWO AUTHORS, and only one is the user. cswap-pin writes
+    # `CSWAP_PIN_PORT` into `.claude.json`'s env block as its self-loop marker,
+    # and Claude Code applies that block at boot — so every process inside a
+    # pinned session inherits it, including this one. Reading it back as a
+    # SETTING makes the pin's own address look like something the user asked
+    # for. `CSWAP_PIN_WIRED` is written beside it and nowhere else, so it
+    # identifies our value; an rc export has no companion. Same rule, same
+    # reasoning, as the package's own `_env_port`.
+    env_value = None if os.environ.get("CSWAP_PIN_WIRED") else os.environ.get(
+        "CSWAP_PIN_PORT"
+    )
+    # THE ENVIRONMENT ANSWERS OR IT DOES NOT — it never falls through to the
+    # file. `CSWAP_PIN_PORT=0` means "let the kernel choose", the same thing
+    # `--set_port 0` means; falling through made one word mean two things, and
+    # an rc export could not force a dynamic port on a machine that had ever
+    # been given a fixed one. A TYPO still falls through: it is not an
+    # instruction, and the saved setting beats nothing.
+    if env_value is not None:
         try:
-            port = int(value)
+            port = int(env_value)
         except (TypeError, ValueError):
-            continue
-        if 0 < port <= 65535:
+            port = None
+        if port == 0:
+            return None
+        if port is not None and 0 < port <= 65535:
             return port
-    return None
+    try:
+        port = int(saved)
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port <= 65535 else None
 
 
 def _certdir(switcher):

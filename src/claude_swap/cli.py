@@ -120,7 +120,7 @@ Examples:
   cswap pin --clear    remove the pin
   cswap pin --heal     restart a pin proxy that died, or unwire it
   cswap pin --get_port print the serving port (for scripts), or exit 1
-  cswap pin --set_port N   serve on port N from the next start (0 clears)
+  cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
         """,
     )
@@ -159,9 +159,10 @@ Examples:
         type=int,
         metavar="N",
         help=(
-            "Serve on port N from the next daemon start (0 clears it and "
-            "returns to an ephemeral port). CSWAP_PIN_PORT in the environment "
-            "still wins."
+            "Serve on port N from the next daemon start. 0 means dynamic: "
+            "the kernel picks the port, which is the default. CSWAP_PIN_PORT "
+            "in the environment outranks this, and 0 there means the same "
+            "thing."
         ),
     )
     # THE LAUNCH HOOK. `--heal` prints its verdict and is called by a human or
