@@ -50,17 +50,67 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     path it REACHED. Why a wiring could not be REMOVED is a different record —
     the lock WARNING at the bottom of `clear_wiring`.
     """
-    # `stacklevel=2` ATTRIBUTES THE RECORD TO THE CALLER. Without it all three
-    # call sites' records are identical in origin — same `funcName`, same
-    # `pathname`, same `lineno` — so nothing downstream can tell the per-tick
-    # getters from the gated one, and a guard on this split can only key on
-    # LEVEL. With it, `record.funcName` is `_wiring_present` / `_wired_ports` /
-    # `clear_wiring`.
+    # `stacklevel=3` ATTRIBUTES THE RECORD TO THE CONSUMER. Without it all
+    # three call sites' records are identical in origin — same `funcName`,
+    # same `pathname`, same `lineno` — so nothing downstream can tell the
+    # per-tick getters from the gated one, and a guard on this split can only
+    # key on LEVEL. With it, `record.funcName` is `_wiring_present` /
+    # `_wired_ports` / `clear_wiring`.
+    #
+    # THREE, NOT TWO, because the traversal is now one shared generator
+    # (`_each_config`) rather than three copies of the loop: 2 would name
+    # `_each_config` for all of them, which is precisely the collapse this
+    # argument exists to prevent. Verified against a generator AND a
+    # comprehension consumer — a comprehension reports its ENCLOSING function
+    # (inlined since 3.12; this project's floor), not a `<listcomp>` frame.
     #
     # Production output is UNCHANGED: `logging_config` formats
     # "%(asctime)s - %(levelname)s - %(message)s" and never renders funcName,
     # filename or lineno.
-    _logger.log(level, "%s could not be resolved: %s", get.__name__, exc, stacklevel=2)
+    _logger.log(level, "%s could not be resolved: %s", get.__name__, exc, stacklevel=3)
+
+
+def _each_config(level: int = logging.DEBUG):
+    """Both global configs, in read order, de-duplicated, guards applied.
+
+    THE GETTER ITSELF CAN RAISE, and that is why this exists as one function
+    rather than three loops. ``get_default_global_config_path`` calls
+    ``Path.home()``, which raises ``RuntimeError`` when HOME is unset and the
+    uid has no ``/etc/passwd`` entry (the standard rootless-container shape).
+    ``heal``'s docstring promises "never raises" because the status line calls
+    it on a timer, and ``_wired_ports`` sits on the path from ``heal`` through
+    ``_wired_port_is_serving`` with no guard above it — an unguarded raise
+    there reaches the status line's caller directly, so ``pin.heal(sw)``
+    raises ``RuntimeError`` instead of returning ``(False, 'Could not heal…')``.
+
+    A config this cannot even LOCATE has no opinion — a fact about ONE config,
+    never a reason to abandon the other, which is why it continues rather than
+    propagating.
+
+    ``level`` is the caller's, and only ``clear_wiring`` raises it to WARNING;
+    see the comment at that call site for why that one is allowed to be loud
+    and the two ``heal`` calls unconditionally are not.
+
+    De-duplicated because the two getters return the SAME path whenever
+    ``CLAUDE_CONFIG_DIR`` is unset, and every caller would otherwise do its
+    work on that config twice.
+    """
+    from claude_swap.paths import (
+        get_default_global_config_path,
+        get_global_config_path,
+    )
+
+    seen = set()
+    for get in (get_global_config_path, get_default_global_config_path):
+        try:
+            path = get()
+        except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
+            _log_unresolvable(get, exc, level)
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        yield path
 
 
 def _install_how() -> str:
@@ -399,35 +449,25 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # default profile was never attempted because HOME could not be found"
     # and "the default profile was attempted and had nothing wired" are the
     # same silence from the outside.
-    paths = []
-    for get in (get_global_config_path, get_default_global_config_path):
-        try:
-            path = get()
-        except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
-            # WARNING HERE ONLY. `heal` reaches `clear_wiring` through
-            # `_wiring_is_stale`, which goes false ONCE THE REMOVAL SUCCEEDS,
-            # so this logs once and goes quiet. The two getters `heal` calls
-            # UNCONDITIONALLY stay at DEBUG (see `_log_unresolvable`).
-            #
-            # THIS RECORD DOES NOT EXPLAIN AN UNREMOVABLE WIRING, and must not
-            # be read as if it did. On the flagship shape — read-only config
-            # dir, HOME resolvable — nothing raises here and it never fires;
-            # what fires is `heal`'s own "the config is locked" message. Make
-            # `Path.home()` raise too and this names
-            # `get_default_global_config_path` while the STUCK config is the
-            # one the other getter resolved fine. Put the wiring in the raising
-            # getter's config and `_wiring_present` cannot see it either, so
-            # `heal` answers "Nothing to heal" and never reaches this function.
-            #
-            # What names an unremovable wiring is the lock-failure WARNING at
-            # the bottom of this function. This record's job is the narrower
-            # one it can do: a config that could not be LOCATED is missing from
-            # `paths`, and `clear_wiring`'s bool is a claim about every path it
-            # REACHED.
-            _log_unresolvable(get, exc, logging.WARNING)
-            continue
-        if path not in paths:
-            paths.append(path)
+    # WARNING HERE ONLY, which is the whole reason this passes a level. `heal`
+    # reaches `clear_wiring` through `_wiring_is_stale`, which goes false ONCE
+    # THE REMOVAL SUCCEEDS, so this logs once and goes quiet. The two getters
+    # `heal` calls UNCONDITIONALLY stay at DEBUG (see `_log_unresolvable`).
+    #
+    # THIS RECORD DOES NOT EXPLAIN AN UNREMOVABLE WIRING, and must not be read
+    # as if it did. On the flagship shape — read-only config dir, HOME
+    # resolvable — nothing raises here and it never fires; what fires is
+    # `heal`'s own "the config is locked" message. Make `Path.home()` raise
+    # too and this names `get_default_global_config_path` while the STUCK
+    # config is the one the other getter resolved fine. Put the wiring in the
+    # raising getter's config and `_wiring_present` cannot see it either, so
+    # `heal` answers "Nothing to heal" and never reaches this function.
+    #
+    # What names an unremovable wiring is the lock-failure WARNING at the
+    # bottom of this function. This record's job is the narrower one it can
+    # do: a config that could not be LOCATED is missing from `paths`, and
+    # `clear_wiring`'s bool is a claim about every path it REACHED.
+    paths = list(_each_config(logging.WARNING))
 
     # ONE LOCK PER PATH. The shared config lock derives its directory from
     # get_global_config_path(), so a single lock around the loop guards one
@@ -822,23 +862,8 @@ def wired_config_paths(_switcher=None) -> list:
     Same traversal, same guards, same de-dup as ``_wiring_present`` — it is
     now written once here and that predicate reads this.
     """
-    from claude_swap.paths import (
-        get_default_global_config_path,
-        get_global_config_path,
-    )
-
-    wired, seen = [], set()
-    for get in (get_global_config_path, get_default_global_config_path):
-        # The getter itself can raise; see `_wiring_present` above for why
-        # `heal` cannot afford that to escape.
-        try:
-            path = get()
-        except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
-            _log_unresolvable(get, exc)
-            continue
-        if path in seen:
-            continue
-        seen.add(path)
+    wired = []
+    for path in _each_config():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
@@ -1159,35 +1184,7 @@ def _wired_ports() -> list[int]:
     ``clear_wiring``, the every-config-must-serve probe below) where both
     configs' opinions genuinely apply at once.
     """
-    from claude_swap.paths import (
-        get_default_global_config_path,
-        get_global_config_path,
-    )
-
-    ports, seen = [], set()
-    for get in (get_global_config_path, get_default_global_config_path):
-        # THE GETTER ITSELF CAN RAISE. `get()` is not just "resolve a path and
-        # a set membership test": `get_default_global_config_path` calls
-        # `Path.home()`, which raises RuntimeError when HOME is unset and the
-        # uid has no /etc/passwd entry (the standard rootless-container
-        # shape). `heal`'s docstring promises "never raises" because the
-        # status line calls it on a timer, and this function sits on the path
-        # from `heal` through `_wired_port_is_serving` with no guard above it
-        # — an unguarded raise here reaches the status line's caller directly,
-        # so `pin.heal(sw)` raises RuntimeError instead of returning
-        # ``(False, 'Could not heal…')``.
-        try:
-            path = get()
-        except Exception as exc:  # noqa: BLE001 — unreadable/unresolvable: no opinion
-            _log_unresolvable(get, exc)
-            continue
-        if path in seen:
-            continue
-        seen.add(path)
-        port = _port_of_config(path)
-        if port:
-            ports.append(port)
-    return ports
+    return [port for path in _each_config() if (port := _port_of_config(path))]
 
 
 def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
