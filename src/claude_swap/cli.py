@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import shlex
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -163,6 +165,17 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--share-all",
+        action="store_true",
+        help=(
+            "Symlink EVERYTHING from ~/.claude into the session profile — "
+            "plugins, hooks, todos, history, the lot — except credentials "
+            "and per-profile state (.claude.json, sessions/, ide/, statsig/, "
+            "backups/). The profile becomes auth-only. Implies "
+            "--share-history; POSIX only."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -183,6 +196,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_all=args.share_all,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -194,6 +208,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_all=args.share_all,
             )
             return  # only reachable in tests
         if email is not None:
@@ -215,6 +230,134 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _env_command(argv: list[str]) -> None:
+    """Handle `cswap env [NUM|EMAIL]` — print a shell `export` line.
+
+    Bootstraps (or reuses) the account's session profile exactly like
+    `cswap run`, but instead of launching claude it prints
+    ``export CLAUDE_CONFIG_DIR=<profile>`` on stdout, so shell hooks can pin
+    a whole terminal — or a directory, via a chpwd/PROMPT_COMMAND hook — to
+    an account without wrapping the claude launch:
+
+        eval "$(cswap env 2)"
+
+    Sharing defaults to --share-all: the profile is auth-only and everything
+    else stays one set of files in ~/.claude. Everything except the final
+    export line is routed to stderr so `eval "$(...)"` never executes
+    bootstrap chatter.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} env",
+        description=(
+            "Bootstrap an account's session profile and print the "
+            "`export CLAUDE_CONFIG_DIR=...` line for shell hooks "
+            "(per-shell / per-directory account selection)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  eval "$(cswap env 2)"
+  eval "$(cswap env user@example.com)"
+  eval "$(cswap env)"        # resolve from the current directory's mapping
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account (number or email). Omit to use the current "
+        "directory's mapping (see `cswap map`).",
+    )
+    parser.add_argument(
+        "--share-all",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Symlink everything from ~/.claude except credentials and "
+            "per-profile state into the profile (default: on). "
+            "--no-share-all falls back to the standard shared set."
+        ),
+    )
+    parser.add_argument(
+        "--share-history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --no-share-all: also share projects/ and history.jsonl.",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if sys.platform == "win32":
+        error("Error: `env` prints POSIX shell syntax; not supported on Windows.")
+        sys.exit(1)
+
+    session_dir = None
+    # The caller evals stdout: nothing but the export line may reach it.
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            switcher = ClaudeAccountSwitcher(debug=args.debug)
+            _guard_root(switcher)
+
+            from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, SessionManager
+
+            manager = SessionManager(switcher)
+
+            identifier = args.account
+            if identifier is None:
+                slot, email = switcher.slot_for_directory(os.getcwd())
+                if slot is None:
+                    if email is not None:
+                        warning(
+                            f"Mapped account {email} no longer exists — "
+                            "not printing an export line."
+                        )
+                    else:
+                        print(dimmed(f"No account mapped for {os.getcwd()}."))
+                    sys.exit(3)
+                identifier = slot
+
+            # Same-account guard, mirroring `run`'s fast path: if the target
+            # account IS the active default login, bootstrapping a profile
+            # would seed a second copy of its live refresh-token family, and
+            # the next rotation (either side) can invalidate the other —
+            # logging running claudes out. No override is needed anyway:
+            # print nothing and exit 0 so eval'ing hooks fall through to the
+            # default login, which already is the requested account.
+            account_num, email, org_uuid = switcher.resolve_account(identifier)
+            current = switcher._get_current_account()
+            if current is not None and current == (email, org_uuid):
+                print(
+                    dimmed(
+                        f"Account-{account_num} ({email}) is already the "
+                        "active default login — no export needed."
+                    )
+                )
+                sys.exit(0)
+
+            overrides = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+            if overrides:
+                warning(
+                    f"{', '.join(overrides)} is set in this shell and will "
+                    "override the profile's account inside Claude Code."
+                )
+
+            session_dir, account_num, email = manager.setup_session(
+                identifier,
+                share=True,
+                share_history=args.share_history,
+                share_all=args.share_all,
+            )
+            print(dimmed(f"Account-{account_num} ({email}) session profile ready."))
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print(f"\n{dimmed('Operation cancelled')}")
+            sys.exit(130)
+
+    print(f"export CLAUDE_CONFIG_DIR={shlex.quote(str(session_dir))}")
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -869,6 +1012,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "env":
+        _env_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -920,6 +1066,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s env [num|email]            print `export CLAUDE_CONFIG_DIR=...` for shell hooks
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
