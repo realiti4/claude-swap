@@ -629,7 +629,6 @@ def _clear_pin_record(switcher) -> None:
 # change keeps writing the config key, and it must keep working — so this is
 # not a migration with a cutover, it is two readers and one writer, and the
 # old location stays readable indefinitely.
-_LEDGER_FILE = "pin-wiring.json"
 
 
 def _ledger_path(config_path):
@@ -663,10 +662,14 @@ def _clear_ledger(config_path) -> None:
     """Record "not wired" in the sidecar. Best-effort, never raises.
 
     WRITES AN EMPTY MARKER rather than deleting the file. `_wire_mark_of`
-    treats a sidecar that says "not wired" as an ANSWER and stops there; a
-    DELETED sidecar is a miss, and the read falls through to the config — so
-    unlinking would let an old config key that a failed earlier write left
-    behind resurrect a wiring this call just removed.
+    treats a sidecar that says "not wired" as the answer FOR THE SIDECAR and
+    stops there when the config carries no marker of its own; a DELETED
+    sidecar is a miss, so unlinking would let an old config key that a failed
+    earlier write left behind resurrect a wiring this call just removed.
+
+    It does NOT silence a marker in the config: that is a receipt this clear
+    never saw, and reading the empty sidecar as an answer for BOTH locations
+    made an older cswap-pin's wiring invisible to every recovery path.
     """
     path = None
     try:
@@ -674,6 +677,13 @@ def _clear_ledger(config_path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({_WIRE_MARK: []}), encoding="utf-8")
+        # 0600 BEFORE the rename, like every other writer in this store. The
+        # ambient umask put this file at 0644 next to the package's 0600 ones
+        # in the same directory. The contents are key NAMES, not secrets, so
+        # this is consistency rather than exposure — but a store where the
+        # mode depends on which component wrote last is one someone will
+        # eventually read the wrong way.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except Exception:  # noqa: BLE001 — the config write is what matters
         if path is not None:
@@ -926,6 +936,18 @@ def clear_pin(switcher) -> tuple[bool, str]:
         # This is the stranding clear_wiring was moved into this repo to
         # prevent, one level up: the wiring is cswap's file and gets cleared,
         # and settings.json -> remoteControl is equally cswap's file.
+        _clear_pin_record(switcher)
+    # AND THE SAME FALLBACK WHEN IT DID NOT RAISE. A peer whose `apply_pin`
+    # RETURNS and clears nothing reaches the dead end the branch above exists
+    # to prevent, without going through it: the record is still there, the
+    # re-read below says "still pinned", and the user is told to "re-run once
+    # it frees up" — advice that never converges, which is the exact wording
+    # the comment above rejects. An older peer, or one whose pin backend is
+    # off, does precisely this. Measured before this line:
+    #     run 1: False 'Could not remove the pin …'  record: a@b.c
+    #     run 2: False 'Could not remove the pin …'  record: a@b.c
+    # The failure is what the peer DID, not whether it raised, so ask.
+    if _pinned_email_now(switcher) is not None:
         _clear_pin_record(switcher)
     cleared = clear_wiring(switcher)
     still_pinned = _pinned_email_now(switcher) is not None

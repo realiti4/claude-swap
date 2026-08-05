@@ -477,6 +477,69 @@ class TestLaunchIsNeverBlocked:
             "inherits it, which is disaster path D"
         )
 
+    def test_a_config_write_that_fails_does_not_report_the_wiring_removed(
+        self, tmp_path, monkeypatch
+    ):
+        """A FAILED UNWIRE MUST NOT READ AS A REMOVED WIRING.
+
+        `_clear_wiring_locked` writes through `switcher._write_json`, and that
+        write is the whole operation: the proxy vars are still in the file
+        until it lands. Every existing test hands it a stub that writes
+        successfully, so the failure path — a read-only home, a full disk, a
+        `ConfigError` from the switcher's own validation — has never run.
+
+        The direction matters more than the failure. Reporting "removed" when
+        the vars are still there sends every caller down the wrong branch:
+        `run(..., ensure=True)` stops repairing, and the user is told the pin
+        is gone while every new session still dials the proxy.
+
+        THE CONTROL is the same call with a working writer, which must report
+        removal — otherwise "does not report removed" would pass for a
+        `clear_wiring` that never removes anything.
+        """
+        import types
+
+        import claude_swap.paths as paths
+
+        from claude_swap import pin
+
+        def _cleared(writer):
+            # A DIRECTORY PER ATTEMPT, created first: `_cfg` writes into it
+            # rather than making it, and the two attempts must not share a
+            # config or the control's result answers for both.
+            home = tmp_path / writer.__name__
+            home.mkdir(parents=True, exist_ok=True)
+            cfg = _cfg(home, "cfgdir", _dead_port())
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: cfg
+            )
+            sw = types.SimpleNamespace(backup_dir=tmp_path, _write_json=writer)
+            ok = pin.clear_wiring(sw)
+            still = json.loads(cfg.read_text(encoding="utf-8"))
+            return ok, "HTTPS_PROXY" in (still.get("env") or {})
+
+        def works(p, d):
+            p.write_text(json.dumps(d), encoding="utf-8")
+
+        def fails(p, d):
+            raise OSError("read-only file system")
+
+        # CONTROL: a working writer really removes the wiring.
+        ok, still_wired = _cleared(works)
+        assert ok and not still_wired, (
+            f"CONTROL FAILED: a normal unwire did not happen "
+            f"(ok={ok} still_wired={still_wired})"
+        )
+
+        ok, still_wired = _cleared(fails)
+        assert still_wired, "premise: the failed write left the vars in place"
+        assert not ok, (
+            "clear_wiring reported the wiring removed while HTTPS_PROXY is "
+            "still in .claude.json — `--ensure` stops repairing and every new "
+            "session keeps dialling the proxy"
+        )
+
     def test_a_peer_that_returns_a_broken_env_cannot_reach_execvpe(
         self, tmp_path, monkeypatch
     ):
@@ -2544,6 +2607,80 @@ class TestTheVerdictIsSharedNotDuplicated:
         ok, msg = pin.clear_pin(sw)
         assert not ok, msg
         assert "wiring" in msg, msg
+
+    def test_clear_pin_converges_against_a_peer_that_silently_does_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """`--clear` MUST NOT TELL THE USER TO RE-RUN A COMMAND THAT CANNOT WORK.
+
+        The record is cleared here only in the `except` branch, on the
+        reasoning — spelled out in that branch's own comment — that advice
+        which "never converges (run 2 is identical)" is worse than useless.
+        A peer whose `apply_pin` RETURNS WITHOUT RAISING and clears nothing
+        reaches the same dead end without going through the except at all.
+
+        Measured against this code before the fix:
+            run 1: False 'Could not remove the pin — re-run once it frees up'
+                   record: a@b.c
+            run 2: False 'Could not remove the pin — re-run once it frees up'
+                   record: a@b.c
+
+        Identical forever, and the record is cswap's OWN file the whole time.
+        A released peer that no-ops on `apply_pin(sw, None, None)` — an older
+        one, or one whose pin backend is disabled — leaves the user unable to
+        unpin by any documented means.
+
+        The failure is what the peer DID, not whether it raised, so the
+        re-read that already runs is what should drive the fallback.
+
+        THE CONTROL is a peer that clears properly, which must NOT have its
+        record touched by the fallback path — otherwise "converges" would pass
+        for a `--clear` that ignores the peer entirely.
+        """
+        import types
+
+        from claude_swap import pin
+
+        state = {"pinned": "a@b.c", "record_cleared": 0}
+
+        def _run(peer_clears):
+            state["pinned"] = "a@b.c"
+            monkeypatch.setattr(
+                pin, "_impl",
+                lambda: types.SimpleNamespace(
+                    apply_pin=lambda *a, **k: (
+                        state.update(pinned=None) if peer_clears else None
+                    )
+                ),
+            )
+            monkeypatch.setattr(pin, "clear_wiring", lambda *a, **k: False)
+            monkeypatch.setattr(pin, "_wiring_present", lambda *a, **k: False)
+            monkeypatch.setattr(
+                pin, "_pinned_email_now", lambda sw: state["pinned"]
+            )
+            monkeypatch.setattr(
+                pin, "_clear_pin_record",
+                lambda sw: state.update(
+                    pinned=None, record_cleared=state["record_cleared"] + 1
+                ),
+            )
+            return pin.clear_pin(object())
+
+        # CONTROL: a peer that really clears must succeed on its own.
+        before = state["record_cleared"]
+        ok, msg = _run(peer_clears=True)
+        assert ok, f"CONTROL FAILED: a working peer could not unpin: {msg}"
+        assert state["record_cleared"] == before, (
+            "the fallback ran even though the peer had already cleared the "
+            "record — `--clear` is ignoring the peer"
+        )
+
+        ok, msg = _run(peer_clears=False)
+        assert ok, (
+            f"a peer that silently did nothing left the pin in place and told "
+            f"the user to re-run: {msg!r} — run 2 is identical, forever"
+        )
+        assert state["pinned"] is None, "the record survived a successful clear"
 
     def test_clear_pin_succeeds_when_both_are_gone(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
