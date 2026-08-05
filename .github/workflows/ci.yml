@@ -78,16 +78,8 @@ jobs:
           # free on a public repo — and drops the longest shard to ~13s.
           - name: autoswitch
             paths: tests/test_autoswitch.py
-          # pin and cli SEPARATE, not one shard. Together they were the
-          # longest job at 48s (21.3s of tests) while `switcher` finished in
-          # 28s, and they are the two files that spawn interpreters — the one
-          # operation Windows is several times slower at. Nothing makes them
-          # belong together; they were grouped when the cost model still
-          # blamed the wrong file.
-          - name: pin
-            paths: tests/test_pin.py
-          - name: cli
-            paths: tests/test_cli.py
+          - name: pin-cli
+            paths: tests/test_pin.py tests/test_cli.py
           - name: switcher
             paths: tests/test_switcher.py
           - name: rest
