@@ -51,22 +51,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Split by MEASURED time, not by file count. Linux at 4 workers:
-          # tui+pin+cli 10.5s, the rest 5.2s, switcher+autoswitch 2.9s — so
-          # the 618-test shard is the FAST one and the 434-test shard is the
-          # slow one. Splitting by count would have put the three heaviest
-          # files together.
-          - name: tui-pin-cli
+          # BALANCED ON THE WINDOWS NUMBERS, because Windows is the platform
+          # that sets the clock and it does NOT rank these the way Linux does.
+          # First sharded run, same tests on both:
+          #
+          #     shard                 linux  windows  ratio
+          #     switcher+autoswitch   2.93s   26.9s    9.2x
+          #     tui-pin-cli          10.54s   21.4s    2.0x
+          #     rest                  5.21s   12.9s    2.5x
+          #
+          # A Linux-derived split made the fastest Linux shard the SLOWEST
+          # Windows job. The 9.2x is filesystem: test_switcher.py builds 138
+          # switchers over 576 tmp_path/temp_home uses, and each construction
+          # runs the real migration checks against a fresh directory — the
+          # production path these tests exist to cover, so it is cost to
+          # spread rather than cost to remove.
+          - name: switcher
+            paths: tests/test_switcher.py
+          - name: tui-cli-autoswitch
             paths: >-
               tests/test_tui.py tests/test_tui_pin.py tests/test_menubar.py
-              tests/test_pin.py tests/test_cli.py
-          - name: switcher-autoswitch
-            paths: tests/test_switcher.py tests/test_autoswitch.py
+              tests/test_autoswitch.py
           - name: rest
             paths: >-
-              --ignore=tests/test_tui.py --ignore=tests/test_tui_pin.py
-              --ignore=tests/test_menubar.py --ignore=tests/test_pin.py
-              --ignore=tests/test_cli.py --ignore=tests/test_switcher.py
+              --ignore=tests/test_switcher.py --ignore=tests/test_tui.py
+              --ignore=tests/test_tui_pin.py --ignore=tests/test_menubar.py
               --ignore=tests/test_autoswitch.py
     name: test-windows (${{ matrix.name }})
 
