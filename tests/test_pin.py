@@ -1999,6 +1999,37 @@ class TestTheExtraIsGatedByOneFloorOnly:
             [sys.executable, "-c", code], capture_output=True, text=True
         ).stdout
 
+    def test_the_extra_names_no_version_at_all(self):
+        """AND NOT IN PYPROJECT EITHER. The class above argues a floor cannot
+        survive the release cycle; the extra carried one anyway.
+
+        Measured: `pin = ["cswap-pin>=0.1.3"]` sat unchanged through
+        THIRTY-SIX releases of cswap-pin. So `uv tool install
+        'claude-swap[pin]'` resolved a pin from before the port handdown, the
+        chain walk and the launch hook — on a machine that looked correctly
+        installed, because a satisfied floor says nothing. The user's dotfiles
+        grew a 248-line installer to work around exactly this.
+
+        Unpinned resolves to the LATEST release, which is what a fresh install
+        should get and what the floor was only ever approximating badly.
+        Keeping a bad release out is an install-time job, as this class
+        already says about the runtime check.
+        """
+        import re
+        import tomllib
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        raw = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        specs = raw["project"]["optional-dependencies"]["pin"]
+
+        for spec in specs:
+            assert not re.search(r"[<>=!~]", spec), (
+                f"the pin extra pins a version: {spec!r}. A constant somebody "
+                f"must remember to raise goes stale silently — this one sat at "
+                f"0.1.3 through 36 releases while every install looked fine."
+            )
+
     def test_no_version_is_refused_at_runtime(self):
         """Any installed version imports. Refusing one here would need a
         constant this project cannot keep current."""
@@ -2011,18 +2042,6 @@ class TestTheExtraIsGatedByOneFloorOnly:
             expected = "not available on Windows" if self.WIN else "ACCEPTED"
             assert expected in out, f"{literal!r} -> {out}"
             assert "too old" not in out, f"a runtime floor came back: {out}"
-
-    def test_the_floor_is_declared_in_pyproject(self):
-        """The one place it lives. If this disappears, an install resolves to
-        whatever is newest and the correctness bound is gone entirely."""
-        import re
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parent.parent
-        text = (root / "pyproject.toml").read_text(encoding="utf-8")
-        assert re.search(r'pin\s*=\s*\[\s*"cswap-pin>=[0-9]', text), (
-            "the pin extra no longer declares a version floor"
-        )
 
     def test_the_seam_holds_no_version_constant(self):
         """Asserts the ABSENCE, because the constant is easy to reintroduce and

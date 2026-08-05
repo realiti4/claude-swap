@@ -38,7 +38,19 @@ menubar = ["rumps>=0.4.0"]
 # Code treats 401/403/404 as terminal, so one misrouted request ends that
 # session's Remote Control until the process restarts. 0.1.1 retries, and
 # stops swapping client/presence (registration, not ownership).
-pin = ["cswap-pin>=0.1.3"]
+# NO FLOOR. A pinned minimum here is a constant somebody has to remember to
+# raise, and it does not survive the release cycle: this one sat at 0.1.3
+# through THIRTY-SIX releases, so `uv tool install 'claude-swap[pin]'`
+# resolved a pin from before the port handdown, the chain walk and the launch
+# hook — while the machine looked correctly installed. The user's dotfiles
+# then grew 248 lines of installer to work around it.
+#
+# An unpinned requirement resolves to the LATEST release, which is what a
+# fresh install should get and what a floor was only ever approximating.
+# Keeping an old release out is an INSTALL-time job, not a constant this
+# project re-litigates on someone else's release cadence — the same reasoning
+# `_impl` already applies to the runtime check it deliberately does not do.
+pin = ["cswap-pin"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
