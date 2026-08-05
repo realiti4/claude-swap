@@ -1337,24 +1337,17 @@ def serving_port(switcher) -> int | None:
 def configured_port(switcher) -> int | None:
     """The port the user asked the pin to serve on, or None.
 
-    Delegated to the package, which OWNS the setting — the seam must not grow
-    a second reader of a file cswap-pin writes, because two readers of one
-    fact is how `--clear` stopped converging once already. Falls back to the
-    environment alone when the package is absent, so the answer is still the
-    user's own export rather than nothing.
+    ONE SOURCE: ``settings.json``, written by ``cswap pin --set_port``. Read
+    here rather than delegated to the package — it is a plain JSON record in
+    cswap's own directory, and depending on an optional package would leave it
+    unreadable exactly when a user is diagnosing.
+
+    NOT ``CSWAP_PIN_PORT``: cswap-pin writes that name into `.claude.json` as
+    its self-loop marker and Claude Code applies the block at boot, so inside
+    a pinned session it is already the live daemon's port.
+
+    0 is not a port to bind, so `--set_port 0` clears the setting.
     """
-    # THE SAME ORDER THE PACKAGE USES, and read here rather than delegated:
-    # the setting lives in CSWAP's own directory and is a plain JSON record,
-    # so making the answer depend on an optional package would leave it
-    # unreadable in the case a user is most likely to be diagnosing.
-    #
-    #   1. the ENVIRONMENT — what the user typed for THIS shell
-    #   2. the settings file — what they saved once
-    #   3. nothing — an ephemeral port
-    #
-    # RANGE-CHECKED, and 0 is the one that matters: bind() reads it as
-    # "choose one for me", so treating a configured 0 as a request would do
-    # the opposite of what it says.
     saved = None
     try:
         raw = json.loads(
@@ -1363,32 +1356,6 @@ def configured_port(switcher) -> int | None:
         saved = raw.get("port") if isinstance(raw, dict) else None
     except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
         pass
-    # THE ENV VAR HAS TWO AUTHORS, and only one is the user. cswap-pin writes
-    # `CSWAP_PIN_PORT` into `.claude.json`'s env block as its self-loop marker,
-    # and Claude Code applies that block at boot — so every process inside a
-    # pinned session inherits it, including this one. Reading it back as a
-    # SETTING makes the pin's own address look like something the user asked
-    # for. `CSWAP_PIN_WIRED` is written beside it and nowhere else, so it
-    # identifies our value; an rc export has no companion. Same rule, same
-    # reasoning, as the package's own `_env_port`.
-    env_value = None if os.environ.get("CSWAP_PIN_WIRED") else os.environ.get(
-        "CSWAP_PIN_PORT"
-    )
-    # THE ENVIRONMENT ANSWERS OR IT DOES NOT — it never falls through to the
-    # file. `CSWAP_PIN_PORT=0` means "let the kernel choose", the same thing
-    # `--set_port 0` means; falling through made one word mean two things, and
-    # an rc export could not force a dynamic port on a machine that had ever
-    # been given a fixed one. A TYPO still falls through: it is not an
-    # instruction, and the saved setting beats nothing.
-    if env_value is not None:
-        try:
-            port = int(env_value)
-        except (TypeError, ValueError):
-            port = None
-        if port == 0:
-            return None
-        if port is not None and 0 < port <= 65535:
-            return port
     try:
         port = int(saved)
     except (TypeError, ValueError):

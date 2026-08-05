@@ -151,18 +151,14 @@ Examples:
         ),
     )
     # The WRITE side. Persisted in the pin's own settings file, not in
-    # ~/.claude.json — that file is for what Claude Code reads. An rc export
-    # of CSWAP_PIN_PORT still outranks it: a value the user typed for this
-    # shell beats one they saved once.
+    # ~/.claude.json — that file is for what Claude Code reads.
     parser.add_argument(
         "--set_port",
         type=int,
         metavar="N",
         help=(
             "Serve on port N from the next daemon start. 0 means dynamic: "
-            "the kernel picks the port, which is the default. CSWAP_PIN_PORT "
-            "in the environment outranks this, and 0 there means the same "
-            "thing."
+            "the kernel picks the port, which is the default."
         ),
     )
     # THE LAUNCH HOOK. `--heal` prints its verdict and is called by a human or

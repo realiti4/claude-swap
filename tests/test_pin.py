@@ -3017,20 +3017,15 @@ class TestHealADeadPin:
         finally:
             lsn.close()
 
-    def test_set_port_persists_and_the_environment_still_wins(
+    def test_set_port_persists_and_the_environment_is_not_a_source(
         self, tmp_path, monkeypatch
     ):
         """`--set_port N` writes the pin's own settings file, not .claude.json.
 
-        The number used to live in `~/.claude.json`'s env block — the one
-        entry there Claude Code does not read. It is ours, so it belongs in
-        our directory, and a user who wants a fixed port now has somewhere to
-        say so.
-
-        THE ENVIRONMENT STILL OUTRANKS IT. A value exported in an rc file is
-        what the user typed for THIS shell; a persisted one is what they said
-        once. Asserted in both directions, because testing only the file
-        would pass against an implementation that never reads the env.
+        The env is NOT read: cswap-pin writes `CSWAP_PIN_PORT` into
+        `.claude.json` as its self-loop marker and Claude Code applies the
+        block at boot, so inside a pinned session it is already the live
+        daemon's port.
         """
         import types
 
@@ -3052,8 +3047,9 @@ class TestHealADeadPin:
 
         assert pin.configured_port(sw) == 44444
         monkeypatch.setenv("CSWAP_PIN_PORT", "45555")
-        assert pin.configured_port(sw) == 45555, (
-            "an rc export was overruled by the persisted value"
+        assert pin.configured_port(sw) == 44444, (
+            "the env overruled the file — inside a pinned session that value "
+            "is the live daemon's port, not a setting"
         )
 
     def test_set_port_refuses_a_number_that_is_not_a_port(self, tmp_path):
