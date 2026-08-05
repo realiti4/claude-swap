@@ -40,17 +40,6 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 _BACK = ("← back", "back")
 
 
-def cloud_menu_label(pinned_email: str | None) -> str:
-    """Menu row for the cloud pin, naming the pinned account inline.
-
-    The row has to answer "is a pin set, and where does it point" without
-    being opened — that is the whole question a user has when they glance at
-    the menu. "RC/artifacts" names the scope, which is wider than Remote
-    Control alone (artifacts, triggers, marketplace sync all follow the pin).
-    """
-    return f"Cloud account (RC/artifacts)… — {pinned_email or 'none'}"
-
-
 class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
@@ -160,7 +149,16 @@ class DashboardScreen(Screen):
             # Gating the row on is_available() alone left a TUI-first user
             # with a wired config and no visible way out.
             *(
-                [(cloud_menu_label(pin.pinned_email(self.app.switcher)), "pin-menu")]
+                # The row answers "is a pin set, and where does it point"
+                # without being opened — the whole question a user has when
+                # glancing at the menu. "RC/artifacts" names the scope, which
+                # is wider than Remote Control alone (artifacts, triggers and
+                # marketplace sync all follow the pin).
+                [(
+                    "Cloud account (RC/artifacts)… — "
+                    f"{pin.pinned_email(self.app.switcher) or 'none'}",
+                    "pin-menu",
+                )]
                 if pin.is_available() or pin._wiring_present(self.app.switcher)
                 else []
             ),

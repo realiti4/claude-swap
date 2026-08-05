@@ -1446,9 +1446,6 @@ class TestTheTuiSurfaceSurvivesTheSplit:
 
         from claude_swap.tui import dashboard
 
-        assert "none" in dashboard.cloud_menu_label(None)
-        assert "a@b.c" in dashboard.cloud_menu_label("a@b.c")
-
         # `app` is a read-only Textual property, so patch it on the class.
         monkeypatch.setattr(
             dashboard.DashboardScreen,
@@ -1467,7 +1464,19 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         )
         labels = [label for label, action in screen._root_entries()
                   if action == "pin-menu"]
+        # THE LABEL MUST NAME THE PIN, not merely exist. "Cloud account" alone
+        # passes with the email interpolation gone, and that string is the
+        # entire reason the row is worth reading without opening it.
         assert "Cloud account" in labels[0]
+        assert "none" in labels[0], (
+            f"the row does not say where the pin points: {labels[0]!r}"
+        )
+        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: "a@b.c")
+        pinned = [label for label, action in screen._root_entries()
+                  if action == "pin-menu"][0]
+        assert "a@b.c" in pinned, (
+            f"the row does not name the pinned account: {pinned!r}"
+        )
 
     def test_both_account_renderers_actually_render_the_badge(self):
         """The badge rides on the account rows, and there are two renderers —
