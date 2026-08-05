@@ -33,8 +33,42 @@ jobs:
       - name: Run tests
         run: uv run pytest -n 8
 
+  # SHARDED, because a single Windows job cannot go much below a minute no
+  # matter how fast the tests are. Measured on this repo: 13.7s checkout +
+  # uv + `uv sync` (cache already hitting), 8.8s to boot 4 xdist workers and
+  # collect 2000 items, 3.5s teardown — 26s before the first test runs, and
+  # none of it is test time anyone can optimise away.
+  #
+  # Three shards each pay that floor once and split the ~51s of test
+  # execution, so they finish together instead of in series. They are
+  # exhaustive by construction: shards 1 and 2 name their files, shard 3
+  # `--ignore`s exactly those and takes the rest, so a NEW test file lands in
+  # shard 3 automatically. tests/test_ci_shards.py fails if that ever stops
+  # being true.
   test-windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Split by MEASURED time, not by file count. Linux at 4 workers:
+          # tui+pin+cli 10.5s, the rest 5.2s, switcher+autoswitch 2.9s — so
+          # the 618-test shard is the FAST one and the 434-test shard is the
+          # slow one. Splitting by count would have put the three heaviest
+          # files together.
+          - name: tui-pin-cli
+            paths: >-
+              tests/test_tui.py tests/test_tui_pin.py tests/test_menubar.py
+              tests/test_pin.py tests/test_cli.py
+          - name: switcher-autoswitch
+            paths: tests/test_switcher.py tests/test_autoswitch.py
+          - name: rest
+            paths: >-
+              --ignore=tests/test_tui.py --ignore=tests/test_tui_pin.py
+              --ignore=tests/test_menubar.py --ignore=tests/test_pin.py
+              --ignore=tests/test_cli.py --ignore=tests/test_switcher.py
+              --ignore=tests/test_autoswitch.py
+    name: test-windows (${{ matrix.name }})
 
     steps:
       - uses: actions/checkout@v4
@@ -51,11 +85,16 @@ jobs:
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
         #
-        # THE SLOWEST JOB BY FAR and the one that sets the wall clock: 74s
-        # against Linux's 24s for the same suite, because process spawn and
-        # file operations cost several times more here. Same -n 8 for the same
-        # reason — the idle-worker problem is worse where each spawn is slower.
-        run: uv run pytest -n 8
+        # `-o testpaths=` because pyproject sets `testpaths = ["tests"]`, and
+        # that setting OVERRIDES positional arguments rather than being
+        # narrowed by them — a shard given explicit paths silently ran the
+        # whole suite without it. Measured: "no tests ran" vs 1995 passed.
+        #
+        # -n 4, not the 8 the unsharded job used. Each worker re-imports the
+        # test modules, and on Windows booting 8 cost 16.7s against 4's 8.8s.
+        # With a third of the tests per job there is nothing for the extra
+        # workers to do but pay their own boot.
+        run: uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}
 
   macos-keychain:
     runs-on: macos-latest
