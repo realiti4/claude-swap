@@ -14,6 +14,8 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.models import Platform
+from claude_swap.session import session_dir_for
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -47,7 +49,11 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
     # developer with either exported would otherwise point the spawned CLI back
     # at real config/backup paths (and on macOS, the real Keychain). Drop them
     # unless a caller set them deliberately.
-    for var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
+    for var in (
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "XDG_DATA_HOME",
+    ):
         if var not in extra:
             env.pop(var, None)
     return env
@@ -663,6 +669,129 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
+
+    def test_e2e_claude_220_run_keeps_backup_generation(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """Two real CLI launches must seed once and consume no refresh grant."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.LINUX)
+        )
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+
+        email = "account2@example.com"
+        org_uuid = "org-2"
+        credentials = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "stored-access",
+                    "refreshToken": "stored-refresh",
+                    "expiresAt": 1,
+                }
+            }
+        )
+        config = json.dumps(
+            {
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "accountUuid": "uuid-2",
+                    "organizationUuid": org_uuid,
+                }
+            }
+        )
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2026-08-03T00:00:00Z",
+                "sequence": [2],
+                "accounts": {
+                    "2": {
+                        "email": email,
+                        "uuid": "uuid-2",
+                        "organizationUuid": org_uuid,
+                        "organizationName": "Org Two",
+                    }
+                },
+            },
+        )
+        switcher._write_account_credentials("2", email, credentials)
+        switcher._write_account_config("2", email, config)
+        backup_before = switcher._backup_enc_path("2", email).read_bytes()
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        launch_log = tmp_path / "launch.log"
+        fake_program = fake_bin / "fake_claude.py"
+        fake_program.write_text(
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "if sys.argv[1:3] == ['auth', 'status']:\n"
+            "    print(json.dumps({\n"
+            "        'loggedIn': True,\n"
+            "        'authMethod': 'oauth_token',\n"
+            "        'apiProvider': 'firstParty',\n"
+            "    }))\n"
+            "    raise SystemExit(0)\n"
+            "with Path(os.environ['CSWAP_E2E_LOG']).open('a') as handle:\n"
+            "    handle.write(\n"
+            "        os.environ.get('CLAUDE_CONFIG_DIR', '')\n"
+            "        + '|' + ' '.join(sys.argv[1:]) + '\\n'\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+        if sys.platform == "win32":
+            fake_claude = fake_bin / "claude.cmd"
+            fake_claude.write_text(
+                f'@"{sys.executable}" "{fake_program}" %*\r\n', encoding="utf-8"
+            )
+        else:
+            fake_claude = fake_bin / "claude"
+            fake_claude.write_text(
+                f'#!{sys.executable}\nexec(compile(open({str(fake_program)!r}).read(), '
+                f'{str(fake_program)!r}, "exec"))\n',
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+        wrapper = tmp_path / "cswap_e2e.py"
+        wrapper.write_text(
+            "from claude_swap.models import Platform\n"
+            "Platform.detect = classmethod(lambda cls: Platform.LINUX)\n"
+            "from claude_swap.cli import main\n"
+            "main()\n",
+            encoding="utf-8",
+        )
+        env = _subprocess_env(
+            HOME=str(temp_home),
+            PATH=str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            CSWAP_E2E_LOG=str(launch_log),
+        )
+        command = [
+            sys.executable,
+            str(wrapper),
+            "run",
+            "2",
+            "--no-share",
+            "--",
+            "--model",
+            "test-model",
+        ]
+
+        for _ in range(2):
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
+            assert result.returncode == 0, result.stderr
+
+        session_dir = session_dir_for(switcher.backup_dir, "2", email)
+        assert switcher._backup_enc_path("2", email).read_bytes() == backup_before
+        assert switcher.read_account_credentials("2", email) == credentials
+        assert (session_dir / ".credentials.json").read_text() == credentials
+        launches = launch_log.read_text().splitlines()
+        assert len(launches) == 2
+        assert all(str(session_dir) in line for line in launches)
 
 
 class TestSubcommandAliases:
