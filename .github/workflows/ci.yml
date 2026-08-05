@@ -87,8 +87,16 @@ jobs:
           #
           # Same commit, same lockfile, same cache key, same tests — one more
           # job made the SLOWEST shard 76% slower. Sharding stops paying here;
-          # do not add a sixth without measuring the whole run, not the shard
+          # do not add a fifth without measuring the whole run, not the shard
           # you are splitting.
+          #
+          # EXPECT ±8s OF RUNNER NOISE when reading these numbers. Two runs of
+          # this exact four-shard config: switcher 28/27s and autoswitch 32/32s
+          # (stable), rest 40/46s and pin-cli 48/56s. The delay lands on a
+          # DIFFERENT step each time — `uv sync` took 10.0s in one run,
+          # `Install uv` 15.8s in the next — so a single slow run is not
+          # evidence a shard needs splitting. Measure twice before moving a
+          # file between shards.
           - name: autoswitch
             paths: tests/test_autoswitch.py
           - name: pin-cli
