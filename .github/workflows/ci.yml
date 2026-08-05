@@ -76,6 +76,19 @@ jobs:
           # inherited switcher (8.6s) plus the tail (12.9s) and became the new
           # maximum at ~25s. Splitting switcher back out costs one more job —
           # free on a public repo — and drops the longest shard to ~13s.
+          #
+          # AND NOT FIVE. Splitting pin from cli was tried and REVERTED: the
+          # wall clock went 48s -> 80s. More concurrent Windows jobs means
+          # more contention for the same GitHub cache, and it shows up twice:
+          #
+          #     uv sync `Prepared`   4 shards: 2.3 2.3 2.45 8.93
+          #                          5 shards: 2.24 2.35 2.62 10.06 11.52
+          #     `rest` test time     4 shards: 21.36s   5 shards: 37.52s
+          #
+          # Same commit, same lockfile, same cache key, same tests — one more
+          # job made the SLOWEST shard 76% slower. Sharding stops paying here;
+          # do not add a sixth without measuring the whole run, not the shard
+          # you are splitting.
           - name: autoswitch
             paths: tests/test_autoswitch.py
           - name: pin-cli
