@@ -24,8 +24,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # -n 8, NOT the pyproject default of `auto`. A runner has 4 vCPUs and
+      # this suite is mostly WAITING (file locks, spawned interpreters,
+      # Textual pilots), so one worker per core leaves cores idle. Measured on
+      # 4 CPUs, same 1995 passed: auto(=4) 16.9s, -n 6 14.1s, -n 8 14.5s,
+      # -n 10 14.7s. xdist has no multiplier spelling, so the literal lives
+      # here, where the runner's shape is known, rather than in pyproject.
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -n 8
 
   test-windows:
     runs-on: windows-latest
@@ -44,7 +50,12 @@ jobs:
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
-        run: uv run pytest
+        #
+        # THE SLOWEST JOB BY FAR and the one that sets the wall clock: 74s
+        # against Linux's 24s for the same suite, because process spawn and
+        # file operations cost several times more here. Same -n 8 for the same
+        # reason — the idle-worker problem is worse where each spawn is slower.
+        run: uv run pytest -n 8
 
   macos-keychain:
     runs-on: macos-latest

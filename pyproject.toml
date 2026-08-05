@@ -75,8 +75,22 @@ pythonpath = ["src"]
 # across the whole suite, with the top five totalling under 7 s of a 51 s run.
 # Measured here, 48 cores: 51.0s serial -> 12.1s (-n 8) -> 7.7s (-n 16), same
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
-# store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
-# cores) and this box both get the cores they have.
+# store hash unmoved.
+#
+# `auto` here so any machine scales from the cores it has. CI OVERRIDES IT
+# with `-n 8` (see .github/workflows/ci.yml): the work is mostly WAITING —
+# file locks, spawned interpreters, Textual pilots — so on a runner's 4 vCPUs
+# a worker parked on a syscall leaves its core idle and one-worker-per-core
+# cannot fill them. Measured on 4 CPUs (`taskset -c 0-3`), same 1995 passed:
+#
+#     -n auto (=4)  16.94s  16.97s
+#     -n 6          14.06s
+#     -n 8          15.49s  14.52s
+#     -n 10         14.69s
+#
+# xdist takes only `auto`, `logical`, or an integer — there is no multiplier
+# spelling, and `logical` is also 4 on a 4-vCPU runner. So the oversubscription
+# has to be a literal, and a literal belongs where the machine is known.
 addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
