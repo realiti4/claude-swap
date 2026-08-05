@@ -420,7 +420,7 @@ class TestLaunchIsNeverBlocked:
         # Idle: nothing wired, nothing recorded -> no heal at all. This runs on
         # EVERY launch, and the status line already calls heal on a timer.
         healed = []
-        monkeypatch.setattr(pin, "heal", lambda s: healed.append(1) or (False, ""))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: healed.append(1) or (False, ""))
         monkeypatch.setattr(pin, "_wiring_present", lambda s: False)
         monkeypatch.setattr(pin, "_pinned_email_now", lambda s: None)
         assert pin.run(sw, None, ensure=True) == 0
@@ -429,7 +429,7 @@ class TestLaunchIsNeverBlocked:
         # Wired: it must actually repair, or the assertion above is satisfied
         # by an ensure that never heals anything.
         monkeypatch.setattr(pin, "_wiring_present", lambda s: True)
-        monkeypatch.setattr(pin, "heal", lambda s: healed.append(1) or (True, "Restored"))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: healed.append(1) or (True, "Restored"))
         assert pin.run(sw, None, ensure=True) == 0
         assert healed == [1], "a wired config was not healed"
 
@@ -468,7 +468,7 @@ class TestLaunchIsNeverBlocked:
         )
         # A LYING heal: reports success, changes nothing. Exactly what an old
         # cswap's rejected --heal looks like from the caller's side.
-        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored the cloud pin"))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored the cloud pin"))
 
         assert pin.run(sw, None, ensure=True) == 0
         assert not pin._wiring_is_stale(sw), (
@@ -641,8 +641,21 @@ class TestLaunchIsNeverBlocked:
 
         from claude_swap import claude_locks as pin_locks
 
+        # THE PROBE IS THE OTHER HALF OF THE SAME BUDGET, and it was the half
+        # that shipped unbudgeted: `wire_launch_env` passes `_LAUNCH_PROBE_S`
+        # and this site passed nothing, so the probe fell back to its 2.0s
+        # default on the very path that exists to never block. Wrapped, not
+        # replaced — the elapsed assertion below has to keep measuring the
+        # real connect.
+        real_stale = pin._wiring_is_stale
+
+        def _stale_spy(switcher, connect_timeout=2.0):
+            seen["probe"] = connect_timeout
+            return real_stale(switcher, connect_timeout=connect_timeout)
+
+        monkeypatch.setattr(pin, "_wiring_is_stale", _stale_spy)
         monkeypatch.setattr(pin, "clear_wiring", _spy)
-        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored"))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored"))
 
         sw = types.SimpleNamespace(
             backup_dir=tmp_path,
@@ -657,7 +670,68 @@ class TestLaunchIsNeverBlocked:
             f"means the {pin_locks.DEFAULT_TIMEOUT_S}s default, paid before "
             f"every hand-launched claude"
         )
+        assert seen.get("probe") == pin._LAUNCH_PROBE_S, (
+            f"--ensure probed with connect_timeout={seen.get('probe')!r}; "
+            f"unbudgeted means 2.0s against a black-holed port, on the path "
+            f"whose sibling in wire_launch_env already pays "
+            f"{pin._LAUNCH_PROBE_S}s"
+        )
+        # 2.0 is not an arbitrary ceiling: it is the probe default this site
+        # used to inherit. Windows CI failed here at exactly 2.5s (0.5 lock +
+        # 2.0 probe) on a port that Linux refuses instantly, which is what a
+        # black-holed port costs everywhere.
         assert elapsed < 2.0, f"the launch hook blocked for {elapsed:.1f}s"
+
+    def test_every_probe_a_launch_arms_is_budgeted_including_heals(
+        self, tmp_path, monkeypatch
+    ):
+        """No socket on the `--ensure` path may carry the 2.0s default.
+
+        The sibling test above stubs `heal`, so it measured ONE probe and the
+        two INSIDE `heal` stayed invisible — a launch hook that looked fixed
+        while still arming 4.2s. Counting `settimeout` instead of wall clock
+        is what makes that visible: a refusing port and a black-holing one arm
+        the same budgets and only the second pays them, so a Linux runner
+        cannot tell them apart by elapsed time. Windows already proved the
+        difference is real.
+
+        `heal` keeps its 2.0s default for the hand-run `--heal`; the launch
+        path passes its own budget, the way `wire_launch_env` always has.
+        """
+        import socket
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        # No package: `heal` cannot restart, so it takes the branch that
+        # probes and then unwires — the longest path a launch can walk.
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        monkeypatch.setattr(pin, "clear_wiring", lambda s, timeout=None: False)
+
+        armed = []
+        real = socket.socket.settimeout
+        monkeypatch.setattr(
+            socket.socket,
+            "settimeout",
+            lambda self, t: (armed.append(t), real(self, t))[1],
+        )
+
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        assert pin.run(sw, None, ensure=True) == 0
+
+        assert armed, "nothing probed — the fixture stopped exercising the path"
+        assert max(armed) <= pin._LAUNCH_PROBE_S, (
+            f"a launch armed {armed} — {sum(armed):.1f}s against a "
+            f"black-holed port, before every hand-launched claude"
+        )
 
     def test_ensure_prints_nothing_and_survives_a_raising_heal(
         self, tmp_path, monkeypatch, capsys
@@ -670,11 +744,11 @@ class TestLaunchIsNeverBlocked:
         sw = types.SimpleNamespace(backup_dir=tmp_path)
         monkeypatch.setattr(pin, "_wiring_present", lambda s: True)
 
-        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored the cloud pin"))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored the cloud pin"))
         pin.run(sw, None, ensure=True)
         assert capsys.readouterr().out == "", "a launch hook printed"
 
-        def _boom(_s):
+        def _boom(_s, **_k):
             raise RuntimeError("heal exploded")
 
         monkeypatch.setattr(pin, "heal", _boom)
@@ -3440,7 +3514,7 @@ class TestHealADeadPin:
         monkeypatch.setattr(
             pin, "_impl", lambda: (_ for _ in ()).throw(ClaudeSwitchError("no extra"))
         )
-        monkeypatch.setattr(pin, "heal", lambda s: (True, "Removed a stale wiring"))
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Removed a stale wiring"))
         assert pin.run(sw, None, heal_only=True) == 0
 
     def test_heal_does_not_claim_success_over_a_PARTIAL_unwire(
@@ -3851,7 +3925,7 @@ class TestHealNeverTearsDownAServingPin:
         monkeypatch.setattr(
             pin,
             "_wiring_is_stale",
-            lambda switcher: (_ for _ in ()).throw(RuntimeError("disk gone")),
+            lambda switcher, **_k: (_ for _ in ()).throw(RuntimeError("disk gone")),
         )
 
         changed, msg = pin.heal(sw)

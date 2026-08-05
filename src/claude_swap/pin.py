@@ -1241,7 +1241,7 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     return bool(ports)
 
 
-def heal(switcher) -> tuple[bool, str]:
+def heal(switcher, *, connect_timeout: float = 2.0) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
 
     A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
@@ -1263,6 +1263,14 @@ def heal(switcher) -> tuple[bool, str]:
 
     Never raises: this is called from the status line every few seconds, and a
     health check that can break the prompt is worse than the fault it reports.
+
+    ``connect_timeout`` is every loopback probe below, and it is a keyword the
+    LAUNCH path must pass. The default is right for a hand-run ``--heal``, and
+    wrong for ``--ensure``: that hook runs from an rc file before every
+    hand-launched ``claude``, and one call arms three probes here, so a port
+    that black-holes rather than refuses costs the launch 4.2s on the default.
+    Same defect the two call sites in this file already carry a budget for —
+    it was only invisible here because it lives one frame down.
     """
     # A SERVING PIN IS NEVER **TORN DOWN**. That is what the guard protects,
     # and the destructive operation is `clear_wiring` at the bottom — not the
@@ -1298,16 +1306,18 @@ def heal(switcher) -> tuple[bool, str]:
             # nothing gives `heal() -> (True, "Restored the cloud pin")` with
             # the wired port not serving, so the status line shows healthy
             # while every session dials a dead port.
-            if impl.heal(switcher.backup_dir) and _wired_port_is_serving(switcher):
+            if impl.heal(switcher.backup_dir) and _wired_port_is_serving(
+                switcher, connect_timeout=connect_timeout
+            ):
                 return True, "Restored the cloud pin"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
             pass
         # The restart may have succeeded while returning False (it also uses
         # False for "already serving"). Re-READ rather than infer: unwiring a
         # pin that just came back is the same damage as unwiring a live one.
-        if _wired_port_is_serving(switcher):
+        if _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
             return False, "Nothing to heal"
-    elif _wired_port_is_serving(switcher):
+    elif _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
         # No package, so nothing can restart OR recycle — but a serving pin is
         # still a working one, and removing its wiring would unpin a healthy
         # session. The guard has to survive the package being absent, which is
@@ -1349,7 +1359,7 @@ def heal(switcher) -> tuple[bool, str]:
     # the worse of the two call sites to leave unguarded: the status line
     # calls it on a timer, unattended, while the launch path runs once.
     try:
-        if _wiring_is_stale(switcher):
+        if _wiring_is_stale(switcher, connect_timeout=connect_timeout):
             clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
             if not _wiring_present(switcher):
                 return True, (
@@ -1491,7 +1501,11 @@ def run(
             # machine with both this would be the second caller per tick.
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
                 return 0
-            heal(switcher)
+            # BUDGETED, like the two probes below it. `heal` arms three
+            # loopback probes of its own, and on its 2.0s default a
+            # black-holed port cost this hook 4.2s (measured) before every
+            # hand-launched `claude`.
+            heal(switcher, connect_timeout=_LAUNCH_PROBE_S)
             # RE-READ, DO NOT TRUST THE RETURN. This is disaster path D from
             # the lmd42 outage, one level in: an old cswap REJECTED `--heal`
             # with exit 2, the call was made, the rejection went unread, and
@@ -1505,7 +1519,14 @@ def run(
             # The wiring is CSWAP'S OWN record, so removing it needs no
             # package at all: unpinned is a working session, wired-to-a-dead-
             # port is not.
-            if _wiring_is_stale(switcher):
+            # THE PROBE IS BUDGETED TOO, not just the lock below. Its default
+            # is 2.0s, and a port that black-holes instead of refusing pays
+            # all of it — on the hook that runs before EVERY hand-launched
+            # `claude`. Windows CI measured the whole 2.0 on a port Linux
+            # refuses instantly, which is what any DROP-ing port costs
+            # everywhere. `wire_launch_env` already passes `_LAUNCH_PROBE_S`
+            # here for exactly this reason; this site did not.
+            if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
                 # BUDGETED, like every other call on a launch path. The
                 # default is 9s, and this hook runs from an rc file before
                 # EVERY hand-launched `claude` — so a config lock held by a
