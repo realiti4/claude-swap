@@ -138,7 +138,8 @@ Examples:
         "account",
         nargs="?",
         metavar="NUM|EMAIL",
-        help="Account to run (number or email). Omit to use the current "
+        help="Account to run (number or email). Omit to use a project pin "
+        "(.claude-account / CLAUDE_SWAP_ACCOUNT in .env) or the current "
         "directory's mapping (see `cswap map`).",
     )
     parser.add_argument(
@@ -186,7 +187,34 @@ Examples:
             )
             return  # only reachable in tests where exec/exit is mocked
 
-        # No account given: resolve from the current directory's mapping.
+        # No account given: a project pin (.claude-account / .env) in the
+        # working directory or an ancestor wins over the global `cswap map`
+        # table — it's the explicit, committable "this repo uses that account".
+        from claude_swap.project_pin import find_account_pin
+
+        pin = find_account_pin(os.getcwd())
+        if pin is not None:
+            slot, email = switcher.slot_for_identifier(pin.identifier)
+            if slot is not None:
+                print(
+                    dimmed(
+                        f"Using account {email or pin.identifier} "
+                        f"(pinned by {pin.display_source()})"
+                    )
+                )
+                manager.run(
+                    slot,
+                    tail,
+                    share=not args.no_share,
+                    share_history=args.share_history,
+                )
+                return  # only reachable in tests
+            warning(
+                f"{pin.display_source()} pins account '{pin.identifier}', "
+                "which cswap doesn't manage — falling back."
+            )
+
+        # Otherwise resolve from the current directory's mapping.
         slot, email = switcher.slot_for_directory(os.getcwd())
         if slot is not None:
             manager.run(
