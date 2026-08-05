@@ -113,22 +113,6 @@ def _each_config(level: int = logging.DEBUG):
         yield path
 
 
-def _install_how() -> str:
-    """The install COMMAND for this install method, on its own.
-
-    Split out so there is exactly one place that decides it. A second
-    hardcoded `uv tool install ...` survived beside the derived hint and
-    diverged from it on a pipx machine — one screen apart, both wrong for
-    someone.
-    """
-    from claude_swap.update_check import _detect_install_method
-
-    return {
-        "uv": "uv tool install 'claude-swap[pin]'",
-        "pipx": "pipx install 'claude-swap[pin]'",
-    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
-
-
 def _install_hint() -> str:
     """How to install the extra, in a form that reaches THIS install.
 
@@ -138,8 +122,20 @@ def _install_hint() -> str:
     follows the instruction, it succeeds, and the pin is still missing.
     `cswap upgrade` already solves this; reuse its detector rather than
     re-deriving it.
+
+    THE ONE PLACE THAT DECIDES THE COMMAND, which is why the mapping is inline
+    rather than in a helper of its own: a second hardcoded `uv tool install`
+    once survived beside the derived hint and diverged from it on a pipx
+    machine — one screen apart, both wrong for someone.
+    `test_one_place_decides_the_install_command` enforces that by name.
     """
-    return f"The cloud pin requires 'cswap-pin'. Install with: {_install_how()}"
+    from claude_swap.update_check import _detect_install_method
+
+    how = {
+        "uv": "uv tool install 'claude-swap[pin]'",
+        "pipx": "pipx install 'claude-swap[pin]'",
+    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
+    return f"The cloud pin requires 'cswap-pin'. Install with: {how}"
 
 
 def _impl() -> ModuleType:

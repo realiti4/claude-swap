@@ -2593,9 +2593,14 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
         # would forbid documenting the rule. What must not repeat is a literal
         # the code can PRINT.
         allowed = set()
+        decider = "_install_hint"
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == "_install_how":
+            if isinstance(node, ast.FunctionDef) and node.name == decider:
                 allowed = {id(n) for n in ast.walk(node)}
+        assert allowed, (
+            f"{decider}() is gone — this guard keys on it by name, so a rename "
+            f"must move the name here rather than leave the check vacuous"
+        )
         offenders = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
@@ -2620,7 +2625,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
         }
         offenders = [ln for ln in offenders if ln not in docs]
         assert not offenders, (
-            f"install command literal outside _install_how() at line(s) {offenders} "
+            f"install command literal outside {decider}() at line(s) {offenders} "
             "— two places decide it, and they diverged on pipx once already"
         )
 
