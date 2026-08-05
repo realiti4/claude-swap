@@ -12,6 +12,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
@@ -218,6 +223,101 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     if entry.last_error:
         detail += f" ({entry.last_error})"
     return [dimmed(detail)]
+
+
+def _quota_style(pct: float) -> str:
+    """Return the urgency colour for a used-quota percentage."""
+    if pct >= 100:
+        return "bold red"
+    if pct >= 90:
+        return "bright_red"
+    if pct >= 70:
+        return "dark_orange"
+    if pct >= 40:
+        return "yellow"
+    return "green"
+
+
+def _usage_table_cell(entry: UsageEntry, key: str, bar_width: int) -> Text:
+    """Return a fixed-width percentage and mini progress bar for a quota window."""
+    if entry.last_good is None or (window := entry.last_good.get(key)) is None:
+        if entry.sentinel is not None:
+            return Text(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel), style="dim")
+        return Text("unavailable", style="dim")
+
+    pct = window["pct"]
+    style = _quota_style(pct)
+    filled = min(bar_width, max(0, round(pct * bar_width / 100)))
+    cell = Text(f"{pct:>3.0f}% ", style=style)
+    cell.append("█" * filled, style=style)
+    cell.append("░" * (bar_width - filled), style="dim")
+    return cell
+
+
+def _reset_table_cell(entry: UsageEntry, key: str) -> Text:
+    """Return one quota window's reset countdown for the adjacent reset column."""
+    if entry.last_good is None or (window := entry.last_good.get(key)) is None:
+        return Text("—", style="dim")
+    reset = oauth.fresh_reset_strings(window)
+    return Text(reset[0].replace(" ", "") if reset else "—", style="dim")
+
+
+def _compact_reset_table_cell(entry: UsageEntry) -> Text:
+    """Return the 5h/weekly reset pair for the narrow table layout."""
+    five_hour = _reset_table_cell(entry, "five_hour").plain
+    seven_day = _reset_table_cell(entry, "seven_day").plain
+    return Text(f"{five_hour}/{seven_day}", style="dim")
+
+
+def _accounts_table(
+    accounts_info: list[tuple], entries: dict[str, UsageEntry], seq_data: dict, wide: bool = True
+) -> Table:
+    """Build the human-facing account and quota overview used by ``list --table``."""
+    cached_quota = any(entry.sentinel is not None for entry in entries.values())
+    table = Table(
+        title="Claude Code quota · cached values" if cached_quota else "Claude Code quota",
+        box=box.ROUNDED,
+        header_style="bold",
+        pad_edge=False,
+        show_lines=False,
+    )
+    table.add_column("#", justify="right", style="bold", no_wrap=True, min_width=2)
+    table.add_column("Account", no_wrap=True, max_width=26 if wide else 18)
+    table.add_column("5h limit", justify="right", no_wrap=True, min_width=14 if wide else 10)
+    if wide:
+        table.add_column("5h reset", justify="right", no_wrap=True, min_width=8)
+    table.add_column("Weekly limit", justify="right", no_wrap=True, min_width=14 if wide else 12)
+    table.add_column("Weekly reset" if wide else "Reset", justify="right", no_wrap=True, min_width=10 if wide else 11)
+    table.add_column("Status", no_wrap=True, min_width=7)
+
+    for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        account = Text()
+        if alias:
+            account.append(alias, style="bold bright_cyan")
+            account.append(f" ({email})", style="dim")
+        else:
+            account.append(email)
+        if is_active:
+            account.stylize("bold")
+        status = Text("active", style="bold green") if is_active else Text("ready", style="dim")
+        if ClaudeAccountSwitcher._disabled_from_data(seq_data, str(num)):
+            status = Text("disabled", style="yellow")
+        row = [
+            str(num),
+            account,
+            _usage_table_cell(entries[str(num)], "five_hour", bar_width=9 if wide else 5),
+        ]
+        if wide:
+            row.append(_reset_table_cell(entries[str(num)], "five_hour"))
+        row.append(_usage_table_cell(entries[str(num)], "seven_day", bar_width=9 if wide else 5))
+        row.append(
+            _reset_table_cell(entries[str(num)], "seven_day")
+            if wide
+            else _compact_reset_table_cell(entries[str(num)])
+        )
+        row.append(status)
+        table.add_row(*row)
+    return table
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:
@@ -3922,6 +4022,7 @@ class ClaudeAccountSwitcher:
         self,
         show_token_status: bool = False,
         json_output: bool = False,
+        table_output: bool = False,
         fetch: set[str] | None = None,
     ) -> dict | None:
         """List all managed accounts.
@@ -3953,24 +4054,32 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries)
 
         seq_data = self._get_sequence_data() or {}
-        print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
-            tag = self._get_display_tag(email, org_name, org_uuid)
-            label = f"{accent(alias)} ({email})" if alias else email
-            markers = ""
-            if is_active:
-                markers += f" {bold_accent('(active)')}"
-            if self._disabled_from_data(seq_data, str(num)):
-                markers += f" {muted('(disabled)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
-                print(f"     {line}")
-
+        if table_output:
+            console = Console()
+            console.print(_accounts_table(accounts_info, entries, seq_data, wide=console.width >= 100))
             if show_token_status:
-                for line in self._token_status_lines(accounts_info[i]):
-                    print(f"     {dimmed('•')} {muted(line)}")
-            if i < len(accounts_info) - 1:
-                print()
+                for account in accounts_info:
+                    for line in self._token_status_lines(account):
+                        print(f"  {dimmed('•')} {muted(line)}")
+        else:
+            print(bolded("Accounts:"))
+            for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+                tag = self._get_display_tag(email, org_name, org_uuid)
+                label = f"{accent(alias)} ({email})" if alias else email
+                markers = ""
+                if is_active:
+                    markers += f" {bold_accent('(active)')}"
+                if self._disabled_from_data(seq_data, str(num)):
+                    markers += f" {muted('(disabled)')}"
+                print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+                for line in _usage_entry_lines(entries[str(num)]):
+                    print(f"     {line}")
+
+                if show_token_status:
+                    for line in self._token_status_lines(accounts_info[i]):
+                        print(f"     {dimmed('•')} {muted(line)}")
+                if i < len(accounts_info) - 1:
+                    print()
 
         # Safety copies (unclaimed credentials) are deliberately NOT surfaced
         # here: users can't act on them (recovery is always /login + cswap
