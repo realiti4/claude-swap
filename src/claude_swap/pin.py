@@ -281,7 +281,29 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         pinned = pin.ensure_proxy(switcher)
         if pinned:
             port, ca_path = pinned
-            return pin.wire_env(env, port, ca_path)
+            wired = pin.wire_env(env, port, ca_path)
+            # VALIDATED, NOT TRUSTED. This is the one value from the peer that
+            # reaches `os.execvpe`, and execvpe sits OUTSIDE the launch's try —
+            # so a wrong shape here is not a caught exception, it is the
+            # launch. Both failure modes were measured:
+            #
+            #   None            execvpe(argv, None) does NOT fail. It hands the
+            #                   child the PARENT's environ, dropping
+            #                   CLAUDE_CONFIG_DIR — so the session launches
+            #                   against the default login instead of the
+            #                   selected account, silently. An account-isolation
+            #                   break with no error anywhere.
+            #   {"K": 41234}    execvpe raises TypeError out of the launch.
+            #
+            # The module's standing rule is that the peer may be wrong: `heal`
+            # re-reads state rather than believing a return value. Same rule
+            # here — anything that is not a str->str mapping degrades to an
+            # UNPINNED launch, which is the failure mode the rest of this file
+            # is built to tolerate.
+            if isinstance(wired, dict) and all(
+                isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
+            ):
+                return wired
     except Exception:  # noqa: BLE001 — never block the launch
         pass
     # No proxy this launch, whether ensure_proxy said so or died saying it.
@@ -681,10 +703,31 @@ def _wire_mark_of(raw: object, config_path=None) -> list | None:
             ours = side.get(_WIRE_MARK)
             if isinstance(ours, list) and ours:
                 return ours
-            # A sidecar that exists and says "not wired" is an ANSWER, not a
-            # miss: `--clear` writes it. Falling through to the config here
-            # would resurrect a receipt the clear deliberately emptied.
-            if _WIRE_MARK in side:
+            # AN EMPTY SIDECAR ANSWERS FOR THE SIDECAR, NOT FOR THE CONFIG.
+            #
+            # `--clear` empties it, and treating that as the final answer made
+            # a wiring written by an OLDER cswap-pin — which writes the config
+            # key and no sidecar, the compat promise stated above — invisible
+            # to every recovery path at once:
+            #
+            #     _wiring_present  False    _wired_ports  []
+            #     _wiring_is_stale False    clear_wiring  False
+            #     heal             (False, 'Nothing to heal')
+            #
+            # while `.claude.json` still named a proxy port. Every probe that
+            # could have caught the stranding reported healthy. The population
+            # is not exotic: the extra carries no floor, so an already-present
+            # `cswap-pin` is never upgraded, and anyone who installed the pin
+            # before the sidecar existed lands here on their first clear.
+            #
+            # What the empty sidecar DOES rule out is resurrecting a receipt
+            # the clear emptied — but only the one it emptied. A marker in the
+            # config is a receipt the clear never saw.
+            if _WIRE_MARK in side and not (
+                isinstance(raw, dict)
+                and isinstance(raw.get(_WIRE_MARK), list)
+                and raw.get(_WIRE_MARK)
+            ):
                 return None
     if not isinstance(raw, dict):
         return None
@@ -702,8 +745,24 @@ def _saved_of(raw: object, config_path=None) -> dict:
     if config_path is not None:
         side = _read_ledger(config_path)
         if side is not None and _WIRE_MARK in side:
-            saved = side.get(f"{_WIRE_MARK}Saved")
-            return dict(saved) if isinstance(saved, dict) else {}
+            # PAIRED WITH THE MARKER, not merely with the sidecar's existence.
+            # `_wire_mark_of` falls through to the config when the sidecar is
+            # EMPTY and the config carries a marker of its own; reading the
+            # displaced values from the sidecar in that case would restore one
+            # wiring's values over another wiring's keys — which is worse than
+            # restoring nothing, because it writes a proxy address that was
+            # never there.
+            side_mark = side.get(_WIRE_MARK)
+            if isinstance(side_mark, list) and side_mark:
+                saved = side.get(f"{_WIRE_MARK}Saved")
+                return dict(saved) if isinstance(saved, dict) else {}
+            if not (
+                isinstance(raw, dict)
+                and isinstance(raw.get(_WIRE_MARK), list)
+                and raw.get(_WIRE_MARK)
+            ):
+                saved = side.get(f"{_WIRE_MARK}Saved")
+                return dict(saved) if isinstance(saved, dict) else {}
     if not isinstance(raw, dict):
         return {}
     saved = raw.get(f"{_WIRE_MARK}Saved")
@@ -1425,7 +1484,19 @@ def run(
             # package at all: unpinned is a working session, wired-to-a-dead-
             # port is not.
             if _wiring_is_stale(switcher):
-                clear_wiring(switcher)
+                # BUDGETED, like every other call on a launch path. The
+                # default is 9s, and this hook runs from an rc file before
+                # EVERY hand-launched `claude` — so a config lock held by a
+                # routine credential refresh turned a launch into a 9.5s
+                # stall (measured, against 0.86s for the same state through
+                # `wire_launch_env`). `_LAUNCH_LOCK_BUDGET_S` exists for
+                # exactly this site; the `heal` above already uses it.
+                #
+                # Giving up early is correct here: the wiring is stale, not
+                # dangerous-to-leave-one-more-launch, and the next launch
+                # tries again. A launch that blocks is the failure this whole
+                # module is written to avoid.
+                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
         return 0

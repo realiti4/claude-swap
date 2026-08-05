@@ -477,6 +477,125 @@ class TestLaunchIsNeverBlocked:
             "inherits it, which is disaster path D"
         )
 
+    def test_a_peer_that_returns_a_broken_env_cannot_reach_execvpe(
+        self, tmp_path, monkeypatch
+    ):
+        """The peer's return value is the one thing taken on trust, and both
+        wrong shapes are worse than a raise.
+
+        `wire_launch_env` guards the CALL but returns whatever `wire_env`
+        hands back, and `os.execvpe` sits outside `_exec`'s try. Measured:
+
+          returns None            `execvpe(argv, None)` does NOT fail. It
+                                  hands the child the PARENT's environ, so
+                                  CLAUDE_CONFIG_DIR is silently dropped and
+                                  the session launches against the default
+                                  login instead of the selected account.
+                                  Verified: the child printed the parent's
+                                  value. That is an account-isolation break
+                                  with no error anywhere.
+          returns {"K": 41234}    `execvpe` raises TypeError out of `_exec`
+                                  and kills the launch.
+
+        This module's standing rule is that the peer may be wrong — `heal`
+        re-reads state rather than believing a return value. The same rule
+        belongs here: a peer that answers nonsense degrades to an UNPINNED
+        launch, which is the failure mode everything else is built to
+        tolerate.
+        """
+        import types
+
+        from claude_swap import pin
+
+        base = {"CLAUDE_CONFIG_DIR": "/selected/account", "PATH": "/usr/bin"}
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        class _Peer:
+            def __init__(self, answer):
+                self._answer = answer
+
+            def ensure_proxy(self, switcher):
+                return (41234, tmp_path / "ca.pem")
+
+            def wire_env(self, env, port, ca_path):
+                return self._answer
+
+            def unwire_if_dead(self, certdir):
+                return False
+
+        for answer, label in (
+            (None, "None"),
+            ({"CLAUDE_CONFIG_DIR": "/selected/account", "PORT": 41234}, "a non-str value"),
+            ("not a dict", "a string"),
+        ):
+            monkeypatch.setattr(pin, "_impl", lambda a=answer: _Peer(a))
+            out = pin.wire_launch_env(sw, dict(base))
+            assert isinstance(out, dict), f"{label}: returned {type(out).__name__}"
+            assert all(
+                isinstance(k, str) and isinstance(v, str) for k, v in out.items()
+            ), f"{label}: reached execvpe with a non-str entry — the launch dies"
+            assert out.get("CLAUDE_CONFIG_DIR") == "/selected/account", (
+                f"{label}: the account's config dir was lost — the session "
+                f"launches against the default login, silently"
+            )
+
+    def test_ensure_gives_up_the_config_lock_rather_than_stalling_a_launch(
+        self, tmp_path, monkeypatch
+    ):
+        """A launch hook may not wait out the DEFAULT lock timeout.
+
+        `--ensure` runs from an rc file before EVERY hand-launched `claude`.
+        Its `clear_wiring` had no budget, so it fell back to
+        `DEFAULT_TIMEOUT_S` (9.0s) — and a config lock held by a routine
+        credential refresh turned a launch into a measured 9.5s stall, against
+        0.86s for the same state through `wire_launch_env`.
+
+        `_LAUNCH_LOCK_BUDGET_S` exists for exactly this site and the `heal`
+        one line above already used it. Giving up early is the right answer
+        here: the wiring is stale, not dangerous to leave for one more launch,
+        and the next launch tries again. A launch that blocks is the failure
+        this module is written to avoid.
+        """
+        import time
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        seen = {}
+
+        def _spy(switcher, timeout=None):
+            seen["timeout"] = timeout
+            # Behave like a lock we cannot take: burn the budget we were
+            # given, then report nothing removed.
+            time.sleep(min(timeout or pin_locks.DEFAULT_TIMEOUT_S, 1.5))
+            return False
+
+        from claude_swap import claude_locks as pin_locks
+
+        monkeypatch.setattr(pin, "clear_wiring", _spy)
+        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored"))
+
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        started = time.monotonic()
+        assert pin.run(sw, None, ensure=True) == 0
+        elapsed = time.monotonic() - started
+
+        assert seen.get("timeout") == pin._LAUNCH_LOCK_BUDGET_S, (
+            f"--ensure asked for timeout={seen.get('timeout')!r}; unbudgeted "
+            f"means the {pin_locks.DEFAULT_TIMEOUT_S}s default, paid before "
+            f"every hand-launched claude"
+        )
+        assert elapsed < 2.0, f"the launch hook blocked for {elapsed:.1f}s"
+
     def test_ensure_prints_nothing_and_survives_a_raising_heal(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -583,6 +702,66 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert "CSWAP_PIN_PORT" not in env
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
+
+    def test_an_emptied_sidecar_does_not_blind_us_to_an_older_pins_wiring(
+        self, tmp_path, monkeypatch
+    ):
+        """A clear must not make the OTHER receipt location unreadable.
+
+        The receipt moved from `.claude.json` into the account store, and an
+        older `cswap-pin` still writes the config key — the compat promise
+        this module states in `_wire_mark_of`. But `--clear` writes an EMPTY
+        sidecar, and an empty sidecar was treated as the final answer. So
+        after one clear, a wiring written by that older package became
+        invisible to EVERY recovery path at once:
+
+            _wiring_present  False      _wired_ports  []
+            _wiring_is_stale False      clear_wiring  False
+            heal             (False, 'Nothing to heal')
+
+        while `.claude.json` still named a proxy port. That is precisely the
+        stranding this module exists to prevent, reported as healthy by every
+        probe that could have caught it. The population is not exotic: with no
+        floor on the extra, an already-satisfied `cswap-pin` is not upgraded,
+        so anyone who installed the pin before the sidecar existed lands here.
+
+        The rule: an empty sidecar answers for the SIDECAR, not for the
+        config. Only when neither location has a marker is the answer "not
+        wired".
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import _ledger_path, clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        port = _dead_port()
+        cfg = tmp_path / ".claude.json"
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+
+        # An emptied sidecar, exactly as `--clear` leaves it.
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({"_cswapPinWiredKeys": []}))
+
+        # ...and an OLDER cswap-pin wires again, into the config only.
+        cfg.write_text(json.dumps({
+            "env": {
+                "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                "CSWAP_PIN_PORT": str(port),
+                "UNRELATED": "keep me",
+            },
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://127.0.0.1:9901"},
+        }))
+
+        assert clear_wiring(ClaudeAccountSwitcher()) is True, (
+            "an emptied sidecar hid a wiring the config plainly carries — "
+            "every recovery path reports healthy while sessions dial a dead "
+            "port"
+        )
+        env = json.loads(cfg.read_text())["env"]
+        assert "CSWAP_PIN_PORT" not in env
+        assert env["UNRELATED"] == "keep me"
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"
 
     def test_clearing_an_unwired_config_is_a_no_op(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
