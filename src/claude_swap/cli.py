@@ -119,7 +119,8 @@ Examples:
   cswap pin            show the current pin
   cswap pin --clear    remove the pin
   cswap pin --heal     restart a pin proxy that died, or unwire it
-  cswap pin --port     print the serving port (for scripts), or exit 1
+  cswap pin --get_port print the serving port (for scripts), or exit 1
+  cswap pin --set_port N   serve on port N from the next start (0 clears)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
         """,
     )
@@ -142,11 +143,25 @@ Examples:
     # reported as bypassing the cache proxy. Nothing could ask, so the layout
     # and the schema became a compatibility surface we do not control.
     parser.add_argument(
-        "--port",
+        "--get_port",
         action="store_true",
         help=(
             "Print the port a live pin proxy is serving, and nothing else "
-            "(exit 1 if none). For scripts: PORT=$(cswap pin --port)"
+            "(exit 1 if none). For scripts: PORT=$(cswap pin --get_port)"
+        ),
+    )
+    # The WRITE side. Persisted in the pin's own settings file, not in
+    # ~/.claude.json — that file is for what Claude Code reads. An rc export
+    # of CSWAP_PIN_PORT still outranks it: a value the user typed for this
+    # shell beats one they saved once.
+    parser.add_argument(
+        "--set_port",
+        type=int,
+        metavar="N",
+        help=(
+            "Serve on port N from the next daemon start (0 clears it and "
+            "returns to an ephemeral port). CSWAP_PIN_PORT in the environment "
+            "still wins."
         ),
     )
     # THE LAUNCH HOOK. `--heal` prints its verdict and is called by a human or
@@ -171,8 +186,11 @@ Examples:
         parser.error("--heal takes no account and does not combine with --clear")
     # Same rule as --clear/--heal: a query that silently discarded an action
     # would be indistinguishable from having performed it.
-    if args.port and (args.account or args.clear or args.heal or args.ensure):
-        parser.error("--port takes no account and does not combine with other flags")
+    if args.get_port and (args.account or args.clear or args.heal or args.ensure):
+        parser.error("--get_port takes no account and does not combine with other flags")
+    if args.set_port is not None and (args.account or args.clear or args.heal
+                                      or args.ensure or args.get_port):
+        parser.error("--set_port takes no account and does not combine with other flags")
     if args.ensure and (args.account or args.clear or args.heal):
         parser.error("--ensure takes no account and does not combine with other flags")
 
@@ -187,7 +205,8 @@ Examples:
                 args.account,
                 clear=args.clear,
                 heal_only=args.heal,
-                port=args.port,
+                get_port=args.get_port,
+                set_port=args.set_port,
                 ensure=args.ensure,
             )
         )

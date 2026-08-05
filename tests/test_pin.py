@@ -2884,11 +2884,11 @@ class TestHealADeadPin:
 
         seen = {}
 
-        def _run(switcher, account, clear=False, heal_only=False, port=False,
-                 ensure=False):
+        def _run(switcher, account, clear=False, heal_only=False, get_port=False,
+                 set_port=None, ensure=False):
             seen.update(
-                account=account, clear=clear, heal_only=heal_only, port=port,
-                ensure=ensure,
+                account=account, clear=clear, heal_only=heal_only,
+                get_port=get_port, set_port=set_port, ensure=ensure,
             )
             return 0
 
@@ -2899,12 +2899,12 @@ class TestHealADeadPin:
             cli._pin_command(["--heal"])
         assert e.value.code == 0
         assert seen == {
-            "account": None, "clear": False, "heal_only": True, "port": False,
-            "ensure": False,
+            "account": None, "clear": False, "heal_only": True,
+            "get_port": False, "set_port": None, "ensure": False,
         }
 
-    def test_the_port_query_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
-        """`--port` exists so consumers stop reading our files.
+    def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
+        """`--get_port` exists so consumers stop reading our files.
 
         Measured in the owner's dotfiles: `cc-update` opens
         `pin-proxy/proxy.json` at TWO hardcoded paths and parses our schema,
@@ -2935,7 +2935,7 @@ class TestHealADeadPin:
         dead_port = dead.getsockname()[1]
         dead.close()
         record.write_text(json.dumps({"port": dead_port, "pid": 999}))
-        assert pin.run(sw, None, port=True) != 0, (
+        assert pin.run(sw, None, get_port=True) != 0, (
             "a dead recorded port was reported as serving"
         )
 
@@ -2949,11 +2949,79 @@ class TestHealADeadPin:
         monkeypatch.setattr(pin, "_impl", lambda: (_ for _ in ()).throw(
             ClaudeSwitchError("The cloud pin requires 'cswap-pin'")))
         try:
-            assert pin.run(sw, None, port=True) == 0
+            assert pin.run(sw, None, get_port=True) == 0
         finally:
             lsn.close()
 
-    def test_the_cli_forwards_port_and_ensure(self):
+    def test_set_port_persists_and_the_environment_still_wins(
+        self, tmp_path, monkeypatch
+    ):
+        """`--set_port N` writes the pin's own settings file, not .claude.json.
+
+        The number used to live in `~/.claude.json`'s env block — the one
+        entry there Claude Code does not read. It is ours, so it belongs in
+        our directory, and a user who wants a fixed port now has somewhere to
+        say so.
+
+        THE ENVIRONMENT STILL OUTRANKS IT. A value exported in an rc file is
+        what the user typed for THIS shell; a persisted one is what they said
+        once. Asserted in both directions, because testing only the file
+        would pass against an implementation that never reads the env.
+        """
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+        assert pin.run(sw, None, set_port=44444) == 0
+        raw = json.loads((backup / "pin-proxy" / "settings.json").read_text())
+        assert raw.get("port") == 44444, raw
+        # NOT in .claude.json — that file is for what Claude Code reads.
+        assert "settings.json" in os.listdir(backup / "pin-proxy")
+
+        assert pin.configured_port(sw) == 44444
+        monkeypatch.setenv("CSWAP_PIN_PORT", "45555")
+        assert pin.configured_port(sw) == 45555, (
+            "an rc export was overruled by the persisted value"
+        )
+
+    def test_set_port_refuses_a_number_that_is_not_a_port(self, tmp_path):
+        """0 is the interesting one and it is not merely invalid.
+
+        `bind()` reads 0 as "choose one for me", so persisting it would do the
+        OPPOSITE of what a user who typed it meant, while looking like it
+        worked. 0 clears the setting instead — the one reading that cannot be
+        mistaken for a request.
+        """
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+        assert pin.run(sw, None, set_port=44444) == 0
+        assert pin.run(sw, None, set_port=0) == 0, "clearing must be allowed"
+        raw = json.loads((backup / "pin-proxy" / "settings.json").read_text())
+        assert "port" not in raw, f"0 was persisted as a port: {raw}"
+
+        for bad in (70000, -1):
+            assert pin.run(sw, None, set_port=bad) != 0, (
+                f"{bad} was accepted as a port"
+            )
+
+    def test_the_cli_forwards_the_port_flags_and_ensure(self):
         """Both flags must be WIRED, not merely declared.
 
         A flag that parses and is then dropped prints the pin STATUS and exits
@@ -2968,7 +3036,7 @@ class TestHealADeadPin:
         from claude_swap import cli
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(cli._pin_command)))
-        for flag in ("--port", "--ensure"):
+        for flag in ("--get_port", "--set_port", "--ensure"):
             assert [
                 n for n in ast.walk(tree)
                 if isinstance(n, ast.Call)
@@ -2982,9 +3050,9 @@ class TestHealADeadPin:
             for n in ast.walk(tree) if isinstance(n, ast.Call)
             for kw in n.keywords
         }
-        assert {"port", "ensure"} <= forwarded, (
+        assert {"get_port", "set_port", "ensure"} <= forwarded, (
             f"parsed but never forwarded to pin.run: "
-            f"{ {'port', 'ensure'} - forwarded }"
+            f"{ {'get_port', 'set_port', 'ensure'} - forwarded }"
         )
 
     def test_heal_runs_before_the_package_is_required(self, tmp_path, monkeypatch):

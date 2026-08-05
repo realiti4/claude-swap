@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
@@ -1219,12 +1220,60 @@ def serving_port(switcher) -> int | None:
         return None
 
 
+def configured_port(switcher) -> int | None:
+    """The port the user asked the pin to serve on, or None.
+
+    Delegated to the package, which OWNS the setting — the seam must not grow
+    a second reader of a file cswap-pin writes, because two readers of one
+    fact is how `--clear` stopped converging once already. Falls back to the
+    environment alone when the package is absent, so the answer is still the
+    user's own export rather than nothing.
+    """
+    # THE SAME ORDER THE PACKAGE USES, and read here rather than delegated:
+    # the setting lives in CSWAP's own directory and is a plain JSON record,
+    # so making the answer depend on an optional package would leave it
+    # unreadable in the case a user is most likely to be diagnosing.
+    #
+    #   1. the ENVIRONMENT — what the user typed for THIS shell
+    #   2. the settings file — what they saved once
+    #   3. nothing — an ephemeral port
+    #
+    # RANGE-CHECKED, and 0 is the one that matters: bind() reads it as
+    # "choose one for me", so treating a configured 0 as a request would do
+    # the opposite of what it says.
+    saved = None
+    try:
+        raw = json.loads(
+            (_certdir(switcher) / "settings.json").read_text(encoding="utf-8")
+        )
+        saved = raw.get("port") if isinstance(raw, dict) else None
+    except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
+        pass
+    for value in (os.environ.get("CSWAP_PIN_PORT"), saved):
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port <= 65535:
+            return port
+    return None
+
+
+def _certdir(switcher):
+    """Where the pin keeps its own files. One definition, so a layout change
+    is one edit rather than a grep."""
+    from pathlib import Path
+
+    return Path(switcher.backup_dir) / "pin-proxy"
+
+
 def run(
     switcher,
     account: str | None,
     clear: bool = False,
     heal_only: bool = False,
-    port: bool = False,
+    get_port: bool = False,
+    set_port: int | None = None,
     ensure: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
@@ -1277,7 +1326,51 @@ def run(
             pass
         return 0
 
-    if port:
+    if set_port is not None:
+        # WRITE THE PIN'S OWN SETTING, in the pin's own directory. This number
+        # used to live in `~/.claude.json`'s env block — the one entry there
+        # Claude Code does not read — so a user who wanted a fixed port had
+        # nowhere to say so and we were storing our config in another
+        # program's exclusive file.
+        #
+        # 0 CLEARS rather than persists. It is not merely out of range:
+        # `bind()` reads 0 as "choose one for me", so persisting it would do
+        # the OPPOSITE of what a user typing it meant, while looking like it
+        # worked. Clearing is the one reading that cannot be mistaken.
+        from claude_swap.printer import error
+
+        if set_port and not 0 < set_port <= 65535:
+            error(f"Not a port: {set_port}")
+            return 1
+        # WRITTEN HERE, NOT THROUGH THE PACKAGE. The cert dir is CSWAP's own
+        # directory and this is a plain JSON record, so requiring cswap-pin to
+        # save it would make the setting unsettable in exactly the case a user
+        # is most likely to be fixing something — the same reason `--clear`
+        # and `--heal` do their half without the package.
+        #
+        # READ-MODIFY-WRITE: it is a SETTINGS file, so the next setting to
+        # land there must not be erased by the next --set_port.
+        try:
+            d = _certdir(switcher)
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / "settings.json"
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raw = {}
+            except Exception:  # noqa: BLE001 — absent or garbage: start clean
+                raw = {}
+            if set_port:
+                raw["port"] = int(set_port)
+            else:
+                raw.pop("port", None)
+            switcher._write_json(path, raw)
+        except Exception as exc:  # noqa: BLE001
+            error(f"Could not save the port: {_safe(exc)}")
+            return 1
+        return 0
+
+    if get_port:
         # A NUMBER ON STDOUT AND NOTHING ELSE. This is read by `$(cswap pin
         # --port)`, so a prefix, a colour code or a "no pin set" sentence
         # would land INSIDE the caller's variable — turning every consumer
