@@ -840,6 +840,45 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
 
+    def test_no_sidecar_is_not_the_same_answer_as_a_cleared_one(
+        self, tmp_path, monkeypatch
+    ):
+        """ABSENT and EMPTIED are different receipts and must stay different.
+
+        `--clear` writes `{_cswapPinWiredKeys: []}`, and that says "the
+        sidecar was cleared" — which suppresses a marker the clear itself
+        emptied. A sidecar that was never written says nothing at all, so a
+        config marker still has to be found and removed.
+
+        Asserted through `_saved_of`, because that is where the two answers
+        actually diverge. Measured on every sidecar/config pair: with a usable
+        config marker both receipts agree, and a test written that way passes
+        even with absence and a clear treated identically (my first version
+        did). The difference shows only in what gets RESTORED — a clear's
+        receipt carries displaced values, and absence carries nothing.
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import _WIRE_MARK, _ledger_path, _saved_of
+
+        cfg = tmp_path / ".claude.json"
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        raw = {"env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}"}}
+
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.unlink(missing_ok=True)
+        assert _saved_of(raw, cfg) == {}, (
+            "a sidecar that was never written produced displaced values — "
+            "absence was read as a receipt when it is the lack of one, and a "
+            "clear would restore a hop this machine never had"
+        )
+
+        # The one shape that IS a receipt, same config underneath.
+        side.write_text(json.dumps({
+            _WIRE_MARK: [], f"{_WIRE_MARK}Saved": {"HTTPS_PROXY": "http://127.0.0.1:9901"},
+        }))
+        assert _saved_of(raw, cfg) == {"HTTPS_PROXY": "http://127.0.0.1:9901"}
+
     def test_an_emptied_sidecar_does_not_blind_us_to_an_older_pins_wiring(
         self, tmp_path, monkeypatch
     ):
@@ -899,6 +938,55 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert "CSWAP_PIN_PORT" not in env
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"
+
+    def test_an_older_pins_wiring_restores_ITS_values_not_the_sidecars(
+        self, tmp_path, monkeypatch
+    ):
+        """The marker and the displaced values must come from ONE receipt.
+
+        Same shape as the test above — emptied sidecar, older cswap-pin wires
+        into the config only — but asking what gets RESTORED rather than
+        whether the wiring is found. `_wire_mark_of` falls through to the
+        config here; `_saved_of` has to fall through with it. Reading the
+        marker from one receipt and the values from the other restores one
+        wiring's values over another wiring's keys, which is worse than
+        restoring nothing: it writes a proxy address that was never there.
+
+        The sidecar deliberately carries a DIFFERENT saved value, so a
+        crossed read is visible rather than accidentally right.
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import _ledger_path, clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        port = _dead_port()
+        cfg = tmp_path / ".claude.json"
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+
+        # Emptied by `--clear`, but still carrying what THAT clear displaced.
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": [],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://127.0.0.1:1111"},
+        }))
+
+        # An OLDER cswap-pin wires again, config-only, over a DIFFERENT hop.
+        cfg.write_text(json.dumps({
+            "env": {
+                "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                "CSWAP_PIN_PORT": str(port),
+            },
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://127.0.0.1:9901"},
+        }))
+
+        assert clear_wiring(ClaudeAccountSwitcher()) is True
+        env = json.loads(cfg.read_text())["env"]
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901", (
+            "the sidecar's saved value was restored over the config's keys — "
+            "sessions now dial a hop this wiring never displaced"
+        )
 
     def test_clearing_an_unwired_config_is_a_no_op(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
@@ -3465,6 +3553,43 @@ class TestHealADeadPin:
         # top-level "port" key out of this file and nothing else.
         raw = json.loads((backup / "pin-proxy" / "settings.json").read_text())
         assert raw.get("port") == 44444, raw
+
+    def test_set_port_keeps_the_rest_of_the_settings_file(self, tmp_path):
+        """It is a SETTINGS file, so `--set_port` must not truncate it.
+
+        The next setting to land beside `port` would otherwise be erased by
+        the next `--set_port` — the kind of loss nobody notices until the
+        setting they set has quietly gone.
+
+        Untested here until the package's own dead writer was removed: the
+        read-modify-write was asserted against THAT one, so the writer that
+        actually runs had the property and nothing checking it.
+        """
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        path = backup / "pin-proxy" / "settings.json"
+        path.write_text(json.dumps({"somethingElse": "keep me"}))
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+        assert pin.run(sw, None, set_port=43333) == 0
+        raw = json.loads(path.read_text())
+        assert raw.get("somethingElse") == "keep me", (
+            f"--set_port clobbered the rest of the settings file: {raw}"
+        )
+        assert raw.get("port") == 43333, raw
+
+        # ...and clearing removes ONLY the port.
+        assert pin.run(sw, None, set_port=0) == 0
+        raw = json.loads(path.read_text())
+        assert "port" not in raw, raw
+        assert raw.get("somethingElse") == "keep me", raw
 
     def test_set_port_refuses_a_number_that_is_not_a_port(self, tmp_path):
         """0 is the interesting one and it is not merely invalid.

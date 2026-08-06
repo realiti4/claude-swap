@@ -668,13 +668,24 @@ def _ledger_path(config_path):
     return get_backup_root() / "pin-wiring" / f"{key}.json"
 
 
-def _read_ledger(config_path) -> dict | None:
-    """The sidecar receipt, or None when there is none to read."""
+def _read_ledger(config_path) -> dict:
+    """The sidecar receipt, or an empty one when there is none to read.
+
+    ``{}`` rather than ``None``: ABSENT and UNREADABLE answer every question a
+    caller asks the same way an empty dict does — ``_WIRE_MARK in {}`` is
+    False and ``{}.get()`` is None — so both readers were re-testing for a
+    distinction neither of them made. Verified equivalent across all 56
+    sidecar/config pairs before the change.
+
+    What still differs, and must, is ``{_WIRE_MARK: []}``: that is `--clear`'s
+    receipt, it answers FOR THE SIDECAR, and it carries what that clear
+    displaced. Absence carries nothing.
+    """
     try:
         raw = json.loads(_ledger_path(config_path).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — absent/unreadable is not "wired"
-        return None
-    return raw if isinstance(raw, dict) else None
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def _clear_ledger(config_path) -> None:
@@ -728,36 +739,35 @@ def _wire_mark_of(raw: object, config_path=None) -> list | None:
     """
     if config_path is not None:
         side = _read_ledger(config_path)
-        if side is not None:
-            ours = side.get(_WIRE_MARK)
-            if isinstance(ours, list) and ours:
-                return ours
-            # AN EMPTY SIDECAR ANSWERS FOR THE SIDECAR, NOT FOR THE CONFIG.
-            #
-            # `--clear` empties it, and treating that as the final answer made
-            # a wiring written by an OLDER cswap-pin — which writes the config
-            # key and no sidecar, the compat promise stated above — invisible
-            # to every recovery path at once:
-            #
-            #     _wiring_present  False    _wired_ports  []
-            #     _wiring_is_stale False    clear_wiring  False
-            #     heal             (False, 'Nothing to heal')
-            #
-            # while `.claude.json` still named a proxy port. Every probe that
-            # could have caught the stranding reported healthy. The population
-            # is not exotic: the extra carries no floor, so an already-present
-            # `cswap-pin` is never upgraded, and anyone who installed the pin
-            # before the sidecar existed lands here on their first clear.
-            #
-            # What the empty sidecar DOES rule out is resurrecting a receipt
-            # the clear emptied — but only the one it emptied. A marker in the
-            # config is a receipt the clear never saw.
-            if _WIRE_MARK in side and not (
-                isinstance(raw, dict)
-                and isinstance(raw.get(_WIRE_MARK), list)
-                and raw.get(_WIRE_MARK)
-            ):
-                return None
+        ours = side.get(_WIRE_MARK)
+        if isinstance(ours, list) and ours:
+            return ours
+        # AN EMPTY SIDECAR ANSWERS FOR THE SIDECAR, NOT FOR THE CONFIG.
+        #
+        # `--clear` empties it, and treating that as the final answer made
+        # a wiring written by an OLDER cswap-pin — which writes the config
+        # key and no sidecar, the compat promise stated above — invisible
+        # to every recovery path at once:
+        #
+        #     _wiring_present  False    _wired_ports  []
+        #     _wiring_is_stale False    clear_wiring  False
+        #     heal             (False, 'Nothing to heal')
+        #
+        # while `.claude.json` still named a proxy port. Every probe that
+        # could have caught the stranding reported healthy. The population
+        # is not exotic: the extra carries no floor, so an already-present
+        # `cswap-pin` is never upgraded, and anyone who installed the pin
+        # before the sidecar existed lands here on their first clear.
+        #
+        # What the empty sidecar DOES rule out is resurrecting a receipt
+        # the clear emptied — but only the one it emptied. A marker in the
+        # config is a receipt the clear never saw.
+        if _WIRE_MARK in side and not (
+            isinstance(raw, dict)
+            and isinstance(raw.get(_WIRE_MARK), list)
+            and raw.get(_WIRE_MARK)
+        ):
+            return None
     if not isinstance(raw, dict):
         return None
     ours = raw.get(_WIRE_MARK)
@@ -773,7 +783,7 @@ def _saved_of(raw: object, config_path=None) -> dict:
     """
     if config_path is not None:
         side = _read_ledger(config_path)
-        if side is not None and _WIRE_MARK in side:
+        if _WIRE_MARK in side:
             # PAIRED WITH THE MARKER, not merely with the sidecar's existence.
             # `_wire_mark_of` falls through to the config when the sidecar is
             # EMPTY and the config carries a marker of its own; reading the
