@@ -1280,6 +1280,67 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
+    def test_strike_binds_to_failed_credential_generation(self, store):
+        store.record(
+            {
+                "1": FetchRecord(
+                    error="invalid_grant", struck_fp="sha256:failed"
+                )
+            },
+            IDENT,
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.struck_fingerprint == "sha256:failed"
+        assert entry.token_dead(stored_fp="sha256:failed")
+        assert not entry.token_dead(stored_fp="sha256:new")
+
+    def test_changed_generation_clears_bound_quarantine(self, store):
+        store.record(
+            {
+                "1": FetchRecord(
+                    error="invalid_grant", struck_fp="sha256:failed"
+                )
+            },
+            IDENT,
+        )
+        cleared = store.clear_stale_dead_tokens(
+            {"1": IDENT["1"]},
+            {"1": "sha256:new"},
+            {"1": "sha256:failed"},
+        )
+        assert cleared == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert not entry.token_dead()
+        assert entry.struck_fingerprint is None
+        assert entry.last_error is None
+
+    def test_legacy_strike_uses_stored_generation_as_migration_binding(self, store):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        cleared = store.clear_stale_dead_tokens(
+            {"1": IDENT["1"]},
+            {"1": "sha256:session-new"},
+            {"1": "sha256:stored-old"},
+        )
+        assert cleared == {"1"}
+        assert not store.entries(IDENT)["1"].token_dead()
+
+    def test_same_generation_keeps_quarantine(self, store):
+        store.record(
+            {
+                "1": FetchRecord(
+                    error="invalid_grant", struck_fp="sha256:failed"
+                )
+            },
+            IDENT,
+        )
+        cleared = store.clear_stale_dead_tokens(
+            {"1": IDENT["1"]},
+            {"1": "sha256:failed"},
+            {"1": "sha256:failed"},
+        )
+        assert cleared == set()
+        assert store.entries(IDENT)["1"].token_dead()
+
 
 class TestReserve:
     """Atomic fetch reservation: eligibility re-checked under the lock."""

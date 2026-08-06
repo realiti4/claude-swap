@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import shutil
@@ -65,7 +64,6 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
-    error,
     format_age,
     ide_short_name,
     muted,
@@ -3129,7 +3127,10 @@ class ClaudeAccountSwitcher:
                             # "re-login needed" — a bare sentinel is a no-op
                             # to the store and would re-POST every pass.
                             return FetchRecord(
-                                error=result.error or "invalid_grant"
+                                error=result.error or "invalid_grant",
+                                struck_fp=oauth.credential_fingerprint(
+                                    refresh_input
+                                ),
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
@@ -3400,6 +3401,7 @@ class ClaudeAccountSwitcher:
                 self._write_account_credentials(acct_num, acct_email, new_creds)
 
         from claude_swap.session import (
+            STALE_MARKER,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -3416,7 +3418,10 @@ class ClaudeAccountSwitcher:
         # family here would log the next `cswap run` out the same way.
         session_dir = self._session_dir(str(num), email)
         session_creds = read_session_credentials(session_dir)
-        if session_creds and session_identity_drifted(session_dir, email, org_uuid):
+        session_exists = session_dir.is_dir()
+        session_stale = (session_dir / STALE_MARKER).exists()
+        session_drifted = session_identity_drifted(session_dir, email, org_uuid)
+        if session_creds and session_drifted:
             # An in-session /login re-pointed the profile at a different
             # account; fetching with its credential would record THAT
             # account's usage under this slot's label. The profile no longer
@@ -3441,16 +3446,23 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                     )
-                if has_live_session:
-                    # The live claude refreshes lazily on its next API call;
-                    # requesting now would just 401 (same rule as the owned
-                    # active account in _fetch_active_usage).
-                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                # The profile remains the credential authority while idle:
+                # Claude may have rotated its refresh-token family without
+                # synchronizing the stored backup. Falling back on expiry can
+                # therefore POST a consumed predecessor and falsely quarantine
+                # a healthy account as invalid_grant. Native Claude refreshes
+                # the profile lazily on its next real API call.
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+
+            # A non-stale session profile remains Claude Code's credential
+            # authority even after its credential was cleared or became
+            # unreadable. Falling through to the stored bootstrap copy would
+            # POST a potentially consumed predecessor and recreate the exact
+            # invalid_grant churn session mode is designed to avoid.
+            if session_exists and not session_stale and not session_drifted:
+                return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
+        elif session_exists and not session_stale and not session_drifted:
+            return FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
@@ -3461,7 +3473,57 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            struck_fp=outcome.struck_fp,
         )
+
+    def _usage_credential_fingerprints(
+        self,
+        info_by_num: dict[
+            str, tuple[int, str, str, str, bool, str, str]
+        ],
+        nums: set[str],
+    ) -> tuple[dict[str, str | None], dict[str, str | None]]:
+        """Return current-authority and legacy stored fingerprints.
+
+        Session profiles are read strictly on macOS: an unavailable Keychain
+        must not fall back to an old plaintext seed and falsely look like a
+        fresh generation. Only a complete access+refresh pair can release a
+        quarantine; cleared or partial profiles keep the stored verdict.
+        """
+        from claude_swap.session import (
+            read_config_dir_credentials,
+            session_identity_drifted,
+        )
+
+        current: dict[str, str | None] = {}
+        legacy: dict[str, str | None] = {}
+        for num in nums:
+            info = info_by_num[num]
+            _, email, _, org_uuid, is_active, stored_creds, _ = info
+            stored_fp = oauth.credential_fingerprint(stored_creds)
+            legacy[num] = stored_fp
+            current_creds = stored_creds
+            if is_active:
+                if self._active_keychain_unavailable:
+                    current_creds = ""
+            else:
+                session_dir = self._session_dir(num, email)
+                if not session_identity_drifted(session_dir, email, org_uuid):
+                    try:
+                        profile_creds = read_config_dir_credentials(
+                            str(session_dir), strict_keychain=True
+                        )
+                    except CredentialReadError:
+                        profile_creds = None
+                    profile_oauth = oauth.extract_oauth_data(profile_creds or "")
+                    if (
+                        profile_oauth
+                        and profile_oauth.get("accessToken")
+                        and profile_oauth.get("refreshToken")
+                    ):
+                        current_creds = profile_creds or ""
+            current[num] = oauth.credential_fingerprint(current_creds)
+        return current, legacy
 
     def _run_usage_fetches(
         self, infos: list[tuple[int, str, str, str, bool, str, str]]
@@ -3518,6 +3580,25 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
+        dead_nums = {
+            num for num in info_by_num if entries[num].token_dead()
+        }
+        if dead_nums:
+            current_fps, legacy_fps = self._usage_credential_fingerprints(
+                info_by_num, dead_nums
+            )
+            cleared = store.clear_stale_dead_tokens(
+                {num: identities[num] for num in dead_nums},
+                current_fps,
+                legacy_fps,
+            )
+            if cleared:
+                self._logger.info(
+                    "Released stale auth quarantine after credential generation "
+                    "changed for account(s): %s",
+                    ", ".join(sorted(cleared, key=int)),
+                )
+                entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
