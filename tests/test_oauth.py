@@ -502,6 +502,21 @@ class TestTryRefreshOAuthCredentials:
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
 
+    def test_invalid_grant_substring_in_detail_is_transient(self):
+        err = self._http_error(
+            400,
+            b'{"error": "server_error", "detail": "mentions invalid_grant"}',
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_invalid_client_is_systemic_not_a_dead_token(self):
+        err = self._http_error(401, b'{"error": "invalid_client"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "invalid_client"
+
     def test_5xx_is_transient_even_with_marker(self):
         err = self._http_error(500, b'{"error": "invalid_grant"}')
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
@@ -521,9 +536,9 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
-    def test_invalid_json_is_permanent(self):
+    def test_invalid_json_is_transient(self):
         outcome = oauth.try_refresh_oauth_credentials("not json")
-        assert outcome.error == "no_refresh_token"
+        assert outcome.error == "transient"
 
     def test_wrapper_returns_none_on_failure(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
