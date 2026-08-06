@@ -2031,20 +2031,38 @@ class TestClearRunsWithTheExtraGone:
     sys.meta_path — the one form that also stops importlib.import_module.
     """
 
-    def test_the_marker_still_matches_the_package_that_writes_it(self):
+    def test_the_marker_still_matches_the_package_that_writes_it(self, tmp_path):
         """cswap READS a key cswap-pin WRITES, and the two version
         independently. Agreeing on a magic string by convention is this seam's
         one silent-drift risk: rename it there and `--clear` stops finding
         wirings while still reporting 'No cloud account pinned'.
 
-        Skipped without the extra because there is nothing to compare against
-        — the assertion is about two installed packages agreeing.
+        The port setting is the same shape of agreement in the other
+        direction: cswap WRITES `settings.json` from `--set_port` and
+        `proxy.configured_port` is what carries it to `bind()`. Both live here
+        because both are "two installed packages agreeing", and neither can be
+        checked at all without the extra.
         """
+        import types
+
         proxy = pytest.importorskip("cswap_pin.proxy")
 
+        from claude_swap import pin
         from claude_swap.pin import _WIRE_MARK
 
         assert proxy._WIRE_MARK == _WIRE_MARK
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        assert pin.run(sw, None, set_port=44444) == 0
+        assert proxy.configured_port(backup / "pin-proxy") == 44444, (
+            "the package could not read the port cswap just set — the two "
+            "sides of --set_port have drifted apart"
+        )
 
     def test_clear_removes_the_wiring_with_cswap_pin_blocked(self, tmp_path):
         import subprocess
@@ -3412,15 +3430,21 @@ class TestHealADeadPin:
         finally:
             lsn.close()
 
-    def test_set_port_persists_and_the_environment_is_not_a_source(
+    def test_set_port_persists_where_the_package_looks_for_it(
         self, tmp_path, monkeypatch
     ):
         """`--set_port N` writes the pin's own settings file, not .claude.json.
 
-        The env is NOT read: cswap-pin writes `CSWAP_PIN_PORT` into
-        `.claude.json` as its self-loop marker and Claude Code applies the
-        block at boot, so inside a pinned session it is already the live
-        daemon's port.
+        THE SHAPE, not our own reader. This asserted `pin.configured_port`,
+        a second copy of the parse that lived here with no caller — proving
+        only that we are self-consistent, which two components that both
+        drifted also are. The reader that matters is
+        `cswap_pin.proxy.configured_port`, since that one reaches `bind()`,
+        and it is asserted against this writer in
+        `TestClearRunsWithTheExtraGone` where the extra is installed.
+
+        Stated in raw JSON here so the check still runs on CI, which does not
+        install the extra (see ci.yml).
         """
         import types
 
@@ -3435,17 +3459,12 @@ class TestHealADeadPin:
 
         monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
         assert pin.run(sw, None, set_port=44444) == 0
-        raw = json.loads((backup / "pin-proxy" / "settings.json").read_text())
-        assert raw.get("port") == 44444, raw
         # NOT in .claude.json — that file is for what Claude Code reads.
         assert "settings.json" in os.listdir(backup / "pin-proxy")
-
-        assert pin.configured_port(sw) == 44444
-        monkeypatch.setenv("CSWAP_PIN_PORT", "45555")
-        assert pin.configured_port(sw) == 44444, (
-            "the env overruled the file — inside a pinned session that value "
-            "is the live daemon's port, not a setting"
-        )
+        # THE SHAPE THE PACKAGE PARSES: `proxy._settings_port` reads the
+        # top-level "port" key out of this file and nothing else.
+        raw = json.loads((backup / "pin-proxy" / "settings.json").read_text())
+        assert raw.get("port") == 44444, raw
 
     def test_set_port_refuses_a_number_that_is_not_a_port(self, tmp_path):
         """0 is the interesting one and it is not merely invalid.

@@ -1401,35 +1401,6 @@ def serving_port(switcher) -> int | None:
         return None
 
 
-def configured_port(switcher) -> int | None:
-    """The port the user asked the pin to serve on, or None.
-
-    ONE SOURCE: ``settings.json``, written by ``cswap pin --set_port``. Read
-    here rather than delegated to the package — it is a plain JSON record in
-    cswap's own directory, and depending on an optional package would leave it
-    unreadable exactly when a user is diagnosing.
-
-    NOT ``CSWAP_PIN_PORT``: cswap-pin writes that name into `.claude.json` as
-    its self-loop marker and Claude Code applies the block at boot, so inside
-    a pinned session it is already the live daemon's port.
-
-    0 is not a port to bind, so `--set_port 0` clears the setting.
-    """
-    saved = None
-    try:
-        raw = json.loads(
-            (_certdir(switcher) / "settings.json").read_text(encoding="utf-8")
-        )
-        saved = raw.get("port") if isinstance(raw, dict) else None
-    except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
-        pass
-    try:
-        port = int(saved)
-    except (TypeError, ValueError):
-        return None
-    return port if 0 < port <= 65535 else None
-
-
 def _certdir(switcher):
     """Where the pin keeps its own files. One definition, so a layout change
     is one edit rather than a grep."""
