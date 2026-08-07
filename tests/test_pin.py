@@ -5992,8 +5992,32 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         lock = cfg.parent / (cfg.name + ".lock")
         os.mkdir(lock)
 
+        # BUDGET PINNED, because the default sits 1.0s from a cliff.
+        #
+        # `clear_wiring` gives each path `left / (paths remaining)`, so how
+        # long THIS lock is waited on depends on how many configs are being
+        # cleared: two -> 9.0/2 = 4.5s, one -> the whole 9.0s. `proper_lockfile`
+        # takes a lock over once its mtime is older than CONFIG_STALENESS_S
+        # (10.0s) and RE-CHECKS that on every loop, so the wait itself ages the
+        # dir toward the threshold. Measured here:
+        #
+        #     budget  lock age at start   outcome
+        #       4.5s        0.0s          refused after 4.5s
+        #       4.5s        1.5s          refused after 4.5s
+        #       9.0s        0.0s          refused after 9.0s
+        #       9.0s        1.5s          TAKEN OVER after 8.8s   <- gate lost
+        #       1.0s        0.0s          refused after 1.0s
+        #
+        # The takeover is correct behaviour — a lock nothing has touched for
+        # 10s IS stale — but it is not the shape this test names, and with the
+        # default budget the margin is however long setup took. It reached
+        # zero on Windows CI the moment `heal` began clearing one config
+        # instead of two. `lock_timeout` is the documented per-caller budget
+        # (the launch path already passes it), not a patch of the mechanism
+        # under test: the real lock, the real `proper_lockfile` and the real
+        # `heal` are all still in the loop.
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            changed, message = pin.heal(sw)
+            changed, message = pin.heal(sw, lock_timeout=1.0)
 
         # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
         # this same `(False, "…could not be removed…")` for ANY raise inside
