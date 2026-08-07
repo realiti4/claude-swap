@@ -688,8 +688,17 @@ def _read_ledger(config_path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _clear_ledger(config_path) -> None:
-    """Record "not wired" in the sidecar. Best-effort, never raises.
+def _clear_ledger(config_path) -> bool:
+    """Record "not wired" in the sidecar. Never raises; SAYS whether it wrote.
+
+    THE RETURN IS LOAD-BEARING, and discarding it made `--clear` permanently
+    non-converging. The config write could succeed while this one failed (an
+    unwritable pin-wiring dir, a full disk, a root-owned parent) and
+    `_clear_wiring_locked` still returned True. The sidecar then kept a
+    non-empty marker over a config that was already clean, so `_wiring_present`
+    stayed true forever: every re-run re-injected the recorded values, failed
+    the same way, and answered "re-run once it frees up" — advice that could
+    never come true. The TUI kept showing a phantom cloud-account row on top.
 
     WRITES AN EMPTY MARKER rather than deleting the file. `_wire_mark_of`
     treats a sidecar that says "not wired" as the answer FOR THE SIDECAR and
@@ -715,12 +724,14 @@ def _clear_ledger(config_path) -> None:
         # eventually read the wrong way.
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        return True
     except Exception:  # noqa: BLE001 — the config write is what matters
         if path is not None:
             try:
                 path.with_name(f"{path.name}.{os.getpid()}.tmp").unlink()
             except OSError:
                 pass
+        return False
 
 
 def _wire_mark_of(raw: object, config_path=None) -> list | None:
@@ -907,8 +918,10 @@ def _clear_wiring_locked(switcher, path) -> bool:
     # config would leave the proxy vars in place with nothing recording that
     # they are ours — unremovable except by hand, the exact failure
     # `clear_wiring` exists to prevent.
-    _clear_ledger(path)
-    return True
+    # GATED ON THE SIDECAR, not only the config. Both receipts have to go, or
+    # `_wiring_present` reads the survivor and the caller is told to re-run a
+    # command that cannot converge.
+    return _clear_ledger(path)
 
 
 # -- command -----------------------------------------------------------------
@@ -1227,7 +1240,10 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     return bool(ports)
 
 
-def heal(switcher, *, connect_timeout: float = 2.0) -> tuple[bool, str]:
+def heal(
+    switcher, *, connect_timeout: float = 2.0,
+    lock_timeout: float | None = None,
+) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
 
     A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
@@ -1346,7 +1362,13 @@ def heal(switcher, *, connect_timeout: float = 2.0) -> tuple[bool, str]:
     # calls it on a timer, unattended, while the launch path runs once.
     try:
         if _wiring_is_stale(switcher, connect_timeout=connect_timeout):
-            clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
+            # BUDGETED PER CALLER, like `connect_timeout` beside it. Hardcoding
+            # the launch budget here gave the HUMAN recovery command 0.5s:
+            # Claude Code holds .claude.json.lock routinely during a
+            # credential refresh, so `cswap pin --heal` — the command this
+            # function's own message tells the user to run — bounced with
+            # "the config is locked" where a patient wait would have taken it.
+            clear_wiring(switcher, timeout=lock_timeout)
             if not _wiring_present(switcher):
                 return True, (
                     "Removed a cloud pin wiring whose proxy was gone — "
@@ -1362,7 +1384,7 @@ def heal(switcher, *, connect_timeout: float = 2.0) -> tuple[bool, str]:
     return False, "Nothing to heal"
 
 
-def serving_port(switcher) -> int | None:
+def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     """The port a live pin daemon is serving, or None. CSWAP'S OWN RECORD.
 
     Exists because nothing could ASK. Measured in the owner's dotfiles:
@@ -1405,7 +1427,15 @@ def serving_port(switcher) -> int | None:
     if not 0 < port <= 65535:
         return None
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+        # BUDGETED BY THE CALLER. This was the one probe left hardcoded after
+        # every other one on a per-tick path was given a budget. Its own
+        # docstring names the consumer: a status line that runs on a timer.
+        # A port that DROPs rather than refuses — a firewall rule, a
+        # half-dead daemon — then costs the full 2s on every tick, which is
+        # exactly the cost `_LAUNCH_PROBE_S` exists to refuse one function up.
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=connect_timeout
+        ):
             return port
     except OSError:
         return None
@@ -1462,7 +1492,8 @@ def run(
             # loopback probes of its own, and on its 2.0s default a
             # black-holed port cost this hook 4.2s (measured) before every
             # hand-launched `claude`.
-            heal(switcher, connect_timeout=_LAUNCH_PROBE_S)
+            heal(switcher, connect_timeout=_LAUNCH_PROBE_S,
+                 lock_timeout=_LAUNCH_LOCK_BUDGET_S)
             # RE-READ, DO NOT TRUST THE RETURN. This is disaster path D from
             # the lmd42 outage, one level in: an old cswap REJECTED `--heal`
             # with exit 2, the call was made, the rejection went unread, and

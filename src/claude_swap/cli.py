@@ -193,9 +193,27 @@ Examples:
 
     from claude_swap.pin import run as pin_run
 
+    # `--ensure` PROMISES SILENCE AND EXIT 0, and the promise has to cover
+    # everything it runs — not only `pin_run`. Both lines below sit outside
+    # that function: `_guard_root` calls `sys.exit(1)`, a SystemExit, which
+    # BaseException-derives and so passes through every handler here; and a
+    # switcher that cannot be constructed (migration collision, unwritable
+    # store) raises ClaudeSwitchError straight into the printing handler.
+    #
+    # The consumer is an rc hook that runs before every hand-launched
+    # `claude`. In a bare-metal root shell that meant an error line on every
+    # launch, and under `set -e` it aborted the rc file — from the one flag
+    # documented as unable to fail.
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
+    except (Exception, SystemExit):  # noqa: BLE001 — SystemExit is the point
+        # NOT BaseException: a Ctrl-C during construction must still reach the
+        # user as one, even under a flag that promises never to fail.
+        if args.ensure:
+            sys.exit(0)
+        raise
+    try:
         sys.exit(
             pin_run(
                 switcher,
