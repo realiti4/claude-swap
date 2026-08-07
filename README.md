@@ -212,6 +212,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+- The usage endpoint rate-limits busy accounts on their own inference activity, so a heavily-used account can 429 there indefinitely. When that happens, cswap falls back to a throwaway 1-token completion and reads the same 5-hour/7-day utilization off that response's headers instead, so the dashboard still shows real numbers rather than `usage unavailable`. This fallback spends about 10 tokens of the account's own quota, fires on a 429 only (never on an expired or invalid token, which quota can't fix), and runs at most once per scheduled check, so it stays inside the same adaptive cadence as the normal usage poll.
 
 ## Data locations
 

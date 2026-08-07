@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
+from claude_swap.unified_headers import probe_usage
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
@@ -554,6 +555,31 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+def _probe_fallback(kind: str, access_token: str) -> UsageOutcome | None:
+    """Recover a busy account's usage from response headers, or None.
+
+    ``GET /api/oauth/usage`` rate-limits per account on that account's own
+    inference activity (issue #220), so a busy account can 429 there
+    indefinitely. ``unified_headers.probe_usage`` recovers the same
+    utilization from a throwaway completion's response headers instead,
+    spending about 10 tokens of the account's own quota. Only a 429
+    justifies that spend: an auth failure (401/403) means the token is
+    dead, and quota can't heal that, so callers must pass the classified
+    ``kind`` in and this returns None untouched for anything but
+    ``"http-429"``. Also returns None when the probe itself fails or
+    reports nothing, so the caller falls through to its own failure return
+    instead of papering over the original error. Shared by both 429 sites
+    in :func:`try_fetch_usage_for_account` (the direct fetch, and the retry
+    after a 401-triggered refresh) since both need the identical rule.
+    """
+    if kind != "http-429":
+        return None
+    probed = probe_usage(access_token)
+    if probed is None:
+        return None
+    return UsageOutcome({**probed, "source": "headers"})
+
+
 def try_fetch_usage_for_account(
     account_num: str,
     email: str,
@@ -564,6 +590,12 @@ def try_fetch_usage_for_account(
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+
+    Both places a fetch here can 429 (the direct request, and the retry
+    after a 401-triggered refresh) route through :func:`_probe_fallback`,
+    which recovers busy-account usage from response headers instead of the
+    endpoint that just refused it. See that function's docstring for why
+    only a 429 qualifies and what a failed probe does.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -604,6 +636,9 @@ def try_fetch_usage_for_account(
             or not oauth
             or not oauth.get("refreshToken")
         ):
+            probed_outcome = _probe_fallback(kind, access_token)
+            if probed_outcome is not None:
+                return probed_outcome
             _log_usage_failure(context, e, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
@@ -630,6 +665,9 @@ def try_fetch_usage_for_account(
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
+            probed_outcome = _probe_fallback(kind, new_token)
+            if probed_outcome is not None:
+                return probed_outcome
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
