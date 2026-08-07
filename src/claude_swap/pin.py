@@ -300,9 +300,18 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # and its lock WARNING), because the gate goes false only when the
         # removal succeeds. At human launch cadence that is negligible, which
         # is why the churn arithmetic lives at the statusline call site.
+        #
+        # THE DEAD CONFIGS, NOT "THE WIRING" — the correction `heal` carries,
+        # on the third of its three call sites. All three ask a MACHINE-WIDE
+        # verdict, and answering it with a machine-wide ACT strips a live
+        # session config wired to a serving port because the OTHER config
+        # names a dead one. `_dead_wired_configs` keeps the verdict identical
+        # (it IS what `_wiring_is_stale` now returns, one bool wide) and
+        # narrows only what gets removed.
         try:
-            if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
-                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
+            dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S)
+            if dead:
+                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S, only=dead)
         except Exception:  # noqa: BLE001
             pass
         return env
@@ -1593,7 +1602,20 @@ def run(
             # refuses instantly, which is what any DROP-ing port costs
             # everywhere. `wire_launch_env` already passes `_LAUNCH_PROBE_S`
             # here for exactly this reason; this site did not.
-            if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
+            # THE DEAD CONFIGS, NOT "THE WIRING" — same correction as `heal`
+            # and `wire_launch_env`, on the site that runs from an rc hook
+            # before EVERY hand-launched `claude`.
+            #
+            # NOT DEAD CODE just because `heal` ran above it: `heal` clears the
+            # same dead set under `_LAUNCH_LOCK_BUDGET_S`, so a contended
+            # config — Claude Code holding `.claude.json.lock` through a
+            # credential refresh, which this file calls routine — leaves the
+            # verdict stale and drops through to here. The lock that stopped
+            # `heal` stops this clear too, so the config it CAN take is the
+            # free one, which is the LIVE one. Measured before this line:
+            # `--ensure` unwired a config whose port was answering.
+            dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S)
+            if dead:
                 # BUDGETED, like every other call on a launch path. The
                 # default is 9s, and this hook runs from an rc file before
                 # EVERY hand-launched `claude` — so a config lock held by a
@@ -1606,7 +1628,7 @@ def run(
                 # dangerous-to-leave-one-more-launch, and the next launch
                 # tries again. A launch that blocks is the failure this whole
                 # module is written to avoid.
-                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
+                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S, only=dead)
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
         return 0

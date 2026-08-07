@@ -632,8 +632,9 @@ class TestLaunchIsNeverBlocked:
 
         seen = {}
 
-        def _spy(switcher, timeout=None):
+        def _spy(switcher, timeout=None, only=None):
             seen["timeout"] = timeout
+            seen["only"] = only
             # Behave like a lock we cannot take: burn the budget we were
             # given, then report nothing removed.
             time.sleep(min(timeout or pin_locks.DEFAULT_TIMEOUT_S, 1.5))
@@ -647,13 +648,18 @@ class TestLaunchIsNeverBlocked:
         # default on the very path that exists to never block. Wrapped, not
         # replaced — the elapsed assertion below has to keep measuring the
         # real connect.
-        real_stale = pin._wiring_is_stale
+        # ON `_dead_wired_configs`, which is what this site now asks. It is
+        # the same question `_wiring_is_stale` answers — that predicate is
+        # this list one bool wide — and the same probe, so the budget under
+        # test is unchanged. Spying on the predicate instead would silently
+        # measure nothing from here on.
+        real_dead = pin._dead_wired_configs
 
-        def _stale_spy(switcher, connect_timeout=2.0):
+        def _dead_spy(switcher, connect_timeout=2.0):
             seen["probe"] = connect_timeout
-            return real_stale(switcher, connect_timeout=connect_timeout)
+            return real_dead(switcher, connect_timeout=connect_timeout)
 
-        monkeypatch.setattr(pin, "_wiring_is_stale", _stale_spy)
+        monkeypatch.setattr(pin, "_dead_wired_configs", _dead_spy)
         monkeypatch.setattr(pin, "clear_wiring", _spy)
         monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored"))
 
@@ -681,6 +687,14 @@ class TestLaunchIsNeverBlocked:
         # 2.0 probe) on a port that Linux refuses instantly, which is what a
         # black-holed port costs everywhere.
         assert elapsed < 2.0, f"the launch hook blocked for {elapsed:.1f}s"
+        # AND ONLY THE DEAD ONES. The machine-wide clear this replaced took a
+        # live config down with a dead sibling; `only=None` here would mean
+        # the launch path had drifted back to it.
+        assert seen.get("only") == [cfg], (
+            f"--ensure cleared only={seen.get('only')!r}; None is the "
+            f"machine-wide clear that unwires a serving config because "
+            f"another one names a dead port"
+        )
 
     def test_every_probe_a_launch_arms_is_budgeted_including_heals(
         self, tmp_path, monkeypatch
@@ -4035,6 +4049,124 @@ class TestHealNeverTearsDownAServingPin:
             )
         finally:
             srv.close()
+
+    def test_the_LAUNCH_path_does_not_take_the_live_config_down_either(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SIBLING CALL SITE, and it is the worse of the two.
+
+        `heal` and `run(ensure=True)` both ask `_wiring_is_stale` — a
+        MACHINE-WIDE verdict — and both used to answer it with `clear_wiring`,
+        a machine-wide ACT. Fixing only the one a review named would leave the
+        identical defect on the path that runs from an rc hook before EVERY
+        hand-launched `claude`, where it is worse in two ways: nothing calls
+        `impl.heal` afterwards to re-wire what it stripped, and every launch
+        pays it again.
+
+        Kept beside its sibling on purpose. The two guards drifting apart is
+        exactly how this was missed the first time — the grep for
+        `clear_wiring(` finds both, a reading of one diff finds one.
+
+        THE DEAD CONFIG'S LOCK IS HELD, and that is what makes this test reach
+        the branch rather than describe it. Without contention `heal` runs
+        FIRST inside the same `--ensure` call, clears the dead config itself,
+        and `_wiring_is_stale` is False by the time line 1609 is asked — so a
+        version of this test with no lock passes against the unfixed code and
+        proves nothing. With the lock held, `heal` cannot clear it, the
+        verdict is still stale, and the machine-wide clear below it reaches
+        the config whose lock is FREE: the live one. That is not a contrived
+        state — the file documents Claude Code holding `.claude.json.lock`
+        through a routine credential refresh as the common case.
+        """
+        from claude_swap import pin
+
+        srv, live = self._serving()
+        try:
+            sw, session_cfg = self._wired_to(tmp_path, live)
+            dead_dir = tmp_path / "default"
+            dead_dir.mkdir()
+            default_cfg = dead_dir / ".claude.json"
+            dead = _dead_port()
+            default_cfg.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "HTTPS_PROXY": f"http://127.0.0.1:{dead}",
+                            "CSWAP_PIN_PORT": str(dead),
+                        },
+                        "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                    }
+                )
+            )
+            import claude_swap.paths as paths
+
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: session_cfg)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: default_cfg
+            )
+            monkeypatch.setattr(pin, "_live_impl", lambda: None)
+            # Fresh mtime by construction, so `proper_lockfile` refuses rather
+            # than taking it over (0.5s launch budget against a 10s staleness
+            # window — see TestTheLockFailureThatStrandsTheWiringIsNamed).
+            os.mkdir(default_cfg.parent / (default_cfg.name + ".lock"))
+
+            assert pin.run(sw, None, ensure=True) == 0, "the launch hook failed"
+
+            assert "_cswapPinWiredKeys" in json.loads(default_cfg.read_text()), (
+                "the fixture did not reach the shape it names: the dead "
+                "config was cleared, so the machine-wide branch under test "
+                "was never asked"
+            )
+            assert "_cswapPinWiredKeys" in json.loads(session_cfg.read_text()), (
+                f"the launch hook unwired a config whose own port ({live}) is "
+                f"SERVING, because the other config named a dead one"
+            )
+        finally:
+            srv.close()
+
+    def test_every_clear_wiring_call_site_narrows_to_the_dead_set(self):
+        """THE GUARD FOR THE MISS ITSELF, not for a fourth call site.
+
+        This defect was found once and fixed once, and the fix reached one of
+        THREE call sites — `heal` — because that is the one a review named. A
+        `grep` for `clear_wiring(` then found `run(ensure=True)`; a `grep` for
+        `_wiring_is_stale(` found a third, `wire_launch_env`, which the first
+        grep had missed because it does not spell the call the same way. Two
+        greps, two more sites, both with the identical defect on the LAUNCH
+        path.
+
+        Writing a third near-identical behavioural test would guard the site
+        that exists today. This guards the RULE, so a fourth site cannot be
+        added without either passing `only=` or deliberately deleting this.
+
+        `clear_pin` is the one exemption and it is the whole point of the
+        default: the user asked to be unpinned, so every wired config must go.
+        Narrowing THERE would restore the stranding `clear_wiring` was moved
+        into this repo to prevent.
+        """
+        import ast
+        import inspect
+
+        from claude_swap import pin
+
+        tree = ast.parse(inspect.getsource(pin))
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "clear_wiring"
+                    and not any(kw.arg == "only" for kw in node.keywords)
+                ):
+                    offenders.append((fn.name, node.lineno))
+        assert [name for name, _ in offenders] == ["clear_pin"], (
+            f"clear_wiring is called machine-wide from {offenders} — every "
+            f"caller but `clear_pin` must pass `only=` (the dead set), or a "
+            f"config whose own port is SERVING gets unwired because another "
+            f"config names a dead one"
+        )
 
     def test_a_restart_that_worked_is_not_then_unwired(self, tmp_path, monkeypatch):
         """The SECOND guard. `impl.heal()` uses False for 'already serving' as
