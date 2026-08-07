@@ -44,14 +44,33 @@ def _cfg(tmp_path, name, port=None, *, marker=True):
     return cfg
 
 
+# Held for the process lifetime by `_dead_port`; see there for why closing is
+# not enough. One entry per call, so the fd cost is bounded by how many dead
+# ports a worker asks for (~30 across this file).
+_RESERVED_DEAD: list = []
+
+
 def _dead_port() -> int:
-    """A port nothing is listening on, obtained by binding and closing.
+    """A port nothing is listening on, and that NOTHING CAN START serving.
 
     NOT a hardcoded number. The heal tests once used 36301, which is the port
     a real pin daemon uses — so on a machine where the pin was actually
     running they described a LIVE wiring while claiming to describe a dead
-    one, and every assertion about healing was inverted. Asking the OS for a
-    port and releasing it is the only way to be sure it is closed.
+    one, and every assertion about healing was inverted.
+
+    AND NOT RELEASED, which binding-then-closing was. The suite runs `-n auto`
+    and another worker's `_serving()` can take the number between the close
+    and the assertion that depends on it being dead — turning a "wiring points
+    at a dead port" fixture into a live one, in the direction that inverts
+    every healing verdict. Measured here, all three facts:
+
+        held, not listening    connect -> ConnectionRefusedError  (dead)
+        held, not listening    another SO_REUSEADDR bind -> OSError (reserved)
+        bound then CLOSED      another SO_REUSEADDR bind -> SUCCEEDS (the race)
+
+    A socket bound without `listen()` refuses connections exactly like a free
+    port while holding the number against every other binder, which is the
+    combination this needs and `close()` gave up.
 
     ``TestNoFixtureNamesARealDaemonPort`` lints for the literal coming back.
     """
@@ -59,9 +78,26 @@ def _dead_port() -> int:
 
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    _RESERVED_DEAD.append(s)  # released only by `_revive_dead_port`, below
+    return s.getsockname()[1]
+
+
+def _revive_dead_port(port: int) -> None:
+    """Give a reserved dead port back, so a fixture may SERVE it.
+
+    Two tests simulate a daemon coming back on the port the wiring names, and
+    that is the one legitimate reason to take a `_dead_port()` number. They
+    have to say so: the reservation is what stops ANOTHER WORKER doing the
+    same thing by accident, and a helper that silently yielded to any binder
+    would be the released-port race again with extra steps.
+
+    A no-op for a port this process never reserved — the caller's own
+    `_serving()` sockets do not go through here.
+    """
+    for sock in list(_RESERVED_DEAD):
+        if sock.getsockname()[1] == port:
+            sock.close()
+            _RESERVED_DEAD.remove(sock)
 
 
 def _port_literal_offenders(directory, own_file, own_class_name: str) -> list:
@@ -3448,6 +3484,9 @@ class TestHealADeadPin:
                 # seam trusts a claim it must not trust.
                 called.append(backup_dir)
                 port = int(json.loads(cfg.read_text())["env"]["CSWAP_PIN_PORT"])
+                # Taking a RESERVED dead port back, deliberately: this fixture
+                # is a daemon returning to the address its wiring names.
+                _revive_dead_port(port)
                 srv = socket.socket()
                 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 srv.bind(("127.0.0.1", port))
@@ -4306,7 +4345,10 @@ class TestHealNeverTearsDownAServingPin:
                 # Bind the SAME port: this is what a real revival looks like,
                 # and it is why the outcome must be re-read rather than taken
                 # from the return value. Accepting, not merely listening — see
-                # _serving.
+                # _serving. The reservation `_dead_port` holds has to be given
+                # back first, deliberately and out loud — that reservation is
+                # what stops ANOTHER WORKER doing this by accident.
+                _revive_dead_port(port)
                 srv, _ = outer._serving(port)
                 revived["srv"] = srv
                 return False  # "nothing to report" — NOT failure
@@ -5305,6 +5347,57 @@ class TestNoFixtureNamesARealDaemonPort:
     the number cannot be right, because the test cannot know what the machine
     is running.
     """
+
+    def test_a_dead_port_cannot_be_taken_by_another_worker(self):
+        """`_dead_port` must RESERVE, not merely sample.
+
+        It used to bind :0 and close, so the number it called dead was free
+        the instant it returned it. The suite runs `-n auto`, and another
+        worker's `_serving()` binding that exact number turns a "wiring points
+        at a dead port" fixture into a live one — which inverts every healing
+        verdict built on it, in the direction that reports a working pin as
+        gone.
+
+        Both halves, because either alone passes for the wrong reason: a port
+        nothing can bind is useless if it also answers, and a refusing port is
+        useless if anyone can start serving it.
+        """
+        import socket
+
+        port = _dead_port()
+
+        probe = socket.socket()
+        probe.settimeout(2)
+        try:
+            probe.connect(("127.0.0.1", port))
+            raise AssertionError(f"port {port} ANSWERED — it is not dead")
+        except ConnectionRefusedError:
+            pass
+        finally:
+            probe.close()
+
+        taker = socket.socket()
+        taker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            taker.bind(("127.0.0.1", port))
+            taker.listen(8)
+            raise AssertionError(
+                f"another socket took port {port} while a fixture was calling "
+                f"it dead — this is the cross-worker race, reproduced"
+            )
+        except OSError as exc:
+            assert not isinstance(exc, AssertionError), exc
+        finally:
+            taker.close()
+
+        # And the release is explicit, so a revival fixture can still serve it.
+        _revive_dead_port(port)
+        after = socket.socket()
+        after.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            after.bind(("127.0.0.1", port))
+        finally:
+            after.close()
 
     def test_no_test_fixture_hardcodes_the_pin_daemon_port(self):
         import pathlib
