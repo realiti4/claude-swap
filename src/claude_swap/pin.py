@@ -375,7 +375,7 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     # briefly unpinned — the whole reason this path fails open.
     try:
         if _config_lock_is_free(_LAUNCH_LOCK_BUDGET_S):
-            pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
+            pin.unwire_if_dead(_certdir(switcher))
     except Exception:  # noqa: BLE001
         pass
     return env
@@ -1242,48 +1242,38 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     header warns about and which its `clear_wiring` call sites had already
     demonstrated.
 
-    Both guards below are MACHINE-WIDE, and stay that way: they ask whether
-    ANY of this is cswap's to condemn at all, which is not a per-config
-    question.
+    "Is any of this cswap's to condemn at all" is asked by
+    :func:`_port_of_config`, once per config, and not again here — see the
+    comment below for what that replaced.
     """
-    # THE MARKER CHECK, and it is the ONLY one before a port is treated as
-    # cswap's to condemn. `_wired_ports()` reads BOTH configs' ports with no
-    # marker check of its own, so without this line a foreign `CSWAP_PIN_PORT`
-    # — a future `cswap-pin` that stops writing it, or an unrelated var of the
-    # same name — sitting in either config and naming a dead port makes this
-    # list non-empty with nothing of cswap's actually wired.
+    # BOTH GUARDS THAT STOOD HERE ARE ENFORCED ONE SCOPE DOWN, and asking
+    # them again was a leftover from before they moved. `_port_of_config`
+    # runs `_wire_mark_of` itself and range-checks the port, so a config
+    # without cswap's marker and a config whose port cannot be read BOTH
+    # yield None and are skipped by the comprehension below — which is also
+    # what made `_wired_ports()` (the same comprehension over the same
+    # reader) unable to change this answer.
     #
-    # Without it: `_wiring_present=False`, `_wired_ports=[<dead>]`, the verdict
-    # True, and `heal()` reporting "Removed a cloud pin wiring…" over a
-    # byte-for-byte unchanged config — a false removal claim in the
-    # machine-readable channel the status line polls. Nothing is ever mutated
-    # (`_clear_wiring_locked` refuses a markerless file); the damage is
-    # entirely in the VERDICT this guard keeps honest.
+    # Measured: deleting the line cost 0 of 2013 tests, and it was costing
+    # two extra passes over `.claude.json` on the launch path — a file that
+    # is megabytes on a real machine.
     #
-    # "I CANNOT TELL" IS NOT "IT IS DEAD" — the second guard. `_wiring_present`
-    # keys on the marker; the probe reads CSWAP_PIN_PORT. A config carrying the
-    # marker and no port satisfies both "wired" and "not serving" at once, and
-    # the launch path tore it down against a proxy that may be perfectly live.
-    # Today's writer always emits the port, so that is not reachable through
-    # it — but the seam's threat model is a PEER on an independent release
-    # schedule, and trusting its file FORMAT with the destructive operation
-    # while refusing to trust its return value is the same inference this
-    # module keeps being burned by.
+    # THE TWO FACTS IT WAS KEEPING ARE STILL TRUE, and both are documented
+    # where they are now enforced (`_port_of_config`):
     #
-    # MACHINE-WIDE for that second guard too, because the shipped deployment
-    # shape makes the narrow reading the COMMON case: `cswap run` wires
-    # ~/.claude.json and launches a child whose own config is seeded with no
-    # wiring, and the status-line hook inside that child is what calls `heal`
-    # on a timer. So the healing process is normally the one whose own config
-    # names no port, and a dead port in the OTHER config must still be
-    # reachable. Per-config, that read sees None and answers "Nothing to heal"
-    # over a dead port.
+    #   A foreign `CSWAP_PIN_PORT` with no marker — a future `cswap-pin`
+    #   that stops writing it, or an unrelated var of the same name — must
+    #   not make this list non-empty, or `heal` reports "Removed a cloud pin
+    #   wiring…" over a byte-for-byte unchanged config. Nothing is ever
+    #   mutated (`_clear_wiring_locked` refuses a markerless file); the
+    #   damage is entirely in the VERDICT.
     #
-    # Past both, a config that names no readable port of ITS OWN is skipped
-    # rather than cleared — the second guard applied one scope down, which is
-    # what makes the ACT per-config while the verdict stays machine-wide.
-    if not _wiring_present(_switcher) or not _wired_ports():
-        return []
+    #   "I CANNOT TELL" IS NOT "IT IS DEAD". A config carrying the marker
+    #   with no readable port satisfies "wired" and "not serving" at once,
+    #   and the launch path tore it down against a proxy that may be
+    #   perfectly live. Per-config, that read sees None and the config is
+    #   skipped rather than cleared — which is what makes the ACT per-config
+    #   while the verdict stays machine-wide.
     return [
         path
         for path in _each_config()
@@ -1515,9 +1505,8 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     """
     import json as _json
     import socket
-    from pathlib import Path
 
-    record = Path(switcher.backup_dir) / "pin-proxy" / "proxy.json"
+    record = _certdir(switcher) / "proxy.json"
     try:
         port = int(_json.loads(record.read_text(encoding="utf-8"))["port"])
     except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
@@ -1542,7 +1531,12 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
 
 def _certdir(switcher):
     """Where the pin keeps its own files. One definition, so a layout change
-    is one edit rather than a grep."""
+    is one edit rather than a grep.
+
+    IT HAD ONE CALLER while two other sites spelled `backup_dir /
+    "pin-proxy"` themselves, so the grep it exists to prevent was still
+    three files wide and the docstring above was aspirational. All three go
+    through it now; the literal appears exactly once, below."""
     from pathlib import Path
 
     return Path(switcher.backup_dir) / "pin-proxy"
