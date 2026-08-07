@@ -992,6 +992,68 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_a_stuck_receipt_does_not_become_a_permanent_re_run_forever(
+        self, tmp_path, monkeypatch
+    ):
+        """The config is CLEAN; only the bookkeeping is stuck.
+
+        `_clear_wiring_locked` returns `_clear_ledger(path)` AFTER the config
+        write succeeded. So an unwritable `pin-wiring/` (root-owned parent,
+        read-only mount, full disk) makes it report False over a config that
+        no longer carries the wiring at all — and `_wire_mark_of` then keeps
+        finding the stale sidecar marker, so `_wiring_present` stays True and
+        every re-run answers "could not be removed, re-run once it frees up".
+        Advice that can never come true, over a user who is not stranded.
+
+        `_clear_ledger`'s docstring argues this return prevents a phantom
+        SUCCESS. It does; it substitutes a permanent phantom FAILURE, which is
+        the same defect with the sign flipped. The message has to separate
+        "your launches still dial a dead port" from "our receipt is stale".
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import _ledger_path, clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        port = _dead_port()
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {
+            "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+            "CSWAP_PIN_PORT": str(port),
+        }}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        side.parent.chmod(0o500)  # the receipt cannot be rewritten
+        try:
+            sw = ClaudeAccountSwitcher()
+            clear_wiring(sw)
+            env = json.loads(cfg.read_text()).get("env", {})
+            assert "CSWAP_PIN_PORT" not in env, (
+                f"fixture did not reach the shape under test — the CONFIG "
+                f"write was supposed to succeed: {env!r}"
+            )
+            from claude_swap import pin
+
+            changed, message = pin.clear_pin(sw)
+            assert "re-run" not in message.lower(), (
+                f"advice that can never come true: the config is already "
+                f"clean and no re-run can rewrite a read-only receipt dir. "
+                f"{message!r}"
+            )
+            assert str(side) in message, (
+                f"the message does not name the stale receipt, which is the "
+                f"only thing left to remove: {message!r}"
+            )
+        finally:
+            side.parent.chmod(0o700)
+
     def test_no_sidecar_is_not_the_same_answer_as_a_cleared_one(
         self, tmp_path, monkeypatch
     ):
@@ -2277,7 +2339,13 @@ class TestPurgeDoesNotStrandTheWiring:
         # The path the code resolves, not where this test happened to write:
         # a session-scoped isolated_home fixture also sets HOME.
         assert str(cfg) in out, "the message does not name the file to edit"
-        assert "_cswapPinWiredKeys" in out, "it does not name what to delete"
+        # THE ENV KEYS, not the marker. This asserted `"_cswapPinWiredKeys"`,
+        # which a sidecar-era config never carries — so the advice was
+        # unfollowable for exactly the wiring the current pin writes, and the
+        # sidecar that lists the real keys is rmtree'd moments later.
+        assert "HTTPS_PROXY" in out and "CSWAP_PIN_PORT" in out, (
+            f"it does not name what to delete: {out!r}"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
@@ -2324,6 +2392,79 @@ class TestPurgeDoesNotStrandTheWiring:
             f"the warning does not name the file that ACTUALLY still carries "
             f"the wiring ({default_cfg}) — the user edits the wrong file and "
             f"the stranding survives: {out!r}"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root) to fail the unwire",
+    )
+    def test_the_advice_names_what_is_ACTUALLY_in_the_file(
+        self, tmp_path, monkeypatch
+    ):
+        """SIDECAR-ERA WIRING, and the advice was written for the old shape.
+
+        `_wire_mark_of` reads the receipt from the config OR the sidecar, so a
+        wiring the CURRENT pin wrote — receipt in
+        `<backup>/pin-wiring/<sha>.json`, nothing but env vars in the config —
+        counts as wired. When the unwire then fails, purge tells the user to
+        delete `"_cswapPinWiredKeys"` from that config: a key which is not in
+        it, and never was.
+
+        Naming a key the user cannot find is worse than naming none, because
+        the rmtree below is about to delete the sidecar — the only record of
+        WHICH env vars were cswap's and what they displaced. After that the
+        advice is unfollowable and no tool can reconstruct it. Name the env
+        keys themselves, while they can still be read.
+        """
+        from claude_swap.pin import _ledger_path
+
+        port = _dead_port()
+        cfgdir = tmp_path / "cfgdir"
+        cfgdir.mkdir()
+        cfg = cfgdir / ".claude.json"
+        cfg.write_text(json.dumps({"env": {
+            "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+            "CSWAP_PIN_PORT": str(port),
+        }}))  # no receipt here — the current pin does not write one
+        monkeypatch.setenv("HOME", str(tmp_path))
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://127.0.0.1:9901"},
+        }))
+        assert "_cswapPinWiredKeys" not in cfg.read_text(), (
+            "fixture put the receipt in the config — that is the OLD shape, "
+            "and the advice under test happens to be correct for it"
+        )
+
+        cfg.parent.chmod(0o500)
+        try:
+            out = self._purge_with(tmp_path, monkeypatch, cfg)
+        finally:
+            cfg.parent.chmod(0o700)
+
+        # The dir is unwritable, so the wiring CANNOT go — that is the premise,
+        # not the defect. The defect is what purge then says about it.
+        left = json.loads(cfg.read_text()).get("env", {})
+        assert "CSWAP_PIN_PORT" in left, (
+            f"fixture did not reach the stranded shape — the unwire "
+            f"succeeded: {left!r}"
+        )
+        assert "Removed:\n" not in out or "Cloud pin wiring" not in out.split(
+            "Removed:"
+        )[-1], (
+            "purge claimed the wiring was removed while it is still in the "
+            f"file. Clearing the SIDECAR made the config read as unwired, so "
+            f"the survivor check — which asked for the marker it had just "
+            f"deleted — saw nothing to warn about:\n\n{out}"
+        )
+        assert "Could not remove the cloud pin wiring" in out, (
+            f"stranded silently: no warning at all.\n\n{out}"
+        )
+        assert "HTTPS_PROXY" in out and "CSWAP_PIN_PORT" in out, (
+            f"the advice does not name the env keys the user must delete, and "
+            f"the receipt that listed them is about to be rmtree'd: {out!r}"
         )
 
     def test_an_unwired_config_says_nothing(self, tmp_path, monkeypatch):

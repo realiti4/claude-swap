@@ -885,6 +885,57 @@ def _wiring_present(_switcher) -> bool:
     return bool(wired_config_paths(_switcher))
 
 
+def wired_env_keys(_switcher=None) -> dict:
+    """``{config path: the env keys its receipt names}`` — read BEFORE a clear.
+
+    THE MARKER CANNOT ANSWER "DID IT SURVIVE", because the marker is one of
+    the things a clear removes. `purge` asked `wired_config_paths` afterwards
+    and got an empty list for two opposite reasons: the wiring really went, or
+    the RECEIPT went and left the wiring behind. On a sidecar-era wiring
+    (receipt in ``<backup>/pin-wiring/<sha>.json``, nothing but env vars in
+    the config) with an unwritable config dir, the second is what happens —
+    `clear_pin` clears the writable sidecar, the config then reads as unwired,
+    and purge printed "Removed: Cloud pin wiring" with no warning while
+    ``HTTPS_PROXY`` and ``CSWAP_PIN_PORT`` still named a dead port. Measured.
+
+    So the survivor question has to key on what the receipt NAMED, captured
+    while the receipt still exists. This is that capture; `env_keys_survive`
+    is the matching read afterwards.
+    """
+    keys = {}
+    for path in wired_config_paths(_switcher):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unreadable: nothing to promise about
+            continue
+        mark = _wire_mark_of(raw, path)
+        if mark:
+            keys[path] = list(mark)
+    return keys
+
+
+def env_keys_survive(before: dict) -> dict:
+    """``{config path: the keys still in its env}``, for what `wired_env_keys`
+    captured. Empty when every clear did what it said.
+
+    ASKS THE ENV BLOCK, not the marker — the marker is gone by now either way,
+    and the env block is the thing that actually strands a launch. A config
+    that has become unreadable counts as surviving: "I cannot check it" must
+    not render as "it is clean" in the one message a purged user still gets.
+    """
+    left = {}
+    for path, names in before.items():
+        try:
+            env = (json.loads(path.read_text(encoding="utf-8")).get("env") or {})
+        except Exception:  # noqa: BLE001
+            left[path] = list(names)
+            continue
+        still = [n for n in names if n in env]
+        if still:
+            left[path] = still
+    return left
+
+
 def wired_config_paths(_switcher=None) -> list:
     """Every config that still carries OUR marker, in read order.
 
@@ -1014,14 +1065,37 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # The failure is what the peer DID, not whether it raised, so ask.
     if _pinned_email_now(switcher) is not None:
         _clear_pin_record(switcher)
+    # CAPTURED BEFORE, for the same reason `purge` does it: `_wiring_present`
+    # reads the MARKER, and a clear that got the config but not the sidecar
+    # leaves the marker behind over a config that is already clean.
+    before = wired_env_keys(switcher)
     cleared = clear_wiring(switcher)
     still_pinned = _pinned_email_now(switcher) is not None
-    still_wired = _wiring_present(switcher)
-    if still_pinned or still_wired:
+    # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
+    # `_clear_ledger(path)` AFTER the config write, so an unwritable
+    # `pin-wiring/` (root-owned parent, read-only mount, full disk) reported
+    # "could not remove the wiring — re-run once it frees up" FOREVER over a
+    # user whose launches were already fine. Its docstring argues the return
+    # prevents a phantom success; it substituted a permanent phantom failure,
+    # which is the same defect with the sign flipped.
+    survivors = env_keys_survive(before)
+    if still_pinned or survivors:
         what = " and ".join(
-            w for w, on in (("the pin", still_pinned), ("the wiring", still_wired)) if on
+            w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
+            if on
         )
         return False, f"Could not remove {what} — re-run once it frees up"
+    stale = wired_config_paths(switcher)
+    if stale:
+        # A DIFFERENT STATE AND A DIFFERENT SENTENCE. Nothing dials a dead
+        # port any more; only cswap's own bookkeeping is stuck, and a re-run
+        # cannot rewrite a directory it may not write. Name the file.
+        return True, (
+            "Removed the cloud pin wiring. A stale receipt could not be "
+            "deleted — remove "
+            + " and ".join(str(_ledger_path(p)) for p in stale)
+            + " by hand, or cswap will keep reporting a wiring that is gone"
+        )
     if not cleared and not had_pin:
         return True, "No cloud account pinned"
     return True, "Unpinned the cloud account"

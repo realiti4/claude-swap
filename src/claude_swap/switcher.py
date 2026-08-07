@@ -5671,7 +5671,16 @@ class ClaudeAccountSwitcher:
         # can remove it, so the message names the file and the keys.
         from claude_swap import pin as _pin
 
-        was_wired = bool(_pin.wired_config_paths(self))
+        # CAPTURED BEFORE THE CLEAR, because the receipt is one of the things
+        # the clear removes and it is the only record of WHICH env keys were
+        # cswap's. `wired_config_paths` afterwards returned empty for two
+        # opposite reasons — the wiring went, or the RECEIPT went and left the
+        # wiring behind — and on a sidecar-era wiring with an unwritable
+        # config dir it is always the second: `clear_pin` clears the writable
+        # sidecar, the config then reads as unwired, and this printed
+        # "Removed: Cloud pin wiring" with NO warning while HTTPS_PROXY and
+        # CSWAP_PIN_PORT still named a dead port. Measured, not reasoned.
+        before = _pin.wired_env_keys(self)
         _pin.clear_pin(self)
         # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
         # `get_global_config_path()` after asking a check that reads BOTH
@@ -5680,15 +5689,18 @@ class ClaudeAccountSwitcher:
         # sat in a file they were never told about. By this point the record,
         # cert dir and daemon state are gone, so hand editing is the only cure
         # and naming the wrong file is the whole failure.
-        survivors = _pin.wired_config_paths(self)
-        if was_wired and not survivors:
+        survivors = _pin.env_keys_survive(before)
+        if before and not survivors:
             removed_items.append("Cloud pin wiring in .claude.json")
-        if survivors:
+        for path, names in survivors.items():
+            # NAMES THE KEYS, not the marker. The advice used to say to delete
+            # `"_cswapPinWiredKeys"`, which a sidecar-era config never carried
+            # — and the sidecar that lists the real keys is about to be
+            # rmtree'd, so after this nothing can reconstruct them.
             warning(
-                "Could not remove the cloud pin wiring — edit "
-                + " and ".join(str(p) for p in survivors)
-                + ' by hand and delete the "_cswapPinWiredKeys" entry and the '
-                "proxy vars it names."
+                f"Could not remove the cloud pin wiring — edit {path} by hand "
+                f"and delete these entries from its \"env\" block: "
+                + ", ".join(names)
             )
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
