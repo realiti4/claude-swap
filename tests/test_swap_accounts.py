@@ -1,5 +1,6 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -435,3 +436,83 @@ class TestSwapAccounts:
         moved = switcher._session_dir("2", "account1@example.com")
         assert (moved / "marker.txt").read_text() == "history-of-account-one"
         assert not session_a.exists()
+
+
+class TestSwapUnreadableSourceIsNotAbsent:
+    """Same defect family as C1/C2/move: the plain reader's ``""`` means both
+    "no backup" and "the backup exists but could not be read right now".
+
+    The pre-swap read (:1063-1064) used the plain reader — a permission
+    glitch on either slot's ``.enc`` read as "no backup", and the swap
+    committed BOTH destination keys from that snapshot: the unreadable
+    slot's live refresh token would be silently dropped and replaced with
+    an empty credential at its new number. Fixed with
+    ``_read_account_credentials_ex``, aborting BEFORE anything moves.
+    """
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_enc_aborts_the_swap_before_anything_changes(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials("1", "account1@example.com", "rt-1")
+        switcher._write_account_credentials("2", "account2@example.com", "rt-2")
+
+        # CONTROL: both readable, the swap lands cleanly (instrument says YES).
+        switcher.swap_accounts("1", "2")
+        assert (
+            switcher._read_account_credentials("2", "account1@example.com")
+            == "rt-1"
+        )
+        assert (
+            switcher._read_account_credentials("1", "account2@example.com")
+            == "rt-2"
+        )
+        # Swap back to the original layout for the probe below.
+        switcher.swap_accounts("1", "2")
+
+        enc = switcher._backup_enc_path("2", "account2@example.com")
+        enc.chmod(0o000)
+        try:
+            with pytest.raises(ConfigError, match="could not be read"):
+                switcher.swap_accounts("1", "2")
+        finally:
+            if enc.exists():
+                enc.chmod(0o600)
+
+        # Nothing committed: both accounts intact under their original
+        # numbers, account 2 still holding its readable credential.
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "account1@example.com"
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+        assert (
+            switcher._read_account_credentials("1", "account1@example.com")
+            == "rt-1"
+        )
+        assert (
+            switcher._read_account_credentials("2", "account2@example.com")
+            == "rt-2"
+        )
+
+    def test_absent_source_still_swaps(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Control in the other direction: genuinely unbacked slots (no
+        .enc at all) are not mistaken for unreadable and still swap."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        num_a, num_b = switcher.swap_accounts("1", "2")
+
+        assert (num_a, num_b) == ("1", "2")
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "account2@example.com"
+        assert data["accounts"]["2"]["email"] == "account1@example.com"

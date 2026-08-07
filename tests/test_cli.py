@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -965,6 +966,55 @@ class TestAutoCommand:
                 cli.main()
         assert excinfo.value.code == 2
 
+    def test_ctrl_c_stops_the_engine_the_way_the_banner_promises(
+        self, temp_home
+    ):
+        """The banner says "Ctrl-C to stop"; only SIGTERM was wired.
+
+        `KeyboardInterrupt` is a `BaseException`, so neither `except
+        ClaudeSwitchError` nor `except Exception` in `tick()` catches it. It
+        propagates out of `_perform` between `switch_to` and the state write:
+        the account IS switched, `lastSwitchAt` is not recorded, and the LIVE
+        lock is still held. The next engine sees no cooldown and can switch
+        again immediately — the same half-written state the RLock fix closed,
+        through a door nobody wired shut.
+
+        Asserts the HANDLER is installed rather than simulating delivery:
+        installing it is the fix, and `stop()`'s own behaviour under a signal
+        is covered on the engine side.
+        """
+        import signal as signal_mod
+
+        installed = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        stopped = []
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                stopped.append(True)
+
+            def run_loop(self):
+                return 0
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        assert signal_mod.SIGINT in installed, (
+            f"handlers installed for {sorted(s.name for s in installed)} — the "
+            "banner tells the user Ctrl-C stops it and nothing handles SIGINT"
+        )
+        installed[signal_mod.SIGINT]()
+        assert stopped == [True], "the SIGINT handler does not stop the engine"
+
     def test_auto_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
             with pytest.raises(SystemExit) as excinfo:
@@ -993,6 +1043,56 @@ class TestAutoCommand:
                 cli.main()
         assert excinfo.value.code == 1
         assert "nope" in capsys.readouterr().err  # printer.error -> stderr
+
+
+class TestUnclaimedCommand:
+    """Minor 2: the operator escape hatch for a stash row.
+
+    ``--json`` emits bare entry ids, and the two conditions this branch
+    introduces (a stranded row, a permanently unreadable one) both leave a row
+    an operator must be able to see the slot/reason of, and drop.
+    """
+
+    def _stashed(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        entry_id = switcher._store._write_unclaimed_credential(
+            "creds-bytes",
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "2",
+             "consumedFp": "fp-old"},
+        )
+        return switcher, entry_id
+
+    def test_list_shows_slot_and_reason_not_just_the_id(self, temp_home, capsys):
+        _, entry_id = self._stashed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._unclaimed_command([])
+        out = capsys.readouterr().out
+        assert entry_id in out
+        assert "consume-gate-persist-lock-failed" in out
+        assert "2" in out
+
+    def test_purge_removes_bytes_and_row(self, temp_home, capsys):
+        switcher, entry_id = self._stashed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._unclaimed_command(["--purge", entry_id])
+        assert switcher.list_unclaimed_credentials() == {}
+        assert not switcher._store._stash_entry_path(entry_id).exists()
+
+    def test_purging_an_unknown_id_fails_loudly(self, temp_home):
+        self._stashed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True), \
+             pytest.raises(SystemExit) as exc:
+            cli._unclaimed_command(["--purge", "no-such-entry"])
+        assert exc.value.code == 1
+
+    def test_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._unclaimed_command") as fn, \
+             patch.object(sys, "argv", ["claude-swap", "unclaimed", "--purge", "x"]):
+            cli.main()
+        fn.assert_called_once_with(["--purge", "x"])
 
 
 class TestMapCommand:
@@ -1265,7 +1365,8 @@ class TestAliasCommand:
     def test_add_with_alias_flag(self, temp_home, mock_claude_config, capsys):
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         with patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(ClaudeAccountSwitcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(ClaudeAccountSwitcher, "_write_account_credentials"), \
              patch.object(sys, "argv", ["claude-swap", "add", "--alias", "dev"]):
             cli.main()
@@ -1491,3 +1592,38 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestTuiAutoFlag:
+    """`cswap tui --auto` opens the TUI on the auto view with the engine
+    LIVE — the flag itself is the go-live consent."""
+
+    def test_tui_auto_passes_start_auto(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui", "--auto"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "auto"
+
+    def test_tui_without_auto_stays_dashboard(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "dashboard"

@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -30,12 +31,13 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -74,10 +76,13 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_live: bool = False) -> None:
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        # `cswap tui --auto` only. The engine starts LIVE without the modal
+        # because the flag IS the consent, for that launch alone.
+        self._start_live = start_live
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
         # toggle. ``_configured_threshold`` is the mount-time file value the
@@ -111,7 +116,13 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        # ONLY `cswap tui --auto` starts LIVE. Entering the view from the
+        # menu always starts dry-run, because opening a view must never
+        # begin switching accounts — and a persisted "yes" is not consent
+        # for a launch nobody asked to be live. A setting used to be read
+        # here too, so one confirmed "Go live" made every later menu visit
+        # switch accounts unasked, on every machine sharing settings.json.
+        self._start_engine(dry_run=not self._start_live)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -214,6 +225,10 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
+        # A LIVE request the engine could not honor: another LIVE engine holds
+        # the machine's lock. Report what actually started, not what was asked
+        # for — the badge reads engine.dry_run, so it is already right.
+        dry_run = engine.dry_run
         self.run_worker(
             engine.run_loop,
             thread=True,
@@ -244,6 +259,12 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        # The engine can PROMOTE itself mid-run: a demotion is a contention
+        # answer, and the holder eventually exits. Nothing else re-reads
+        # `dry_run` after mount, so the badge would keep saying DRY-RUN over a
+        # live engine — worse than the stuck-dry-run it fixes, because now the
+        # display disagrees with what is actually switching accounts.
+        self._update_badge()
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -302,7 +323,33 @@ class AutoScreen(Screen):
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
+            if acc.number == active_number:
+                continue
+            # A slot with no stored login is still a place you can GO — that
+            # is now how you fill one. It used to be dropped from this list
+            # entirely, so a machine with the roster but not the credentials
+            # showed two accounts here and five in the engine's own log. A row
+            # that says why it cannot be picked beats a row that isn't there.
+            if not acc.switchable:
+                entry = Text()
+                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                entry.append(acc.email, style=palette.muted)
+                # From SENTINEL_NOTES, not written here: an API-key slot has no
+                # login to restore, and the switch screen reads the same table,
+                # so both surfaces must describe a slot identically.
+                # The slot's OWN sentinel first: unswitchable is not always
+                # "nothing stored". A backup that exists but could not be READ
+                # reads USAGE_KEYCHAIN_UNAVAILABLE, and sending that slot to
+                # `cswap add` overwrites a working stored grant. `kind` still
+                # wins for api_key — the sentinel diverges from it behind a
+                # locked keychain.
+                note = data.sentinel_label(
+                    USAGE_API_KEY if acc.kind == "api_key"
+                    else acc.usage.sentinel or USAGE_NO_CREDENTIALS
+                )
+                entry.append(f"  {note}", style=palette.sev_warn)
+                lines[acc.number] = entry
+                ranked.append((1000.0, acc.number))   # last: never a target
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -314,17 +361,57 @@ class AutoScreen(Screen):
                 )
                 ranked.append((998.0, acc.number))
             elif pct is None:
-                entry.append("  usage unknown", style=palette.muted)
+                # An extra-usage (pay-as-you-go) account has no 5h/7d window,
+                # so binding_pct answers None — but it is not unknown, it has
+                # a SPEND budget, and the watch screen already renders it.
+                # `relevant_windows` excludes spend on purpose (a separate
+                # axis from a rate-limit window), so this row was the only
+                # place the same account read two different ways.
+                spend_row = next(
+                    (r for r in usage_rows(acc.usage.last_good, time.time())
+                     if r[0] == "$$"),
+                    None,
+                )
+                if spend_row is not None:
+                    _label, spend_pct, spend_suffix, _full = spend_row
+                    entry.append("  $$ ", style=palette.muted)
+                    entry.append(f"{spend_pct:.0f}%",
+                                 style=palette.severity(spend_pct))
+                    entry.append(f" · {spend_suffix}", style=palette.muted)
+                else:
+                    entry.append("  usage unknown", style=palette.muted)
+                # RANKED LAST EITHER WAY. Spend is not headroom: folding it
+                # into the sort key would change which account the engine
+                # picks, and the ranking axis is not this row's to move.
                 ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # Per-window chips, from the same helper the dashboard uses
+                # (data.window_chip_label) so one account cannot read two ways.
+                now = time.time()
+                chips = [
+                    (key, label, data.window_pct(acc.usage.last_good, key))
+                    for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
+                ]
+                chips = [c for c in chips if c[2] is not None]
+                for i, (key, label, wpct) in enumerate(chips):
+                    entry.append("  " if i == 0 else " · ", style=palette.muted)
+                    entry.append(
+                        data.window_chip_label(acc.usage.last_good, key, label, now),
+                        style=palette.muted,
+                    )
+                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
+                if not chips:  # no window data at all — keep the old reading
+                    entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
-            text.append("\n  no other switchable accounts", style=palette.muted)
+            # Reached only when this is the sole account. Slots that cannot be
+            # switched to are listed above with the reason, so "no other
+            # accounts" is now literal rather than a filter's side effect.
+            text.append("\n  no other accounts", style=palette.muted)
             return text
         for _pct, number in sorted(ranked):
             text.append(lines[number])

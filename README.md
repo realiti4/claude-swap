@@ -159,6 +159,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+`cswap tui --auto` opens the auto-switch view **live**, for a TUI meant to keep running unattended — after a reboot, a deploy, or a tmux respawn it resumes switching instead of waiting in dry-run for a keypress. Only the flag does this: a bare `cswap tui` lands on the dashboard, and reaching the auto view from the menu watches without switching, so opening a view never starts moving accounts on its own. One live engine runs per machine — a second TUI still shows its dashboard but stays in dry-run and says so, since two engines decide independently and undo each other's switches.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
@@ -189,8 +191,11 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
+cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
+cswap tui --auto                # Dashboard, opened on the auto-switch view, LIVE
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
@@ -238,6 +243,40 @@ cswap menubar
 ```
 
 Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+
+</details>
+
+## Cloud pin (Remote Control / Artifacts)
+
+<details>
+<summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
+
+Needs the `pin` extra:
+
+```bash
+uv tool install 'claude-swap[pin]'   # or: pipx install 'claude-swap[pin]'
+cswap pin 2
+```
+
+Swapping accounts moves *everything*, including two things that are not inference:
+
+- **Remote Control** — a session's owner is fixed at creation by whichever bearer created it, so after a swap the phone/web loses the session and ghosts pile up on the old account.
+- **Artifacts** — owned by the publishing bearer, so a republish 403s and the artifact "disappears" from the account you are logged into.
+
+The pin keeps those on one account of your choosing while `cswap switch` / [`cswap auto`](#automatic-switching) keep steering inference. `/v1/messages` is never touched, so usage still bills the account you swapped onto.
+
+```bash
+cswap pin 2          # Remote Control / artifacts → account 2
+cswap pin            # show the current pin
+cswap pin --clear    # remove it
+cswap pin --heal     # restart a pin proxy that died, or unwire it
+```
+
+The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
+
+If the pin's daemon dies, `.claude.json` keeps naming its dead port and every new session inherits it at boot — reach for `--heal` to restart the daemon, or, if it can't come back, remove the wiring so sessions fall back to what they had before the pin.
+
+Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the extra pulls in.
 
 </details>
 

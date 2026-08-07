@@ -74,6 +74,29 @@ class TestProperLockfile:
         with proper_lockfile(nested):
             assert nested.is_dir()
 
+    def test_a_small_timeout_is_not_overshot_by_the_retry_sleep(self, lock_dir):
+        """The contention retry sleeps a full jittered 0.25-0.5s regardless of
+        the deadline, so a sub-sleep ``timeout`` (e.g. 0.01s) never times out
+        anywhere near when it says: MEASURED (this worktree, before any fix,
+        `$CLAUDE_JOB_DIR/tmp/overshoot.py`, 6 tries each) —
+
+            timeout=0.01   worst elapsed=0.408s   overshoot=+0.398s
+            timeout=0.25   worst elapsed=0.487s   overshoot=+0.237s
+            timeout=0.5    worst elapsed=0.910s   overshoot=+0.410s
+
+        The sleep must clamp to what's left of the budget, not the jitter's
+        own floor."""
+        lock_dir.mkdir()  # fresh mtime -> contended, not stale
+        start = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.01):
+                pass
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.15, (
+            f"a 0.01s timeout overshot to {elapsed:.3f}s — the retry sleep "
+            "ignored the remaining budget"
+        )
+
 
 class TestLockPaths:
     def test_default_paths(self, temp_home, monkeypatch):

@@ -15,8 +15,11 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+)
 from claude_swap.models import AccountSnapshot
+from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -207,7 +210,11 @@ def account_card_text(
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
         if acc.usage.last_error:
-            text.append(f" · {acc.usage.last_error}", style=palette.muted)
+            # Same wording as the CLI detail line: error KINDS with a
+            # friendly note render it, so both surfaces describe the state
+            # identically.
+            note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
+            text.append(f" · {note}", style=palette.muted)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
@@ -236,7 +243,10 @@ def account_card_text(
 
 
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -275,13 +285,13 @@ def mini_account_text(
         if parts:
             text.append(" · ", style=palette.track)
         color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
+        # Same chip the auto view's Next-best rows draw, from the same
+        # helper — one account must not read two ways on two screens.
+        text.append(
+            data.window_chip_label(last_good, key, label, now), style=palette.muted
+        )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                text.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
+        if key == "seven_day":
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
@@ -296,8 +306,37 @@ def mini_account_text(
             text.append(" · ", style=palette.track)
         text.append(f"{name} (!)", style=palette.sev_crit)
         parts += 1
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    rows = usage_rows(last_good, now, fetched_at)
+    spend_row = next((r for r in rows if r[0] == "$$"), None)
+    if spend_row is not None:
+        if parts:
+            text.append(" · ", style=palette.track)
+        _label, pct, suffix, _full = spend_row
+        color = palette.severity(pct)
+        text.append("$$ ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        text.append(f" · {suffix}", style=palette.muted)
+        parts += 1
     if not parts:
-        text.append("usage unknown", style=palette.muted)
+        # Nothing above rendered — an account whose only window is a
+        # per-model (scoped) limit below its cap (the maxed loop only counts
+        # ones at/over 100) still has something to show via the same helper,
+        # rather than reading as no data at all. `rows` has no "$$" row here
+        # (spend_row was None, or `parts` would already be nonzero).
+        if not rows:
+            text.append("usage unknown", style=palette.muted)
+        for i, (label, pct, _suffix, _full) in enumerate(rows):
+            if i:
+                text.append(" · ", style=palette.track)
+            color = palette.severity(pct)
+            text.append(f"{label} ", style=palette.muted)
+            text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
     return text
 
 
@@ -339,7 +378,9 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(acc, now, palette=palette)
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()

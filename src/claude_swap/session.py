@@ -58,7 +58,6 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
@@ -517,6 +516,34 @@ class SessionManager:
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
+        # One refresh so the profile starts with a fresh access token —
+        # BEFORE the bootstrap lock (the gate takes the same non-reentrant
+        # FileLock and POSTs over the network, which must never run under a
+        # held lock). The gate re-reads the freshest copy itself and
+        # persists via fingerprint CAS; _bootstrap then reads the rotated
+        # backup. Failure is non-fatal: the stored token may still be
+        # valid, and claude refreshes on its own at runtime. Setup-token
+        # accounts (--add-token) have no refresh token by design — skip
+        # silently instead of warning about a flow that can't happen.
+        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        if pre_creds and self._has_refresh_token(pre_creds):
+            outcome = self.switcher.consume_backup_grant(
+                account_num, email, pre_creds
+            )
+            if outcome.error is not None:
+                # `error is None` is the gate's own "the slot is freshened
+                # and safe to activate" signal, and it is NOT implied by
+                # credentials being present: a failed persist returns the
+                # successor AND `transient`, with the backup still holding
+                # the generation whose grant was just spent. Branching on the
+                # credentials alone stayed silent exactly there, and
+                # _bootstrap then seeded the profile from that spent
+                # generation — claude's first refresh gets invalid_grant.
+                warning(
+                    f"Could not refresh the token for Account-{account_num}; "
+                    "continuing with the stored credentials."
+                )
+
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
@@ -526,6 +553,30 @@ class SessionManager:
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
+                # Valid, but possibly not on the generation WE just paid for.
+                # The consume above runs outside this lock (it POSTs), so a
+                # peer `cswap run` can bootstrap while we wait — and its
+                # profile predates our rotation. Its refresh token is the one
+                # our gate consumed, so claude's own refresh would get
+                # invalid_grant on first use: a spent grant, silently.
+                # Validity is an identity check, not a generation check, so it
+                # cannot see this. Re-seed instead of returning early.
+                #
+                # NEVER under a live claude. _bootstrap deletes the profile's
+                # Keychain entry and overwrites .credentials.json, and the peer
+                # that bootstrapped ahead of us has already exec'd into that
+                # profile — rewriting it beneath a running instance is the
+                # failure every other invalidation site in this file guards
+                # against (the STALE_MARKER branch above, and
+                # _post_backup_write's). This branch fires precisely when the
+                # profile is VALID, which is the live case, so it needed the
+                # guard most and had it least. Deferring costs the peer a
+                # generation it can still refresh from; rewriting costs it the
+                # session.
+                if not self._profile_matches_backup(
+                    session_dir, account_num, email
+                ) and not live_sessions_for(session_dir):
+                    self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
@@ -543,6 +594,29 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    def _profile_matches_backup(
+        self, session_dir: Path, account_num: str, email: str
+    ) -> bool:
+        """Is the profile on the same credential generation as the backup?
+
+        Compared by fingerprint, because that is what identifies a generation;
+        the identity (email/org) is the same across all of them, which is why
+        ``_is_session_valid`` cannot answer this.
+
+        Unknowable answers are TRUE — an unreadable backup or profile is not
+        evidence of a mismatch, and re-bootstrapping on one would throw away a
+        working profile over a read error.
+        """
+        from claude_swap import oauth as _oauth
+
+        profile = read_session_credentials(session_dir)
+        backup = self.switcher.read_account_credentials(account_num, email)
+        if not profile or not backup:
+            return True
+        return _oauth.credential_fingerprint(
+            profile
+        ) == _oauth.credential_fingerprint(backup)
+
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
@@ -551,29 +625,27 @@ class SessionManager:
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
 
-        creds = self.switcher.read_account_credentials(account_num, email)
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
         if not creds:
+            if unreadable:
+                # Third copy of the switch path's message; same reason not to
+                # send the user to a re-add over a locked Keychain.
+                raise SessionError(
+                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"but it is unreadable right now (locked or no GUI "
+                    f"session). Retry from a GUI terminal; do not re-add."
+                )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
 
-        # One refresh so the profile starts with a fresh access token; persist
-        # a possibly-rotated refresh token back to backup so future switches
-        # and runs see the latest. Failure is non-fatal: the stored token may
-        # still be valid, and claude refreshes on its own at runtime.
-        # Setup-token accounts (--add-token) have no refresh token by design —
-        # skip silently instead of warning about a flow that can't happen.
-        if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
-                self.switcher.write_account_credentials(account_num, email, creds)
-            else:
-                warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
-                )
+        # The pre-lock refresh (see run(): the consume gate must not run
+        # under this lock — its POST is network and the FileLock is
+        # non-reentrant) may have already rotated the backup; the read
+        # above picked that successor up. No POST happens here.
 
         config_text = self.switcher.read_account_config(account_num, email)
         try:

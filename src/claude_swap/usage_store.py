@@ -254,6 +254,14 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    # Fingerprint of the credential whose refresh token was POSTed when a
+    # permanent auth error came back. Strikes bind to it: token_dead() holds
+    # only while the stored credential still fingerprints to the struck
+    # generation, so any credential-writing path heals the strike without a
+    # bespoke clear call. None on non-auth outcomes (and from writers that
+    # predate the field — those strikes bind unconditionally, the legacy
+    # behavior).
+    struck_fp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,9 @@ class UsageEntry:
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
+    # Fingerprint of the generation the strikes condemned (absent on legacy
+    # rows → strikes bind unconditionally). See ``token_dead``.
+    struck_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -334,14 +345,33 @@ class UsageEntry:
         """Whether another collector's bounded fetch lease is still live."""
         return _live_claim(self.claim_until, self.last_attempt_at, now)
 
-    def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
+    def token_dead(
+        self,
+        threshold: int = AUTH_DEAD_STRIKES,
+        stored_fp: str | None = None,
+    ) -> bool:
         """Whether the stored credential's refresh-token lineage is provably dead.
 
         True once ``invalid_grant`` has recurred ``threshold`` times without an
         intervening success. Such an account is quarantined: not fetched (see
         ``due_candidate`` and the collector) and surfaced as "re-login needed".
+
+        Strikes condemn the GENERATION that was POSTed, not the slot: when
+        the caller passes the currently-stored credential's fingerprint and
+        it differs from the struck one, the credential has been replaced
+        since the verdict — the strike no longer applies (any writing path
+        heals it, mirroring #142's identity-not-slot rule). A row struck
+        before fingerprints were recorded binds unconditionally.
         """
-        return self.auth_dead_strikes >= threshold
+        if self.auth_dead_strikes < threshold:
+            return False
+        if (
+            stored_fp is not None
+            and self.struck_fingerprint is not None
+            and stored_fp != self.struck_fingerprint
+        ):
+            return False
+        return True
 
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -906,6 +936,7 @@ class UsageStore:
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                struck_fingerprint=row.get("struckFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1068,6 +1099,11 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # Additive field (absent/None = legacy unconditional
+                    # binding). Always overwrite: a legacy writer's strike
+                    # must bind unconditionally, not inherit a stale
+                    # fingerprint from an earlier, already-healed strike.
+                    row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
             rows = self._read_rows()
@@ -1117,26 +1153,73 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        revoke_claim: bool = True,
+        strike_only: bool = False,
+        expected_fingerprints: dict[str, str | None] | None = None,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
-        strike count (and the failure/backoff state riding with it) no longer
-        reflects reality, and the account must become fetch-eligible again so the
-        next pass can prove the new token good. A no-op for rows with no strikes.
+        strike count (and, for the default full clear, the failure/backoff
+        state riding with it) no longer reflects reality, and the account
+        must become fetch-eligible again so the next pass can prove the new
+        token good. A no-op for rows with no strikes.
+
+        ``revoke_claim`` (default True) also fences out any fetch lease bound
+        to the OLD credential generation — needed by the credential-refresh
+        callers (login/add/import), whose whole premise is that lineage is
+        now dead. Callers with no credential change of their own to fence —
+        the collector's fingerprint-healed strike-clear reachable from a
+        lock-free, no-network ``fetch=set()`` read every 3s — must pass
+        ``revoke_claim=False``: nulling `claimId` there voids a DIFFERENT
+        collector's live, in-flight lease on ``record()``'s own fencing
+        field, discarding its measurement.
+
+        ``strike_only`` (default False) limits the clear to the STRIKE
+        fields (``authDeadStrikes``/``struckFingerprint``) and leaves
+        ``consecutiveFailures``/``lastError``/``backoffUntil`` untouched.
+        The five credential-refresh callers keep the default full clear — a
+        freshly written credential has no history at all, so a stale
+        backoff must not survive it either. Only the collector's
+        fingerprint-healed strike-clear passes ``strike_only=True``: that
+        call is evidence a STRIKE healed, not that the server's throttle
+        lifted, and unconditionally zeroing ``backoffUntil`` there would
+        re-open a token still inside its own 429 block — the same
+        "no credential change of its own to fence" reasoning ``revoke_claim``
+        already applies, extended to the throttle fields.
+
+        ``expected_fingerprints`` re-checks, UNDER THIS METHOD'S LOCK, that
+        a row's ``struckFingerprint`` still matches what the caller's
+        lock-free read observed before deciding to heal. The collector
+        decides on a lock-free :meth:`entries` snapshot and had no re-check
+        between that decision and this write — a fresh strike (or a
+        different collector's own heal) landing in that gap must not be
+        silently overwritten by a decision made against stale data. A row
+        whose current fingerprint no longer matches is left alone entirely.
         """
         nums = list(nums)
         if not nums:
             return
 
-        def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+        def apply(num: str, row: dict) -> None:
+            if (
+                expected_fingerprints is not None
+                and row.get("struckFingerprint") != expected_fingerprints.get(num)
+            ):
+                return  # the row moved since the caller's lock-free read
+            if revoke_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
-            row["consecutiveFailures"] = 0
-            row["lastError"] = None
-            row["backoffUntil"] = None
+            row["struckFingerprint"] = None
+            if not strike_only:
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 

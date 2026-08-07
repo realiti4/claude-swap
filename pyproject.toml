@@ -33,6 +33,12 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# NOT >=0.1. That floor admits 0.1.0, the release where a swap the upstream
+# REFUSED was handed to the client instead of retried unswapped — and Claude
+# Code treats 401/403/404 as terminal, so one misrouted request ends that
+# session's Remote Control until the process restarts. 0.1.1 retries, and
+# stops swapping client/presence (registration, not ownership).
+pin = ["cswap-pin>=0.1.3"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
