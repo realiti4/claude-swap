@@ -418,38 +418,53 @@ class AccountsPanel(Static):
 
 
 class AccountCard(Static):
-    """One account rendered full-size (used by the switch screen's list)."""
+    """One account rendered full-size (used by the switch screen's list).
 
-    def __init__(self, acc: AccountSnapshot, *, threshold: float | None = None) -> None:
+    ``cloud_pinned`` IS HANDED IN, not asked for. This used to call
+    ``pin.pinned_email`` from ``render()``, which is per-widget and not on the
+    poll: it fires on every repaint, resize and reflow, so N accounts cost N
+    package resolutions per frame (measured 450us each with the extra absent,
+    the majority case). Steady state that is 0.15% of a 3s tick and would not
+    be worth a line, but a held arrow key repaints at key-repeat rate and the
+    same work becomes ~13% of a core. The panel beside this already resolves
+    it once per render and passes it down; this is the same fact, resolved
+    once per SNAPSHOT one frame further up.
+    """
+
+    def __init__(
+        self, acc: AccountSnapshot, *, threshold: float | None = None,
+        cloud_pinned: bool = False,
+    ) -> None:
         super().__init__()
         self._acc = acc
         self._threshold = threshold
+        self._cloud_pinned = cloud_pinned
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
         self._acc = acc
+        self._cloud_pinned = cloud_pinned
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        pinned_email = pin.pinned_email(self.app.switcher)
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
-            cloud_pinned=bool(pinned_email and self._acc.email == pinned_email),
+            cloud_pinned=self._cloud_pinned,
         )
 
 
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
-    def __init__(self, acc: AccountSnapshot) -> None:
-        super().__init__(AccountCard(acc))
+    def __init__(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
+        super().__init__(AccountCard(acc, cloud_pinned=cloud_pinned))
         self.number = acc.number
         self.email = acc.email
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, *, cloud_pinned: bool = False) -> None:
         self.number = acc.number
         self.email = acc.email
-        self.query_one(AccountCard).set_account(acc)
+        self.query_one(AccountCard).set_account(acc, cloud_pinned=cloud_pinned)
 
 
 class MenuItem(ListItem):

@@ -361,6 +361,73 @@ class TestThePinBadgeDoesNotOverstate:
 
 
 @pytest.mark.asyncio
+class TestTheSwitchScreenBadgeIsResolvedOncePerSnapshot:
+    """The switch screen's cards carry the ○ cloud badge, and had NO test.
+
+    `AccountCard.render` used to call `pin.pinned_email` itself. `render()` is
+    per-widget and off the poll — it fires on every repaint, resize and reflow
+    — so N accounts cost N package resolutions per FRAME (450us each with the
+    extra absent, the majority case). Steady state that is 0.15% of a 3s tick;
+    a held arrow key repaints at key-repeat rate and the same work becomes
+    ~13% of a core.
+
+    Moving the question to `_on_snapshot` is only safe if the badge still
+    lands on the right card, and nothing asserted that it ever did. So this
+    pins BOTH halves in one trip: the badge is correct, and repainting does
+    not re-ask. Either alone passes for the wrong reason — a card that never
+    badges anything also never asks.
+    """
+
+    async def test_the_badge_lands_on_the_pinned_card_and_survives_repaints(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.tui import dashboard as _dash
+        from claude_swap.tui.widgets import AccountCard, AccountItem
+
+        accounts = [
+            make_account(1, active=True, email="one@e.com"),
+            make_account(2, email="two@e.com"),
+        ]
+        fake = FakeSwitcher(accounts, tmp_path)
+
+        calls = []
+        monkeypatch.setattr(
+            _dash.pin, "pinned_email", lambda _sw: calls.append(1) or "two@e.com"
+        )
+
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "switch")
+            await settle(pilot)
+
+            cards = {
+                item.email: item.query_one(AccountCard)
+                for item in app.screen.query(AccountItem)
+            }
+            assert set(cards) == {"one@e.com", "two@e.com"}, sorted(cards)
+
+            badged = {e: "○ cloud" in c.render().plain for e, c in cards.items()}
+            assert badged == {"one@e.com": False, "two@e.com": True}, (
+                f"the badge is on the wrong card(s): {badged} — the pinned "
+                f"account is two@e.com"
+            )
+
+            # NOW THE REGRESSION GUARD. Repaint every card without a new
+            # snapshot: the old code asked the pin once per render, so this
+            # count grew with frames rather than with snapshots.
+            before = len(calls)
+            for card in cards.values():
+                for _ in range(5):
+                    card.render()
+            assert len(calls) == before, (
+                f"rendering asked the pin {len(calls) - before} more time(s); "
+                f"render() is per-widget and off the poll, so this scales with "
+                f"frames — a held arrow key, a resize, a reflow"
+            )
+
+
+@pytest.mark.asyncio
 class TestTheStrandedWiringIsRemovableFromTheTui:
     """`--clear` is what a user reaches for precisely when they have
     UNINSTALLED the extra, and the CLI is deliberately able to do it without

@@ -493,11 +493,22 @@ class AccountListScreen(Screen):
             return
         listview = self.query_one("#accounts", ListView)
         numbers = [acc.number for acc in snap.accounts]
+        # ONCE PER SNAPSHOT, not once per card per repaint. `AccountCard.render`
+        # used to ask `pin.pinned_email` itself, which is per-widget and off the
+        # poll — see that class for the measurement. This is the only place that
+        # knows a new snapshot has arrived, so it is where the question belongs.
+        pinned_email = pin.pinned_email(self.app.switcher)
+
+        def _pinned(acc) -> bool:
+            return bool(pinned_email and acc.email == pinned_email)
+
         if numbers != self._numbers:
             first_build = not self._numbers
             previous = listview.index
             await listview.clear()
-            await listview.extend(AccountItem(acc) for acc in snap.accounts)
+            await listview.extend(
+                AccountItem(acc, cloud_pinned=_pinned(acc)) for acc in snap.accounts
+            )
             self._numbers = numbers
             listview.index = (
                 self._index_after_build(snap, first_build, previous)
@@ -506,7 +517,7 @@ class AccountListScreen(Screen):
             )
         else:
             for item, acc in zip(listview.query(AccountItem), snap.accounts):
-                item.set_account(acc)
+                item.set_account(acc, cloud_pinned=_pinned(acc))
         self._flash_updated(snap, listview)
 
     def _index_after_build(
