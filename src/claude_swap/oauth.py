@@ -537,11 +537,22 @@ class UsageOutcome:
     ``error`` is ``None`` on success, else a ``_classify_usage_error`` kind
     (plus ``"no-access-token"`` / ``"refresh-failed"`` for pre-request
     failures). ``retry_after_s`` carries the server's Retry-After when sent.
+
+    ``rescued_from`` names the ``_classify_usage_error`` kind a fallback
+    source recovered this measurement from, and is set only alongside
+    ``error=None``: the fetch really did succeed and the data really is
+    good, but the failure it routed around still happened, and downstream
+    state must not be told otherwise. Today only ``"http-429"`` appears
+    here (see :func:`_probe_fallback`), and the one consumer that needs it
+    is the usage store's cadence floor: a probe-rescued 429 has to keep
+    arming ``last429At``, or the rescue would unlock fast polling for
+    exactly the accounts whose usage endpoint is already saturated.
     """
 
     usage: dict | None
     error: str | None = None
     retry_after_s: float | None = None
+    rescued_from: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -571,13 +582,23 @@ def _probe_fallback(kind: str, access_token: str) -> UsageOutcome | None:
     instead of papering over the original error. Shared by both 429 sites
     in :func:`try_fetch_usage_for_account` (the direct fetch, and the retry
     after a 401-triggered refresh) since both need the identical rule.
+
+    The returned outcome reports ``error=None`` (the data is real and
+    fresh) but carries ``rescued_from=kind``, so state that keys on "did
+    this token 429?" still sees the 429. Erasing it would let the rescue
+    hand the account back to the urgent poll cadence: the usage endpoint
+    admits roughly 28-30 requests per hour per identity (see
+    ``poll_policy``), a 429 means that budget is already spent, and a
+    60-second cadence there re-spends it faster than it ages out. The
+    fallback would become permanently load-bearing on exactly the accounts
+    whose quota is scarcest.
     """
     if kind != "http-429":
         return None
     probed = probe_usage(access_token)
     if probed is None:
         return None
-    return UsageOutcome({**probed, "source": "headers"})
+    return UsageOutcome({**probed, "source": "headers"}, rescued_from=kind)
 
 
 def try_fetch_usage_for_account(

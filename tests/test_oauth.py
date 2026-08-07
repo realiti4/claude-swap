@@ -1086,6 +1086,37 @@ class TestUsageEndpointFallbackToHeaderProbe:
         assert outcome.usage["source"] == "headers"
         probe_mock.assert_called_once_with("old-access")
 
+    def test_a_rescued_429_still_reports_the_429_it_rescued(self):
+        """``error=None`` says the data is good; ``rescued_from`` says the
+        endpoint budget is nonetheless spent. The usage store needs the
+        second fact to keep the post-429 cadence floor armed -- dropping it
+        would let the rescue unlock 60s polling on the very accounts already
+        429ing."""
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage",
+                  return_value={"five_hour": {"pct": 11.0}}),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.rescued_from == "http-429"
+
+    def test_an_endpoint_success_rescues_nothing(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.rescued_from is None
+
     def test_non_429_errors_do_not_probe(self):
         probe_mock = MagicMock()
         with (
