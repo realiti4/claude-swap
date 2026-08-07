@@ -2165,6 +2165,16 @@ class TestPurgeDoesNotStrandTheWiring:
         assert "Could not remove the cloud pin wiring" in out, (
             "the purge reported success over a wiring it failed to remove"
         )
+        # AND THE OTHER HALF OF THE SAME REPORT. The warning above and the
+        # "Removed:" list are printed by one run and read together; a purge
+        # that warns the wiring survived while listing it as removed
+        # contradicts itself in the same breath, and the list is the half a
+        # user skims. Mutation-checked: dropping `and not survivors` from the
+        # append left every test here green.
+        assert "Cloud pin wiring" not in out.split("Removed:")[-1], (
+            "the purge listed the wiring as removed in the same output that "
+            f"tells the user to delete it by hand: {out!r}"
+        )
         # The path the code resolves, not where this test happened to write:
         # a session-scoped isolated_home fixture also sets HOME.
         assert str(cfg) in out, "the message does not name the file to edit"
