@@ -36,6 +36,7 @@ _logger = logging.getLogger("claude-swap")
 
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 PROBE_MODEL = "claude-haiku-4-5-20251001"
+MESSAGES_API_VERSION = "2023-06-01"
 
 _WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 
@@ -109,9 +110,11 @@ def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:
     /api/oauth/usage`` (issue #220), so this succeeds, or comes back 429 with
     the unified headers still attached, exactly on the accounts the usage
     endpoint goes silent on. Uses the same bearer and beta headers cswap
-    already sends to the usage endpoint (see ``oauth.request_usage_data``).
-    Returns None on any transport failure, or when the response carried no
-    unified headers at all.
+    already sends to the usage endpoint (see ``oauth.request_usage_data``),
+    plus ``anthropic-version``, which ``/v1/messages`` rejects with a 400
+    when it's absent but the usage endpoint never required. Returns None on
+    any transport failure, or when the response carried no unified headers
+    at all.
     """
     body = json.dumps(
         {
@@ -123,6 +126,7 @@ def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": oauth.OAUTH_BETA_HEADER,
+        "anthropic-version": MESSAGES_API_VERSION,
         "Content-Type": "application/json",
         "User-Agent": "claude-swap/1.0",
     }
