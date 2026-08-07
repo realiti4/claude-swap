@@ -368,10 +368,26 @@ class AccountsPanel(Static):
     def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
         super().__init__(id=id)
         self._show_minis = show_minis
+        self._pinned_email: str | None = None
 
     def on_mount(self) -> None:
-        self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
+        self.watch(self.app, "snapshot", lambda _snap: self._resolve_and_refresh())
+        # THEME ONLY REPAINTS. The pin did not move, so re-resolving it here
+        # would put the package lookup back on a path that is not a snapshot.
         self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+
+    def _resolve_and_refresh(self) -> None:
+        """Ask the pin ONCE per snapshot, like AccountCard's owner does.
+
+        `render()` used to ask it. That is one call per repaint rather than
+        the N `AccountCard` was making, so the arithmetic is milder — but the
+        argument in that class's docstring is about WHEN `render()` fires, not
+        how many widgets fire it: resize and reflow, not the 3s poll. This
+        widget already watched `snapshot`, so the answer had a place to live
+        and simply was not put there.
+        """
+        self._pinned_email = pin.pinned_email(self.app.switcher)
+        self.refresh(layout=True)
 
     def render(self) -> Text:
         app: "CswapApp" = self.app  # type: ignore[assignment]
@@ -389,7 +405,7 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
-        pinned_email = pin.pinned_email(app.switcher)
+        pinned_email = self._pinned_email
         for acc in snap.accounts:
             pinned = bool(pinned_email and acc.email == pinned_email)
             if acc.is_active:

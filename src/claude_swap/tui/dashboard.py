@@ -159,7 +159,23 @@ class DashboardScreen(Screen):
                     f"{pin.pinned_email(self.app.switcher) or 'none'}",
                     "pin-menu",
                 )]
-                if pin.is_available() or pin._wiring_present(self.app.switcher)
+                if (
+                    pin.is_available()
+                    or pin._wiring_present(self.app.switcher)
+                    # AND THE RECORD, which is the state every unwire LEAVES.
+                    # Only `clear_pin` removes settings.json -> remoteControl;
+                    # `heal`, `wire_launch_env` and `--ensure` all remove the
+                    # wiring and keep it, deliberately — the wiring is what
+                    # strands a launch and the record is not. So "record, no
+                    # wiring" is not a corner case, it is where every one of
+                    # those paths lands, and this gate hid the row there while
+                    # the record still named an account that re-pins live the
+                    # moment anything reinstalls the package. The leaf gate in
+                    # `_pin_entries` already asks all three and says why: a
+                    # gate must ask what the ACTION asks, or it hides work
+                    # that exists. This was the sibling that did not.
+                    or pin._pinned_email_now(self.app.switcher) is not None
+                )
                 else []
             ),
             ("Remove account…", "remove-menu"),
@@ -274,7 +290,15 @@ class DashboardScreen(Screen):
             # Scrubbed: the text comes from an optional package and lands in a
             # MENU LABEL (see pin._safe).
             rows: MenuEntries = [(pin._safe(exc), "")]
-            if pin._wiring_present(self.app.switcher):
+            # THE RECORD COUNTS HERE TOO, same gate one screen down.
+            # `clear_pin` removes it without the package — that is the whole
+            # reason it reads `_pinned_email_now` rather than asking the
+            # extra — so gating the row on a surviving WIRING dead-ends the
+            # user on the error string with removable state on disk.
+            if (
+                pin._wiring_present(self.app.switcher)
+                or pin._pinned_email_now(self.app.switcher) is not None
+            ):
                 rows.append(("Remove the leftover pin wiring", "pin:clear"))
             rows.append(_BACK)
             return rows

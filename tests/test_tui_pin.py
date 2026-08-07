@@ -426,6 +426,50 @@ class TestTheSwitchScreenBadgeIsResolvedOncePerSnapshot:
                 f"frames — a held arrow key, a resize, a reflow"
             )
 
+    async def test_the_dashboard_panel_does_not_re_ask_the_pin_per_frame(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SIBLING WIDGET, and it kept the pattern the card just lost.
+
+        `AccountsPanel.render` resolved `pin.pinned_email` itself. It is one
+        call per repaint rather than N, so the arithmetic is milder — but the
+        argument in `AccountCard`'s docstring is about WHEN `render()` fires,
+        not how many widgets fire it: resize and reflow, not the 3s poll.
+
+        The panel already watches `snapshot`, so the answer had a place to
+        live and simply was not put there. Fixing the card and leaving the
+        panel would also leave two patterns for one question in one file,
+        which is how the `clear_wiring` call sites drifted.
+        """
+        from claude_swap.tui import dashboard as _dash
+        from claude_swap.tui.widgets import AccountsPanel
+
+        calls = []
+        monkeypatch.setattr(
+            _dash.pin, "pinned_email", lambda _sw: calls.append(1) or "one@e.com"
+        )
+        monkeypatch.setattr(
+            "claude_swap.tui.widgets.pin.pinned_email",
+            lambda _sw: calls.append(1) or "one@e.com",
+        )
+
+        fake = FakeSwitcher([make_account(1, active=True, email="one@e.com")], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel)
+            assert "○ cloud" in panel.render().plain, (
+                "the panel does not badge the pinned account at all, so a "
+                "call count of zero below would prove nothing"
+            )
+            before = len(calls)
+            for _ in range(5):
+                panel.render()
+            assert len(calls) == before, (
+                f"the panel asked the pin {len(calls) - before} more time(s) "
+                f"across 5 repaints; render() fires on resize and reflow, not "
+                f"only on the 3s poll"
+            )
 
 @pytest.mark.asyncio
 class TestTheStrandedWiringIsRemovableFromTheTui:
@@ -608,4 +652,88 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
             assert calls, (
                 "a snapshot did not rebuild the root menu — the pin row cannot "
                 "appear on a mid-session install"
+            )
+
+
+@pytest.mark.asyncio
+class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
+    """A pin RECORD with no wiring must still show the surface that clears it.
+
+    Only `clear_pin` ever removes `settings.json -> remoteControl`. `heal`,
+    `wire_launch_env` and `--ensure` all remove the WIRING and leave the
+    record — by design, because the wiring is what strands a launch and the
+    record is not. So "record present, wiring gone" is not a corner case, it
+    is where every one of those paths lands.
+
+    In that state the root menu asked `is_available() or _wiring_present()`
+    and hid the Cloud row, while the record still named an account that
+    re-pins live the moment anything reinstalls the package. The leaf gate one
+    screen down already had the rule in its own comment — "a gate must ask
+    what the ACTION asks, or it hides work that exists" — and the root gate
+    was the copy that did not get it.
+
+    THE SAME DRIFT AS `clear_wiring`'s three call sites, one file over: a rule
+    written once at one site and not at its siblings.
+    """
+
+    def _orphaned_record(self, tmp_path, monkeypatch):
+        """Record present, wiring absent, package gone — what `heal` leaves."""
+        from claude_swap import pin
+        from claude_swap.tui import dashboard as _dash
+
+        monkeypatch.setattr(_dash.pin, "is_available", lambda: False)
+        monkeypatch.setattr(_dash.pin, "_wiring_present", lambda _sw: False)
+        monkeypatch.setattr(
+            _dash.pin, "_pinned_email_now", lambda _sw: ("c@e.com", None)
+        )
+        return pin
+
+    async def test_the_root_menu_still_offers_the_cloud_row(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.tui.widgets import MenuItem
+
+        self._orphaned_record(tmp_path, monkeypatch)
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            actions = [i.action_id for i in app.screen.query(MenuItem)]
+            assert "pin-menu" in actions, (
+                f"the Cloud row is hidden while a pin RECORD still names an "
+                f"account: {actions}. That record re-pins live the moment the "
+                f"package is reinstalled, and the TUI now offers no way to "
+                f"remove it"
+            )
+
+    async def test_the_broken_package_submenu_still_offers_the_clear(
+        self, tmp_path, monkeypatch
+    ):
+        """The row exists but dead-ends: same gate, one screen down.
+
+        With the package BROKEN rather than absent, `_pin_entries` takes its
+        error branch and offers the clear only when a wiring survives —
+        while `clear_pin` can remove the record without the package at all.
+        """
+        from claude_swap.exceptions import ClaudeSwitchError
+        from claude_swap.tui import dashboard as _dash
+        from claude_swap.tui.widgets import MenuItem
+
+        self._orphaned_record(tmp_path, monkeypatch)
+        monkeypatch.setattr(_dash.pin, "is_available", lambda: True)
+
+        def _boom():
+            raise ClaudeSwitchError("the extra is installed but not usable")
+
+        monkeypatch.setattr(_dash.pin, "_impl", _boom)
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "pin-menu")
+            await settle(pilot)
+            actions = [i.action_id for i in app.screen.query(MenuItem)]
+            assert "pin:clear" in actions, (
+                f"the broken-package submenu dead-ends on the error string "
+                f"with a removable record still on disk: {actions}"
             )

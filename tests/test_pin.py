@@ -472,7 +472,7 @@ class TestLaunchIsNeverBlocked:
         monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored the cloud pin"))
 
         assert pin.run(sw, None, ensure=True) == 0
-        assert not pin._wiring_is_stale(sw), (
+        assert not bool(pin._dead_wired_configs(sw)), (
             "ensure believed a heal that changed nothing — the config still "
             "names a dead port and every session started after this launch "
             "inherits it, which is disaster path D"
@@ -650,10 +650,12 @@ class TestLaunchIsNeverBlocked:
         # replaced — the elapsed assertion below has to keep measuring the
         # real connect.
         # ON `_dead_wired_configs`, which is what this site now asks. It is
-        # the same question `_wiring_is_stale` answers — that predicate is
-        # this list one bool wide — and the same probe, so the budget under
-        # test is unchanged. Spying on the predicate instead would silently
-        # measure nothing from here on.
+        # the question this site asks, and the same probe, so the budget
+        # under test is unchanged. A `_wiring_is_stale` predicate used to hold
+        # the same answer one bool wide; it was deleted once every call site
+        # moved here, so spying on it would now patch a name that is gone.
+        # (Older prose in this file still names it — that is history, and the
+        # absence of any `src/` reference is what makes it readable as such.)
         real_dead = pin._dead_wired_configs
 
         def _dead_spy(switcher, connect_timeout=2.0):
@@ -1462,17 +1464,25 @@ class TestTheTuiSurfaceSurvivesTheSplit:
     surface reports the other as healthy.
     """
 
-    def test_no_extra_means_no_pin_row(self, monkeypatch):
+    def test_no_extra_means_no_pin_row(self, tmp_path, monkeypatch):
         """A user who never asked for the pin must not see a row for it."""
         import types
 
         from claude_swap.tui import dashboard
 
         monkeypatch.setattr(dashboard.pin, "is_available", lambda: False)
+        # A REAL `backup_dir`, empty. The gate also asks `_pinned_email_now`
+        # now — the record is the state every unwire leaves behind — and that
+        # reads `settings.json` under it. `object()` was enough while the gate
+        # only asked `_wiring_present`, which ignores its switcher entirely;
+        # pointing it at an empty dir keeps the answer "nothing pinned" while
+        # letting the call be the real one.
         monkeypatch.setattr(
             dashboard.DashboardScreen,
             "app",
-            property(lambda self: types.SimpleNamespace(switcher=object(), snapshot=None)),
+            property(lambda self: types.SimpleNamespace(
+                switcher=types.SimpleNamespace(backup_dir=tmp_path), snapshot=None
+            )),
             raising=False,
         )
         screen = object.__new__(dashboard.DashboardScreen)
@@ -3802,6 +3812,60 @@ class TestHealADeadPin:
             f"{ {'get_port', 'set_port', 'ensure'} - forwarded }"
         )
 
+    def test_a_peer_that_mutates_the_env_cannot_half_wire_a_launch(
+        self, tmp_path, monkeypatch
+    ):
+        """"Degrades to an UNPINNED launch" must hold for a peer that WRITES.
+
+        `wire_launch_env` validates `wire_env`'s RETURN and falls back to an
+        unpinned launch when it is not a str->str mapping — but the fallback
+        returns the caller's own `env` object, so the guard only covers a peer
+        that returns wrongly, not one that MUTATES. `session.py` hands in its
+        own dict and the result reaches `os.execvpe`, which sits outside the
+        launch's `try`: a half-wired env there is not a caught exception, it
+        is the launch.
+
+        Not reachable through 0.1.68 — its `wire_env` opens with
+        `out = dict(env)` (verified in the package source). This is the peer
+        threat model the module states in its own words: "the package is a
+        PEER on an independent release schedule", and `heal` already refuses
+        to trust its return value. Trusting it not to write, while validating
+        what it returns, was the half that was missing.
+        """
+        import types
+
+        from claude_swap import pin
+
+        class _Mutating:
+            @staticmethod
+            def ensure_proxy(_sw):
+                return (41234, tmp_path / "ca.pem")
+
+            @staticmethod
+            def wire_env(env, port, ca_path, *a, **k):
+                env["HTTPS_PROXY"] = f"http://127.0.0.1:{port}"
+                env["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+                return None  # the shape the existing guard already rejects
+
+        monkeypatch.setattr(pin, "_impl", lambda: _Mutating)
+        monkeypatch.setattr(pin, "_pinned_email_now", lambda _sw: ("c@e.com", None))
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+
+        caller_env = {"PATH": "/usr/bin"}
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+        out = pin.wire_launch_env(sw, caller_env)
+
+        assert "HTTPS_PROXY" not in out, (
+            f"a rejected wire still reached the launch env: {sorted(out)} — "
+            f"the value execvpe receives is half-wired, pointing at a proxy "
+            f"the guard just refused to trust"
+        )
+        assert caller_env == {"PATH": "/usr/bin"}, (
+            f"the caller's own dict was mutated: {caller_env}. session.py "
+            f"passes the dict it goes on to use, so the damage outlives this "
+            f"call even when the return value is discarded"
+        )
+
     def test_heal_runs_before_the_package_is_required(self, tmp_path, monkeypatch):
         """`run(--heal)` must not go through _impl(): the missing-package error
         would abort exactly the users who most need the wiring removed."""
@@ -4076,8 +4140,9 @@ class TestHealNeverTearsDownAServingPin:
     ):
         """THE SIBLING CALL SITE, and it is the worse of the two.
 
-        `heal` and `run(ensure=True)` both ask `_wiring_is_stale` — a
-        MACHINE-WIDE verdict — and both used to answer it with `clear_wiring`,
+        `heal` and `run(ensure=True)` both ask a MACHINE-WIDE verdict — is
+        any wired config's own port dead — and both used to answer it with
+        `clear_wiring`,
         a machine-wide ACT. Fixing only the one a review named would leave the
         identical defect on the path that runs from an rc hook before EVERY
         hand-launched `claude`, where it is worse in two ways: nothing calls
@@ -4091,8 +4156,9 @@ class TestHealNeverTearsDownAServingPin:
         THE DEAD CONFIG'S LOCK IS HELD, and that is what makes this test reach
         the branch rather than describe it. Without contention `heal` runs
         FIRST inside the same `--ensure` call, clears the dead config itself,
-        and `_wiring_is_stale` is False by the time line 1609 is asked — so a
-        version of this test with no lock passes against the unfixed code and
+        and the verdict is empty by the time the branch below it is asked —
+        so a version of this test with no lock passes against the unfixed code
+        and
         proves nothing. With the lock held, `heal` cannot clear it, the
         verdict is still stale, and the machine-wide clear below it reaches
         the config whose lock is FREE: the live one. That is not a contrived
@@ -4566,7 +4632,7 @@ class TestHealNeverTearsDownAServingPin:
             assert pin._wired_port_is_serving(sw) is False, (
                 "a live session config masked a dead default config"
             )
-            assert pin._wiring_is_stale(sw) is True
+            assert bool(pin._dead_wired_configs(sw)) is True
         finally:
             srv.close()
 
@@ -4593,7 +4659,7 @@ class TestHealNeverTearsDownAServingPin:
                 paths, "get_default_global_config_path", lambda: cfg_bare
             )
             assert pin._wired_port_is_serving(sw) is True
-            assert pin._wiring_is_stale(sw) is False
+            assert bool(pin._dead_wired_configs(sw)) is False
         finally:
             srv.close()
 
@@ -4740,7 +4806,7 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
 
         assert pin._wiring_present(sw) is True, "fixture is not wired"
-        assert pin._wiring_is_stale(sw) is False, (
+        assert bool(pin._dead_wired_configs(sw)) is False, (
             "a wiring whose port cannot be read was called stale — the next "
             "launch would tear down a pin that may be perfectly live"
         )
@@ -4832,7 +4898,7 @@ class TestTheDeadPortCanBeInTheOtherConfig:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_own)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_other)
 
-        assert pin._wiring_is_stale(None) is True, (
+        assert bool(pin._dead_wired_configs(None)) is True, (
             "a dead port in the OTHER config is unreachable when this "
             "process's own config has no opinion — it must still be healed"
         )
@@ -4881,7 +4947,7 @@ class TestTheDeadPortCanBeInTheOtherConfig:
             monkeypatch.setattr(
                 paths, "get_default_global_config_path", lambda: cfg_other
             )
-            assert pin._wiring_is_stale(None) is False, (
+            assert bool(pin._dead_wired_configs(None)) is False, (
                 "a live port in the other config was read as stale"
             )
         finally:
@@ -4978,7 +5044,7 @@ class TestTheGuardIsPerConfigNotPerMachine:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_session)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_default)
 
-        assert pin._wiring_is_stale(None) is True, (
+        assert bool(pin._dead_wired_configs(None)) is True, (
             "a confirmed-dead port in the default config must make the "
             "guard fire, even though the session's own config has no "
             "opinion — otherwise that dead port is unreachable (Task 1)"
@@ -5055,7 +5121,7 @@ class TestTheMarkerGuardIsNotJustTheStalenessVerdict:
             "the marker guard has to hold at the read, not only in the one "
             "caller that remembered to ask"
         )
-        assert pin._wiring_is_stale(None) is False, (
+        assert bool(pin._dead_wired_configs(None)) is False, (
             "a config with no _cswapPinWiredKeys marker was condemned as "
             "stale wiring — nothing here is cswap's to remove"
         )

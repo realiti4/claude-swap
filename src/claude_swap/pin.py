@@ -45,7 +45,7 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     under a day. DEBUG keeps the record without paying for it every tick.
 
     `clear_wiring` overrides to WARNING because it is gated by
-    `_wiring_is_stale`, and because a config that could not be LOCATED is the
+    `_dead_wired_configs`, and because a config that could not be LOCATED is the
     one fact its return value cannot carry: the bool is a claim about every
     path it REACHED. Why a wiring could not be REMOVED is a different record —
     the lock WARNING at the bottom of `clear_wiring`.
@@ -306,8 +306,8 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # verdict, and answering it with a machine-wide ACT strips a live
         # session config wired to a serving port because the OTHER config
         # names a dead one. `_dead_wired_configs` keeps the verdict identical
-        # (it IS what `_wiring_is_stale` now returns, one bool wide) and
-        # narrows only what gets removed.
+        # (the list IS the staleness verdict, one bool wide) and narrows
+        # only what gets removed.
         try:
             dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S)
             if dead:
@@ -319,7 +319,21 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         pinned = pin.ensure_proxy(switcher)
         if pinned:
             port, ca_path = pinned
-            wired = pin.wire_env(env, port, ca_path)
+            # A COPY, so the peer can only scribble on a throwaway. The
+            # validation below covers what `wire_env` RETURNS; a version that
+            # also WRITES would leave a half-wired env in the object the
+            # caller keeps — `session.py` passes the dict it goes on to use —
+            # and in the one this function falls back to returning, which
+            # reaches `os.execvpe` OUTSIDE the launch's try. There a wrong
+            # shape is not a caught exception, it is the launch.
+            #
+            # Today's 0.1.68 opens with `out = dict(env)` and does not write.
+            # But this module's stated threat model is a peer on an
+            # independent release schedule: `heal` already refuses to trust
+            # its return value, and trusting it not to WRITE while validating
+            # what it returns was the missing half. One `dict()` here covers
+            # the caller's object and the fallback path together.
+            wired = pin.wire_env(dict(env), port, ca_path)
             # VALIDATED, NOT TRUSTED. This is the one value from the peer that
             # reaches `os.execvpe`, and execvpe sits OUTSIDE the launch's try —
             # so a wrong shape here is not a caught exception, it is the
@@ -445,8 +459,8 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     # and "the default profile was attempted and had nothing wired" are the
     # same silence from the outside.
     # WARNING HERE ONLY, which is the whole reason this passes a level. `heal`
-    # reaches `clear_wiring` through `_wiring_is_stale`, which goes false ONCE
-    # THE REMOVAL SUCCEEDS, so this logs once and goes quiet. The two getters
+    # reaches `clear_wiring` through `_dead_wired_configs`, which goes empty
+    # ONCE THE REMOVAL SUCCEEDS, so this logs once and goes quiet. The two getters
     # `heal` calls UNCONDITIONALLY stay at DEBUG (see `_log_unresolvable`).
     #
     # THIS RECORD DOES NOT EXPLAIN AN UNREMOVABLE WIRING, and must not be read
@@ -785,7 +799,7 @@ def _wire_mark_of(raw: object, config_path=None) -> list | None:
         # to every recovery path at once:
         #
         #     _wiring_present  False    _wired_ports  []
-        #     _wiring_is_stale False    clear_wiring  False
+        #     _dead_wired_configs []     clear_wiring  False
         #     heal             (False, 'Nothing to heal')
         #
         # while `.claude.json` still named a proxy port. Every probe that
@@ -1086,84 +1100,6 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
-def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
-    """Should this wiring be removed? Present AND not serving.
-
-    THE VERDICT LIVES HERE, NOT AT EACH CALL SITE — the rule this file already
-    states for the pin record, applied to the wiring. It was not, and the two
-    places that forgot the serving half both tore down a working pin:
-
-      * ``heal`` had the guard.
-      * ``wire_launch_env`` did not. With ``_impl()`` raising for a reason
-        unrelated to the daemon (a broken ``cryptography`` — precisely the case
-        ``_impl`` re-raises separately), one ``cswap run`` unwires a pin whose
-        port is answering, and every session on the box loses it.
-
-    ``connect_timeout`` exists because the launch path has a sub-second budget
-    and a black-holed port would otherwise blow it on the probe alone.
-
-    ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
-    underscore-prefixed, so this predicate stays call-compatible with its
-    sibling and every call site can keep passing the switcher it already has
-    on hand without checking which predicate needs it.
-    """
-    # THIS GUARD DOES A SECOND JOB the comment below (added when the
-    # per-config verdict became machine-wide) does not mention: it is also
-    # the ONLY thing left checking the `_cswapPinWiredKeys` MARKER before a
-    # port is treated as cswap's to condemn. The short-circuit this replaced
-    # read only the session config's own port (a now-deleted per-config
-    # helper — see Task 3 of this file's history) and so incidentally never
-    # reached the serving probe for a config cswap never wired — the marker
-    # was never checked explicitly, but the narrow per-config read meant it
-    # didn't have to be. `_wired_ports()` below reads BOTH configs' ports
-    # with NO marker check at all, so without this line a foreign
-    # `CSWAP_PIN_PORT` (no marker, e.g. a future `cswap-pin` release that
-    # stops writing it, or an unrelated var of the same name) sitting in
-    # either config and pointing at a dead port makes `_wiring_is_stale`
-    # True with nothing of cswap's actually wired.
-    #
-    # Without this line: `_wiring_present=False`, `_wired_ports=[<dead>]`,
-    # `_wiring_is_stale=True`, and `heal()` reports "Removed a cloud pin
-    # wiring…" over a byte-for-byte unchanged config — a false removal claim
-    # in the machine-readable channel the status line polls. Nothing is ever
-    # mutated (`_clear_wiring_locked` refuses a markerless file); the damage
-    # is entirely in the VERDICT this guard keeps honest.
-    # BOTH GUARDS BELOW NOW LIVE IN `_dead_wired_configs`, which this delegates
-    # to — "is any wired config's own port dead" and "is the machine-wide
-    # wiring stale" are the same question, and asking it twice in two places is
-    # how the two answers drift. The commentary is kept here because this is
-    # the name every call site uses.
-    if not _wiring_present(_switcher):
-        return False
-    # "I CANNOT TELL" IS NOT "IT IS DEAD". `_wiring_present` keys on the
-    # marker; the serving probe reads CSWAP_PIN_PORT. A config carrying the
-    # marker and no port satisfied both "wired" and "not serving" at once, so
-    # the launch path tore it down — against a proxy that may be perfectly
-    # live.
-    #
-    # Today's writer always emits the port, so this is not reachable through
-    # it. But the seam's stated threat model is that the package is a PEER on
-    # an independent release schedule, and refusing to trust its return value
-    # while trusting its file FORMAT with the destructive operation is the same
-    # inference this module keeps being burned by.
-    #
-    # MACHINE-WIDE, not per-config: this guards a WHOLE-MACHINE action
-    # (`clear_wiring` clears every wired config), so "I cannot tell" has to
-    # mean nothing ON THE MACHINE names a readable port — not merely that
-    # THIS config alone does not. The shipped deployment shape makes the
-    # narrower reading the COMMON case, not a corner one: `cswap run` wires
-    # ~/.claude.json and launches a child whose OWN config is seeded with no
-    # wiring at all, and the status line hook inside that child is what calls
-    # `heal` on a timer. So the process that heals is normally the one whose
-    # own config has no port to name — and a dead port sitting in the OTHER
-    # config must still be reachable. With the own config unwired and
-    # ~/.claude.json wired to a dead port, a per-config read sees None, returns
-    # False, and `heal()` answers "Nothing to heal" over a dead port.
-    if not _wired_ports():
-        return False
-    return bool(_dead_wired_configs(_switcher, connect_timeout=connect_timeout))
-
-
 def _port_of_config(path) -> int | None:
     """The pin port ONE config file names, or None when it names none, is
     unreadable, or malformed. The single-file read :func:`_wired_ports`
@@ -1292,22 +1228,60 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     correctly-routed pin:
 
         session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
-        _wiring_is_stale : True   ->  clear_wiring strips BOTH
+        stale verdict : True      ->  clear_wiring strips BOTH
 
     which is this file's own rule broken by its own code path — see the
     capitals at the top of :func:`heal`. The per-config answer was already
     computed by `_port_of_config`; it just was not used to decide WHICH.
 
-    The two guards from :func:`_wiring_is_stale` are kept, and kept
-    machine-wide, because both are about whether ANY of this is cswap's to
-    condemn at all:
+    THIS LIST IS ALSO THE STALENESS VERDICT, one bool wide: "should any wiring
+    be removed" is exactly "is any wired config's own port dead". A separate
+    ``_wiring_is_stale`` predicate held that answer until every call site moved
+    here, and it was deleted rather than kept as a one-line shim — one decision
+    with two implementations is how the two drift apart, which this module's
+    header warns about and which its `clear_wiring` call sites had already
+    demonstrated.
 
-      * nothing marked -> nothing of ours is wired, so no port here is ours
-      * no readable port anywhere -> "I cannot tell" is not "it is dead"
-
-    Past them, a config that names no readable port of its own is skipped
-    rather than cleared, for the second reason applied one scope down.
+    Both guards below are MACHINE-WIDE, and stay that way: they ask whether
+    ANY of this is cswap's to condemn at all, which is not a per-config
+    question.
     """
+    # THE MARKER CHECK, and it is the ONLY one before a port is treated as
+    # cswap's to condemn. `_wired_ports()` reads BOTH configs' ports with no
+    # marker check of its own, so without this line a foreign `CSWAP_PIN_PORT`
+    # — a future `cswap-pin` that stops writing it, or an unrelated var of the
+    # same name — sitting in either config and naming a dead port makes this
+    # list non-empty with nothing of cswap's actually wired.
+    #
+    # Without it: `_wiring_present=False`, `_wired_ports=[<dead>]`, the verdict
+    # True, and `heal()` reporting "Removed a cloud pin wiring…" over a
+    # byte-for-byte unchanged config — a false removal claim in the
+    # machine-readable channel the status line polls. Nothing is ever mutated
+    # (`_clear_wiring_locked` refuses a markerless file); the damage is
+    # entirely in the VERDICT this guard keeps honest.
+    #
+    # "I CANNOT TELL" IS NOT "IT IS DEAD" — the second guard. `_wiring_present`
+    # keys on the marker; the probe reads CSWAP_PIN_PORT. A config carrying the
+    # marker and no port satisfies both "wired" and "not serving" at once, and
+    # the launch path tore it down against a proxy that may be perfectly live.
+    # Today's writer always emits the port, so that is not reachable through
+    # it — but the seam's threat model is a PEER on an independent release
+    # schedule, and trusting its file FORMAT with the destructive operation
+    # while refusing to trust its return value is the same inference this
+    # module keeps being burned by.
+    #
+    # MACHINE-WIDE for that second guard too, because the shipped deployment
+    # shape makes the narrow reading the COMMON case: `cswap run` wires
+    # ~/.claude.json and launches a child whose own config is seeded with no
+    # wiring, and the status-line hook inside that child is what calls `heal`
+    # on a timer. So the healing process is normally the one whose own config
+    # names no port, and a dead port in the OTHER config must still be
+    # reachable. Per-config, that read sees None and answers "Nothing to heal"
+    # over a dead port.
+    #
+    # Past both, a config that names no readable port of ITS OWN is skipped
+    # rather than cleared — the second guard applied one scope down, which is
+    # what makes the ACT per-config while the verdict stays machine-wide.
     if not _wiring_present(_switcher) or not _wired_ports():
         return []
     return [
@@ -1430,17 +1404,18 @@ def heal(
     # so `heal` reports "Removed a cloud pin wiring" while the session config
     # still names the dead port.
     #
-    # THE SAME QUESTION `_wiring_is_stale` ASKS, not `_wiring_present` alone.
+    # THE SAME QUESTION `_dead_wired_configs` ASKS, not `_wiring_present`
+    # alone.
     # `_wiring_present` keys on the marker only, so a config carrying the
     # marker with no readable CSWAP_PIN_PORT satisfied it and got torn down
-    # here — the exact shape `_wiring_is_stale`'s own guard (see its
+    # here — the exact shape `_dead_wired_configs`' second guard (see its
     # docstring) declares must not be read as "the proxy is dead". `heal` is
     # the worse of the two call sites to leave unguarded: the status line
     # calls it on a timer, unattended, while the launch path runs once.
     try:
-        # THE DEAD CONFIGS, NOT "THE WIRING". `_wiring_is_stale` is the same
-        # question one bool wide, and asking it that way is what let a machine-
-        # wide verdict authorise a machine-wide ACT: with the session config
+        # THE DEAD CONFIGS, NOT "THE WIRING". The list IS the same question
+        # one bool wide, and asking it as a bool is what let a machine-wide
+        # verdict authorise a machine-wide ACT: with the session config
         # live and the default config dead, `clear_wiring` stripped both and
         # unpinned sessions that were routed correctly. Take the list instead
         # and clear exactly what is dead — one probe round either way.
