@@ -116,8 +116,20 @@ class TestThePinTuiSurface:
         try:
             async with app.run_test(size=(100, 32)) as pilot:
                 await settle(pilot)
-                await app.screen._dispatch("pin:clear")
-                await pilot.pause()
+                # `pin:1`, NOT `pin:clear`. This said "apply_pin failing"
+                # and dispatched the ONE action that never calls it: the
+                # clear branch skips `_impl()` on purpose ("CLEAR does not
+                # need the package, and must not"). Measured — replacing the
+                # raise with `return None` left the test passing, so the
+                # injection was inert and the assertion held for a reason
+                # unrelated to its name.
+                #
+                # `settle`, not a bare pause: this goes through
+                # `_start_action`, so the failure runs on a WORKER and one
+                # pause does not wait for it. The sibling below caught that
+                # half the loud way — Windows CI, `assert 'clear_wiring' in []`.
+                await app.screen._dispatch("pin:1")
+                await settle(pilot)
                 assert app.is_running, "a failing pin killed the dashboard"
         finally:
             pin.is_available, pin._impl = real_avail, real_impl
@@ -169,7 +181,14 @@ class TestThePinTuiSurface:
             async with app.run_test(size=(100, 32)) as pilot:
                 await settle(pilot)
                 await app.screen._dispatch("pin:clear")
-                await pilot.pause()
+                # `settle` WAITS FOR THE WORKER; one pause only yields the
+                # loop. `pin:clear` is dispatched through `_start_action`
+                # (clear_wiring takes a 9s lock and would freeze the
+                # dashboard inline), so this asserted a thread's side effect
+                # without waiting for the thread. Green on linux, and on
+                # Windows CI it failed with `assert 'clear_wiring' in []` —
+                # the scheduler, not the product.
+                await settle(pilot)
                 assert "clear_wiring" in called, (
                     "the TUI cleared the pin but left the wiring behind"
                 )
