@@ -19,6 +19,17 @@ Two things a caller must not get wrong:
 - The probe spends a small amount of the account's own quota: a real
   completion with ``max_tokens=1``, roughly 10 tokens including the fixed
   prompt. Every caller must bound how often it fires.
+
+``PROBE_MODEL`` is a dated snapshot id, and dated snapshots are retired.
+Nothing here notices: ``probe_usage`` swallows every transport failure, so
+the day Anthropic drops that snapshot the 404 reads as "probe failed", every
+429 falls back to the original error, and the whole issue-#220 rescue goes
+quiet with no diagnostic beyond a DEBUG line. It is pinned rather than
+aliased deliberately (an alias would silently change what the probe costs
+and which limits it counts against), so keeping it current is a maintenance
+obligation, not something the code can carry on its own. Any cheap model the
+account can call works; the reply is discarded and only the response headers
+are read.
 """
 
 from __future__ import annotations
