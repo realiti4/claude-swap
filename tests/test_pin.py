@@ -4773,17 +4773,41 @@ class TestANoteMustNotFailTheAction:
         assert rc == 0, "a malformed pin file made a read-only command fail"
         assert "No cloud account pinned" in out, out
 
-    def test_the_cli_catch_all_scrubs_credentials(self, capsys):
+    def test_the_cli_catch_all_scrubs_credentials(self, monkeypatch, capsys):
         """`_safe` exists for exactly this renderer, and it was the one
-        renderer not using it."""
+        renderer not using it.
+
+        DRIVEN, NOT GREPPED. This asserted `"_safe(e)" in
+        inspect.getsource(cli._pin_command)`, which is wrong in both
+        directions: renaming the caught exception to `exc` breaks it against a
+        change that is entirely correct, and the literal appearing ANYWHERE in
+        the function — a comment, an unrelated branch — satisfies it while the
+        catch-all prints the credential raw. A test keyed on source text
+        asserts how the code is spelled, not what it does.
+        """
         import claude_swap.cli as cli
         from claude_swap.pin import _safe
 
         leaky = "GET http://svc:s3cr3t@127.0.0.1:9901/sessions failed"
         assert "s3cr3t" not in _safe(ValueError(leaky)), _safe(ValueError(leaky))
-        src = __import__("inspect").getsource(cli._pin_command)
-        assert "_safe(e)" in src, (
-            "the catch-all renders a package exception without the scrubber"
+
+        def _boom(*_a, **_k):
+            raise ValueError(leaky)
+
+        monkeypatch.setattr("claude_swap.pin.run", _boom)
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **k: object())
+        monkeypatch.setattr(cli, "_guard_root", lambda s: None)
+        with pytest.raises(SystemExit) as exc:
+            cli._pin_command([])
+        assert exc.value.code == 1, exc.value.code
+
+        err = capsys.readouterr().err
+        assert "installed but not usable" in err, (
+            f"the catch-all did not render at all, so this proves nothing "
+            f"about scrubbing: {err!r}"
+        )
+        assert "s3cr3t" not in err, (
+            f"the catch-all printed the proxy credential verbatim: {err!r}"
         )
 
 
