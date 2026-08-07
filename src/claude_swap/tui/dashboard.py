@@ -192,12 +192,8 @@ class DashboardScreen(Screen):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
             await self._pop_menu()
-        elif action_id in actions:
+        else:
             actions[action_id]()
-        # An id that matches nothing is an INFORMATIONAL row. It has no
-        # action by design, and `actions[action_id]()` raised KeyError out of
-        # on_list_view_selected and killed the dashboard. Selecting a row that
-        # says nothing should do nothing.
 
     # -- actions ----------------------------------------------------------------
 
