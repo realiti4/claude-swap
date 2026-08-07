@@ -4548,8 +4548,9 @@ class TestHealNeverTearsDownAServingPin:
         # mutation to the string body survived unnoticed.
         assert msg == (
             "A cloud pin wiring points at a proxy that is gone, and it "
-            "could not be removed (the config is locked) — re-run "
-            "`cswap pin --heal`"
+            "could not be removed — re-run `cswap pin --heal`, or "
+            "`cswap pin --heal --debug` for the reason (a held config "
+            "lock and a config directory you cannot write both land here)"
         ), msg
         # The wiring really did survive — the message is describing reality.
         assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
@@ -6258,8 +6259,15 @@ class TestTheSelfLimitingCallSiteStillWarns:
 
 
 class TestTheLockFailureThatStrandsTheWiringIsNamed:
-    """`heal` says "could not be removed (the config is locked)" and nothing
-    anywhere says WHICH config or WHY.
+    """`heal` says "could not be removed" and nothing anywhere says WHICH
+    config or WHY.
+
+    It used to say "(the config is locked)", which was worse than vague: on
+    the `0o500` shape below the cause is `PermissionError`, and the advice
+    that followed could never come true. That claim is gone; the message now
+    names the condition and points at `--debug`. What this class guards is
+    the other half — that the WARNING carrying the real exception exists at
+    all, since the console handler only appears under that flag.
 
     The unresolvable-getter WARNING above is NOT this record. That one needs
     `Path.home()` to raise, and on the shape it fires it names
@@ -6455,6 +6463,24 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # fixture ever stops reaching the stranded state it is about.
         assert not changed and "could not be removed" in message, (
             f"fixture did not reach the stranded shape: {(changed, message)}"
+        )
+        # AND IT MUST NOT NAME A CAUSE IT CANNOT KNOW. `clear_wiring` catches
+        # every exception around the lock, so this one message covered a held
+        # lock AND an unwritable config directory — and said "the config is
+        # locked" for both. Here the cause is `PermissionError: [Errno 13]`,
+        # asserted below, and the advice that follows ("re-run `cswap pin
+        # --heal`") can never come true: re-running does not chmod anything,
+        # so the user waits on a lock that was never held.
+        #
+        # The true cause reaches only the log FILE — `logging_config` adds a
+        # console handler under `--debug` alone — so this message is the whole
+        # of what an ordinary run shows. Naming one cause for a condition with
+        # two is the same defect as naming none.
+        assert "is locked" not in message, (
+            f"heal blamed a lock for a permission failure: {message!r}"
+        )
+        assert "--debug" in message, (
+            f"the message does not say where the real cause is: {message!r}"
         )
 
         named = [

@@ -1437,10 +1437,25 @@ def heal(
                     "Removed a cloud pin wiring whose proxy was gone — "
                     "sessions fall back to the proxy they had before the pin"
                 )
+            # NAME THE CONDITION, NOT A CAUSE THIS CANNOT KNOW. `clear_wiring`
+            # catches every exception around the lock, so one message covered
+            # a held lock AND a config directory this user cannot write — and
+            # asserted the first for both. On the permission shape the advice
+            # that followed ("re-run `cswap pin --heal`") can never come true:
+            # re-running chmods nothing, so the user waits on a lock that was
+            # never held while the fix is one command away.
+            #
+            # AND SAY WHERE THE CAUSE IS. `clear_wiring`'s WARNING carries the
+            # real exception, but `logging_config` attaches a console handler
+            # under `--debug` alone — so on an ordinary run this line is the
+            # whole of what the user sees, and it was pointing at the wrong
+            # thing. Naming one cause for a condition with two fails the same
+            # way as naming none.
             return False, (
                 "A cloud pin wiring points at a proxy that is gone, and it "
-                "could not be removed (the config is locked) — re-run "
-                "`cswap pin --heal`"
+                "could not be removed — re-run `cswap pin --heal`, or "
+                "`cswap pin --heal --debug` for the reason (a held config "
+                "lock and a config directory you cannot write both land here)"
             )
     except Exception as exc:  # noqa: BLE001
         return False, f"Could not heal the cloud pin ({_safe(exc)})"
