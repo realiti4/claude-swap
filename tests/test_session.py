@@ -544,6 +544,30 @@ class TestIsSessionValid:
             tmp_path / "missing", ACCOUNT_EMAIL, ORG_UUID
         )
 
+    def test_probe_timeout_leans_valid(self, manager, tmp_path, monkeypatch):
+        """A probe timeout is a busy machine, not a bad login.
+
+        setup_session escalates a False from here all the way to
+        _cleanup_failed_session deleting the profile, so an indeterminate
+        probe must not report invalid (#224).
+        """
+        tmp_path.mkdir(exist_ok=True)
+
+        def raise_timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_oserror_stays_invalid(self, manager, tmp_path, monkeypatch):
+        tmp_path.mkdir(exist_ok=True)
+
+        def raise_oserror(*a, **k):
+            raise OSError("spawn failed")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_oserror)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
     def test_invokes_pathext_resolved_launcher(
         self, manager, tmp_path, monkeypatch, valid_payload
     ):

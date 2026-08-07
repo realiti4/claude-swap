@@ -654,7 +654,13 @@ class SessionManager:
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            # A timeout is the machine under load, not a bad profile: this
+            # check is best-effort (see docstring), and setup_session
+            # escalates a False all the way to deleting the profile. Real
+            # invalidity still fails on first use.
+            return True
+        except OSError:
             return False
         if result.returncode != 0:
             return False
