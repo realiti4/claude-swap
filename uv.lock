@@ -107,6 +107,7 @@ pin = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "claude-swap", extra = ["pin"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-xdist" },
@@ -124,6 +125,7 @@ provides-extras = ["menubar", "pin"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "claude-swap", extras = ["pin"] },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-xdist", specifier = ">=3.5" },

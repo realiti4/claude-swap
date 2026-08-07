@@ -830,6 +830,42 @@ class TestLaunchIsNeverBlocked:
             f"err={captured.err!r}"
         )
 
+    def test_a_store_that_cannot_be_built_is_rendered_not_raised(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """THE OTHER HALF OF THE SAME HANDLER, and it fails the opposite way.
+
+        The construction `try` exists for `--ensure`'s silence promise, so its
+        handler is `except (Exception, SystemExit): if ensure: exit 0; raise`.
+        For every OTHER invocation that `raise` is the whole behaviour — and
+        the `except ClaudeSwitchError` that renders `Error: …` sits on the
+        SECOND try, which only wraps `pin_run`. So the exact failures the
+        comment above it names (migration collision, unwritable store) reach
+        the user as a traceback from `cswap pin` while `cswap run` prints one
+        line for the identical fault.
+
+        A traceback is the worst outcome for the command whose job is to work
+        when things are already broken.
+        """
+        from claude_swap import cli
+
+        def _boom(*_a, **_k):
+            raise ClaudeSwitchError("store is unwritable")
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _boom)
+
+        with pytest.raises(SystemExit) as exc:
+            cli._pin_command(["2"])
+        assert exc.value.code == 1, exc.value.code
+        err = capsys.readouterr().err
+        # The premise and the assertion in one: the rendered line has to carry
+        # the cause, or this passes against a handler that swallowed it.
+        assert "store is unwritable" in err, (
+            f"the failure did not reach the user as a message: {err!r}"
+        )
+        assert "Traceback" not in err, err
+
 
 class TestTheWiringCanAlwaysBeRemoved:
     """`.claude.json` names the pin's port, and Claude Code applies that env
@@ -1511,10 +1547,30 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         (pkg / "__init__.py").write_text("")
         (pkg / "proxy.py").write_text("def load_pin(d):\n    return None\n")
         src = str(Path(__file__).resolve().parent.parent / "src")
+        late = str(tmp_path / "late")
         code = textwrap.dedent(
             f"""
             import sys
             sys.path.insert(0, {src!r})
+            # THE PREMISE HAS TO HOLD WHETHER OR NOT THE EXTRA IS INSTALLED.
+            # This asserted "not resolvable" and then installed a fake — true
+            # only while cswap-pin was absent from every environment, which
+            # stopped being true when `claude-swap[pin]` joined the dev group
+            # so the peer contract could be tested at all. An INSTALLED
+            # package broke the premise, not the behaviour.
+            #
+            # Refuse the real one until the "install" lands; after that the
+            # late directory sits at sys.path[0] and wins on its own, so what
+            # decides the second assertion is still invalidate_caches seeing
+            # a NEW path entry — the thing under test.
+            class OnlyLate:
+                def find_spec(self, name, path=None, target=None):
+                    if name.split(".")[0] != "cswap_pin":
+                        return None
+                    if {late!r} in sys.path:
+                        return None
+                    raise ImportError("not installed here", name=name)
+            sys.meta_path.insert(0, OnlyLate())
             from claude_swap import pin
             # _impl refuses on win32 BEFORE it looks for the package, so
             # is_available is False there no matter what gets installed —
@@ -2271,7 +2327,16 @@ class TestClearRunsWithTheExtraGone:
         """
         import types
 
-        proxy = pytest.importorskip("cswap_pin.proxy")
+        # A HARD IMPORT, and the skip it replaces is the finding. Under
+        # `importorskip` this test reported "skipped" on every job on every
+        # platform — `uv sync --locked` installs base + dev, and the extra was
+        # only under `[project.optional-dependencies]` — and, measured, in the
+        # maintainer's checkout too. It had never run once, so the one check
+        # standing between a rename in cswap-pin and `--clear` silently
+        # finding nothing was decorative. `claude-swap[pin]` is in the dev
+        # group now; if it ever leaves, this must fail rather than go quiet
+        # again, which is the whole reason the skip is gone.
+        from cswap_pin import proxy
 
         from claude_swap import pin
         from claude_swap.pin import _WIRE_MARK
@@ -4896,11 +4961,26 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
         monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package removed
 
-        pin.heal(sw)
+        changed, message = pin.heal(sw)
 
         assert pin._wiring_present(sw) is True, (
             "heal tore down a wiring whose port could not be read — the "
             "same inference _wiring_is_stale exists to forbid"
+        )
+        # NOT ACTING IS NOT A REASON TO REPORT THE ALL-CLEAR. Refusing to
+        # condemn this shape is right — "I cannot tell" is not "it is dead" —
+        # but `cswap pin --heal` is the command this module's own messages
+        # send a stranded user to, and it printed "Nothing to heal" over a
+        # wiring whose port it could not read. That is this file's signature
+        # defect (see the capitals in `heal`) reached through a different
+        # door: the only signal the user gets says nothing is wrong.
+        assert not changed, message
+        assert message != "Nothing to heal", (
+            "heal reported the all-clear over a wiring it could not check — "
+            "the user's one signal during the fault says there is no fault"
+        )
+        assert "CSWAP_PIN_PORT" in message, (
+            f"the message does not name what to fix: {message!r}"
         )
 
 

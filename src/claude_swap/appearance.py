@@ -182,6 +182,20 @@ def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
         return False
     if "--json" in argv:
         return False
+    # THE PIN'S LAUNCH FLAGS, for the two reasons already listed. Both run
+    # from an rc hook before EVERY hand-launched `claude`. `--ensure`
+    # promises silence and is budgeted in fractions of a second
+    # (`_LAUNCH_PROBE_S` 0.2, `_LAUNCH_LOCK_BUDGET_S` 0.5) — while the probe
+    # below puts the terminal into cbreak, writes OSC 11 to stdout and
+    # select-waits `_TIMEOUT_S` = 1.0, larger on its own than the whole
+    # budget the pin's launch path exists to protect. `--get_port` prints a
+    # bare number for a script to read, which is the `--json` reason under a
+    # different spelling.
+    #
+    # ON THE FLAG, NOT ON `pin`: `cswap pin 2` renders to a human and keeps
+    # its theme.
+    if argv[:1] == ["pin"] and {"--ensure", "--get_port"}.intersection(argv):
+        return False
     return True
 
 

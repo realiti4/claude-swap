@@ -303,6 +303,26 @@ class TestCliShouldProbe:
     def test_plain_command_with_colors_probes(self):
         assert appearance.cli_should_probe(["list"], colors_enabled=True) is True
 
+    def test_the_pins_launch_flags_never_probe(self):
+        """Both reasons above, on a path `run` was excluded for.
+
+        `pin --ensure` and `pin --get_port` run from an rc hook before EVERY
+        hand-launched `claude`. This probe puts the terminal into cbreak,
+        writes OSC 11 to stdout and select-waits `_TIMEOUT_S = 1.0` — larger
+        by itself than the entire budget the pin's launch path is built
+        around (`_LAUNCH_PROBE_S` 0.2, `_LAUNCH_LOCK_BUDGET_S` 0.5), and
+        `--ensure`'s contract is silence. `--get_port` prints a bare number
+        for a script to read, which is the `--json` reason spelled
+        differently.
+        """
+        for argv in (["pin", "--ensure"], ["pin", "--get_port"]):
+            assert appearance.cli_should_probe(argv, colors_enabled=True) is False, argv
+
+    def test_an_interactive_pin_still_probes(self):
+        """The control, and the reason the rule keys on the FLAG not on `pin`:
+        `cswap pin 2` renders to a human and must keep its theme."""
+        assert appearance.cli_should_probe(["pin", "2"], colors_enabled=True) is True
+
 
 def test_query_short_circuits_under_tmux(monkeypatch):
     """Inside tmux the OSC 11 probe is skipped (never waits out the timeout)."""

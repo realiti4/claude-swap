@@ -1444,6 +1444,26 @@ def heal(
             )
     except Exception as exc:  # noqa: BLE001
         return False, f"Could not heal the cloud pin ({_safe(exc)})"
+    # REFUSING TO ACT IS NOT A REASON TO REPORT THE ALL-CLEAR. A marker with no
+    # readable `CSWAP_PIN_PORT` reaches here because `_dead_wired_configs`
+    # declines to condemn it — correctly, "I cannot tell" is not "it is dead",
+    # see its second guard. But declining leaves the wiring in place, and this
+    # answered "Nothing to heal": the file's signature defect (the capitals
+    # above) through a different door. `cswap pin --heal` is the command this
+    # module's own messages send a stranded user to, and over a hand-edited or
+    # out-of-range port — the case `_port_of_config`'s range check exists for —
+    # it printed the all-clear.
+    #
+    # NOT A WOLF: today's writer always emits the port, so the normal wired
+    # machine never reaches this branch. `--ensure` discards the message
+    # entirely, so the launch path stays silent either way.
+    if _wiring_present(switcher) and not _wired_ports():
+        return False, (
+            "A cloud pin wiring is present but names no readable "
+            "CSWAP_PIN_PORT — it is left alone (it may still be serving) and "
+            "cannot be checked. Fix that value in .claude.json, or run "
+            "`cswap pin --clear` to remove the wiring"
+        )
     return False, "Nothing to heal"
 
 

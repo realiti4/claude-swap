@@ -88,7 +88,29 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `claude-swap[pin]`, NOT a second `cswap-pin>=…`. The extra above is the one
+# floor; spelling the version again here is how the two drift, and a stale
+# copy would pin CI to a package older than the behaviour the floor exists to
+# require.
+#
+# THE EXTRA HAS TO BE INSTALLED SOMEWHERE OR ITS CONTRACT IS UNTESTED. cswap
+# READS a marker cswap-pin WRITES and the two version independently, so
+# `test_the_marker_still_matches_the_package_that_writes_it` is the only thing
+# standing between a rename there and `--clear` reporting "No cloud account
+# pinned" over a live wiring. `uv sync --locked` installs base + dev only, so
+# that test skipped on every job on every platform — and, measured, in the
+# maintainer's own checkout too. It had never run once.
+#
+# This does NOT weaken "works without the extra": all three guarantees there
+# (`TestImportSafeWithoutTheExtra`, `TestClearRunsWithTheExtraGone`) block
+# `cswap_pin` at `sys.meta_path` or scan the AST, so they hold whether or not
+# the package is present.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "claude-swap[pin]",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

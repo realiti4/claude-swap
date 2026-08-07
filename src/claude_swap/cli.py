@@ -215,11 +215,23 @@ Examples:
         if args.ensure and _is_refused_root(switcher):
             sys.exit(0)
         _guard_root(switcher)
-    except (Exception, SystemExit):  # noqa: BLE001 — SystemExit is the point
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — SystemExit is the point
         # NOT BaseException: a Ctrl-C during construction must still reach the
         # user as one, even under a flag that promises never to fail.
         if args.ensure:
             sys.exit(0)
+        # RENDER WHAT THE SIBLINGS RENDER. The `except ClaudeSwitchError` that
+        # prints `Error: …` sits on the SECOND try, which wraps only
+        # `pin_run` — so the two faults the comment above names (migration
+        # collision, unwritable store) left `cswap pin` as a traceback while
+        # `cswap run` printed one line for the same cause. A traceback is the
+        # worst outcome for the command whose job is to work when the rest
+        # already does not. SystemExit still passes through untouched: it
+        # carries its own exit code and was raised by a guard that already
+        # printed.
+        if isinstance(exc, ClaudeSwitchError):
+            error(f"Error: {exc}")
+            sys.exit(1)
         raise
     try:
         sys.exit(
