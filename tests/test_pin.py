@@ -5,6 +5,7 @@ dependency, and the missing extra surfaces as a ClaudeSwitchError naming the
 install, not as a traceback.
 """
 
+import contextlib
 import json
 import os
 import pathlib
@@ -798,6 +799,26 @@ class TestLaunchIsNeverBlocked:
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "_is_running_in_container", lambda _self: False
         )
+        # THE PREMISE, and without it this test passes when the root
+        # simulation does not take: a NON-root `--ensure` also exits 0 in
+        # silence, so the assertions below would be describing the ordinary
+        # path under the name of the root one. The control is the sibling
+        # command that MUST refuse — if `cswap pin` still runs happily here,
+        # nothing about this process looks like root and nothing below means
+        # anything.
+        with contextlib.suppress(SystemExit):
+            cli._pin_command([])
+        # ON THE MESSAGE, NOT THE EXIT CODE. Exit 1 does NOT discriminate:
+        # measured with the euid patch reverted, plain `cswap pin` still
+        # exited 1 for an unrelated reason, so an exit-code premise passes
+        # against a root simulation that never took. The guard's own line is
+        # the only thing that says this process looks like root.
+        assert "as root" in capsys.readouterr().err, (
+            "the guard did not print for the command that SHOULD print, so "
+            "an empty stderr below is not evidence of silence — the root "
+            "simulation did not take"
+        )
+
         with pytest.raises(SystemExit) as exc:
             cli._pin_command(["--ensure"])
         assert exc.value.code == 0, f"--ensure failed as root: {exc.value.code}"
