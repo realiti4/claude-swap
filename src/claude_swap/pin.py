@@ -1512,7 +1512,8 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     try:
         # BUDGETED BY THE CALLER. This was the one probe left hardcoded after
         # every other one on a per-tick path was given a budget. Its own
-        # docstring names the consumer: a status line that runs on a timer.
+        # docstring names the consumer: any caller that runs on a timer
+        # (a contract, not an observed one — see `--heal`'s block).
         # A port that DROPs rather than refuses — a firewall rule, a
         # half-dead daemon — then costs the full 2s on every tick, which is
         # exactly the cost `_LAUNCH_PROBE_S` exists to refuse one function up.
@@ -1567,8 +1568,9 @@ def run(
             # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE. Healing
             # unconditionally would spend a config read, two path resolutions
             # and a socket probe per launch for a user who has never pinned —
-            # and the status line already calls `heal` on a timer, so on a
-            # machine with both this would be the second caller per tick.
+            # This hook is per-LAUNCH, and that is reason enough on its own;
+            # it once also cited a status line calling `heal` on a timer,
+            # which measurement says does not exist (see `--heal`'s block).
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
                 return 0
             # BUDGETED, like the two probes below it. `heal` arms three
@@ -1690,8 +1692,26 @@ def run(
     if heal_only:
         # Deliberately BEFORE _impl(): healing must work when the package is
         # missing or broken, because removing a stale wiring is the half that
-        # matters most then. Exit 0 either way — the status line calls this on
-        # a timer and a non-zero exit for "nothing was wrong" is noise.
+        # matters most then. Exit 0 either way — this is meant to be safe to
+        # wire into a timer or a shell chain, and a non-zero exit for "nothing
+        # was wrong" is noise in both.
+        #
+        # A CONTRACT, NOT AN OBSERVED CALLER, and the difference is worth the
+        # line: comments here (and `_wired_port_of`'s, and the launch hook's)
+        # justified budgets with "the status line calls this on a timer".
+        # Measured — nothing does. The status line that used to REPORTS and no
+        # longer repairs (recovery on one machine's personal config is no
+        # recovery for anyone else), and a launcher test now asserts `--heal`
+        # is never spawned. A review read the stale claim and correctly
+        # concluded the budgets were wrong for a timer.
+        #
+        # SO THE BUDGETS HERE STAY THE HUMAN ONES, deliberately: `heal`'s
+        # defaults (2.0s probe, 9.0s lock). Hardcoding the launch budget gave
+        # the human recovery command 0.5s, and Claude Code holds
+        # `.claude.json.lock` routinely during a credential refresh — so the
+        # one command whose job is to un-strand you bounced with "the config
+        # is locked" where a patient wait would have taken it. `--ensure` is
+        # the flag with the launch budgets; that split is the answer.
         changed, msg = heal(switcher)
         print(msg if changed else dimmed(msg))
         return 0
