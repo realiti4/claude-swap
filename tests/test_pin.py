@@ -904,6 +904,49 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert env["UNRELATED"] == "keep me"
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # displaced value back
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="needs POSIX symlink semantics without developer mode",
+    )
+    def test_a_symlinked_config_is_written_THROUGH_not_replaced(
+        self, tmp_path, monkeypatch
+    ):
+        """A rename swaps a directory ENTRY and does not follow links.
+
+        `settings.atomic_write_json` resolves the target first and says why in
+        its docstring — #192/#193, the same bug in `session.py`'s writer. The
+        unwire publishes through `switcher._write_json`, which ends in
+        `shutil.move` and resolves nothing, so on a dotfiles-managed
+        `.claude.json` the clear DETACHES the link: the symlink becomes a
+        regular clean file, the real target keeps the dead-port wiring, Claude
+        Code's later writes land on an orphan, and the next deploy restores
+        the link and resurrects the wiring.
+
+        It reads as success at every step, which is why it needs a test rather
+        than a caveat. The sibling half of one clear (`_clear_pin_record`)
+        already uses the resolving writer, so today the two disagree.
+        """
+        import claude_swap.paths as paths
+        from claude_swap.pin import clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        real = self._wired(tmp_path / "real")
+        link = tmp_path / ".claude.json"
+        link.symlink_to(real)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: link)
+
+        assert clear_wiring(ClaudeAccountSwitcher()) is True
+
+        assert link.is_symlink(), (
+            "the clear replaced the symlink with a regular file — the next "
+            "dotfiles deploy restores the link and the dead wiring with it"
+        )
+        env = json.loads(real.read_text())["env"]
+        assert "CSWAP_PIN_PORT" not in env, (
+            "the link's TARGET still carries the wiring: every launch reading "
+            "the real file still dials the dead port"
+        )
+
     def test_clear_wiring_reads_the_receipt_where_the_pin_now_writes_it(
         self, tmp_path, monkeypatch
     ):
@@ -4937,6 +4980,85 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
             "a wiring whose port cannot be read was called stale — the next "
             "launch would tear down a pin that may be perfectly live"
         )
+
+    @pytest.mark.parametrize("with_package", [False, True])
+    def test_a_LIVE_sibling_does_not_hide_the_config_that_cannot_be_read(
+        self, tmp_path, monkeypatch, with_package
+    ):
+        """PER-CONFIG CONDITION, MACHINE-WIDE ANSWER — this file's own defect,
+        reintroduced by the message that reports it.
+
+        The branch keys on `_wiring_present(...) and not _wired_ports()`, and
+        both are "does ANY config". So with the default config wired to a LIVE
+        port and the session config wired to a hand-edited one,
+        `_wired_ports()` is non-empty because of the default, the branch never
+        fires, and `--heal` prints "Nothing to heal" without ever mentioning
+        the config it cannot check. Exactly the masking
+        `_wired_port_is_serving`'s comment describes and that
+        `_dead_wired_configs` fixes per-config everywhere else.
+        """
+        import types
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        # The listener helper lives on the class that owns the serving-pin
+        # tests; a second copy is how two "a port that answers" fixtures drift.
+        srv, live = TestHealNeverTearsDownAServingPin._serving()
+        try:
+            good = tmp_path / "default.json"
+            good.write_text(json.dumps({
+                "env": {"HTTPS_PROXY": f"http://127.0.0.1:{live}",
+                        "CSWAP_PIN_PORT": str(live)},
+                "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            }))
+            # Marker present, port unreadable — the range check at the read
+            # turns a hand-edit into "no opinion", which is the whole point.
+            bad = tmp_path / "session.json"
+            bad.write_text(json.dumps({
+                "env": {"HTTPS_PROXY": "http://127.0.0.1:99999",
+                        "CSWAP_PIN_PORT": "99999"},
+                "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            }))
+            sw = types.SimpleNamespace(
+                backup_dir=backup,
+                _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+            )
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: bad)
+            monkeypatch.setattr(paths, "get_default_global_config_path", lambda: good)
+            # BOTH ARMS, because `heal` has a serving exit on each and they are
+            # the sibling call sites this branch keeps being bitten by: fixing
+            # the one a test happens to reach leaves the other saying "Nothing
+            # to heal". Measured — with only the no-package arm, reverting the
+            # package-present exit killed nothing.
+            if with_package:
+                monkeypatch.setattr(
+                    pin, "_live_impl",
+                    lambda: types.SimpleNamespace(
+                        # False is also what the package returns for "already
+                        # serving", which is the state this fixture is in.
+                        heal=lambda _d: False,
+                    ),
+                )
+            else:
+                monkeypatch.setattr(pin, "_live_impl", lambda: None)
+
+            # The premise: without this the assertion below could pass because
+            # the fixture never built the masking shape.
+            assert pin._wired_ports(), "no port anywhere — nothing to mask with"
+            assert pin._port_of_config(bad) is None, "the bad port reads fine"
+
+            changed, message = pin.heal(sw)
+
+            assert not changed, message
+            assert str(bad) in message, (
+                f"heal did not name the config it cannot check, so the live "
+                f"sibling hid it: {message!r}"
+            )
+        finally:
+            srv.close()
 
     def test_heal_does_not_tear_down_a_marker_with_no_port(
         self, tmp_path, monkeypatch

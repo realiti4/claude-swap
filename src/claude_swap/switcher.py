@@ -408,8 +408,31 @@ class ClaudeAccountSwitcher:
             return None
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON file with validation.
+
+        THROUGH A SYMLINK, NEVER OVER IT. The publish below is a rename, and a
+        rename swaps a directory ENTRY without following links — so on a
+        dotfiles-managed `.claude.json` this replaced the link with a regular
+        file, left the real target carrying whatever it had, and sent Claude
+        Code's later writes to an orphan. The next deploy restores the link
+        and everything the write meant to remove comes back with it.
+
+        `settings.atomic_write_json` already resolves for exactly this reason
+        and cites #192/#193, which fixed the same bug in `session.py`'s
+        writer. `_clear_pin_record` uses that one while the pin's config half
+        came through here, so the two halves of a single `pin --clear`
+        disagreed about what "published" means.
+
+        THE TEMP FILE STAYS BESIDE THE TARGET, not beside the link: they can
+        be on different filesystems, and a cross-device rename is not atomic
+        (`shutil.move` falls back to copy+unlink, which a reader can catch
+        half-written). Resolving only the final component keeps this a
+        same-directory rename on the side that matters.
+        """
         content = json.dumps(data, indent=2)
+
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")

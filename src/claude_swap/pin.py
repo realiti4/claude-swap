@@ -1281,6 +1281,41 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     ]
 
 
+def _nothing_to_heal(switcher) -> tuple[bool, str]:
+    """The healthy verdict — unless a wired config cannot be read at all.
+
+    THREE EXITS SAID "Nothing to heal" AND ONLY ONE OF THEM ASKED. A config
+    carrying the marker with no readable `CSWAP_PIN_PORT` is deliberately not
+    condemned (see `_dead_wired_configs`' second guard: "I cannot tell" is not
+    "it is dead"), but declining to ACT is not a reason to report the
+    all-clear, and `cswap pin --heal` is where this module's own messages send
+    a stranded user.
+
+    PER CONFIG, NOT MACHINE-WIDE. The first version asked
+    `_wiring_present(...) and not _wired_ports()` — both "does ANY config" —
+    so a default config on a LIVE port hid a session config whose own port was
+    hand-edited. It also sat at only the LAST of the three exits, and the
+    serving branches above return first in exactly that scenario, so the check
+    could not run where it was needed.
+
+    AND IT NAMES THE FILE. "somewhere a config is unreadable" sends the user
+    to grep two paths; `purge` learned that the expensive way.
+    """
+    unreadable = [
+        path for path in wired_config_paths(switcher)
+        if _port_of_config(path) is None
+    ]
+    if not unreadable:
+        return False, "Nothing to heal"
+    return False, (
+        "A cloud pin wiring names no readable CSWAP_PIN_PORT in "
+        + " and ".join(str(path) for path in unreadable)
+        + " — it is left alone (it may still be serving) and cannot be "
+        "checked. Fix that value, or run `cswap pin --clear` to remove the "
+        "wiring"
+    )
+
+
 def heal(
     switcher, *, connect_timeout: float = 2.0,
     lock_timeout: float | None = None,
@@ -1359,7 +1394,7 @@ def heal(
         # False for "already serving"). Re-READ rather than infer: unwiring a
         # pin that just came back is the same damage as unwiring a live one.
         if _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
-            return False, "Nothing to heal"
+            return _nothing_to_heal(switcher)
     elif _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
         # No package, so nothing can restart OR recycle — but a serving pin is
         # still a working one, and removing its wiring would unpin a healthy
@@ -1369,7 +1404,7 @@ def heal(
         # The port the WIRING names is the right question, not any state file:
         # `_spawn_daemon` unlinks proxy.json as its first act, so a missing
         # record is not proof of death while the original daemon still serves.
-        return False, "Nothing to heal"
+        return _nothing_to_heal(switcher)
     # No package, or the restart failed. Either way the wiring must not outlive
     # the daemon it points at. clear_wiring works WITHOUT the package on
     # purpose — the wiring is cswap's own record, and the case where the extra
@@ -1462,14 +1497,7 @@ def heal(
     # NOT A WOLF: today's writer always emits the port, so the normal wired
     # machine never reaches this branch. `--ensure` discards the message
     # entirely, so the launch path stays silent either way.
-    if _wiring_present(switcher) and not _wired_ports():
-        return False, (
-            "A cloud pin wiring is present but names no readable "
-            "CSWAP_PIN_PORT — it is left alone (it may still be serving) and "
-            "cannot be checked. Fix that value in .claude.json, or run "
-            "`cswap pin --clear` to remove the wiring"
-        )
-    return False, "Nothing to heal"
+    return _nothing_to_heal(switcher)
 
 
 def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
