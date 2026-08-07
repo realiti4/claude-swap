@@ -2410,18 +2410,18 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
 class TestTheExtraIsGatedByOneFloorOnly:
     """The extra's version floor lives in pyproject, and NOWHERE else.
 
-    A hardcoded `_MIN_PIN_VERSION` tuple in `pin.py` would refuse an
-    older cswap-pin at import time. It was removed because it cannot survive
-    the release cycle: cswap-pin ships on its own schedule, so every release of
-    it needed a matching pull request against THIS project just to raise a
-    constant. A gate whose upkeep depends on someone else's cadence goes stale,
-    and a stale floor is worse than none — it refuses a package the installer
-    has just chosen, blaming the user's version.
+    ONE floor, at INSTALL time. A hardcoded `_MIN_PIN_VERSION` tuple in
+    `pin.py` would refuse an older cswap-pin at import time, and that is the
+    gate this class asserts stays gone: it re-litigates on every call, and it
+    refuses a package the installer has just chosen while blaming the user's
+    version. The install-time requirement is the right place, and it is where
+    the floor now lives — see
+    `test_the_extra_floor_matches_what_the_lockfile_resolved`.
 
     This is exactly how the sibling extra behaves: `menubar = ["rumps>=0.4.0"]`
-    in pyproject, and `menubar.py` asks only whether the import works. Keeping
-    a bad release out is an install-time job, not one the seam re-litigates on
-    every call.
+    in pyproject, and `menubar.py` asks only whether the import works. The
+    difference between the two gates is WHEN they run, not whether a floor is
+    allowed to exist.
 
     WINDOWS REFUSES BEFORE ANYTHING ELSE. `_impl` raises on win32 first (POSIX
     locks and FIFOs), and the failure that taught this was the quiet kind: an
@@ -2466,21 +2466,35 @@ class TestTheExtraIsGatedByOneFloorOnly:
             [sys.executable, "-c", code], capture_output=True, text=True
         ).stdout
 
-    def test_the_extra_names_no_version_at_all(self):
-        """AND NOT IN PYPROJECT EITHER. The class above argues a floor cannot
-        survive the release cycle; the extra carried one anyway.
+    def test_the_extra_floor_matches_what_the_lockfile_resolved(self):
+        """The floor exists, and it agrees with `uv.lock`.
 
-        Measured: `pin = ["cswap-pin>=0.1.3"]` sat unchanged through
-        THIRTY-SIX releases of cswap-pin. So `uv tool install
+        THE FLOOR CAME BACK, deliberately. This test used to assert the extra
+        named no version at all, on the argument that a constant somebody has
+        to remember to raise goes stale — measured: `cswap-pin>=0.1.3` sat
+        unchanged through THIRTY-SIX releases, so `uv tool install
         'claude-swap[pin]'` resolved a pin from before the port handdown, the
-        chain walk and the launch hook — on a machine that looked correctly
-        installed, because a satisfied floor says nothing. The user's dotfiles
-        grew a 248-line installer to work around exactly this.
+        chain walk and the launch hook while every install looked fine.
 
-        Unpinned resolves to the LATEST release, which is what a fresh install
-        should get and what the floor was only ever approximating badly.
-        Keeping a bad release out is an install-time job, as this class
-        already says about the runtime check.
+        That argument reasoned as though cswap-pin were somebody else's
+        package. It is ours. The 0.1.3 failure happened because nobody raised
+        it, not because floors are wrong, and dropping the floor did not fix
+        the underlying problem — it moved it into the lockfile, where
+        `uv.lock` quietly held cswap-pin 0.1.37, thirty-one releases behind,
+        with a requirement that looked satisfied.
+
+        SO THE INVARIANT IS AGREEMENT, not a magic number. The floor must
+        equal the version the lock actually resolved. That catches the two
+        ways this goes wrong offline and without a network call:
+
+          - raising the requirement without relocking. Measured today: six
+            red jobs on this PR, every one `uv sync --locked` refusing before
+            a test ran.
+          - a lock that drifts below the floor, which is the 0.1.37 shape.
+
+        Staleness against the newest RELEASE is not checkable here and is not
+        pretended to be — that is the release checklist's job, and pyproject
+        says so beside the pin.
         """
         import re
         import tomllib
@@ -2489,13 +2503,29 @@ class TestTheExtraIsGatedByOneFloorOnly:
         root = Path(__file__).resolve().parent.parent
         raw = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         specs = raw["project"]["optional-dependencies"]["pin"]
+        assert len(specs) == 1, f"expected one pin requirement, got {specs!r}"
 
-        for spec in specs:
-            assert not re.search(r"[<>=!~]", spec), (
-                f"the pin extra pins a version: {spec!r}. A constant somebody "
-                f"must remember to raise goes stale silently — this one sat at "
-                f"0.1.3 through 36 releases while every install looked fine."
-            )
+        m = re.fullmatch(r"cswap-pin>=(\d+(?:\.\d+)*)", specs[0])
+        assert m, (
+            f"the pin extra must name a `>=` floor on cswap-pin, got "
+            f"{specs[0]!r}. The floor is what forces the relock that moves "
+            f"the pinned version; without it the lock silently keeps an old "
+            f"one (measured: 0.1.37, thirty-one releases behind)."
+        )
+        floor = m.group(1)
+
+        lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
+        locked = next(
+            (p.get("version") for p in lock.get("package", [])
+             if p.get("name") == "cswap-pin"),
+            None,
+        )
+        assert locked is not None, "cswap-pin is not in uv.lock at all"
+        assert locked == floor, (
+            f"the pin floor is {floor} but uv.lock resolved {locked}. Raise "
+            f"one without the other and CI fails at `uv sync --locked` before "
+            f"any test runs — run `uv lock` after changing the requirement."
+        )
 
     def test_no_version_is_refused_at_runtime(self):
         """Any installed version imports. Refusing one here would need a
