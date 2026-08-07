@@ -33,37 +33,43 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
-# NO FLOOR. A pinned minimum here is a constant somebody has to remember to
-# raise, and it does not survive the release cycle: this one sat at 0.1.3
-# through THIRTY-SIX releases, so `uv tool install 'claude-swap[pin]'`
-# resolved a pin from before the port handdown, the chain walk and the launch
-# hook — while the machine looked correctly installed. The user's dotfiles
-# then grew 248 lines of installer to work around it.
+# FLOOR AT THE CURRENT RELEASE, and raise it with each one.
 #
-# An unpinned requirement resolves to the LATEST release, which is what a
-# fresh install should get and what a floor was only ever approximating.
-# Keeping an old release out is an INSTALL-time job, not a constant this
-# project re-litigates on someone else's release cadence — the same reasoning
-# `_impl` already applies to the runtime check it deliberately does not do.
+# The argument this line used to carry was "no floor": a minimum is a constant
+# somebody has to remember to raise, and this one sat at 0.1.3 through
+# THIRTY-SIX releases, so `uv tool install 'claude-swap[pin]'` resolved a pin
+# from before the port handdown, the chain walk and the launch hook — while
+# the machine looked correctly installed. The user's dotfiles then grew 248
+# lines of installer to work around it. That history is real and it is why
+# 0.1.3 is not the answer either.
 #
-# THE ONE FLOOR THAT IS NOT AN APPROXIMATION. Everything above argues against
-# a floor that chases freshness, and that still holds. This bound names a
-# boundary instead, and the boundary cannot move: before 0.1.2, wiring the pin
-# wrote `.claude.json` with `write_text`, which takes the umask — 022 on every
-# machine here — and the rename made 0644 permanent. Turning this extra on is
-# exactly what puts the proxy's own credential in that file, as userinfo in
-# `HTTPS_PROXY`. So on 0.1.1 and below, ENABLING THE FEATURE PUBLISHES A
-# CREDENTIAL to every local user. 0.1.2 creates the temp file 0600 via
-# O_CREAT|O_EXCL with an explicit mode and never widens an existing config.
+# WHAT THAT ARGUMENT GOT WRONG: it reasoned as though cswap-pin were somebody
+# else's package whose cadence we cannot see. We own it. A floor here is not
+# betting on a third party's release schedule, it is naming the build this
+# extra was tested against — and the stale-floor failure above happened
+# because nobody raised it, not because floors are wrong.
 #
-# Verified rather than assumed, both directions:
-#   v0.1.1  tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-#   v0.1.2  mode = _mode_of(path, default=0o600); os.open(..., O_EXCL, mode)
+# WHAT 0.1.68 BUYS, all of it measured and all of it in the pin's own tree:
+#   - the config is written 0600 via O_CREAT|O_EXCL and never widened. Before
+#     0.1.2 it took the umask (022 here) and the rename made 0644 permanent —
+#     and turning THIS EXTRA on is exactly what puts the proxy's credential in
+#     that file, as userinfo in HTTPS_PROXY.
+#   - /health carries `direct_last`, so a chain that fell back to a direct
+#     dial and recovered is still visible to a later probe. Before it, the
+#     daemon detected five such outages, wrote all five to daemon.log, and
+#     nobody read any of them.
+#   - the holder-crash path is covered by a test that waits for the whole
+#     lineage rather than for the port, which is what made every earlier
+#     reading of it wrong.
 #
-# And it is not a freshness proxy: the seam this extra actually calls —
-# `heal`, `load_pin`, `apply_pin` — has byte-identical signatures from v0.1.0
-# through 0.1.68, so nothing here is bounding an API. Only the credential.
-pin = ["cswap-pin>=0.1.2"]
+# The seam itself does not need any of this: `heal`, `load_pin` and
+# `apply_pin` have byte-identical signatures from v0.1.0 through 0.1.68. The
+# floor is about the BEHAVIOUR around them, not the API.
+#
+# RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
+# accepted deliberately, and the pre-push hook in cswap-pin already warns when
+# src changes without a version bump — this is the other half of that.
+pin = ["cswap-pin>=0.1.68"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
