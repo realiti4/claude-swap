@@ -380,8 +380,15 @@ _LAUNCH_LOCK_BUDGET_S = 0.5
 _LAUNCH_PROBE_S = 0.2
 
 
-def clear_wiring(switcher, timeout: float | None = None) -> bool:
+def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
+
+    ``only`` narrows it to the given config paths. The default — every wired
+    config — is what ``cswap pin --clear`` means and must not change: the user
+    asked to be unpinned, and leaving one config wired is the stranding this
+    function exists to prevent. ``heal`` is the caller that needs less than
+    that, because its trigger is per-config (see :func:`_dead_wired_configs`)
+    while its remedy was not.
 
     The pin writes its proxy address into ``.claude.json``'s env block and
     records which keys it wrote in ``_cswapPinWiredKeys``; this reads that
@@ -447,6 +454,14 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # do: a config that could not be LOCATED is missing from `paths`, and
     # `clear_wiring`'s bool is a claim about every path it REACHED.
     paths = list(_each_config(logging.WARNING))
+    if only is not None:
+        # BY RESOLVED PATH, not by identity: the caller got its list from
+        # `_each_config` too, but a getter that resolves through a symlink or
+        # a different Path flavour would silently filter everything out — and
+        # an empty `paths` here is a clear that removes nothing while
+        # reporting the same False as "there was nothing to remove".
+        wanted = {str(p) for p in only}
+        paths = [p for p in paths if str(p) in wanted]
 
     # ONE LOCK PER PATH. The shared config lock derives its directory from
     # get_global_config_path(), so a single lock around the loop guards one
@@ -1104,6 +1119,11 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # in the machine-readable channel the status line polls. Nothing is ever
     # mutated (`_clear_wiring_locked` refuses a markerless file); the damage
     # is entirely in the VERDICT this guard keeps honest.
+    # BOTH GUARDS BELOW NOW LIVE IN `_dead_wired_configs`, which this delegates
+    # to — "is any wired config's own port dead" and "is the machine-wide
+    # wiring stale" are the same question, and asking it twice in two places is
+    # how the two answers drift. The commentary is kept here because this is
+    # the name every call site uses.
     if not _wiring_present(_switcher):
         return False
     # "I CANNOT TELL" IS NOT "IT IS DEAD". `_wiring_present` keys on the
@@ -1132,7 +1152,7 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # False, and `heal()` answers "Nothing to heal" over a dead port.
     if not _wired_ports():
         return False
-    return not _wired_port_is_serving(_switcher, connect_timeout=connect_timeout)
+    return bool(_dead_wired_configs(_switcher, connect_timeout=connect_timeout))
 
 
 def _port_of_config(path) -> int | None:
@@ -1207,8 +1227,6 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
     underscore-prefixed, for the same call-compatibility reason.
     """
-    import socket
-
     # EVERY WIRED CONFIG MUST SERVE, not merely one of them.
     #
     # The two configs are written asymmetrically:
@@ -1228,16 +1246,66 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     # Only a config that NAMES a port has an opinion, and every such opinion
     # has to be right for the pin to be serving.
     ports = _wired_ports()
-    for port in ports:
-        sock = socket.socket()
-        sock.settimeout(connect_timeout)
-        try:
-            sock.connect(("127.0.0.1", port))
-        except OSError:
-            return False  # a config names a port nothing serves
-        finally:
-            sock.close()
-    return bool(ports)
+    return bool(ports) and all(
+        _port_answers(port, connect_timeout) for port in ports
+    )
+
+
+def _port_answers(port: int, connect_timeout: float) -> bool:
+    """Does a loopback connect to ``port`` succeed? The one probe, once.
+
+    Extracted because two callers need it and they need DIFFERENT shapes of
+    the answer: :func:`_wired_port_is_serving` wants the machine-wide AND,
+    :func:`_dead_wired_configs` wants it per config. Two copies of the probe
+    would be two places for a timeout or an exception class to drift.
+    """
+    import socket
+
+    sock = socket.socket()
+    sock.settimeout(connect_timeout)
+    try:
+        sock.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
+
+
+def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
+    """Every wired config whose OWN port is not answering — and no more.
+
+    THE VERDICT IS MACHINE-WIDE; THE ACT MUST NOT BE. `_wired_port_is_serving`
+    is AND over every wired config on purpose, so one dead config makes the
+    whole machine "not serving" — correct, because a live session config must
+    not mask a dead default config. But `clear_wiring` is unconditional over
+    every wired config, and composing the two unwired the OTHER config's live,
+    correctly-routed pin:
+
+        session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
+        _wiring_is_stale : True   ->  clear_wiring strips BOTH
+
+    which is this file's own rule broken by its own code path — see the
+    capitals at the top of :func:`heal`. The per-config answer was already
+    computed by `_port_of_config`; it just was not used to decide WHICH.
+
+    The two guards from :func:`_wiring_is_stale` are kept, and kept
+    machine-wide, because both are about whether ANY of this is cswap's to
+    condemn at all:
+
+      * nothing marked -> nothing of ours is wired, so no port here is ours
+      * no readable port anywhere -> "I cannot tell" is not "it is dead"
+
+    Past them, a config that names no readable port of its own is skipped
+    rather than cleared, for the second reason applied one scope down.
+    """
+    if not _wiring_present(_switcher) or not _wired_ports():
+        return []
+    return [
+        path
+        for path in _each_config()
+        if (port := _port_of_config(path)) and not _port_answers(port, connect_timeout)
+    ]
 
 
 def heal(
@@ -1361,15 +1429,26 @@ def heal(
     # the worse of the two call sites to leave unguarded: the status line
     # calls it on a timer, unattended, while the launch path runs once.
     try:
-        if _wiring_is_stale(switcher, connect_timeout=connect_timeout):
+        # THE DEAD CONFIGS, NOT "THE WIRING". `_wiring_is_stale` is the same
+        # question one bool wide, and asking it that way is what let a machine-
+        # wide verdict authorise a machine-wide ACT: with the session config
+        # live and the default config dead, `clear_wiring` stripped both and
+        # unpinned sessions that were routed correctly. Take the list instead
+        # and clear exactly what is dead — one probe round either way.
+        dead = _dead_wired_configs(switcher, connect_timeout=connect_timeout)
+        if dead:
             # BUDGETED PER CALLER, like `connect_timeout` beside it. Hardcoding
             # the launch budget here gave the HUMAN recovery command 0.5s:
             # Claude Code holds .claude.json.lock routinely during a
             # credential refresh, so `cswap pin --heal` — the command this
             # function's own message tells the user to run — bounced with
             # "the config is locked" where a patient wait would have taken it.
-            clear_wiring(switcher, timeout=lock_timeout)
-            if not _wiring_present(switcher):
+            clear_wiring(switcher, timeout=lock_timeout, only=dead)
+            # AGAINST `dead`, not against every config: a live config left
+            # wired on purpose is not a survivor, and `_wiring_present` counts
+            # it as one — which would report "could not be removed (the config
+            # is locked)" over a clear that did exactly what it meant to.
+            if not set(map(str, dead)) & set(map(str, wired_config_paths(switcher))):
                 return True, (
                     "Removed a cloud pin wiring whose proxy was gone — "
                     "sessions fall back to the proxy they had before the pin"

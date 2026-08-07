@@ -5618,25 +5618,38 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # UNWIRE FIRST. purge deletes backup_dir, taking the pin record, the
-        # cert dir and the daemon state with it — but .claude.json's env block
-        # is not in there, and Claude Code applies it at boot. Left behind, it
-        # points every hand-launched `claude` at a port nothing serves, with
-        # nothing remaining that knows how to remove it: exactly the stranding
-        # clear_wiring lives in this repo to prevent. Before the rmtree, while
-        # there is still something to unwire with.
+        # TEAR THE PIN DOWN FIRST — both halves, before the rmtree.
         #
-        # RE-READ, DO NOT TRUST THE BOOL. `clear_wiring` returns False both
-        # for "there was nothing to remove" and for "the lock was contended so
-        # this path was skipped", and swallows every per-path failure, so only
-        # `_wiring_present` tells ABSENT from FAILED — as pin.clear_pin and
-        # pin.heal already do. A survivor warns and the purge continues, like
-        # every other partial failure below; after this the user is the only
-        # one who can remove it, so the message names the file and the keys.
+        # THE WIRING, because purge deletes backup_dir and takes the pin
+        # record, the cert dir and the daemon state with it, while
+        # .claude.json's env block is not in there and Claude Code applies it
+        # at boot. Left behind it points every hand-launched `claude` at a port
+        # nothing serves, with nothing remaining that knows how to remove it:
+        # exactly the stranding clear_wiring lives in this repo to prevent.
+        #
+        # AND THE DAEMON, which unwiring does not touch: `clear_wiring` is "no
+        # proxy, no daemon and no credential — only a record cswap left", by
+        # its own docstring. The proxy is a SEPARATE PROCESS holding OAuth
+        # bearers, so an unwire-only purge left it listening after the user
+        # asked to remove ALL claude-swap data — and the rmtree then took the
+        # cert dir, `proxy.json` and daemon state, leaving nothing on the
+        # machine that names its port. `cswap pin --clear` could no longer find
+        # it and `kill` was the only cure for a process the user had no way to
+        # identify. `clear_pin` does both, and already tolerates a missing or
+        # broken package (it falls back to clearing the record itself), which
+        # is why it needs no guard here.
+        #
+        # RE-READ AROUND IT, DO NOT TRUST A RETURN. Neither bool separates
+        # "there was nothing to remove" from "the lock was contended so this
+        # path was skipped", and both swallow per-path failures — only reading
+        # the configs tells ABSENT from FAILED, as pin.clear_pin and pin.heal
+        # already do. A survivor warns and the purge continues, like every
+        # other partial failure below; after this the user is the only one who
+        # can remove it, so the message names the file and the keys.
         from claude_swap import pin as _pin
 
-        if _pin.clear_wiring(self):
-            removed_items.append("Cloud pin wiring in .claude.json")
+        was_wired = bool(_pin.wired_config_paths(self))
+        _pin.clear_pin(self)
         # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
         # `get_global_config_path()` after asking a check that reads BOTH
         # configs, so when the survivor was the other one the user was sent to
@@ -5645,6 +5658,8 @@ class ClaudeAccountSwitcher:
         # cert dir and daemon state are gone, so hand editing is the only cure
         # and naming the wrong file is the whole failure.
         survivors = _pin.wired_config_paths(self)
+        if was_wired and not survivors:
+            removed_items.append("Cloud pin wiring in .claude.json")
         if survivors:
             warning(
                 "Could not remove the cloud pin wiring — edit "

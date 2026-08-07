@@ -206,6 +206,14 @@ Examples:
     # documented as unable to fail.
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
+        # AND THE PRINT, not only the exit. `_guard_root` calls `error()`
+        # BEFORE `sys.exit(1)`, and a handler can only catch the second half —
+        # so on the bare-metal root shell the guard names, the rc hook stayed
+        # silent in its exit code and emitted the refusal line before every
+        # hand-launched `claude`. Ask the same question instead of running the
+        # printing guard; `_is_refused_root` is that question.
+        if args.ensure and _is_refused_root(switcher):
+            sys.exit(0)
         _guard_root(switcher)
     except (Exception, SystemExit):  # noqa: BLE001 — SystemExit is the point
         # NOT BaseException: a Ctrl-C during construction must still reach the
@@ -371,12 +379,24 @@ Examples:
         sys.exit(130)
 
 
+def _is_refused_root(switcher: ClaudeAccountSwitcher) -> bool:
+    """The state :func:`_guard_root` refuses, as a question rather than an act.
+
+    ONE RULE, TWO REACTIONS. `--ensure` also has to know about root, and its
+    contract is to say nothing — so it cannot call the guard, and re-deriving
+    "am I root outside a container" at its call site would be a second copy of
+    the rule that the next change to either one silently forks.
+    """
+    if sys.platform == "win32":  # no euid; the guard does not apply
+        return False
+    return os.geteuid() == 0 and not switcher._is_running_in_container()
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
-    if sys.platform != "win32":
-        if os.geteuid() == 0 and not switcher._is_running_in_container():
-            error("Error: Do not run this script as root (unless running in a container)")
-            sys.exit(1)
+    if _is_refused_root(switcher):
+        error("Error: Do not run this script as root (unless running in a container)")
+        sys.exit(1)
 
 
 def _map_command(argv: list[str]) -> None:

@@ -757,6 +757,42 @@ class TestLaunchIsNeverBlocked:
             "propagating that fails the launch it was protecting"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="_guard_root's euid check is POSIX-only"
+    )
+    def test_ensure_is_silent_as_root_too(self, tmp_path, monkeypatch, capsys):
+        """SILENCE IS THE OTHER HALF OF THE PROMISE, and only exit 0 was kept.
+
+        `_guard_root` PRINTS before it `sys.exit(1)`s, and the handler in
+        `_pin_command` catches only the SystemExit — so the exit code went
+        quiet while the line above it did not. On a bare-metal root shell,
+        the case that guard names, the rc hook emitted
+
+            Error: Do not run this script as root (unless running in a container)
+
+        before EVERY hand-launched `claude`, from the one flag whose help text
+        says "Silent, never fails".
+
+        Through the CLI, not `pin.run`: the leak is one frame ABOVE it, so the
+        sibling test's `pin.run` assertions can never see it.
+        """
+        from claude_swap import cli
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_is_running_in_container", lambda _self: False
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli._pin_command(["--ensure"])
+        assert exc.value.code == 0, f"--ensure failed as root: {exc.value.code}"
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", ""), (
+            f"a launch hook printed as root: out={captured.out!r} "
+            f"err={captured.err!r}"
+        )
+
 
 class TestTheWiringCanAlwaysBeRemoved:
     """`.claude.json` names the pin's port, and Claude Code applies that env
@@ -1998,6 +2034,53 @@ class TestPurgeDoesNotStrandTheWiring:
         with patch("builtins.input", return_value="y"), redirect_stdout(buf):
             sw.purge()
         return buf.getvalue()
+
+    def test_purge_stops_the_daemon_while_its_state_is_still_on_disk(
+        self, tmp_path, monkeypatch
+    ):
+        """UNWIRING IS NOT STOPPING, and only the unwire was here.
+
+        `clear_wiring` touches "no proxy, no daemon and no credential — only a
+        record cswap left", by its own docstring. So a purge that only unwires
+        leaves the MITM proxy RUNNING: a live process holding OAuth bearers,
+        still listening, after the user asked to remove ALL claude-swap data.
+
+        Then `rmtree(backup_dir)` deletes `pin-proxy/` out from under it — the
+        cert dir, `proxy.json`, the daemon state — and nothing left on the
+        machine names that port. `cswap pin --clear` cannot find it and `kill`
+        is the only cure left for a process the user has no way to identify.
+
+        BEFORE THE RMTREE IS THE WHOLE FIX, so that is what this asserts: the
+        teardown reads the state the rmtree deletes, and a stop ordered after
+        it is a stop with nothing left to read.
+        """
+        from claude_swap import pin
+
+        seen = []
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(switcher, email, org_uuid):
+                # `backup_dir` IS what the rmtree takes, and `pin-proxy/` is
+                # inside it — so its presence dates the call against the
+                # deletion without seeding anything.
+                seen.append((email, org_uuid, switcher.backup_dir.is_dir()))
+
+        monkeypatch.setattr(pin, "_impl", lambda: _Impl)
+        self._purge_with(tmp_path, monkeypatch, _cfg(tmp_path, "cfgdir", _dead_port()))
+
+        assert seen, (
+            "purge never asked the pin to stop: it unwired the configs and "
+            "deleted the daemon's state, leaving the proxy listening"
+        )
+        assert seen[0][:2] == (None, None), (
+            f"purge called apply_pin with {seen[0][:2]}, which pins rather "
+            f"than unpins"
+        )
+        assert seen[0][2], (
+            "the stop ran AFTER the rmtree had taken pin-proxy/ — by then "
+            "there is no daemon state left to stop the daemon with"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
@@ -3885,6 +3968,74 @@ class TestHealNeverTearsDownAServingPin:
         finally:
             srv.close()
 
+    def test_a_dead_config_does_not_take_the_live_one_down_with_it(
+        self, tmp_path, monkeypatch
+    ):
+        """THE MACHINE-WIDE VERDICT MUST NOT BECOME A MACHINE-WIDE ACT.
+
+        `_wired_port_is_serving` is AND over every wired config, deliberately —
+        a live session config must not mask a dead default config. That is the
+        right VERDICT. But `clear_wiring` is unconditional over every wired
+        config, so the two compose into: one dead config unwires the other
+        config's LIVE, correctly-routed pin.
+
+        The asymmetry is the shipped shape, not a corner case — the same one
+        `_wired_port_is_serving`'s own comment describes:
+
+            session cfg -> live   default cfg -> dead
+
+        With the package present it self-recovers on the next tick (`impl.heal`
+        re-wires a daemon that serves while the config names nothing), so the
+        cost is churn plus a window where new sessions launch unpinned. With
+        the package ABSENT nothing re-wires and the live pin is gone for good.
+
+        Either way it contradicts this file's own rule, stated in capitals at
+        the top of `heal`: a serving pin is never torn down. The per-config
+        answer `_port_of_config` already computes is what decides which config
+        may go.
+        """
+        from claude_swap import pin
+
+        srv, live = self._serving()
+        try:
+            sw, session_cfg = self._wired_to(tmp_path, live)
+            dead_dir = tmp_path / "default"
+            dead_dir.mkdir()
+            default_cfg = dead_dir / ".claude.json"
+            dead = _dead_port()
+            default_cfg.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "HTTPS_PROXY": f"http://127.0.0.1:{dead}",
+                            "CSWAP_PIN_PORT": str(dead),
+                        },
+                        "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                    }
+                )
+            )
+            import claude_swap.paths as paths
+
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: session_cfg)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: default_cfg
+            )
+            # No package: the case with no re-wire to hide the damage.
+            monkeypatch.setattr(pin, "_live_impl", lambda: None)
+
+            changed, msg = pin.heal(sw)
+
+            assert "_cswapPinWiredKeys" not in json.loads(default_cfg.read_text()), (
+                f"the DEAD config kept its wiring, which is the stranding heal "
+                f"exists to clear: {msg}"
+            )
+            assert "_cswapPinWiredKeys" in json.loads(session_cfg.read_text()), (
+                f"heal unwired a config whose own port ({live}) is SERVING, "
+                f"because the other config named a dead one: ({changed}, {msg})"
+            )
+        finally:
+            srv.close()
+
     def test_a_restart_that_worked_is_not_then_unwired(self, tmp_path, monkeypatch):
         """The SECOND guard. `impl.heal()` uses False for 'already serving' as
         well as for 'failed', so a restart that genuinely brought the daemon
@@ -4092,8 +4243,9 @@ class TestHealNeverTearsDownAServingPin:
         0`); `tests/test_pin.py:2579,2586` mention "Could not heal" only in
         prose explaining a DIFFERENT fixture where this arm is NOT reached.
 
-        `_wiring_is_stale` is made to raise directly — the narrowest way to
-        land in `heal`'s bottom `except`. The port passed to the fixture is
+        `_dead_wired_configs` — the first call inside that block, and the one
+        that reads the configs — is made to raise directly, the narrowest way
+        to land in `heal`'s bottom `except`. The port passed to the fixture is
         never dialled: the mock raises before it would ever be read.
         """
         from claude_swap import pin
@@ -4103,7 +4255,7 @@ class TestHealNeverTearsDownAServingPin:
         monkeypatch.setattr(pin, "_live_impl", lambda: None)
         monkeypatch.setattr(
             pin,
-            "_wiring_is_stale",
+            "_dead_wired_configs",
             lambda switcher, **_k: (_ for _ in ()).throw(RuntimeError("disk gone")),
         )
 
