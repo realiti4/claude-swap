@@ -3618,9 +3618,36 @@ class TestHealADeadPin:
         monkeypatch.setattr("claude_swap.pin.run", _run)
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **k: object())
         monkeypatch.setattr(cli, "_guard_root", lambda s: None)
+
+        # A TRIPWIRE ON THE REAL `run`, because its failure is SILENT here.
+        # `_pin_command` binds `pin_run` with a function-scoped
+        # `from claude_swap.pin import run`. If that ever resolves to the
+        # unpatched function, the real `run(heal_only=True)` calls `heal`,
+        # which never raises and returns 0 — so `sys.exit(0)` fires, the exit
+        # assertion below PASSES, and the only symptom is `seen == {}`: a bare
+        # empty dict with nothing saying why.
+        #
+        # Observed once on CI (Linux, `-n 8`) and once locally, never
+        # reproducibly; `-n0` over the whole suite is green, so whatever it
+        # is lives in the concurrency, not in this file's ordering. This does
+        # not fix that — it makes the next occurrence name itself instead of
+        # arriving as an unexplained `{} != {...}`.
+        def _real_run_reached(*_a, **_k):
+            raise AssertionError(
+                "the REAL claude_swap.pin.run executed: the monkeypatch did "
+                "not reach _pin_command's function-scoped import of it"
+            )
+
+        monkeypatch.setattr("claude_swap.pin.heal", _real_run_reached)
+
         with pytest.raises(SystemExit) as e:
             cli._pin_command(["--heal"])
         assert e.value.code == 0
+        assert seen, (
+            "pin.run was never called at all, and `--heal` still exited 0 — "
+            "the flag parsed and was dropped, which is exactly the outage "
+            "this test exists to prevent"
+        )
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "set_port": None, "ensure": False,
