@@ -466,18 +466,7 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
-
-        Every launch path funnels through here, so this is also where the
-        cloud pin routes the child through its proxy. Without the extra
-        installed — or with no pin set — the environment comes back unchanged;
-        an optional feature must never be able to block a launch.
         """
-        try:
-            from claude_swap import pin as _pin
-
-            env = _pin.wire_launch_env(self.switcher, env)
-        except Exception:  # noqa: BLE001 — an optional feature cannot block a launch
-            pass
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:

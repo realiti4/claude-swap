@@ -14,12 +14,9 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace, pin
+from claude_swap import pace
 from claude_swap.json_output import (
     USAGE_API_KEY,
-    USAGE_FOREIGN_CREDENTIAL,
-    USAGE_NO_CREDENTIALS,
-    USAGE_RELOGIN_REQUIRED,
 )
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
@@ -165,30 +162,6 @@ def usage_rows(
     return rows
 
 
-def pin_is_broken(acc: AccountSnapshot) -> bool:
-    """Whether pinning to ``acc`` currently cannot produce a bearer.
-
-    Only the states where the pinned account genuinely has no usable
-    credential count. ``token expired`` deliberately does not: the proxy
-    refreshes that itself, and flagging it would cry wolf on the normal case.
-    ``keychain unavailable`` is a read problem on THIS process, not evidence
-    about the credential, so it is left alone too — a warning that fires on
-    "I could not look" teaches people to ignore warnings.
-    """
-    # An API-key account can never produce one: `sk-ant-api…` is not OAuth
-    # JSON, so the provider returns None for every request and each one fails
-    # open. `kind` rather than the sentinel — the sentinel is derived and reads
-    # something else entirely for an unreadable backup blob or a locked macOS
-    # keychain, while `kind` is the same fact set_pin refuses on.
-    if getattr(acc, "kind", None) == "api_key":
-        return True
-    return acc.usage.sentinel in (
-        USAGE_NO_CREDENTIALS,      # nothing stored for the slot
-        USAGE_RELOGIN_REQUIRED,    # refresh lineage dead; only a human fixes it
-        USAGE_FOREIGN_CREDENTIAL,  # the stored credential is another account's
-    )
-
-
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -196,15 +169,8 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
-    cloud_pinned: bool = False,
 ) -> Text:
-    """The full account card: header line + per-window bar rows.
-
-    ``cloud_pinned`` marks the account that owns the claude.ai-side assets
-    (Remote Control sessions, Artifacts). It is independent of ``is_active``
-    — inference follows the active account while those stay pinned — so both
-    badges can appear, on different accounts or the same one.
-    """
+    """The full account card: header line + per-window bar rows."""
     now = now if now is not None else time.time()
 
     text = Text()
@@ -217,19 +183,6 @@ def account_card_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
-    if cloud_pinned:
-        # Same marker shape as "● active" — the two are sibling states of one
-        # account, and a lone glyph read as decoration next to the usage
-        # figures rather than as a label.
-        text.append("   ○ cloud", style=f"bold {palette.sev_warn}")
-        if pin_is_broken(acc):
-            # The pin is FAIL-OPEN: an account that cannot mint a bearer sends
-            # RC and Artifacts back to whichever account is active, silently.
-            # The account's own row already says "re-login needed", but the
-            # cloud marker looked healthy right next to it — so the one place
-            # that claims "your claude.ai side lives here" was the one place
-            # not admitting it no longer does.
-            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -294,7 +247,6 @@ def mini_account_text(
     now: float,
     *,
     palette: Palette = Palette.DARK,
-    cloud_pinned: bool = False,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -311,12 +263,6 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
-    if cloud_pinned:
-        # Labelled, like the full card: a bare glyph sitting between the
-        # org tag and the usage figures read as decoration, not as a state.
-        text.append("  ○ cloud", style=f"bold {palette.sev_warn}")
-        if pin_is_broken(acc):
-            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")
@@ -423,19 +369,17 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
-        pinned_email = pin.pinned_email(app.switcher)
         for acc in snap.accounts:
-            pinned = bool(pinned_email and acc.email == pinned_email)
             if acc.is_active:
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
-                        palette=palette, cloud_pinned=pinned,
+                        palette=palette,
                     )
                 )
             elif self._show_minis:
                 blocks.append(
-                    mini_account_text(acc, now, palette=palette, cloud_pinned=pinned)
+                    mini_account_text(acc, now, palette=palette)
                 )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
@@ -464,11 +408,9 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        pinned_email = pin.pinned_email(self.app.switcher)
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
-            cloud_pinned=bool(pinned_email and self._acc.email == pinned_email),
         )
 
 

@@ -428,15 +428,13 @@ class TestTheCollectorHoldsTheStrikeOnADivergentBackup:
         """The user-visible guarantee I-2 restores, and the reason holding the
         strike matters beyond bookkeeping.
 
-        `tui/widgets.py:pin_is_broken` keys its fail-open warning on
+        Every surface that warns about a dead credential keys on
         ``USAGE_RELOGIN_REQUIRED``. While the read is degraded no pass can
         honestly raise it — but with the strike ERASED it could never be
-        raised again either, so a dead pinned account rendered healthy
-        forever. Held, the warning is merely DEFERRED: the next pass that
-        actually reads the credential surfaces it.
+        raised again either, and the account renders healthy forever. Held,
+        the warning is merely DEFERRED: the next pass that actually reads the
+        credential surfaces it.
         """
-        from claude_swap.tui.widgets import pin_is_broken
-
         sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
         s = ClaudeAccountSwitcher()
         s.platform = Platform.MACOS
@@ -473,13 +471,3 @@ class TestTheCollectorHoldsTheStrikeOnADivergentBackup:
             "strike, so the re-login prompt can never appear and a dead "
             "pinned account renders healthy forever"
         )
-        assert pin_is_broken(
-            _snap_with_sentinel(healthy_pass.sentinel)
-        ), "pin_is_broken did not fire on the recovered verdict"
-
-
-def _snap_with_sentinel(sentinel):
-    """Minimal stand-in for the AccountSnapshot pin_is_broken reads."""
-    import types
-
-    return types.SimpleNamespace(usage=types.SimpleNamespace(sentinel=sentinel))

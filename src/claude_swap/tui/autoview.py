@@ -32,7 +32,6 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -323,10 +322,6 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
-        # The badge rides on that account's own row rather than the summary
-        # line: naming the pin separately makes you match an email against the
-        # list directly below it instead of just reading the list.
-        pinned_email = pin.pinned_email(self.app.switcher)
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -347,7 +342,7 @@ class AutoScreen(Screen):
                 # reads USAGE_KEYCHAIN_UNAVAILABLE, and sending that slot to
                 # `cswap add` overwrites a working stored grant. `kind` still
                 # wins for api_key — the sentinel diverges from it behind a
-                # locked keychain (see dashboard.py's pin menu).
+                # locked keychain.
                 note = data.sentinel_label(
                     USAGE_API_KEY if acc.kind == "api_key"
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
@@ -408,12 +403,6 @@ class AutoScreen(Screen):
                 if not chips:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
-            # Outside the usage branches on purpose: an account whose usage is
-            # unknown still owns the claude.ai side, so the badge must not hang
-            # off whichever branch happened to run.
-            if pinned_email and acc.email == pinned_email:
-                entry.append("  · ", style=palette.muted)
-                entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()

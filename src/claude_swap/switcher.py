@@ -7194,32 +7194,6 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # UNWIRE FIRST. purge deletes backup_dir, taking the pin record, the
-        # cert dir and the daemon state with it — but .claude.json's env block
-        # is not in there, and Claude Code applies it at boot. Left behind, it
-        # points every hand-launched `claude` at a port nothing serves, with
-        # nothing remaining that knows how to remove it: exactly the stranding
-        # clear_wiring lives in this repo to prevent. Before the rmtree, while
-        # there is still something to unwire with.
-        #
-        # RE-READ, DO NOT TRUST THE BOOL. `clear_wiring` returns False both
-        # for "there was nothing to remove" and for "the lock was contended so
-        # this path was skipped", and swallows every per-path failure, so only
-        # `_wiring_present` tells ABSENT from FAILED — as pin.clear_pin and
-        # pin.heal already do. A survivor warns and the purge continues, like
-        # every other partial failure below; after this the user is the only
-        # one who can remove it, so the message names the file and the keys.
-        from claude_swap import pin as _pin
-
-        if _pin.clear_wiring(self):
-            removed_items.append("Cloud pin wiring in .claude.json")
-        if _pin._wiring_present(self):
-            warning(
-                "Could not remove the cloud pin wiring — edit "
-                f"{get_global_config_path()} by hand and delete the "
-                f'"_cswapPinWiredKeys" entry and the proxy vars it names.'
-            )
-
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
         data = self._get_sequence_data()
