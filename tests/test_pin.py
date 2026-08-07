@@ -1051,6 +1051,26 @@ class TestTheWiringCanAlwaysBeRemoved:
                 f"the message does not name the stale receipt, which is the "
                 f"only thing left to remove: {message!r}"
             )
+            # AND THROUGH THE CLI, because asserting on `clear_pin`'s return
+            # says nothing about what a user sees. `run()`'s clear branch
+            # renders `msg if msg.startswith("No ") else "Unpinned the cloud
+            # account"` — so every success message except the "No …" one is
+            # DISCARDED, and this path's whole value is the path it names.
+            # The TUI prints `msg` verbatim, so the two front ends disagreed:
+            # exactly the divergence the shared (ok, message) pair exists to
+            # prevent, and the reason a direct-call assertion is not enough.
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = pin.run(sw, None, clear=True)
+            out = buf.getvalue()
+            assert rc == 0, out
+            assert str(side) in out, (
+                f"the CLI threw away the only message naming the file the "
+                f"user must delete by hand: {out!r}"
+            )
         finally:
             side.parent.chmod(0o700)
 
@@ -1107,6 +1127,71 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert "--clear" in message or "clear" in message, (
             f"the message does not offer the remedy that works: {message!r}"
         )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_heal_judges_the_env_block_too_not_only_the_marker(
+        self, tmp_path, monkeypatch
+    ):
+        """THE FIX `clear_pin` GOT, ON ITS SIBLING. `heal`'s survivor test is
+        `dead & wired_config_paths(...)`, which reads the MARKER via
+        `_wire_mark_of` — so a clear that rewrote the config but could not
+        rewrite the sidecar still sees a survivor and answers "could not be
+        removed — re-run" over a machine whose launches are already fine.
+
+        `clear_pin` was moved to `env_keys_survive` for exactly this, with the
+        reasoning spelled out at its call site. Leaving `heal` on the marker is
+        the sibling call site left behind — this branch's recurring failure —
+        and `heal` is the worse one to leave, since its own docstring makes
+        the loudest claim about not reporting a fault that is not there.
+
+        It self-corrects on the NEXT invocation (`_port_of_config` then reads
+        no port and the leftover-receipt sentence takes over), so the cost is
+        one wrong verdict. One wrong verdict in the machine-readable channel
+        is what this file keeps paying for.
+        """
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.pin import _ledger_path
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        port = _dead_port()
+        cfgdir = tmp_path / "cfgdir"
+        cfgdir.mkdir()
+        cfg = cfgdir / ".claude.json"
+        cfg.write_text(json.dumps({"env": {
+            "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+            "CSWAP_PIN_PORT": str(port),
+        }}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+
+        sw = ClaudeAccountSwitcher()
+        side.parent.chmod(0o500)  # the receipt cannot be rewritten
+        try:
+            changed, message = pin.heal(sw)
+        finally:
+            side.parent.chmod(0o700)
+
+        env = json.loads(cfg.read_text()).get("env", {})
+        assert "CSWAP_PIN_PORT" not in env, (
+            f"fixture did not reach the shape under test — the CONFIG write "
+            f"was supposed to succeed: {env!r}"
+        )
+        assert "could not be removed" not in message, (
+            f"heal reported a failure over a config it successfully cleared; "
+            f"only the receipt is stuck, and no re-run rewrites a read-only "
+            f"directory: {message!r}"
+        )
+        assert changed is True, (changed, message)
 
     def test_no_sidecar_is_not_the_same_answer_as_a_cleared_one(
         self, tmp_path, monkeypatch

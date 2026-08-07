@@ -1288,14 +1288,28 @@ def _port_answers(port: int, connect_timeout: float) -> bool:
     """
     import socket
 
-    sock = socket.socket()
-    sock.settimeout(connect_timeout)
+    # INSIDE THE TRY, both of them. `socket.socket()` raises `OSError` on fd
+    # exhaustion (EMFILE/ENFILE) and it sat OUTSIDE — so on a starved box the
+    # probe raised through `_wired_port_is_serving`, which `heal` calls twice
+    # with no guard, out of the function whose docstring promises "never
+    # raises: this is called from the status line every few seconds". Nothing
+    # about "can I reach this port" should be able to end the command that
+    # answers it.
+    # AND `sock` IS BOUND FIRST, or the fix moves the raise instead of
+    # removing it: with the construction inside the `try`, a failing
+    # `socket()` leaves the name unbound and `finally` raises
+    # `UnboundLocalError` — not an `OSError`, so it escapes the handler that
+    # was just widened to catch it.
+    sock = None
     try:
+        sock = socket.socket()
+        sock.settimeout(connect_timeout)
         sock.connect(("127.0.0.1", port))
     except OSError:
         return False
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
     return True
 
 
@@ -1554,12 +1568,30 @@ def heal(
             # credential refresh, so `cswap pin --heal` — the command this
             # function's own message tells the user to run — bounced with
             # "the config is locked" where a patient wait would have taken it.
+            # CAPTURED BEFORE THE CLEAR, and against `dead` only. Two
+            # corrections in one line, and the second is the sibling call site
+            # `clear_pin` already got:
+            #
+            # AGAINST `dead`, not every config — a live config left wired on
+            # purpose is not a survivor, and `_wiring_present` counted it as
+            # one, reporting "could not be removed" over a clear that did
+            # exactly what it meant to.
+            #
+            # AND THE ENV BLOCK, not the marker. `wired_config_paths` reads
+            # `_wire_mark_of`, so a clear that rewrote the config but could
+            # not rewrite the SIDECAR still saw a survivor and answered
+            # "could not be removed — re-run" over a machine whose launches
+            # were already fine. `clear_pin` was moved off the marker for
+            # exactly this; leaving `heal` on it is the sibling left behind,
+            # and `heal` is the worse one — its docstring makes the loudest
+            # claim about not reporting a fault that is not there.
+            wanted = {str(d) for d in dead}
+            before = {
+                p: keys for p, keys in wired_env_keys(switcher).items()
+                if str(p) in wanted
+            }
             clear_wiring(switcher, timeout=lock_timeout, only=dead)
-            # AGAINST `dead`, not against every config: a live config left
-            # wired on purpose is not a survivor, and `_wiring_present` counts
-            # it as one — which would report "could not be removed (the config
-            # is locked)" over a clear that did exactly what it meant to.
-            if not set(map(str, dead)) & set(map(str, wired_config_paths(switcher))):
+            if not env_keys_survive(before):
                 return True, (
                     "Removed a cloud pin wiring whose proxy was gone — "
                     "sessions fall back to the proxy they had before the pin"
@@ -1873,7 +1905,21 @@ def run(
         if not ok:
             warning(msg)
             return 1
-        print(msg if msg.startswith("No ") else f"{accent('Unpinned')} the cloud account")
+        # PRINT WHAT `clear_pin` DECIDED. This rendered the returned message
+        # only when it started with "No " and replaced every other one with
+        # "Unpinned the cloud account" — so the stale-receipt success, whose
+        # entire value is the PATH it names, reached the TUI (which prints
+        # `msg` verbatim) and never the CLI. Two front ends, one decision,
+        # opposite output: the divergence the shared `(ok, message)` pair
+        # exists to prevent, reintroduced by a startswith.
+        #
+        # The accent stays on the ordinary unpin, which is the common case and
+        # the only one whose wording this layer owns.
+        print(
+            f"{accent('Unpinned')} the cloud account"
+            if msg == "Unpinned the cloud account"
+            else msg
+        )
         return 0
 
     pin = _impl()  # raises ClaudeSwitchError with the install hint
