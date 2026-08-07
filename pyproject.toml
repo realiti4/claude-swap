@@ -45,7 +45,25 @@ menubar = ["rumps>=0.4.0"]
 # Keeping an old release out is an INSTALL-time job, not a constant this
 # project re-litigates on someone else's release cadence — the same reasoning
 # `_impl` already applies to the runtime check it deliberately does not do.
-pin = ["cswap-pin"]
+#
+# THE ONE FLOOR THAT IS NOT AN APPROXIMATION. Everything above argues against
+# a floor that chases freshness, and that still holds. This bound names a
+# boundary instead, and the boundary cannot move: before 0.1.2, wiring the pin
+# wrote `.claude.json` with `write_text`, which takes the umask — 022 on every
+# machine here — and the rename made 0644 permanent. Turning this extra on is
+# exactly what puts the proxy's own credential in that file, as userinfo in
+# `HTTPS_PROXY`. So on 0.1.1 and below, ENABLING THE FEATURE PUBLISHES A
+# CREDENTIAL to every local user. 0.1.2 creates the temp file 0600 via
+# O_CREAT|O_EXCL with an explicit mode and never widens an existing config.
+#
+# Verified rather than assumed, both directions:
+#   v0.1.1  tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+#   v0.1.2  mode = _mode_of(path, default=0o600); os.open(..., O_EXCL, mode)
+#
+# And it is not a freshness proxy: the seam this extra actually calls —
+# `heal`, `load_pin`, `apply_pin` — has byte-identical signatures from v0.1.0
+# through 0.1.68, so nothing here is bounding an API. Only the credential.
+pin = ["cswap-pin>=0.1.2"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
