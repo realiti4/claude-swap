@@ -1054,6 +1054,60 @@ class TestTheWiringCanAlwaysBeRemoved:
         finally:
             side.parent.chmod(0o700)
 
+    def test_an_orphan_receipt_is_not_reported_as_a_broken_port_value(
+        self, tmp_path, monkeypatch
+    ):
+        """A recreated config inherits the OLD receipt, deterministically.
+
+        `_ledger_path` keys the sidecar on the config PATH, so a
+        `.claude.json` deleted and recreated at the same path gets the same
+        sha and therefore the same receipt — and Claude Code recreating that
+        file at that path is the normal case, not a corner. The fresh config
+        carries no proxy vars, so `_port_of_config` reads None and `heal`
+        reaches the "names no readable CSWAP_PIN_PORT" arm.
+
+        Which tells the user to fix a value that is not in the file. Same
+        family as the three messages fixed above — the condition is "an
+        orphan receipt", and the sentence names a different one. The remedy
+        it also offers (`--clear`) does work, which is what keeps this
+        bounded; naming the actual state is what makes it followable.
+        """
+        import types
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+        from claude_swap.pin import _ledger_path
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {"UNRELATED": "keep me"}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        side = _ledger_path(cfg)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+
+        assert pin._wiring_present(sw) is True, "fixture is not the orphan shape"
+        changed, message = pin.heal(sw)
+
+        assert not changed, message
+        assert "Fix that value" not in message, (
+            f"heal told the user to fix a CSWAP_PIN_PORT that is not in the "
+            f"file — the state is a leftover receipt: {message!r}"
+        )
+        assert "--clear" in message or "clear" in message, (
+            f"the message does not offer the remedy that works: {message!r}"
+        )
+
     def test_no_sidecar_is_not_the_same_answer_as_a_cleared_one(
         self, tmp_path, monkeypatch
     ):

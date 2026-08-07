@@ -914,6 +914,14 @@ def wired_env_keys(_switcher=None) -> dict:
     return keys
 
 
+def _env_of_config(path) -> dict:
+    """The ``env`` block one config names, or ``{}``. Never raises."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+    except Exception:  # noqa: BLE001 — unreadable: no opinion
+        return {}
+
+
 def env_keys_survive(before: dict) -> dict:
     """``{config path: the keys still in its env}``, for what `wired_env_keys`
     captured. Empty when every clear did what it said.
@@ -1381,6 +1389,26 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
     ]
     if not unreadable:
         return False, "Nothing to heal"
+    # TWO STATES REACH THAT LIST AND THEY NEED DIFFERENT SENTENCES. A config
+    # whose receipt names keys the env no longer has is not a broken port
+    # value — it is a LEFTOVER RECEIPT, and telling the user to fix a
+    # `CSWAP_PIN_PORT` that is not in the file is the same defect this
+    # message was added to remove.
+    #
+    # DETERMINISTIC, not rare: `_ledger_path` keys the sidecar on the config
+    # PATH, so a `.claude.json` deleted and recreated at the same path
+    # inherits the same receipt — which is what Claude Code recreating that
+    # file normally does. The `--clear` half of the advice does resolve it,
+    # which is what keeps the cost to one message.
+    stale = [p for p in unreadable if not (set(wired_env_keys(switcher).get(p, ()))
+                                           & set(_env_of_config(p)))]
+    if stale:
+        return False, (
+            "A leftover cloud pin receipt names "
+            + " and ".join(str(path) for path in stale)
+            + ", whose env block no longer carries the wiring — nothing is "
+            "misrouted. Run `cswap pin --clear` to drop the receipt"
+        )
     return False, (
         "A cloud pin wiring names no readable CSWAP_PIN_PORT in "
         + " and ".join(str(path) for path in unreadable)
