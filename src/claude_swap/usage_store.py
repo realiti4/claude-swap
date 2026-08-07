@@ -254,6 +254,14 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    # Fingerprint of the credential whose refresh token was POSTed when a
+    # permanent auth error came back. Strikes bind to it: token_dead() holds
+    # only while the stored credential still fingerprints to the struck
+    # generation, so any credential-writing path heals the strike without a
+    # bespoke clear call. None on non-auth outcomes (and from writers that
+    # predate the field — those strikes bind unconditionally, the legacy
+    # behavior).
+    struck_fp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,9 @@ class UsageEntry:
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
+    # Fingerprint of the generation the strikes condemned (absent on legacy
+    # rows → strikes bind unconditionally). See ``token_dead``.
+    struck_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -334,14 +345,33 @@ class UsageEntry:
         """Whether another collector's bounded fetch lease is still live."""
         return _live_claim(self.claim_until, self.last_attempt_at, now)
 
-    def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
+    def token_dead(
+        self,
+        threshold: int = AUTH_DEAD_STRIKES,
+        stored_fp: str | None = None,
+    ) -> bool:
         """Whether the stored credential's refresh-token lineage is provably dead.
 
         True once ``invalid_grant`` has recurred ``threshold`` times without an
         intervening success. Such an account is quarantined: not fetched (see
         ``due_candidate`` and the collector) and surfaced as "re-login needed".
+
+        Strikes condemn the GENERATION that was POSTed, not the slot: when
+        the caller passes the currently-stored credential's fingerprint and
+        it differs from the struck one, the credential has been replaced
+        since the verdict — the strike no longer applies (any writing path
+        heals it, mirroring #142's identity-not-slot rule). A row struck
+        before fingerprints were recorded binds unconditionally.
         """
-        return self.auth_dead_strikes >= threshold
+        if self.auth_dead_strikes < threshold:
+            return False
+        if (
+            stored_fp is not None
+            and self.struck_fingerprint is not None
+            and stored_fp != self.struck_fingerprint
+        ):
+            return False
+        return True
 
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -906,6 +936,7 @@ class UsageStore:
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                struck_fingerprint=row.get("struckFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1068,6 +1099,11 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # Additive field (absent/None = legacy unconditional
+                    # binding). Always overwrite: a legacy writer's strike
+                    # must bind unconditionally, not inherit a stale
+                    # fingerprint from an earlier, already-healed strike.
+                    row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
             rows = self._read_rows()
@@ -1134,6 +1170,7 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None

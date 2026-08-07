@@ -17,6 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
+from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -207,7 +208,11 @@ def account_card_text(
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
         if acc.usage.last_error:
-            text.append(f" · {acc.usage.last_error}", style=palette.muted)
+            # Same wording as the CLI detail line: error KINDS with a
+            # friendly note render it, so both surfaces describe the state
+            # identically.
+            note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
+            text.append(f" · {note}", style=palette.muted)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S

@@ -521,9 +521,12 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
-    def test_invalid_json_is_permanent(self):
+    def test_invalid_json_is_transient(self):
+        # Changed contract (stale-credential robustness): an unparseable blob
+        # is more likely a torn read than a credential shape — it must not
+        # produce a permanent strike-advancing verdict.
         outcome = oauth.try_refresh_oauth_credentials("not json")
-        assert outcome.error == "no_refresh_token"
+        assert outcome.error == "transient"
 
     def test_wrapper_returns_none_on_failure(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
@@ -1379,3 +1382,118 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestInvalidGrantTaxonomy:
+    """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
+    parse — top-level error == "invalid_grant" in the JSON body. Substring
+    hits inside other envelopes stay transient; invalid_client is a distinct
+    systemic kind, never a dead-token verdict."""
+
+    def _refresh_with_body(self, monkeypatch, code, body):
+        import urllib.error, io
+        creds = json.dumps({
+            "claudeAiOauth": {"refreshToken": "rt-x", "accessToken": "a"}
+        })
+
+        def raise_http(*a, **k):
+            raise urllib.error.HTTPError(
+                "url", code, "err", {}, io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.urllib.request.urlopen", raise_http
+        )
+        return oauth.try_refresh_oauth_credentials(creds)
+
+    def test_rfc_invalid_grant_is_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400, '{"error": "invalid_grant"}'
+        )
+        assert out.error == "invalid_grant"
+
+    def test_substring_in_other_envelope_is_transient(self, monkeypatch):
+        # the marker appears only inside a nested message — not a §5.2 error
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "server_error", "detail": "log mentions invalid_grant"}'
+        )
+        assert out.error == "transient"
+
+    def test_invalid_client_is_systemic_not_dead_token(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 401, '{"error": "invalid_client"}'
+        )
+        assert out.error == "invalid_client"
+
+    def test_unparseable_body_is_transient(self, monkeypatch):
+        out = self._refresh_with_body(monkeypatch, 400, "<html>oops</html>")
+        assert out.error == "transient"
+
+    def test_error_description_variant_still_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "invalid_grant", "error_description": "revoked"}'
+        )
+        assert out.error == "invalid_grant"
+
+
+class TestNoRefreshTokenStructuralGuard:
+    """M3: ``no_refresh_token`` is permanent only for a structurally complete
+    OAuth dict genuinely missing the field — an unparseable/partial blob is
+    transient (a torn read must not condemn the slot)."""
+
+    def test_complete_dict_without_rt_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a"}})
+        out = oauth.try_refresh_oauth_credentials(creds)
+        assert out.error == "no_refresh_token"
+
+    def test_unparseable_blob_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('{"claudeAiOa')  # torn read
+        assert out.error == "transient"
+
+    def test_non_dict_payload_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('"just-a-string"')
+        assert out.error == "transient"
+
+
+class TestConsumeBusyIsDeterministic:
+    """A busy consume gate must not fall through to a guaranteed 401.
+
+    `consume-busy` means another process holds the gate — the token in hand is
+    known-expired, so calling the usage endpoint with it 401s every time, and
+    the retry re-enters the gate and gets busy again. The kind then arrives as
+    generic "refresh-failed", hiding the distinct kind this PR added and
+    spending a request per pass to learn nothing.
+    """
+
+    def test_a_busy_gate_does_not_spend_a_doomed_request(self):
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
+            )
+        assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_every_deterministic_kind_has_a_note(self):
+        """The reason these kinds stay distinct is the note they carry.
+
+        ``try_fetch_usage_for_account`` keeps a deterministic kind rather than
+        collapsing it to "refresh-failed" because "ERROR_NOTES renders the
+        remedy for each" — a kind with no note renders the bare identifier,
+        which is strictly worse than the generic string it displaced.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        missing = [
+            k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
+        ]
+        assert not missing, missing
