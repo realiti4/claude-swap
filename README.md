@@ -265,7 +265,15 @@ cswap pin 2          # Remote Control / artifacts → account 2
 cswap pin            # show the current pin
 cswap pin --clear    # remove it
 cswap pin --heal     # restart a pin proxy that died, or unwire it
+cswap pin --get_port # the serving port, bare digits (exit 1 if none)
+cswap pin --set_port N   # serve on N from the next start (0 = dynamic)
+cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
 ```
+
+`--get_port` exists so scripts stop reading our files: a pinned session's
+`HTTPS_PROXY` names the pin's own dynamic port, and without a way to ask for it
+the on-disk layout becomes a compatibility surface. It prints bare digits and
+probes the port first, so a stale record cannot report a dead daemon as live.
 
 The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
 
