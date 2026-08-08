@@ -1159,6 +1159,58 @@ class TestUsageEndpointFallbackToHeaderProbe:
         probe_mock.assert_not_called()
         assert outcome.error == "http-403"
 
+    def test_the_fallback_can_be_switched_off(self):
+        """``usage.headerFallback`` disabled: the 429 stands and no quota is
+        spent, because the probe is a real completion on the account's own
+        subscription."""
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+                header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-429"
+        assert outcome.usage is None
+
+    def test_the_fallback_is_on_when_no_caller_says_otherwise(self):
+        probe_mock = MagicMock(return_value={"five_hour": {"pct": 11.0}})
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        probe_mock.assert_called_once()
+        assert outcome.rescued_from == "http-429"
+
+    def test_the_switched_off_fallback_also_covers_the_refresh_retry(self):
+        def fake_request_usage_data(token):
+            if token == "old-access":
+                raise self._http_error(401)
+            raise self._http_error(429)
+
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen",
+                  return_value=self._token_response()),
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=fake_request_usage_data),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+                header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-429"
+
     def test_probe_failure_leaves_the_original_error(self):
         with (
             patch("claude_swap.oauth.request_usage_data",

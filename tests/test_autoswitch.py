@@ -702,7 +702,7 @@ class TestAdaptiveScheduler:
 
     @staticmethod
     def _counting_fetch(counts, usage_by_num, errors_by_num=None):
-        def fake(num, email, creds, is_active=False, persist_credentials=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             counts[num] = counts.get(num, 0) + 1
             error = (errors_by_num or {}).get(num)
             if error:
@@ -6814,7 +6814,7 @@ class TestEscalationCannotOutrunThePost429Floor:
         counts: dict[str, int] = {}
         usage_by_num = {"1": _usage(80), "2": _usage(10)}
 
-        def fake(num, email, creds, is_active=False, persist_credentials=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             counts[num] = counts.get(num, 0) + 1
             return oauth.UsageOutcome(
                 dict(usage_by_num[num]),

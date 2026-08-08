@@ -1049,7 +1049,7 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, persist_credentials=None):
+        def mock_fetch(account_num, email, credentials, is_active, persist_credentials=None, **kwargs):
             # Simulate a refresh on the inactive account only.
             if not is_active and persist_credentials is not None:
                 persist_credentials(account_num, email, refreshed_creds)
@@ -1599,7 +1599,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -1669,7 +1669,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -1961,7 +1961,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -7354,7 +7354,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})
@@ -8408,3 +8408,47 @@ class TestARescuedFetchIsPlannedAtThePost429Floor:
         inside the band with no 429 behind it still polls urgently."""
         _next_poll, interval = self._plan(temp_home, self._burning_record())
         assert interval == poll_policy.URGENT_INTERVAL_S
+
+
+class TestHeaderFallbackIsConfigurable:
+    """``usage.headerFallback`` (default on) decides whether a 429'd usage
+    fetch may spend about 10 tokens of the account's own subscription quota on
+    the unified-header probe. The switcher owns the setting, because every
+    surface -- list, status, the TUI, the menu bar, auto -- fetches through it.
+    """
+
+    def test_the_default_is_enabled(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        assert switcher._header_fallback_enabled() is True
+
+    def test_the_setting_is_honored(self, temp_home: Path):
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+        assert switcher._header_fallback_enabled() is False
+
+    def test_a_real_fetch_carries_the_setting(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        from claude_swap.settings import set_setting
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+
+        usage = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage)) as mock_fetch:
+            switcher.status()
+
+        capsys.readouterr()
+        assert mock_fetch.call_args.kwargs.get("header_fallback") is False

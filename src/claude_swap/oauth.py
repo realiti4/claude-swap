@@ -574,7 +574,9 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
-def _probe_fallback(kind: str, access_token: str) -> UsageOutcome | None:
+def _probe_fallback(
+    kind: str, access_token: str, enabled: bool = True
+) -> UsageOutcome | None:
     """Recover a busy account's usage from response headers, or None.
 
     ``GET /api/oauth/usage`` rate-limits per account on that account's own
@@ -601,7 +603,7 @@ def _probe_fallback(kind: str, access_token: str) -> UsageOutcome | None:
     fallback would become permanently load-bearing on exactly the accounts
     whose quota is scarcest.
     """
-    if kind != "http-429":
+    if kind != "http-429" or not enabled:
         return None
     probed = probe_usage(access_token)
     if probed is None:
@@ -615,6 +617,8 @@ def try_fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    header_fallback: bool = True,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -624,7 +628,10 @@ def try_fetch_usage_for_account(
     after a 401-triggered refresh) route through :func:`_probe_fallback`,
     which recovers busy-account usage from response headers instead of the
     endpoint that just refused it. See that function's docstring for why
-    only a 429 qualifies and what a failed probe does.
+    only a 429 qualifies and what a failed probe does. ``header_fallback``
+    carries the user's ``usage.headerFallback`` setting: False turns the
+    rescue off, and a 429 then reports as the failure it is, since the probe
+    spends the account's own subscription quota.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -665,7 +672,7 @@ def try_fetch_usage_for_account(
             or not oauth
             or not oauth.get("refreshToken")
         ):
-            probed_outcome = _probe_fallback(kind, access_token)
+            probed_outcome = _probe_fallback(kind, access_token, header_fallback)
             if probed_outcome is not None:
                 return probed_outcome
             _log_usage_failure(context, e, kind, retry_after)
@@ -694,7 +701,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
-            probed_outcome = _probe_fallback(kind, new_token)
+            probed_outcome = _probe_fallback(kind, new_token, header_fallback)
             if probed_outcome is not None:
                 return probed_outcome
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
