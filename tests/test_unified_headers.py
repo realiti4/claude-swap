@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import urllib.error
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from claude_swap import oauth
-from claude_swap.unified_headers import parse_unified_headers
+from claude_swap.unified_headers import parse_unified_headers, probe_usage
 
 HEALTHY = {
     "anthropic-ratelimit-unified-status": "allowed",
@@ -121,3 +124,64 @@ def test_malformed_values_are_skipped_not_fatal():
     assert "five_hour" not in out
     assert out["seven_day"]["pct"] == 10.0
     assert oauth.account_headroom(out) is None
+
+
+class TestProbeTransport:
+    """``probe_usage``'s own transport, driven for real rather than mocked
+    away. The oauth-side tests patch ``probe_usage`` out entirely, so nothing
+    there can see which HTTP statuses it trusts. Only a 429 body is documented
+    to carry usable utilization; parsing unified-looking headers off a 401,
+    403, 404 or 5xx would report a dead token or a failing server as a healthy
+    account.
+    """
+
+    @staticmethod
+    def _http_error(code: int, headers: dict | None) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages", code, "error",
+            hdrs=headers, fp=None,
+        )
+
+    @staticmethod
+    def _ok_response(headers: dict) -> MagicMock:
+        resp = MagicMock()
+        resp.headers = headers
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_a_200_response_is_read_from_its_headers(self):
+        with patch(
+            "claude_swap.unified_headers.urllib.request.urlopen",
+            return_value=self._ok_response(HEALTHY),
+        ):
+            assert probe_usage("sk-token")["five_hour"]["pct"] == 11.0
+
+    def test_a_429_is_read_from_its_headers(self):
+        with patch(
+            "claude_swap.unified_headers.urllib.request.urlopen",
+            side_effect=self._http_error(429, EXHAUSTED),
+        ):
+            assert probe_usage("sk-token")["seven_day"]["pct"] == 100.0
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 500, 502, 503])
+    def test_no_other_status_reports_usage(self, code):
+        with patch(
+            "claude_swap.unified_headers.urllib.request.urlopen",
+            side_effect=self._http_error(code, HEALTHY),
+        ):
+            assert probe_usage("sk-token") is None
+
+    def test_a_429_without_headers_reports_nothing(self):
+        with patch(
+            "claude_swap.unified_headers.urllib.request.urlopen",
+            side_effect=self._http_error(429, None),
+        ):
+            assert probe_usage("sk-token") is None
+
+    def test_a_transport_failure_reports_nothing(self):
+        with patch(
+            "claude_swap.unified_headers.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError()),
+        ):
+            assert probe_usage("sk-token") is None

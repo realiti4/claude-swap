@@ -159,6 +159,13 @@ def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:
     when it's absent but the usage endpoint never required. Returns None on
     any transport failure, or when the response carried no unified headers
     at all.
+
+    Of the error responses, only a 429 is documented to carry usable
+    utilization, and only a 429 makes sense as one: it is the account's own
+    rate-limit state. Every other status describes the request or the server,
+    not the quota — a 401/403 means the token is dead, a 404 that the model is
+    gone, a 5xx that the service failed — so unified-looking headers on those
+    are not evidence of a healthy account and are ignored.
     """
     body = json.dumps(
         {
@@ -181,7 +188,7 @@ def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return parse_unified_headers(resp.headers)
     except urllib.error.HTTPError as e:
-        if not e.headers:
+        if e.code != 429 or not e.headers:
             return None
         return parse_unified_headers(e.headers)
     except Exception as e:
