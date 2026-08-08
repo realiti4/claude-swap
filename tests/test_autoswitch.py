@@ -6846,3 +6846,28 @@ class TestEscalationCannotOutrunThePost429Floor:
         h = self._harness(temp_home, monkeypatch)
         fetches = self._fetches_in_an_hour(h, rescued=False)
         assert fetches >= 15, f"escalation slowed down to {fetches} fetches/hour"
+
+
+class TestPollEventReportsUsageProvenance:
+    """``cswap auto --json`` is the surface a script watches to see which
+    account the engine is reasoning about, and a header-probe measurement
+    (issue #220's 429 fallback) reasons differently: it spent the account's own
+    quota, and a partial one is deliberately unrankable. Additive field, like
+    ``fetchErrors``/``windowsPct`` beside it."""
+
+    def test_a_rescued_measurement_is_named_in_the_payload(self, harness):
+        harness.tick_with_usage({
+            "1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 5.0},
+                  "source": "headers"},
+            "2": _usage(10),
+            "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert poll.to_json()["usageSources"] == {"1": "headers"}
+
+    def test_endpoint_only_ticks_omit_the_field(self, harness):
+        harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert "usageSources" not in poll.to_json()

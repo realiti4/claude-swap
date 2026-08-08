@@ -290,6 +290,15 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    sources: dict[str, str] = field(default_factory=dict)
+    """Account number → the fallback source that served this measurement.
+
+    Only accounts the usage endpoint did not answer for appear, and today the
+    only value is ``"headers"`` (the unified-header probe, issue #220). An
+    additive field like ``fetch_errors``/``windows``, and the one place a
+    watcher can see that metadata polling is spending the account's own
+    inference quota.
+    """
 
     def _fields(self) -> dict:
         fields = {
@@ -301,6 +310,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.sources:
+            fields["usageSources"] = self.sources
         return fields
 
     def _describe(self, num: str) -> str:
@@ -917,6 +928,11 @@ class AutoSwitchEngine:
                     if (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
+                },
+                sources={
+                    num: value["source"]
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and value.get("source")
                 },
             )
         )
