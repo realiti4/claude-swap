@@ -1935,6 +1935,19 @@ class AutoSwitchEngine:
         Adapted cadences are persisted by the collector itself after each
         fetch (shared with every other surface), not by the engine.
 
+        Phase B also leaves out an account that 429'd recently and still has a
+        future poll plan. A 429'd usage fetch is served by the header probe
+        (issue #220), which spends the account's own inference quota, and
+        escalation otherwise refetches on the serve TTL alone: about 20 probes
+        an hour on the account whose quota is scarcest. The floored post-429
+        plan the planner already computed is the budget, so honoring it here is
+        what bounds the probe. Accounts with no recent 429 escalate exactly as
+        before — their fetch costs no quota. For the same reason a recent 429
+        exempts the active account from the ``stale_candidate_plan`` override
+        below: a post-429 plan is necessarily wider than any normal active
+        cadence, so that heuristic would read the floor itself as the leftover
+        candidate-style plan it exists to repair.
+
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
         """
@@ -1965,6 +1978,7 @@ class AutoSwitchEngine:
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            and not active_pre.recent_429(now)
         )
         overslept_plan = (
             active_pre is not None
@@ -2025,15 +2039,14 @@ class AutoSwitchEngine:
                 planned_headroom = oauth.account_headroom(
                     value if isinstance(value, dict) else None, self._models
                 )
+                if entry is None or entry.next_poll_at is None or now >= entry.next_poll_at:
+                    continue
                 if (
-                    entry is not None
-                    and entry.next_poll_at is not None
-                    and now < entry.next_poll_at
-                    and (entry.poll_interval_s or 0.0)
+                    (entry.poll_interval_s or 0.0)
                     > poll_policy.EXHAUSTED_INTERVAL_S
                     and planned_headroom is not None
                     and planned_headroom <= 0
-                ):
+                ) or entry.recent_429(now):
                     escalation_fetch.remove(num)
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch

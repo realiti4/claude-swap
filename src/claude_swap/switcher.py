@@ -3606,6 +3606,12 @@ class ClaudeAccountSwitcher:
 
         Failures are paced by the store's backoff and keep their past-due plan
         for when the backoff lifts.
+
+        A fetch the header probe rescued from a 429 (``rescued_from``) counts
+        as a recent 429 for its OWN plan, not only for the next one. ``record``
+        stamps ``last429At`` afterwards, so reading the pre-fetch row alone
+        would hand the first rescue the 60s urgent cadence on the very account
+        whose usage endpoint just refused it.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
@@ -3614,7 +3620,9 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            recent_429 = before is not None and before.recent_429(now)
+            recent_429 = rec.rescued_from == "http-429" or (
+                before is not None and before.recent_429(now)
+            )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,

@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap import poll_policy
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -8362,3 +8363,48 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestARescuedFetchIsPlannedAtThePost429Floor:
+    """The 429 a header probe rescued is stamped on the row AFTER the plan for
+    that same fetch is computed, so the first rescue used to be planned as if
+    no 429 had happened -- and an active account burning inside the escalation
+    band is exactly the shape that earns the 60s urgent cadence. The endpoint
+    budget it just exhausted is unchanged by the rescue, so the floor has to
+    apply in the same pass, not from the second rescue onward.
+    """
+
+    ACTIVE_INFO = {"1": (1, "a@b.c", "", "", True, "", "")}
+
+    def _plan(self, temp_home: Path, record: FetchRecord):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        now = switcher._usage_store.clock()
+        pre = {
+            "1": UsageEntry(
+                last_good={"five_hour": {"pct": 80.0}},
+                fetched_at=now - 100,
+                age_s=100.0,
+                poll_interval_s=poll_policy.MIN_INTERVAL_S,
+            )
+        }
+        plans = switcher._plans_after_fetch(
+            {"1": record}, pre, self.ACTIVE_INFO
+        )
+        return plans["1"]
+
+    def _burning_record(self, **kwargs) -> FetchRecord:
+        return FetchRecord(usage={"five_hour": {"pct": 90.0}}, **kwargs)
+
+    def test_the_first_rescue_is_not_given_the_urgent_cadence(self, temp_home: Path):
+        _next_poll, interval = self._plan(
+            temp_home, self._burning_record(rescued_from="http-429")
+        )
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
+        assert interval > poll_policy.URGENT_INTERVAL_S
+
+    def test_an_unrescued_fetch_keeps_the_urgent_cadence(self, temp_home: Path):
+        """The floor is armed by the 429, not by burning: an account moving
+        inside the band with no 429 behind it still polls urgently."""
+        _next_poll, interval = self._plan(temp_home, self._burning_record())
+        assert interval == poll_policy.URGENT_INTERVAL_S

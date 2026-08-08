@@ -6777,3 +6777,72 @@ class TestHeaderProbeDataThatCannotBeRanked:
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
+
+
+class TestEscalationCannotOutrunThePost429Floor:
+    """A near-threshold active account whose usage endpoint 429s gets its
+    measurement from the header probe, and every probe spends about 10 tokens
+    of the account's own subscription quota. Escalation ignores poll plans once
+    data ages past the serve TTL, so the account the planner parked on a
+    post-429 cadence was re-probed every SERVE_TTL_S -- roughly 20 probes an
+    hour, about 200 subscription tokens, on the account whose quota is already
+    scarcest. Escalation itself must survive: it exists so a switch decision
+    never runs on stale candidate data.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            yield
+
+    def _harness(self, temp_home, monkeypatch) -> EngineHarness:
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    def _fetches_in_an_hour(self, h: EngineHarness, rescued: bool) -> int:
+        """Fetch count for the active account across an hour of 60s ticks.
+
+        80% used with threshold 90 keeps every tick inside the escalation band
+        and below the switch threshold, so the account is escalated on every
+        tick and never rotated away from.
+        """
+        counts: dict[str, int] = {}
+        usage_by_num = {"1": _usage(80), "2": _usage(10)}
+
+        def fake(num, email, creds, is_active=False, persist_credentials=None):
+            counts[num] = counts.get(num, 0) + 1
+            return oauth.UsageOutcome(
+                dict(usage_by_num[num]),
+                rescued_from="http-429" if rescued and num == "1" else None,
+            )
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake
+        ):
+            for _ in range(60):
+                h.engine.tick()
+                h.clock.advance(60)
+        return counts.get("1", 0)
+
+    def test_a_rescued_account_is_not_probed_faster_than_the_floor(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        probes = self._fetches_in_an_hour(h, rescued=True)
+        budget = 3600.0 / poll_policy.POST_429_MIN_INTERVAL_S
+        assert probes <= budget, f"{probes} probes/hour exceeds {budget}"
+
+    def test_an_unrescued_account_keeps_its_escalation_cadence(
+        self, temp_home, monkeypatch
+    ):
+        """The other half of the fix: a normal endpoint fetch spends no
+        subscription quota, and escalation must still refresh it as often as
+        it always has."""
+        h = self._harness(temp_home, monkeypatch)
+        fetches = self._fetches_in_an_hour(h, rescued=False)
+        assert fetches >= 15, f"escalation slowed down to {fetches} fetches/hour"
