@@ -522,11 +522,10 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped, never ranked).
 
-    ``usage["partial"]`` is the same answer for a measurement whose source
-    could not read every gating window (see
-    ``unified_headers.parse_unified_headers``): the windows it did read are
-    still worth displaying, but one window's headroom is not the account's,
-    and a confident number here would rank an account nobody measured.
+    Also ``None`` for a measurement marked ``partial`` (a source that could
+    not read every gating window, see
+    ``unified_headers.parse_unified_headers``): those windows are worth
+    displaying, but one window's headroom is not the account's.
     """
     if isinstance(usage, dict) and usage.get("partial"):
         return None
@@ -546,15 +545,13 @@ class UsageOutcome:
     (plus ``"no-access-token"`` / ``"refresh-failed"`` for pre-request
     failures). ``retry_after_s`` carries the server's Retry-After when sent.
 
-    ``rescued_from`` names the ``_classify_usage_error`` kind a fallback
-    source recovered this measurement from, and is set only alongside
-    ``error=None``: the fetch really did succeed and the data really is
-    good, but the failure it routed around still happened, and downstream
-    state must not be told otherwise. Today only ``"http-429"`` appears
-    here (see :func:`_probe_fallback`), and the one consumer that needs it
-    is the usage store's cadence floor: a probe-rescued 429 has to keep
-    arming ``last429At``, or the rescue would unlock fast polling for
-    exactly the accounts whose usage endpoint is already saturated.
+    ``rescued_from`` names the ``_classify_usage_error`` kind a fallback source
+    recovered this measurement from, set only alongside ``error=None``: the
+    data really is good, but the failure it routed around still happened and
+    downstream state must not be told otherwise. Today only ``"http-429"``
+    (see :func:`_probe_fallback`), whose consumer is the poll cadence floor:
+    without it the rescue unlocks fast polling on exactly the accounts whose
+    usage endpoint is already saturated.
     """
 
     usage: dict | None
@@ -582,26 +579,21 @@ def _probe_fallback(
     ``GET /api/oauth/usage`` rate-limits per account on that account's own
     inference activity (issue #220), so a busy account can 429 there
     indefinitely. ``unified_headers.probe_usage`` recovers the same
-    utilization from a throwaway completion's response headers instead,
-    spending about 10 tokens of the account's own quota. Only a 429
-    justifies that spend: an auth failure (401/403) means the token is
-    dead, and quota can't heal that, so callers must pass the classified
-    ``kind`` in and this returns None untouched for anything but
-    ``"http-429"``. Also returns None when the probe itself fails or
-    reports nothing, so the caller falls through to its own failure return
-    instead of papering over the original error. Shared by both 429 sites
-    in :func:`try_fetch_usage_for_account` (the direct fetch, and the retry
-    after a 401-triggered refresh) since both need the identical rule.
+    utilization from a throwaway completion's response headers, spending about
+    10 tokens of the account's own quota. Only a 429 justifies that spend, and
+    only a 429 could be healed by it: an auth failure means the token is dead,
+    which quota cannot fix. So callers pass the classified ``kind`` in, and
+    ``enabled`` carries the user's ``usage.headerFallback`` setting. None for
+    anything else, and None when the probe fails, so the caller falls through
+    to its own failure return instead of papering over the original error.
+    Shared by both 429 sites in :func:`try_fetch_usage_for_account`.
 
-    The returned outcome reports ``error=None`` (the data is real and
-    fresh) but carries ``rescued_from=kind``, so state that keys on "did
-    this token 429?" still sees the 429. Erasing it would let the rescue
-    hand the account back to the urgent poll cadence: the usage endpoint
-    admits roughly 28-30 requests per hour per identity (see
-    ``poll_policy``), a 429 means that budget is already spent, and a
-    60-second cadence there re-spends it faster than it ages out. The
-    fallback would become permanently load-bearing on exactly the accounts
-    whose quota is scarcest.
+    The outcome reports ``error=None`` (the data is real) but carries
+    ``rescued_from=kind``, so state keyed on "did this token 429?" still sees
+    the 429. Erasing it would hand the account back to the urgent poll
+    cadence: the endpoint admits roughly 28-30 requests per hour per identity
+    (see ``poll_policy``), a 429 means that budget is spent, and 60-second
+    polling re-spends it faster than it ages out.
     """
     if kind != "http-429" or not enabled:
         return None

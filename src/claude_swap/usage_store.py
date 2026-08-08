@@ -249,13 +249,12 @@ class FetchRecord:
       owner present, ...), recorded as a no-op: sentinels are re-derived every
       pass and never persisted.
 
-    ``rescued_from`` rides along on the success shape (``oauth.UsageOutcome``
-    sets it when a fallback source recovered the measurement from a failed
-    request) and carries that request's error kind. A success is still a
-    success (the measurement is recorded and the failure fields cleared),
-    but ``"http-429"`` here also stamps ``last429At``, because the 429 that
-    the fallback routed around really did happen and the poll cadence must
-    still back off for it.
+    ``rescued_from`` rides along on the success shape (see
+    ``oauth.UsageOutcome``) and carries the error kind a fallback source
+    recovered the measurement from. A success is still a success: the
+    measurement lands and the failure fields clear. But ``"http-429"`` here
+    also stamps ``last429At``, because that 429 really happened and the poll
+    cadence must still back off for it.
     """
 
     usage: dict | None = None

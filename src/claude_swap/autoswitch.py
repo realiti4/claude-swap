@@ -294,10 +294,9 @@ class PollEvent(AutoSwitchEvent):
     """Account number → the fallback source that served this measurement.
 
     Only accounts the usage endpoint did not answer for appear, and today the
-    only value is ``"headers"`` (the unified-header probe, issue #220). An
-    additive field like ``fetch_errors``/``windows``, and the one place a
-    watcher can see that metadata polling is spending the account's own
-    inference quota.
+    only value is ``"headers"`` (the unified-header probe, issue #220).
+    Additive like ``fetch_errors``/``windows``, and the one place a watcher can
+    see metadata polling spending the account's own inference quota.
     """
 
     def _fields(self) -> dict:
@@ -1952,17 +1951,16 @@ class AutoSwitchEngine:
         fetch (shared with every other surface), not by the engine.
 
         Phase B also leaves out an account that 429'd recently and still has a
-        future poll plan. A 429'd usage fetch is served by the header probe
-        (issue #220), which spends the account's own inference quota, and
-        escalation otherwise refetches on the serve TTL alone: about 20 probes
-        an hour on the account whose quota is scarcest. The floored post-429
-        plan the planner already computed is the budget, so honoring it here is
-        what bounds the probe. Accounts with no recent 429 escalate exactly as
-        before — their fetch costs no quota. For the same reason a recent 429
-        exempts the active account from the ``stale_candidate_plan`` override
-        below: a post-429 plan is necessarily wider than any normal active
-        cadence, so that heuristic would read the floor itself as the leftover
-        candidate-style plan it exists to repair.
+        future poll plan, and a recent 429 likewise exempts the active account
+        from the ``stale_candidate_plan`` override below (a post-429 plan is
+        necessarily wider than any normal active cadence, so that heuristic
+        would read the floor itself as the leftover plan it exists to repair).
+        A 429'd fetch is served by the header probe (issue #220) and spends the
+        account's own inference quota, while both paths otherwise refetch on
+        the serve TTL alone: about 20 probes an hour on the account whose quota
+        is scarcest. The floored plan the planner already computed is the
+        budget. An account with no recent 429 escalates exactly as before: its
+        fetch costs no quota.
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
@@ -2051,12 +2049,16 @@ class AutoSwitchEngine:
             # that token at the bounded all-exhausted wake cadence.
             for num in tuple(escalation_fetch):
                 entry = entries.get(num)
+                if (
+                    entry is None
+                    or entry.next_poll_at is None
+                    or now >= entry.next_poll_at
+                ):
+                    continue
                 value = usage.get(num)
                 planned_headroom = oauth.account_headroom(
                     value if isinstance(value, dict) else None, self._models
                 )
-                if entry is None or entry.next_poll_at is None or now >= entry.next_poll_at:
-                    continue
                 if (
                     (entry.poll_interval_s or 0.0)
                     > poll_policy.EXHAUSTED_INTERVAL_S

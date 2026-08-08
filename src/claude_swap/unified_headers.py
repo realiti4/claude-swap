@@ -1,35 +1,29 @@
 """Usage source that reads utilization from unified rate-limit response headers.
 
 Upstream issue realiti4/claude-swap#220: ``GET /api/oauth/usage`` rate-limits
-per account, keyed on that account's own inference activity. So the busiest
-accounts, the ones most worth watching, answer 429 and never report. The
-same account's token still gets a 200 from ``POST /v1/messages``, and that
-response, on a 429 as well as a 200, carries the same utilization data as
-``anthropic-ratelimit-unified-*`` response headers. This module parses those
-headers and probes for them. A later patch wires the probe into the regular
-fetch path; nothing here calls it on its own.
+per account on that account's own inference activity, so the busiest accounts,
+the ones most worth watching, answer 429 and never report. The same token
+still gets an answer from ``POST /v1/messages``, and that response carries the
+same utilization as ``anthropic-ratelimit-unified-*`` headers, on a 429 as well
+as a 200.
 
 Two things a caller must not get wrong:
 
-- The headers are fractions (``0.11`` means 11%), while cswap's own
-  ``pct``/``utilization`` fields, and the shape ``oauth.build_usage_result``
-  consumes, are percentages. ``parse_unified_headers`` multiplies by 100
-  before handing off, so its output renders through every existing display
-  path exactly like a real ``/api/oauth/usage`` fetch.
-- The probe spends a small amount of the account's own quota: a real
-  completion with ``max_tokens=1``, roughly 10 tokens including the fixed
-  prompt. Every caller must bound how often it fires.
+- The headers are FRACTIONS (``0.11`` means 11%), while cswap's ``pct`` fields,
+  and the shape ``oauth.build_usage_result`` consumes, are PERCENTAGES.
+  ``parse_unified_headers`` scales before handing off, so its output renders
+  through every existing display path.
+- The probe spends the account's own quota: a real completion with
+  ``max_tokens=1``, roughly 10 tokens including the prompt. Every caller must
+  bound how often it fires, and ``usage.headerFallback`` can switch it off.
 
-``PROBE_MODEL`` is a dated snapshot id, and dated snapshots are retired.
-Nothing here notices: ``probe_usage`` swallows every transport failure, so
-the day Anthropic drops that snapshot the 404 reads as "probe failed", every
-429 falls back to the original error, and the whole issue-#220 rescue goes
-quiet with no diagnostic beyond a DEBUG line. It is pinned rather than
-aliased deliberately (an alias would silently change what the probe costs
-and which limits it counts against), so keeping it current is a maintenance
-obligation, not something the code can carry on its own. Any cheap model the
-account can call works; the reply is discarded and only the response headers
-are read.
+``PROBE_MODEL`` is pinned to a dated snapshot rather than an alias, so what the
+probe costs and which limits it counts against cannot change under us. Dated
+snapshots do get retired and nothing here would notice: the 404 reads as
+"probe failed", the 429 falls back to its original error, and the #220 rescue
+goes quiet with only a DEBUG line. Keeping it current is a maintenance
+obligation. Any cheap model the account can call works; only the response
+headers are read.
 """
 
 from __future__ import annotations
@@ -56,10 +50,9 @@ _WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     """Case-insensitive lookup by header name.
 
-    HTTP header names are case-insensitive by spec, but the mapping a caller
-    hands in is not guaranteed to normalize case (a test fixture, or a real
-    ``HTTPMessage`` that already normalizes it another way). A linear scan is
-    fine: callers only ever look up a handful of fixed header names.
+    HTTP header names are case-insensitive by spec, but a caller's mapping is
+    not guaranteed to normalize case. A linear scan is fine: only a handful of
+    fixed names are ever looked up.
     """
     wanted = name.lower()
     for key, value in headers.items():
@@ -85,12 +78,10 @@ def _reset_iso(raw: str) -> str | None:
 def _utilization_pct(raw: str) -> float | None:
     """A utilization fraction as a percentage, or None when it is not usable.
 
-    ``float()`` accepts ``"nan"``, ``"inf"`` and negatives, and each of those
-    stored as a percentage reads downstream as a real measurement: nan loses
-    every comparison it takes part in, an infinity poisons the reset math, and
-    a negative fraction invents headroom the account does not have. Rejected
-    here at the boundary so nothing past this module has to defend against
-    them.
+    ``float()`` accepts ``"nan"``, ``"inf"`` and negatives, and each stored as
+    a percentage reads downstream as a measurement: nan loses every comparison,
+    an infinity poisons the reset math, a negative invents headroom. Rejected
+    here so nothing past this module has to defend against them.
     """
     try:
         value = float(raw)
@@ -105,22 +96,20 @@ def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
     """Normalize ``anthropic-ratelimit-unified-*`` headers into cswap's usage shape.
 
     Reads the ``5h``/``7d`` ``utilization`` and ``reset`` headers
-    case-insensitively, scales utilization from a fraction to a percentage
-    (see the module docstring), then delegates the final shape to
-    ``oauth.build_usage_result`` so the output renders like a real
-    usage-endpoint fetch. Returns None when no window survives, matching
-    ``build_usage_result``'s own empty-result contract.
+    case-insensitively, scales utilization to a percentage (see the module
+    docstring), then delegates the final shape to
+    ``oauth.build_usage_result``. None when no window survives, matching that
+    function's own empty-result contract.
 
     A window whose ``utilization`` header is missing or unusable is skipped
     rather than defaulted to 0, and the result is marked ``partial`` so
     ``oauth.account_headroom`` reports UNKNOWN instead of the surviving
-    window's headroom. Both halves matter: the number is still worth showing,
-    but one window's headroom is not the account's. Verified live against an
-    account at 5h 0% / 7d 100% -- dropping the weekly utilization header made
-    it read as 100% headroom, i.e. the fleet's preferred rotation target.
-    Unlike the usage endpoint, which is authoritative about which windows an
-    account has, a header set can lose one in transit, so incompleteness here
-    is never evidence that a window does not exist.
+    window's headroom: the number is still worth showing, but one window's
+    headroom is not the account's. Verified live on an account at 5h 0% / 7d
+    100%, where dropping the weekly header made it read as 100% headroom, the
+    fleet's preferred rotation target. Unlike the usage endpoint, a header set
+    can lose a window in transit, so incompleteness here is no evidence that
+    the window does not exist.
     """
     endpoint_shaped: dict = {}
     for prefix, key in _WINDOWS:
@@ -151,21 +140,17 @@ def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:
     """Spend a 1-token completion to read live utilization off response headers.
 
     ``POST /v1/messages`` rate-limits far more loosely than ``GET
-    /api/oauth/usage`` (issue #220), so this succeeds, or comes back 429 with
-    the unified headers still attached, exactly on the accounts the usage
-    endpoint goes silent on. Uses the same bearer and beta headers cswap
-    already sends to the usage endpoint (see ``oauth.request_usage_data``),
-    plus ``anthropic-version``, which ``/v1/messages`` rejects with a 400
-    when it's absent but the usage endpoint never required. Returns None on
-    any transport failure, or when the response carried no unified headers
-    at all.
+    /api/oauth/usage`` (issue #220), so it answers, with a 200 or a 429 that
+    still carries the headers, on exactly the accounts the usage endpoint goes
+    silent on. Sends the same bearer and beta headers as
+    ``oauth.request_usage_data``, plus ``anthropic-version``, which
+    ``/v1/messages`` 400s without and the usage endpoint never required.
 
-    Of the error responses, only a 429 is documented to carry usable
-    utilization, and only a 429 makes sense as one: it is the account's own
-    rate-limit state. Every other status describes the request or the server,
-    not the quota — a 401/403 means the token is dead, a 404 that the model is
-    gone, a 5xx that the service failed — so unified-looking headers on those
-    are not evidence of a healthy account and are ignored.
+    None on any transport failure, on a response with no unified headers, and
+    on every error status but 429. Only a 429 reports the account's own
+    rate-limit state; any other status describes the request or the server (a
+    dead token, a retired model, an outage), so unified-looking headers on one
+    are not evidence of a healthy account.
     """
     body = json.dumps(
         {

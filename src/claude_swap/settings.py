@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
+``autoswitch``, ``ui`` and ``usage`` sections; others can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -72,12 +72,12 @@ class UsageSettings:
     """How usage is collected (``usage`` section).
 
     ``header_fallback`` permits the unified-header probe that rescues a usage
-    fetch the endpoint answered 429 (issue #220). Enabled by default: the
-    endpoint rate-limits per account on that account's own inference activity,
-    so without the probe the busiest accounts never report at all. It is
-    switchable because it costs about 10 tokens of that account's own
-    subscription quota per rescued fetch — real inference, spent by a metadata
-    command. Off means a 429'd fetch reports unavailable, as it did before the
+    fetch the endpoint answered 429 (issue #220). Enabled by default, because
+    the endpoint rate-limits per account on that account's own inference
+    activity and without the probe the busiest accounts never report at all.
+    Switchable because it costs about 10 tokens of that account's own
+    subscription quota per rescued fetch: real inference, spent by a metadata
+    command. Off means a 429'd fetch reports unavailable, as before the
     fallback existed.
     """
 

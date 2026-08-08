@@ -1561,12 +1561,10 @@ class ClaudeAccountSwitcher:
     def _header_fallback_enabled(self) -> bool:
         """Whether a 429'd usage fetch may fall back to the header probe.
 
-        ``usage.headerFallback`` (default on). The probe answers issue #220 on
-        the accounts the usage endpoint refuses, and it spends about 10 tokens
-        of that account's own subscription quota to do it, so a user must be
-        able to turn it off. Read here rather than in ``oauth`` because every
-        surface -- list, status, the TUI, the menu bar, auto -- fetches through
-        this class.
+        ``usage.headerFallback`` (default on): the probe answers issue #220 on
+        the accounts the usage endpoint refuses, and spends about 10 tokens of
+        that account's own quota to do it. Read here, not in ``oauth``, because
+        every surface fetches through this class.
         """
         return load_usage_settings(self.backup_dir).header_fallback
 
