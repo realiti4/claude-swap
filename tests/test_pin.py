@@ -4017,6 +4017,24 @@ class TestHealADeadPin:
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **k: object())
         monkeypatch.setattr(cli, "_guard_root", lambda s: None)
 
+        # THE MODULE OBJECT WE PATCHED, held by reference on purpose.
+        #
+        # `_pin_command` re-reads `claude_swap.pin.run` on every call (its
+        # import is function-local, cli.py:194, and it is the ONLY binding of
+        # `run` in src/ — the module-level ones import the module object, not
+        # the function). So a stale pre-patch reference cannot be the culprit;
+        # the only way the call reaches a different function is if
+        # `claude_swap.pin` is not the same MODULE here and there.
+        #
+        # A REFERENCE, NOT `id()`. An id is only unique among LIVE objects: if
+        # the first module were collected after a re-import, a fresh one can
+        # land on the same address and the comparison silently passes. Holding
+        # the object makes `is` exact and keeps the old one alive to be
+        # compared against — the check cannot be defeated by the very
+        # collection it is trying to notice.
+        import sys as _sys
+        _mod_at_patch = _sys.modules["claude_swap.pin"]
+
         # A TRIPWIRE ON THE REAL `run`, because its failure is SILENT here.
         # `_pin_command` binds `pin_run` with a function-scoped
         # `from claude_swap.pin import run`. If that ever resolves to the
@@ -4070,16 +4088,38 @@ class TestHealADeadPin:
         # UNCONDITIONALLY, so the real function cannot reach `return 0` with
         # the tripwire quiet.
         #
-        # This splits what is left in two, which is all one line can do: either
-        # the patch was gone by call time (something undid or overwrote it), or
-        # it held and `_pin_command` bound a third object anyway. Measured at
-        # 4 in 32 under `-n auto` on 3.14, never under `-n0`.
-        import claude_swap.pin as _pin_mod
-        assert _pin_mod.run is _run, (
+        # TWO ASSERTS, THREE OUTCOMES, and given the binding audit above they
+        # are exhaustive. Measured at 4 in 32 under `-n auto` on 3.14, never
+        # under `-n0`.
+        #
+        #   module identity changed      -> re-imported under our feet
+        #   module same, run is not _run -> the patch was removed
+        #   both hold, real code still ran -> the call reaches `pin` by a route
+        #                                     neither of us has found
+        #
+        # ORDER MATTERS: ask about the MODULE first. If it was re-imported then
+        # `run is not _run` is true as well, and reporting that would name the
+        # symptom of the re-import as though it were a separate fault.
+        #
+        # A RELOAD IS NOT A RE-IMPORT, and the second assert is what covers it:
+        # `importlib.reload()` updates the module IN PLACE and returns the same
+        # object, so identity survives while every patched attribute is wiped.
+        # Found while mutation-testing these two lines — the first attempt at a
+        # "re-imported" mutation used reload() and tripped the SECOND assert,
+        # which means the mutation, not the assert, was wrong. Both routes are
+        # real and the pair separates them: reload -> assert 2, fresh module
+        # object in sys.modules -> assert 1.
+        assert _sys.modules["claude_swap.pin"] is _mod_at_patch, (
+            "claude_swap.pin was RE-IMPORTED between the patch and the call: "
+            f"sys.modules now holds {_sys.modules['claude_swap.pin']!r}, not "
+            f"the object that was patched. The stub and the tripwire are both "
+            f"on the old module, which is why the real run and the real heal "
+            f"execute with nothing raised."
+        )
+        assert _mod_at_patch.run is _run, (
             f"the monkeypatch did not survive the call: claude_swap.pin.run is "
-            f"{_pin_mod.run!r}, not the test stub. The patch was undone or "
-            f"overwritten DURING _pin_command, which is a different fault from "
-            f"the function-scoped import resolving late."
+            f"{_mod_at_patch.run!r}, not the test stub, and the module object "
+            f"is unchanged — so it was undone or overwritten, not re-imported."
         )
         assert seen, (
             "pin.run was never called at all, and `--heal` still exited 0 — "
