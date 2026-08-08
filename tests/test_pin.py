@@ -4041,10 +4041,46 @@ class TestHealADeadPin:
         with pytest.raises(SystemExit) as e:
             cli._pin_command(["--heal"])
         assert e.value.code == 0
+        # WHAT THE TRIPWIRE ABOVE CANNOT SEE, and the reason the one observed
+        # failure said nothing. It fires only if the real `run` reaches `heal`.
+        # The failure actually seen was all three of these at once: exit 0,
+        # `seen` empty, AND the tripwire silent — so `pin_run` was NEITHER the
+        # patched stub NOR the real function. The old message asserted the
+        # symptom and left that fact unrecorded.
+        #
+        # WHAT THE CAPTURED RUN ACTUALLY PROVED, and it is the fact that moves
+        # this from "flaky" to a two-way question. Reproduced on gw22 with
+        # output kept: stdout carried `Nothing to heal`. That string has ONE
+        # source, `_nothing_to_heal`, reachable only through `heal` — so the
+        # REAL `run` ran AND the REAL `heal` ran, while both were patched. The
+        # old tripwire could not see it: it only fires if the real `run`
+        # reaches a `heal` that is still the raising stub.
+        #
+        # Ruled out by reading, so the next occurrence need not re-do it: no
+        # in-process test rebinds `claude_swap.pin.run` (the two that assign it
+        # directly run in a subprocess), none mutates `sys.modules` for it, no
+        # fixture calls `monkeypatch.undo()`, only ONE `claude_swap` package
+        # root is on the test path, and `run(heal_only=True)` calls `heal`
+        # UNCONDITIONALLY, so the real function cannot reach `return 0` with
+        # the tripwire quiet.
+        #
+        # This splits what is left in two, which is all one line can do: either
+        # the patch was gone by call time (something undid or overwrote it), or
+        # it held and `_pin_command` bound a third object anyway. Reproduced at
+        # roughly 1 run in 12 under `-n auto` on 3.14, never under `-n0`.
+        import claude_swap.pin as _pin_mod
+        assert _pin_mod.run is _run, (
+            f"the monkeypatch did not survive the call: claude_swap.pin.run is "
+            f"{_pin_mod.run!r}, not the test stub. The patch was undone or "
+            f"overwritten DURING _pin_command, which is a different fault from "
+            f"the function-scoped import resolving late."
+        )
         assert seen, (
             "pin.run was never called at all, and `--heal` still exited 0 — "
             "the flag parsed and was dropped, which is exactly the outage "
-            "this test exists to prevent"
+            "this test exists to prevent. The patch WAS still in place (the "
+            "assertion above passed) and the tripwire on `heal` stayed quiet, "
+            "so `pin_run` resolved to neither stub nor real function"
         )
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
