@@ -33,6 +33,43 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# FLOOR AT THE CURRENT RELEASE, and raise it with each one.
+#
+# The argument this line used to carry was "no floor": a minimum is a constant
+# somebody has to remember to raise, and this one sat at 0.1.3 through
+# THIRTY-SIX releases, so `uv tool install 'claude-swap[pin]'` resolved a pin
+# from before the port handdown, the chain walk and the launch hook — while
+# the machine looked correctly installed. The user's dotfiles then grew 248
+# lines of installer to work around it. That history is real and it is why
+# 0.1.3 is not the answer either.
+#
+# WHAT THAT ARGUMENT GOT WRONG: it reasoned as though cswap-pin were somebody
+# else's package whose cadence we cannot see. We own it. A floor here is not
+# betting on a third party's release schedule, it is naming the build this
+# extra was tested against — and the stale-floor failure above happened
+# because nobody raised it, not because floors are wrong.
+#
+# WHAT 0.1.68 BUYS, all of it measured and all of it in the pin's own tree:
+#   - the config is written 0600 via O_CREAT|O_EXCL and never widened. Before
+#     0.1.2 it took the umask (022 here) and the rename made 0644 permanent —
+#     and turning THIS EXTRA on is exactly what puts the proxy's credential in
+#     that file, as userinfo in HTTPS_PROXY.
+#   - /health carries `direct_last`, so a chain that fell back to a direct
+#     dial and recovered is still visible to a later probe. Before it, the
+#     daemon detected five such outages, wrote all five to daemon.log, and
+#     nobody read any of them.
+#   - the holder-crash path is covered by a test that waits for the whole
+#     lineage rather than for the port, which is what made every earlier
+#     reading of it wrong.
+#
+# The seam itself does not need any of this: `heal`, `load_pin` and
+# `apply_pin` have byte-identical signatures from v0.1.0 through 0.1.68. The
+# floor is about the BEHAVIOUR around them, not the API.
+#
+# RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
+# accepted deliberately, and the pre-push hook in cswap-pin already warns when
+# src changes without a version bump — this is the other half of that.
+pin = ["cswap-pin>=0.1.68"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -51,7 +88,29 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `claude-swap[pin]`, NOT a second `cswap-pin>=…`. The extra above is the one
+# floor; spelling the version again here is how the two drift, and a stale
+# copy would pin CI to a package older than the behaviour the floor exists to
+# require.
+#
+# THE EXTRA HAS TO BE INSTALLED SOMEWHERE OR ITS CONTRACT IS UNTESTED. cswap
+# READS a marker cswap-pin WRITES and the two version independently, so
+# `test_the_marker_still_matches_the_package_that_writes_it` is the only thing
+# standing between a rename there and `--clear` reporting "No cloud account
+# pinned" over a live wiring. `uv sync --locked` installs base + dev only, so
+# that test skipped on every job on every platform — and, measured, in the
+# maintainer's own checkout too. It had never run once.
+#
+# This does NOT weaken "works without the extra": all three guarantees there
+# (`TestImportSafeWithoutTheExtra`, `TestClearRunsWithTheExtraGone`) block
+# `cswap_pin` at `sys.meta_path` or scan the AST, so they hold whether or not
+# the package is present.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "claude-swap[pin]",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -62,8 +121,22 @@ pythonpath = ["src"]
 # across the whole suite, with the top five totalling under 7 s of a 51 s run.
 # Measured here, 48 cores: 51.0s serial -> 12.1s (-n 8) -> 7.7s (-n 16), same
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
-# store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
-# cores) and this box both get the cores they have.
+# store hash unmoved.
+#
+# `auto` here so any machine scales from the cores it has. CI OVERRIDES IT
+# with `-n 8` (see .github/workflows/ci.yml): the work is mostly WAITING —
+# file locks, spawned interpreters, Textual pilots — so on a runner's 4 vCPUs
+# a worker parked on a syscall leaves its core idle and one-worker-per-core
+# cannot fill them. Measured on 4 CPUs (`taskset -c 0-3`), same 1995 passed:
+#
+#     -n auto (=4)  16.94s  16.97s
+#     -n 6          14.06s
+#     -n 8          15.49s  14.52s
+#     -n 10         14.69s
+#
+# xdist takes only `auto`, `logical`, or an integer — there is no multiplier
+# spelling, and `logical` is also 4 on a 4-vCPU runner. So the oversubscription
+# has to be a literal, and a literal belongs where the machine is known.
 addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [

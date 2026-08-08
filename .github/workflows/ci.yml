@@ -24,11 +24,90 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # -n 8, NOT the pyproject default of `auto`. A runner has 4 vCPUs and
+      # this suite is mostly WAITING (file locks, spawned interpreters,
+      # Textual pilots), so one worker per core leaves cores idle. Measured on
+      # 4 CPUs, same 1995 passed: auto(=4) 16.9s, -n 6 14.1s, -n 8 14.5s,
+      # -n 10 14.7s. xdist has no multiplier spelling, so the literal lives
+      # here, where the runner's shape is known, rather than in pyproject.
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -n 8
 
+  # SHARDED, because a single Windows job cannot go much below a minute no
+  # matter how fast the tests are. Measured on this repo: 13.7s checkout +
+  # uv + `uv sync` (cache already hitting), 8.8s to boot 4 xdist workers and
+  # collect 2000 items, 3.5s teardown — 26s before the first test runs, and
+  # none of it is test time anyone can optimise away.
+  #
+  # Three shards each pay that floor once and split the ~51s of test
+  # execution, so they finish together instead of in series. They are
+  # exhaustive by construction: shards 1 and 2 name their files, shard 3
+  # `--ignore`s exactly those and takes the rest, so a NEW test file lands in
+  # shard 3 automatically. tests/test_ci_shards.py fails if that ever stops
+  # being true.
   test-windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # BALANCED ON WINDOWS COST, because Windows sets the clock and does
+          # NOT rank these files the way Linux does. Two sharded runs with
+          # different groupings give the per-file cost by subtraction (all
+          # Windows, same suite):
+          #
+          #     autoswitch            ~18.3s   (26.9 switcher+autoswitch - 8.6 switcher)
+          #     pin + cli             ~17.9s   (21.4 tui+pin+cli - 3.6 tui group)
+          #     everything else       ~12.9s
+          #     switcher               ~8.6s
+          #     tui+tui_pin+menubar    ~3.6s
+          #
+          # Two heavyweights, and they must not share a job. `pin` and `cli`
+          # spawn 20 interpreters between them, which is the one thing Windows
+          # is reliably several times slower at. autoswitch spawns nothing —
+          # its cost is 253 tests each rebuilding switcher/store state, so it
+          # is volume rather than any single slow case.
+          #
+          # A Linux-derived split had put both heavyweights in the same shard
+          # while giving `switcher` its own; on Linux switcher+autoswitch is
+          # the FASTEST group at 2.93s, which is exactly backwards.
+          #
+          # FOUR shards, not three: with the heavyweights separated, "rest"
+          # inherited switcher (8.6s) plus the tail (12.9s) and became the new
+          # maximum at ~25s. Splitting switcher back out costs one more job —
+          # free on a public repo — and drops the longest shard to ~13s.
+          #
+          # AND NOT FIVE. Splitting pin from cli was tried and REVERTED: the
+          # wall clock went 48s -> 80s. More concurrent Windows jobs means
+          # more contention for the same GitHub cache, and it shows up twice:
+          #
+          #     uv sync `Prepared`   4 shards: 2.3 2.3 2.45 8.93
+          #                          5 shards: 2.24 2.35 2.62 10.06 11.52
+          #     `rest` test time     4 shards: 21.36s   5 shards: 37.52s
+          #
+          # Same commit, same lockfile, same cache key, same tests — one more
+          # job made the SLOWEST shard 76% slower. Sharding stops paying here;
+          # do not add a fifth without measuring the whole run, not the shard
+          # you are splitting.
+          #
+          # EXPECT ±8s OF RUNNER NOISE when reading these numbers. Two runs of
+          # this exact four-shard config: switcher 28/27s and autoswitch 32/32s
+          # (stable), rest 40/46s and pin-cli 48/56s. The delay lands on a
+          # DIFFERENT step each time — `uv sync` took 10.0s in one run,
+          # `Install uv` 15.8s in the next — so a single slow run is not
+          # evidence a shard needs splitting. Measure twice before moving a
+          # file between shards.
+          - name: autoswitch
+            paths: tests/test_autoswitch.py
+          - name: pin-cli
+            paths: tests/test_pin.py tests/test_cli.py
+          - name: switcher
+            paths: tests/test_switcher.py
+          - name: rest
+            paths: >-
+              --ignore=tests/test_autoswitch.py --ignore=tests/test_pin.py
+              --ignore=tests/test_cli.py --ignore=tests/test_switcher.py
+    name: test-windows (${{ matrix.name }})
 
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +123,17 @@ jobs:
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
-        run: uv run pytest
+        #
+        # `-o testpaths=` because pyproject sets `testpaths = ["tests"]`, and
+        # that setting OVERRIDES positional arguments rather than being
+        # narrowed by them — a shard given explicit paths silently ran the
+        # whole suite without it. Measured: "no tests ran" vs 1995 passed.
+        #
+        # -n 4, not the 8 the unsharded job used. Each worker re-imports the
+        # test modules, and on Windows booting 8 cost 16.7s against 4's 8.8s.
+        # With a third of the tests per job there is nothing for the extra
+        # workers to do but pay their own boot.
+        run: uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}
 
   macos-keychain:
     runs-on: macos-latest

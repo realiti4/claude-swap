@@ -408,8 +408,31 @@ class ClaudeAccountSwitcher:
             return None
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON file with validation.
+
+        THROUGH A SYMLINK, NEVER OVER IT. The publish below is a rename, and a
+        rename swaps a directory ENTRY without following links — so on a
+        dotfiles-managed `.claude.json` this replaced the link with a regular
+        file, left the real target carrying whatever it had, and sent Claude
+        Code's later writes to an orphan. The next deploy restores the link
+        and everything the write meant to remove comes back with it.
+
+        `settings.atomic_write_json` already resolves for exactly this reason
+        and cites #192/#193, which fixed the same bug in `session.py`'s
+        writer. `_clear_pin_record` uses that one while the pin's config half
+        came through here, so the two halves of a single `pin --clear`
+        disagreed about what "published" means.
+
+        THE TEMP FILE STAYS BESIDE THE TARGET, not beside the link: they can
+        be on different filesystems, and a cross-device rename is not atomic
+        (`shutil.move` falls back to copy+unlink, which a reader can catch
+        half-written). Resolving only the final component keeps this a
+        same-directory rename on the side that matters.
+        """
         content = json.dumps(data, indent=2)
+
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
@@ -5617,6 +5640,68 @@ class ClaudeAccountSwitcher:
             return
 
         removed_items = []
+
+        # TEAR THE PIN DOWN FIRST — both halves, before the rmtree.
+        #
+        # THE WIRING, because purge deletes backup_dir and takes the pin
+        # record, the cert dir and the daemon state with it, while
+        # .claude.json's env block is not in there and Claude Code applies it
+        # at boot. Left behind it points every hand-launched `claude` at a port
+        # nothing serves, with nothing remaining that knows how to remove it:
+        # exactly the stranding clear_wiring lives in this repo to prevent.
+        #
+        # AND THE DAEMON, which unwiring does not touch: `clear_wiring` is "no
+        # proxy, no daemon and no credential — only a record cswap left", by
+        # its own docstring. The proxy is a SEPARATE PROCESS holding OAuth
+        # bearers, so an unwire-only purge left it listening after the user
+        # asked to remove ALL claude-swap data — and the rmtree then took the
+        # cert dir, `proxy.json` and daemon state, leaving nothing on the
+        # machine that names its port. `cswap pin --clear` could no longer find
+        # it and `kill` was the only cure for a process the user had no way to
+        # identify. `clear_pin` does both, and already tolerates a missing or
+        # broken package (it falls back to clearing the record itself), which
+        # is why it needs no guard here.
+        #
+        # RE-READ AROUND IT, DO NOT TRUST A RETURN. Neither bool separates
+        # "there was nothing to remove" from "the lock was contended so this
+        # path was skipped", and both swallow per-path failures — only reading
+        # the configs tells ABSENT from FAILED, as pin.clear_pin and pin.heal
+        # already do. A survivor warns and the purge continues, like every
+        # other partial failure below; after this the user is the only one who
+        # can remove it, so the message names the file and the keys.
+        from claude_swap import pin as _pin
+
+        # CAPTURED BEFORE THE CLEAR, because the receipt is one of the things
+        # the clear removes and it is the only record of WHICH env keys were
+        # cswap's. `wired_config_paths` afterwards returned empty for two
+        # opposite reasons — the wiring went, or the RECEIPT went and left the
+        # wiring behind — and on a sidecar-era wiring with an unwritable
+        # config dir it is always the second: `clear_pin` clears the writable
+        # sidecar, the config then reads as unwired, and this printed
+        # "Removed: Cloud pin wiring" with NO warning while HTTPS_PROXY and
+        # CSWAP_PIN_PORT still named a dead port. Measured, not reasoned.
+        before = _pin.wired_env_keys(self)
+        _pin.clear_pin(self)
+        # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
+        # `get_global_config_path()` after asking a check that reads BOTH
+        # configs, so when the survivor was the other one the user was sent to
+        # a file that was already clean — while the wiring that strands them
+        # sat in a file they were never told about. By this point the record,
+        # cert dir and daemon state are gone, so hand editing is the only cure
+        # and naming the wrong file is the whole failure.
+        survivors = _pin.env_keys_survive(before)
+        if before and not survivors:
+            removed_items.append("Cloud pin wiring in .claude.json")
+        for path, names in survivors.items():
+            # NAMES THE KEYS, not the marker. The advice used to say to delete
+            # `"_cswapPinWiredKeys"`, which a sidecar-era config never carried
+            # — and the sidecar that lists the real keys is about to be
+            # rmtree'd, so after this nothing can reconstruct them.
+            warning(
+                f"Could not remove the cloud pin wiring — edit {path} by hand "
+                f"and delete these entries from its \"env\" block: "
+                + ", ".join(names)
+            )
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
