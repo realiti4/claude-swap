@@ -44,6 +44,8 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    auth_method_label,
+    classify_auth_method,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -1494,6 +1496,7 @@ class ClaudeAccountSwitcher:
                     kind=self._account_kind(n),
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
+                    auth_method=classify_auth_method(_creds),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                 )
@@ -3881,7 +3884,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
-        for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -3896,6 +3899,7 @@ class ClaudeAccountSwitcher:
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
+                    auth_method=classify_auth_method(creds),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                 )
@@ -3954,7 +3958,7 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
@@ -3963,6 +3967,10 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            print(
+                f"     {dimmed('Claude Code:')} "
+                f"{muted(auth_method_label(classify_auth_method(creds)))}"
+            )
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 

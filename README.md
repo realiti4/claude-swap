@@ -333,7 +333,8 @@ cswap switch 2 --json
   "schemaVersion": 1,
   "activeAccountNumber": 2,
   "accounts": [
-    { "number": 2, "email": "you@example.com", "active": true, "usageStatus": "ok",
+    { "number": 2, "email": "you@example.com", "active": true,
+      "authMethod": "setup_token", "usageStatus": "ok",
       "usage": { "fiveHour": { "pct": 25.0, "resetsAt": "2026-06-22T23:29:59Z" },
                  "sevenDay": { "pct": 16.0, "resetsAt": "2026-06-26T17:59:59Z" } } }
   ]
@@ -344,7 +345,11 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
-An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+Each account row carries an additive `authMethod`: `browser_oauth`,
+`setup_token`, `api_key`, or `unknown`. The human list and TUI use the same
+classification and show it separately from the account's usage. An account row
+also carries an additive `alias` field once one is set with `cswap alias` (e.g.
+`"alias": "dev"`); accounts without one simply omit the key.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 

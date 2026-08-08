@@ -113,6 +113,48 @@ def _credential_object(credentials: str | None) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+AUTH_BROWSER_OAUTH = "browser_oauth"
+AUTH_SETUP_TOKEN = "setup_token"
+AUTH_API_KEY = "api_key"
+AUTH_UNKNOWN = "unknown"
+
+AUTH_METHOD_LABELS = {
+    AUTH_BROWSER_OAUTH: "browser OAuth",
+    AUTH_SETUP_TOKEN: "one-year setup token",
+    AUTH_API_KEY: "API key",
+    AUTH_UNKNOWN: "unknown login",
+}
+
+
+def classify_auth_method(credentials: str | None) -> str:
+    """Classify one stored Claude Code credential without exposing its value.
+
+    Browser OAuth carries a refresh token. A setup token is a standalone
+    ``sk-ant-oat`` access token with no refresh token. Managed API keys use the
+    raw ``sk-ant-api`` form. Anything else stays explicitly unknown rather than
+    being guessed from account metadata.
+    """
+    if looks_like_api_key(credentials):
+        return AUTH_API_KEY
+    data = _credential_object(credentials)
+    if data is None:
+        return AUTH_UNKNOWN
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return AUTH_UNKNOWN
+    if oauth.get("refreshToken"):
+        return AUTH_BROWSER_OAUTH
+    access_token = oauth.get("accessToken")
+    if isinstance(access_token, str) and access_token.startswith("sk-ant-oat"):
+        return AUTH_SETUP_TOKEN
+    return AUTH_UNKNOWN
+
+
+def auth_method_label(method: str) -> str:
+    """Return the human label for a classified authentication method."""
+    return AUTH_METHOD_LABELS.get(method, AUTH_METHOD_LABELS[AUTH_UNKNOWN])
+
+
 # The credential object's siblings of claudeAiOauth are not uniformly owned:
 # these keys hold machine-shared OAuth integrations that rotate independently
 # of any account slot, so on activation the live copy is authoritative.

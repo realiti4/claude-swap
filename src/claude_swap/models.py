@@ -138,6 +138,7 @@ class AccountSnapshot:
     kind: str  # "oauth" | "api_key"
     switchable: bool
     usage: UsageEntry
+    auth_method: str = "unknown"
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
 

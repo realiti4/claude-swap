@@ -16,9 +16,13 @@ import pytest
 from claude_swap import macos_keychain
 from claude_swap import session as session_mod
 from claude_swap.credentials import (
+    AUTH_API_KEY,
+    AUTH_BROWSER_OAUTH,
+    AUTH_SETUP_TOKEN,
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
     approved_form,
+    classify_auth_method,
     looks_like_api_key,
 )
 from claude_swap.exceptions import SessionError, ValidationError
@@ -62,6 +66,22 @@ def _read_global_config() -> dict:
 
 
 class TestKindDetection:
+    def test_classifies_every_supported_auth_method(self):
+        browser = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-browser",
+                    "refreshToken": "refresh",
+                }
+            }
+        )
+        setup = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-ant-oat01-setup"}}
+        )
+        assert classify_auth_method(browser) == AUTH_BROWSER_OAUTH
+        assert classify_auth_method(setup) == AUTH_SETUP_TOKEN
+        assert classify_auth_method(API_KEY) == AUTH_API_KEY
+
     def test_api_key_detected(self):
         assert looks_like_api_key(API_KEY) is True
 

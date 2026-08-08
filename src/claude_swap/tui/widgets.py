@@ -15,6 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace
+from claude_swap.credentials import auth_method_label
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.usage_store import STALE_OK_S
@@ -186,6 +187,10 @@ def account_card_text(
     if age:
         text.append(f"   {age}", style=palette.muted)
 
+    text.append("\n    ")
+    text.append("Claude Code  ", style=palette.muted)
+    text.append(auth_method_label(acc.auth_method), style=palette.foreground)
+
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
@@ -255,6 +260,7 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    text.append(f"  · {auth_method_label(acc.auth_method)}", style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel

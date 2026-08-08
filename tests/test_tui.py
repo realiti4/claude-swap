@@ -77,6 +77,7 @@ def make_account(
     active: bool = False,
     switchable: bool = True,
     kind: str = "oauth",
+    auth_method: str = "browser_oauth",
     entry: UsageEntry | None = None,
     email: str | None = None,
     alias: str = "",
@@ -91,6 +92,7 @@ def make_account(
         kind=kind,
         switchable=switchable,
         usage=entry if entry is not None else make_entry(),
+        auth_method=auth_method,
         alias=alias,
         disabled=disabled,
     )
@@ -626,6 +628,16 @@ class TestUsageRows:
 
 
 class TestMiniAccountText:
+    def test_auth_method_is_visible_without_repeating_usage(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        active = make_account(1, active=True, auth_method="setup_token")
+        inactive = make_account(2, auth_method="api_key")
+        assert "Claude Code  one-year setup token" in account_card_text(
+            active, 100
+        ).plain
+        assert "API key" in mini_account_text(inactive, time.time()).plain
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
@@ -1709,4 +1721,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-
