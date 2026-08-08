@@ -702,7 +702,7 @@ class TestAdaptiveScheduler:
 
     @staticmethod
     def _counting_fetch(counts, usage_by_num, errors_by_num=None):
-        def fake(num, email, creds, is_active=False, persist_credentials=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             counts[num] = counts.get(num, 0) + 1
             error = (errors_by_num or {}).get(num)
             if error:
@@ -6716,3 +6716,251 @@ class TestReviewFindings202:
         assert sw.trigger == "at-limit"
 
 
+
+
+class TestHeaderProbeDataThatCannotBeRanked:
+    """Issue #220's header-probe rescue can come back with only some of the
+    gating windows: a proxy strips a header, or one arrives malformed. The
+    account below is really at 100% weekly with an idle 5-hour window, so the
+    surviving header reads as full headroom. Ranking on it would make the one
+    exhausted account in the fleet the preferred rotation target."""
+
+    HEADERS = {
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-5h-status": "allowed",
+        "anthropic-ratelimit-unified-5h-utilization": "0.0",
+        "anthropic-ratelimit-unified-7d-status": "rejected",
+        "anthropic-ratelimit-unified-7d-utilization": "1.0",
+    }
+
+    def _rescued(self, **overrides) -> dict:
+        from claude_swap.unified_headers import parse_unified_headers
+
+        headers = {**self.HEADERS, **overrides}
+        return parse_unified_headers(
+            {k: v for k, v in headers.items() if v is not None}
+        )
+
+    def test_a_missing_weekly_header_is_not_a_switch_target(self, harness):
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": None}
+        )
+        assert rescued["five_hour"]["pct"] == 0.0
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_a_malformed_weekly_header_is_not_a_switch_target(self, harness):
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": "nan"}
+        )
+        assert rescued["five_hour"]["pct"] == 0.0, (
+            "premise: the measurement must survive with its healthy-looking 5h "
+            "window, or this passes for the wrong reason"
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_a_complete_rescued_header_set_is_still_a_switch_target(
+        self, harness
+    ):
+        """The rescue must keep working: a full header set from a healthy
+        account ranks exactly like an endpoint measurement."""
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": "0.05"}
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+
+class TestEscalationCannotOutrunThePost429Floor:
+    """A near-threshold active account whose usage endpoint 429s gets its
+    measurement from the header probe, and every probe spends about 10 tokens
+    of the account's own subscription quota. Escalation ignores poll plans once
+    data ages past the serve TTL, so the account the planner parked on a
+    post-429 cadence was re-probed every SERVE_TTL_S -- roughly 20 probes an
+    hour, about 200 subscription tokens, on the account whose quota is already
+    scarcest. Escalation itself must survive: it exists so a switch decision
+    never runs on stale candidate data.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            yield
+
+    def _harness(self, temp_home, monkeypatch) -> EngineHarness:
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    def _fetches_in_an_hour(self, h: EngineHarness, rescued: bool) -> int:
+        """Fetch count for the active account across an hour of 60s ticks.
+
+        80% used with threshold 90 keeps every tick inside the escalation band
+        and below the switch threshold, so the account is escalated on every
+        tick and never rotated away from.
+        """
+        counts: dict[str, int] = {}
+        usage_by_num = {"1": _usage(80), "2": _usage(10)}
+
+        def fake(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
+            counts[num] = counts.get(num, 0) + 1
+            return oauth.UsageOutcome(
+                dict(usage_by_num[num]),
+                rescued_from="http-429" if rescued and num == "1" else None,
+            )
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake
+        ):
+            for _ in range(60):
+                h.engine.tick()
+                h.clock.advance(60)
+        return counts.get("1", 0)
+
+    def test_a_rescued_account_is_not_probed_faster_than_the_floor(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        probes = self._fetches_in_an_hour(h, rescued=True)
+        budget = 3600.0 / poll_policy.POST_429_MIN_INTERVAL_S
+        assert probes <= budget, f"{probes} probes/hour exceeds {budget}"
+        assert probes <= 6, (
+            f"{probes} probes/hour: the AIMD growth past the floor has stopped "
+            "working, measured 5 when this was written"
+        )
+
+    def test_an_unrescued_account_keeps_its_escalation_cadence(
+        self, temp_home, monkeypatch
+    ):
+        """The other half of the fix: a normal endpoint fetch spends no
+        subscription quota, and escalation must still refresh it as often as
+        it always has."""
+        h = self._harness(temp_home, monkeypatch)
+        fetches = self._fetches_in_an_hour(h, rescued=False)
+        assert fetches >= 15, f"escalation slowed down to {fetches} fetches/hour"
+
+
+class TestPollEventReportsUsageProvenance:
+    """``cswap auto --json`` is the surface a script watches to see which
+    account the engine is reasoning about, and a header-probe measurement
+    (issue #220's 429 fallback) reasons differently: it spent the account's own
+    quota, and a partial one is deliberately unrankable. Additive field, like
+    ``fetchErrors``/``windowsPct`` beside it."""
+
+    def test_a_rescued_measurement_is_named_in_the_payload(self, harness):
+        harness.tick_with_usage({
+            "1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 5.0},
+                  "source": "headers"},
+            "2": _usage(10),
+            "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert poll.to_json()["usageSources"] == {"1": "headers"}
+
+    def test_endpoint_only_ticks_omit_the_field(self, harness):
+        harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert "usageSources" not in poll.to_json()
+
+
+class TestAModelGatedFleetCannotRankAHeaderRescue:
+    """With ``autoswitch.model`` set, the per-model weekly window is part of
+    the decision, and a header rescue (issue #220) cannot see it: the unified
+    headers carry 5h and 7d only. Such an account must be unrankable, or the
+    engine hands the user's model-gated work to an account whose model quota
+    may be spent."""
+
+    RESCUED = {
+        "five_hour": {"pct": 5.0},
+        "seven_day": {"pct": 5.0},
+        "source": "headers",
+    }
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_rescued_candidate_is_not_a_target(self, temp_home: Path):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _model_usage(95.0, 10.0), "2": self.RESCUED})
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_an_endpoint_candidate_with_the_model_window_is_a_target(
+        self, temp_home: Path
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95.0, 10.0), "2": _model_usage(5.0, 5.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_rescue_does_not_earn_the_model_typo_warning(self, temp_home: Path):
+        """The configured name is not absent, it is unobservable on this
+        source. Claiming a typo would send the user hunting a spelling bug."""
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": self.RESCUED, "2": self.RESCUED})
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert warnings == []
+
+
+class TestAPartialMeasurementIsVisibleOnThePollEvent:
+    """``cswap auto --json`` is what a script watches, and its human line is
+    what an operator reads. A partial measurement has real window numbers and no
+    headroom, so without a marker the stream shows a healthy-looking pct beside
+    a null headroom, and the human line shows the number with nothing saying the
+    engine will not act on it."""
+
+    PARTIAL = {"five_hour": {"pct": 0.0}, "partial": True, "source": "headers"}
+
+    def _poll(self, harness, usage: dict) -> PollEvent:
+        harness.tick_with_usage(usage)
+        return next(e for e in harness.events if isinstance(e, PollEvent))
+
+    def test_the_payload_names_the_partial_accounts(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": self.PARTIAL, "3": _usage(10),
+        })
+        assert poll.to_json()["partialUsage"] == ["2"]
+        assert poll.to_json()["headroomPct"]["2"] is None
+
+    def test_a_complete_tick_omits_the_field(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": _usage(10), "3": _usage(10),
+        })
+        assert "partialUsage" not in poll.to_json()
+
+    def test_the_human_line_marks_a_partial_candidate(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": self.PARTIAL, "3": _usage(10),
+        })
+        assert "#2: 5h 0% (partial)" in poll.human()
+
+    def test_the_human_line_marks_a_partial_active_account(self, harness):
+        poll = self._poll(harness, {
+            "1": self.PARTIAL, "2": _usage(10), "3": _usage(10),
+        })
+        assert "usage incomplete" in poll.human()

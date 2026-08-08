@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
+from claude_swap.unified_headers import probe_usage
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
@@ -519,12 +520,47 @@ def account_headroom(
     of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
     account is at or over a limit. Returns ``None`` when usage is unavailable
     or carries no window data, which callers treat as "unknown" (never
-    auto-skipped).
+    auto-skipped, never ranked).
+
+    Also ``None`` for a measurement marked ``partial`` (a source that could
+    not read every gating window, see
+    ``unified_headers.parse_unified_headers``): those windows are worth
+    displaying, but one window's headroom is not the account's.
+
+    And ``None`` when ``models`` are configured but the measurement came from
+    a source that cannot see the per-model axis (see
+    :func:`scoped_axis_unseen`). Same rule, one axis over: the 5h/7d numbers
+    are real, they just do not answer the question the user asked.
     """
+    if isinstance(usage, dict) and usage.get("partial"):
+        return None
+    if scoped_axis_unseen(usage, models):
+        return None
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
         return None
     return 100.0 - max(pcts)
+
+
+def scoped_axis_unseen(usage: dict | None, models: Sequence[str] = ()) -> bool:
+    """Whether ``models`` are configured and this source cannot report them.
+
+    The ``anthropic-ratelimit-unified-*`` headers carry the 5-hour and 7-day
+    windows and nothing per-model, so a header-rescued measurement (issue
+    #220) has no view of the ``scoped`` weekly limits the usage endpoint
+    reports in its ``limits`` array. A missing scoped window from the ENDPOINT
+    means the account has no such limit; from this source it means nobody
+    looked. Keyed on ``source`` rather than on the absence of ``scoped``, so a
+    header source that ever learns to report per-model windows stops tripping
+    this on its own.
+
+    Two callers: :func:`account_headroom`, which reports unknown instead of a
+    headroom that ignores the axis the user pinned; and the ``--model`` typo
+    guards, which must not call a name absent when it is merely unobservable.
+    """
+    if not models or not isinstance(usage, dict):
+        return False
+    return usage.get("source") == "headers" and "scoped" not in usage
 
 
 @dataclass(frozen=True)
@@ -536,11 +572,20 @@ class UsageOutcome:
     ``error`` is ``None`` on success, else a ``_classify_usage_error`` kind
     (plus ``"no-access-token"`` / ``"refresh-failed"`` for pre-request
     failures). ``retry_after_s`` carries the server's Retry-After when sent.
+
+    ``rescued_from`` names the ``_classify_usage_error`` kind a fallback source
+    recovered this measurement from, set only alongside ``error=None``: the
+    data really is good, but the failure it routed around still happened and
+    downstream state must not be told otherwise. Today only ``"http-429"``
+    (see :func:`_probe_fallback`), whose consumer is the poll cadence floor:
+    without it the rescue unlocks fast polling on exactly the accounts whose
+    usage endpoint is already saturated.
     """
 
     usage: dict | None
     error: str | None = None
     retry_after_s: float | None = None
+    rescued_from: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -554,16 +599,59 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+def _probe_fallback(
+    kind: str, access_token: str, enabled: bool = True
+) -> UsageOutcome | None:
+    """Recover a busy account's usage from response headers, or None.
+
+    ``GET /api/oauth/usage`` rate-limits per account on that account's own
+    inference activity (issue #220), so a busy account can 429 there
+    indefinitely. ``unified_headers.probe_usage`` recovers the same
+    utilization from a throwaway completion's response headers, spending about
+    10 tokens of the account's own quota. Only a 429 justifies that spend, and
+    only a 429 could be healed by it: an auth failure means the token is dead,
+    which quota cannot fix. So callers pass the classified ``kind`` in, and
+    ``enabled`` carries the user's ``usage.headerFallback`` setting. None for
+    anything else, and None when the probe fails, so the caller falls through
+    to its own failure return instead of papering over the original error.
+    Shared by both 429 sites in :func:`try_fetch_usage_for_account`.
+
+    The outcome reports ``error=None`` (the data is real) but carries
+    ``rescued_from=kind``, so state keyed on "did this token 429?" still sees
+    the 429. Erasing it would hand the account back to the urgent poll
+    cadence: the endpoint admits roughly 28-30 requests per hour per identity
+    (see ``poll_policy``), a 429 means that budget is spent, and 60-second
+    polling re-spends it faster than it ages out.
+    """
+    if kind != "http-429" or not enabled:
+        return None
+    probed = probe_usage(access_token)
+    if probed is None:
+        return None
+    return UsageOutcome({**probed, "source": "headers"}, rescued_from=kind)
+
+
 def try_fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    header_fallback: bool = True,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+
+    Both places a fetch here can 429 (the direct request, and the retry
+    after a 401-triggered refresh) route through :func:`_probe_fallback`,
+    which recovers busy-account usage from response headers instead of the
+    endpoint that just refused it. See that function's docstring for why
+    only a 429 qualifies and what a failed probe does. ``header_fallback``
+    carries the user's ``usage.headerFallback`` setting: False turns the
+    rescue off, and a 429 then reports as the failure it is, since the probe
+    spends the account's own subscription quota.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -604,6 +692,9 @@ def try_fetch_usage_for_account(
             or not oauth
             or not oauth.get("refreshToken")
         ):
+            probed_outcome = _probe_fallback(kind, access_token, header_fallback)
+            if probed_outcome is not None:
+                return probed_outcome
             _log_usage_failure(context, e, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
@@ -630,6 +721,9 @@ def try_fetch_usage_for_account(
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
+            probed_outcome = _probe_fallback(kind, new_token, header_fallback)
+            if probed_outcome is not None:
+                return probed_outcome
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
@@ -644,10 +738,17 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    header_fallback: bool = True,
 ) -> dict | None:
-    """Usage dict or None (see try_fetch_usage_for_account for the cause)."""
+    """Usage dict or None (see try_fetch_usage_for_account for the cause).
+
+    ``header_fallback`` is forwarded, not defaulted here: a wrapper that
+    dropped it would silently re-enable a probe the user switched off.
+    """
     return try_fetch_usage_for_account(
-        account_num, email, credentials, is_active, persist_credentials
+        account_num, email, credentials, is_active, persist_credentials,
+        header_fallback=header_fallback,
     ).usage
 
 

@@ -16,9 +16,11 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    UsageSettings,
     effective_settings,
     load_settings,
     load_ui_settings,
+    load_usage_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -163,9 +165,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["usage"] == {
+            f.name for f in UsageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "usage": UsageSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
@@ -355,3 +364,42 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestUsageSettings:
+    """``usage.headerFallback`` gates the unified-header probe that rescues a
+    usage fetch the endpoint answered 429 (issue #220). Enabled by default,
+    because without it the busiest accounts never report at all, but it spends
+    the account's own inference quota, so it must be switchable off."""
+
+    def test_the_fallback_is_enabled_by_default(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path) == UsageSettings(header_fallback=True)
+
+    def test_it_reads_a_disabled_fallback(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerFallback": False}})
+        )
+        assert load_usage_settings(tmp_path).header_fallback is False
+
+    def test_a_non_bool_value_degrades_to_the_default(self, tmp_path: Path):
+        """A hand-edited ``"false"`` string must not read as True the way
+        ``bool(str)`` would."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerFallback": "false"}})
+        )
+        assert load_usage_settings(tmp_path).header_fallback is True
+
+    def test_set_and_unset_round_trip(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.headerFallback", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "usage": {"headerFallback": False}}
+        assert load_usage_settings(tmp_path).header_fallback is False
+        assert unset_setting(tmp_path, "usage.headerFallback") is True
+        assert load_usage_settings(tmp_path).header_fallback is True
+
+    def test_it_appears_in_the_effective_listing(self, tmp_path: Path):
+        by_key = {
+            spec.dotted: (value, is_set)
+            for spec, value, is_set in effective_settings(tmp_path)
+        }
+        assert by_key["usage.headerFallback"] == (True, False)
