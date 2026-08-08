@@ -1677,3 +1677,35 @@ class TestAHeaderRescueCannotAnswerForPerModelWindows:
 
     def test_the_all_sentinel_counts_as_a_configured_model(self):
         assert oauth.account_headroom(self.RESCUED, ("all",)) is None
+
+
+class TestTheThinWrapperForwardsTheFallbackSetting:
+    """``fetch_usage_for_account`` is the dict-returning wrapper over
+    ``try_fetch_usage_for_account``. It must not quietly re-enable the probe:
+    the whole point of the setting is that no code path spends subscription
+    quota once a user has switched it off."""
+
+    def test_the_wrapper_carries_the_flag(self):
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": future_ms,
+        }})
+        error = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "error",
+            hdrs=None, fp=None,
+        )
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data", side_effect=error),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            usage = oauth.fetch_usage_for_account(
+                "1", "a@b.c", creds, False, header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert usage is None

@@ -8452,3 +8452,74 @@ class TestHeaderFallbackIsConfigurable:
 
         capsys.readouterr()
         assert mock_fetch.call_args.kwargs.get("header_fallback") is False
+
+
+class TestEveryFetchSiteCarriesTheFallbackSetting:
+    """The setting is worthless if one fetch path forgets it: the probe would
+    keep spending quota on whichever accounts route through that path. A
+    ``--list`` pass covers both shapes at once, the ACTIVE slot's own fetch and
+    an inactive slot's backup-credential fetch."""
+
+    def test_a_list_pass_passes_it_on_every_call(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        from claude_swap.settings import set_setting
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       {"five_hour": {"pct": 5.0}})) as mock_fetch:
+            switcher.list_accounts()
+
+        assert mock_fetch.call_count >= 2
+        assert all(
+            call.kwargs.get("header_fallback") is False
+            for call in mock_fetch.call_args_list
+        ), mock_fetch.call_args_list
+
+    def test_the_setting_is_read_once_per_pass_not_once_per_account(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Fetches run in a thread pool, so an uncached read is N concurrent
+        parses of the same file. The sibling poll-policy read caches on mtime
+        for exactly this reason."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        from claude_swap import settings as settings_mod
+        real = settings_mod.load_usage_settings
+        calls: list[int] = []
+
+        def counting(backup_root):
+            calls.append(1)
+            return real(backup_root)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=backup_creds), \
+             patch("claude_swap.switcher.load_usage_settings", counting), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       {"five_hour": {"pct": 5.0}})):
+            switcher.list_accounts()
+            switcher.list_accounts()
+
+        assert len(calls) == 1, f"read the settings file {len(calls)} times"

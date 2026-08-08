@@ -738,10 +738,17 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    header_fallback: bool = True,
 ) -> dict | None:
-    """Usage dict or None (see try_fetch_usage_for_account for the cause)."""
+    """Usage dict or None (see try_fetch_usage_for_account for the cause).
+
+    ``header_fallback`` is forwarded, not defaulted here: a wrapper that
+    dropped it would silently re-enable a probe the user switched off.
+    """
     return try_fetch_usage_for_account(
-        account_num, email, credentials, is_active, persist_credentials
+        account_num, email, credentials, is_active, persist_credentials,
+        header_fallback=header_fallback,
     ).usage
 
 

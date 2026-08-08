@@ -298,6 +298,7 @@ class ClaudeAccountSwitcher:
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
+        self._header_fallback_cache: tuple[float | None, bool] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
@@ -1565,8 +1566,23 @@ class ClaudeAccountSwitcher:
         the accounts the usage endpoint refuses, and spends about 10 tokens of
         that account's own quota to do it. Read here, not in ``oauth``, because
         every surface fetches through this class.
+
+        Cached on the settings file's mtime, like ``_poll_policy_inputs`` right
+        above: the fetches that ask run concurrently in a thread pool, so an
+        uncached read is one parse of the same file per account per pass. A
+        racing double read costs one extra parse and cannot disagree.
         """
-        return load_usage_settings(self.backup_dir).header_fallback
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        cached = self._header_fallback_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        enabled = load_usage_settings(self.backup_dir).header_fallback
+        self._header_fallback_cache = (mtime, enabled)
+        return enabled
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
