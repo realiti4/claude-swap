@@ -1,7 +1,7 @@
 """Tests for managed API-key (``/login`` key) account support.
 
-Covers kind detection, ``--add-token`` auto-detection, the cross-kind collision
-guard, the ``add_account`` live-key guard, kind+platform-aware active credential
+Covers kind detection, ``--add-token`` auto-detection, account-owned login methods,
+the ``add_account`` live-key guard, kind+platform-aware active credential
 read/write with OAuth↔API-key mutual exclusion, the "API key — no quota" usage
 display, the ``cswap run`` session guard, and export/import of raw keys.
 """
@@ -140,18 +140,131 @@ class TestAddTokenApiKey:
         assert s._read_account_credentials("1", "me@example.com") == OTHER_KEY
 
 
-class TestCrossKindCollision:
-    def test_api_key_rejected_when_email_is_oauth(self, temp_home: Path):
+class TestAccountAuthMethods:
+    def test_browser_oauth_joins_existing_setup_token_account(
+        self, temp_home: Path
+    ):
+        s = _linux_switcher()
+        s.add_account_from_token(
+            "sk-ant-oat01-setup", email="dup@example.com"
+        )
+        (temp_home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "emailAddress": "dup@example.com",
+                        "accountUuid": "account-1",
+                        "organizationUuid": None,
+                        "organizationName": None,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+
+        s.add_account()
+
+        record = s._get_sequence_data()["accounts"]["1"]
+        assert record["authMethods"] == [AUTH_BROWSER_OAUTH, AUTH_SETUP_TOKEN]
+        assert record["preferredAuthMethod"] == AUTH_BROWSER_OAUTH
+
+    def test_api_key_and_setup_token_share_one_account(self, temp_home: Path):
         s = _linux_switcher()
         s.add_account_from_token("sk-ant-oat01-abc", email="dup@example.com")
-        with pytest.raises(ValidationError, match="already exists as an OAuth account"):
-            s.add_account_from_token(API_KEY, email="dup@example.com")
+        s.add_account_from_token(API_KEY, email="dup@example.com")
 
-    def test_oauth_rejected_when_email_is_api_key(self, temp_home: Path):
+        data = s._get_sequence_data()
+        record = data["accounts"]["1"]
+        assert len(data["accounts"]) == 1
+        assert record["authMethods"] == [AUTH_SETUP_TOKEN, AUTH_API_KEY]
+        assert record["preferredAuthMethod"] == AUTH_API_KEY
+        assert s._read_auth_method_credentials(
+            "1", "dup@example.com", "", AUTH_SETUP_TOKEN
+        )
+        assert s._read_auth_method_credentials(
+            "1", "dup@example.com", "", AUTH_API_KEY
+        ) == API_KEY
+
+    def test_explicit_method_switch_updates_preference(self, temp_home: Path):
         s = _linux_switcher()
         s.add_account_from_token(API_KEY, email="dup@example.com")
-        with pytest.raises(ValidationError, match="already exists as an API-key account"):
-            s.add_account_from_token("sk-ant-oat01-abc", email="dup@example.com")
+        s.add_account_from_token("sk-ant-oat01-abc", email="dup@example.com")
+
+        s.switch_to("1", force=True, auth_method="api-key")
+        s.switch_to("1", auth_method="setup-token")
+
+        record = s._get_sequence_data()["accounts"]["1"]
+        assert record["preferredAuthMethod"] == AUTH_SETUP_TOKEN
+        assert classify_auth_method(
+            s._read_account_credentials("1", "dup@example.com")
+        ) == AUTH_SETUP_TOKEN
+
+    def test_usage_stays_account_level_when_api_key_is_preferred(
+        self, temp_home: Path
+    ):
+        s = _linux_switcher()
+        s.add_account_from_token(
+            "sk-ant-oat01-setup", email="dup@example.com"
+        )
+        s.add_account_from_token(API_KEY, email="dup@example.com")
+
+        info = s._build_accounts_info()
+        snapshot = s.accounts_snapshot(fetch=set())
+
+        assert classify_auth_method(info[0][5]) == AUTH_SETUP_TOKEN
+        assert len(snapshot.accounts) == 1
+        assert snapshot.accounts[0].auth_method == AUTH_API_KEY
+        assert snapshot.accounts[0].auth_methods == (
+            AUTH_SETUP_TOKEN,
+            AUTH_API_KEY,
+        )
+        assert snapshot.accounts[0].usage.sentinel != USAGE_API_KEY
+
+    def test_active_api_key_uses_oauth_backup_without_replacing_live_login(
+        self, temp_home: Path
+    ):
+        s = _linux_switcher()
+        s.add_account_from_token(
+            "sk-ant-oat01-setup", email="dup@example.com"
+        )
+        s.add_account_from_token(API_KEY, email="dup@example.com")
+        s.switch_to("1", force=True, auth_method="api-key")
+
+        info = s._build_accounts_info()
+
+        assert info[0][4] is True
+        assert classify_auth_method(info[0][5]) == AUTH_SETUP_TOKEN
+        assert "1" in s._usage_backup_slots
+        assert s._read_credentials() == API_KEY
+
+    def test_method_secrets_follow_slot_move_and_delete_with_account(
+        self, temp_home: Path
+    ):
+        s = _linux_switcher()
+        email = "dup@example.com"
+        s.add_account_from_token("sk-ant-oat01-setup", email=email)
+        s.add_account_from_token(API_KEY, email=email)
+
+        s.move_account("1", "3")
+
+        assert s._read_auth_method_credentials(
+            "3", email, "", AUTH_SETUP_TOKEN
+        )
+        assert s._read_auth_method_credentials(
+            "3", email, "", AUTH_API_KEY
+        ) == API_KEY
+        keys = [
+            s._auth_method_storage_key(email, "", method)
+            for method in (AUTH_SETUP_TOKEN, AUTH_API_KEY)
+        ]
+
+        s.remove_account("3", assume_yes=True)
+
+        assert all(
+            not s._store._read_account_credentials(key, email) for key in keys
+        )
 
 
 # ---------------------------------------------------------------------------

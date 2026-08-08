@@ -220,6 +220,7 @@ def account_row(
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
     auth_method: str | None = None,
+    auth_methods: list[str] | None = None,
     alias: str = "",
     disabled: bool = False,
 ) -> dict:
@@ -237,6 +238,8 @@ def account_row(
     }
     if auth_method is not None:
         row["authMethod"] = auth_method
+    if auth_methods is not None:
+        row["authMethods"] = auth_methods
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so

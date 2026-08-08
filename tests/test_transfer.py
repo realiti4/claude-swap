@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap.exceptions import TransferError
+from claude_swap.credentials import AUTH_API_KEY, AUTH_SETUP_TOKEN
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
@@ -132,6 +133,39 @@ class TestRoundTrip:
                 # Credentials JSON parses and contains the marker
                 creds_text = dst._read_account_credentials("1", "alice@example.com")
                 assert json.loads(creds_text)["_marker"] == "alice@example.com"
+
+    def test_multiple_auth_methods_round_trip_as_one_account(self, temp_home: Path):
+        api_key = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+        src = _linux_switcher(temp_home)
+        src.add_account_from_token(
+            "sk-ant-oat01-setup", email="alice@example.com"
+        )
+        src.add_account_from_token(api_key, email="alice@example.com")
+
+        out_file = temp_home / "multi-method.cswap"
+        export_accounts(src, str(out_file))
+        exported = json.loads(out_file.read_text())["accounts"]
+        assert len(exported) == 1
+        assert [item["method"] for item in exported[0]["authMethods"]] == [
+            AUTH_SETUP_TOKEN,
+            AUTH_API_KEY,
+        ]
+
+        dst_home = temp_home.parent / "dst-multi"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(out_file))
+                record = dst._get_sequence_data()["accounts"]["1"]
+                assert record["authMethods"] == [AUTH_SETUP_TOKEN, AUTH_API_KEY]
+                assert record["preferredAuthMethod"] == AUTH_API_KEY
+                assert dst._read_auth_method_credentials(
+                    "1", "alice@example.com", "", AUTH_SETUP_TOKEN
+                )
+                assert dst._read_auth_method_credentials(
+                    "1", "alice@example.com", "", AUTH_API_KEY
+                ) == api_key
 
     def test_active_state_carried_but_not_applied(self, temp_home: Path):
         src = _linux_switcher(temp_home)

@@ -224,6 +224,7 @@ class TestListJson:
         assert acct1["active"] is True
         assert acct1["usageStatus"] == "ok"
         assert acct1["authMethod"] == "setup_token"
+        assert acct1["authMethods"] == ["setup_token"]
         assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
 
     def test_list_payload_includes_alias(

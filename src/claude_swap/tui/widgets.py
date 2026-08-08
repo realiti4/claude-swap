@@ -187,9 +187,13 @@ def account_card_text(
     if age:
         text.append(f"   {age}", style=palette.muted)
 
-    text.append("\n    ")
-    text.append("Claude Code  ", style=palette.muted)
-    text.append(auth_method_label(acc.auth_method), style=palette.foreground)
+    methods = acc.auth_methods or (acc.auth_method,)
+    for method in methods:
+        text.append("\n    ")
+        text.append("Claude Code  ", style=palette.muted)
+        text.append(auth_method_label(method), style=palette.foreground)
+        if len(methods) > 1 and method == acc.auth_method:
+            text.append("  preferred", style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -260,7 +264,9 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
-    text.append(f"  · {auth_method_label(acc.auth_method)}", style=palette.muted)
+    methods = acc.auth_methods or (acc.auth_method,)
+    labels = ", ".join(auth_method_label(method) for method in methods)
+    text.append(f"  · {labels}", style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel

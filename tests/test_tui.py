@@ -638,6 +638,20 @@ class TestMiniAccountText:
         ).plain
         assert "API key" in mini_account_text(inactive, time.time()).plain
 
+    def test_multiple_auth_methods_are_grouped_on_one_account(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        acc = make_account(1, auth_method="api_key")
+        acc = dataclasses.replace(
+            acc,
+            auth_methods=("browser_oauth", "setup_token", "api_key"),
+        )
+        text = account_card_text(acc, 100).plain
+        assert text.count("Claude Code") == 3
+        assert "browser OAuth" in text
+        assert "one-year setup token" in text
+        assert "API key  preferred" in text
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 

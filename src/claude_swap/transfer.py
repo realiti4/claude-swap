@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
-from claude_swap.credentials import looks_like_api_key
+from claude_swap.credentials import (
+    AUTH_API_KEY,
+    AUTH_BROWSER_OAUTH,
+    AUTH_SETUP_TOKEN,
+    classify_auth_method,
+    looks_like_api_key,
+)
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
@@ -29,6 +35,11 @@ if TYPE_CHECKING:
 
 
 FORMAT_VERSION = 1
+_TRANSFER_AUTH_METHODS = {
+    AUTH_BROWSER_OAUTH,
+    AUTH_SETUP_TOKEN,
+    AUTH_API_KEY,
+}
 
 _PLATFORM_TAG = {
     Platform.MACOS: "macos",
@@ -160,6 +171,33 @@ def _slim_credentials(creds_obj: dict) -> dict:
     return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
 
 
+def _credentials_payload(credentials: str, label: str, full: bool) -> Any:
+    """Serialize one login secret using the existing transfer representation."""
+    if looks_like_api_key(credentials):
+        return credentials.strip()
+    payload = _parse_payload(credentials, label)
+    return payload if full else _slim_credentials(payload)
+
+
+def _imported_credentials_text(value: Any, method: str, email: str) -> str:
+    """Validate and normalize one imported login method secret."""
+    if method == AUTH_API_KEY:
+        if not (isinstance(value, str) and looks_like_api_key(value)):
+            raise TransferError(
+                f"API-key credentials for {email} must be a raw sk-ant-api… string"
+            )
+        return value.strip()
+    if not isinstance(value, dict):
+        raise TransferError(f"credentials for {email} must be a JSON object")
+    text = json.dumps(value)
+    classified = classify_auth_method(text)
+    if classified != method:
+        raise TransferError(
+            f"credentials for {email} do not match auth method {method}"
+        )
+    return text
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
@@ -225,6 +263,19 @@ def export_accounts(
             if not config_path.exists():
                 raise ConfigError("Claude config file not found")
             config_text = config_path.read_text(encoding="utf-8")
+            if isinstance(record.get("authMethods"), list):
+                preferred = switcher._preferred_auth_method(
+                    num, data=sequence_data
+                )
+                if classify_auth_method(creds_text) != preferred:
+                    creds_text = switcher._read_auth_method_credentials(
+                        num, email, org_uuid, preferred
+                    )
+                    if not creds_text:
+                        raise CredentialReadError(
+                            f"no stored {preferred} credentials found for "
+                            f"account {num} ({email})"
+                        )
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
@@ -248,16 +299,13 @@ def export_accounts(
         if not full:
             config_obj = _slim_config(config_obj, f"config for {email}")
 
-        # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
-        # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
-        # below doesn't choke and import can restore it as-is.
+        # Keep the v1 preferred credential fields for older importers. Accounts
+        # with child login methods add an optional list below; usage and identity
+        # remain account-owned and are not duplicated per method.
         is_api_key = looks_like_api_key(creds_text)
-        if is_api_key:
-            creds_payload: Any = creds_text.strip()
-        else:
-            creds_payload = _parse_payload(creds_text, f"credentials for {email}")
-            if not full:
-                creds_payload = _slim_credentials(creds_payload)
+        creds_payload = _credentials_payload(
+            creds_text, f"credentials for {email}", full
+        )
         entry: dict[str, Any] = {
             "number": int(num),
             "email": email,
@@ -270,6 +318,38 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+        stored_methods = record.get("authMethods")
+        if isinstance(stored_methods, list):
+            preferred = switcher._preferred_auth_method(
+                num, credentials=creds_text, data=sequence_data
+            )
+            method_entries: list[dict[str, Any]] = []
+            for method in switcher._account_auth_methods(
+                num, credentials=creds_text, data=sequence_data
+            ):
+                method_creds = (
+                    creds_text
+                    if method == preferred
+                    else switcher._read_auth_method_credentials(
+                        num, email, org_uuid, method
+                    )
+                )
+                if not method_creds:
+                    raise CredentialReadError(
+                        f"no stored {method} credentials found for account {num} ({email})"
+                    )
+                method_entries.append(
+                    {
+                        "method": method,
+                        "credentials": _credentials_payload(
+                            method_creds,
+                            f"{method} credentials for {email}",
+                            full,
+                        ),
+                    }
+                )
+            entry["authMethods"] = method_entries
+            entry["preferredAuthMethod"] = preferred
         if record.get("alias"):
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
@@ -383,20 +463,51 @@ def import_accounts(
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
         # API-key accounts carry the credential as a raw string; OAuth accounts
-        # carry a JSON object.
+        # carry a JSON object. Optional child methods are additive to format v1.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
-                raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
-                )
-            creds_text = creds_obj.strip()
+            preferred_method = AUTH_API_KEY
+            creds_text = _imported_credentials_text(
+                creds_obj, preferred_method, email
+            )
         else:
             if not isinstance(creds_obj, dict):
                 raise TransferError(
                     f"credentials for {email} must be a JSON object"
                 )
             creds_text = json.dumps(creds_obj)
+            preferred_method = classify_auth_method(creds_text)
+            if preferred_method not in _TRANSFER_AUTH_METHODS:
+                # Legacy exports may use an old OAuth object shape that cannot
+                # be classified locally. Version 1 accepted it as OAuth.
+                preferred_method = AUTH_BROWSER_OAUTH
+
+        method_credentials: dict[str, str] = {}
+        raw_methods = raw.get("authMethods")
+        if raw_methods is not None:
+            if not isinstance(raw_methods, list) or not raw_methods:
+                raise TransferError(
+                    f"authMethods for {email} must be a non-empty list"
+                )
+            for child in raw_methods:
+                if not isinstance(child, dict):
+                    raise TransferError(f"authMethods for {email} must contain objects")
+                method = child.get("method")
+                if method not in _TRANSFER_AUTH_METHODS:
+                    raise TransferError(
+                        f"unsupported auth method for {email}: {method!r}"
+                    )
+                if method in method_credentials:
+                    raise TransferError(f"duplicate auth method for {email}: {method}")
+                method_credentials[method] = _imported_credentials_text(
+                    child.get("credentials"), method, email
+                )
+            preferred_method = raw.get("preferredAuthMethod")
+            if preferred_method not in method_credentials:
+                raise TransferError(
+                    f"preferredAuthMethod for {email} must name an imported auth method"
+                )
+            creds_text = method_credentials[preferred_method]
         key = (email, org_uuid)
         if key in seen_keys:
             raise TransferError(
@@ -428,7 +539,9 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": "api_key" if preferred_method == AUTH_API_KEY else "oauth",
+                "preferred_method": preferred_method,
+                "method_credentials": method_credentials,
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -528,6 +641,10 @@ def import_accounts(
         switcher._write_account_config(
             target_num, entry["email"], entry["config_text"]
         )
+        for method, method_creds in entry["method_credentials"].items():
+            switcher._write_auth_method_secret(
+                entry["email"], entry["org_uuid"], method, method_creds
+            )
         # Every successful import write introduces credential material whose
         # previous auth verdict is no longer authoritative, so lift any
         # dead-token quarantine on this slot (mirrors add_account / the
@@ -550,6 +667,9 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        if entry["method_credentials"]:
+            new_record["authMethods"] = list(entry["method_credentials"])
+            new_record["preferredAuthMethod"] = entry["preferred_method"]
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record
