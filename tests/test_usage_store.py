@@ -1642,3 +1642,27 @@ class TestClaimTrustBridge:
         assert entry.decision_value() == USAGE
         clock.advance(CLAIM_TTL_S)  # claim expired, no result recorded
         assert store.entries(IDENT)["1"].decision_value() is None
+
+
+class TestPartialSurvivesTheStore:
+    """The ``partial`` marker is what keeps an incomplete measurement
+    unrankable, and every surface reads its usage back out of the store rather
+    than from the fetch. A marker that did not round-trip would restore the
+    confident headroom on the next read."""
+
+    PARTIAL = {"five_hour": {"pct": 0.0}, "partial": True, "source": "headers"}
+
+    def test_the_marker_and_the_source_round_trip(self, store, clock):
+        store.record(
+            {"1": FetchRecord(usage=self.PARTIAL, rescued_from="http-429")}, IDENT
+        )
+        last_good = store.entries(IDENT)["1"].last_good
+        assert last_good["partial"] is True
+        assert last_good["source"] == "headers"
+
+    def test_the_row_stays_unrankable_after_a_reload(self, store, clock):
+        store.record(
+            {"1": FetchRecord(usage=self.PARTIAL, rescued_from="http-429")}, IDENT
+        )
+        entry = store.entries(IDENT)["1"]
+        assert oauth.account_headroom(entry.decision_value()) is None

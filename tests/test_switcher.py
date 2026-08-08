@@ -31,6 +31,7 @@ from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
+    last_seen_note,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
@@ -8523,3 +8524,34 @@ class TestEveryFetchSiteCarriesTheFallbackSetting:
             switcher.list_accounts()
 
         assert len(calls) == 1, f"read the settings file {len(calls)} times"
+
+
+class TestAPartialMeasurementStaysVisible:
+    """A partial measurement withholds the HEADROOM, not the numbers: the whole
+    reason to keep it is that a number beats "usage unavailable". The
+    "last seen" note (shared word-for-word by the CLI and the TUI) reads the
+    windows directly for that reason, and says which measurements were
+    incomplete so nobody mistakes a surviving window for the whole account.
+    """
+
+    def _entry(self, usage: dict) -> UsageEntry:
+        return UsageEntry(last_good=usage, fetched_at=time.time())
+
+    def test_a_partial_row_still_reports_its_number(self):
+        note = last_seen_note(self._entry({
+            "five_hour": {"pct": 40.0}, "partial": True, "source": "headers",
+        }))
+        assert note is not None
+        assert "40% used" in note
+        assert "(partial)" in note
+
+    def test_a_complete_row_reads_exactly_as_before(self):
+        note = last_seen_note(self._entry({
+            "five_hour": {"pct": 53.0}, "seven_day": {"pct": 12.0},
+        }))
+        assert note is not None
+        assert note.startswith("last seen 53% used · ")
+        assert "partial" not in note
+
+    def test_no_windows_at_all_still_has_no_note(self):
+        assert last_seen_note(self._entry({"spend": {"pct": 10.0}})) is None

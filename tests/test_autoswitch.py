@@ -6757,6 +6757,10 @@ class TestHeaderProbeDataThatCannotBeRanked:
         rescued = self._rescued(
             **{"anthropic-ratelimit-unified-7d-utilization": "nan"}
         )
+        assert rescued["five_hour"]["pct"] == 0.0, (
+            "premise: the measurement must survive with its healthy-looking 5h "
+            "window, or this passes for the wrong reason"
+        )
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": rescued, "3": None,
         })
@@ -6836,6 +6840,10 @@ class TestEscalationCannotOutrunThePost429Floor:
         probes = self._fetches_in_an_hour(h, rescued=True)
         budget = 3600.0 / poll_policy.POST_429_MIN_INTERVAL_S
         assert probes <= budget, f"{probes} probes/hour exceeds {budget}"
+        assert probes <= 6, (
+            f"{probes} probes/hour: the AIMD growth past the floor has stopped "
+            "working, measured 5 when this was written"
+        )
 
     def test_an_unrescued_account_keeps_its_escalation_cadence(
         self, temp_home, monkeypatch
@@ -6917,3 +6925,42 @@ class TestAModelGatedFleetCannotRankAHeaderRescue:
         h.tick_with_usage({"1": self.RESCUED, "2": self.RESCUED})
         warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
         assert warnings == []
+
+
+class TestAPartialMeasurementIsVisibleOnThePollEvent:
+    """``cswap auto --json`` is what a script watches, and its human line is
+    what an operator reads. A partial measurement has real window numbers and no
+    headroom, so without a marker the stream shows a healthy-looking pct beside
+    a null headroom, and the human line shows the number with nothing saying the
+    engine will not act on it."""
+
+    PARTIAL = {"five_hour": {"pct": 0.0}, "partial": True, "source": "headers"}
+
+    def _poll(self, harness, usage: dict) -> PollEvent:
+        harness.tick_with_usage(usage)
+        return next(e for e in harness.events if isinstance(e, PollEvent))
+
+    def test_the_payload_names_the_partial_accounts(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": self.PARTIAL, "3": _usage(10),
+        })
+        assert poll.to_json()["partialUsage"] == ["2"]
+        assert poll.to_json()["headroomPct"]["2"] is None
+
+    def test_a_complete_tick_omits_the_field(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": _usage(10), "3": _usage(10),
+        })
+        assert "partialUsage" not in poll.to_json()
+
+    def test_the_human_line_marks_a_partial_candidate(self, harness):
+        poll = self._poll(harness, {
+            "1": _usage(50), "2": self.PARTIAL, "3": _usage(10),
+        })
+        assert "#2: 5h 0% (partial)" in poll.human()
+
+    def test_the_human_line_marks_a_partial_active_account(self, harness):
+        poll = self._poll(harness, {
+            "1": self.PARTIAL, "2": _usage(10), "3": _usage(10),
+        })
+        assert "usage incomplete" in poll.human()

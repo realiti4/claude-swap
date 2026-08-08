@@ -298,6 +298,14 @@ class PollEvent(AutoSwitchEvent):
     Additive like ``fetch_errors``/``windows``, and the one place a watcher can
     see metadata polling spending the account's own inference quota.
     """
+    partial: tuple[str, ...] = ()
+    """Account numbers whose measurement could not read every gating window.
+
+    Their ``windowsPct`` entries are real numbers with no headroom behind them
+    (``headroomPct`` is null), so a consumer that ranked on the windows alone
+    would make exactly the mistake the engine no longer makes. Additive, and
+    marked in ``human()`` too, where a bare pct otherwise reads as healthy.
+    """
 
     def _fields(self) -> dict:
         fields = {
@@ -311,12 +319,21 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.sources:
             fields["usageSources"] = self.sources
+        if self.partial:
+            fields["partialUsage"] = list(self.partial)
         return fields
 
-    def _describe(self, num: str) -> str:
+    def _windows_text(self, num: str) -> str:
+        """``"5h 12% · 7d 40%"`` for one account, or "" when none were read."""
         wins = self.windows.get(num)
-        if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+        if not wins:
+            return ""
+        return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+
+    def _describe(self, num: str) -> str:
+        shown = self._windows_text(num)
+        if shown:
+            return f"{shown} (partial)" if num in self.partial else shown
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -330,6 +347,9 @@ class PollEvent(AutoSwitchEvent):
         h = self.headroom.get(str(num))
         if h is not None:
             used = f"{100 - h:.0f}% used"
+        elif str(num) in self.partial:
+            shown = self._windows_text(str(num))
+            used = f"usage incomplete ({shown})" if shown else "usage incomplete"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -552,7 +572,10 @@ def _binding_recovery_ts(
     utilization among the windows that gate it (the same set
     ``account_headroom`` measures, so ranking and headroom can never disagree
     about which window matters). Its reset is the moment the account becomes
-    useful again.
+    useful again. The one asymmetry: this reads the windows even when
+    ``account_headroom`` withholds a headroom (an incomplete measurement, see
+    ``oauth.account_headroom``). Such an account is unrankable anyway, and here
+    the effect is a recovery estimate no later than the truth.
 
     Not the weekly window: with every account in the 90s the thing that
     decides where to go is which 5-hour window rolls over first, and that is
@@ -933,6 +956,11 @@ class AutoSwitchEngine:
                     for num, value in usage.items()
                     if isinstance(value, dict) and value.get("source")
                 },
+                partial=tuple(
+                    num
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and value.get("partial")
+                ),
             )
         )
 
@@ -1933,9 +1961,10 @@ class AutoSwitchEngine:
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
-        escalation condition (the deliberate exception: an owned-and-expired
-        active is excluded above, so a post-idle-hold failover can run
-        without escalating). The consume-first trigger can fire outside the
+        escalation condition (two deliberate exceptions: an owned-and-expired
+        active is excluded above, so a post-idle-hold failover can run without
+        escalating, and an account whose own post-429 plan is still in the
+        future keeps that plan, see below). The consume-first trigger can fire outside the
         escalation band, so it instead decides *provisionally* on the stored
         snapshot and, only when a switch would fire, re-runs an escalated
         collection and re-verifies the choice in ``_tick_inner`` (two-phase

@@ -179,14 +179,21 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
     Public: the TUI renders the same note under sentinel states (see
     ``SENTINEL_NOTES``), so both surfaces stay word-for-word identical.
+
+    Reads the windows rather than ``account_headroom`` so a ``partial``
+    measurement keeps its number: withholding the headroom is a decision rule,
+    and this line is display, where a number beats "unavailable". Marked
+    ``(partial)`` so the surviving window is not read as the whole account. For
+    a complete measurement the two paths give the identical figure.
     """
     if entry.last_good is None or entry.fetched_at is None:
         return None
-    headroom = oauth.account_headroom(entry.last_good)
-    if headroom is None:
+    pcts = [pct for _, pct, _ in oauth.relevant_windows(entry.last_good)]
+    if not pcts:
         return None
+    marker = " (partial)" if entry.last_good.get("partial") else ""
     return (
-        f"last seen {100 - headroom:.0f}% used · "
+        f"last seen {max(pcts):.0f}% used{marker} · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
 
