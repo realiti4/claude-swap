@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -81,26 +82,53 @@ def _reset_iso(raw: str) -> str | None:
         return None
 
 
+def _utilization_pct(raw: str) -> float | None:
+    """A utilization fraction as a percentage, or None when it is not usable.
+
+    ``float()`` accepts ``"nan"``, ``"inf"`` and negatives, and each of those
+    stored as a percentage reads downstream as a real measurement: nan loses
+    every comparison it takes part in, an infinity poisons the reset math, and
+    a negative fraction invents headroom the account does not have. Rejected
+    here at the boundary so nothing past this module has to defend against
+    them.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value * 100
+
+
 def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
     """Normalize ``anthropic-ratelimit-unified-*`` headers into cswap's usage shape.
 
     Reads the ``5h``/``7d`` ``utilization`` and ``reset`` headers
-    case-insensitively, scales utilization from a fraction to a percentage,
-    then delegates the final shape to ``oauth.build_usage_result`` so the
-    output is indistinguishable from a real usage-endpoint fetch. A window
-    whose ``utilization`` header is missing or unparseable is skipped
-    entirely, not defaulted to 0 (which would misreport a window this source
-    never actually saw as an idle one). Returns None when no window
-    survives, matching ``build_usage_result``'s own empty-result contract.
+    case-insensitively, scales utilization from a fraction to a percentage
+    (see the module docstring), then delegates the final shape to
+    ``oauth.build_usage_result`` so the output renders like a real
+    usage-endpoint fetch. Returns None when no window survives, matching
+    ``build_usage_result``'s own empty-result contract.
+
+    A window whose ``utilization`` header is missing or unusable is skipped
+    rather than defaulted to 0, and the result is marked ``partial`` so
+    ``oauth.account_headroom`` reports UNKNOWN instead of the surviving
+    window's headroom. Both halves matter: the number is still worth showing,
+    but one window's headroom is not the account's. Verified live against an
+    account at 5h 0% / 7d 100% -- dropping the weekly utilization header made
+    it read as 100% headroom, i.e. the fleet's preferred rotation target.
+    Unlike the usage endpoint, which is authoritative about which windows an
+    account has, a header set can lose one in transit, so incompleteness here
+    is never evidence that a window does not exist.
     """
     endpoint_shaped: dict = {}
     for prefix, key in _WINDOWS:
         raw_util = _header(headers, f"anthropic-ratelimit-unified-{prefix}-utilization")
         if raw_util is None:
             continue
-        try:
-            pct = float(raw_util) * 100
-        except ValueError:
+        pct = _utilization_pct(raw_util)
+        if pct is None:
             continue
         window: dict = {"utilization": pct}
         raw_reset = _header(headers, f"anthropic-ratelimit-unified-{prefix}-reset")
@@ -111,7 +139,12 @@ def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
         endpoint_shaped[key] = window
     if not endpoint_shaped:
         return None
-    return oauth.build_usage_result(endpoint_shaped)
+    result = oauth.build_usage_result(endpoint_shaped)
+    if result is None:
+        return None
+    if any(key not in endpoint_shaped for _, key in _WINDOWS):
+        result["partial"] = True
+    return result
 
 
 def probe_usage(access_token: str, timeout_s: float = 30.0) -> dict | None:

@@ -6716,3 +6716,64 @@ class TestReviewFindings202:
         assert sw.trigger == "at-limit"
 
 
+
+
+class TestHeaderProbeDataThatCannotBeRanked:
+    """Issue #220's header-probe rescue can come back with only some of the
+    gating windows: a proxy strips a header, or one arrives malformed. The
+    account below is really at 100% weekly with an idle 5-hour window, so the
+    surviving header reads as full headroom. Ranking on it would make the one
+    exhausted account in the fleet the preferred rotation target."""
+
+    HEADERS = {
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-5h-status": "allowed",
+        "anthropic-ratelimit-unified-5h-utilization": "0.0",
+        "anthropic-ratelimit-unified-7d-status": "rejected",
+        "anthropic-ratelimit-unified-7d-utilization": "1.0",
+    }
+
+    def _rescued(self, **overrides) -> dict:
+        from claude_swap.unified_headers import parse_unified_headers
+
+        headers = {**self.HEADERS, **overrides}
+        return parse_unified_headers(
+            {k: v for k, v in headers.items() if v is not None}
+        )
+
+    def test_a_missing_weekly_header_is_not_a_switch_target(self, harness):
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": None}
+        )
+        assert rescued["five_hour"]["pct"] == 0.0
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_a_malformed_weekly_header_is_not_a_switch_target(self, harness):
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": "nan"}
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_a_complete_rescued_header_set_is_still_a_switch_target(
+        self, harness
+    ):
+        """The rescue must keep working: a full header set from a healthy
+        account ranks exactly like an endpoint measurement."""
+        rescued = self._rescued(
+            **{"anthropic-ratelimit-unified-7d-utilization": "0.05"}
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": rescued, "3": None,
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2

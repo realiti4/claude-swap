@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from claude_swap import oauth
 from claude_swap.unified_headers import parse_unified_headers
 
 HEALTHY = {
@@ -59,11 +62,57 @@ def test_header_lookup_is_case_insensitive():
     assert parse_unified_headers(upper)["five_hour"]["pct"] == 11.0
 
 
-def test_partial_windows_are_allowed():
+def test_a_complete_header_set_ranks_normally():
+    """The safe row of the table: both gating windows read, so headroom is a
+    confident number and the account is rankable."""
+    assert oauth.account_headroom(parse_unified_headers(HEALTHY)) == pytest.approx(89.0)
+    assert oauth.account_headroom(parse_unified_headers(EXHAUSTED)) == 0.0
+
+
+def test_partial_windows_are_shown_but_never_ranked():
+    """A window this source never saw is still worth SHOWING (a number beats
+    "unavailable"), but the surviving window's headroom is not the account's:
+    a dropped weekly header on an exhausted account would otherwise read as
+    100% headroom and make it the preferred rotation target."""
     only5h = {k: v for k, v in HEALTHY.items() if "-7d-" not in k}
     out = parse_unified_headers(only5h)
     assert out["five_hour"]["pct"] == 11.0
     assert "seven_day" not in out
+    assert out["partial"] is True
+    assert oauth.account_headroom(out) is None
+
+
+def test_a_dropped_weekly_header_cannot_make_an_exhausted_account_look_healthy():
+    """The live case: true state is 5h 0%, 7d 100%. Losing the weekly
+    utilization header must not turn that into full headroom."""
+    dropped = {
+        k: v
+        for k, v in EXHAUSTED.items()
+        if k != "anthropic-ratelimit-unified-7d-utilization"
+    }
+    out = parse_unified_headers(dropped)
+    assert out["five_hour"]["pct"] == 0.0
+    assert oauth.account_headroom(out) is None
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity", "-0.5"])
+def test_non_finite_and_negative_utilization_is_rejected(raw):
+    """``float()`` accepts all of these, and each one stored as a percentage
+    reads downstream as a measurement: nan loses every comparison, an infinity
+    poisons the reset math, and a negative fraction invents headroom."""
+    bad = dict(HEALTHY, **{"anthropic-ratelimit-unified-7d-utilization": raw})
+    out = parse_unified_headers(bad)
+    assert "seven_day" not in out
+    assert out["partial"] is True
+    assert oauth.account_headroom(out) is None
+
+
+def test_a_five_hour_infinity_is_never_stored_as_a_pct():
+    bad = dict(HEALTHY, **{"anthropic-ratelimit-unified-5h-utilization": "inf"})
+    out = parse_unified_headers(bad)
+    assert "five_hour" not in out
+    assert out["seven_day"]["pct"] == 10.0
+    assert oauth.account_headroom(out) is None
 
 
 def test_malformed_values_are_skipped_not_fatal():
@@ -71,3 +120,4 @@ def test_malformed_values_are_skipped_not_fatal():
     out = parse_unified_headers(bad)
     assert "five_hour" not in out
     assert out["seven_day"]["pct"] == 10.0
+    assert oauth.account_headroom(out) is None

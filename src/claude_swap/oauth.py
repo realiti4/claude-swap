@@ -520,8 +520,16 @@ def account_headroom(
     of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
     account is at or over a limit. Returns ``None`` when usage is unavailable
     or carries no window data, which callers treat as "unknown" (never
-    auto-skipped).
+    auto-skipped, never ranked).
+
+    ``usage["partial"]`` is the same answer for a measurement whose source
+    could not read every gating window (see
+    ``unified_headers.parse_unified_headers``): the windows it did read are
+    still worth displaying, but one window's headroom is not the account's,
+    and a confident number here would rank an account nobody measured.
     """
+    if isinstance(usage, dict) and usage.get("partial"):
+        return None
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
         return None
