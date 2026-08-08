@@ -217,6 +217,87 @@ Examples:
         sys.exit(130)
 
 
+def _desktop_command(argv: list[str]) -> None:
+    """Handle ``cswap desktop NUM|EMAIL [options]``."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} desktop",
+        description=(
+            "Switch Claude Desktop to a stored account while keeping resumable "
+            "local Code sessions visible. macOS only."
+        ),
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the local sessions that would be added; change nothing",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    parser.add_argument(
+        "--confirm-login",
+        action="store_true",
+        help="Record a visually verified one-time Desktop login",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        profile_overrides = (
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "CLAUDE_USER_DATA_DIR",
+        )
+        if any(os.environ.get(name) for name in profile_overrides):
+            raise ClaudeSwitchError(
+                "Desktop switching must run from the default Claude profile. "
+                f"Unset {', '.join(profile_overrides)} first."
+            )
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        from claude_swap.desktop import DesktopManager
+
+        payload = DesktopManager(switcher).run(
+            args.account,
+            dry_run=args.dry_run,
+            json_output=args.json,
+            confirm_login=args.confirm_login,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return
+        sessions = payload["sessions"]
+        verb = "Would add" if args.dry_run else "Added"
+        print(
+            f"{accent(verb)} {sessions['copied']} local session(s); "
+            f"{sessions['existing']} already visible; "
+            f"{sessions['unavailable']} unavailable."
+        )
+        if payload["loginRequired"] and not args.dry_run:
+            print(
+                "Sign in once in the opened Claude window, verify the account "
+                "email, then rerun with --confirm-login."
+            )
+        elif not args.dry_run:
+            state = "already active" if payload["alreadyActive"] else "switched"
+            print(f"Claude Desktop {state} to {payload['account']['email']}.")
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
@@ -865,10 +946,13 @@ def main() -> None:
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
 
-    # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    # `run`, `desktop`, and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "desktop":
+        _desktop_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -920,6 +1004,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s desktop <num|email>        switch Claude Desktop and share local sessions
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
@@ -949,6 +1034,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s desktop 2 --dry-run                # preview Desktop session reconciliation
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
 
