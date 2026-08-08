@@ -15,6 +15,35 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 
+# IMPORTED HERE SO IT CANNOT BE FIRST-IMPORTED INSIDE A `patch.dict(sys.modules)`
+# BLOCK, which several tests in this suite use to fake `keyring`.
+#
+# `patch.dict` restores by CLEARING the dict and repopulating from an
+# entry-time snapshot, so a module first imported INSIDE the block is DELETED
+# from `sys.modules` on exit — while surviving as an attribute of its parent
+# package. `claude_swap.pin` then becomes an orphan: reachable as
+# `claude_swap.pin`, absent from `sys.modules`.
+#
+# That breaks patching in a way that looks like nothing at all.
+# `monkeypatch.setattr("claude_swap.pin.run", …)` resolves by importing the
+# ROOT and walking with `getattr`, so it patches the orphan and reports
+# success — while a later `from claude_swap.pin import run` finds no
+# `sys.modules` entry, RE-IMPORTS a fresh module, and calls the REAL function.
+# The patch and the call land on two different module objects, and nothing
+# raises.
+#
+# Measured: `test_cli_accepts_heal` failed 4 in 32 full-suite runs under
+# `-n auto` exactly this way — its stub never called, its tripwire never
+# fired, because the real `run` and the real `heal` both ran on the fresh
+# module and printed "Nothing to heal". Whether it happens depends on which
+# worker gets a `patch.dict(sys.modules)` test first, which is why it read as
+# a concurrency bug for months.
+#
+# Importing it before any test runs puts it in every snapshot, so the restore
+# preserves it. One line here covers every site that patches
+# `claude_swap.pin.*` instead of each of them guarding separately.
+from claude_swap import pin as _pin_keep_in_sys_modules  # noqa: F401
+
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
