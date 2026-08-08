@@ -15,8 +15,23 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 
-# IMPORTED HERE SO IT CANNOT BE FIRST-IMPORTED INSIDE A `patch.dict(sys.modules)`
+# IMPORTED HERE SO THEY CANNOT BE FIRST-IMPORTED INSIDE A `patch.dict(sys.modules)`
 # BLOCK, which several tests in this suite use to fake `keyring`.
+#
+# THREE MODULES, NOT ONE, AND THE OTHER TWO ARRIVE THROUGH pin's OWN LAZY
+# IMPORT. Traced with a hook on `builtins.__import__`:
+#
+#     pin.py:1049         impl = _impl()
+#     pin.py:186          raise ClaudeSwitchError(_install_hint())
+#     pin.py:132          from claude_swap.update_check import _detect_install_method
+#     update_check.py:12  from claude_swap.cache import CACHE_DIR, MISSING, ...
+#
+# `_install_hint()` runs only when the `pin` extra is MISSING, so which modules
+# get orphaned depends on whether the extra is installed on that machine —
+# which is why this measured as one module here (extra present) and three on a
+# box without it. Both configurations are real, so all three are listed.
+# Importing `pin` alone does NOT cover the other two: the chain is a
+# function-level import and never runs at module scope.
 #
 # `patch.dict` restores by CLEARING the dict and repopulating from an
 # entry-time snapshot, so a module first imported INSIDE the block is DELETED
@@ -42,7 +57,17 @@ from claude_swap import macos_keychain as _macos_keychain
 # Importing it before any test runs puts it in every snapshot, so the restore
 # preserves it. One line here covers every site that patches
 # `claude_swap.pin.*` instead of each of them guarding separately.
-from claude_swap import pin as _pin_keep_in_sys_modules  # noqa: F401
+#
+# NOT HOISTED IN pin.py INSTEAD, which was the tempting fix: making that import
+# module-level would pull the chain in by itself and need only one line here.
+# But `cache.py` computes `CACHE_DIR = get_backup_root() / "cache"` AT IMPORT
+# TIME, so hoisting moves that evaluation earlier and freezes it against
+# whatever HOME is set then. This suite isolates HOME per test and raises
+# RealStoreWriteBlocked on a real-store write; changing production import order
+# to suit a test hazard is the wrong direction anyway.
+from claude_swap import cache as _keep_cache  # noqa: F401
+from claude_swap import pin as _keep_pin  # noqa: F401
+from claude_swap import update_check as _keep_update_check  # noqa: F401
 
 
 class _KeychainStore:
