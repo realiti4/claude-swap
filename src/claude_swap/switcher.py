@@ -3700,11 +3700,16 @@ class ClaudeAccountSwitcher:
 
         A configured name that no account reports gates nothing while looking
         active. Only claimed when every account's usage is readable (an
-        unreadable account could be the one carrying the window)."""
+        unreadable account could be the one carrying the window) and every
+        measurement could see the per-model axis at all: a header-rescued row
+        never reports ``scoped`` windows (``oauth.scoped_axis_unseen``), so it
+        cannot tell an absent model from an unobservable one."""
         wanted = {m.lower(): m for m in models if m.lower() != "all"}
         if not wanted or not usage:
             return
         if any(not isinstance(v, dict) for v in usage.values()):
+            return
+        if any(oauth.scoped_axis_unseen(v, models) for v in usage.values()):
             return
         seen = {
             s["name"].lower()

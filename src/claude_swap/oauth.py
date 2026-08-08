@@ -526,13 +526,41 @@ def account_headroom(
     not read every gating window, see
     ``unified_headers.parse_unified_headers``): those windows are worth
     displaying, but one window's headroom is not the account's.
+
+    And ``None`` when ``models`` are configured but the measurement came from
+    a source that cannot see the per-model axis (see
+    :func:`scoped_axis_unseen`). Same rule, one axis over: the 5h/7d numbers
+    are real, they just do not answer the question the user asked.
     """
     if isinstance(usage, dict) and usage.get("partial"):
+        return None
+    if scoped_axis_unseen(usage, models):
         return None
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
         return None
     return 100.0 - max(pcts)
+
+
+def scoped_axis_unseen(usage: dict | None, models: Sequence[str] = ()) -> bool:
+    """Whether ``models`` are configured and this source cannot report them.
+
+    The ``anthropic-ratelimit-unified-*`` headers carry the 5-hour and 7-day
+    windows and nothing per-model, so a header-rescued measurement (issue
+    #220) has no view of the ``scoped`` weekly limits the usage endpoint
+    reports in its ``limits`` array. A missing scoped window from the ENDPOINT
+    means the account has no such limit; from this source it means nobody
+    looked. Keyed on ``source`` rather than on the absence of ``scoped``, so a
+    header source that ever learns to report per-model windows stops tripping
+    this on its own.
+
+    Two callers: :func:`account_headroom`, which reports unknown instead of a
+    headroom that ignores the axis the user pinned; and the ``--model`` typo
+    guards, which must not call a name absent when it is merely unobservable.
+    """
+    if not models or not isinstance(usage, dict):
+        return False
+    return usage.get("source") == "headers" and "scoped" not in usage
 
 
 @dataclass(frozen=True)

@@ -1634,3 +1634,46 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestAHeaderRescueCannotAnswerForPerModelWindows:
+    """``anthropic-ratelimit-unified-*`` carries the 5h and 7d windows and
+    nothing per-model, so a rescued measurement (issue #220) has no view of the
+    ``scoped`` weekly limits the endpoint reports in its ``limits`` array. With
+    ``autoswitch.model`` set, that axis is the one the user said binds them, so
+    a confident headroom computed without it would rank an account whose model
+    quota is spent."""
+
+    RESCUED = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 20.0},
+        "source": "headers",
+    }
+    ENDPOINT_WITH_SCOPED = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 20.0},
+        "scoped": [{"name": "Fable", "pct": 100.0}],
+    }
+
+    def test_a_rescue_is_unrankable_once_a_model_is_configured(self):
+        assert oauth.account_headroom(self.RESCUED, ("Fable",)) is None
+
+    def test_the_same_rescue_still_ranks_without_a_model(self):
+        assert oauth.account_headroom(self.RESCUED) == 80.0
+
+    def test_an_endpoint_measurement_is_unaffected(self):
+        assert oauth.account_headroom(self.ENDPOINT_WITH_SCOPED, ("Fable",)) == 0.0
+        assert oauth.account_headroom(
+            {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}, ("Fable",)
+        ) == 80.0
+
+    def test_a_rescue_that_did_report_the_model_ranks_on_it(self):
+        """If a header source ever learns to report per-model windows, the
+        guard must stop firing on its own."""
+        rescued_with_scoped = dict(
+            self.RESCUED, scoped=[{"name": "Fable", "pct": 100.0}]
+        )
+        assert oauth.account_headroom(rescued_with_scoped, ("Fable",)) == 0.0
+
+    def test_the_all_sentinel_counts_as_a_configured_model(self):
+        assert oauth.account_headroom(self.RESCUED, ("all",)) is None

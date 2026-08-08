@@ -6871,3 +6871,49 @@ class TestPollEventReportsUsageProvenance:
         })
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
         assert "usageSources" not in poll.to_json()
+
+
+class TestAModelGatedFleetCannotRankAHeaderRescue:
+    """With ``autoswitch.model`` set, the per-model weekly window is part of
+    the decision, and a header rescue (issue #220) cannot see it: the unified
+    headers carry 5h and 7d only. Such an account must be unrankable, or the
+    engine hands the user's model-gated work to an account whose model quota
+    may be spent."""
+
+    RESCUED = {
+        "five_hour": {"pct": 5.0},
+        "seven_day": {"pct": 5.0},
+        "source": "headers",
+    }
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_rescued_candidate_is_not_a_target(self, temp_home: Path):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _model_usage(95.0, 10.0), "2": self.RESCUED})
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_an_endpoint_candidate_with_the_model_window_is_a_target(
+        self, temp_home: Path
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95.0, 10.0), "2": _model_usage(5.0, 5.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_rescue_does_not_earn_the_model_typo_warning(self, temp_home: Path):
+        """The configured name is not absent, it is unobservable on this
+        source. Claiming a typo would send the user hunting a spelling bug."""
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": self.RESCUED, "2": self.RESCUED})
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert warnings == []

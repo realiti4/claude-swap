@@ -2166,7 +2166,9 @@ class AutoSwitchEngine:
         active while gating nothing. That's only provable once every
         relevant oauth account has readable usage this tick — adaptive
         polling legitimately leaves gaps before that — and never worth a
-        forced refresh of its own.
+        forced refresh of its own. A header-rescued row cannot see the
+        per-model axis at all (``oauth.scoped_axis_unseen``), so it proves
+        nothing either way and defers the check the same as a gap does.
         """
         wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
         if not wanted:
@@ -2182,6 +2184,8 @@ class AutoSwitchEngine:
         readable = [v for v in values if isinstance(v, dict)]
         if not readable or len(readable) != len(values):
             return  # not every account observed yet — re-check next tick
+        if any(oauth.scoped_axis_unseen(v, self._models) for v in readable):
+            return
         seen = {
             s["name"].lower()
             for v in readable
