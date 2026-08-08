@@ -72,8 +72,10 @@ def test_no_claude_swap_module_is_orphaned():
         f"orphaned: {sorted(orphans)} -- first imported inside a "
         f"patch.dict(sys.modules, ...) block, so they are attributes of their "
         f"parent but absent from sys.modules. Any string-target patch of them "
-        f"now silently does nothing. Import them at conftest module level so "
-        f"they are in every entry-time snapshot."
+        f"now silently does nothing. conftest's autouse "
+        f"`_no_orphaned_claude_swap_modules` re-attaches them after every "
+        f"test, so seeing this means the orphan was created and read WITHIN a "
+        f"single test, which that fixture cannot reach."
     )
 
 

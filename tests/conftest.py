@@ -15,59 +15,69 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 
-# IMPORTED HERE SO THEY CANNOT BE FIRST-IMPORTED INSIDE A `patch.dict(sys.modules)`
-# BLOCK, which several tests in this suite use to fake `keyring`.
-#
-# THREE MODULES, NOT ONE, AND THE OTHER TWO ARRIVE THROUGH pin's OWN LAZY
-# IMPORT. Traced with a hook on `builtins.__import__`:
-#
-#     pin.py:1049         impl = _impl()
-#     pin.py:186          raise ClaudeSwitchError(_install_hint())
-#     pin.py:132          from claude_swap.update_check import _detect_install_method
-#     update_check.py:12  from claude_swap.cache import CACHE_DIR, MISSING, ...
-#
-# `_install_hint()` runs only when the `pin` extra is MISSING, so which modules
-# get orphaned depends on whether the extra is installed on that machine —
-# which is why this measured as one module here (extra present) and three on a
-# box without it. Both configurations are real, so all three are listed.
-# Importing `pin` alone does NOT cover the other two: the chain is a
-# function-level import and never runs at module scope.
-#
-# `patch.dict` restores by CLEARING the dict and repopulating from an
-# entry-time snapshot, so a module first imported INSIDE the block is DELETED
-# from `sys.modules` on exit — while surviving as an attribute of its parent
-# package. `claude_swap.pin` then becomes an orphan: reachable as
-# `claude_swap.pin`, absent from `sys.modules`.
-#
-# That breaks patching in a way that looks like nothing at all.
-# `monkeypatch.setattr("claude_swap.pin.run", …)` resolves by importing the
-# ROOT and walking with `getattr`, so it patches the orphan and reports
-# success — while a later `from claude_swap.pin import run` finds no
-# `sys.modules` entry, RE-IMPORTS a fresh module, and calls the REAL function.
-# The patch and the call land on two different module objects, and nothing
-# raises.
-#
-# Measured: `test_cli_accepts_heal` failed 4 in 32 full-suite runs under
-# `-n auto` exactly this way — its stub never called, its tripwire never
-# fired, because the real `run` and the real `heal` both ran on the fresh
-# module and printed "Nothing to heal". Whether it happens depends on which
-# worker gets a `patch.dict(sys.modules)` test first, which is why it read as
-# a concurrency bug for months.
-#
-# Importing it before any test runs puts it in every snapshot, so the restore
-# preserves it. One line here covers every site that patches
-# `claude_swap.pin.*` instead of each of them guarding separately.
-#
-# NOT HOISTED IN pin.py INSTEAD, which was the tempting fix: making that import
-# module-level would pull the chain in by itself and need only one line here.
-# But `cache.py` computes `CACHE_DIR = get_backup_root() / "cache"` AT IMPORT
-# TIME, so hoisting moves that evaluation earlier and freezes it against
-# whatever HOME is set then. This suite isolates HOME per test and raises
-# RealStoreWriteBlocked on a real-store write; changing production import order
-# to suit a test hazard is the wrong direction anyway.
-from claude_swap import cache as _keep_cache  # noqa: F401
-from claude_swap import pin as _keep_pin  # noqa: F401
-from claude_swap import update_check as _keep_update_check  # noqa: F401
+def _reattach_orphaned_modules() -> list[str]:
+    """Put back any ``claude_swap`` module a ``patch.dict`` restore deleted.
+
+    `unittest.mock`'s `patch.dict(sys.modules, ...)` — which several tests here
+    use to fake `keyring` — restores by CLEARING the dict and repopulating from
+    an ENTRY-TIME snapshot. A module FIRST IMPORTED INSIDE the block is
+    therefore DELETED from `sys.modules` on exit, while surviving as an
+    attribute of its parent package.
+
+    That pair (attribute of parent, absent from `sys.modules`) silently defeats
+    patching. `monkeypatch.setattr("claude_swap.X.f", stub)` resolves by
+    importing the ROOT and walking with `getattr`, so it finds the orphan,
+    patches it, and REPORTS SUCCESS — while `from claude_swap.X import f` finds
+    no `sys.modules` entry, RE-IMPORTS a fresh module, and calls the REAL `f`.
+    Two module objects, nothing raised. Measured: `test_cli_accepts_heal`
+    failed 4 in 32 full-suite runs that way, its stub never called and its own
+    tripwire never fired.
+
+    WHY THIS AND NOT A LIST OF IMPORTS. The first fix imported the three known
+    victims at module scope so they would be in every snapshot. It worked and
+    it was the wrong shape: three names are today's, a fourth joins them the
+    moment some other module is first imported inside such a block, and the
+    list goes stale WHILE STILL PASSING — the same failure as the verify-merge
+    greps deleted this morning. Worse, WHICH modules get orphaned depends on
+    the machine: `pin` alone where the `cswap-pin` extra is installed, and
+    `pin` + `update_check` + `cache` where it is not, because `_impl()` only
+    raises (and `_install_hint()` only runs its lazy import chain) when the
+    extra is absent. A list would have had to enumerate a set that differs per
+    environment, which is not a set anyone can keep correct.
+
+    This asks the question instead, so it holds for any module, on any machine,
+    with or without the extra.
+    """
+    import sys as _sys
+    from types import ModuleType as _ModuleType
+
+    restored: list[str] = []
+    for parent_name in [n for n in list(_sys.modules) if n.startswith("claude_swap")]:
+        parent = _sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        for attr in dir(parent):
+            child = getattr(parent, attr, None)
+            if not isinstance(child, _ModuleType):
+                continue
+            name = getattr(child, "__name__", "")
+            if name.startswith("claude_swap") and name not in _sys.modules:
+                _sys.modules[name] = child
+                restored.append(name)
+    return restored
+
+
+@pytest.fixture(autouse=True)
+def _no_orphaned_claude_swap_modules():
+    """Re-attach after every test, so the NEXT test patches what it calls.
+
+    Teardown, not setup: the orphan is created inside the test that runs the
+    `patch.dict` block, and the damage is done to whichever test patches that
+    module afterwards. Repairing at the end of each test closes the window
+    before anything can fall into it.
+    """
+    yield
+    _reattach_orphaned_modules()
 
 
 class _KeychainStore:
