@@ -4048,13 +4048,19 @@ class TestHealADeadPin:
         # patched stub NOR the real function. The old message asserted the
         # symptom and left that fact unrecorded.
         #
-        # WHAT THE CAPTURED RUN ACTUALLY PROVED, and it is the fact that moves
-        # this from "flaky" to a two-way question. Reproduced on gw22 with
-        # output kept: stdout carried `Nothing to heal`. That string has ONE
-        # source, `_nothing_to_heal`, reachable only through `heal` — so the
-        # REAL `run` ran AND the REAL `heal` ran, while both were patched. The
-        # old tripwire could not see it: it only fires if the real `run`
-        # reaches a `heal` that is still the raising stub.
+        # WHAT THE CAPTURED RUNS ACTUALLY PROVED, and it is the fact that moves
+        # this from "flaky" to a two-way question. 4 failures in 32 full-suite
+        # runs, and in EVERY ONE of the three kept captures stdout carried
+        # `Nothing to heal`. That string has ONE source, `_nothing_to_heal`,
+        # reachable only through `heal` — so the REAL `run` ran AND the REAL
+        # `heal` ran, while both were patched. The old tripwire could not see
+        # it: it only fires if the real `run` reaches a `heal` that is still
+        # the raising stub.
+        #
+        # THREE DIFFERENT WORKERS (gw3, gw22, gw29), so it is not one worker's
+        # state. Consistent across occurrences rather than a single reading —
+        # which is the difference between evidence and an anecdote, and the
+        # reason this comment states a mechanism instead of a suspicion.
         #
         # Ruled out by reading, so the next occurrence need not re-do it: no
         # in-process test rebinds `claude_swap.pin.run` (the two that assign it
@@ -4066,8 +4072,8 @@ class TestHealADeadPin:
         #
         # This splits what is left in two, which is all one line can do: either
         # the patch was gone by call time (something undid or overwrote it), or
-        # it held and `_pin_command` bound a third object anyway. Reproduced at
-        # roughly 1 run in 12 under `-n auto` on 3.14, never under `-n0`.
+        # it held and `_pin_command` bound a third object anyway. Measured at
+        # 4 in 32 under `-n auto` on 3.14, never under `-n0`.
         import claude_swap.pin as _pin_mod
         assert _pin_mod.run is _run, (
             f"the monkeypatch did not survive the call: claude_swap.pin.run is "
