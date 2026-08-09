@@ -219,6 +219,12 @@ def account_row(
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
+    auth_method: str | None = None,
+    auth_methods: list[str] | None = None,
+    auth_scope: str | None = None,
+    auth_supports_remote_control: bool | None = None,
+    auth_expires_at: str | None = None,
+    auth_method_details: list[dict] | None = None,
     alias: str = "",
     disabled: bool = False,
 ) -> dict:
@@ -234,6 +240,17 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if auth_method is not None:
+        row["authMethod"] = auth_method
+    if auth_methods is not None:
+        row["authMethods"] = auth_methods
+    if auth_scope is not None:
+        row["authScope"] = auth_scope
+        row["supportsRemoteControl"] = auth_supports_remote_control
+    if auth_expires_at is not None:
+        row["authExpiresAt"] = auth_expires_at
+    if auth_method_details is not None:
+        row["authMethodDetails"] = auth_method_details
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so

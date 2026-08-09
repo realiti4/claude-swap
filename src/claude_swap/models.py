@@ -121,6 +121,17 @@ class AccountInfo:
 
 
 @dataclass(frozen=True)
+class AuthMethodSnapshot:
+    """Safe display metadata for one stored Claude Code login method."""
+
+    method: str
+    scope: str
+    supports_remote_control: bool | None
+    expires_at: str | None
+    is_default: bool = False
+
+
+@dataclass(frozen=True)
 class AccountSnapshot:
     """One managed account as seen by interactive UIs (the TUI).
 
@@ -138,6 +149,12 @@ class AccountSnapshot:
     kind: str  # "oauth" | "api_key"
     switchable: bool
     usage: UsageEntry
+    auth_method: str = "unknown"
+    auth_methods: tuple[str, ...] = ()
+    auth_scope: str = "unknown"
+    auth_supports_remote_control: bool | None = None
+    auth_expires_at: str | None = None
+    auth_method_details: tuple[AuthMethodSnapshot, ...] = ()
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
 

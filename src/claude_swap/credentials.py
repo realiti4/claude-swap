@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -111,6 +112,137 @@ def _credential_object(credentials: str | None) -> dict | None:
     except (json.JSONDecodeError, TypeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+AUTH_BROWSER_OAUTH = "browser_oauth"
+AUTH_SETUP_TOKEN = "setup_token"
+AUTH_API_KEY = "api_key"
+AUTH_UNKNOWN = "unknown"
+
+AUTH_SCOPE_FULL = "full"
+AUTH_SCOPE_INFERENCE_ONLY = "inference_only"
+AUTH_SCOPE_UNKNOWN = "unknown"
+
+AUTH_CAPABILITY_REMOTE_CONTROL = "remote_control"
+
+AUTH_METHOD_LABELS = {
+    AUTH_BROWSER_OAUTH: "browser OAuth",
+    AUTH_SETUP_TOKEN: "setup token",
+    AUTH_API_KEY: "API key",
+    AUTH_UNKNOWN: "unknown login",
+}
+
+AUTH_SCOPE_LABELS = {
+    AUTH_SCOPE_FULL: "full access",
+    AUTH_SCOPE_INFERENCE_ONLY: "inference only",
+    AUTH_SCOPE_UNKNOWN: "scope unknown",
+}
+
+
+class AuthMetadata(NamedTuple):
+    """Safe display metadata derived from one credential value."""
+
+    method: str
+    scope: str
+    supports_remote_control: bool | None
+    expires_at: str | None
+
+
+def classify_auth_method(credentials: str | None) -> str:
+    """Classify one stored Claude Code credential without exposing its value.
+
+    Browser OAuth carries a refresh token. A setup token is a standalone
+    ``sk-ant-oat`` access token with no refresh token. Managed API keys use the
+    raw ``sk-ant-api`` form. Anything else stays explicitly unknown rather than
+    being guessed from account metadata.
+    """
+    if looks_like_api_key(credentials):
+        return AUTH_API_KEY
+    data = _credential_object(credentials)
+    if data is None:
+        return AUTH_UNKNOWN
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return AUTH_UNKNOWN
+    if oauth.get("refreshToken"):
+        return AUTH_BROWSER_OAUTH
+    access_token = oauth.get("accessToken")
+    if isinstance(access_token, str) and access_token.startswith("sk-ant-oat"):
+        return AUTH_SETUP_TOKEN
+    return AUTH_UNKNOWN
+
+
+def auth_method_label(method: str) -> str:
+    """Return the human label for a classified authentication method."""
+    return AUTH_METHOD_LABELS.get(method, AUTH_METHOD_LABELS[AUTH_UNKNOWN])
+
+
+def auth_scope_label(scope: str) -> str:
+    """Return the human label for an authentication scope."""
+    return AUTH_SCOPE_LABELS.get(scope, AUTH_SCOPE_LABELS[AUTH_SCOPE_UNKNOWN])
+
+
+def auth_method_supports_capability(method: str, capability: str) -> bool:
+    """Whether a login method can satisfy one explicit Claude Code feature."""
+    if capability == AUTH_CAPABILITY_REMOTE_CONTROL:
+        return method == AUTH_BROWSER_OAUTH
+    return False
+
+
+def auth_metadata(credentials: str | None) -> AuthMetadata:
+    """Describe method, scope, capabilities, and stable expiry for display.
+
+    Browser OAuth is Claude Code's full login. Setup tokens and managed API
+    keys are inference-only and cannot start Remote Control. Browser OAuth's
+    access-token expiry is intentionally hidden because its refresh token
+    renews that value; a setup token has no refresh token, so its actual expiry
+    is useful operator information.
+    """
+    method = classify_auth_method(credentials)
+    scope = {
+        AUTH_BROWSER_OAUTH: AUTH_SCOPE_FULL,
+        AUTH_SETUP_TOKEN: AUTH_SCOPE_INFERENCE_ONLY,
+        AUTH_API_KEY: AUTH_SCOPE_INFERENCE_ONLY,
+    }.get(method, AUTH_SCOPE_UNKNOWN)
+    supports_remote_control = {
+        AUTH_BROWSER_OAUTH: True,
+        AUTH_SETUP_TOKEN: False,
+        AUTH_API_KEY: False,
+    }.get(method)
+    expires_at = None
+    if method == AUTH_SETUP_TOKEN:
+        data = _credential_object(credentials)
+        oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        value = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        if isinstance(value, (int, float)) and value > 0:
+            try:
+                expires_at = (
+                    datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                )
+            except (OverflowError, OSError, ValueError):
+                expires_at = None
+    return AuthMetadata(method, scope, supports_remote_control, expires_at)
+
+
+def auth_metadata_summary(
+    metadata: AuthMetadata, *, include_remote_control: bool = True,
+    include_expiry: bool = True,
+) -> str:
+    """Return one concise human line for authentication metadata."""
+    parts = [
+        auth_method_label(metadata.method),
+        auth_scope_label(metadata.scope),
+    ]
+    if include_remote_control:
+        if metadata.supports_remote_control is True:
+            parts.append("Remote Control")
+        elif metadata.supports_remote_control is False:
+            parts.append("no Remote Control")
+    if include_expiry and metadata.expires_at:
+        parts.append(f"expires {metadata.expires_at[:10]}")
+    return " · ".join(parts)
 
 
 # The credential object's siblings of claudeAiOauth are not uniformly owned:

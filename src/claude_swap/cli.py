@@ -944,6 +944,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s switch user@example.com --auth-method setup-token
+  %(prog)s switch user@example.com --require-capability remote-control
   %(prog)s list --token-status
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
@@ -1032,6 +1034,22 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
             "login first"
+        ),
+    )
+    parser.add_argument(
+        "--auth-method",
+        choices=["browser-oauth", "setup-token", "api-key"],
+        help=(
+            "Claude Code login method to activate with "
+            "'switch <num|email>'; defaults to the account's preferred method"
+        ),
+    )
+    parser.add_argument(
+        "--require-capability",
+        choices=["remote-control"],
+        help=(
+            "Select a login that supports this Claude Code feature with "
+            "'switch <num|email>'; fails before switching when none is stored"
         ),
     )
     parser.add_argument(
@@ -1194,6 +1212,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
+    if args.auth_method is not None and not args.switch_to:
+        parser.error("--auth-method can only be used with 'switch <num|email>'")
+
+    if args.require_capability is not None and not args.switch_to:
+        parser.error(
+            "--require-capability can only be used with 'switch <num|email>'"
+        )
+
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
@@ -1266,9 +1292,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
-            payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
-            )
+            kwargs = {"json_output": args.json, "force": args.force}
+            if args.auth_method is not None:
+                kwargs["auth_method"] = args.auth_method
+            if args.require_capability is not None:
+                kwargs["required_capability"] = args.require_capability
+            payload = switcher.switch_to(args.switch_to, **kwargs)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:
