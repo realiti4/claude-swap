@@ -108,8 +108,10 @@ def try_refresh_oauth_credentials(
     try:
         data = json.loads(credentials)
     except json.JSONDecodeError:
-        return RefreshOutcome(None, "no_refresh_token")
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        return RefreshOutcome(None, "transient")
+    if not isinstance(data, dict):
+        return RefreshOutcome(None, "transient")
+    oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
 
@@ -151,10 +153,15 @@ def try_refresh_oauth_credentials(
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
         # would wrongly quarantine a live token.
-        if e.code in (400, 401, 403) and (
-            "invalid_grant" in body or "invalid_client" in body
-        ):
-            return RefreshOutcome(None, "invalid_grant")
+        if e.code in (400, 401, 403):
+            try:
+                error = json.loads(body).get("error")
+            except (ValueError, AttributeError):
+                error = None
+            if error == "invalid_grant":
+                return RefreshOutcome(None, "invalid_grant")
+            if error == "invalid_client":
+                return RefreshOutcome(None, "invalid_client")
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
@@ -541,6 +548,7 @@ class UsageOutcome:
     usage: dict | None
     error: str | None = None
     retry_after_s: float | None = None
+    struck_fp: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -589,7 +597,11 @@ def try_fetch_usage_for_account(
             # Don't hit the usage endpoint with a token we know is expired
             # (that just adds a 401/429 to a lost cause): report the permanent
             # failure distinctly so the store can quarantine the account.
-            return UsageOutcome(None, error="invalid_grant")
+            return UsageOutcome(
+                None,
+                error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
@@ -616,7 +628,13 @@ def try_fetch_usage_for_account(
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error == "invalid_grant"
-            return UsageOutcome(None, error="invalid_grant" if dead else "refresh-failed")
+            return UsageOutcome(
+                None,
+                error="invalid_grant" if dead else "refresh-failed",
+                struck_fp=(
+                    credential_fingerprint(working_credentials) if dead else None
+                ),
+            )
 
         working_credentials = refresh.credentials
         _persist(persist_credentials, account_num, email, working_credentials)

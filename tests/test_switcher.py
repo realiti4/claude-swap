@@ -14,7 +14,12 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -786,10 +791,15 @@ class TestFetchAccountUsageSessionProfile:
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         mock_fetch.assert_not_called()
 
-    def test_expired_session_credentials_without_live_session_falls_back(
+    def test_expired_session_credentials_without_live_session_stay_authoritative(
         self, temp_home: Path
     ):
-        """No live session: the backup path (with refresh machinery) still runs."""
+        """An idle profile still owns the newest refresh-token generation.
+
+        Falling back to its stored backup would POST the consumed predecessor,
+        falsely record ``invalid_grant``, and quarantine a healthy account.
+        Native Claude refreshes the profile on its next real turn instead.
+        """
         switcher = ClaudeAccountSwitcher()
         backup = _oauth_creds("sk-backup", 7200)
         session = _oauth_creds("sk-session", -60)
@@ -797,15 +807,11 @@ class TestFetchAccountUsageSessionProfile:
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.session.read_session_credentials",
                    return_value=session), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             record = switcher._fetch_account_usage(self._info(backup))
 
-        assert record.usage == {"five_hour": {"pct": 9}}
-        args, kwargs = mock_fetch.call_args
-        assert args[2] == backup
-        assert kwargs.get("is_active") is False
-        assert kwargs.get("persist_credentials") is not None
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
 
     def test_no_session_profile_uses_backup_path(self, temp_home: Path):
         """Accounts without a session profile behave exactly as before."""
@@ -824,6 +830,35 @@ class TestFetchAccountUsageSessionProfile:
         assert args[2] == backup
         assert kwargs.get("is_active") is False
         assert kwargs.get("persist_credentials") is not None
+
+    def test_cleared_session_profile_never_falls_back_to_backup(
+        self, temp_home: Path
+    ):
+        """A cleared profile is authoritative; its backup may be consumed."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+        cleared = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresAt": 0,
+                }
+            }
+        )
+        session_dir = switcher._session_dir("2", "test@example.com")
+        session_dir.mkdir(parents=True)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=cleared), \
+             patch("claude_swap.session.session_identity_drifted",
+                   return_value=False), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_NO_CREDENTIALS
+        mock_fetch.assert_not_called()
 
     def _write_profile_identity(self, switcher, email: str, org_uuid) -> None:
         session_dir = switcher._session_dir("2", "test@example.com")
@@ -3959,7 +3994,91 @@ class TestDeadTokenQuarantine:
             "window has reset — it never handed its configured models to the "
             "bound"
         )
+    @pytest.mark.parametrize("legacy_row", [False, True])
+    def test_new_session_generation_releases_stale_quarantine(
+        self, temp_home, legacy_row
+    ):
+        """A healthy profile must not inherit its stored predecessor's verdict."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("backup-old", -3600)
+        profile = _oauth_creds("profile-new", 7200)
+        identity = ("test@example.com", "org-uuid")
+        struck_fp = None if legacy_row else oauth.credential_fingerprint(backup)
+        switcher._usage_store.record(
+            {
+                "2": FetchRecord(
+                    error="invalid_grant", struck_fp=struck_fp
+                )
+            },
+            {"2": identity},
+        )
+        info = [(2, identity[0], "Org", identity[1], False, backup, "")]
+        usage = {"five_hour": {"pct": 12.0}}
 
+        with patch(
+            "claude_swap.session.read_config_dir_credentials",
+            return_value=profile,
+        ), patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=profile,
+        ), patch(
+            "claude_swap.session.session_identity_drifted",
+            return_value=False,
+        ), patch.object(
+            switcher, "_live_session_pids", return_value=[]
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(usage),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        fetch.assert_called_once()
+        assert entries["2"].sentinel is None
+        assert entries["2"].last_good == usage
+        assert not switcher._usage_store.entries({"2": identity})["2"].token_dead()
+
+    def test_cleared_profile_does_not_release_or_retry_dead_backup(self, temp_home):
+        """The invalid_grant wipe shape stays quarantined without another POST."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("backup-dead", -3600)
+        cleared = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresAt": 0,
+                }
+            }
+        )
+        identity = ("test@example.com", "org-uuid")
+        switcher._usage_store.record(
+            {
+                "2": FetchRecord(
+                    error="invalid_grant",
+                    struck_fp=oauth.credential_fingerprint(backup),
+                )
+            },
+            {"2": identity},
+        )
+        info = [(2, identity[0], "Org", identity[1], False, backup, "")]
+
+        with patch(
+            "claude_swap.session.read_config_dir_credentials",
+            return_value=cleared,
+        ), patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=cleared,
+        ), patch(
+            "claude_swap.session.session_identity_drifted",
+            return_value=False,
+        ), patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert switcher._usage_store.entries({"2": identity})["2"].token_dead()
+        fetch.assert_not_called()
     def test_readd_clears_quarantine(self, temp_home):
         # Re-adding an account (fresh credential) must lift the quarantine, so
         # the disabled fetches don't leave it stuck at "re-login needed" forever.
@@ -4668,7 +4787,7 @@ class TestAddAccountFromToken:
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)
-        with patch.object(switcher, "_write_account_credentials") as mock_creds, \
+        with patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_write_account_config"):
             switcher.add_account_from_token("sk-ant-oat01-abc", "user@example.com")
 

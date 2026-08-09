@@ -1525,12 +1525,15 @@ class TestGuards:
         assert (session_dir / ".credentials.json").read_text() == "live session creds"
         assert (session_dir / session_mod.STALE_MARKER).exists()
 
-    def test_list_skips_refresh_for_live_session_accounts(
+    def test_list_never_falls_back_to_backup_for_unreadable_live_profile(
         self, seeded_switcher, monkeypatch
     ):
-        """cswap --list must not proactively refresh an account that is live in
-        a session — rotating the backup copy's token could invalidate the
-        session's copy."""
+        """An unreadable live profile cannot authorize use of its backup.
+
+        The backup may be a consumed predecessor of the profile's real token
+        family. Treating it as merely ``is_active`` still sends its access
+        token and can later manufacture an invalid_grant verdict.
+        """
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
@@ -1546,7 +1549,7 @@ class TestGuards:
         )
         seeded_switcher.list_accounts()
 
-        assert seen[ACCOUNT_NUM] is True  # treated like active: no refresh
+        assert ACCOUNT_NUM not in seen
         assert seen.get("1") in (None, False)  # account 1 has no live session
 
     def test_invalidate_session_credentials_keeps_history(

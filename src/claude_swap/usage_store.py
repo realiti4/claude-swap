@@ -254,6 +254,7 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    struck_fp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,9 @@ class UsageEntry:
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
+    # Refresh-token lineage condemned by the permanent-auth verdict. Missing
+    # on rows written before generation binding was introduced.
+    struck_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -334,14 +338,30 @@ class UsageEntry:
         """Whether another collector's bounded fetch lease is still live."""
         return _live_claim(self.claim_until, self.last_attempt_at, now)
 
-    def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
+    def token_dead(
+        self,
+        threshold: int = AUTH_DEAD_STRIKES,
+        stored_fp: str | None = None,
+    ) -> bool:
         """Whether the stored credential's refresh-token lineage is provably dead.
 
         True once ``invalid_grant`` has recurred ``threshold`` times without an
         intervening success. Such an account is quarantined: not fetched (see
         ``due_candidate`` and the collector) and surfaced as "re-login needed".
+
+        When a current credential fingerprint is supplied, a strike applies
+        only to the generation that produced it. A changed credential lineage
+        is eligible for a fresh test instead of inheriting the old verdict.
         """
-        return self.auth_dead_strikes >= threshold
+        if self.auth_dead_strikes < threshold:
+            return False
+        if (
+            stored_fp is not None
+            and self.struck_fingerprint is not None
+            and stored_fp != self.struck_fingerprint
+        ):
+            return False
+        return True
 
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -906,6 +926,7 @@ class UsageStore:
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                struck_fingerprint=row.get("struckFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1050,6 +1071,7 @@ class UsageStore:
                 row["lastError"] = None
                 row["backoffUntil"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["struckFingerprint"] = None
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -1068,6 +1090,7 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
             rows = self._read_rows()
@@ -1134,11 +1157,54 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
+
+    def clear_stale_dead_tokens(
+        self,
+        identities: dict[str, Identity],
+        current_fingerprints: dict[str, str | None],
+        legacy_fingerprints: dict[str, str | None] | None = None,
+    ) -> set[str]:
+        """Release quarantines that belong to an older credential generation.
+
+        ``current_fingerprints`` names the credential authority Claude Code
+        would use now. ``legacy_fingerprints`` supplies the stored credential
+        lineage for rows written before ``struckFingerprint`` existed; those
+        historical strikes came from that stored path, so it is the only safe
+        migration binding. Rows stay quarantined when either side is unknown.
+        """
+        legacy = legacy_fingerprints or {}
+        cleared: set[str] = set()
+        with self._lock():
+            rows = self._read_rows()
+            for num, identity in identities.items():
+                row = rows.get(num)
+                if not self._matches(row, identity) or not isinstance(row, dict):
+                    continue
+                if int(row.get("authDeadStrikes") or 0) < AUTH_DEAD_STRIKES:
+                    continue
+                current_fp = current_fingerprints.get(num)
+                struck_fp = row.get("struckFingerprint")
+                if not isinstance(struck_fp, str) or not struck_fp:
+                    struck_fp = legacy.get(num)
+                if not current_fp or not struck_fp or current_fp == struck_fp:
+                    continue
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
+                row["authDeadStrikes"] = 0
+                row["struckFingerprint"] = None
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
+                cleared.add(num)
+            if cleared:
+                self._write_rows(rows)
+        return cleared
 
 
 def _num_or_none(value: object) -> float | None:
