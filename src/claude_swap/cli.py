@@ -221,7 +221,9 @@ def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
         if os.geteuid() == 0 and not switcher._is_running_in_container():
-            error("Error: Do not run this script as root (unless running in a container)")
+            error(
+                "Error: Do not run this script as root (unless running in a container)"
+            )
             sys.exit(1)
 
 
@@ -277,7 +279,9 @@ Examples:
         account_num, email, org_uuid = switcher.resolve_account(args.account)
         target = args.path or os.getcwd()
         if not os.path.isdir(target):
-            warning(f"Warning: {target} is not an existing directory (mapping it anyway)")
+            warning(
+                f"Warning: {target} is not an existing directory (mapping it anyway)"
+            )
         previous = store.get(target)
         store.set(target, email, org_uuid)
 
@@ -468,7 +472,9 @@ Examples:
         metavar="NAME",
         help="Alias to set (letters, digits, ., -, _; not purely numeric).",
     )
-    parser.add_argument("--unset", action="store_true", help="Remove the account's alias")
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's alias"
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
@@ -538,6 +544,8 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --grace-before-reset 300  # ride the active account to ~100%% instead of
+                                    #   switching away when its window resets within 5h
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -576,6 +584,18 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="SECONDS",
         help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--grace-before-reset",
+        type=float,
+        metavar="MINUTES",
+        dest="grace_before_reset",
+        help=(
+            "Skip a proactive switch when the active account's binding "
+            "window resets within this many minutes — ride it to ~100%% "
+            "instead of jumping accounts right before a refresh "
+            "(0-1440; default 0 = off)"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -620,6 +640,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
+    from claude_swap.settings import cli_overrides as auto_cli_overrides
     from claude_swap.settings import load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
@@ -632,7 +653,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
             line = yellowed(line)
-        elif event.kind in ("poll", "no-switch", "sleep"):
+        elif event.kind in ("poll", "no-switch", "sleep", "settings-reloaded"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
 
@@ -640,15 +661,24 @@ Defaults live in settings.json in the backup root; flags override them.
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         if sys.platform != "win32":
             if os.geteuid() == 0 and not switcher._is_running_in_container():
-                error("Error: Do not run this script as root (unless running in a container)")
+                error(
+                    "Error: Do not run this script as root (unless running in a container)"
+                )
                 sys.exit(1)
 
+        overrides = auto_cli_overrides(args)
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            # Loop mode only: pick up `cswap config set ...` / hand edits to
+            # settings.json made in another terminal while this loop runs,
+            # instead of silently ignoring them until the process restarts.
+            # `--once` never needs it — it reloads fresh on every invocation.
+            cli_overrides=overrides,
+            watch_settings=not args.once,
         )
 
         if args.once:
@@ -657,10 +687,15 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            grace_note = (
+                f", {settings.grace_before_reset_minutes:.0f}m reset grace"
+                if settings.grace_before_reset_minutes > 0
+                else ""
+            )
             print(
                 dimmed(
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"every {settings.interval_seconds:.0f}s{grace_note}"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -705,8 +740,7 @@ def _config_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="cswap config",
         description=(
-            "Read and edit claude-swap settings (settings.json in the "
-            "backup root)."
+            "Read and edit claude-swap settings (settings.json in the backup root)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
@@ -735,7 +769,9 @@ Examples:
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
-    p_get.add_argument("key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold")
+    p_get.add_argument(
+        "key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold"
+    )
     for p in (p_list, p_get):
         # SUPPRESS: without it the subparser's False default would clobber a
         # pre-verb `cswap config --json` in the shared namespace.
@@ -762,7 +798,9 @@ Examples:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         if sys.platform != "win32":
             if os.geteuid() == 0 and not switcher._is_running_in_container():
-                error("Error: Do not run this script as root (unless running in a container)")
+                error(
+                    "Error: Do not run this script as root (unless running in a container)"
+                )
                 sys.exit(1)
         root = switcher.backup_dir
 
@@ -856,6 +894,7 @@ def main() -> None:
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
+
         # `run` execs a child that takes over the terminal, and `--json`
         # must stay machine-readable — never probe (and emit the OSC query)
         # in either case.
@@ -1221,7 +1260,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":
             if os.geteuid() == 0 and not switcher._is_running_in_container():
-                error("Error: Do not run this script as root (unless running in a container)")
+                error(
+                    "Error: Do not run this script as root (unless running in a container)"
+                )
                 sys.exit(1)
 
         if args.add_account:

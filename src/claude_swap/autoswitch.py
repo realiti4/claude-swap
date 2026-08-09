@@ -37,7 +37,7 @@ import random
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -51,7 +51,14 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    apply_overrides,
+    atomic_write_json,
+    load_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -232,9 +239,7 @@ def _recovery_is_useful(
 
 def _now_iso() -> str:
     return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
 
 
@@ -324,9 +329,7 @@ class PollEvent(AutoSwitchEvent):
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
         others = ", ".join(
-            f"#{n}: {self._describe(n)}"
-            for n in self.headroom
-            if n != str(num)
+            f"#{n}: {self._describe(n)}" for n in self.headroom if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
         return (
@@ -354,9 +357,7 @@ class SwitchEvent(AutoSwitchEvent):
         }
 
     def human(self) -> str:
-        src = (
-            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
-        )
+        src = f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
         dst = (
             f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
             if self.to_ref
@@ -376,7 +377,9 @@ class NoSwitchEvent(AutoSwitchEvent):
         return {"reason": self.reason, "detail": self.detail}
 
     def human(self) -> str:
-        return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+        return f"no switch: {self.reason}" + (
+            f" ({self.detail})" if self.detail else ""
+        )
 
 
 @dataclass(frozen=True)
@@ -467,6 +470,24 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class SettingsReloadedEvent(AutoSwitchEvent):
+    """settings.json changed on disk (e.g. ``cswap config set`` from another
+    terminal) while a `cswap auto` loop was already running, and the engine
+    picked up the new values without needing a restart."""
+
+    kind: ClassVar[str] = "settings-reloaded"
+    changed: tuple[str, ...] = ()
+
+    def _fields(self) -> dict:
+        return {"changed": list(self.changed)}
+
+    def human(self) -> str:
+        if self.changed:
+            return f"settings.json reloaded ({', '.join(self.changed)})"
+        return "settings.json reloaded"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -489,9 +510,7 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def _window_pcts(
-    usage: dict | None, models: tuple[str, ...] = ()
-) -> dict[str, float]:
+def _window_pcts(usage: dict | None, models: tuple[str, ...] = ()) -> dict[str, float]:
     """Ordered window label → pct: "5h", "7d", then configured scoped names.
 
     Deliberately restricted to the windows the *decision* reads (same
@@ -499,9 +518,7 @@ def _window_pcts(
     to a switch onto that account would look like a bug, when the engine
     correctly ignored it. Full per-model usage lives in ``cswap list``.
     """
-    return {
-        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
-    }
+    return {name: pct for name, pct, _ in oauth.relevant_windows(usage, models)}
 
 
 # Reset math moved to poll_policy with the cadence numbers; aliased for the
@@ -599,9 +616,7 @@ def _headroom_by_account(
 ) -> dict[str, float | None]:
     """Per-account headroom derived from decision values."""
     return {
-        num: oauth.account_headroom(
-            value if isinstance(value, dict) else None, models
-        )
+        num: oauth.account_headroom(value if isinstance(value, dict) else None, models)
         for num, value in usage.items()
     }
 
@@ -623,9 +638,26 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        cli_overrides: dict | None = None,
+        watch_settings: bool = False,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Overrides an owning CLI passed on the command line (e.g. `cswap
+        # auto --threshold 95`); a settings.json hot-reload re-applies these
+        # on top of the fresh file read, same precedence as at startup, so a
+        # flag never gets silently defeated by a later file edit.
+        self._cli_overrides = cli_overrides or {}
+        # `run_loop()` watches settings.json for edits made by another
+        # process (`cswap config set ...`, a hand edit) while this loop is
+        # already running, and hot-applies them — mirrors the menubar app's
+        # own mtime-gated reload. Off by default: only the plain CLI loop
+        # (`cswap auto`) needs it — the TUI and menubar already have their
+        # own live-apply paths (session slider / explicit restart) and must
+        # not have a second, uncoordinated writer of `self.settings`.
+        self._watch_settings = watch_settings
+        self._settings_path = settings_path(switcher.backup_dir)
+        self._settings_mtime = self._current_settings_mtime()
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -718,9 +750,7 @@ class AutoSwitchEngine:
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
-                to_release.append(
-                    (number, entry.get("email", ""), "account-replaced")
-                )
+                to_release.append((number, entry.get("email", ""), "account-replaced"))
                 continue
             creds = self.switcher.read_account_credentials(number, email_now)
             fingerprint = _refresh_fingerprint(creds) if creds else None
@@ -782,9 +812,7 @@ class AutoSwitchEngine:
             # Persist first, unconditionally: the grant consumed a generation,
             # and not writing the successor would kill the lineage regardless
             # of whose it turns out to be.
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
-            )
+            self.switcher.persist_backup_credentials(number, email, outcome.credentials)
             if self._note_token_identity(number, outcome.token_account):
                 # The slot's stored credential authenticates as a *different*
                 # account — activating it would put the user on the wrong
@@ -797,9 +825,7 @@ class AutoSwitchEngine:
             return "invalid_grant"
         return "transient"
 
-    def _note_token_identity(
-        self, number: str, token_account: dict | None
-    ) -> bool:
+    def _note_token_identity(self, number: str, token_account: dict | None) -> bool:
         """Use the token endpoint's free identity to verify/backfill a slot.
 
         The refresh grant just ran against the slot's own stored credential,
@@ -848,9 +874,7 @@ class AutoSwitchEngine:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
-            self._emit(
-                ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
-            )
+            self._emit(ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True))
             return TickOutcome.ERROR
 
     def _tick_inner(self) -> TickOutcome:
@@ -893,10 +917,14 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         current_email = self.switcher.account_email(current)
-        active_ref = _ref(current, current_email) if current_email else {
-            "number": int(current),
-            "email": "",
-        }
+        active_ref = (
+            _ref(current, current_email)
+            if current_email
+            else {
+                "number": int(current),
+                "email": "",
+            }
+        )
 
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
@@ -914,9 +942,11 @@ class AutoSwitchEngine:
                 windows={
                     num: pcts
                     for num, value in usage.items()
-                    if (pcts := _window_pcts(
-                        value if isinstance(value, dict) else None, self._models
-                    ))
+                    if (
+                        pcts := _window_pcts(
+                            value if isinstance(value, dict) else None, self._models
+                        )
+                    )
                 },
             )
         )
@@ -1009,6 +1039,36 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
+
+        if trigger == "proactive" and settings.grace_before_reset_minutes > 0:
+            # Ride it to ~100% instead of jumping accounts: the active
+            # account is over the threshold but not yet blocked, and its own
+            # binding window (the one driving this trigger) is about to
+            # reset anyway — any headroom "saved" by switching away gets
+            # wiped out by the reset regardless, so the switch would only
+            # spend quota on an account that didn't need touching. Scoped to
+            # "proactive" only: "at-limit"/"failover" mean the account is
+            # already unusable, where moving is strictly an improvement, and
+            # "consume-first" already has its own reset-driven logic for
+            # below-threshold moves that this would fight.
+            recovery_ts = _binding_recovery_ts(
+                usage.get(current), self._models, self.clock()
+            )
+            if recovery_ts != float("inf"):
+                remaining_s = recovery_ts - self.clock()
+                grace_s = settings.grace_before_reset_minutes * 60.0
+                if 0 < remaining_s <= grace_s:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reset-imminent",
+                            detail=(
+                                f"binding window resets in {remaining_s / 60:.0f}m "
+                                f"(<= grace {pct_label(settings.grace_before_reset_minutes)}m); "
+                                "riding it out instead of switching"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1235,9 +1295,7 @@ class AutoSwitchEngine:
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
+            truly_exhausted = all(h is not None and h <= 0 for h in candidate_headrooms)
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -1962,23 +2020,18 @@ class AutoSwitchEngine:
             active_pre is not None
             and active_pre.age_s is not None
             and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (active_pre.poll_interval_s or 0.0)
-            > poll_policy.ACTIVE_MAX_INTERVAL_S
+            and (active_pre.poll_interval_s or 0.0) > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
         )
-        overslept_plan = (
-            active_pre is not None
-            and plan_oversleeps_interval(active_pre, now)
+        overslept_plan = active_pre is not None and plan_oversleeps_interval(
+            active_pre, now
         )
         if (
             active_pre is None
             or active_pre.age_s is None
             or stale_candidate_plan
             or overslept_plan
-            or (
-                active_pre.next_poll_at is not None
-                and now >= active_pre.next_poll_at
-            )
+            or (active_pre.next_poll_at is not None and now >= active_pre.next_poll_at)
             or (
                 active_pre.next_poll_at is None
                 and active_pre.age_s >= poll_policy.MIN_INTERVAL_S
@@ -2035,9 +2088,7 @@ class AutoSwitchEngine:
                     and planned_headroom <= 0
                 ):
                     escalation_fetch.remove(num)
-            entries = self.switcher.usage_entries_by_account(
-                fetch=escalation_fetch
-            )
+            entries = self.switcher.usage_entries_by_account(fetch=escalation_fetch)
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = _headroom_by_account(usage, self._models)
@@ -2144,8 +2195,7 @@ class AutoSwitchEngine:
         relevant = [
             n
             for n in self.switcher.switchable_account_numbers()
-            if n not in quarantined
-            and self.switcher.account_kind_for(n) != "api_key"
+            if n not in quarantined and self.switcher.account_kind_for(n) != "api_key"
         ]
         values = [usage.get(n) for n in relevant]
         readable = [v for v in values if isinstance(v, dict)]
@@ -2225,10 +2275,61 @@ class AutoSwitchEngine:
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
         cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
-        self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        state) are fixed at construction."""
+        self.apply_settings(replace(self.settings, threshold=threshold))
+
+    def apply_settings(self, settings: AutoSwitchSettings) -> None:
+        """Hot-swap every policy knob except the model axis mid-run.
+
+        ``self._models`` (parsed once in ``__init__``) is never re-derived
+        here — same fixed-at-construction invariant ``apply_threshold``
+        already documented, generalized: a live settings.json edit to
+        ``autoswitch.model`` must not desync ``self._models`` from
+        ``self.settings.model`` out from under the one-shot typo guard and
+        every window filter that reads ``self._models``. Callers that build
+        ``settings`` from a fresh file read (``_maybe_reload_settings``)
+        pin ``model`` back to the current value before calling this. The
+        frozen-settings swap is atomic and each tick snapshots
+        ``self.settings`` once, so no locking.
+        """
+        self.settings = settings
+        self.switcher.set_poll_policy_inputs(settings.threshold, self._models)
+
+    def _current_settings_mtime(self) -> float | None:
+        try:
+            return self._settings_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload_settings(self) -> None:
+        """Pick up settings.json edits made by another process while this
+        loop is already running (``cswap config set ...``, a hand edit).
+
+        Mtime-gated so a normal tick costs one cheap ``stat()`` — same
+        technique the menubar app already uses for its own active-account
+        change detection. Only wired into ``run_loop()`` when the engine was
+        constructed with ``watch_settings=True`` (the plain CLI loop); the
+        TUI and menubar own their settings application some other way and
+        must not have two uncoordinated writers of ``self.settings``.
+        """
+        mtime = self._current_settings_mtime()
+        if mtime is None or mtime == self._settings_mtime:
+            return
+        self._settings_mtime = mtime
+        file_settings = load_settings(self.switcher.backup_dir)
+        merged = apply_overrides(file_settings, self._cli_overrides)
+        # The model axis is fixed at construction (see apply_settings) —
+        # never let a live file edit change it out from under self._models.
+        merged = replace(merged, model=self.settings.model)
+        changed = tuple(
+            f.name
+            for f in fields(merged)
+            if getattr(merged, f.name) != getattr(self.settings, f.name)
+        )
+        if not changed:
+            return
+        self.apply_settings(merged)
+        self._emit(SettingsReloadedEvent(changed=changed))
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
@@ -2290,6 +2391,8 @@ class AutoSwitchEngine:
             self._wake.clear()
             if self._stop.is_set():
                 return 0
+            if self._watch_settings:
+                self._maybe_reload_settings()
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
