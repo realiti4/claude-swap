@@ -963,10 +963,12 @@ class CredentialStore:
         never serve them. The best-effort variant remains right for
         post-commit cleanup, where a failure only leaks an unreferenced file.
         """
-        # Best-effort sweep first: same cruft cleanup (legacy alias, .prev,
-        # quiet Keychain) a normal delete performs.
-        self._delete_account_credentials(account_num, email)
-        # Then assure the served key really is gone, propagating failures.
+        # Strict deletes of the served backends first, propagating failures: a
+        # clear that is going to fail must fail *before* the key's material is
+        # destroyed, so an aborted transaction leaves the original readable.
+        # (The best-effort sweep used to run first, and on macOS it deleted
+        # the Keychain copy with errors swallowed — a later file failure then
+        # aborted a clear that had already half-destroyed the key.)
         # Unconditional unlink: exists() returns False on an inaccessible
         # directory, which would fail open here — missing is fine
         # (missing_ok), permission/I/O errors must abort the commit.
@@ -979,6 +981,9 @@ class CredentialStore:
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit: {e}"
             ) from e
+        # Then the same cruft cleanup (legacy alias, .prev, quiet Keychain) a
+        # normal delete performs — pure cleanup once the served key is gone.
+        self._delete_account_credentials(account_num, email)
         # Final belt: catches any backend view the deletes above missed.
         if self._read_account_credentials(account_num, email):
             raise CredentialError(
