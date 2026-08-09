@@ -21,7 +21,7 @@ import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot, AuthMethodSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
@@ -77,6 +77,10 @@ def make_account(
     active: bool = False,
     switchable: bool = True,
     kind: str = "oauth",
+    auth_method: str = "browser_oauth",
+    auth_scope: str = "full",
+    auth_supports_remote_control: bool | None = True,
+    auth_expires_at: str | None = None,
     entry: UsageEntry | None = None,
     email: str | None = None,
     alias: str = "",
@@ -91,6 +95,10 @@ def make_account(
         kind=kind,
         switchable=switchable,
         usage=entry if entry is not None else make_entry(),
+        auth_method=auth_method,
+        auth_scope=auth_scope,
+        auth_supports_remote_control=auth_supports_remote_control,
+        auth_expires_at=auth_expires_at,
         alias=alias,
         disabled=disabled,
     )
@@ -611,8 +619,8 @@ class TestUsageRows:
         )
         acc = make_account(1, active=True, entry=entry)
 
-        wide = account_card_text(acc, 100).plain
-        assert wide.count(" · ") == 3
+        wide_lines = account_card_text(acc, 100).plain.splitlines()
+        assert sum(" · " in line for line in wide_lines if "resets" in line) == 3
 
         mid_lines = account_card_text(acc, 78).plain.splitlines()
         spend_line = next(line for line in mid_lines if "$12.50" in line)
@@ -621,11 +629,63 @@ class TestUsageRows:
             if "resets" in line and "$12.50" not in line:
                 assert " · " in line
 
-        narrow = account_card_text(acc, 40).plain
-        assert " · " not in narrow
+        narrow_lines = account_card_text(acc, 40).plain.splitlines()
+        assert all(" · " not in line for line in narrow_lines if "resets" in line)
 
 
 class TestMiniAccountText:
+    def test_auth_method_is_visible_without_repeating_usage(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        active = make_account(
+            1,
+            active=True,
+            auth_method="setup_token",
+            auth_scope="inference_only",
+            auth_supports_remote_control=False,
+            auth_expires_at="2027-01-02T03:04:05Z",
+        )
+        inactive = make_account(
+            2,
+            auth_method="api_key",
+            auth_scope="inference_only",
+            auth_supports_remote_control=False,
+        )
+        full = account_card_text(active, 100).plain
+        assert (
+            "Claude Code  setup token · inference only · no Remote Control "
+            "· expires 2027-01-02"
+        ) in full
+        assert "API key · inference only" in mini_account_text(
+            inactive, time.time()
+        ).plain
+
+    def test_multiple_auth_methods_are_grouped_on_one_account(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        acc = make_account(1, auth_method="api_key")
+        acc = dataclasses.replace(
+            acc,
+            auth_methods=("browser_oauth", "setup_token", "api_key"),
+            auth_method_details=(
+                AuthMethodSnapshot("browser_oauth", "full", True, None),
+                AuthMethodSnapshot(
+                    "setup_token",
+                    "inference_only",
+                    False,
+                    "2027-01-02T03:04:05Z",
+                ),
+                AuthMethodSnapshot(
+                    "api_key", "inference_only", False, None, True
+                ),
+            ),
+        )
+        text = account_card_text(acc, 100).plain
+        assert text.count("Claude Code") == 3
+        assert "browser OAuth · full access · Remote Control" in text
+        assert "setup token · inference only · no Remote Control" in text
+        assert "API key · inference only · no Remote Control · default" in text
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
@@ -1709,4 +1769,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-

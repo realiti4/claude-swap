@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -40,10 +41,21 @@ from claude_swap.json_output import (
     usage_freshness_fields,
 )
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
+    AUTH_API_KEY,
+    AUTH_BROWSER_OAUTH,
+    AUTH_CAPABILITY_REMOTE_CONTROL,
+    AUTH_METHOD_LABELS,
+    AUTH_SETUP_TOKEN,
+    AUTH_UNKNOWN,
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    auth_method_label,
+    auth_method_supports_capability,
+    auth_metadata,
+    auth_metadata_summary,
+    classify_auth_method,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -53,6 +65,7 @@ from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     AccountSnapshot,
     AccountsSnapshot,
+    AuthMethodSnapshot,
     Platform,
     SwitchTransaction,
     get_timestamp,
@@ -333,6 +346,11 @@ class ClaudeAccountSwitcher:
         self._probe_verdicts: dict[
             tuple[str, str, str, str, str, str], bool
         ] = {}
+        # Populated by _build_accounts_info. An active account may use an API
+        # key while its account-level quota is fetched through a stored OAuth
+        # child. Those credentials must follow the inactive, backup-safe fetch
+        # path so a refresh never replaces the live API-key login.
+        self._usage_backup_slots: set[str] = set()
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -612,7 +630,253 @@ class ClaudeAccountSwitcher:
             self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        raw = record.get("authMethods")
+        preferred = record.get("preferredAuthMethod")
+        if isinstance(raw, list) and preferred in raw:
+            key = self._auth_method_storage_key(
+                email,
+                record.get("organizationUuid", "") or "",
+                preferred,
+            )
+            credentials = self._store._read_account_credentials(key, email)
+            if credentials:
+                return credentials
         return self._store._read_account_credentials(account_num, email)
+
+    @staticmethod
+    def _auth_method_storage_key(
+        email: str, organization_uuid: str, auth_method: str
+    ) -> str:
+        """Stable, non-secret backup key for one account login method.
+
+        Method backups must follow an account through slot moves and swaps, so
+        they are keyed by the account identity rather than its mutable slot.
+        The email remains part of the existing backup key for diagnostics; the
+        digest prevents organization UUIDs and separators from entering file or
+        Keychain account names.
+        """
+        identity = f"{email}\0{organization_uuid or ''}".encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()[:20]
+        return f"auth-{digest}-{auth_method}"
+
+    def _account_auth_methods(
+        self,
+        account_num: str,
+        *,
+        credentials: str | None = None,
+        data: dict | None = None,
+    ) -> tuple[str, ...]:
+        """Return stored login methods, including legacy single-method slots."""
+        data = data if data is not None else (self._get_sequence_data() or {})
+        record = data.get("accounts", {}).get(str(account_num), {})
+        raw = record.get("authMethods")
+        if isinstance(raw, list):
+            methods = tuple(
+                method for method in AUTH_METHOD_LABELS
+                if method != AUTH_UNKNOWN and method in raw
+            )
+            if methods:
+                return methods
+        if credentials is None:
+            credentials = self._read_account_credentials(
+                str(account_num), record.get("email", "")
+            )
+        method = classify_auth_method(credentials)
+        return (method,) if method != AUTH_UNKNOWN else ()
+
+    def _preferred_auth_method(
+        self,
+        account_num: str,
+        *,
+        credentials: str | None = None,
+        data: dict | None = None,
+    ) -> str:
+        """Return the account's default Claude Code login method."""
+        data = data if data is not None else (self._get_sequence_data() or {})
+        record = data.get("accounts", {}).get(str(account_num), {})
+        methods = self._account_auth_methods(
+            account_num, credentials=credentials, data=data
+        )
+        preferred = record.get("preferredAuthMethod")
+        if preferred in methods:
+            return preferred
+        return methods[0] if methods else AUTH_UNKNOWN
+
+    def _auth_method_snapshots(
+        self,
+        account_num: str,
+        email: str,
+        organization_uuid: str,
+        *,
+        credentials: str | None = None,
+        data: dict | None = None,
+    ) -> tuple[AuthMethodSnapshot, ...]:
+        """Return safe display metadata for every login stored by an account."""
+        data = data if data is not None else (self._get_sequence_data() or {})
+        methods = self._account_auth_methods(
+            account_num, credentials=credentials, data=data
+        )
+        default = self._preferred_auth_method(
+            account_num, credentials=credentials, data=data
+        )
+        details = []
+        for method in methods:
+            if classify_auth_method(credentials) == method:
+                method_credentials = credentials or ""
+            else:
+                method_credentials = self._read_auth_method_credentials(
+                    account_num, email, organization_uuid, method
+                )
+            metadata = auth_metadata(method_credentials)
+            details.append(
+                AuthMethodSnapshot(
+                    method=method,
+                    scope=metadata.scope,
+                    supports_remote_control=metadata.supports_remote_control,
+                    expires_at=metadata.expires_at,
+                    is_default=method == default,
+                )
+            )
+        return tuple(details)
+
+    def _read_auth_method_credentials(
+        self, account_num: str, email: str, organization_uuid: str, auth_method: str
+    ) -> str:
+        """Read one child login method, with legacy preferred-backup fallback."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        raw = record.get("authMethods")
+        if not isinstance(raw, list):
+            primary = self._read_account_credentials(account_num, email)
+            if classify_auth_method(primary) in {auth_method, AUTH_UNKNOWN}:
+                return primary
+            return ""
+        primary = self._store._read_account_credentials(account_num, email)
+        methods = self._account_auth_methods(
+            account_num, credentials=primary, data=data
+        )
+        if auth_method not in methods:
+            return ""
+        key = self._auth_method_storage_key(email, organization_uuid, auth_method)
+        credentials = self._store._read_account_credentials(key, email)
+        if credentials:
+            return credentials
+        preferred = self._preferred_auth_method(
+            account_num, credentials=primary, data=data
+        )
+        if auth_method == preferred:
+            primary = self._store._read_account_credentials(account_num, email)
+            if classify_auth_method(primary) == auth_method:
+                return primary
+        return ""
+
+    def _write_auth_method_secret(
+        self, email: str, organization_uuid: str, auth_method: str, credentials: str
+    ) -> None:
+        """Write one child login secret without slot-session side effects."""
+        key = self._auth_method_storage_key(email, organization_uuid, auth_method)
+        self._store._write_account_credentials(key, email, credentials)
+
+    def _delete_auth_method_secrets(self, record: dict) -> None:
+        email = record.get("email", "")
+        org_uuid = record.get("organizationUuid", "") or ""
+        raw = record.get("authMethods")
+        if not isinstance(raw, list):
+            return
+        for method in raw:
+            if method in AUTH_METHOD_LABELS and method != AUTH_UNKNOWN:
+                key = self._auth_method_storage_key(email, org_uuid, method)
+                self._store._delete_account_credentials(key, email)
+
+    def _set_account_auth_methods(
+        self,
+        data: dict,
+        account_num: str,
+        methods: list[str],
+        preferred: str,
+    ) -> None:
+        """Persist a canonical method list and its preferred child."""
+        ordered = [
+            method for method in AUTH_METHOD_LABELS
+            if method != AUTH_UNKNOWN and method in methods
+        ]
+        if preferred not in ordered:
+            raise ValidationError(f"Unknown login method: {preferred}")
+        record = data["accounts"][str(account_num)]
+        record["authMethods"] = ordered
+        record["preferredAuthMethod"] = preferred
+        if preferred == AUTH_API_KEY:
+            record["kind"] = "api_key"
+        else:
+            record.pop("kind", None)
+
+    def _store_account_auth_method(
+        self,
+        data: dict,
+        account_num: str,
+        credentials: str,
+        *,
+        make_default: bool = False,
+        auth_method: str | None = None,
+    ) -> str:
+        """Add or refresh one child login method for an existing account.
+
+        The first time an account gains a second method, its legacy primary
+        backup is copied into child storage before the new secret is written.
+        The primary backup remains a compatibility pointer to the preferred
+        method, so existing switch, usage, session, and auto-rotation paths keep
+        one account-level credential source. Adding or refreshing a method keeps
+        the current default unless ``make_default`` is explicit.
+        """
+        record = data["accounts"][str(account_num)]
+        email = record.get("email", "")
+        org_uuid = record.get("organizationUuid", "") or ""
+        primary = self._read_account_credentials(str(account_num), email)
+        methods = list(
+            self._account_auth_methods(
+                account_num, credentials=primary, data=data
+            )
+        )
+        if not isinstance(record.get("authMethods"), list):
+            old_method = classify_auth_method(primary)
+            if old_method != AUTH_UNKNOWN and primary:
+                self._write_auth_method_secret(
+                    email, org_uuid, old_method, primary
+                )
+
+        method = auth_method or classify_auth_method(credentials)
+        if method == AUTH_UNKNOWN:
+            raise ValidationError("Unsupported Claude Code login credential")
+        self._write_auth_method_secret(email, org_uuid, method, credentials)
+        if method not in methods:
+            methods.append(method)
+
+        current_preferred = self._preferred_auth_method(
+            account_num, credentials=primary, data=data
+        )
+        selected = (
+            method
+            if make_default or current_preferred == AUTH_UNKNOWN
+            else current_preferred
+        )
+        selected_credentials = (
+            credentials
+            if selected == method
+            else self._read_auth_method_credentials(
+                account_num, email, org_uuid, selected
+            )
+        )
+        if not selected_credentials:
+            raise CredentialReadError(
+                f"No stored credentials for {auth_method_label(selected)}"
+            )
+        self._write_account_credentials(
+            str(account_num), email, selected_credentials
+        )
+        self._set_account_auth_methods(data, str(account_num), methods, selected)
+        return method
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -623,6 +887,18 @@ class ClaudeAccountSwitcher:
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
         once and only after a successful write.
         """
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        methods = record.get("authMethods")
+        if isinstance(methods, list):
+            method = classify_auth_method(credentials)
+            if method in methods:
+                self._write_auth_method_secret(
+                    email,
+                    record.get("organizationUuid", "") or "",
+                    method,
+                    credentials,
+                )
         self._store._write_account_credentials(account_num, email, credentials)
         self._post_backup_write(account_num, email)
 
@@ -1484,6 +1760,27 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            preferred = self._preferred_auth_method(
+                n, credentials=_creds, data=seq_data
+            )
+            details = self._auth_method_snapshots(
+                n,
+                email,
+                org_uuid,
+                credentials=_creds,
+                data=seq_data,
+            )
+            fallback = auth_metadata(_creds)
+            selected = next(
+                (detail for detail in details if detail.method == preferred),
+                AuthMethodSnapshot(
+                    fallback.method,
+                    fallback.scope,
+                    fallback.supports_remote_control,
+                    fallback.expires_at,
+                    True,
+                ),
+            )
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -1494,6 +1791,13 @@ class ClaudeAccountSwitcher:
                     kind=self._account_kind(n),
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
+                    auth_method=preferred,
+                    auth_methods=tuple(detail.method for detail in details)
+                    or (selected.method,),
+                    auth_scope=selected.scope,
+                    auth_supports_remote_control=selected.supports_remote_control,
+                    auth_expires_at=selected.expires_at,
+                    auth_method_details=details or (selected,),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                 )
@@ -2026,34 +2330,6 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
-        """Reject registering a token whose (email, personal-org) already exists as
-        the *other* kind.
-
-        Identity is matched on ``(email, organizationUuid)`` only, so two slots
-        sharing an email across kinds (one OAuth, one API key) could not be told
-        apart at switch time. Rather than thread ``kind`` through the whole identity
-        system, refuse the collision and point the user at a distinct ``--email``.
-        The default ``…@token.local`` labels never collide; this only guards a forced
-        ``--email``.
-        """
-        data = self._get_sequence_data()
-        if not data:
-            return
-        slot = self._find_account_slot(data, email, "")
-        if slot is None:
-            return
-        existing_kind = self._account_kind(slot)
-        new_kind = "api_key" if is_api_key else "oauth"
-        if existing_kind != new_kind:
-            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
-            new_label = "API-key" if is_api_key else "OAuth"
-            raise ValidationError(
-                f"'{email}' already exists as an {existing_label} account "
-                f"(slot {slot}); cannot add it as an {new_label} account. "
-                f"Pass a distinct --email."
-            )
-
     @staticmethod
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
         """Return display tag for an account's org context."""
@@ -2258,7 +2534,12 @@ class ClaudeAccountSwitcher:
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
 
-            self._write_account_credentials(account_num, current_email, current_creds)
+            self._store_account_auth_method(
+                seq,
+                account_num,
+                current_creds,
+                auth_method=AUTH_BROWSER_OAUTH,
+            )
             self._write_account_config(account_num, current_email, current_config)
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
@@ -2377,6 +2658,10 @@ class ClaudeAccountSwitcher:
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
             d_num, d_email, d_org = displace_slot
+            displaced = (self._get_sequence_data() or {}).get("accounts", {}).get(
+                d_num, {}
+            )
+            self._delete_auth_method_secrets(displaced)
             self._delete_account_files(d_num, d_email)
             data = self._get_sequence_data()
             if int(d_num) in data["sequence"]:
@@ -2394,13 +2679,6 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
         # Update sequence.json
         data = self._get_sequence_data()
         data["accounts"][account_num] = {
@@ -2410,6 +2688,16 @@ class ClaudeAccountSwitcher:
             "organizationName": organization_name,
             "added": get_timestamp(),
         }
+        self._store_account_auth_method(
+            data,
+            account_num,
+            current_creds,
+            auth_method=AUTH_BROWSER_OAUTH,
+        )
+        self._write_account_config(account_num, current_email, current_config)
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (current_email, organization_uuid)}
+        )
         carried_alias = alias if alias is not None else existing_alias
         if carried_alias:
             data["accounts"][account_num]["alias"] = carried_alias
@@ -2433,7 +2721,7 @@ class ClaudeAccountSwitcher:
         slot: int | None = None,
         assume_yes: bool = False,
     ) -> None:
-        """Register a raw OAuth setup-token or managed API key as a new account.
+        """Register a raw setup-token or managed API key under an account.
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine. The
@@ -2447,7 +2735,8 @@ class ClaudeAccountSwitcher:
             email: Email address to associate with the account. When omitted,
                    defaults to ``setup-token-{slot}@token.local`` (or
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
-                   carry no real email metadata.
+                   carry no real email metadata. An existing personal account
+                   with the same email gains or refreshes this login method.
             slot:  Slot number to use; auto-assigned when ``None``.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
@@ -2481,11 +2770,6 @@ class ClaudeAccountSwitcher:
             label = "api-key" if is_api_key else "setup-token"
             email = f"{label}-{slot}@token.local"
 
-        # Don't silently overwrite/convert an existing account of the other kind:
-        # identity is matched on (email, org) only, so an api-key and an OAuth
-        # account sharing an email would be indistinguishable at switch time.
-        self._reject_cross_kind_collision(email, is_api_key)
-
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
         # synthesized config is identical for both (no real org metadata).
@@ -2515,7 +2799,12 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(account_num, email, credentials)
+            method = self._store_account_auth_method(
+                seq,
+                account_num,
+                credentials,
+                auth_method=AUTH_API_KEY if is_api_key else AUTH_SETUP_TOKEN,
+            )
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
@@ -2526,7 +2815,7 @@ class ClaudeAccountSwitcher:
             )
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
-            kind_label = "API key" if is_api_key else "token"
+            kind_label = "API key" if method == AUTH_API_KEY else "token"
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
@@ -2582,6 +2871,10 @@ class ClaudeAccountSwitcher:
 
         if displace_slot:
             d_num, d_email, d_org = displace_slot
+            displaced = (self._get_sequence_data() or {}).get("accounts", {}).get(
+                d_num, {}
+            )
+            self._delete_auth_method_secrets(displaced)
             self._delete_account_files(d_num, d_email)
             data = self._get_sequence_data()
             if int(d_num) in data["sequence"]:
@@ -2599,14 +2892,6 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
         data = self._get_sequence_data()
         record = {
             "email": email,
@@ -2615,16 +2900,26 @@ class ClaudeAccountSwitcher:
             "organizationName": "",
             "added": get_timestamp(),
         }
-        if is_api_key:
-            record["kind"] = "api_key"
         data["accounts"][account_num] = record
+        method = self._store_account_auth_method(
+            data,
+            account_num,
+            credentials,
+            auth_method=AUTH_API_KEY if is_api_key else AUTH_SETUP_TOKEN,
+        )
+        self._write_account_config(account_num, email, config)
+        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (email, "")}
+        )
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
+        source_label = auth_method_label(method)
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
@@ -2707,6 +3002,7 @@ class ClaudeAccountSwitcher:
                 return
 
         # Remove backup files
+        self._delete_auth_method_secrets(account_info)
         self._delete_account_files(account_num, email)
 
         # Update sequence.json
@@ -2738,6 +3034,7 @@ class ClaudeAccountSwitcher:
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
+        self._usage_backup_slots = set()
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
@@ -2756,6 +3053,25 @@ class ClaudeAccountSwitcher:
                 self._active_keychain_unavailable = active.keychain_unavailable
             else:
                 creds = self._read_account_credentials(str(num), email)
+
+            methods = self._account_auth_methods(
+                str(num), credentials=creds, data=data
+            )
+            live_method = classify_auth_method(creds)
+            oauth_methods = [
+                method
+                for method in (AUTH_BROWSER_OAUTH, AUTH_SETUP_TOKEN)
+                if method in methods
+            ]
+            if oauth_methods and live_method not in oauth_methods:
+                usage_method = oauth_methods[0]
+                stored_oauth = self._read_auth_method_credentials(
+                    str(num), email, org_uuid, usage_method
+                )
+                if stored_oauth:
+                    creds = stored_oauth
+                    if is_active:
+                        self._usage_backup_slots.add(str(num))
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
@@ -3392,7 +3708,7 @@ class ClaudeAccountSwitcher:
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
-        if is_active:
+        if is_active and str(num) not in self._usage_backup_slots:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
@@ -3881,7 +4197,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
-        for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -3889,6 +4205,30 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
+            preferred = self._preferred_auth_method(
+                str(num), credentials=creds, data=seq_data
+            )
+            methods = self._account_auth_methods(
+                str(num), credentials=creds, data=seq_data
+            )
+            details = self._auth_method_snapshots(
+                str(num),
+                email,
+                org_uuid,
+                credentials=creds,
+                data=seq_data,
+            )
+            fallback = auth_metadata(creds)
+            selected = next(
+                (detail for detail in details if detail.method == preferred),
+                AuthMethodSnapshot(
+                    fallback.method,
+                    fallback.scope,
+                    fallback.supports_remote_control,
+                    fallback.expires_at,
+                    True,
+                ),
+            )
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
@@ -3896,6 +4236,25 @@ class ClaudeAccountSwitcher:
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
+                    auth_method=preferred,
+                    auth_methods=list(methods or (preferred,)),
+                    auth_scope=selected.scope,
+                    auth_supports_remote_control=selected.supports_remote_control,
+                    auth_expires_at=selected.expires_at,
+                    auth_method_details=[
+                        {
+                            "method": detail.method,
+                            "scope": detail.scope,
+                            "supportsRemoteControl": detail.supports_remote_control,
+                            **(
+                                {"expiresAt": detail.expires_at}
+                                if detail.expires_at
+                                else {}
+                            ),
+                            **({"default": True} if detail.is_default else {}),
+                        }
+                        for detail in details
+                    ],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                 )
@@ -3954,7 +4313,7 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
@@ -3963,6 +4322,37 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            preferred = self._preferred_auth_method(
+                str(num), credentials=creds, data=seq_data
+            )
+            details = self._auth_method_snapshots(
+                str(num),
+                email,
+                org_uuid,
+                credentials=creds,
+                data=seq_data,
+            )
+            if not details:
+                auth = auth_metadata(creds)
+                details = (
+                    AuthMethodSnapshot(
+                        auth.method,
+                        auth.scope,
+                        auth.supports_remote_control,
+                        auth.expires_at,
+                        True,
+                    ),
+                )
+            for detail in details:
+                marker = (
+                    " · default"
+                    if detail.method == preferred and len(details) > 1
+                    else ""
+                )
+                print(
+                    f"     {dimmed('Claude Code:')} "
+                    f"{muted(auth_metadata_summary(detail) + marker)}"
+                )
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 
@@ -4597,13 +4987,20 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        auth_method: str | None = None,
+        required_capability: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``required_capability`` selects a login that supports the requested
+        Claude Code feature and fails before mutation when none is stored.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -4654,6 +5051,59 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
+        requested_method = auth_method.replace("-", "_") if auth_method else None
+        capability = (
+            required_capability.replace("-", "_")
+            if required_capability
+            else None
+        )
+        if capability not in {None, AUTH_CAPABILITY_REMOTE_CONTROL}:
+            raise ValidationError(
+                f"Unsupported Claude Code capability: {required_capability}"
+            )
+        target_email = data["accounts"][target_account].get("email", "")
+        target_primary = self._read_account_credentials(
+            target_account, target_email
+        )
+        available_methods = self._account_auth_methods(
+            target_account, credentials=target_primary, data=data
+        )
+        if requested_method is not None and requested_method not in available_methods:
+            available = ", ".join(auth_method_label(m) for m in available_methods)
+            raise ValidationError(
+                f"Account-{target_account} has no {auth_method_label(requested_method)} "
+                f"login. Available: {available or 'none'}"
+            )
+        default_method = self._preferred_auth_method(
+            target_account, credentials=target_primary, data=data
+        )
+        if requested_method is not None:
+            selected_method = requested_method
+        elif capability is not None:
+            ordered_methods = (default_method,) + tuple(
+                method for method in available_methods if method != default_method
+            )
+            selected_method = next(
+                (
+                    method
+                    for method in ordered_methods
+                    if auth_method_supports_capability(method, capability)
+                ),
+                AUTH_UNKNOWN,
+            )
+        else:
+            selected_method = default_method
+
+        if capability is not None and not auth_method_supports_capability(
+            selected_method, capability
+        ):
+            if capability == AUTH_CAPABILITY_REMOTE_CONTROL:
+                raise ValidationError(
+                    f"Remote Control requires browser OAuth for Account-"
+                    f"{target_account}. Run 'claude auth login', then "
+                    f"'cswap add --slot {target_account}'."
+                )
+
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
         # destroying a freshly imported backup with a possibly stale login —
@@ -4670,11 +5120,19 @@ class ClaudeAccountSwitcher:
             identity = self._get_current_account()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
-                if cur_slot == target_account:
+                current_preferred = self._preferred_auth_method(
+                    target_account, credentials=target_primary, data=data
+                )
+                method_change = selected_method != current_preferred
+                if cur_slot == target_account and not method_change:
                     action, provenance = self._self_switch_action(
                         target_account, identity[0]
                     )
-                if cur_slot == target_account and action != "reconcile":
+                if (
+                    cur_slot == target_account
+                    and not method_change
+                    and action != "reconcile"
+                ):
                     email = (
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
@@ -4697,12 +5155,14 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
-        op = self._perform_switch(
-            target_account,
-            emit_output=not json_output,
-            force_activate=force,
-            provenance=provenance,
-        )
+        switch_kwargs = {
+            "emit_output": not json_output,
+            "force_activate": force,
+            "provenance": provenance,
+        }
+        if selected_method != AUTH_UNKNOWN:
+            switch_kwargs["target_auth_method"] = selected_method
+        op = self._perform_switch(target_account, **switch_kwargs)
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -5027,6 +5487,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        target_auth_method: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -5094,6 +5555,11 @@ class ClaudeAccountSwitcher:
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
+            target_record = data["accounts"][target_account]
+            target_org_uuid = target_record.get("organizationUuid", "") or ""
+            target_method = target_auth_method or self._preferred_auth_method(
+                target_account, data=data
+            )
             to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:
@@ -5122,8 +5588,11 @@ class ClaudeAccountSwitcher:
                     from_ref = account_ref(None, current_identity[0])
                 else:
                     from_ref = account_ref(int(current_account), current_identity[0])
-                target_creds = self._read_account_credentials(
-                    target_account, target_email
+                target_creds = self._read_auth_method_credentials(
+                    target_account,
+                    target_email,
+                    target_org_uuid,
+                    target_method,
                 )
                 target_config = self._read_account_config(target_account, target_email)
                 if not target_creds:
@@ -5230,6 +5699,16 @@ class ClaudeAccountSwitcher:
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
+                    target_methods = self._account_auth_methods(
+                        target_account, credentials=target_creds, data=data
+                    )
+                    if target_method in target_methods:
+                        self._set_account_auth_methods(
+                            data,
+                            target_account,
+                            list(target_methods),
+                            target_method,
+                        )
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
@@ -5446,9 +5925,24 @@ class ClaudeAccountSwitcher:
                             acct["uuid"] = resolved["uuid"]
                     self._logger.info(f"Backed up account {current_account}")
 
+                outgoing_method = classify_auth_method(original_creds)
+                outgoing_methods = self._account_auth_methods(
+                    current_account, credentials=original_creds, data=data
+                )
+                if outgoing_method in outgoing_methods:
+                    self._set_account_auth_methods(
+                        data,
+                        current_account,
+                        list(outgoing_methods),
+                        outgoing_method,
+                    )
+
                 # Step 2: Retrieve target account
-                target_creds = self._read_account_credentials(
-                    target_account, target_email
+                target_creds = self._read_auth_method_credentials(
+                    target_account,
+                    target_email,
+                    target_org_uuid,
+                    target_method,
                 )
                 target_config = self._read_account_config(target_account, target_email)
 
@@ -5487,6 +5981,16 @@ class ClaudeAccountSwitcher:
                 self._logger.info("Updated config file")
 
                 # Step 5: Update sequence state
+                target_methods = self._account_auth_methods(
+                    target_account, credentials=target_creds, data=data
+                )
+                if target_method in target_methods:
+                    self._set_account_auth_methods(
+                        data,
+                        target_account,
+                        list(target_methods),
+                        target_method,
+                    )
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
@@ -5627,6 +6131,17 @@ class ClaudeAccountSwitcher:
                 nums = [account_num]
                 if str(account_num) != "None":
                     nums.append("None")
+                raw_methods = account_info.get("authMethods")
+                if isinstance(raw_methods, list):
+                    nums.extend(
+                        self._auth_method_storage_key(
+                            email,
+                            account_info.get("organizationUuid", "") or "",
+                            method,
+                        )
+                        for method in raw_methods
+                        if method in AUTH_METHOD_LABELS and method != AUTH_UNKNOWN
+                    )
                 usernames = [f"account-{num}-{email}" for num in nums]
 
                 # .enc files (Linux/WSL/Windows always; macOS fallback copies).

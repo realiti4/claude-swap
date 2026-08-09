@@ -314,6 +314,63 @@ class TestCLI:
             "2", json_output=False, force=False
         )
 
+    def test_switch_to_forwards_auth_method(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(
+                 sys,
+                 "argv",
+                 ["claude-swap", "switch", "2", "--auth-method", "setup-token"],
+             ), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2",
+            json_output=False,
+            force=False,
+            auth_method="setup-token",
+        )
+
+    def test_switch_to_forwards_required_capability(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(
+                 sys,
+                 "argv",
+                 [
+                     "claude-swap",
+                     "switch",
+                     "2",
+                     "--require-capability",
+                     "remote-control",
+                 ],
+             ), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2",
+            json_output=False,
+            force=False,
+            required_capability="remote-control",
+        )
+
+    def test_required_capability_requires_switch_target(self, capsys):
+        with patch.object(
+            sys,
+            "argv",
+            ["claude-swap", "list", "--require-capability", "remote-control"],
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert (
+            "--require-capability can only be used with 'switch <num|email>'"
+            in capsys.readouterr().err
+        )
+
     def test_export_and_import_are_mutually_exclusive(self):
         """--export and --import cannot be combined."""
         result = subprocess.run(
