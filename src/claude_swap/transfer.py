@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -272,6 +272,13 @@ def export_accounts(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        # Carry provenance across the wire. Without this the importing machine
+        # would have to guess, and "arrived via import" is not the same claim as
+        # "acquired independently" — an account captured from the live store
+        # here and imported there would be mislabelled independent, suppressing
+        # a heal it genuinely needs.
+        if record.get("credentialOrigin"):
+            entry["credentialOrigin"] = record["credentialOrigin"]
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -432,6 +439,10 @@ def import_accounts(
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
+                "origin_kind": (
+                    (raw.get("credentialOrigin") or {}).get("kind")
+                    or "independent"
+                ),
             }
         )
 
@@ -552,6 +563,18 @@ def import_accounts(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        # Record where this credential came from, so the rotated-backup resync
+        # can tell a consumed predecessor from an independent grant for the same
+        # account — the one case the ownership probe cannot separate. An import
+        # is independent unless the payload says otherwise (see export). The
+        # fingerprint is recomputed from the bytes actually written, so the
+        # record describes what is really in the slot.
+        origin_fp = oauth.credential_fingerprint(entry["creds_text"])
+        if origin_fp:
+            new_record["credentialOrigin"] = {
+                "kind": entry["origin_kind"],
+                "fingerprint": origin_fp,
+            }
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

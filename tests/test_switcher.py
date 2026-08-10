@@ -2294,6 +2294,83 @@ class TestActiveAccountRefresh:
             )
         return result, write_backup, mock_probe
 
+    # An independently acquired grant for the SAME account: a full token pair
+    # that was never derived from the live store, so it is nobody's predecessor.
+    _INDEPENDENT = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-independent",
+            "refreshToken": "rt-independent",
+            "expiresAt": 9999999999000,
+        }
+    })
+
+    def test_fresh_fetch_leaves_an_independently_provisioned_backup_alone(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Two independent grants for the same account. The ownership probe
+        affirms both — it answers *whose account is this*, not *which grant is
+        newer* — so without provenance the resync overwrites a working,
+        independently acquired refresh token that it cannot distinguish from a
+        consumed predecessor. A backup cswap never derived from the live store
+        is nobody's predecessor and must survive."""
+        sample_sequence_data["accounts"]["1"]["credentialOrigin"] = {
+            "kind": "independent",
+            "fingerprint": oauth.credential_fingerprint(self._INDEPENDENT),
+        }
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._REFRESHED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=self._INDEPENDENT,
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=self._PROFILE_SELF), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        write_backup.assert_not_called()
+
+    def test_fresh_fetch_resyncs_when_the_origin_record_no_longer_describes_the_backup(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The origin record is keyed by fingerprint so it self-invalidates. A
+        slot re-provisioned by any derived path leaves the recorded fingerprint
+        describing a credential that is no longer there, and the marker must
+        stop applying rather than protect bytes it never described — failing
+        back to the resync, not away from it."""
+        sample_sequence_data["accounts"]["1"]["credentialOrigin"] = {
+            "kind": "independent",
+            "fingerprint": "sha256:stale-no-longer-the-backup",
+        }
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._REFRESHED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=self._EXPIRED,
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=self._PROFILE_SELF), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        assert write_backup.call_args_list == [
+            call("1", "test@example.com", self._REFRESHED),
+        ]
+
     def test_fresh_foreign_probe_mismatch_skips_resync_warns_once_and_caches(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
         caplog,
