@@ -355,3 +355,62 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+class TestWriteIsByteStable:
+    """The written bytes must depend on the CONTENT, not on dict order or luck.
+
+    `<backup>/settings.json` is deployed `link: absolute`, so it points AT a
+    tracked file in the dotfiles repo. Every write cswap makes lands in that
+    repo. Two properties therefore decide whether `git status` is ever clean
+    on three machines: a trailing newline, and a key order that does not move.
+    """
+
+    def test_write_ends_with_a_newline(self, tmp_path):
+        """No trailing newline means a permanent `\\ No newline at end of file`
+        diff that comes back on every write, so committing it never sticks."""
+        p = tmp_path / "settings.json"
+
+        atomic_write_json(p, {"b": 1, "a": 2})
+
+        assert p.read_bytes().endswith(b"\n"), (
+            "settings.json must end with a newline; without it the dotfiles "
+            "repo carries a one-line diff that returns after every write"
+        )
+
+    def test_key_order_does_not_change_the_bytes(self, tmp_path):
+        """Same content, different insertion order -> identical bytes.
+
+        Measured 2026-08-10 on the personal mac: the `ui`/`theme` block moved
+        while `json.load` equality stayed True, so an alignment was reverted by
+        pure reordering with no value change.
+        """
+        a = tmp_path / "a.json"
+        b = tmp_path / "b.json"
+
+        atomic_write_json(a, {"ui": {"theme": "dark"}, "schemaVersion": 1})
+        atomic_write_json(b, {"schemaVersion": 1, "ui": {"theme": "dark"}})
+
+        assert a.read_bytes() == b.read_bytes(), (
+            "insertion order must not reach the file: equal content has to "
+            "produce equal bytes or the repo diff flaps"
+        )
+
+    def test_nested_key_order_also_normalised(self, tmp_path):
+        """Sorting only the top level would leave the nested blocks flapping —
+        and `ui`/`theme` is exactly a nested block."""
+        a = tmp_path / "a.json"
+        b = tmp_path / "b.json"
+
+        atomic_write_json(a, {"ui": {"theme": "dark", "colour": "auto"}})
+        atomic_write_json(b, {"ui": {"colour": "auto", "theme": "dark"}})
+
+        assert a.read_bytes() == b.read_bytes(), "nested order must normalise too"
+
+    def test_content_still_round_trips(self, tmp_path):
+        """Normalising the bytes must not change what is stored."""
+        p = tmp_path / "settings.json"
+        data = {"schemaVersion": 1, "ui": {"theme": "dark"}, "autoswitch": {"threshold": 90}}
+
+        atomic_write_json(p, data)
+
+        assert json.loads(p.read_text()) == data

@@ -472,7 +472,16 @@ def atomic_write_json(path: Path, data: dict) -> None:
         os.chmod(path.parent, 0o700)
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+        # sort_keys + trailing newline: the bytes must depend on the CONTENT
+        # only. This file is deployed `link: absolute`, so every write lands
+        # in a TRACKED dotfiles path — without both, the repo carries a diff
+        # that returns after each write and `git status` is never clean on any
+        # machine. Measured: the missing newline gave a permanent
+        # `\ No newline at end of file`, and insertion order moved the
+        # `ui`/`theme` block while json equality stayed True, silently
+        # reverting a sync someone had just aligned.
+        payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        os.write(fd, payload.encode("utf-8"))
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(target))
