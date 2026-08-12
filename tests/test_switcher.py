@@ -8357,6 +8357,50 @@ class TestSlotVacatePrunesUsageStore:
 
         assert "1" not in self._raw_usage_accounts(switcher)
 
+    @pytest.mark.parametrize("entrypoint", ["capture", "token"])
+    @pytest.mark.parametrize("vacate_kind", ["displaced", "migrated"])
+    def test_add_completes_when_post_commit_usage_drop_fails(
+        self, temp_home, entrypoint, vacate_kind
+    ):
+        """Cache hygiene is best-effort once vacating the roster is committed."""
+        new_email = "new@x.com"
+        old_email = "old@x.com" if vacate_kind == "displaced" else new_email
+        old_slot = "5" if vacate_kind == "displaced" else "1"
+        target_slot = 5
+        switcher = self._config_switcher(temp_home, new_email)
+        data = switcher._get_sequence_data()
+        data["accounts"][old_slot] = {
+            "email": old_email,
+            "uuid": "old-uuid",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [int(old_slot)]
+        switcher._write_json(switcher.sequence_file, data)
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch.object(switcher, "_delete_account_files"), patch.object(
+            switcher, "_write_account_credentials"
+        ), patch.object(switcher, "_write_account_config"), patch.object(
+            switcher._usage_store,
+            "drop",
+            side_effect=OSError("injected usage cache write failure"),
+        ), patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(fake_creds, False),
+        ):
+            if entrypoint == "capture":
+                switcher.add_account(slot=target_slot, assume_yes=True)
+            else:
+                switcher.add_account_from_token(
+                    "token", new_email, slot=target_slot, assume_yes=True
+                )
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"][str(target_slot)]["email"] == new_email
+        assert data["sequence"] == [target_slot]
+
 
 class TestReconcilesPreExistingOrphans:
     """BC-18973 rework: independent review found the forward-only drop()

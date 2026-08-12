@@ -843,9 +843,15 @@ class UsageStore:
       docstring before calling it.
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float] = time.time,
+        roster_path: Path | None = None,
+    ):
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
+        self._roster_path = roster_path
         self.clock = clock
 
     # -- raw I/O ------------------------------------------------------------
@@ -878,6 +884,29 @@ class UsageStore:
 
     def _fresh_row(self, identity: Identity) -> dict:
         return {"email": identity[0], "organizationUuid": identity[1]}
+
+    def _is_current_roster_identity(self, num: str, identity: Identity) -> bool:
+        """Whether ``num`` still names ``identity`` in the managed roster.
+
+        Switcher-owned stores provide a roster path so an in-flight collector
+        cannot cross a completed remove or slot reuse. Standalone stores omit
+        it and retain the generic identity-guarded behavior.
+        """
+        if self._roster_path is None:
+            return True
+        try:
+            data = json.loads(self._roster_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return True
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        account = accounts.get(num) if isinstance(accounts, dict) else None
+        return (
+            isinstance(account, dict)
+            and account.get("email") == identity[0]
+            and (account.get("organizationUuid") or "") == identity[1]
+        )
 
     # -- read model -----------------------------------------------------------
 
@@ -1037,6 +1066,8 @@ class UsageStore:
             rows = self._read_rows()
             for num in nums:
                 identity = identities[num]
+                if not self._is_current_roster_identity(num, identity):
+                    continue
                 row = rows.get(num)
                 if not self._matches(row, identity):
                     rows[num] = row = self._fresh_row(identity)
@@ -1126,6 +1157,10 @@ class UsageStore:
             rows = self._read_rows()
             for num in outcomes:
                 identity = identities[num]
+                if claims is not None and not self._is_current_roster_identity(
+                    num, identity
+                ):
+                    continue
                 row = rows.get(num)
                 expected: str | None = None
                 if claims is not None:

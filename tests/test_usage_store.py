@@ -1738,6 +1738,44 @@ class TestDrop:
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.drop(["1", "9"]) == 1
 
+    def test_stale_collector_cannot_recreate_a_removed_roster_slot(
+        self, tmp_path, clock
+    ):
+        """Removal after snapshot construction fences later reserve/record."""
+        sequence_path = tmp_path / "sequence.json"
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {"email": "b@x.com", "organizationUuid": "org-2"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = UsageStore(
+            tmp_path / "cache", clock=clock, roster_path=sequence_path
+        )
+        stale_snapshot = {"2": IDENT["2"]}
+        store.record({"2": FetchRecord(usage=USAGE)}, stale_snapshot)
+
+        # The collector retains stale_snapshot while the roster mutation and
+        # cache cleanup complete in another process.
+        sequence_path.write_text(
+            json.dumps({"sequence": [], "accounts": {}}), encoding="utf-8"
+        )
+        store.drop(["2"])
+
+        claims = store.reserve(["2"], stale_snapshot, respect_plans=False)
+        accepted = store.record(
+            {"2": FetchRecord(usage=USAGE)}, stale_snapshot, claims
+        )
+
+        assert claims == {}
+        assert accepted == set()
+        assert "2" not in store._read_rows()
+
 
 class TestReconcile:
     """BC-18973 rework: drop() only ever reaches a slot its caller already

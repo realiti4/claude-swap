@@ -325,7 +325,9 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
-        self._usage_store = UsageStore(self.backup_dir / "cache")
+        self._usage_store = UsageStore(
+            self.backup_dir / "cache", roster_path=self.sequence_file
+        )
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -917,7 +919,12 @@ class ClaudeAccountSwitcher:
         del data["accounts"][d_num]
         self._write_json(self.sequence_file, data)
         self._prune_mappings(d_email, d_org)
-        self._usage_store.drop([d_num])
+        try:
+            self._usage_store.drop([d_num])
+        except Exception as e:
+            self._logger.error(
+                f"Stale ring-usage cache row left under displaced key {d_num}: {e}"
+            )
 
     def _vacate_migrated_slot(self, migrate_from: str) -> None:
         """Free the OLD slot number after the same identity moves to a new
@@ -933,7 +940,13 @@ class ClaudeAccountSwitcher:
             data["sequence"].remove(int(migrate_from))
         del data["accounts"][migrate_from]
         self._write_json(self.sequence_file, data)
-        self._usage_store.drop([migrate_from])
+        try:
+            self._usage_store.drop([migrate_from])
+        except Exception as e:
+            self._logger.error(
+                "Stale ring-usage cache row left under migrated key "
+                f"{migrate_from}: {e}"
+            )
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
