@@ -1177,6 +1177,33 @@ class UsageStore:
 
         self._mutate(identities, nums, apply)
 
+    def drop(self, nums: Iterable[str]) -> int:
+        """Delete stored rows for slots that have permanently left the
+        managed set (removed, displaced, migrated, or moved away from — see
+        the callers in switcher.py, one per table mutation that frees a slot
+        number for good).
+
+        Unconditional on identity: a freed slot's row is stale regardless of
+        what it currently holds — the identity it recorded is gone, or (a
+        reused slot number) the next fetch's identity-guarded write already
+        replaces it. Without this, a removed account's row keeps reading as
+        an unpolled, unknown account to any consumer of the raw file forever
+        (ring-watcher, most notably: it has no in-band "managed" signal of
+        its own and must trust the stored rows as-is). Returns the count of
+        rows actually removed.
+        """
+        nums = list(nums)
+        if not nums:
+            return 0
+        with self._lock():
+            rows = self._read_rows()
+            doomed = [num for num in nums if num in rows]
+            for num in doomed:
+                del rows[num]
+            if doomed:
+                self._write_rows(rows)
+        return len(doomed)
+
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None

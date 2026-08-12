@@ -8255,6 +8255,109 @@ class TestRemoveAccountPrunesMappings:
         assert switcher.slot_for_directory(str(temp_home)) == ("5", "a@x.com")
 
 
+class TestSlotVacatePrunesUsageStore:
+    """BC-18973: a slot that leaves cswap's managed set for good (removed,
+    displaced by an overwrite, or migrated to a new number) must not leave
+    its row behind in usage.json — orphaned rows there are invisible to
+    cswap's own identity-guarded reads but not to a tool that reads the raw
+    file directly (ring-watcher; see BC-18955/BC-18973), where they read as
+    permanently unpolled managed accounts and block ring-wide confirmation.
+
+    Each test reads the raw file exactly as such a tool would (plain JSON,
+    no identity matching) rather than through ``UsageStore.entries()``,
+    since entries() already hides a mismatched row and would pass even if
+    the row were merely orphaned rather than actually removed.
+    """
+
+    @staticmethod
+    def _raw_usage_accounts(switcher) -> dict:
+        path = switcher.backup_dir / "cache" / "usage.json"
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8")).get("accounts", {})
+
+    def _config_switcher(self, temp_home, email):
+        config = {
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "uuid-" + email,
+                "organizationUuid": "",
+                "organizationName": "",
+            }
+        }
+        (temp_home / ".claude.json").write_text(json.dumps(config))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    def test_remove_account_drops_the_usage_row(self, temp_home, monkeypatch):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "u1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        switcher._write_json(switcher.sequence_file, data)
+
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 50.0}})},
+            {"1": ("a@x.com", "")},
+        )
+        assert "1" in self._raw_usage_accounts(switcher)
+
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        switcher.remove_account("1")
+
+        assert "1" not in self._raw_usage_accounts(switcher)
+
+    # NOTE on the displace-slot path (add_account/add_account_from_token
+    # overwriting an occupied target slot): the displaced slot number IS the
+    # target slot, which the same call immediately rewrites via
+    # ``clear_dead_token`` right after — that call's own identity mismatch
+    # already forces a fresh row there, independent of the ``drop()`` this
+    # fix adds at the point of displacement. So the happy path can't
+    # discriminate the two — a black-box test asserting the row's final
+    # state passes whether or not the extra drop() runs. It stays in source
+    # for the narrow window it does cover (a crash between the displacement
+    # and that follow-up write, which the "safe to perform destructive
+    # cleanup" comment there says is not otherwise guarded), verified by
+    # code review rather than by a test that can't tell the difference.
+
+    def test_slot_migration_drops_the_old_slot_usage_row(self, temp_home):
+        """Moving an account to another slot (same identity, new number)
+        drops the vacated slot's row — unlike directory mappings (identity-
+        keyed, so migration needs no pruning there), usage rows are keyed by
+        slot number, so the OLD number is now a stray key. Mirrors
+        TestRemoveAccountPrunesMappings.test_slot_migration_keeps_mappings."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        switcher = self._config_switcher(temp_home, "a@x.com")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account()  # lands in slot 1
+
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 50.0}})},
+            {"1": ("a@x.com", "")},
+        )
+        assert "1" in self._raw_usage_accounts(switcher)
+
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=5)  # same identity, new slot
+
+        assert "1" not in self._raw_usage_accounts(switcher)
+
+
 class TestSwitchRemoveGatesAcceptAlias:
     """Regression: switch_to/remove_account must accept an alias identifier
     instead of rejecting it with 'Invalid email format' before resolution."""

@@ -1631,6 +1631,12 @@ class ClaudeAccountSwitcher:
             self._logger.error(
                 f"Stale backup left under old key {num_src} ({email}): {e}"
             )
+        try:
+            self._usage_store.drop([num_src])
+        except Exception as e:
+            self._logger.error(
+                f"Stale ring-usage cache row left under old key {num_src}: {e}"
+            )
         if creds:
             # Any .prev retained while overwriting a stale target key holds
             # that stale material, not this account's history.
@@ -3377,6 +3383,7 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            self._usage_store.drop([d_num])
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -3386,6 +3393,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._usage_store.drop([migrate_from])
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -3583,6 +3591,7 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            self._usage_store.drop([d_num])
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -3592,6 +3601,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._usage_store.drop([migrate_from])
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
@@ -3714,6 +3724,7 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        self._usage_store.drop([account_num])
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

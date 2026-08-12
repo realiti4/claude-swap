@@ -1682,3 +1682,58 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestDrop:
+    """BC-18973: a slot freed for good (account removed, displaced, migrated,
+    or moved away from) must not leave its row sitting in usage.json forever.
+
+    Identity-guarded reads (``entries()``) already hide a mismatched row from
+    cswap itself, but a tool with no access to that guard — ring-watcher,
+    which reads the raw file directly and has no in-band "managed" signal of
+    its own (BC-18955/BC-18973) — sees the orphaned row exactly as if it were
+    a real, never-polled managed account. These tests assert the row is
+    physically gone from the raw file, not merely hidden from entries().
+    """
+
+    def test_drop_removes_the_row_from_the_raw_file(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert "1" in store._read_rows()
+
+        removed = store.drop(["1"])
+
+        assert removed == 1
+        assert "1" not in store._read_rows()
+
+    def test_dropped_row_is_gone_even_to_a_reader_with_no_identity_guard(self, store):
+        """The discriminating check: read the file exactly as ring-watcher
+        does (raw JSON, no identity matching) rather than through
+        ``entries()``, which would already hide a mismatched row and could
+        pass even if the row were merely orphaned, not actually deleted."""
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.drop(["1"])
+
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert "1" not in raw["accounts"]
+
+    def test_drop_missing_slot_is_a_noop(self, store):
+        assert store.drop(["9"]) == 0
+        assert not store.path.exists()
+
+    def test_drop_empty_list_is_a_noop(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        mtime_before = store.path.stat().st_mtime_ns
+
+        assert store.drop([]) == 0
+        assert store.path.stat().st_mtime_ns == mtime_before
+
+    def test_drop_leaves_other_rows_untouched(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+        store.drop(["1"])
+        assert store.entries(IDENT)["2"].last_good == USAGE
+
+    def test_drop_reports_only_rows_actually_present(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.drop(["1", "9"]) == 1

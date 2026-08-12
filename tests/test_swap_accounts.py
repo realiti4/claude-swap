@@ -1,5 +1,6 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import FetchRecord, UsageStore
 
 
 class TestSwapAccounts:
@@ -436,6 +438,33 @@ class TestSwapAccounts:
         moved = switcher._session_dir("2", "account1@example.com")
         assert (moved / "marker.txt").read_text() == "history-of-account-one"
         assert not session_a.exists()
+
+    def test_swap_does_not_drop_usage_rows_for_still_managed_slots(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Scope guard for BC-18973's fix: unlike remove/displace/migrate/
+        move, a swap never frees a slot NUMBER — both numbers stay in the
+        accounts table, just holding each other's identity. Their usage
+        rows must survive (self-healing via the identity guard on next
+        write, same as any slot reuse) rather than being wiped by an
+        over-eager drop()."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        UsageStore(switcher.backup_dir / "cache").record(
+            {
+                "1": FetchRecord(usage={"five_hour": {"pct": 10.0}}),
+                "2": FetchRecord(usage={"five_hour": {"pct": 20.0}}),
+            },
+            {"1": ("account1@example.com", ""), "2": ("account2@example.com", "")},
+        )
+
+        switcher.swap_accounts("1", "2")
+
+        raw = json.loads(
+            (switcher.backup_dir / "cache" / "usage.json").read_text()
+        )["accounts"]
+        assert "1" in raw
+        assert "2" in raw
 
 
 class TestSwapUnreadableSourceIsNotAbsent:
