@@ -1738,10 +1738,10 @@ class TestDrop:
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.drop(["1", "9"]) == 1
 
-    def test_stale_collector_cannot_recreate_a_removed_roster_slot(
+    def test_stale_reserve_cannot_recreate_a_removed_roster_slot(
         self, tmp_path, clock
     ):
-        """Removal after snapshot construction fences later reserve/record."""
+        """Removal after snapshot construction fences a later reserve."""
         sequence_path = tmp_path / "sequence.json"
         sequence_path.write_text(
             json.dumps(
@@ -1768,13 +1768,56 @@ class TestDrop:
         store.drop(["2"])
 
         claims = store.reserve(["2"], stale_snapshot, respect_plans=False)
+
+        assert claims == {}
+        assert "2" not in store._read_rows()
+
+    def test_fenced_record_rejects_a_claim_after_roster_identity_reuse(
+        self, tmp_path, clock
+    ):
+        """A claim won before slot reuse cannot persist its stale result."""
+        sequence_path = tmp_path / "sequence.json"
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {"email": "b@x.com", "organizationUuid": "org-2"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = UsageStore(
+            tmp_path / "cache", clock=clock, roster_path=sequence_path
+        )
+        stale_snapshot = {"2": IDENT["2"]}
+        claims = store.reserve(["2"], stale_snapshot, respect_plans=False)
+        assert set(claims) == {"2"}  # the fetch starts while still managed
+
+        # Reuse commits before the in-flight fetch returns. Model failed
+        # best-effort cache cleanup by deliberately retaining the old claim.
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {
+                            "email": "replacement@x.com",
+                            "organizationUuid": "",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
         accepted = store.record(
             {"2": FetchRecord(usage=USAGE)}, stale_snapshot, claims
         )
 
-        assert claims == {}
         assert accepted == set()
-        assert "2" not in store._read_rows()
+        assert "lastGood" not in store._read_rows()["2"]
 
 
 class TestReconcile:
