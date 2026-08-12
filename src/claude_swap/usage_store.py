@@ -818,12 +818,29 @@ class UsageStore:
     """The ``cache/usage.json`` table. All writes go read-modify-write under
     ``cache/.usage.lock``; reads are lock-free (writes are atomic replaces).
 
-    Every method takes the caller's current ``identities`` map (slot number →
-    ``(email, organizationUuid)``) and only ever touches rows for those slots:
-    a row whose stored identity differs is invisible to reads and replaced on
-    write, so slot reuse never serves the previous account's usage. Rows for
-    slots outside the map are left alone (callers like ``--status`` operate
-    on a single slot).
+    Every read/fetch/plan method takes the caller's current ``identities``
+    map (slot number → ``(email, organizationUuid)``) and only ever touches
+    rows for those slots: a row whose stored identity differs is invisible
+    to reads and replaced on write, so slot reuse never serves the previous
+    account's usage. Rows for slots outside the map are left alone (callers
+    like ``--status`` operate on a single slot) — this is the general rule,
+    and it is safe precisely because these methods never need to know
+    whether a slot they weren't told about is still managed.
+
+    Two methods are the deliberate exception, both existing solely to keep
+    ``usage.json`` from accumulating rows for accounts no longer managed at
+    all (BC-18973 — orphaned rows are invisible to cswap's own identity
+    guard but not to a consumer with no such guard, e.g. ring-watcher,
+    which reads the raw file directly):
+
+    - :meth:`drop` takes bare slot numbers (``nums``, no identity check) and
+      deletes exactly those rows — for a caller that already knows, by
+      construction, that a specific slot was just freed for good.
+    - :meth:`reconcile` takes an ``identities`` map like every other method,
+      but inverts the rule above: it deletes every row NOT in the map,
+      instead of leaving rows outside it alone. Callers MUST pass their
+      complete current managed set here, never a subset — see its own
+      docstring before calling it.
     """
 
     def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
@@ -1198,6 +1215,54 @@ class UsageStore:
         with self._lock():
             rows = self._read_rows()
             doomed = [num for num in nums if num in rows]
+            for num in doomed:
+                del rows[num]
+            if doomed:
+                self._write_rows(rows)
+        return len(doomed)
+
+    def reconcile(self, identities: dict[str, Identity]) -> int:
+        """Delete every stored row whose slot number is not a key in
+        ``identities`` — the retroactive counterpart to :meth:`drop`.
+
+        ``drop()`` only reaches rows for slot numbers its caller names
+        explicitly, at the moment a slot is freed. It cannot reach a row
+        that was already orphaned before that per-removal pruning existed
+        (BC-18973's original gap: accounts removed by an older release, or
+        by any write path that missed a ``drop()`` call). This sweep closes
+        that gap by comparing against the caller's live view of the whole
+        table instead of a specific slot list, so the cache converges to
+        the managed set on its own the next time a caller with the full
+        picture runs — no migration step, no touching the file by hand.
+
+        ``identities`` MUST be the caller's COMPLETE current managed set,
+        fresh off the account table (e.g. every slot in
+        ``Switcher._build_accounts_info()``'s return) — never a subset. A
+        row for a slot simply not mentioned in a partial or single-account
+        map looks identical, from here, to a genuinely orphaned one; this
+        method cannot tell the difference and would delete perfectly
+        healthy, still-managed rows a caller only forgot to list. Contrast
+        every other method on this class, whose ``identities``/``nums``
+        arguments may safely be a subset — this is the one exception, and
+        callers must build it accordingly (see ``Switcher.
+        _collect_usage_entries``'s ``reconcile`` parameter).
+
+        An empty ``identities`` is treated as "not a real reading" rather
+        than "zero managed accounts" and is always a no-op: a transient
+        failure reading the account table (a corrupt or momentarily
+        unreadable ``sequence.json``) must never be able to read as "prune
+        everything" and wipe the entire cache. The true empty-table case
+        loses nothing by waiting for the next reconciling call once the
+        table is readable again — an unreconciled row is merely stale, the
+        harm this guard avoids is irreversible.
+
+        Returns the count of rows actually removed.
+        """
+        if not identities:
+            return 0
+        with self._lock():
+            rows = self._read_rows()
+            doomed = [num for num in rows if num not in identities]
             for num in doomed:
                 del rows[num]
             if doomed:

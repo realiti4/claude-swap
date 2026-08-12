@@ -1737,3 +1737,75 @@ class TestDrop:
     def test_drop_reports_only_rows_actually_present(self, store):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.drop(["1", "9"]) == 1
+
+
+class TestReconcile:
+    """BC-18973 rework: drop() only ever reaches a slot its caller already
+    knows was just freed. A row orphaned before that per-removal pruning
+    existed (or by any write path that missed it — e.g. the 8 slots
+    reported live in this ticket) can't be reached that way at all, since
+    no future removal will ever name a slot number nobody manages anymore.
+    reconcile() is the retroactive sweep: given the caller's whole current
+    managed set, delete anything not in it.
+    """
+
+    def test_reconcile_removes_a_row_outside_identities(self, store):
+        store.record({"9": FetchRecord(usage=USAGE)}, {"9": ("orphan@x.com", "")})
+
+        removed = store.reconcile(IDENT)  # IDENT only knows "1" and "2"
+
+        assert removed == 1
+        assert "9" not in store._read_rows()
+
+    def test_reconciled_row_is_gone_even_to_a_reader_with_no_identity_guard(self, store):
+        """Discriminating check, as with drop(): read the file exactly as
+        ring-watcher does (raw JSON, no identity matching)."""
+        store.record({"9": FetchRecord(usage=USAGE)}, {"9": ("orphan@x.com", "")})
+        store.reconcile(IDENT)
+
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert "9" not in raw["accounts"]
+
+    def test_reconcile_keeps_a_genuinely_managed_never_polled_row(self, store):
+        """The discriminating half of the fix: a row for a slot that IS in
+        ``identities`` but has never been successfully fetched (claimed,
+        no ``lastGood`` yet) must survive — it is a real managed account
+        ring-watcher is right to call unknown, not an orphan."""
+        store.claim(["1"], IDENT)
+        assert store.entries(IDENT)["1"].last_good is None  # genuinely unpolled
+
+        removed = store.reconcile(IDENT)
+
+        assert removed == 0
+        assert "1" in store._read_rows()
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_reconcile_keeps_managed_rows_and_drops_orphans_together(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "9": FetchRecord(usage=USAGE)},
+            {"1": IDENT["1"], "9": ("orphan@x.com", "")},
+        )
+
+        removed = store.reconcile(IDENT)
+
+        assert removed == 1
+        rows = store._read_rows()
+        assert "1" in rows
+        assert "9" not in rows
+
+    def test_reconcile_with_empty_identities_is_a_safe_noop(self, store):
+        """A blank managed-set reading (e.g. a momentarily unreadable
+        sequence.json) must never be mistaken for "zero accounts, prune
+        everything" — that would wipe the whole cache on a transient glitch."""
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+
+        removed = store.reconcile({})
+
+        assert removed == 0
+        assert set(store._read_rows()) == {"1", "2"}
+
+    def test_reconcile_returns_zero_when_nothing_is_orphaned(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.reconcile(IDENT) == 0

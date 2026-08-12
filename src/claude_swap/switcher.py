@@ -904,6 +904,37 @@ class ClaudeAccountSwitcher:
         if pruned:
             print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
 
+    def _vacate_displaced_slot(self, displace_slot: tuple[str, str, str]) -> None:
+        """Free a slot occupied by a DIFFERENT account so a new one can take
+        it: delete its backup files, drop it from the account table, and
+        prune its directory mappings and ring-usage cache row. Shared by
+        add_account and add_account_from_token's identical overwrite path."""
+        d_num, d_email, d_org = displace_slot
+        self._delete_account_files(d_num, d_email)
+        data = self._get_sequence_data()
+        if int(d_num) in data["sequence"]:
+            data["sequence"].remove(int(d_num))
+        del data["accounts"][d_num]
+        self._write_json(self.sequence_file, data)
+        self._prune_mappings(d_email, d_org)
+        self._usage_store.drop([d_num])
+
+    def _vacate_migrated_slot(self, migrate_from: str) -> None:
+        """Free the OLD slot number after the same identity moves to a new
+        one: delete its backup files, drop it from the account table, and
+        drop its ring-usage cache row (keyed by slot number, so migration
+        leaves it behind even though the identity-keyed directory mappings
+        need no pruning here). Shared by add_account and
+        add_account_from_token's identical migration path."""
+        data = self._get_sequence_data()
+        old_email = data["accounts"][migrate_from].get("email", "")
+        self._delete_account_files(migrate_from, old_email)
+        if int(migrate_from) in data["sequence"]:
+            data["sequence"].remove(int(migrate_from))
+        del data["accounts"][migrate_from]
+        self._write_json(self.sequence_file, data)
+        self._usage_store.drop([migrate_from])
+
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -1732,7 +1763,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
+            accounts_info, fetch=fetch, scheduled=scheduled, reconcile=True
         )
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
@@ -1747,7 +1778,9 @@ class ClaudeAccountSwitcher:
         this pass.
         """
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, reconcile=True
+        )
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -3375,25 +3408,10 @@ class ClaudeAccountSwitcher:
 
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-            self._usage_store.drop([d_num])
+            self._vacate_displaced_slot(displace_slot)
 
         if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-            self._usage_store.drop([migrate_from])
+            self._vacate_migrated_slot(migrate_from)
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -3583,25 +3601,10 @@ class ClaudeAccountSwitcher:
             account_num = str(self._get_next_account_number())
 
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-            self._usage_store.drop([d_num])
+            self._vacate_displaced_slot(displace_slot)
 
         if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-            self._usage_store.drop([migrate_from])
+            self._vacate_migrated_slot(migrate_from)
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
@@ -4605,6 +4608,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        reconcile: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4621,12 +4625,24 @@ class ClaudeAccountSwitcher:
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
         (stale-on-error).
+
+        ``reconcile=True`` (BC-18973) additionally sweeps ``usage.json`` for
+        rows outside ``accounts_info`` before reading it, so a slot orphaned
+        before per-removal pruning existed (or by any write path that missed
+        it) still converges to the managed set. Safe here specifically
+        because ``accounts_info`` is this call's own snapshot of the *whole*
+        table — never set this on a caller that passes a filtered or
+        single-account ``accounts_info`` (e.g. ``_active_account_usage``),
+        or the sweep would delete perfectly healthy rows it simply wasn't
+        told about.
         """
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
         }
+        if reconcile:
+            store.reconcile(identities)
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
@@ -4888,7 +4904,7 @@ class ClaudeAccountSwitcher:
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → decision-grade usage value for managed accounts."""
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info)
+        entries = self._collect_usage_entries(accounts_info, reconcile=True)
         return {num: entry.decision_value() for num, entry in entries.items()}
 
     def _warn_inert_models(
@@ -5180,7 +5196,9 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, reconcile=True
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)

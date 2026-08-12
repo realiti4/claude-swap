@@ -8358,6 +8358,82 @@ class TestSlotVacatePrunesUsageStore:
         assert "1" not in self._raw_usage_accounts(switcher)
 
 
+class TestReconcilesPreExistingOrphans:
+    """BC-18973 rework: independent review found the forward-only drop()
+    calls above can never reach a row orphaned BEFORE this hygiene existed
+    (the ticket's own reported slots 10, 11, 13-18) — no future remove,
+    displace, migrate, or move will ever name a slot number nobody manages
+    anymore, so drop() alone leaves those rows stuck forever. A normal
+    full-managed-set read (list/status/TUI/auto) must reconcile the cache
+    against the account table instead, while leaving a genuinely managed,
+    never-polled account's row alone — ring-watcher's ``unknown_accounts``
+    must still contain exactly those, never fewer.
+    """
+
+    def test_list_accounts_reconciles_a_pre_existing_orphan_row(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        # A row for a slot number no add/remove/move/migrate in this test
+        # ever touched -- exactly the shape of the 8 slots this ticket
+        # found live: cache data outliving a removal from before per-slot
+        # pruning shipped at all.
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"10": FetchRecord(usage={"five_hour": {"pct": 90.0}})},
+            {"10": ("orphan@x.com", "")},
+        )
+        # A genuinely managed account that simply hasn't been polled yet.
+        UsageStore(switcher.backup_dir / "cache").claim(
+            ["2"], {"2": ("account2@example.com", "")}
+        )
+
+        raw_path = switcher.backup_dir / "cache" / "usage.json"
+        assert set(json.loads(raw_path.read_text())["accounts"]) == {"10", "2"}
+
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(active_creds, False),
+        ), patch.object(switcher, "_read_account_credentials", return_value="{}"):
+            switcher.list_accounts(fetch=set())
+
+        raw = json.loads(raw_path.read_text())["accounts"]
+        assert "10" not in raw, "pre-existing orphan must be reconciled away"
+        assert "2" in raw, "a genuinely managed, never-polled row must survive"
+
+    def test_single_slot_status_lookup_never_triggers_reconciliation(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`_active_account_usage` (the `--status` single-slot path) only
+        ever builds a one-account view, never the full table -- it must
+        default `reconcile=False`, or a status check on slot 1 would sweep
+        away every other account's perfectly healthy row."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"2": FetchRecord(usage={"five_hour": {"pct": 50.0}})},
+            {"2": ("account2@example.com", "")},
+        )
+        raw_path = switcher.backup_dir / "cache" / "usage.json"
+        assert "2" in json.loads(raw_path.read_text())["accounts"]
+
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(active_creds, False),
+        ):
+            switcher._active_account_usage("1", "account1@example.com", "")
+
+        assert "2" in json.loads(raw_path.read_text())["accounts"], (
+            "a single-slot status lookup must never sweep other accounts' rows"
+        )
+
+
 class TestSwitchRemoveGatesAcceptAlias:
     """Regression: switch_to/remove_account must accept an alias identifier
     instead of rejecting it with 'Invalid email format' before resolution."""
