@@ -67,6 +67,22 @@ def test_notification_identity_is_noop_off_macos(tmp_path: Path):
 
 # --- settings ------------------------------------------------------------------
 
+def test_strategy_labels_cover_exactly_the_accepted_strategies():
+    """The menu must offer every strategy the settings schema accepts.
+
+    The menu bar had no strategy control at all while `cswap config set
+    autoswitch.strategy` did — a menu-bar user could be running consume-first
+    with nothing on screen saying so. Keying the labels off the schema's own
+    choices means a strategy added there can't silently go missing from the
+    menu (nor can the menu offer one `set_setting` would reject).
+    """
+    from claude_swap.settings import SETTING_SPECS
+
+    accepted = set(SETTING_SPECS["autoswitch.strategy"].choices)
+    assert set(menubar.STRATEGY_LABELS) == accepted
+    assert all(menubar.STRATEGY_LABELS.values()), "every strategy needs a label"
+
+
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True

@@ -57,6 +57,14 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Nudge Claude Code sessions that stopped on a usage limit once a switch
+    # has landed on an account with quota. OFF by default: it delivers a
+    # message into a live session over an undocumented Claude Code IPC
+    # channel, and a session resumed unattended keeps spending quota — both
+    # are things to opt into rather than inherit. Only sessions observed
+    # stopping while the engine was running are eligible (see
+    # session_resume.find_stopped_sessions).
+    resume_stopped_sessions: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +142,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "resumeStoppedSessions", "resume_stopped_sessions", "bool",
+            help="Nudge sessions stopped by a usage limit once quota returns",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
