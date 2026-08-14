@@ -248,6 +248,61 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     return UiSettings(theme=theme)
 
 
+def load_chrome_settings(backup_root: Path):
+    """Load the ``chrome`` section (browser-side account sync for the Claude in
+    Chrome extension); missing/corrupt file or fields → disabled defaults.
+
+    Kept standalone (like ``load_ui_settings``) rather than wired into
+    SETTING_SPECS: it is opt-in, macOS-only, and not part of the auto-switch
+    tuning surface. camelCase keys mirror the repo's other JSON artifacts. See
+    ``claude_swap.chrome_session.ChromeSyncSettings``.
+    """
+    from claude_swap.chrome_session import ChromeSyncSettings
+
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("chrome")
+    defaults = ChromeSyncSettings()
+    if not isinstance(section, dict):
+        return defaults
+
+    def _bool(key: str, default: bool) -> bool:
+        value = section.get(key, default)
+        return value if isinstance(value, bool) else default
+
+    def _int(key: str, default: int) -> int:
+        value = section.get(key, default)
+        return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+    def _str(key: str, default: str) -> str:
+        value = section.get(key, default)
+        return value if isinstance(value, str) else default
+
+    return ChromeSyncSettings(
+        enabled=_bool("enabled", defaults.enabled),
+        debug_port=_int("debugPort", defaults.debug_port),
+        automation_dir=_str("automationDir", defaults.automation_dir),
+        source_profile=_str("sourceProfile", defaults.source_profile),
+        auto_launch=_bool("autoLaunch", defaults.auto_launch),
+    )
+
+
+def set_chrome_enabled(backup_root: Path, enabled: bool) -> None:
+    """Toggle chrome.enabled in settings.json, preserving other chrome keys.
+
+    The `cswap chrome enable/disable` writer (and the setup wizard's step 0), so
+    users never hand-edit JSON to turn the optional browser-sync feature on/off.
+    """
+    path = settings_path(backup_root)
+    raw = _read_raw_for_write(path)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    section = raw.get("chrome")
+    if not isinstance(section, dict):
+        section = {}
+    section["enabled"] = bool(enabled)
+    raw["chrome"] = section
+    atomic_write_json(path, raw)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
