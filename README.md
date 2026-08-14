@@ -245,6 +245,50 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 </details>
 
+## Chrome extension sync (macOS)
+
+<details>
+<summary>Optional — also switch the "Claude in Chrome" extension's account when you switch</summary>
+
+`cswap switch` changes the account the `claude` CLI uses. This opt-in add-on also switches the account the **Claude browser extension** uses, so Claude Code's browser automation follows the same account.
+
+Two separate logins are involved, linked by account number:
+
+- **CLI** — the `claude` command's account (Keychain OAuth), managed already.
+- **Browser** — the Claude in Chrome extension's own OAuth pairing.
+
+The extension authenticates with OAuth tokens (not a cookie), held in its
+service worker's in-memory storage. Switching stores each account's tokens and,
+on a switch, injects the target account's tokens into the extension and restarts
+its service worker so it reconnects as that account. Because modern Chrome won't
+let a tool drive your everyday profile, this runs a dedicated, lean "Claude Code"
+Chrome profile alongside your normal browser (a separate window just for Claude
+Code).
+
+> **Security:** stored tokens are bearer credentials (`sk-ant-oat01-` /
+> `sk-ant-ort01-`, equivalent to a password) kept in `chrome_sessions.json`
+> (chmod 600) beside your other cswap state. Anyone with that file can act as
+> those accounts until the tokens expire.
+
+```bash
+cswap chrome setup      # guided: enable → create profile → install extension → capture accounts
+cswap chrome doctor     # what's set up + per-account coverage
+```
+
+The wizard installs the extension into the dedicated profile (one click from the Web Store), has you connect it to Claude Code, and captures each account's tokens. Other commands:
+
+```bash
+cswap chrome open              # open/focus the dedicated Claude Browser
+cswap chrome capture <n>       # store account <n>'s tokens (connect it there first)
+cswap chrome refresh <n>       # keep account <n>'s stored tokens alive (no browser)
+cswap chrome create-profile    # (re)create the dedicated profile  (--rebuild to reset)
+cswap chrome enable | disable  # turn the feature on/off
+```
+
+Once set up, `cswap switch <n>` (CLI or menu bar) flips the dedicated browser to account `<n>` too — the extension reconnects on its own, no side-panel reopen needed. A stored account's refresh token lasts about 28.5 days untouched; switching to it within that window is seamless (the extension self-refreshes an expired token), and `cswap chrome refresh <n>` (or any switch) rolls the window forward so it never lapses. Off until you turn it on (`chrome.enabled` in `settings.json`); when disabled, switching is CLI-only and behaves exactly as before.
+
+</details>
+
 ## Advanced
 
 ### Configuration
