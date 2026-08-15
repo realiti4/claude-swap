@@ -233,6 +233,15 @@ def test_an_unknown_peer_protocol_is_skipped(tmp_path: Path, monkeypatch, caplog
 
 # --- the wire ------------------------------------------------------------------
 
+# Binding a listener needs real Unix domain sockets. Windows has none (Claude
+# Code uses a named pipe there, a transport this module does not speak), so
+# these exercise POSIX behaviour only — `test_send_is_inert_without_unix_sockets`
+# below covers what Windows actually does.
+requires_af_unix = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"), reason="peer messaging is POSIX-only"
+)
+
+
 @pytest.fixture
 def short_sock(tmp_path_factory) -> Path:
     """A bindable socket path.
@@ -270,6 +279,7 @@ def _listener(path: Path, received: list[bytes]):
     return thread
 
 
+@requires_af_unix
 def test_send_writes_auth_then_message_as_ndjson(tmp_path: Path, short_sock: Path):
     """The frame shape Claude Code's inbox expects: an auth frame carrying the
     peer token first, then the user-role message, newline-delimited."""
@@ -291,6 +301,7 @@ def test_send_writes_auth_then_message_as_ndjson(tmp_path: Path, short_sock: Pat
     assert frames[1]["msg_id"]
 
 
+@requires_af_unix
 def test_send_without_a_key_file_omits_the_auth_frame(tmp_path: Path, short_sock: Path):
     """Auth is optional on some platforms; the receiver decides. Sending a
     null token would be a malformed frame rather than an unauthenticated one."""
@@ -309,11 +320,27 @@ def test_send_without_a_key_file_omits_the_auth_frame(tmp_path: Path, short_sock
 
 def test_send_to_a_dead_socket_reports_failure(tmp_path: Path):
     """A stale socket file outlives the process that bound it. The caller's
-    alternative to a failed nudge is an un-resumed session, never a crash."""
+    alternative to a failed nudge is an un-resumed session, never a crash.
+
+    Runs on EVERY platform on purpose: "returns False rather than raising" is
+    the contract the auto-switch engine relies on, and Windows reaches it by
+    a different route (no AF_UNIX at all) than POSIX (connect refused).
+    """
     dead = tmp_path / "gone.sock"
     assert not send_peer_message(str(dead), "hi", pid=1, claude_dir=tmp_path)
 
 
+def test_send_is_inert_without_unix_sockets(tmp_path: Path, monkeypatch):
+    """Windows has no AF_UNIX — Claude Code binds a named pipe there, which
+    this module does not speak. Reaching the `socket()` call would raise
+    AttributeError out of a function documented never to raise, and that
+    exception would surface inside an auto-switch tick.
+    """
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    assert not send_peer_message("/anything.sock", "hi", pid=1, claude_dir=tmp_path)
+
+
+@requires_af_unix
 def test_resume_reports_only_the_sessions_that_accepted(tmp_path: Path, short_sock: Path):
     sock_path = short_sock
     received: list[bytes] = []

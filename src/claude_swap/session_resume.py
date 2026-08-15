@@ -227,10 +227,22 @@ def send_peer_message(
     ``<cross-session-message>``, which is what wakes an idle session.
 
     Returns True only when the whole exchange completed. Every failure mode —
-    socket gone, permission denied, timeout, protocol change — is logged and
-    returns False, because the caller's alternative to a failed nudge is an
-    un-resumed session, never a crash.
+    socket gone, permission denied, timeout, protocol change, unsupported
+    platform — is logged and returns False, because the caller's alternative
+    to a failed nudge is an un-resumed session, never a crash.
     """
+    if not hasattr(socket, "AF_UNIX"):
+        # Windows: no Unix domain sockets in Python's socket module, and
+        # Claude Code does not use one there either — it binds a named pipe
+        # (``\\.\pipe\...``) instead, a different transport this does not
+        # speak. Refuse up front rather than at the `socket()` call, where it
+        # would raise AttributeError out of a caller documented never to see
+        # one. `find_stopped_sessions` still returns nothing to nudge on
+        # Windows (no socket path in the session record), so in practice this
+        # is the belt to that braces.
+        _logger.debug("Peer messaging is POSIX-only; not resuming on this platform")
+        return False
+
     frames: list[dict] = []
     token = _peer_token(pid, claude_dir)
     if token:
