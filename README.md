@@ -52,6 +52,8 @@ Log in with another account, then:
 cswap add
 ```
 
+Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+
 ### Switch accounts
 
 Rotate to the next account:
@@ -189,6 +191,8 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
+cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version

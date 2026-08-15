@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp, normalize_alias
+from claude_swap.oauth import credential_fingerprint
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -476,11 +477,22 @@ def import_accounts(
         if existing_slot is not None:
             if force:
                 outcome = "overwrote"
-            elif (
-                switcher._usage_store.entries(
+                # Snapshot the row before the write path's clear_dead_token
+                # wipes it, so the "Overwrote" print can say the strike was
+                # lifted. Silence here is how issue #218 read a lifted-then-
+                # honestly-re-condemned strike as a clear that never happened.
+                # Identity-guarded: a foreign row reads blank, so only this
+                # account's own verdict narrates.
+                row = switcher._usage_store.entries(
                     {existing_slot: (entry["email"], entry["org_uuid"])}
-                )[existing_slot].token_dead()
-            ):
+                )[existing_slot]
+                had_strike = row.auth_dead_strikes > 0
+                same_generation = (
+                    row.struck_fingerprint is not None
+                    and credential_fingerprint(entry["creds_text"])
+                    == row.struck_fingerprint
+                )
+            elif switcher._slot_token_dead(existing_slot, entry["email"]):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
@@ -565,6 +577,22 @@ def import_accounts(
 
         if outcome == "overwrote":
             _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+            if had_strike:
+                # Store-fact wording on purpose: import rewrites the backup,
+                # so for the active slot the next poll may still exercise the
+                # live credentials — promise only what actually happened.
+                _eprint("  └ cleared this slot's stored dead-token strike")
+                if same_generation:
+                    # "credential generation" / "permanent auth failure", not
+                    # "refresh-token generation" / "invalid_grant": strikes
+                    # also come from no_refresh_token, where the condemned
+                    # blob has no refresh token and fingerprints by content.
+                    _eprint(
+                        "  └ this import holds the same credential "
+                        "generation the strike condemned; another permanent "
+                        "auth failure will quarantine it again — recover "
+                        "with a newer export or a re-login"
+                    )
             overwritten += 1
         elif outcome == "replaced":
             # Describe the observed trigger (the quarantine verdict), not the

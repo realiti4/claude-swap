@@ -86,13 +86,29 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
-def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
-    """Read session PID files and return only those with alive processes."""
+def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], int]:
+    """Live sessions, and how many records could NOT be read.
+
+    Two kinds of caller read this directory and they need opposite things from
+    an unparseable record:
+
+    - A SCAN (a listing, a status display) wants it skipped. One bad file must
+      not take out the whole listing.
+    - A GUARD wants to know. ``0 live`` and ``0 readable`` are the same list,
+      and only the first is safe to act on -- the callers gate ``_bootstrap``
+      (which deletes a profile's Keychain entry and overwrites
+      ``.credentials.json``) and account removal, so reading "could not tell"
+      as "nobody there" runs them underneath a live instance.
+
+    So the count is returned rather than swallowed, and ``list_sessions``
+    below is the scan-shaped view that drops it.
+    """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
     if not sessions_dir.is_dir():
-        return []
+        return [], 0
 
     sessions = []
+    unreadable = 0
     for path in sessions_dir.glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -108,9 +124,34 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
             ))
-        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+        except (
+            json.JSONDecodeError,   # malformed JSON
+            KeyError,               # required field missing
+            TypeError,              # field has the wrong type (e.g. pid not an int)
+            AttributeError,         # valid JSON that is not an object: a
+                                    # top-level array reaches `.get` as a list.
+                                    # Also how a too-deep nesting lands where
+                                    # the parser's recursion limit is high
+                                    # enough not to raise -- it differs per
+                                    # machine, so BOTH outcomes must be inert.
+            ValueError,             # includes UnicodeDecodeError from read_text
+            OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
+            RecursionError,         # pathologically nested JSON in json.loads
+            OSError,
+        ) as exc:
+            unreadable += 1
             logger.debug("Skipping session file %s: %s", path, exc)
-    return sessions
+    return sessions, unreadable
+
+
+def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
+    """Live sessions. A record that cannot be read is SKIPPED.
+
+    SCAN USE ONLY. The returned list cannot distinguish "no live sessions"
+    from "no readable records", so anything gating a destructive step must
+    call :func:`scan_sessions` and treat a non-zero count as live.
+    """
+    return scan_sessions(claude_dir)[0]
 
 
 def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
@@ -133,7 +174,21 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
                 ide_name=data.get("ideName", "Unknown IDE"),
                 workspace_folders=data.get("workspaceFolders", []),
             ))
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+        except (
+            json.JSONDecodeError,   # malformed JSON
+            KeyError,               # required field missing
+            TypeError,              # field has the wrong type (e.g. pid not an int)
+            AttributeError,         # valid JSON that is not an object: a
+                                    # top-level array reaches `.get` as a list.
+                                    # Also how a too-deep nesting lands where
+                                    # the parser's recursion limit is high
+                                    # enough not to raise -- it differs per
+                                    # machine, so BOTH outcomes must be inert.
+            ValueError,             # includes UnicodeDecodeError from read_text
+            OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
+            RecursionError,         # pathologically nested JSON in json.loads
+            OSError,
+        ) as exc:
             logger.debug("Skipping IDE lockfile %s: %s", path, exc)
     return instances
 
