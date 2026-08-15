@@ -43,6 +43,12 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
+class LauncherError(ClaudeSwitchError):
+    """Error launching or stopping the Claude desktop app (``cswap launch``)."""
+
+    pass
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 

@@ -878,6 +878,124 @@ Examples:
         sys.exit(130)
 
 
+def _launch_command(argv: list[str]) -> None:
+    """Handle `cswap launch [NUM|EMAIL|ALIAS] [--all] [--stop]`. macOS only.
+
+    Pre-dispatched before the main parser is built, like `map`/`alias`/`swap`/
+    `move` (the main parser's required mutually-exclusive group can't hold a
+    positional subcommand). Guarded up front so a non-macOS run exits cleanly
+    with no traceback before anything in `launcher.py` (which is itself
+    platform-agnostic and fully mockable) is touched.
+    """
+    if sys.platform != "darwin":
+        error(
+            "cswap launch is macOS only — it launches the Claude.app desktop "
+            "app on its own profile, which relies on macOS's Application "
+            "Support layout."
+        )
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} launch",
+        description=(
+            "Launch the Claude desktop app for a stored account on its own "
+            "profile directory, so several signed-in instances can run side "
+            "by side. Re-running on an already-running account focuses its "
+            "window instead of opening a second one."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap launch 2
+  cswap launch user@example.com
+  cswap launch dev
+  cswap launch --all
+  cswap launch --stop 2
+  cswap launch --stop --all
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Account to launch or stop (number, email, or alias)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Launch (or stop) every managed account",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Quit the app instead of launching it",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.account and args.all:
+        parser.error("give either NUM|EMAIL|ALIAS or --all, not both")
+    if not args.account and not args.all:
+        parser.error("NUM|EMAIL|ALIAS or --all is required")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap import launcher
+
+        if args.stop:
+            outcomes = (
+                launcher.stop_all(switcher)
+                if args.all
+                else [launcher.stop_account(switcher, args.account)]
+            )
+            for outcome in outcomes:
+                if outcome.stopped:
+                    print(
+                        f"{accent('Stopped')} Account-{outcome.account_num} "
+                        f"({outcome.email}) — pid {outcome.pid}"
+                    )
+                else:
+                    print(
+                        dimmed(
+                            f"Account-{outcome.account_num} ({outcome.email}) "
+                            "not running"
+                        )
+                    )
+            return
+
+        outcomes = (
+            launcher.launch_all(switcher)
+            if args.all
+            else [launcher.launch_account(switcher, args.account)]
+        )
+        for outcome in outcomes:
+            if outcome.focused:
+                print(
+                    f"{accent('Focused')} Account-{outcome.account_num} "
+                    f"({outcome.email}) — already running (pid {outcome.pid})"
+                )
+            else:
+                print(
+                    f"{accent('Launched')} Account-{outcome.account_num} "
+                    f"({outcome.email})"
+                )
+                if outcome.fresh:
+                    print(
+                        dimmed(
+                            f"   → new profile: sign in as {outcome.email} "
+                            "in that window"
+                        )
+                    )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -947,6 +1065,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "launch":
+        _launch_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -985,6 +1106,9 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s launch <num|email>         launch the desktop app for an account (macOS)
+  %(prog)s launch --all               launch the desktop app for every account
+  %(prog)s launch --stop <num|email>  quit an account's desktop app
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries

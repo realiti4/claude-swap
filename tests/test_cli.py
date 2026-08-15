@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap import launcher
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -1543,3 +1544,149 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestLaunchCommand:
+    """`cswap launch` — desktop-app launcher dispatch and the macOS gate."""
+
+    def _seeded_switcher(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com",
+            "uuid": "uuid-2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_launch_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._launch_command") as launch_fn, \
+             patch.object(sys, "argv", ["cswap", "launch", "2"]):
+            cli.main()
+        launch_fn.assert_called_once_with(["2"])
+
+    def test_non_macos_exits_cleanly_no_traceback(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "linux")
+        with pytest.raises(SystemExit) as exc:
+            cli._launch_command(["2"])
+        assert exc.value.code == 1
+        assert "macOS only" in capsys.readouterr().err
+
+    def test_requires_account_or_all(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with pytest.raises(SystemExit) as exc:
+            cli._launch_command([])
+        assert exc.value.code == 2
+
+    def test_rejects_account_and_all_together(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with pytest.raises(SystemExit) as exc:
+            cli._launch_command(["2", "--all"])
+        assert exc.value.code == 2
+
+    def test_prints_launched(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcome = launcher.LaunchOutcome("2", "work@co.com", focused=False, fresh=False, pid=None)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.launch_account", return_value=outcome) as launch_fn:
+            cli._launch_command(["2"])
+        launch_fn.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Launched" in out
+        assert "work@co.com" in out
+
+    def test_prints_fresh_profile_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcome = launcher.LaunchOutcome("2", "work@co.com", focused=False, fresh=True, pid=None)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.launch_account", return_value=outcome):
+            cli._launch_command(["2"])
+        assert "sign in as work@co.com" in capsys.readouterr().out
+
+    def test_already_running_prints_focused_not_launched(self, monkeypatch, capsys):
+        """Edge case: an already-running account must be reported as focused,
+        never as a fresh launch — the CLI must not claim a double-launch."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcome = launcher.LaunchOutcome("2", "work@co.com", focused=True, fresh=False, pid=54602)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.launch_account", return_value=outcome):
+            cli._launch_command(["2"])
+        out = capsys.readouterr().out
+        assert "Focused" in out
+        assert "Launched" not in out
+
+    def test_all_launches_every_account(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcomes = [
+            launcher.LaunchOutcome("2", "a@co.com", focused=False, fresh=False, pid=None),
+            launcher.LaunchOutcome("3", "b@co.com", focused=False, fresh=False, pid=None),
+        ]
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.launch_all", return_value=outcomes) as launch_all_fn:
+            cli._launch_command(["--all"])
+        launch_all_fn.assert_called_once()
+        out = capsys.readouterr().out
+        assert "a@co.com" in out and "b@co.com" in out
+
+    def test_stop_prints_stopped(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcome = launcher.StopOutcome("2", "work@co.com", stopped=True, pid=54602)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.stop_account", return_value=outcome) as stop_fn:
+            cli._launch_command(["--stop", "2"])
+        stop_fn.assert_called_once()
+        assert "Stopped" in capsys.readouterr().out
+
+    def test_stop_not_running_reports_cleanly(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        outcome = launcher.StopOutcome("2", "work@co.com", stopped=False, pid=None)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.stop_account", return_value=outcome):
+            cli._launch_command(["--stop", "2"])
+        assert "not running" in capsys.readouterr().out
+
+    def test_stop_all_dispatches(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.launcher.stop_all", return_value=[]) as stop_all_fn:
+            cli._launch_command(["--stop", "--all"])
+        stop_all_fn.assert_called_once()
+
+    def test_unknown_account_error_surfaces(self, monkeypatch, capsys):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch(
+                 "claude_swap.launcher.launch_account",
+                 side_effect=AccountNotFoundError("No account found with identifier: 999"),
+             ):
+            with pytest.raises(SystemExit) as exc:
+                cli._launch_command(["999"])
+        assert exc.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_refuses_root(self, temp_home, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        self._seeded_switcher(temp_home)
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container", return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._launch_command(["2"])
+        assert exc.value.code == 1
+        assert "root" in capsys.readouterr().err

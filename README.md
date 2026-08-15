@@ -157,6 +157,21 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Run several desktop apps at once (macOS)
+
+Launch the Claude desktop app for a stored account on its own profile, so several signed-in windows can run side by side — each account gets its own `Claude-a<N>` folder under `~/Library/Application Support`, separate from your normal `Claude.app` login.
+
+```bash
+cswap launch 2                  # launch (or focus, if already running) account 2
+cswap launch user@example.com   # by email
+cswap launch dev                # by alias
+cswap launch --all              # launch every managed account
+cswap launch --stop 2           # quit one account's app
+cswap launch --stop --all       # quit every launched account
+```
+
+Re-running `cswap launch` on an account that's already open brings its window to the front instead of opening a duplicate. A profile's cookies and login are never shared — copied only once, on first launch, from your default `Claude.app` profile: `claude_desktop_config.json`, extensions, and that account's own Code sidebar sessions. Each window signs in independently. macOS only.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -191,6 +206,8 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap launch 2                  # Launch the desktop app for an account, one profile per account (macOS)
+cswap launch --stop 2           # Quit an account's desktop app
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
