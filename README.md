@@ -211,6 +211,9 @@ cswap config set autoswitch.codexThreshold 85   # 0 = use autoswitch.threshold
 cswap config set autoswitch.codexEnabled false  # leave Codex out of `cswap auto`
 ```
 
+`autoswitch.includeApiKeyAccounts` applies to Claude only: a Codex API-key login
+reports no usage, so there is nothing for a threshold to compare.
+
 ### Other commands
 
 ```bash

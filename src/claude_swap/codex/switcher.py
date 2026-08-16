@@ -386,7 +386,15 @@ class CodexSwitcher:
         self._store.set_disabled(slot.account_key, disabled)
 
     def switchable_account_numbers(self) -> list[str]:
-        """Slots eligible for automatic rotation."""
+        """Slots eligible for automatic rotation.
+
+        API-key accounts are excluded unconditionally, and unlike the Claude
+        side this is **not** governed by ``autoswitch.includeApiKeyAccounts``.
+        That setting exists because a Claude API-key account is a real rotation
+        target that simply bills per token; a Codex API-key login reports no
+        usage at all, so there is nothing to compare it against and nothing for
+        a threshold to mean. Documented rather than silently divergent.
+        """
         return [
             s.number
             for s in self._store.slots()

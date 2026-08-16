@@ -199,3 +199,40 @@ def test_the_human_line_names_the_provider():
     """Two engines share one event stream; a line that does not say which
     provider it is about is noise."""
     assert CodexTick("ok", "nothing to do").human().startswith("codex:")
+
+
+# ---- the property Stage 4 was gated on ---------------------------------
+
+
+def test_repeated_ticks_do_not_re_poll_the_api(codex_home: Path, monkeypatch):
+    """The auto loop ticks every interval and asks for `fetch=None` — "every
+    account eligible". Only the usage cache's poll plan stops that becoming a
+    request per account per tick, and that is one semantics flip away from
+    hammering the endpoint. This test pins it.
+    """
+    from claude_swap.codex.auth_file import account_key
+    from claude_swap.codex.store import CodexStore
+    from claude_swap.codex.switcher import CodexSwitcher
+    from claude_swap.codex.usage import UsageFetch
+    from tests.conftest_codex import make_auth_json
+
+    store = CodexStore()
+    for n, acct in (("a", "acct-a"), ("b", "acct-b")):
+        key = account_key(f"user-{n}", acct)
+        store.upsert_slot(key, email=f"{n}@x", plan="pro")
+        store.write_snapshot(key, make_auth_json(account_id=acct, user_id=f"user-{n}"))
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "claude_swap.codex.usage_cache.fetch_usage",
+        lambda *a, **k: calls.append(1) or UsageFetch(usage={"five_hour": {"pct": 5}}),
+    )
+
+    auto = CodexAutoSwitcher(CodexSwitcher(), threshold=90)
+    auto.tick()
+    first = len(calls)
+    auto.tick()
+    auto.tick()
+
+    assert first == 2  # one round on the cold cache
+    assert len(calls) == first  # and nothing on the two ticks after it

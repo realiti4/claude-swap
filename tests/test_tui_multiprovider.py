@@ -259,3 +259,121 @@ def test_menubar_row_resolution_routes_to_the_owning_provider(temp_home: Path):
     assert _resolve_menu_row(app, "1") == (app.switcher, "1")
     assert _resolve_menu_row(app, "codex:2")[0].provider_id == "codex"
     assert _resolve_menu_row(app, "codex:2")[1] == "2"
+
+
+# ---- the real screen, driven ------------------------------------------
+#
+# The dispatch-bug class this stage kept producing (fetch semantics, action
+# ids) lives at integration seams that hand-rolled fakes cannot reach. These
+# drive the actual dashboard.
+
+
+class _PilotProvider:
+    """A provider the real app can take snapshots from."""
+
+    def __init__(self, provider_id: str, numbers, backup_dir: Path):
+        self.provider_id = provider_id
+        self.backup_dir = backup_dir
+        self._numbers = list(numbers)
+        self.calls: list[tuple] = []
+
+    def accounts_snapshot(self, fetch=None):
+        self.calls.append(("snapshot", fetch))
+        return AccountsSnapshot(
+            active_number=self._numbers[0],
+            accounts=tuple(
+                _acc(n, self.provider_id, is_active=(n == self._numbers[0]))
+                for n in self._numbers
+            ),
+            taken_at=0.0,
+            provider=self.provider_id,
+        )
+
+    def switch_to(self, number, **kw):
+        self.calls.append(("switch", number))
+        return None
+
+    def set_account_disabled(self, number, disabled):
+        self.calls.append(("set_disabled", number, disabled))
+
+    def remove_account(self, number, assume_yes=False):
+        self.calls.append(("remove", number, assume_yes))
+
+    def current_account_number(self):
+        return self._numbers[0]
+
+    def switchable_account_numbers(self):
+        return list(self._numbers)
+
+    def resolve_account(self, identifier):
+        return identifier, f"{self.provider_id}-{identifier}@x", ""
+
+    def set_alias(self, identifier, alias):
+        return identifier, alias
+
+    def unset_alias(self, identifier):
+        return identifier
+
+
+@pytest.mark.asyncio
+class TestDashboardWithTwoProviders:
+    def _app(self, tmp_path: Path):
+        from claude_swap.tui.app import CswapApp
+
+        claude = _PilotProvider("claude", ["1", "2"], tmp_path)
+        codex = _PilotProvider("codex", ["1", "2"], tmp_path)
+        app = CswapApp(claude)
+        app.providers = [claude, codex]
+        from claude_swap.providers.aggregate import MultiSnapshotSource
+
+        app.source = MultiSnapshotSource([claude, codex])
+        return app, claude, codex
+
+    async def test_both_providers_rows_reach_the_switch_screen(self, tmp_path):
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountItem
+
+        app, _claude, _codex = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            items = list(app.screen.query_one("#accounts", ListView).query(AccountItem))
+            assert [i.key_id for i in items] == [
+                "claude:1",
+                "claude:2",
+                "codex:1",
+                "codex:2",
+            ]
+
+    async def test_selecting_a_codex_row_switches_codex_not_claude(self, tmp_path):
+        """The failure the composite key exists to prevent, driven through the
+        real screen rather than asserted against a fake."""
+        from textual.widgets import ListView
+
+        app, claude, codex = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            listview = app.screen.query_one("#accounts", ListView)
+            listview.index = 2  # the first codex row
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(6):
+                await pilot.pause()
+
+        assert ("switch", "1") in codex.calls
+        assert not any(c[0] == "switch" for c in claude.calls)
+
+    async def test_the_codex_badge_is_visible_on_screen(self, tmp_path):
+        app, _claude, _codex = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            rendered = app.screen.query_one("#accounts-panel").render().plain
+
+        assert "codex" in rendered
