@@ -181,17 +181,24 @@ class CodexSwitcher:
     def _usage_for(
         self, slots: list[CodexSlot], fetch: set[str] | None, active: str | None
     ) -> dict[str, UsageEntry]:
-        """Usage for every slot, refreshing only those asked for and due.
+        """Usage for every slot, refreshing those eligible and due.
 
-        The cache decides what a "due" fetch is (serve TTL, poll plan, backoff,
-        cross-process lease). This method's only job is to hand it the payload
-        rule — which is where the never-refresh-the-active-account invariant
-        lives, so the cache never has to know about it.
+        ``fetch`` carries the Claude side's documented semantics, which the TUI
+        and every other shared consumer rely on: **None makes every account
+        eligible**, and a set restricts which accounts *may* be fetched this
+        pass (so an empty set means "no network at all"). Getting this backwards
+        is invisible from the CLI, which always passes an explicit set — and
+        would make the dashboard silently never refresh Codex usage.
+
+        The cache decides what a "due" fetch actually is (serve TTL, poll plan,
+        backoff, cross-process lease). This method's only job is to hand it the
+        payload rule — which is where the never-refresh-the-active-account
+        invariant lives, so the cache never has to know about it.
         """
         if not slots:
             return {}
 
-        wanted = [s for s in slots if fetch is not None and s.number in fetch]
+        wanted = [s for s in slots if fetch is None or s.number in fetch]
         if not wanted:
             return self._cache.entries(slots)
 

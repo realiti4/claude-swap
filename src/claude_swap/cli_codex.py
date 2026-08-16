@@ -83,7 +83,8 @@ def _print_list(
     skip_api: bool,
     token_status: bool = False,
 ) -> None:
-    numbers = None if skip_api else set(switcher.account_numbers())
+    # None = every account eligible; an empty set = no network at all.
+    numbers: set[str] | None = set() if skip_api else None
     snap = switcher.accounts_snapshot(fetch=numbers)
 
     if as_json:

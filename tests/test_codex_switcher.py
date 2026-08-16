@@ -284,14 +284,48 @@ def test_snapshot_tags_every_row_with_the_codex_provider(seeded: CodexSwitcher, 
     assert {a.provider for a in snap.accounts} == {"codex"}
 
 
-def test_snapshot_without_fetch_makes_no_requests(seeded: CodexSwitcher, monkeypatch):
+def test_an_empty_fetch_set_makes_no_requests(seeded: CodexSwitcher, monkeypatch):
     """`--skip-api` must genuinely skip the network, not just hide the result."""
 
     def boom(*a, **k):
         raise AssertionError("no request should be made")
 
     monkeypatch.setattr("claude_swap.codex.usage_cache.fetch_usage", boom)
-    assert len(seeded.accounts_snapshot().accounts) == 2
+    assert len(seeded.accounts_snapshot(fetch=set()).accounts) == 2
+
+
+def test_fetch_none_makes_every_account_eligible(seeded: CodexSwitcher, monkeypatch):
+    """The Claude side documents `fetch=None` as "every stale account is
+    eligible", and SnapshotSource — hence the whole TUI — depends on it. Having
+    it backwards is invisible from the CLI (which always passes an explicit set)
+    and would make the dashboard silently never refresh Codex usage."""
+    from claude_swap.codex.usage import UsageFetch
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "claude_swap.codex.usage_cache.fetch_usage",
+        lambda *a, **k: calls.append(1) or UsageFetch(usage={"five_hour": {"pct": 1}}),
+    )
+
+    seeded.accounts_snapshot(fetch=None)
+
+    assert len(calls) == 2
+
+
+def test_a_fetch_set_restricts_which_accounts_are_fetched(
+    seeded: CodexSwitcher, monkeypatch
+):
+    from claude_swap.codex.usage import UsageFetch
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "claude_swap.codex.usage_cache.fetch_usage",
+        lambda *a, **k: calls.append(1) or UsageFetch(usage={"five_hour": {"pct": 1}}),
+    )
+
+    seeded.accounts_snapshot(fetch={"2"})
+
+    assert len(calls) == 1
 
 
 def test_a_usage_failure_becomes_a_sentinel_not_an_exception(
