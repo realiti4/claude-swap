@@ -45,7 +45,7 @@ def seeded(codex_home: Path) -> CodexSwitcher:
 def no_usage(monkeypatch):
     """Neutralise the network for snapshot tests."""
     monkeypatch.setattr(
-        "claude_swap.codex.switcher.fetch_usage", lambda *a, **k: UsageFetch(usage={})
+        "claude_swap.codex.usage_cache.fetch_usage", lambda *a, **k: UsageFetch(usage={})
     )
 
 
@@ -290,7 +290,7 @@ def test_snapshot_without_fetch_makes_no_requests(seeded: CodexSwitcher, monkeyp
     def boom(*a, **k):
         raise AssertionError("no request should be made")
 
-    monkeypatch.setattr("claude_swap.codex.switcher.fetch_usage", boom)
+    monkeypatch.setattr("claude_swap.codex.usage_cache.fetch_usage", boom)
     assert len(seeded.accounts_snapshot().accounts) == 2
 
 
@@ -298,7 +298,7 @@ def test_a_usage_failure_becomes_a_sentinel_not_an_exception(
     seeded: CodexSwitcher, monkeypatch
 ):
     monkeypatch.setattr(
-        "claude_swap.codex.switcher.fetch_usage",
+        "claude_swap.codex.usage_cache.fetch_usage",
         lambda *a, **k: UsageFetch(sentinel="http 401"),
     )
     snap = seeded.accounts_snapshot(fetch={"1"})
@@ -437,3 +437,46 @@ def test_disable_and_enable_round_trip(seeded: CodexSwitcher):
     assert CodexStore().slots()[1].disabled is True
     seeded.set_account_disabled("2", False)
     assert CodexStore().slots()[1].disabled is False
+
+
+# ---- usage caching (stage 2) -------------------------------------------
+
+
+def test_two_consecutive_snapshots_cost_one_round_of_requests(
+    seeded: CodexSwitcher, monkeypatch
+):
+    """The reason the usage cache exists. If someone later 'simplifies' it
+    away, this is the test that fails."""
+    from claude_swap.codex.usage import UsageFetch
+
+    calls: list[int] = []
+
+    def counted(*a, **k):
+        calls.append(1)
+        return UsageFetch(usage={"five_hour": {"pct": 5}})
+
+    monkeypatch.setattr("claude_swap.codex.usage_cache.fetch_usage", counted)
+
+    seeded.accounts_snapshot(fetch={"1", "2"})
+    first = len(calls)
+    seeded.accounts_snapshot(fetch={"1", "2"})
+
+    assert first == 2
+    assert len(calls) == first  # the second pass added nothing
+
+
+def test_a_cached_value_is_served_to_a_later_snapshot_without_fetching(
+    seeded: CodexSwitcher, monkeypatch
+):
+    from claude_swap.codex.usage import UsageFetch
+
+    monkeypatch.setattr(
+        "claude_swap.codex.usage_cache.fetch_usage",
+        lambda *a, **k: UsageFetch(usage={"five_hour": {"pct": 7}}),
+    )
+    seeded.accounts_snapshot(fetch={"1", "2"})
+
+    # no fetch set at all: pure cache read
+    snap = seeded.accounts_snapshot()
+
+    assert snap.accounts[0].usage.last_good == {"five_hour": {"pct": 7}}

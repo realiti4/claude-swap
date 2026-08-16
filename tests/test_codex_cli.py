@@ -35,7 +35,7 @@ def offline(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("no network request should be made")
 
-    monkeypatch.setattr("claude_swap.codex.switcher.fetch_usage", boom)
+    monkeypatch.setattr("claude_swap.codex.usage_cache.fetch_usage", boom)
 
 
 def test_bare_cswap_verbs_are_untouched(monkeypatch, capsys, temp_home: Path):

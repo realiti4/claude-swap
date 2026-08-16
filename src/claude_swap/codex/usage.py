@@ -75,6 +75,29 @@ class UsageFetch:
 
     usage: dict | None = None
     sentinel: str | None = None
+    #: The server's ``Retry-After``, in seconds, when it sent one. Honouring it
+    #: is the difference between backing off and being rate-limited harder.
+    retry_after_s: float | None = None
+
+
+def _retry_after_seconds(err: urllib.error.HTTPError) -> float | None:
+    """Parse a ``Retry-After`` header. Only the delta-seconds form is read.
+
+    RFC 9110 also permits an HTTP-date, but this endpoint has only ever been
+    observed sending seconds, and a misparsed date that yields a huge backoff
+    would silently park an account for hours.
+    """
+    try:
+        raw = err.headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 def _iso(epoch: object) -> str | None:
@@ -176,8 +199,13 @@ def fetch_usage(
     try:
         data = _get_json(USAGE_URL, access_token, account_id, timeout_s)
     except urllib.error.HTTPError as e:
-        _logger.debug("Codex usage fetch failed: http-%s", e.code)
-        return UsageFetch(sentinel=f"http {e.code}")
+        retry_after = _retry_after_seconds(e)
+        _logger.debug(
+            "Codex usage fetch failed: http-%s%s",
+            e.code,
+            f", retry-after {retry_after:.0f}s" if retry_after is not None else "",
+        )
+        return UsageFetch(sentinel=f"http {e.code}", retry_after_s=retry_after)
     except urllib.error.URLError as e:
         _logger.debug("Codex usage fetch failed: network (%s)", type(e).__name__)
         return UsageFetch(sentinel="network")

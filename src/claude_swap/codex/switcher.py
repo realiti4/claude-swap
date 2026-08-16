@@ -25,11 +25,11 @@ and a CLI switch in another terminal are concurrent by construction, and an
 interleaved capture/write would put one account's tokens in another's slot. The
 lock is the Codex store's own, so it never contends with a Claude switch.
 
-**Stage 1 does not cache usage.** Every fetch here is a live request; the
-``UsageStore`` + ``poll_policy`` integration (TTL, backoff, 429 handling, age
-display) lands in Stage 2. Until then ``cswap codex list`` costs one request per
-account — fine for a handful of accounts and a human at a terminal, not fine for
-an auto loop. Autoswitch must not ship before that caching does.
+Usage goes through ``CodexUsageCache``, which is this provider's adapter onto
+the same ``UsageStore`` + ``poll_policy`` machinery the Claude side uses: serve
+TTL, cross-process fetch leases, failure backoff, 429 handling and an adaptive
+cadence. Two consecutive ``cswap codex list`` calls therefore cost one round of
+requests, not two.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from claude_swap.codex.auth_file import (
 from claude_swap.codex.oauth import needs_refresh, try_refresh
 from claude_swap.codex.processes import running_codex_pids
 from claude_swap.codex.store import CodexSlot, CodexStore
-from claude_swap.codex.usage import fetch_usage
+from claude_swap.codex.usage_cache import CodexUsageCache
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock, LockError
 from claude_swap.models import AccountSnapshot, AccountsSnapshot, normalize_alias
@@ -76,6 +76,7 @@ class CodexSwitcher:
 
     def __init__(self, debug: bool = False) -> None:
         self._store = CodexStore()
+        self._cache = CodexUsageCache(self._store)
 
     def _lock(self, timeout: float = 10.0) -> FileLock:
         """The Codex store's cross-process lock.
@@ -175,31 +176,46 @@ class CodexSwitcher:
 
     # ---- read model ----------------------------------------------------
 
-    def _usage_entry(self, slot: CodexSlot, payload: dict | None, fetch: bool) -> UsageEntry:
-        if slot.auth_mode == "apikey":
-            return UsageEntry(sentinel="api key")
-        if not fetch:
-            return UsageEntry()
-        if payload is None:
-            return UsageEntry(sentinel="no credentials")
+    def _usage_for(
+        self, slots: list[CodexSlot], fetch: set[str] | None, active: str | None
+    ) -> dict[str, UsageEntry]:
+        """Usage for every slot, refreshing only those asked for and due.
 
-        tokens = payload.get("tokens") or {}
-        result = fetch_usage(
-            tokens.get("access_token") or "",
-            tokens.get("account_id") or slot.account_key.rpartition("::")[2],
+        The cache decides what a "due" fetch is (serve TTL, poll plan, backoff,
+        cross-process lease). This method's only job is to hand it the payload
+        rule — which is where the never-refresh-the-active-account invariant
+        lives, so the cache never has to know about it.
+        """
+        if not slots:
+            return {}
+
+        wanted = [s for s in slots if fetch is not None and s.number in fetch]
+        if not wanted:
+            return self._cache.entries(slots)
+
+        refreshed = self._cache.refresh(
+            wanted,
+            payload_for=lambda slot: self._payload_for_usage(slot, active),
+            active_number=active,
         )
-        if result.usage is None:
-            return UsageEntry(sentinel=result.sentinel)
-        return UsageEntry(last_good=result.usage, fetched_at=time.time(), age_s=0.0)
+        # Slots the caller did not ask about still render from cache.
+        entries = self._cache.entries(slots)
+        entries.update(refreshed)
+        return entries
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One coherent pass over every managed Codex account."""
         active = self.current_account_number()
+        slots = self._store.slots()
+        usage = self._usage_for(slots, fetch, active)
         rows: list[AccountSnapshot] = []
 
-        for slot in self._store.slots():
-            wants_fetch = fetch is not None and slot.number in fetch
-            payload = self._payload_for_usage(slot, active) if wants_fetch else None
+        for slot in slots:
+            entry = usage.get(slot.number, UsageEntry())
+            if slot.auth_mode == "apikey":
+                # Derived every pass, never persisted: an API-key account has no
+                # usage to fetch, and a stored sentinel would outlive the fact.
+                entry = UsageEntry(sentinel="api key")
             rows.append(
                 AccountSnapshot(
                     number=slot.number,
@@ -209,7 +225,7 @@ class CodexSwitcher:
                     is_active=slot.number == active,
                     kind="api_key" if slot.auth_mode == "apikey" else "oauth",
                     switchable=slot.auth_mode != "apikey",
-                    usage=self._usage_entry(slot, payload, wants_fetch),
+                    usage=entry,
                     alias=slot.alias,
                     disabled=slot.disabled,
                     provider="codex",

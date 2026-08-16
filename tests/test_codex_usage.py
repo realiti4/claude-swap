@@ -307,3 +307,29 @@ def test_a_window_without_a_declared_length_falls_back_to_its_position():
     out = cusage.build_usage_result(raw)
     assert out["five_hour"]["pct"] == 11
     assert out["seven_day"]["pct"] == 22
+
+
+def test_a_retry_after_header_is_parsed(monkeypatch):
+    """Honouring the server's backoff is the difference between backing off and
+    being rate-limited harder."""
+    err = urllib.error.HTTPError("u", 429, "slow down", {"Retry-After": "120"}, BytesIO(b"{}"))
+    monkeypatch.setattr(cusage.urllib.request, "urlopen", _raiser(err))
+    result = cusage.fetch_usage("at", "acct")
+    assert result.sentinel == "http 429"
+    assert result.retry_after_s == 120.0
+
+
+def test_an_http_date_retry_after_is_ignored_rather_than_misparsed(monkeypatch):
+    """RFC 9110 permits a date, but this endpoint has only ever sent seconds; a
+    misparsed date would silently park the account for hours."""
+    err = urllib.error.HTTPError(
+        "u", 429, "slow", {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, BytesIO(b"{}")
+    )
+    monkeypatch.setattr(cusage.urllib.request, "urlopen", _raiser(err))
+    assert cusage.fetch_usage("at", "acct").retry_after_s is None
+
+
+def test_no_retry_after_header_is_none(monkeypatch):
+    err = urllib.error.HTTPError("u", 500, "err", {}, BytesIO(b"{}"))
+    monkeypatch.setattr(cusage.urllib.request, "urlopen", _raiser(err))
+    assert cusage.fetch_usage("at", "acct").retry_after_s is None
