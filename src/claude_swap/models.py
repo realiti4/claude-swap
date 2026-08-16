@@ -151,6 +151,17 @@ class AccountSnapshot:
         """Org tag for display: the org name, or 'personal'."""
         return self.org_name if self.org_name else "personal"
 
+    @property
+    def key(self) -> str:
+        """Identity that stays unique once more than one provider is listed.
+
+        Slot numbers are per-provider, so "1" names a Claude account *and* a
+        Codex one. Any surface that shows both — the dashboard, the menu bar —
+        must address rows by this instead of by ``number``, or a keystroke aimed
+        at one provider lands on the other.
+        """
+        return f"{self.provider}:{self.number}"
+
 
 @dataclass(frozen=True)
 class AccountsSnapshot:
