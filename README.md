@@ -2,6 +2,8 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+Also switches **Codex (ChatGPT)** accounts — see [Codex accounts](#codex-chatgpt-accounts).
+
 ## Installation
 
 ### Using uv (recommended)
@@ -172,6 +174,42 @@ cswap add
 ```
 
 This will update the stored credentials without creating a duplicate.
+
+### Codex (ChatGPT) accounts
+
+cswap also switches [Codex](https://github.com/openai/codex) accounts, under a
+`codex` namespace. Bare `cswap list` / `cswap switch` keep meaning Claude, so
+nothing you already type changes.
+
+```bash
+cswap codex list                # accounts + 5h/weekly usage
+cswap codex list --token-status # token expiry diagnostics (never the token)
+cswap codex switch 2            # activate a stored account
+cswap codex add                 # store the account you are logged in as
+cswap codex login               # run `codex login`, then store the result
+cswap codex alias 2 work
+cswap codex disable 2           # hold it out of auto-rotation
+```
+
+If you already use [`codex-auth`](https://github.com/Loongphy/codex-auth), your
+accounts are imported automatically the first time you run a `cswap codex`
+command. `~/.codex/accounts/` is left untouched, so you can keep using that tool
+or go back to it.
+
+> [!IMPORTANT]
+> Switching rewrites `~/.codex/auth.json`. A codex session that is **already
+> running** keeps its old account until you restart it — cswap warns you and
+> names the running PIDs. This applies to automatic switching too: it only
+> affects the next session you start.
+
+Codex accounts appear in the dashboard and the macOS menu bar alongside your
+Claude ones, and `cswap auto` rotates both. Two extra settings tune the Codex
+side:
+
+```bash
+cswap config set autoswitch.codexThreshold 85   # 0 = use autoswitch.threshold
+cswap config set autoswitch.codexEnabled false  # leave Codex out of `cswap auto`
+```
 
 ### Other commands
 
