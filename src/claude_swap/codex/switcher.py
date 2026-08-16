@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from claude_swap.codex import paths as cpaths
 from claude_swap.codex.auth_file import (
     CodexIdentity,
+    access_token_expiry,
     parse_identity,
     read_live_payload,
     write_live_auth,
@@ -49,6 +50,7 @@ from claude_swap.codex.oauth import needs_refresh, try_refresh
 from claude_swap.codex.processes import running_codex_pids
 from claude_swap.codex.store import CodexSlot, CodexStore
 from claude_swap.codex.usage_cache import CodexUsageCache
+from claude_swap.codex.workspaces import refresh_workspace_names
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock, LockError
 from claude_swap.models import AccountSnapshot, AccountsSnapshot, normalize_alias
@@ -193,11 +195,21 @@ class CodexSwitcher:
         if not wanted:
             return self._cache.entries(slots)
 
+        def payload_for(slot: CodexSlot) -> dict | None:
+            return self._payload_for_usage(slot, active)
+
         refreshed = self._cache.refresh(
-            wanted,
-            payload_for=lambda slot: self._payload_for_usage(slot, active),
-            active_number=active,
+            wanted, payload_for=payload_for, active_number=active
         )
+
+        # Workspace names ride along with a usage fetch rather than getting
+        # their own pass: they change approximately never, and the grouped-scope
+        # rules mean most users never issue this request at all.
+        try:
+            refresh_workspace_names(self._store, payload_for=payload_for)
+        except Exception as e:  # pragma: no cover - defensive
+            # A missing workspace name is cosmetic and must never fail a listing.
+            _logger.debug("codex workspace refresh failed: %s", type(e).__name__)
         # Slots the caller did not ask about still render from cache.
         entries = self._cache.entries(slots)
         entries.update(refreshed)
@@ -206,8 +218,10 @@ class CodexSwitcher:
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One coherent pass over every managed Codex account."""
         active = self.current_account_number()
+        usage = self._usage_for(self._store.slots(), fetch, active)
+        # Re-read: a fetching pass may have filled in workspace names, and the
+        # rows must show what the store holds now, not what it held before.
         slots = self._store.slots()
-        usage = self._usage_for(slots, fetch, active)
         rows: list[AccountSnapshot] = []
 
         for slot in slots:
@@ -371,6 +385,33 @@ class CodexSwitcher:
             for s in self._store.slots()
             if not s.disabled and s.auth_mode != "apikey"
         ]
+
+    def token_status(self, identifier: str) -> dict:
+        """Diagnostics for one slot's stored token. Never returns token material.
+
+        Deliberately reports only derived facts — when it expires, whether a
+        refresh is due, when it last refreshed. The token itself is what these
+        diagnostics exist to avoid making people paste into an issue.
+        """
+        slot = self._slot_or_raise(identifier)
+        payload = self._store.read_snapshot(slot.account_key)
+        if payload is None:
+            return {"number": slot.number, "state": "no credentials"}
+        if slot.auth_mode == "apikey":
+            return {"number": slot.number, "state": "api key"}
+
+        tokens = payload.get("tokens") or {}
+        exp = access_token_expiry(payload)
+        now = time.time()
+        return {
+            "number": slot.number,
+            "state": "oauth",
+            "expiresAt": exp,
+            "expiresInSeconds": (exp - now) if exp is not None else None,
+            "refreshDue": needs_refresh(payload, now=now),
+            "hasRefreshToken": bool(tokens.get("refresh_token")),
+            "lastRefresh": payload.get("last_refresh"),
+        }
 
     def account_numbers(self) -> list[str]:
         """Every managed slot number, rotation-eligible or not.

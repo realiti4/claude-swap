@@ -60,34 +60,59 @@ def _usage_summary(usage: dict | None) -> str:
     return "  ".join(parts)
 
 
-def _print_list(switcher: CodexSwitcher, *, as_json: bool, skip_api: bool) -> None:
+def _relative(seconds: float | None) -> str:
+    """A compact human duration, e.g. "6d 4h", "12m", "expired"."""
+    if seconds is None:
+        return "unknown"
+    if seconds <= 0:
+        return "expired"
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _print_list(
+    switcher: CodexSwitcher,
+    *,
+    as_json: bool,
+    skip_api: bool,
+    token_status: bool = False,
+) -> None:
     numbers = None if skip_api else set(switcher.account_numbers())
     snap = switcher.accounts_snapshot(fetch=numbers)
 
     if as_json:
-        print(
-            json.dumps(
+        payload = {
+            "provider": "codex",
+            "activeNumber": snap.active_number,
+            "accounts": [
                 {
-                    "provider": "codex",
-                    "activeNumber": snap.active_number,
-                    "accounts": [
-                        {
-                            "number": a.number,
-                            "email": a.email,
-                            "workspace": a.org_name,
-                            "alias": a.alias,
-                            "active": a.is_active,
-                            "disabled": a.disabled,
-                            "kind": a.kind,
-                            "usage": a.usage.last_good,
-                            "sentinel": a.usage.sentinel,
-                        }
-                        for a in snap.accounts
-                    ],
-                },
-                indent=2,
-            )
-        )
+                    "number": a.number,
+                    "email": a.email,
+                    "workspace": a.org_name,
+                    "alias": a.alias,
+                    "active": a.is_active,
+                    "disabled": a.disabled,
+                    "kind": a.kind,
+                    "usage": a.usage.last_good,
+                    "sentinel": a.usage.sentinel,
+                    "fetchedAt": a.usage.fetched_at,
+                    "ageSeconds": a.usage.age_s,
+                    "plan": (a.usage.last_good or {}).get("plan"),
+                }
+                for a in snap.accounts
+            ],
+        }
+        if token_status:
+            payload["tokenStatus"] = [
+                switcher.token_status(a.number) for a in snap.accounts
+            ]
+        print(json.dumps(payload, indent=2))
         return
 
     if not snap.accounts:
@@ -101,6 +126,22 @@ def _print_list(switcher: CodexSwitcher, *, as_json: bool, skip_api: bool) -> No
         usage = a.usage.sentinel or _usage_summary(a.usage.last_good)
         suffix = f"  {usage}" if usage else ""
         print(f"{marker} {a.number}. {a.email} [{a.display_tag}]{alias}{state}{suffix}")
+
+        if token_status:
+            st = switcher.token_status(a.number)
+            if st["state"] != "oauth":
+                print(dimmed(f"      token: {st['state']}"))
+            else:
+                due = "refresh due" if st["refreshDue"] else "valid"
+                rt = "" if st["hasRefreshToken"] else ", NO refresh token"
+                last = st["lastRefresh"] or "never"
+                print(
+                    dimmed(
+                        f"      token: {due}, expires in "
+                        f"{_relative(st['expiresInSeconds'])}{rt}; "
+                        f"last refresh {last}"
+                    )
+                )
 
 
 def _do_login(args) -> None:
@@ -155,6 +196,11 @@ keeps its old account until you restart it.
     p_list = sub.add_parser("list", help="List managed Codex accounts")
     p_list.add_argument("--json", action="store_true", help="Machine-readable output")
     p_list.add_argument("--skip-api", action="store_true", help="Do not fetch usage")
+    p_list.add_argument(
+        "--token-status",
+        action="store_true",
+        help="Show token expiry diagnostics (never the token itself)",
+    )
 
     sub.add_parser("status", help="Show the currently active Codex account")
 
@@ -202,7 +248,12 @@ def codex_command(argv: list[str]) -> None:
         switcher = CodexSwitcher()
 
         if args.verb == "list":
-            _print_list(switcher, as_json=args.json, skip_api=args.skip_api)
+            _print_list(
+                switcher,
+                as_json=args.json,
+                skip_api=args.skip_api,
+                token_status=args.token_status,
+            )
         elif args.verb == "status":
             number = switcher.current_account_number()
             if number is None:

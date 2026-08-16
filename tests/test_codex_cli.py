@@ -294,3 +294,75 @@ def test_a_failed_codex_login_does_not_add_an_account(monkeypatch, codex_home: P
 def test_explicit_import_reports_its_counts(monkeypatch, capsys, codex_home: Path):
     _run(monkeypatch, ["codex", "import"])
     assert "Imported 0" in capsys.readouterr().out
+
+
+# ---- token status (stage 2) --------------------------------------------
+
+
+def test_token_status_reports_expiry_without_the_token(
+    monkeypatch, capsys, codex_home: Path, offline
+):
+    """These diagnostics exist so people do not paste a token into an issue."""
+    _seed_one()
+    _run(monkeypatch, ["codex", "list", "--skip-api", "--token-status"])
+    out = capsys.readouterr().out
+
+    assert "token:" in out and "expires in" in out
+    payload = make_auth_json(account_id=ACCT_A, user_id=USER_A, email="a@example.com")
+    for secret in (
+        payload["tokens"]["access_token"],
+        payload["tokens"]["refresh_token"],
+        payload["tokens"]["id_token"],
+    ):
+        assert secret not in out
+
+
+def test_token_status_json_carries_the_block(monkeypatch, capsys, codex_home: Path, offline):
+    _seed_one()
+    _run(monkeypatch, ["codex", "list", "--json", "--skip-api", "--token-status"])
+    data = json.loads(capsys.readouterr().out)
+    entry = data["tokenStatus"][0]
+    assert entry["state"] == "oauth"
+    assert entry["hasRefreshToken"] is True
+    assert entry["refreshDue"] is False
+    assert "access_token" not in json.dumps(data)
+
+
+def test_token_status_marks_an_expired_token_as_due(
+    monkeypatch, capsys, codex_home: Path, offline
+):
+    store = CodexStore()
+    store.upsert_slot(KEY_A, email="a@example.com", plan="pro")
+    store.write_snapshot(
+        KEY_A, make_auth_json(account_id=ACCT_A, user_id=USER_A, exp=0)
+    )
+    _run(monkeypatch, ["codex", "list", "--skip-api", "--token-status"])
+    out = capsys.readouterr().out
+    assert "refresh due" in out and "expired" in out
+
+
+def test_token_status_of_an_api_key_account_says_so(
+    monkeypatch, capsys, codex_home: Path, offline
+):
+    store = CodexStore()
+    store.upsert_slot(KEY_A, email="a@example.com", auth_mode="apikey")
+    store.write_snapshot(KEY_A, {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-x", "tokens": None})
+    _run(monkeypatch, ["codex", "list", "--skip-api", "--token-status"])
+    assert "token: api key" in capsys.readouterr().out
+
+
+def test_json_reports_age_and_fetch_time(monkeypatch, capsys, codex_home: Path, monkeypatch2=None):
+    """A cached row must say how old it is, not pretend to be current."""
+    from claude_swap.codex.usage import UsageFetch
+
+    _seed_one()
+    monkeypatch.setattr(
+        "claude_swap.codex.usage_cache.fetch_usage",
+        lambda *a, **k: UsageFetch(usage={"five_hour": {"pct": 3}, "plan": "pro"}),
+    )
+    _run(monkeypatch, ["codex", "list", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    row = data["accounts"][0]
+    assert row["fetchedAt"] is not None
+    assert row["ageSeconds"] is not None
+    assert row["plan"] == "pro"
