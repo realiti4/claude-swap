@@ -205,3 +205,57 @@ def test_an_unknown_provider_falls_back_to_claude_instead_of_raising(
     app, _claude, _codex = app_with_two_providers
     provider, number = app._resolve_row("gemini:3")
     assert provider is app.switcher and number == "3"
+
+
+# ---- menu bar ----------------------------------------------------------
+
+
+def test_menubar_tags_codex_rows_and_keys_them_by_row(temp_home: Path):
+    """The menu bar's tuple is 8-wide and unpacked exactly in five places, so
+    the provider rides in the existing `num` and label fields rather than a
+    ninth element."""
+    from claude_swap.menubar import _adapt_snapshot
+
+    snap = AccountsSnapshot(
+        active_number="1",
+        accounts=(_acc("1", "claude", is_active=True), _acc("1", "codex")),
+        taken_at=0.0,
+        provider="multi",
+    )
+    adapted = _adapt_snapshot(snap)
+
+    nums = [row[0] for row in adapted["accounts"]]
+    labels = [row[1] for row in adapted["accounts"]]
+    assert nums == ["1", "codex:1"]
+    assert "(codex)" in labels[1]
+    assert "(codex)" not in labels[0]
+    assert all(len(row) == 8 for row in adapted["accounts"])
+
+
+def test_the_menubar_title_still_tracks_the_claude_account(temp_home: Path):
+    """It is what the user's `claude` command will run as."""
+    from claude_swap.menubar import _adapt_snapshot
+
+    snap = AccountsSnapshot(
+        active_number="1",
+        accounts=(
+            _acc("1", "claude", is_active=True, email="me@claude"),
+            _acc("1", "codex", is_active=True, email="me@codex"),
+        ),
+        taken_at=0.0,
+        provider="multi",
+    )
+    assert _adapt_snapshot(snap)["active_email"] == "me@claude"
+
+
+def test_menubar_row_resolution_routes_to_the_owning_provider(temp_home: Path):
+    from claude_swap.menubar import _resolve_menu_row
+
+    class App:
+        switcher = _FakeProvider("claude")
+        providers = [switcher, _FakeProvider("codex")]
+
+    app = App()
+    assert _resolve_menu_row(app, "1") == (app.switcher, "1")
+    assert _resolve_menu_row(app, "codex:2")[0].provider_id == "codex"
+    assert _resolve_menu_row(app, "codex:2")[1] == "2"

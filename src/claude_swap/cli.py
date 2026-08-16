@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -705,8 +706,26 @@ Defaults live in settings.json in the backup root; flags override them.
             dry_run=args.dry_run,
         )
 
+        # Codex rides along in this same process as its own small engine — the
+        # user asked for one `cswap auto` driving both providers, and two small
+        # engines beat genericizing the 1700-line Claude tick. Absent Codex
+        # accounts this is a no-op the user never sees.
+        codex_auto = _codex_auto_engine(settings)
+
+        def run_codex_tick() -> None:
+            if codex_auto is None:
+                return
+            tick = codex_auto.tick(dry_run=args.dry_run)
+            if tick.outcome in ("switched", "error") or args.dry_run:
+                if args.json:
+                    print(json.dumps({"event": "codex", **tick.__dict__}, default=list))
+                else:
+                    print(tick.human())
+
         if args.once:
-            sys.exit(engine.tick().value)
+            outcome = engine.tick()
+            run_codex_tick()
+            sys.exit(outcome.value)
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
@@ -718,7 +737,32 @@ Defaults live in settings.json in the backup root; flags override them.
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
-        sys.exit(engine.run_loop())
+        # Codex ticks on its own daemon thread at the same interval rather than
+        # inside the Claude engine's loop: the engine gets no new hook, no new
+        # failure mode, and a slow Codex fetch can never delay a Claude switch.
+        codex_thread = None
+        if codex_auto is not None:
+            codex_stop = threading.Event()
+
+            def codex_loop() -> None:
+                while not codex_stop.wait(settings.interval_seconds):
+                    try:
+                        run_codex_tick()
+                    except Exception:
+                        # A Codex problem must never take down `cswap auto`.
+                        pass
+
+            codex_thread = threading.Thread(
+                target=codex_loop, name="codex-auto", daemon=True
+            )
+            codex_thread.start()
+
+        try:
+            code = engine.run_loop()
+        finally:
+            if codex_thread is not None:
+                codex_stop.set()
+        sys.exit(code)
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e)))
@@ -731,6 +775,32 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+
+def _codex_auto_engine(settings):
+    """A Codex auto-switcher, or None when this machine has no Codex accounts.
+
+    Returning None rather than an idle engine is what keeps a Claude-only
+    install exactly as it was: no extra work per tick, no extra output, nothing
+    new in `cswap auto`'s log.
+    """
+    if not getattr(settings, "codex_enabled", True):
+        return None
+    try:
+        from claude_swap.providers.registry import codex_is_present
+
+        if not codex_is_present():
+            return None
+        from claude_swap.codex.autoswitch import CodexAutoSwitcher
+
+        threshold = getattr(settings, "codex_threshold", 0.0) or settings.threshold
+        return CodexAutoSwitcher(
+            threshold=threshold, hysteresis_pct=settings.hysteresis_pct
+        )
+    except Exception:
+        # A broken Codex store must never stop the Claude auto loop starting.
+        return None
 
 
 def _config_command(argv: list[str]) -> None:
