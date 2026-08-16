@@ -49,7 +49,7 @@ def test_bare_cswap_verbs_are_untouched(monkeypatch, capsys, temp_home: Path):
 def test_the_main_help_advertises_the_codex_namespace(monkeypatch, capsys, temp_home: Path):
     with pytest.raises(SystemExit):
         _run(monkeypatch, ["--help"])
-    assert "codex <cmd>" in capsys.readouterr().out
+    assert "Codex (ChatGPT) accounts" in capsys.readouterr().out
 
 
 def test_codex_list_on_an_empty_store_says_so(monkeypatch, capsys, codex_home: Path):
@@ -366,3 +366,42 @@ def test_json_reports_age_and_fetch_time(monkeypatch, capsys, codex_home: Path, 
     assert row["fetchedAt"] is not None
     assert row["ageSeconds"] is not None
     assert row["plan"] == "pro"
+
+
+# ---- discoverability ---------------------------------------------------
+
+
+def test_the_main_help_lists_the_codex_subcommands(monkeypatch, capsys, temp_home: Path):
+    """A single "codex <cmd>" line is not discoverable: the user has to guess a
+    verb before they can find out what the verbs are."""
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, ["--help"])
+    out = capsys.readouterr().out
+    for verb in ("codex list", "codex status", "codex switch", "codex add", "codex login"):
+        assert verb in out
+
+
+def test_the_main_help_says_the_old_commands_are_unchanged(
+    monkeypatch, capsys, temp_home: Path
+):
+    """The first thing an existing user needs to know."""
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, ["--help"])
+    assert "Claude-only" in capsys.readouterr().out
+
+
+def test_the_codex_help_states_the_restart_caveat(monkeypatch, capsys):
+    """The trap this feature has: a switch under a running session silently
+    only affects the next one."""
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, ["codex", "--help"])
+    out = capsys.readouterr().out
+    assert "ALREADY" in out and "restart" in out.lower()
+
+
+def test_the_codex_help_documents_the_autoswitch_settings(monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, ["codex", "--help"])
+    out = capsys.readouterr().out
+    assert "autoswitch.codexThreshold" in out
+    assert "autoswitch.codexEnabled" in out

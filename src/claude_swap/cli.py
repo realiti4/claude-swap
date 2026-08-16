@@ -1061,7 +1061,6 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
-  %(prog)s codex <cmd>                manage Codex (ChatGPT) accounts
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1071,6 +1070,18 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
+
+Codex (ChatGPT) accounts — the commands above stay Claude-only:
+  %(prog)s codex list                 list Codex accounts and usage
+  %(prog)s codex status               show the account codex is running as
+  %(prog)s codex switch <num|email>   switch to a specific Codex account
+  %(prog)s codex add                  store the current Codex login
+  %(prog)s codex login                run `codex login`, then store it
+  %(prog)s codex remove <num|email>   remove a Codex account
+  %(prog)s codex alias <num> <name>   set a short alias (--unset to clear)
+  %(prog)s codex disable|enable <n>   hold out of / return to auto-rotation
+  %(prog)s codex import               re-run the codex-auth import
+  %(prog)s codex --help               full Codex help
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1085,6 +1096,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
+  %(prog)s codex list --token-status         # Codex token expiry (never the token)
+  %(prog)s codex list --json --skip-api      # machine-readable, no network
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,

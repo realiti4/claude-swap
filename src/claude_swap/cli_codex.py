@@ -178,18 +178,45 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  list                    list managed Codex accounts
+  list [--json] [--skip-api] [--token-status]
+                          list managed Codex accounts and their usage
   status                  show the account the codex CLI is currently using
-  switch <num|email>      activate a stored account
-  add                     store the account you are currently logged in as
-  login [--device-auth]   run 'codex login', then store the result
-  remove <num|email>      forget an account
+  switch <num|email|alias>
+                          activate a stored account
+  add [--alias NAME]      store the account you are currently logged in as
+  login [--device-auth] [--alias NAME]
+                          run 'codex login', then store the result
+  remove <num|email> [-y] forget an account and delete its credentials
   alias <num|email> NAME  set a short alias  (--unset to clear)
-  disable|enable <t>      hold an account out of / return it to auto-rotation
+  disable|enable <target> hold an account out of / return it to auto-rotation
   import                  re-run the codex-auth import
 
-Switching rewrites ~/.codex/auth.json. A codex session that is already running
-keeps its old account until you restart it.
+Examples:
+  cswap codex list                    5h / weekly usage per account
+  cswap codex list --skip-api         cached only, no network
+  cswap codex list --token-status     token expiry (never prints the token)
+  cswap codex list --json             machine-readable
+  cswap codex switch work             by alias
+  cswap codex disable 2               keep it out of `cswap auto` rotation
+
+Auto-switching:
+  Codex rides along in `cswap auto`, which rotates both providers. Tune it with
+  `cswap config set autoswitch.codexThreshold 85` (0 = inherit
+  autoswitch.threshold) or turn it off with `autoswitch.codexEnabled false`.
+  autoswitch.includeApiKeyAccounts is Claude-only: a Codex API-key login
+  reports no usage, so a threshold has nothing to compare.
+
+Notes:
+  Bare `cswap list` / `cswap switch` still mean Claude — nothing you already
+  type changes.
+
+  Switching rewrites ~/.codex/auth.json. A codex session that is ALREADY
+  RUNNING keeps its old account until you restart it; cswap warns you and names
+  the running PIDs. This applies to automatic switching too — it only affects
+  the next session you start.
+
+  If you use codex-auth, your accounts are imported automatically on the first
+  `cswap codex` command. ~/.codex/accounts/ is left untouched.
         """,
     )
     sub = parser.add_subparsers(dest="verb", required=True)
