@@ -31,12 +31,44 @@ def _raiser(exc):
     return boom
 
 
+# The live endpoint's real wire shape, captured 2026-08-16. NOT codex-auth's
+# normalized `last_usage` shape — assuming those were the same cost a bug that
+# only the live smoke test caught.
 RAW = {
-    "primary": {"used_percent": 42, "window_minutes": 300, "resets_at": 1_800_000_000},
-    "secondary": {"used_percent": 7, "window_minutes": 10080, "resets_at": 1_800_600_000},
-    "credits": {"has_credits": True, "unlimited": False, "balance": "12.50"},
+    "user_id": "user-a",
+    "account_id": "acct-a",
+    "email": "a@example.com",
     "plan_type": "pro",
+    "rate_limit": {
+        "allowed": True,
+        "limit_reached": False,
+        "primary_window": {
+            "used_percent": 42,
+            "limit_window_seconds": 18000,
+            "reset_after_seconds": 900,
+            "reset_at": 1_800_000_000,
+        },
+        "secondary_window": {
+            "used_percent": 7,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 90000,
+            "reset_at": 1_800_600_000,
+        },
+    },
+    "credits": {
+        "has_credits": True,
+        "unlimited": False,
+        "overage_limit_reached": False,
+        "balance": "12.50",
+    },
 }
+
+
+def _with_rate_limit(**windows) -> dict:
+    """RAW with its rate_limit windows replaced."""
+    rl = dict(RAW["rate_limit"])
+    rl.update(windows)
+    return dict(RAW, rate_limit=rl)
 
 
 def test_primary_window_maps_to_five_hour():
@@ -75,16 +107,16 @@ def test_the_mapped_shape_is_readable_by_the_existing_pace_calculation():
 
 def test_a_missing_secondary_window_is_omitted_not_zeroed():
     """A plan with no weekly window must not render as 0% used."""
-    assert "seven_day" not in cusage.build_usage_result(dict(RAW, secondary=None))
+    assert "seven_day" not in cusage.build_usage_result(_with_rate_limit(secondary_window=None))
 
 
 def test_a_window_without_a_percentage_is_dropped():
-    raw = dict(RAW, primary={"window_minutes": 300, "resets_at": 1_800_000_000})
+    raw = _with_rate_limit(primary_window={"limit_window_seconds": 18000, "reset_at": 1})
     assert "five_hour" not in cusage.build_usage_result(raw)
 
 
 def test_a_window_without_a_reset_still_reports_its_percentage():
-    raw = dict(RAW, primary={"used_percent": 12})
+    raw = _with_rate_limit(primary_window={"used_percent": 12})
     out = cusage.build_usage_result(raw)
     assert out["five_hour"] == {"pct": 12}
 
@@ -188,3 +220,90 @@ def test_a_workspace_fetch_failure_is_never_fatal(monkeypatch):
         cusage.urllib.request, "urlopen", _raiser(urllib.error.URLError("down"))
     )
     assert cusage.fetch_workspace_names("at", "acct") == {}
+
+
+def test_a_response_with_no_window_is_not_usable_usage():
+    """Every consumer needs a window; a plan-only dict renders as a blank row
+    with no explanation, which is exactly how the first live run failed."""
+    assert cusage.build_usage_result({"plan_type": "pro"}) is None
+    assert cusage.build_usage_result(_with_rate_limit(primary_window=None, secondary_window=None)) is None
+
+
+def test_a_windowless_response_reports_a_sentinel_rather_than_a_blank_row(monkeypatch):
+    monkeypatch.setattr(
+        cusage.urllib.request, "urlopen", lambda *a, **k: _Resp({"plan_type": "pro"})
+    )
+    result = cusage.fetch_usage("at", "acct")
+    assert result.usage is None
+    assert result.sentinel == "bad-response"
+
+
+# --- window classification ------------------------------------------------
+#
+# Captured from two live Plus accounts on 2026-08-16: `primary_window` was
+# 604800 s (a WEEK) and `secondary_window` was null. Mapping by position would
+# have labelled weekly usage as 5-hourly — the row would read wrong and pace,
+# which only applies to weekly windows, would never fire for any Codex account.
+
+LIVE_PLUS = {
+    "email": "a@example.com",
+    "plan_type": "plus",
+    "rate_limit": {
+        "allowed": True,
+        "limit_reached": False,
+        "primary_window": {
+            "used_percent": 98,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 341770,
+            "reset_at": 1_800_600_000,
+        },
+        "secondary_window": None,
+    },
+    "credits": {"has_credits": False, "unlimited": False, "balance": None},
+}
+
+
+def test_a_weekly_primary_window_is_classified_as_weekly():
+    """The regression this whole classification exists for."""
+    out = cusage.build_usage_result(LIVE_PLUS)
+    assert out["seven_day"]["pct"] == 98
+    assert "five_hour" not in out
+
+
+def test_a_weekly_primary_window_still_supports_pace():
+    """Mislabelling it five_hour would silently disable pace forever."""
+    from claude_swap.pace import compute_pace
+
+    window = cusage.build_usage_result(LIVE_PLUS)["seven_day"]
+    assert compute_pace(window, fetched_at=1_800_600_000 - 4 * 86400) is not None
+
+
+def test_a_five_hour_primary_window_is_classified_as_five_hourly():
+    raw = _with_rate_limit(
+        primary_window={
+            "used_percent": 30,
+            "limit_window_seconds": 18000,
+            "reset_at": 1_800_000_000,
+        },
+        secondary_window=None,
+    )
+    out = cusage.build_usage_result(raw)
+    assert out["five_hour"]["pct"] == 30
+    assert "seven_day" not in out
+
+
+def test_both_windows_are_classified_independently():
+    """The documented two-window plan: 5h primary, weekly secondary."""
+    out = cusage.build_usage_result(RAW)
+    assert out["five_hour"]["pct"] == 42
+    assert out["seven_day"]["pct"] == 7
+
+
+def test_a_window_without_a_declared_length_falls_back_to_its_position():
+    raw = _with_rate_limit(
+        primary_window={"used_percent": 11, "reset_at": 1_800_000_000},
+        secondary_window={"used_percent": 22, "reset_at": 1_800_600_000},
+    )
+    out = cusage.build_usage_result(raw)
+    assert out["five_hour"]["pct"] == 11
+    assert out["seven_day"]["pct"] == 22
