@@ -93,7 +93,7 @@ def test_codex_status_reports_the_live_account(monkeypatch, capsys, codex_home: 
 def test_codex_status_without_a_managed_login_says_so(monkeypatch, capsys, codex_home: Path):
     _seed_one()
     _run(monkeypatch, ["codex", "status"])
-    assert "No managed Codex account is active" in capsys.readouterr().out
+    assert "No active Codex account" in capsys.readouterr().out
 
 
 def test_first_codex_command_imports_codex_auth_accounts(
@@ -291,8 +291,10 @@ def test_a_failed_codex_login_does_not_add_an_account(monkeypatch, codex_home: P
     assert CodexStore().slots() == []
 
 
-def test_explicit_import_reports_its_counts(monkeypatch, capsys, codex_home: Path):
-    _run(monkeypatch, ["codex", "import"])
+def test_explicit_codex_auth_import_reports_its_counts(monkeypatch, capsys, codex_home: Path):
+    """`import` now means "import a cswap export file", matching the Claude
+    side; the one-time codex-auth import has its own explicit verb."""
+    _run(monkeypatch, ["codex", "import-codex-auth"])
     assert "Imported 0" in capsys.readouterr().out
 
 

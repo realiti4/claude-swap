@@ -19,6 +19,11 @@ import subprocess
 import sys
 
 from claude_swap.codex.registry_import import import_codex_auth_registry
+from claude_swap.codex.transfer import (
+    export_codex_accounts,
+    import_codex_accounts,
+    purge_codex_data,
+)
 from claude_swap.codex.switcher import CodexSwitcher
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.printer import dimmed, error, warning
@@ -180,24 +185,36 @@ def _build_parser() -> argparse.ArgumentParser:
 Commands:
   list [--json] [--skip-api] [--token-status]
                           list managed Codex accounts and their usage
-  status                  show the account the codex CLI is currently using
+  status [--json]         show the account the codex CLI is currently using
+  switch                  rotate to the next account
   switch <num|email|alias>
-                          activate a stored account
+                          activate a specific account
+  switch --strategy best  jump to the account with the most quota left
   add [--alias NAME]      store the account you are currently logged in as
   login [--device-auth] [--alias NAME]
                           run 'codex login', then store the result
   remove <num|email> [-y] forget an account and delete its credentials
   alias <num|email> NAME  set a short alias  (--unset to clear)
   disable|enable <target> hold an account out of / return it to auto-rotation
-  import                  re-run the codex-auth import
+  swap <a> <b>            exchange two accounts' slot numbers
+  move <target> <slot>    assign an account to a slot (swaps if taken)
+  export <path>           export accounts (with tokens) to a file; '-' = stdout
+  import <path>           import accounts from a file; '-' = stdin
+  purge                   remove all cswap Codex data (your login is untouched)
+  import-codex-auth       re-run the one-time codex-auth registry import
 
 Examples:
   cswap codex list                    5h / weekly usage per account
   cswap codex list --skip-api         cached only, no network
   cswap codex list --token-status     token expiry (never prints the token)
   cswap codex list --json             machine-readable
+  cswap codex switch                  rotate to the next account
   cswap codex switch work             by alias
+  cswap codex switch --strategy best  most quota left
+  cswap codex status --json           machine-readable status
   cswap codex disable 2               keep it out of `cswap auto` rotation
+  cswap codex swap 1 2                exchange slot numbers
+  cswap codex export ~/codex.json     back up accounts (contains live tokens)
 
 Auto-switching:
   Codex rides along in `cswap auto`, which rotates both providers. Tune it with
@@ -230,10 +247,18 @@ Notes:
         help="Show token expiry diagnostics (never the token itself)",
     )
 
-    sub.add_parser("status", help="Show the currently active Codex account")
+    p_status = sub.add_parser("status", help="Show the currently active Codex account")
+    p_status.add_argument("--json", action="store_true", help="Machine-readable output")
 
-    p_switch = sub.add_parser("switch", help="Activate a stored account")
-    p_switch.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    p_switch = sub.add_parser(
+        "switch", help="Activate a stored account (bare: rotate to the next one)"
+    )
+    p_switch.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
+    p_switch.add_argument(
+        "--strategy",
+        choices=("best",),
+        help="Pick the target by remaining quota instead of rotating",
+    )
 
     p_add = sub.add_parser("add", help="Store the current Codex login")
     p_add.add_argument("--alias", metavar="NAME", default="")
@@ -258,7 +283,28 @@ Notes:
         )
         p.add_argument("account", metavar="NUM|EMAIL|ALIAS")
 
-    sub.add_parser("import", help="Re-run the codex-auth registry import")
+    p_swap = sub.add_parser("swap", help="Exchange two accounts' slot numbers")
+    p_swap.add_argument("first", metavar="A")
+    p_swap.add_argument("second", metavar="B")
+
+    p_move = sub.add_parser("move", help="Assign an account to a slot (swaps if taken)")
+    p_move.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    p_move.add_argument("slot", metavar="SLOT")
+
+    p_export = sub.add_parser("export", help="Export accounts to a file ('-' for stdout)")
+    p_export.add_argument("path", metavar="PATH")
+    p_export.add_argument("--account", metavar="NUM|EMAIL", help="Export just one account")
+
+    p_import = sub.add_parser("import", help="Import accounts from a file ('-' for stdin)")
+    p_import.add_argument("path", metavar="PATH")
+    p_import.add_argument("--force", action="store_true", help="Overwrite existing accounts")
+
+    p_purge = sub.add_parser("purge", help="Remove all cswap Codex data")
+    p_purge.add_argument("-y", "--yes", action="store_true")
+
+    sub.add_parser(
+        "import-codex-auth", help="Re-run the one-time codex-auth registry import"
+    )
     return parser
 
 
@@ -267,7 +313,7 @@ def codex_command(argv: list[str]) -> None:
     args = _build_parser().parse_args(argv)
 
     try:
-        if args.verb == "import":
+        if args.verb == "import-codex-auth":
             result = import_codex_auth_registry()
             print(f"Imported {result.imported}, skipped {result.skipped}.")
             return
@@ -283,14 +329,16 @@ def codex_command(argv: list[str]) -> None:
                 token_status=args.token_status,
             )
         elif args.verb == "status":
-            number = switcher.current_account_number()
-            if number is None:
-                print("No managed Codex account is active.")
-            else:
-                _num, _email, label = switcher.resolve_account(number)
-                print(f"Active Codex account {number}: {label}")
+            payload = switcher.status(json_output=args.json)
+            if payload is not None:
+                print(json.dumps(payload, indent=2))
         elif args.verb == "switch":
-            result = switcher.switch_to(args.account)
+            if args.strategy == "best":
+                result = switcher.switch_best()
+            elif args.account is None:
+                result = switcher.rotate()
+            else:
+                result = switcher.switch_to(args.account)
             print(f"Switched to Codex account {result.number}: {result.email}")
             if result.running_pids:
                 pids = ", ".join(str(p) for p in result.running_pids)
@@ -316,6 +364,26 @@ def codex_command(argv: list[str]) -> None:
         elif args.verb in ("disable", "enable"):
             switcher.set_account_disabled(args.account, args.verb == "disable")
             print(f"Codex account {args.account} {args.verb}d")
+        elif args.verb == "swap":
+            a, b = switcher.swap_accounts(args.first, args.second)
+            print(f"Swapped Codex slots {a} and {b}")
+        elif args.verb == "move":
+            src, dst, swapped = switcher.move_account(args.account, args.slot)
+            if src == dst:
+                print(f"Codex account is already in slot {dst}")
+            elif swapped:
+                print(f"Moved Codex account {src} to slot {dst} (swapped with its occupant)")
+            else:
+                print(f"Moved Codex account {src} to slot {dst}")
+        elif args.verb == "export":
+            count = export_codex_accounts(switcher, args.path, account=args.account)
+            if args.path != "-":
+                print(f"Exported {count} Codex account(s) to {args.path}")
+        elif args.verb == "import":
+            count = import_codex_accounts(switcher, args.path, force=args.force)
+            print(f"Imported {count} Codex account(s)")
+        elif args.verb == "purge":
+            purge_codex_data(assume_yes=args.yes)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

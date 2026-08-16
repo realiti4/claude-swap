@@ -1074,13 +1074,18 @@ Commands:
 Codex (ChatGPT) accounts — the commands above stay Claude-only:
   %(prog)s codex list                 list Codex accounts and usage
   %(prog)s codex status               show the account codex is running as
+  %(prog)s codex switch               rotate to the next Codex account
   %(prog)s codex switch <num|email>   switch to a specific Codex account
   %(prog)s codex add                  store the current Codex login
   %(prog)s codex login                run `codex login`, then store it
   %(prog)s codex remove <num|email>   remove a Codex account
   %(prog)s codex alias <num> <name>   set a short alias (--unset to clear)
   %(prog)s codex disable|enable <n>   hold out of / return to auto-rotation
-  %(prog)s codex import               re-run the codex-auth import
+  %(prog)s codex swap <a> <b>         exchange two Codex slot numbers
+  %(prog)s codex move <a> <slot>      assign a Codex account to a slot
+  %(prog)s codex export <path>        export Codex accounts
+  %(prog)s codex import <path>        import Codex accounts
+  %(prog)s codex purge                remove all cswap Codex data
   %(prog)s codex --help               full Codex help
 
 Aliases: ls=list  rm=remove  update=upgrade""",

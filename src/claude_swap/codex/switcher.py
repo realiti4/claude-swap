@@ -54,7 +54,7 @@ from claude_swap.codex.workspaces import refresh_workspace_names
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock, LockError
 from claude_swap.models import AccountSnapshot, AccountsSnapshot, normalize_alias
-from claude_swap.printer import dimmed, warning
+from claude_swap.printer import accent, bolded, dimmed, muted, warning
 from claude_swap.usage_store import UsageEntry
 
 _logger = logging.getLogger(__name__)
@@ -401,6 +401,56 @@ class CodexSwitcher:
             if not s.disabled and s.auth_mode != "apikey"
         ]
 
+    def status(self, json_output: bool = False) -> dict | None:
+        """Print (or return) the active account's status.
+
+        Renders through the Claude side's own ``_usage_entry_lines`` and
+        ``usage_fields`` rather than a Codex-shaped copy, so the two providers
+        produce byte-identical status blocks — which is the point: a user should
+        not have to learn a second output format for the same information.
+        """
+        from claude_swap.json_output import SCHEMA_VERSION, usage_fields
+        from claude_swap.switcher import _usage_entry_lines
+
+        number = self.current_account_number()
+        if number is None:
+            if json_output:
+                return {"schemaVersion": SCHEMA_VERSION, "provider": "codex", "active": None}
+            print(f"{bolded('Status:')} {dimmed('No active Codex account')}")
+            return None
+
+        slot = self._slot_or_raise(number)
+        entry = self._usage_for(self._store.slots(), None, number).get(
+            number, UsageEntry()
+        )
+
+        if json_output:
+            state, usage = usage_fields(entry.decision_value(), entry.fetched_at)
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "provider": "codex",
+                "active": {
+                    "number": int(slot.number),
+                    "email": slot.email,
+                    "workspace": slot.workspace_name,
+                    "alias": slot.alias,
+                    "plan": slot.plan,
+                    "managed": True,
+                    "usageStatus": state,
+                    "usage": usage,
+                },
+                "totalAccounts": len(self._store.slots()),
+            }
+
+        print(
+            f"{bolded('Status:')} {accent(f'Codex-{slot.number}')} "
+            f"({slot.email} {muted(f'[{slot.workspace_name or "personal"}]')})"
+        )
+        print(f"  {dimmed(f'Total managed Codex accounts: {len(self._store.slots())}')}")
+        for line in _usage_entry_lines(entry):
+            print(f"  {line}")
+        return None
+
     def token_status(self, identifier: str) -> dict:
         """Diagnostics for one slot's stored token. Never returns token material.
 
@@ -427,6 +477,94 @@ class CodexSwitcher:
             "hasRefreshToken": bool(tokens.get("refresh_token")),
             "lastRefresh": payload.get("last_refresh"),
         }
+
+    def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
+        """Exchange two accounts' slot numbers.
+
+        Only ``sequence.json`` changes: snapshots are keyed by ``account_key``,
+        which is exactly why they are — renumbering never has to move a secret.
+        """
+        a = self._slot_or_raise(first)
+        b = self._slot_or_raise(second)
+        if a.number == b.number:
+            raise ClaudeSwitchError("Cannot swap an account with itself")
+        try:
+            with self._lock():
+                self._store.renumber({a.account_key: b.number, b.account_key: a.number})
+        except LockError as e:
+            raise ClaudeSwitchError(
+                "Another cswap process is using the Codex store; try again."
+            ) from e
+        return a.number, b.number
+
+    def move_account(self, account: str, target: str) -> tuple[str, str, bool]:
+        """Give an account a specific slot number, swapping if it is taken.
+
+        Returns ``(from, to, swapped)``.
+        """
+        slot = self._slot_or_raise(account)
+        target = str(target).strip()
+        if not target.isdigit() or int(target) < 1:
+            raise ClaudeSwitchError(f"'{target}' is not a valid slot number")
+        if slot.number == target:
+            return slot.number, target, False
+
+        occupant = next(
+            (s for s in self._store.slots() if s.number == target), None
+        )
+        mapping = {slot.account_key: target}
+        if occupant is not None:
+            mapping[occupant.account_key] = slot.number
+        try:
+            with self._lock():
+                self._store.renumber(mapping)
+        except LockError as e:
+            raise ClaudeSwitchError(
+                "Another cswap process is using the Codex store; try again."
+            ) from e
+        return slot.number, target, occupant is not None
+
+    def rotate(self) -> CodexSwitchResult:
+        """Switch to the next rotatable account after the active one.
+
+        Bare ``cswap switch`` rotates on the Claude side; ``cswap codex switch``
+        does the same rather than erroring on a missing argument.
+        """
+        candidates = self.switchable_account_numbers()
+        if not candidates:
+            raise ClaudeSwitchError("No rotatable Codex accounts")
+        active = self.current_account_number()
+        if active is None or active not in candidates:
+            return self.switch_to(candidates[0])
+        if len(candidates) == 1:
+            raise ClaudeSwitchError(
+                "Only one rotatable Codex account — nothing to rotate to"
+            )
+        nxt = candidates[(candidates.index(active) + 1) % len(candidates)]
+        return self.switch_to(nxt)
+
+    def switch_best(self) -> CodexSwitchResult:
+        """Switch to whichever rotatable account has the most headroom."""
+        from claude_swap.codex.autoswitch import binding_pct
+
+        snapshot = self.accounts_snapshot(fetch=None)
+        rotatable = set(self.switchable_account_numbers())
+        active = self.current_account_number()
+
+        best, best_pct = None, None
+        for account in snapshot.accounts:
+            if account.number not in rotatable or account.number == active:
+                continue
+            pct = binding_pct(account)
+            if pct is None:
+                continue
+            if best_pct is None or pct < best_pct:
+                best, best_pct = account, pct
+        if best is None:
+            raise ClaudeSwitchError(
+                "No Codex account with a known measurement to switch to"
+            )
+        return self.switch_to(best.number)
 
     def account_numbers(self) -> list[str]:
         """Every managed slot number, rotation-eligible or not.

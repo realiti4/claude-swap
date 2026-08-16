@@ -201,6 +201,32 @@ class CodexStore:
         self.delete_snapshot(account_key)
         return True
 
+    def renumber(self, mapping: dict[str, str]) -> None:
+        """Reassign slot numbers: ``{account_key: new_number}``, atomically.
+
+        Only ``sequence.json`` moves. Snapshots are keyed by ``account_key``
+        precisely so renumbering never has to touch a secret — the whole reason
+        this store does not key them by slot.
+        """
+        if not mapping:
+            return
+        data = self._read()
+        accounts = data["accounts"]
+        rows = {
+            row.get("account_key"): (num, row)
+            for num, row in accounts.items()
+            if isinstance(row, dict)
+        }
+        for key in mapping:
+            if key not in rows:
+                raise KeyError(f"unknown account_key: {key}")
+        for key, new_number in mapping.items():
+            old_number, _row = rows[key]
+            accounts.pop(old_number, None)
+        for key, new_number in mapping.items():
+            accounts[str(new_number)] = rows[key][1]
+        self._write(data)
+
     def set_active(self, account_key: str | None) -> None:
         """Record cswap's *intent*. The live auth.json remains the authority on
         what is actually active — see ``auth_file.read_live_identity``."""
