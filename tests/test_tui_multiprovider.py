@@ -377,3 +377,26 @@ class TestDashboardWithTwoProviders:
             rendered = app.screen.query_one("#accounts-panel").render().plain
 
         assert "codex" in rendered
+
+
+def test_the_menubar_toggle_callback_targets_the_owning_provider(temp_home: Path):
+    """The toggle callback resolves its row once and uses that result. It used
+    to resolve twice, and nothing pinned that both halves agreed — so a
+    disable aimed at a codex row could have reached claude."""
+    from claude_swap.menubar import _resolve_menu_row
+
+    class App:
+        switcher = _FakeProvider("claude")
+        providers = [switcher, _FakeProvider("codex")]
+
+        def _guard(self, fn):
+            fn()
+            return True
+
+    app = App()
+    provider, number = _resolve_menu_row(app, "codex:2")
+    app._guard(lambda: provider.set_account_disabled(number, True))
+
+    codex = app.providers[1]
+    assert codex.disabled == [("2", True)]
+    assert app.switcher.disabled == []

@@ -353,7 +353,7 @@ def test_token_status_of_an_api_key_account_says_so(
     assert "token: api key" in capsys.readouterr().out
 
 
-def test_json_reports_age_and_fetch_time(monkeypatch, capsys, codex_home: Path, monkeypatch2=None):
+def test_json_reports_age_and_fetch_time(monkeypatch, capsys, codex_home: Path):
     """A cached row must say how old it is, not pretend to be current."""
     from claude_swap.codex.usage import UsageFetch
 

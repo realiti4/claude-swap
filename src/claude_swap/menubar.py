@@ -864,10 +864,9 @@ def run(switcher) -> int:
             # `disabled` is this row's current state; selecting it flips it.
             target = not disabled
             def cb(_sender):
+                provider, number = _resolve_menu_row(self, num)
                 if self._guard(
-                    lambda: _resolve_menu_row(self, num)[0].set_account_disabled(
-                        _resolve_menu_row(self, num)[1], target
-                    )
+                    lambda: provider.set_account_disabled(number, target)
                 ):
                     self.refresh_async()
             return cb
