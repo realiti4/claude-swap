@@ -382,6 +382,29 @@ def test_remove_drops_the_slot_and_its_snapshot(seeded: CodexSwitcher):
     assert CodexStore().read_snapshot(KEY_B) is None
 
 
+def test_remove_asks_before_deleting(seeded: CodexSwitcher, monkeypatch):
+    """Removal deletes the Keychain item too. An unprompted destructive verb
+    would diverge from the Claude side's `remove` for no reason."""
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    seeded.remove_account("2")
+    assert len(CodexStore().slots()) == 2
+    assert CodexStore().read_snapshot(KEY_B) is not None
+
+
+def test_remove_proceeds_when_the_prompt_is_answered_yes(seeded: CodexSwitcher, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    seeded.remove_account("2")
+    assert [s.account_key for s in CodexStore().slots()] == [KEY_A]
+
+
+def test_remove_warns_when_the_target_is_the_active_account(
+    seeded: CodexSwitcher, monkeypatch, capsys
+):
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    seeded.remove_account("1")
+    assert "currently active" in capsys.readouterr().out
+
+
 def test_remove_of_an_unknown_account_raises(seeded: CodexSwitcher):
     with pytest.raises(ClaudeSwitchError):
         seeded.remove_account("99", assume_yes=True)

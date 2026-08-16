@@ -52,6 +52,7 @@ from claude_swap.codex.usage import fetch_usage
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock, LockError
 from claude_swap.models import AccountSnapshot, AccountsSnapshot, normalize_alias
+from claude_swap.printer import dimmed, warning
 from claude_swap.usage_store import UsageEntry
 
 _logger = logging.getLogger(__name__)
@@ -307,7 +308,29 @@ class CodexSwitcher:
         )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
+        """Forget an account and delete its stored credentials.
+
+        Prompts unless ``assume_yes``, mirroring the Claude side (whose TUI
+        collects confirmation before calling and passes True). Removal deletes
+        the Keychain item too, so an unprompted destructive verb here would
+        diverge from its sibling for no reason.
+        """
         slot = self._slot_or_raise(identifier)
+
+        if slot.number == self.current_account_number():
+            warning(
+                f"Warning: Codex account {slot.number} ({slot.email}) is currently active"
+            )
+
+        if not assume_yes:
+            confirm = input(
+                f"Are you sure you want to permanently remove "
+                f"Codex account {slot.number} ({slot.email})? [y/N] "
+            )
+            if confirm.lower() != "y":
+                print(dimmed("Cancelled"))
+                return
+
         self._store.remove_slot(slot.account_key)
 
     def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:

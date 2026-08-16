@@ -113,8 +113,10 @@ def build_usage_result(data: object) -> dict | None:
     if isinstance(rate_limit, dict):
         # Classify by declared length, never by key name — see the module
         # docstring. Both keys are read, and whichever is weekly-length becomes
-        # seven_day. A later window of the same class wins, since the API lists
-        # primary first and a duplicate class is not something to average.
+        # seven_day. If both windows classify the same way (not observed, but
+        # nothing in the response forbids it), the FIRST wins: the API lists
+        # primary first, and averaging two windows of one class would invent a
+        # number the server never reported.
         for key in ("primary_window", "secondary_window"):
             raw = rate_limit.get(key)
             window = _window(raw)
