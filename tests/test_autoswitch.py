@@ -3248,6 +3248,48 @@ class TestResumeStoppedSessions:
     covered in test_session_resume.py.
     """
 
+    def test_one_exhausted_account_is_enough_to_record_a_stopped_session(
+        self, temp_home, monkeypatch
+    ):
+        """The COMMON case, and the one that shipped broken.
+
+        A session dies when the account it is on hits a limit — whether or
+        not any peer still has quota. Recording only from the all-exhausted
+        path missed exactly the everyday shape auto-switch exists for:
+        measured on a real machine, account 3 hit its 5h limit at 100% while
+        account 2 sat at 0%, so the engine took the ordinary `at-limit`
+        escape, nothing was ever recorded, and the stopped session was never
+        nudged.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+
+        # Active is spent; the PEER IS HEALTHY, so this is `at-limit`, not
+        # all-exhausted. The session stops here and must be recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(0),
+        }) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", "premise: the ordinary escape, not exhaustion"
+
+        # Next tick reads the new account's headroom and nudges.
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})
+        assert [s.session_id for s in calls[0]] == ["s-1"], (
+            "one account hitting its limit stopped a session and cswap "
+            "switched, but the session was never nudged"
+        )
+
     def test_the_active_accounts_own_reset_resumes_without_a_switch(
         self, temp_home, monkeypatch
     ):

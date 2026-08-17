@@ -1078,6 +1078,16 @@ class AutoSwitchEngine:
                 trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                if trigger == "at-limit":
+                    # The account in use is spent, so anything running on it
+                    # has stopped — and that is true whether or not a peer
+                    # still has quota. This is the COMMON case and the reason
+                    # auto-switch exists; the all-exhausted path below is the
+                    # rare one. Recording only there missed the everyday
+                    # shape entirely: measured, one account hit its 5h limit
+                    # while a peer sat at 0%, the engine took this ordinary
+                    # escape, and the stopped session was never nudged.
+                    self._record_stopped_sessions()
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
