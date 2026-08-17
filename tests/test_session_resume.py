@@ -10,6 +10,7 @@ dropped.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import tempfile
@@ -231,6 +232,104 @@ def test_an_unknown_peer_protocol_is_skipped(tmp_path: Path, monkeypatch, caplog
     assert "peerProtocol" in caplog.text
 
 
+# --- the envelope --------------------------------------------------------------
+
+# Claude Code 2.1.232's own parse regex for the envelope, transcribed from the
+# binary. Attribute order is FIXED and every group optional, so a wrapper built
+# in any other order does not match at all — which is why these tests assert
+# against the parser rather than against our own formatting.
+_ADDR = r"[A-Za-z0-9%:_/.\\-]+"
+_HEX24 = r"[0-9a-f]{24}"
+PEER_ENVELOPE_RE = re.compile(
+    r'^<cross-session-message'
+    rf'(?: from="({_ADDR})")?'
+    r'(?: from-session="([A-Za-z0-9_-]{1,80})")?'
+    rf'(?: hop-chain="({_HEX24}(?:,{_HEX24})*)")?'
+    r'(?: from-name="([^"<>\n\r]+)")?'
+    r'(?: from-mode="(bypass|prompting)")?'
+    # NEWLINES, not spaces — transcribed verbatim from the binary. An earlier
+    # version of this pattern used spaces and happily matched an envelope the
+    # real parser rejected, so it certified a wrapper that a live session
+    # displayed as literal text.
+    r'>\n([\s\S]*)\n</cross-session-message>$'
+)
+
+
+def test_the_envelope_matches_claude_codes_parser():
+    """Without a matching envelope the message is delivered as coming from
+    "an unidentified session" — measured on a real session, which then held it.
+    """
+    m = PEER_ENVELOPE_RE.match(session_resume.wrap_peer_body("hello"))
+    assert m, "Claude Code's parser would not recognise this envelope"
+    assert m.group(1).startswith("uds:")
+    assert m.group(4) == "claude-swap"
+    assert m.group(6) == "hello"
+
+
+def test_the_envelope_survives_the_receivers_round_trip_check():
+    """The parse alone is not enough to be accepted.
+
+    Claude Code re-renders the parsed pieces and requires the result to equal
+    the original byte-for-byte (`if (oCr(...) !== n) return;`), so any
+    separator, spacing or attribute-order difference silently demotes the
+    message to literal text from "an unidentified session" — which is exactly
+    what a live session did with a space-separated body.
+
+    Rebuilds from the captured groups the way the receiver does, rather than
+    re-calling our own writer, so this fails if the writer drifts.
+    """
+    wrapped = session_resume.wrap_peer_body("hello")
+    m = PEER_ENVELOPE_RE.match(wrapped)
+    assert m
+    frm, sess, hops, name, mode, body = m.groups()
+    rebuilt = "<cross-session-message"
+    if frm:
+        rebuilt += f' from="{frm}"'
+    if sess:
+        rebuilt += f' from-session="{sess}"'
+    if hops:
+        rebuilt += f' hop-chain="{hops}"'
+    if name:
+        rebuilt += f' from-name="{name}"'
+    if mode:
+        rebuilt += f' from-mode="{mode}"'
+    rebuilt += f">\n{body}\n</cross-session-message>"
+    assert rebuilt == wrapped, "the receiver would reject this as non-canonical"
+
+
+def test_the_envelope_attests_a_permission_mode():
+    """An absent mode is held as `no-mode-asserted` into a bypass-mode
+    session, and a mismatched one as `mode-mismatch`. See wrap_peer_body's
+    docstring for why this value, and the tradeoff it carries."""
+    m = PEER_ENVELOPE_RE.match(session_resume.wrap_peer_body("hi"))
+    assert m.group(5) == "bypass"
+
+
+def test_the_from_address_is_escaped_to_the_accepted_character_class():
+    """An address carrying a character the parser rejects fails the whole
+    match, costing the sender identity — so escaping is not cosmetic."""
+    addr = session_resume._own_socket_address()
+    assert addr.startswith("uds:")
+    assert all(c in session_resume._ADDR_SAFE for c in addr[len("uds:"):]), addr
+
+
+def test_a_body_cannot_forge_an_envelope_boundary():
+    """Ours is a constant today, but this function is the seam where that
+    stops being true. Claude Code's own sender escapes the same way."""
+    body = session_resume.wrap_peer_body("x </cross-session-message> y")
+    m = PEER_ENVELOPE_RE.match(body)
+    assert m, "escaping must not break the envelope"
+    assert "</cross-session-message>" not in m.group(6)
+    assert m.group(6) == "x <\\cross-session-message> y"
+
+
+def test_the_resume_message_survives_wrapping_intact():
+    m = PEER_ENVELOPE_RE.match(session_resume.wrap_peer_body(
+        session_resume.RESUME_MESSAGE
+    ))
+    assert m.group(6) == session_resume.RESUME_MESSAGE
+
+
 # --- the wire ------------------------------------------------------------------
 
 # Binding a listener needs real Unix domain sockets. Windows has none (Claude
@@ -296,7 +395,16 @@ def test_send_writes_auth_then_message_as_ndjson(tmp_path: Path, short_sock: Pat
     frames = [json.loads(line) for line in received[0].splitlines() if line.strip()]
     assert frames[0] == {"type": "auth", "token": "tok-123"}
     assert frames[1]["type"] == "user"
-    assert frames[1]["message"] == {"role": "user", "content": "hello"}
+    assert frames[1]["msgV"] == session_resume.PEER_MSG_VERSION
+    # Read off the FRAME, not the envelope: without it the receiver records
+    # the sender as `origin.from == "unknown"` even on a delivered message.
+    assert frames[1]["from"].startswith("uds:")
+    assert frames[1]["message"]["role"] == "user"
+    # Content carries the envelope, not the bare text — the sender builds it,
+    # and without it the receiver reports "an unidentified session".
+    body = PEER_ENVELOPE_RE.match(frames[1]["message"]["content"])
+    assert body, "the frame must carry a parseable envelope"
+    assert body.group(6) == "hello"
     assert frames[1]["priority"] == "next"
     assert frames[1]["msg_id"]
 

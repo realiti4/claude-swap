@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import socket
+import string
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +43,15 @@ _logger = logging.getLogger(__name__)
 # messaged: the frame shape below is reverse-engineered, so guessing across a
 # version bump risks delivering garbage into someone's live session.
 PEER_PROTOCOL = 1
+
+# Frame-format version stamped on every message Claude Code's own sender
+# emits. Distinct from PEER_PROTOCOL, which versions the session record.
+PEER_MSG_VERSION = 1
+
+# Characters the receiver's envelope parser accepts unescaped in a `from`
+# address; everything else must be percent-encoded (Claude Code's own sender
+# does the same). Mirrors its `[A-Za-z0-9%:_/.\-]` character class.
+_ADDR_SAFE = frozenset(string.ascii_letters + string.digits + "%:_/.\\-")
 
 # How much of a transcript's tail to read when classifying its last turn.
 # Transcripts reach hundreds of MB (a real one measured 163MB), so they are
@@ -211,6 +223,64 @@ def _peer_token(pid: int, claude_dir: Path | None = None) -> str | None:
     return None
 
 
+def _own_socket_address() -> str:
+    """This process's peer address, in the ``uds:<escaped path>`` form.
+
+    cswap binds no inbox of its own, so there is no real socket to name — a
+    reply would have nowhere to go, which is correct for a one-way nudge. The
+    address still has to be well-formed or the receiver renders the sender as
+    "an unidentified session": the parse accepts only ``[A-Za-z0-9%:_/.\\-]``,
+    with anything else percent-encoded.
+    """
+    path = f"/tmp/cswap-{os.getpid()}.sock"
+    escaped = "".join(
+        c if c in _ADDR_SAFE else "".join(f"%{b:02X}" for b in c.encode("utf-8"))
+        for c in path
+    )
+    return f"uds:{escaped}"
+
+
+def wrap_peer_body(text: str) -> str:
+    """Wrap ``text`` in the envelope Claude Code's inbox parses.
+
+    The SENDER builds this envelope inside the message content; it is not
+    assembled from JSON fields. A body with no envelope is delivered as coming
+    from "an unidentified session".
+
+    Attribute order is fixed by the receiver's parse regex
+    (``from``, ``from-session``, ``hop-chain``, ``from-name``, ``from-mode``)
+    and unrecognised orderings do not match at all.
+
+    ``from-mode`` is an enum of exactly ``bypass`` | ``prompting``, and the
+    receiver COMPARES it against its own mode: an absent mode is held into a
+    bypass-mode session as ``no-mode-asserted``, and a mismatched one as
+    ``mode-mismatch``. Neither value is literally true of a background daemon,
+    which has no interactive permission posture at all. ``bypass`` is sent
+    because it is the value that reaches a session in either mode, and because
+    the alternative route to the same outcome is the user setting
+    ``crossSessionInbound: accept``, which additionally accepts messages from
+    every other local sender. This is a deliberate, documented tradeoff: the
+    nudge is a fixed, non-instructional string (:data:`RESUME_MESSAGE`) sent by
+    the user's own tool to the user's own sessions, at their explicit opt-in
+    via ``autoswitch.resumeStoppedSessions``.
+    """
+    # Escape any closing-tag lookalike in the body, as Claude Code's own
+    # sender does, so a body can never forge an envelope boundary. Ours is a
+    # constant, but this function is the seam where that stops being true.
+    safe = re.sub(r"</(?=cross-session-message)", "<\\\\", text)
+    # NEWLINES around the body, not spaces. The receiver re-renders the parsed
+    # pieces and requires the result to equal the original byte-for-byte
+    # (`if (oCr(...) !== n) return;`), so a single wrong separator makes the
+    # whole envelope fail to parse — and it is then shown to the user as
+    # literal text from "an unidentified session". Measured against a live
+    # session: a space-separated body was held exactly that way.
+    return (
+        f'<cross-session-message from="{_own_socket_address()}"'
+        f' from-name="claude-swap" from-mode="bypass">\n{safe}\n'
+        "</cross-session-message>"
+    )
+
+
 def send_peer_message(
     socket_path: str,
     text: str,
@@ -248,9 +318,16 @@ def send_peer_message(
     if token:
         frames.append({"type": "auth", "token": token})
     frames.append({
+        # `msgV` is the frame version every real sender stamps; `from` is read
+        # off the FRAME (not the envelope) and is what the receiver records as
+        # `origin.from` — without it a delivered message is attributed to
+        # "unknown". The name and mode come from the envelope instead; the two
+        # layers are read separately.
+        "msgV": PEER_MSG_VERSION,
         "msg_id": str(uuid.uuid4()),
         "type": "user",
-        "message": {"role": "user", "content": text},
+        "from": _own_socket_address(),
+        "message": {"role": "user", "content": wrap_peer_body(text)},
         "priority": "next",
     })
 
@@ -288,7 +365,13 @@ RESUME_MESSAGE = (
 def resume_sessions(
     sessions: list[StoppedSession], claude_dir: Path | None = None
 ) -> list[StoppedSession]:
-    """Nudge each stopped session. Returns the ones that accepted delivery."""
+    """Nudge each stopped session. Returns the ones the socket accepted.
+
+    "Accepted" means the bytes were written to the inbox, NOT that Claude
+    Code acted on them. It may still HOLD the message for the user's review
+    (see the module docstring on ``crossSessionInbound``), and holds are
+    invisible from this side — the socket write succeeds either way.
+    """
     resumed = []
     for stopped in sessions:
         if send_peer_message(
