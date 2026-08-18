@@ -158,12 +158,55 @@ def test_a_session_still_working_is_not_collected(tmp_path: Path, monkeypatch):
 
 
 def test_a_session_that_recovered_is_not_collected(tmp_path: Path, monkeypatch):
-    """Only the LAST entry counts: a limit earlier in the transcript that was
+    """Only the last TURN counts: a limit earlier in the transcript that was
     followed by real work is history, not a stopped session."""
     _write_transcript(tmp_path, [
         LIMIT_STOP,
         {"type": "assistant",
          "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+    ])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    assert find_stopped_sessions(tmp_path) == []
+
+
+# Bookkeeping Claude Code appends AFTER a turn ends. Captured from a real
+# transcript (session 023e5bcb, 2026-08-18): the terminal limit stop was
+# followed by these three, so the LAST entry was never the limit stop at all.
+TRAILING_BOOKKEEPING = [
+    {"type": "system", "subtype": "turn_duration", "durationMs": 3},
+    {"type": "system", "subtype": "informational", "content": "..."},
+    {"type": "bridge-session", "sessionId": "sess-1"},
+]
+
+
+def test_bookkeeping_appended_after_the_stop_does_not_hide_it(
+    tmp_path: Path, monkeypatch
+):
+    """The limit stop is rarely the last LINE — it is the last TURN.
+
+    Claude Code keeps writing non-turn entries after work stops (17 such
+    types seen in one transcript set). Reading only the final line stranded
+    exactly the sessions this feature exists for.
+    """
+    _write_transcript(tmp_path, [{"type": "user"}, LIMIT_STOP, *TRAILING_BOOKKEEPING])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    assert [s.session_id for s in find_stopped_sessions(tmp_path)] == ["sess-1"]
+
+
+def test_a_new_user_turn_after_the_stop_means_it_already_resumed(
+    tmp_path: Path, monkeypatch
+):
+    """Scanning back past bookkeeping must still stop at a real turn — a user
+    who typed after the limit (or an earlier nudge) already restarted it."""
+    _write_transcript(tmp_path, [
+        LIMIT_STOP,
+        {"type": "user"},
+        {"type": "attachment"},
+        *TRAILING_BOOKKEEPING,
     ])
     monkeypatch.setattr(
         session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]

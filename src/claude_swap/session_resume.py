@@ -94,13 +94,39 @@ def transcript_path(session: ClaudeSession, claude_dir: Path | None = None) -> P
     return root / slug / f"{session.session_id}.jsonl"
 
 
-def _last_entry(path: Path) -> dict | None:
-    """The last parseable JSON object in ``path``, or None.
+def _decides_the_turn(entry: dict) -> bool:
+    """Whether ``entry`` says anything about whether work has stopped.
+
+    A transcript is mostly NOT turns: one real capture held 17 distinct
+    non-turn types (``attachment``, ``bridge-session``, ``worktree-state``,
+    ``system``/``turn_duration``, ``pr-link``, ...) against 3 that matter, and
+    Claude Code keeps appending them after work stops. So the tail scan walks
+    back past bookkeeping to the last entry that actually decides the
+    question, of which there are two kinds:
+
+    * a conversation turn (``user``/``assistant``) — the thing
+      :func:`is_limit_stop` classifies;
+    * a retryable mid-turn 429 (``system``/``api_error``) — not a turn, but it
+      means one is still in flight, so the walk must STOP there rather than
+      skip past it to the limit stop the retry is retrying.
+
+    An allow-list rather than a list of types to skip: the bookkeeping set is
+    open-ended and grows with every Claude Code release, while the entries
+    that carry a turn have been these two shapes throughout.
+    """
+    if entry.get("type") in ("user", "assistant"):
+        return True
+    return entry.get("type") == "system" and entry.get("subtype") == "api_error"
+
+
+def _last_turn_entry(path: Path) -> dict | None:
+    """The last entry in ``path`` that decides whether work has stopped.
 
     Reads only the tail. The final line can be a partial write (Claude Code
     appends while we read), and the first line of a mid-file seek is almost
     always a fragment, so every line is tried and unparseable ones skipped
-    rather than treated as an error.
+    rather than treated as an error. A tail holding nothing but bookkeeping
+    yields None — conservative, and the session is simply not recorded.
     """
     try:
         size = path.stat().st_size
@@ -120,7 +146,7 @@ def _last_entry(path: Path) -> dict | None:
             entry = json.loads(line.decode("utf-8", errors="replace"))
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(entry, dict):
+        if isinstance(entry, dict) and _decides_the_turn(entry):
             return entry
     return None
 
@@ -190,7 +216,7 @@ def find_stopped_sessions(claude_dir: Path | None = None) -> list[StoppedSession
                 session.session_id, session.peer_protocol, PEER_PROTOCOL,
             )
             continue
-        entry = _last_entry(transcript_path(session, claude_dir))
+        entry = _last_turn_entry(transcript_path(session, claude_dir))
         if not is_limit_stop(entry):
             continue
         stopped.append(StoppedSession(
