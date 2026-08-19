@@ -1221,21 +1221,19 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        # Whether the drain account was hard-selected, rather than ranked.
         # Everything downstream keys on THIS, not on the trigger string: the
         # freshness contract belongs to "we bypassed ranking for a named
         # account", and `failover` reaching the same bypass under its own name
         # slipped past a trigger-string check once already.
         drain_forced = drain_num is not None and trigger in ("drain-return", "failover")
         if drain_forced:
-            # A NAMED target, not a ranked one — skip `_rank` entirely so
-            # neither the hysteresis margin nor the no-return bar can veto it.
-            # Both of those answer "is this a BETTER account?"; drain-return
-            # asks "is the drain account usable yet?", which the gate answered
-            # against this same headroom snapshot. Ranking here would strand
-            # the user on an away account that merely has more headroom — the
-            # normal case right after a reset, and the whole point of naming
-            # an account in the first place.
+            # Skipping `_rank` is what stops the hysteresis margin and the
+            # no-return bar from vetoing this. Both of those answer "is this
+            # a BETTER account?"; drain-return asks "is the drain account
+            # usable yet?", which the gate answered against this same
+            # headroom snapshot. Ranking here would strand the user on an
+            # away account that merely has more headroom — the normal case
+            # right after a reset, and the whole point of naming an account.
             #
             # PROVISIONAL. The two-phase block below re-asks the same question
             # against a refetch and can overturn this pick — reading only this
@@ -1247,9 +1245,7 @@ class AutoSwitchEngine:
             # `leftTrigger` in the state, and `_no_return_account` reads that
             # to choose the more permissive release legs a failover departure
             # is owed -- an ordinary-departure classification there would sit
-            # on a `leftHeadroom` of None that was never measured. The
-            # debounce is untouched for the same reason it exists: one
-            # unreadable tick must not move anyone.
+            # on a `leftHeadroom` of None that was never measured.
             ordered, any_known, active_reset_ts = [drain_num], True, None
         else:
             ordered, any_known, active_reset_ts = _rank(
@@ -1583,9 +1579,8 @@ class AutoSwitchEngine:
         not. Departures at/above the threshold are untouched — those are not
         a spend-order question, they are the engine's whole point.
 
-        A DISABLED drain account does not win: `cswap disable` is the user's
-        own "hold this out of rotation", which is newer and more specific than
-        a drain account set earlier.
+        A DISABLED drain account does not win either — see
+        :meth:`_drain_account_target` for why disabling outranks it.
         """
         num = self._resolved_drain_account(settings)
         return (
@@ -1603,19 +1598,17 @@ class AutoSwitchEngine:
     ) -> str | None:
         """The drain account, when it is both configured and usable again.
 
-        Returns None unless every condition holds, so a caller that gets None
-        falls through to today's below-threshold behaviour untouched:
+        Returns None unless every check below passes, so a caller that gets
+        None falls through to today's below-threshold behaviour untouched.
+        The checks read plainly; two of them carry a decision that does not:
 
-        - ``autoswitch.drainAccount`` resolves to a switchable, non-quarantined
-          account. A DISABLED one stays out on purpose:
-          ``switchable_account_numbers`` already honours ``cswap disable``,
-          and disabling is the user's own "leave this one alone" — it must
-          outrank a drain account set earlier and forgotten.
-        - it is not where we already are.
-        - its binding window is READABLE and under the threshold. Unknown
-          headroom is not "probably fine": landing on an account we cannot
-          measure would re-trigger blind on the next tick, which is the same
-          harm the landing gate in ``_rank_candidates`` exists to prevent.
+        - ``switchable_account_numbers`` is what folds in ``cswap disable``,
+          and a disabled drain account staying out is the point — disabling
+          is the user's own "leave this one alone", newer and more specific
+          than a drain account set earlier and forgotten.
+        - unreadable headroom is refused, not assumed fine. Landing on an
+          account we cannot measure would re-trigger blind on the next tick,
+          the same harm the landing gate in ``_rank_candidates`` prevents.
 
         WHY RETURNING HERE DOES NOT FLAP, despite bypassing the anti-flap
         gates — and what that argument depends on. Returning fires only
