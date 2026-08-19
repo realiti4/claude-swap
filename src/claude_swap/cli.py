@@ -642,6 +642,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--drain-account",
+        metavar="ACCOUNT",
+        help=(
+            "Spend this account first (alias, slot number, or email). The others "
+            "become overflow: you stay on it until it hits the threshold and are "
+            "moved back as soon as its window resets. Naming an account makes it "
+            "burn sooner, not later"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,

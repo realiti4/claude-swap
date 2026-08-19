@@ -57,6 +57,23 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Account identifier (alias, slot number, or email) whose quota is spent
+    # FIRST; every other account becomes overflow. The engine returns to it as
+    # soon as its binding window is back under ``threshold``. No strategy does
+    # that today -- the tick gate answers below-threshold NO_ACTION for
+    # everything but consume-first, so one departure strands the user off the
+    # account they chose until an unrelated threshold crossing moves them.
+    #
+    # Named for the direction it actually pushes. An earlier draft called this
+    # "home", which reads as a resting place: someone wanting to CONSERVE an
+    # account could set it and silently get the opposite policy.
+    #
+    # This is the same question ``strategy: consume-first`` answers -- which
+    # account's quota burns first -- with a different anchor (a name the user
+    # gave, rather than the soonest weekly reset). A spend order has one
+    # anchor, so the two cannot both be live; see ``_at_drain_account``.
+    # None = no drain account (default).
+    drain_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +151,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "drainAccount", "drain_account", "string",
+            help="Spend this account first; others are overflow while it is at its limit",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +452,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("drain_account", "drain_account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
