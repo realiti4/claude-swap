@@ -7238,6 +7238,61 @@ class TestPerWindowThresholds:
             "100% must still read as at-limit even with both ceilings at 99"
         )
 
+    def test_the_fleet_that_rode_an_account_to_a_hard_limit(self, temp_home):
+        """Observed on a live 3-account fleet under heavy concurrent load.
+
+        Every account sat within a point or two of the single 88 ceiling at
+        once, but on DIFFERENT windows: one on a weekly window days from
+        resetting, one on a 5h window 39 minutes from resetting, and the
+        active one burning. With no candidate under the shared ceiling the
+        engine had nowhere legal to land, reported `no-qualifying-candidate`
+        for eight consecutive ticks, and rode the active account to a real
+        100% before the at-limit escape moved it. A hard rate limit, taken
+        while a peer held a full untouched week of quota.
+
+        The peer was only blocked by a 5h window that heals within the
+        session. Under a split policy it is a legal landing and the limit is
+        never reached, which is the entire point of separating the ceilings.
+        """
+        five_h = _iso_at(1_002_340.0)      # 39 minutes out
+        fleet = {
+            "1": {  # active, burning; 5h past 95 but weekly barely touched
+                "five_hour": {"pct": 96.0, "resets_at": five_h},
+                "seven_day": {"pct": 13.0, "resets_at": _iso_at(1_460_800.0)},
+            },
+            "2": {  # a full untouched week, blocked only by a healing 5h window
+                "five_hour": {"pct": 89.0, "resets_at": five_h},
+                "seven_day": {"pct": 0.0, "resets_at": _iso_at(1_604_800.0)},
+            },
+            "3": {  # genuinely depleted: weekly is days out
+                "five_hour": {"pct": 44.0, "resets_at": _iso_at(1_002_940.0)},
+                "seven_day": {"pct": 88.0, "resets_at": _iso_at(1_241_200.0)},
+            },
+        }
+
+        uniform = self._harness(temp_home, strategy="consume-first", threshold=88.0)
+        assert uniform.tick_with_usage(dict(fleet)) is not TickOutcome.SWITCHED, (
+            "premise: under one ceiling every account is over it, so nothing "
+            "is a legal landing and the active burns on to a hard limit"
+        )
+        assert uniform.active_number() == 1
+
+        # A second, independent home so the two policies cannot share a
+        # store (see EngineHarness.__init__ on per-instance isolation).
+        split_home = temp_home / "split"
+        (split_home / ".claude").mkdir(parents=True)
+        split = self._harness(
+            split_home, strategy="consume-first", **_pw(95.0, 85.0)
+        )
+        assert split.tick_with_usage(dict(fleet)) is TickOutcome.SWITCHED, (
+            "the peer's 5h window is under its own ceiling and its weekly is "
+            "untouched: a legal landing the shared ceiling hid"
+        )
+        assert split.active_number() == 2, (
+            "must land on the account holding a full week, not the one whose "
+            "weekly window is days from resetting"
+        )
+
     def test_thresholds_resolve_and_stay_uniform_when_unset(self):
         from claude_swap.autoswitch import _thresholds_for
 
