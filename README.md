@@ -92,6 +92,7 @@ cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
 cswap auto --strategy pace            # rotate off accounts burning ahead of weekly pace
+cswap auto --threshold-5h 95 --threshold-7d 85   # ride the 5h window, protect weekly quota
 ```
 
 <details>
@@ -99,6 +100,7 @@ cswap auto --strategy pace            # rotate off accounts burning ahead of wee
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Per-window thresholds** (`--threshold-5h` / `--threshold-7d`, or `cswap config set autoswitch.threshold5h`): the two windows recover on different scales, so one ceiling suits neither. A 5-hour window at 95% is whole again within the session; a weekly window at 95% is spent for days. Set them apart to ride the 5h window (fewer switches) while leaving weekly quota earlier (more of it left for the rest of the week). Per-model weekly limits follow `--threshold-7d`. Unset, both fall back to `--threshold` and behavior is unchanged.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `pace` keeps `best`'s behavior and adds an early rotation: when the active account's weekly window is meaningfully ahead of pace (the dashboard's `(ahead)` marker), it moves to the on-pace account with the most quota left, so a hot week gets spread across accounts before anything nears its limit.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

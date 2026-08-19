@@ -72,10 +72,17 @@ class CswapApp(App):
         self._last_refresh_error = ""
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
+        # One tick is drawn against bars for BOTH windows, so it shows the
+        # policy FLOOR: with per-window thresholds set, the earliest point at
+        # which some window trips. Drawing `threshold` alone would put the
+        # tick above the real ceiling on whichever window was lowered, which
+        # reads as "still fine" right up to a switch.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            from claude_swap.autoswitch import _thresholds_for
+
+            self.threshold_pct: float | None = _thresholds_for(
+                load_settings(switcher.backup_dir)
+            ).floor
         except Exception:
             self.threshold_pct = None
         try:

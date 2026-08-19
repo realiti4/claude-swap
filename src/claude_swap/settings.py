@@ -41,9 +41,20 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
     ping-pong while a strictly better account is always taken.
+
+    ``threshold_5h`` / ``threshold_7d`` override it per window when set: the
+    5-hour window is worth riding higher (it is whole again within the
+    session) while weekly quota is worth leaving earlier (it is gone for
+    days). Scoped per-model weekly windows follow ``threshold_7d``.
     """
 
     threshold: float = 90.0
+    # Per-window overrides on ``threshold``. None = use ``threshold`` for that
+    # window, so an unset pair behaves exactly like the single-threshold
+    # policy. The 5h window recovers within the session and the weekly one
+    # does not, so they want different ceilings. See oauth.WindowThresholds.
+    threshold_5h: float | None = None
+    threshold_7d: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -107,6 +118,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold5h", "threshold_5h", "float", 50.0, 99.9,
+            help="Switch when the 5h window reaches this pct (unset: threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold7d", "threshold_7d", "float", 50.0, 99.9,
+            help="Switch when a weekly window reaches this pct (unset: threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -428,6 +447,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
+        ("threshold_5h", "threshold_5h"),
+        ("threshold_7d", "threshold_7d"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
