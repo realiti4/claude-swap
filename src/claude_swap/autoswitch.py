@@ -20,7 +20,13 @@ activation the target's token is *freshened* (refreshed if it expires within
 under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+consecutive ticks, the engine fails over to any healthy candidate. The
+opt-in ``pace`` strategy keeps all of the above and adds one early
+rotation below the threshold: when the active account's weekly window is
+meaningfully ahead of pace (the same noise-gated signal as the UI's
+``(ahead)`` marker, see :mod:`claude_swap.pace`), it moves to the on-pace
+candidate with the most headroom, spreading a week's burn across the
+fleet before any threshold trips.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -42,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, pace, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -362,7 +368,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "pace"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -628,6 +634,54 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def _weekly_ahead(
+    usage: dict | None, fetched_at: float | None, models: Sequence[str]
+) -> bool:
+    """Whether any weekly window is meaningfully ahead of pace.
+
+    Weekly means the 7-day window plus every configured scoped per-model
+    window, the same ``models`` filter every other decision reads (the 5h
+    window is excluded: pace is undefined there, see :mod:`claude_swap.pace`).
+    Windows come through :func:`oauth.relevant_windows`, the canonical window
+    source, so a window that binds a decision can never be invisible here.
+    ``compute_pace`` supplies the noise gates (24h post-reset suppression,
+    the 15-point ahead threshold); this helper adds no thresholds of its own,
+    so the engine's trigger and the UI's ``(ahead)`` marker can never
+    disagree about what "ahead" means.
+    """
+    if not isinstance(usage, dict):
+        return False
+    for label, pct, resets_at in oauth.relevant_windows(usage, models):
+        if label == "5h":
+            continue
+        result = pace.compute_pace(
+            {"pct": pct, "resets_at": resets_at}, fetched_at=fetched_at
+        )
+        if result is not None and result.ahead:
+            return True
+    return False
+
+
+def _pace_ahead_by_account(
+    usage: dict[str, dict | str | None], entries: dict, models: tuple[str, ...]
+) -> dict[str, bool]:
+    """Per-account weekly ahead-of-pace flags, from decision values.
+
+    ``fetched_at`` comes from each account's store entry rather than the
+    wall clock: a decision value served stale is evaluated against the clock
+    it was measured at (the rule every other pace consumer follows).
+    """
+    out: dict[str, bool] = {}
+    for num, value in usage.items():
+        entry = entries.get(num)
+        out[num] = _weekly_ahead(
+            value if isinstance(value, dict) else None,
+            entry.fetched_at if entry is not None else None,
+            models,
+        )
+    return out
 
 
 class AutoSwitchEngine:
@@ -978,7 +1032,21 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                active_entry = entries.get(current)
+                if settings.strategy == "pace" and _weekly_ahead(
+                    usage.get(current) if isinstance(usage.get(current), dict) else None,
+                    active_entry.fetched_at if active_entry is not None else None,
+                    self._models,
+                ):
+                    # pace: below the threshold, a weekly window meaningfully
+                    # ahead of pace (compute_pace's noise-gated marker) means
+                    # this account is projected to exhaust before its reset.
+                    # Rotate off it now, while every window still has room,
+                    # instead of riding it to the threshold cliff. Candidate
+                    # selection decides whether an on-pace account with room
+                    # actually exists.
+                    trigger = "pace"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -991,11 +1059,13 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account
+                    # with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,7 +1116,9 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first", "pace") and self._in_cooldown(
+            state
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1099,6 +1171,15 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        # Weekly ahead-of-pace flags for the pace strategy's landing gate,
+        # recomputed wherever usage/headroom are refetched so the three can
+        # never describe different snapshots. None for every other strategy:
+        # the ranking must not pay for a signal it never reads.
+        pace_ahead = (
+            _pace_ahead_by_account(usage, entries, self._models)
+            if settings.strategy == "pace"
+            else None
+        )
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1184,12 +1265,13 @@ class AutoSwitchEngine:
             active_headroom=active_headroom,
             settings=settings,
             now=decided_now,
+            pace_ahead=pace_ahead,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "pace") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
-            # decides below the threshold, where the collector only escalates
+            # and pace decide below the threshold, where the collector only escalates
             # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
             # A switch is imminent, so spend the fetches now and re-decide on
             # fresh data.
@@ -1204,6 +1286,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
+            if pace_ahead is not None:
+                pace_ahead = _pace_ahead_by_account(usage, entries, self._models)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -1215,12 +1299,17 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=decided_now,
+                pace_ahead=pace_ahead,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in (
+            "consume-first",
+            "pace",
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # or pace nudge: those are opportunistic moves, and an API-key
+            # account has no weekly window to consume or to pace.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1261,6 +1350,19 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == "pace":
+                # Below the threshold and healthy: staying put is a correct
+                # outcome, never a block (the consume-first contract). One
+                # reason covers every gate that emptied the list: candidates
+                # over the threshold, ahead of pace themselves, or unreadable
+                # this tick.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-on-pace-candidate",
+                        detail="no on-pace account with room to spare",
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -1313,11 +1415,11 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "pace"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
+                # and pace are opportunistic, not escapes; never act on stale data
                 # or slide to a worse-ranked target; hold and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
@@ -1467,7 +1569,7 @@ class AutoSwitchEngine:
         left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if trigger not in ("proactive", "consume-first", "pace") or came_from is None:
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -1765,6 +1867,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        pace_ahead: dict[str, bool] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1843,7 +1946,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "pace"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -1906,6 +2009,24 @@ class AutoSwitchEngine:
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
+                        continue
+                elif trigger == "pace":
+                    # Only land where the weekly windows are themselves on
+                    # pace: another over-pace account trades one projected
+                    # exhaustion for the next, and the pair would ping-pong.
+                    # One-way by pace dynamics: a landed-on account's `ahead`
+                    # can only fire after real burn, and the account we left
+                    # stays ahead until expected catches its actual (hours at
+                    # minimum), during which the no-return bar holds anyway.
+                    # Unknown pace counts as on pace: compute_pace suppresses
+                    # the first day after a reset, which is exactly when a
+                    # window is freshest, and an unknowable pace cannot prove
+                    # a candidate hot. No headroom hysteresis on this branch,
+                    # deliberately: the point of the move is that raw headroom
+                    # misleads when burn rates differ, and an on-pace account
+                    # with less headroom than the over-pace active is still
+                    # the account that lasts the week.
+                    if pace_ahead is not None and pace_ahead.get(num):
                         continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
@@ -2124,7 +2245,9 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first", "pace") and self._in_cooldown(
+            state
+        ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

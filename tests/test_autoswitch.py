@@ -6894,3 +6894,158 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+# --- pace strategy -------------------------------------------------------------
+
+# Weekly-reset instants for pace math, anchored to FakeClock's 1_000_000.0
+# epoch (~1970-01-12 13:46:40Z). Elapsed time in the current weekly cycle is
+# 7d minus the time remaining to the reset, and compute_pace's expected pct
+# is elapsed/7d, so each instant pins a known expected value:
+#   _R7_MIDWEEK  58.2h out -> 109.8h elapsed -> expected ~65.3%
+#   _R7_EARLY   138.0h out ->  30.0h elapsed -> expected ~17.9%
+#   _R7_FRESH   156.0h out ->  12.0h elapsed -> inside the 24h suppression
+_R7_MIDWEEK = "1970-01-15T00:00:00Z"
+_R7_EARLY = "1970-01-18T07:46:40Z"
+_R7_FRESH = "1970-01-19T01:46:40Z"
+
+
+class TestPaceStrategy:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_ahead_of_pace_switches_to_on_pace_candidate(self, temp_home):
+        """The discriminating case: the ahead-of-pace candidate has MORE
+        headroom than the on-pace one, so a plain headroom sort would pick it.
+        The pace landing gate must exclude it and land on the on-pace peer."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # active: 85 vs ~65 expected -> ahead
+            "2": _usage7(10, 50, _R7_MIDWEEK),  # on pace, 50 pts headroom
+            "3": _usage7(0, 40, _R7_EARLY),     # 60 pts headroom but ahead (40 vs ~18)
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "pace"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_on_pace_below_threshold_stays(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 50, _R7_MIDWEEK),  # 50 vs ~65 expected -> on pace
+            "2": _usage7(0, 10, _R7_MIDWEEK),
+            "3": _usage7(0, 10, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_every_candidate_ahead_stays(self, temp_home):
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # ahead
+            "2": _usage7(10, 82, _R7_MIDWEEK),  # also ahead (82 vs ~65: 16.7 over)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-on-pace-candidate"]
+
+    def test_pace_target_must_still_be_healthy(self, temp_home):
+        """An on-pace weekly window does not excuse a binding 5h window at or
+        over the threshold: landing there re-triggers on the next tick."""
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # ahead
+            "2": _usage7(95, 20, _R7_MIDWEEK),  # weekly on pace, 5h over threshold
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-on-pace-candidate"]
+
+    def test_within_reset_suppression_stays(self, temp_home):
+        """85% at 12h into the week is hugely over expected, and exactly the
+        false positive compute_pace suppresses for the first day."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_FRESH),
+            "2": _usage7(0, 10, _R7_MIDWEEK),
+            "3": _usage7(0, 10, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)  # default cooldown 300s
+        h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),
+            "2": _usage7(10, 50, _R7_MIDWEEK),
+            "3": _usage7(10, 55, _R7_MIDWEEK),
+        })
+        assert h.active_number() == 2
+        h.clock.advance(60.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),
+            "2": _usage7(10, 85, _R7_MIDWEEK),  # the landing is now ahead itself
+            "3": _usage7(10, 55, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_over_threshold_behaves_like_best(self, temp_home):
+        """Above the threshold the pace gate is out of scope: we must move,
+        and any healthy account beats staying, exactly as `best` decides."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R7_MIDWEEK),  # over threshold
+            "2": _usage7(0, 81, _R7_MIDWEEK),   # ahead of pace, 19 pts
+            "3": _usage7(10, 10, _R7_MIDWEEK),  # most headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_weekly_ahead_ignores_the_5h_window(self):
+        from claude_swap.autoswitch import _weekly_ahead
+
+        usage = {
+            "five_hour": {"pct": 99.0, "resets_at": _R7_MIDWEEK},
+            "seven_day": {"pct": 10.0, "resets_at": _R7_MIDWEEK},
+        }
+        assert _weekly_ahead(usage, 1_000_000.0, ()) is False
+
+    def test_weekly_ahead_reads_configured_scoped_windows(self):
+        from claude_swap.autoswitch import _weekly_ahead
+
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 10.0, "resets_at": _R7_MIDWEEK},
+            "scoped": [
+                {"name": "Fable", "pct": 90.0, "resets_at": _R7_MIDWEEK},
+            ],
+        }
+        assert _weekly_ahead(usage, 1_000_000.0, ("Fable",)) is True
+        assert _weekly_ahead(usage, 1_000_000.0, ()) is False
+
+    def test_settings_accept_pace_strategy(self):
+        from claude_swap.settings import _clamped
+
+        assert _clamped(AutoSwitchSettings(strategy="pace")).strategy == "pace"
