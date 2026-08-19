@@ -339,6 +339,17 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+**Usage for setup-token accounts.** A setup-token is scoped to `user:inference`
+alone, so it cannot read the usage endpoint (that needs profile scope) and such
+accounts used to show a permanent `usage unavailable`, which also hid them from
+`cswap auto` — an account with unknown headroom is never picked as a target.
+Their 5h/7d numbers are instead read from the `anthropic-ratelimit-unified-*`
+headers on a minimal `/v1/messages` call. That probe costs one output token, so
+it is throttled to once per 10 minutes per token (`CLAUDE_SWAP_PROBE_INTERVAL`,
+seconds; `CLAUDE_SWAP_PROBE_MODEL` overrides the model). Per-model weekly
+windows are not in the headers, so `--model` triggers stay blind for these
+accounts.
+
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription

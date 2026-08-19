@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -374,6 +376,120 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+# --- inference-only (setup-token) usage probe --------------------------------
+# ``claude setup-token`` mints a credential scoped to ``user:inference`` alone.
+# The usage endpoint wants profile scope, so those accounts 401/403 there on
+# every pass and read as "usage unavailable" — which makes them invisible to
+# `cswap auto`, since _rank_candidates skips any account whose headroom is
+# None. The same 5h/7d numbers ride back on every ``/v1/messages`` response as
+# ``anthropic-ratelimit-unified-*`` headers, and inference is exactly what
+# these tokens may do.
+#
+# The probe has to be a *successful* call: rejected requests (400 on an empty
+# messages array, 404 on a bogus model) come back with no rate-limit headers at
+# all — measured, not assumed. So each probe costs one output token, and
+# PROBE_MIN_INTERVAL_S keeps the poll loop from spending the very window it is
+# trying to measure. The model is env-overridable because a hardcoded id
+# eventually gets retired out from under us.
+PROBE_URL = "https://api.anthropic.com/v1/messages"
+PROBE_MODEL = os.environ.get("CLAUDE_SWAP_PROBE_MODEL", "claude-haiku-4-5-20251001")
+PROBE_MIN_INTERVAL_S = float(os.environ.get("CLAUDE_SWAP_PROBE_INTERVAL", "600"))
+
+# token fingerprint -> (monotonic stamp, raw-usage-shaped dict)
+_probe_cache: dict[str, tuple[float, dict]] = {}
+
+
+def is_inference_only(oauth: dict | None) -> bool:
+    """Whether this credential is a setup-token (inference scope only).
+
+    Such tokens can never read the usage endpoint, so callers probe instead of
+    spending a guaranteed 401/403 per pass to learn nothing.
+    """
+    if not isinstance(oauth, dict):
+        return False
+    scopes = oauth.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        return False
+    return set(scopes) == {"user:inference"}
+
+
+def _epoch_to_iso(raw: str | None) -> str | None:
+    """Unix seconds (what the headers carry) -> ISO 8601 (what format_reset parses)."""
+    if not raw:
+        return None
+    try:
+        ts = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def usage_from_ratelimit_headers(headers) -> dict:
+    """Raw-usage-shaped dict built from ``anthropic-ratelimit-unified-*`` headers.
+
+    Utilization arrives as a 0-1 fraction while the usage API reports 0-100,
+    and ``build_usage_result`` passes the number straight through as ``pct`` —
+    so it is scaled here or every percentage renders 100x low.
+    """
+    out: dict = {}
+    for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
+        raw = headers.get(f"anthropic-ratelimit-unified-{prefix}-utilization")
+        if raw is None:
+            continue
+        try:
+            pct = float(raw) * 100.0
+        except (TypeError, ValueError):
+            continue
+        entry: dict = {"utilization": pct}
+        iso = _epoch_to_iso(headers.get(f"anthropic-ratelimit-unified-{prefix}-reset"))
+        if iso:
+            entry["resets_at"] = iso
+        out[key] = entry
+    return out
+
+
+def request_usage_via_probe(access_token: str) -> dict:
+    """Read 5h/7d utilization off a minimal ``/v1/messages`` call's headers.
+
+    Returns data in the raw usage-API shape so ``build_usage_result``
+    normalizes it identically. Per-model (``scoped``) windows are absent from
+    the headers, so a probed account reports 5h/7d only and ``--model``
+    triggers stay blind for it.
+    """
+    body = json.dumps({
+        "model": PROBE_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "content-type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(PROBE_URL, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return usage_from_ratelimit_headers(resp.headers)
+
+
+def probe_usage_throttled(access_token: str, now: float | None = None) -> dict:
+    """``request_usage_via_probe`` behind a per-token minimum interval.
+
+    Keyed by token digest rather than the token itself so the process never
+    holds a second copy of the secret.
+    """
+    now = time.monotonic() if now is None else now
+    key = hashlib.sha256(access_token.encode()).hexdigest()[:16]
+    cached = _probe_cache.get(key)
+    if cached is not None and (now - cached[0]) < PROBE_MIN_INTERVAL_S:
+        return cached[1]
+    data = request_usage_via_probe(access_token)
+    if data:
+        _probe_cache[key] = (now, data)
+    return data
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
@@ -668,6 +784,17 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error=refresh.error)
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
+
+    # An inference-only credential can never read the usage endpoint, so probe
+    # the rate-limit headers instead of spending a guaranteed 401/403 per pass.
+    if is_inference_only(oauth):
+        try:
+            data = probe_usage_throttled(access_token)
+            return UsageOutcome(build_usage_result(data) if data else None)
+        except Exception as e:
+            kind, retry_after = _classify_usage_error(e)
+            _log_usage_failure(context, e, kind, retry_after)
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
     try:
         data = request_usage_data(access_token)
