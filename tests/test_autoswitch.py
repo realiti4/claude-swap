@@ -7322,3 +7322,29 @@ class TestPerWindowThresholds:
         assert parse_setting_value(spec, "95") == 95.0
         with pytest.raises(ConfigError):
             parse_setting_value(spec, "120")
+
+
+class TestPollEventReportsThePolicy:
+    def test_uniform_policy_emits_no_extra_field(self, temp_home):
+        h = EngineHarness(temp_home, threshold=88.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage7(10, 10), "2": _usage7(10, 10)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "windowThresholds" not in poll.to_json(), (
+            "a single-threshold run must keep its JSON byte-identical"
+        )
+
+    def test_split_policy_reports_both_ceilings(self, temp_home):
+        h = EngineHarness(
+            temp_home, threshold=88.0, threshold_5h=95.0, threshold_7d=85.0
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage7(10, 10), "2": _usage7(10, 10)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["windowThresholds"] == {"5h": 95.0, "7d": 85.0}, (
+            "a reader of the stream must be able to explain the decision"
+        )

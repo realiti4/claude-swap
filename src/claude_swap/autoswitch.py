@@ -323,6 +323,12 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Resolved per-window ceilings, emitted only when they differ from each
+    # other. `threshold` alone cannot describe a split policy, so a reader
+    # of the JSON stream would see "threshold: 88" while the engine was
+    # actually gating on 95/85 and be unable to explain any decision. Kept
+    # conditional so the default single-threshold output is byte-identical.
+    window_thresholds: dict[str, float] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -330,6 +336,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.window_thresholds:
+            fields["windowThresholds"] = self.window_thresholds
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -1062,6 +1070,14 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                window_thresholds=(
+                    {}
+                    if thresholds.uniform
+                    else {
+                        "5h": thresholds.for_label("5h"),
+                        "7d": thresholds.for_label("7d"),
+                    }
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
