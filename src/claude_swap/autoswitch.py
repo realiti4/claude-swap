@@ -973,25 +973,23 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
-        # Resolved in the gate below, read again at ranking time. Hoisted so
-        # the ranking bypass sees it on every path through the gate.
-        # Asked BEFORE the active account is classified, and deliberately so.
-        # A spend order is a statement about where quota should be consumed,
-        # not a reaction to how the stand-in happens to be doing. Consulted
-        # only in the below-threshold branch, it was ignored on the one tick
-        # that matters most -- the drain account resetting while the overflow
-        # account crosses the threshold -- and ordinary ranking sent the user
-        # to whichever peer had the most headroom instead. That detour also
-        # stamps a fresh cooldown, so the return they actually asked for was
-        # pushed out by another `cooldownSeconds` on top of the wasted hop.
+        # Resolved here, BEFORE the active account is classified, and read
+        # again at ranking time -- hoisted so the ranking bypass sees it on
+        # every path through the gate. A spend order states where quota
+        # should be consumed; it is not a reaction to how the stand-in is
+        # doing. Move this back inside the below-threshold branch and the
+        # setting goes dead on the one tick it matters most: the drain
+        # account resetting while the overflow account crosses the threshold,
+        # where ranking sends the user to the roomiest peer instead and
+        # stamps a cooldown that delays the real return further still.
         drain_num = self._drain_account_target(
             settings, headroom, quarantined, current
         )
         # `at-limit` skips the cooldown by design: sitting still on a spent
         # account is never the right answer. A drain-return fired from that
         # same state is the same move under a different name, so it must keep
-        # the bypass -- otherwise the fix above trades an extra hop for being
-        # stranded on a 100% account until the cooldown lapses. Tracked
+        # the bypass, or the user is stranded on a 100% account until the
+        # cooldown lapses. Tracked
         # separately from the trigger because the trigger now says where we
         # are going, while this says whether staying was ever an option.
         # (`failover` needs no entry here: it keeps its own trigger name and
@@ -1002,15 +1000,9 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if drain_num is not None:
-                # The drain account's window is back under the threshold,
-                # so resume spending it. `drainAccount` is a spend-order
-                # rule: it names the account to burn first and makes every
-                # other one overflow. That is the same question
-                # `consume-first` answers, with a different anchor (a name
-                # the user chose, rather than the soonest weekly reset) --
-                # which is exactly why the two cannot both be live. A spend
-                # order has ONE anchor; the user's wins, and
-                # `_at_drain_account` enforces it.
+                # The drain account's window is back under the threshold, so
+                # resume spending it. `_at_drain_account` carries why this
+                # rule and `consume-first` cannot both be live.
                 trigger = "drain-return"
             elif utilization >= settings.threshold:
                 trigger = "at-limit" if must_move else "proactive"
