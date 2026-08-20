@@ -1385,6 +1385,52 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
 
+    async def test_tick_shows_the_policy_floor_not_the_fallback(
+        self, tmp_path, fake_engine
+    ):
+        """One tick is drawn against bars for BOTH windows, so under a split
+        policy it must show the FLOOR (the earliest point some window trips),
+        not the account-wide fallback. Rendering 88 while the weekly ceiling
+        is 85 would put the tick above the real limit on the weekly bar, which
+        reads as "still fine" right up to a switch."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 88.0, "threshold5h": 95.0, "threshold7d": 85.0,
+            },
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            assert app.threshold_pct == 85.0, (
+                "the tick must be the policy floor (85), not the fallback "
+                f"threshold (88) or the 5h ceiling (95) - got "
+                f"{app.threshold_pct}"
+            )
+
+    async def test_tick_is_the_plain_threshold_when_policy_is_uniform(
+        self, tmp_path, fake_engine
+    ):
+        """Backward-compatibility pin: with no per-window overrides the floor
+        IS the threshold, so existing behavior is unchanged."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 82.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            assert app.threshold_pct == 82.0
+
     async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path

@@ -7293,6 +7293,57 @@ class TestPerWindowThresholds:
             "weekly window is days from resetting"
         )
 
+    @pytest.mark.parametrize(
+        "pct5,pct7,over,who",
+        [
+            (94.9, 10.0, False, "5h just under its ceiling"),
+            (95.0, 10.0, True, "5h exactly at its ceiling"),
+            (95.1, 10.0, True, "5h just over"),
+            (10.0, 84.9, False, "7d just under its ceiling"),
+            (10.0, 85.0, True, "7d exactly at its ceiling"),
+            (10.0, 85.1, True, "7d just over"),
+            (94.0, 84.0, False, "both just under, neither trips"),
+            (90.0, 86.0, True, "only the weekly trips, and that is enough"),
+        ],
+    )
+    def test_boundaries_at_each_ceiling(self, pct5, pct7, over, who):
+        """`excess >= 0` is the trip test, so equality trips. Pinned per
+        window because a split policy has two independent boundaries and an
+        off-by-one on either is a silent switch or a silent hold."""
+        t = oauth.WindowThresholds(default=88.0, five_hour=95.0, weekly=85.0)
+        excess = oauth.threshold_excess(_usage7(pct5, pct7), (), thresholds=t)
+        assert (excess >= 0) is over, f"{who}: excess={excess}"
+
+    @pytest.mark.parametrize("threshold", [50.0, 75.0, 88.0, 99.9])
+    def test_uniform_boundary_matches_the_legacy_comparison_exactly(self, threshold):
+        """Legacy equivalence at the boundary itself, across the settable
+        range: `excess >= 0` must agree with `(100 - headroom) >= threshold`
+        for every window value, including exact equality."""
+        flat = oauth.WindowThresholds(default=threshold)
+        for pct in (threshold - 0.1, threshold, threshold + 0.1, 0.0, 100.0):
+            usage = _usage7(pct, 0.0)
+            new = oauth.threshold_excess(usage, (), thresholds=flat) >= 0
+            legacy = (100.0 - oauth.account_headroom(usage, ())) >= threshold
+            assert new is legacy, f"pct={pct} threshold={threshold}"
+
+    def test_the_no_return_bar_still_applies_under_a_split_policy(self, temp_home):
+        """Anti-flap is not bypassed by the new axis: the engine still refuses
+        to undo its own last move when the ceilings are split."""
+        h = self._harness(temp_home, **_pw(95.0, 85.0))
+        first = h.tick_with_usage({
+            "1": _usage7(10, 90),   # active past the weekly ceiling
+            "2": _usage7(20, 10),
+            "3": _usage7(30, 10),
+        })
+        assert first is TickOutcome.SWITCHED
+        landed = h.active_number()
+        state = h.state()
+        assert state["lastSwitchTo"] == str(landed)
+        assert state["lastSwitchFrom"] == 1, (
+            "the departure must be recorded so the bar has something to "
+            "refuse to undo under a split policy too"
+        )
+
     def test_thresholds_resolve_and_stay_uniform_when_unset(self):
         from claude_swap.autoswitch import _thresholds_for
 
