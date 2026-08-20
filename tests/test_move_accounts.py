@@ -1,5 +1,6 @@
 """Tests for `cswap move` (ClaudeAccountSwitcher.move_account)."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import FetchRecord, UsageStore
 
 
 class TestMoveAccount:
@@ -483,6 +485,29 @@ class TestMoveAccount:
 
         with pytest.raises(ValidationError, match="out of range"):
             switcher.move_account("2", "151")
+
+    # -- BC-18973: the vacated source slot must not linger in usage.json --
+
+    def test_move_drops_the_old_slot_usage_row(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Moving frees ``num_src`` for good (it leaves the accounts table
+        entirely — ``del data["accounts"][num_src]``), so its ring-usage
+        cache row must go with it; otherwise it sits in usage.json forever,
+        indistinguishable from a real never-polled managed account to a
+        reader with no identity guard (ring-watcher; BC-18955/BC-18973)."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"2": FetchRecord(usage={"five_hour": {"pct": 50.0}})},
+            {"2": ("account2@example.com", "")},
+        )
+        raw_path = switcher.backup_dir / "cache" / "usage.json"
+        assert "2" in json.loads(raw_path.read_text())["accounts"]
+
+        switcher.move_account("2", "5")
+
+        assert "2" not in json.loads(raw_path.read_text())["accounts"]
 
 
 class TestMoveUnreadableSourceIsNotAbsent:

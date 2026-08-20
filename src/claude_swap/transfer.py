@@ -544,9 +544,16 @@ def import_accounts(
         # previous auth verdict is no longer authoritative, so lift any
         # dead-token quarantine on this slot (mirrors add_account / the
         # add-token paths). This clears for both "imported" and "overwrote":
-        # account removal doesn't prune usage.json, so re-importing a removed
-        # identity into the same slot would otherwise stay quarantined and
-        # never re-fetch to prove the imported token — issue #138.
+        # "overwrote" replaces a still-managed slot's credentials in place,
+        # without going through remove_account, so its usage row (and any
+        # dead-token strike on it) survives untouched and must be cleared
+        # here explicitly — issue #138. ("imported" onto a slot number
+        # freed by a genuine removal no longer needs this for the same
+        # reason: BC-18973 made remove_account drop that row outright, so
+        # there is nothing left to quarantine the re-import. This call
+        # still runs unconditionally for that outcome too, since it is a
+        # no-op on a slot with no strike and cheap to keep uniform across
+        # both outcomes.)
         switcher._usage_store.clear_dead_token(
             [target_num], {target_num: (entry["email"], entry["org_uuid"])}
         )

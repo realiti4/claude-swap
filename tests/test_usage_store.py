@@ -1682,3 +1682,211 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestDrop:
+    """BC-18973: a slot freed for good (account removed, displaced, migrated,
+    or moved away from) must not leave its row sitting in usage.json forever.
+
+    Identity-guarded reads (``entries()``) already hide a mismatched row from
+    cswap itself, but a tool with no access to that guard — ring-watcher,
+    which reads the raw file directly and has no in-band "managed" signal of
+    its own (BC-18955/BC-18973) — sees the orphaned row exactly as if it were
+    a real, never-polled managed account. These tests assert the row is
+    physically gone from the raw file, not merely hidden from entries().
+    """
+
+    def test_drop_removes_the_row_from_the_raw_file(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert "1" in store._read_rows()
+
+        removed = store.drop(["1"])
+
+        assert removed == 1
+        assert "1" not in store._read_rows()
+
+    def test_dropped_row_is_gone_even_to_a_reader_with_no_identity_guard(self, store):
+        """The discriminating check: read the file exactly as ring-watcher
+        does (raw JSON, no identity matching) rather than through
+        ``entries()``, which would already hide a mismatched row and could
+        pass even if the row were merely orphaned, not actually deleted."""
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.drop(["1"])
+
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert "1" not in raw["accounts"]
+
+    def test_drop_missing_slot_is_a_noop(self, store):
+        assert store.drop(["9"]) == 0
+        assert not store.path.exists()
+
+    def test_drop_empty_list_is_a_noop(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        mtime_before = store.path.stat().st_mtime_ns
+
+        assert store.drop([]) == 0
+        assert store.path.stat().st_mtime_ns == mtime_before
+
+    def test_drop_leaves_other_rows_untouched(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+        store.drop(["1"])
+        assert store.entries(IDENT)["2"].last_good == USAGE
+
+    def test_drop_reports_only_rows_actually_present(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.drop(["1", "9"]) == 1
+
+    def test_stale_reserve_cannot_recreate_a_removed_roster_slot(
+        self, tmp_path, clock
+    ):
+        """Removal after snapshot construction fences a later reserve."""
+        sequence_path = tmp_path / "sequence.json"
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {"email": "b@x.com", "organizationUuid": "org-2"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = UsageStore(
+            tmp_path / "cache", clock=clock, roster_path=sequence_path
+        )
+        stale_snapshot = {"2": IDENT["2"]}
+        store.record({"2": FetchRecord(usage=USAGE)}, stale_snapshot)
+
+        # The collector retains stale_snapshot while the roster mutation and
+        # cache cleanup complete in another process.
+        sequence_path.write_text(
+            json.dumps({"sequence": [], "accounts": {}}), encoding="utf-8"
+        )
+        store.drop(["2"])
+
+        claims = store.reserve(["2"], stale_snapshot, respect_plans=False)
+
+        assert claims == {}
+        assert "2" not in store._read_rows()
+
+    def test_fenced_record_rejects_a_claim_after_roster_identity_reuse(
+        self, tmp_path, clock
+    ):
+        """A claim won before slot reuse cannot persist its stale result."""
+        sequence_path = tmp_path / "sequence.json"
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {"email": "b@x.com", "organizationUuid": "org-2"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = UsageStore(
+            tmp_path / "cache", clock=clock, roster_path=sequence_path
+        )
+        stale_snapshot = {"2": IDENT["2"]}
+        claims = store.reserve(["2"], stale_snapshot, respect_plans=False)
+        assert set(claims) == {"2"}  # the fetch starts while still managed
+
+        # Reuse commits before the in-flight fetch returns. Model failed
+        # best-effort cache cleanup by deliberately retaining the old claim.
+        sequence_path.write_text(
+            json.dumps(
+                {
+                    "sequence": [2],
+                    "accounts": {
+                        "2": {
+                            "email": "replacement@x.com",
+                            "organizationUuid": "",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        accepted = store.record(
+            {"2": FetchRecord(usage=USAGE)}, stale_snapshot, claims
+        )
+
+        assert accepted == set()
+        assert "lastGood" not in store._read_rows()["2"]
+
+
+class TestReconcile:
+    """BC-18973 rework: drop() only ever reaches a slot its caller already
+    knows was just freed. A row orphaned before that per-removal pruning
+    existed (or by any write path that missed it — e.g. the 8 slots
+    reported live in this ticket) can't be reached that way at all, since
+    no future removal will ever name a slot number nobody manages anymore.
+    reconcile() is the retroactive sweep: given the caller's whole current
+    managed set, delete anything not in it.
+    """
+
+    def test_reconcile_removes_a_row_outside_identities(self, store):
+        store.record({"9": FetchRecord(usage=USAGE)}, {"9": ("orphan@x.com", "")})
+
+        removed = store.reconcile(IDENT)  # IDENT only knows "1" and "2"
+
+        assert removed == 1
+        assert "9" not in store._read_rows()
+
+    def test_reconciled_row_is_gone_even_to_a_reader_with_no_identity_guard(self, store):
+        """Discriminating check, as with drop(): read the file exactly as
+        ring-watcher does (raw JSON, no identity matching)."""
+        store.record({"9": FetchRecord(usage=USAGE)}, {"9": ("orphan@x.com", "")})
+        store.reconcile(IDENT)
+
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert "9" not in raw["accounts"]
+
+    def test_reconcile_keeps_a_genuinely_managed_never_polled_row(self, store):
+        """The discriminating half of the fix: a row for a slot that IS in
+        ``identities`` but has never been successfully fetched (claimed,
+        no ``lastGood`` yet) must survive — it is a real managed account
+        ring-watcher is right to call unknown, not an orphan."""
+        store.claim(["1"], IDENT)
+        assert store.entries(IDENT)["1"].last_good is None  # genuinely unpolled
+
+        removed = store.reconcile(IDENT)
+
+        assert removed == 0
+        assert "1" in store._read_rows()
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_reconcile_keeps_managed_rows_and_drops_orphans_together(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "9": FetchRecord(usage=USAGE)},
+            {"1": IDENT["1"], "9": ("orphan@x.com", "")},
+        )
+
+        removed = store.reconcile(IDENT)
+
+        assert removed == 1
+        rows = store._read_rows()
+        assert "1" in rows
+        assert "9" not in rows
+
+    def test_reconcile_with_empty_identities_is_a_safe_noop(self, store):
+        """A blank managed-set reading (e.g. a momentarily unreadable
+        sequence.json) must never be mistaken for "zero accounts, prune
+        everything" — that would wipe the whole cache on a transient glitch."""
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+
+        removed = store.reconcile({})
+
+        assert removed == 0
+        assert set(store._read_rows()) == {"1", "2"}
+
+    def test_reconcile_returns_zero_when_nothing_is_orphaned(self, store):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.reconcile(IDENT) == 0
