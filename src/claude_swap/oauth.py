@@ -562,6 +562,89 @@ def account_headroom(
 
 
 @dataclass(frozen=True)
+class WindowThresholds:
+    """Per-window switch thresholds, resolved by window label.
+
+    ONE THRESHOLD CANNOT SERVE BOTH WINDOWS, because the two recover on
+    different scales. A 5-hour window at 95% is *temporarily* busy and is
+    whole again within the session; a weekly window at 95% is spent for
+    days. Riding the first is nearly free and saves a switch (and the cold
+    prompt cache every switch costs); riding the second trades a week of
+    quota for the same few minutes. Collapsing them through one ``max()``
+    forces the user to pick which mistake to make.
+
+    ``five_hour`` and ``weekly`` are overrides; ``None`` falls back to
+    ``default`` (the account-wide ``autoswitch.threshold``), so an unset
+    pair reproduces the single-threshold behaviour exactly.
+
+    Scoped per-model windows resolve to ``weekly``: they reset on the same
+    7-day cadence as ``seven_day`` (which is why ``pace`` treats them as
+    weekly too), so they are perishable in the same way and want the same
+    protection.
+    """
+
+    default: float
+    five_hour: float | None = None
+    weekly: float | None = None
+
+    def for_label(self, label: str) -> float:
+        """The threshold gating one window, by its ``relevant_windows`` label."""
+        if label == "5h":
+            return self.default if self.five_hour is None else self.five_hour
+        # "7d" and every scoped per-model window: all weekly, see class docstring.
+        return self.default if self.weekly is None else self.weekly
+
+    @property
+    def uniform(self) -> bool:
+        """Whether every window resolves to the same threshold.
+
+        True for an unset pair (the single-threshold policy) and for a pair
+        deliberately set equal. Both are cases where naming the window in a
+        message would disambiguate nothing.
+        """
+        return self.for_label("5h") == self.for_label("7d")
+
+    @property
+    def floor(self) -> float:
+        """The lowest threshold any window can be gated by.
+
+        For consumers that need one scalar and must not under-react (poll
+        cadence): the earliest point at which *some* window could trip.
+        """
+        return min(
+            self.for_label("5h"), self.for_label("7d")
+        )
+
+
+def threshold_excess(
+    usage: dict | None,
+    models: Sequence[str] = (),
+    *,
+    thresholds: WindowThresholds,
+) -> float | None:
+    """How far past its OWN threshold the worst relevant window sits.
+
+    ``>= 0`` means the account is at or over its switch policy on at least
+    one window; ``< 0`` means it is under, and ``-excess`` is the points of
+    room left before the first window trips. ``None`` when usage carries no
+    window data: the same "unknown" every other window reader returns, and
+    never auto-skipped.
+
+    This is the per-window generalisation of the old
+    ``(100 - account_headroom) >= threshold`` test, and is exactly
+    equivalent to it whenever every window resolves to the same threshold.
+    It deliberately does NOT replace :func:`account_headroom`: headroom is
+    distance to the real 100% limit, which is what the at-limit escape and
+    the anti-flap margins are calibrated on. Threshold policy and hard
+    limits are different axes, and the engine reads both.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(pct - thresholds.for_label(label) for label, pct, _ in windows)
+
+
+@dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.
 
