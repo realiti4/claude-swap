@@ -148,7 +148,7 @@ def proper_lockfile(
                 # the heartbeat on a lock still held, and CONFIG_STALENESS_S
                 # later a waiter could steal it. The errno already in hand is
                 # what separates the two; re-checking the path is both a
-                # second syscall that can fail the same way and, from 3.13,
+                # second syscall that can fail the same way and, from 3.14,
                 # an answer that reads absence out of a permission error.
                 pass
 

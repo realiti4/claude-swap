@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -124,7 +125,7 @@ class TestProperLockfile:
 
         With `stat` failing too, asking `lock_dir.exists()` is wrong on every
         supported Python and for two different reasons: 3.12 re-raises these
-        errnos out of the thread, 3.13+ swallows them and answers False, which
+        errnos out of the thread as does 3.13, 3.14+ swallows them and answers False, which
         reads as "gone" for a lock we still hold. requires-python is >=3.12
         and CI runs 3.12, so neither half can be dismissed as theoretical.
         """
@@ -227,14 +228,35 @@ class TestProperLockfile:
             return real_rmdir(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refuse)
-        start = time.monotonic()
+        # The SLEEP ARGUMENT, not the wall clock. A 0.001s budget left ~29ms
+        # of headroom, and Windows rounds every sub-millisecond sleep up to
+        # the ~15.6ms timer tick, so two iterations alone reach 31ms. The
+        # ceiling cannot simply be raised either: the defect produces a flat
+        # 0.05s, so any wall-clock bound must sit below it.
+        #
+        # SCOPED TO THIS THREAD. `claude_locks.time` IS the `time` module, so
+        # an unscoped patch records every other thread's sleeps too --
+        # measured, a foreign 0.5 landing in this list and failing a correct
+        # implementation -- and flattens their pacing to a hot spin.
+        # conftest.py documents that this suite leaves such threads running.
+        slept = []
+        real_sleep = claude_locks.time.sleep
+        mine = threading.get_ident()
+
+        def recording(seconds):
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)      # not ours: leave it alone
+            slept.append(seconds)
+            return real_sleep(0)
+
+        monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(lock_dir, timeout=0.001):
                 pass
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.03, (
-            f"a 0.001s timeout took {elapsed:.3f}s — the rmdir-failure sleep "
-            "ignored the remaining budget"
+        assert slept, "no retry sleep happened — the instrument, not the code"
+        assert max(slept) <= 0.001 + 1e-6, (
+            f"the rmdir-failure path slept {max(slept):.3f}s against a 0.001s "
+            "budget — it ignored the remaining time"
         )
 
 
