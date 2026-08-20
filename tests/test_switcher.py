@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import sys
@@ -12151,7 +12152,7 @@ def test_a_ctrl_c_during_the_roster_move_leaves_no_temp_file(temp_home: Path, mo
     def interrupted(*_a, **_kw):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(switcher_mod.shutil, "move", interrupted)
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", interrupted)
     # `raises` is the guard: without it this passes when the interrupt never
     # fires, and the assertion below would certify nothing.
     with pytest.raises(KeyboardInterrupt):
@@ -12208,3 +12209,141 @@ def test_a_published_roster_is_not_unlinked_by_its_own_cleanup(temp_home: Path, 
     assert not [u for u in unlinked if u.endswith(".tmp")], (
         f"cleanup touched a name it no longer owns: {unlinked}"
     )
+
+
+def test_an_invalid_roster_readback_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The validation branch is a failure path too, and it owns the temp.
+
+    It raises before the move, so the name is still ours and the cleanup
+    must take it. Nothing in the suite reached this branch before.
+    """
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    real_read = Path.read_text
+
+    def truncating_read(self, *a, **kw):
+        # Only the temp read-back: a corrupt file is what this branch is for.
+        if self.name.endswith(".tmp"):
+            return "{"
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", truncating_read)
+    with pytest.raises(ConfigError, match="Generated invalid JSON"):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    assert not target.exists(), "premise: nothing may be published"
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_non_ebusy_publish_failure_never_truncates_the_live_roster(
+    temp_home: Path, monkeypatch
+):
+    """Only EBUSY earns a write-through; every other error keeps the roster.
+
+    `shutil.move` fell back to copying on ANY rename error, and that copy
+    overwrites the live roster in place -- so a failure part-way truncated it
+    while the cleanup removed the last complete copy.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    copies: list[str] = []
+    fired = {"publish": False}
+
+    def refused(*_a, **_kw):
+        fired["publish"] = True
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    def recording_copy2(src, dst, *a, **kw):
+        copies.append(str(dst))
+        raise AssertionError("a non-EBUSY failure must not write through")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", refused)
+    monkeypatch.setattr(switcher_mod.shutil, "copy2", recording_copy2)
+
+    with pytest.raises(OSError):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    # Instrument guard: patching the wrong name makes every assertion below
+    # trivially true -- `os.replace` does NOT route through `os.rename`.
+    assert fired["publish"], "premise: the injected publish failure never fired"
+    assert copies == [], f"a non-EBUSY error wrote through: {copies}"
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 1
+    assert list(target.parent.glob("sequence.*.tmp")) == []
+
+
+def test_a_destination_that_refuses_rename_is_written_through(
+    temp_home: Path, monkeypatch
+):
+    """A bind-mounted destination refuses rename; it must still be writable.
+
+    `-v ~/.claude.json:/root/.claude.json` pins the inode, so `os.replace`
+    raises EBUSY and writing through the mount is the only way to update it.
+    `shutil.move` did this implicitly, for any error; only EBUSY earns it.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    fired = {"replace": False}
+
+    def busy(*_a, **_kw):
+        fired["replace"] = True
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    if sys.platform != "win32":
+        os.chmod(target, 0o644)
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    assert fired["replace"], "premise: the injected EBUSY was never reached"
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert list(target.parent.glob("sequence.*.tmp")) == []
+    if sys.platform != "win32":
+        # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
+        # once published a key world-readable; the write-through must carry it.
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_failed_write_through_keeps_the_only_complete_copy(
+    temp_home: Path, monkeypatch
+):
+    """Writing through cannot be atomic, so the temp is the safety net.
+
+    If the copy dies half-way the destination is truncated, and removing the
+    temp too would destroy the last complete copy -- the exact loss that
+    `shutil.move` produced before this change.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def truncating_copy2(src, dst, *a, **kw):
+        Path(dst).write_text('{"activeAcc', encoding="utf-8")
+        raise OSError("injected: no space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copy2", truncating_copy2)
+
+    with pytest.raises(OSError):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert len(strays) == 1, "the only complete copy was removed"
+    assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2

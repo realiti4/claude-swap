@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -568,16 +569,30 @@ class ClaudeAccountSwitcher:
             except json.JSONDecodeError:
                 raise ConfigError("Generated invalid JSON")
 
-            # Permissions go on the temp file so the rename below is the final,
-            # atomic commit: nothing can fail after the file is published (a
-            # chmod on the final path could raise with the write already live,
-            # making callers roll back around committed metadata).
+            # Permissions go on the temp so a rename publish is the final,
+            # atomic commit. That needs a REAL rename: shutil.move falls back
+            # to a copy on ANY rename error, and that copy overwrites the
+            # roster in place. (The EBUSY branch below is the one publish that
+            # cannot be atomic, and it says so.)
             if sys.platform != "win32":
                 os.chmod(temp_path, 0o600)
-            shutil.move(str(temp_path), str(path))
-            temp_path = None  # consumed by the move; the name is no longer ours
+            try:
+                replace_with_retry(temp_path, path)
+                temp_path = None  # consumed by the publish; the name is not ours
+            except OSError as e:
+                if e.errno != errno.EBUSY:
+                    raise
+                # A bind-mounted destination pins the inode, so rename is
+                # refused and writing through is the only way to update it
+                # (a container mounting ~/.claude.json). Not atomic, so the
+                # temp is disowned first and reclaimed only once the copy
+                # lands: a failure part-way must leave the complete content.
+                source, temp_path = temp_path, None
+                shutil.copy2(source, path)
+                temp_path = source
         finally:
-            # Every failure path, including the Ctrl-C no except can name.
+            # Every path where the name is still ours, including the Ctrl-C
+            # no except can name. The EBUSY branch disowns it deliberately.
             if temp_path is not None:
                 try:
                     temp_path.unlink()
@@ -1313,9 +1328,11 @@ class ClaudeAccountSwitcher:
                             f"the file and retry."
                         )
                     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    # Recorded before the write, so an interrupt in between
+                    # cannot strand a file the discard does not know about.
+                    staged[f"{kind}-{num}"] = path
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(content)
-                    staged[f"{kind}-{num}"] = path
         except ConfigError:
             # Leftover found: remove only what THIS call created.
             self._discard_staging(staged)
@@ -1325,6 +1342,11 @@ class ClaudeAccountSwitcher:
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # Ctrl-C reaches neither handler above, and the caller's rollback
+            # cannot help: it holds the empty dict this call never returned.
+            self._discard_staging(staged)
+            raise
         return staged
 
     def _swap_session_dirs(

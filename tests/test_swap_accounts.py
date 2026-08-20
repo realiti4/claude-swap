@@ -350,6 +350,53 @@ class TestSwapAccounts:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-5678"
 
+    def test_swap_staging_interrupted_is_discarded_not_stranded(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+    ):
+        """Ctrl-C mid-staging must discard, not strand a plaintext credential.
+
+        Nothing has been overwritten yet at this point, so the policy for a
+        failure here is discard, which both existing handlers already apply.
+        A survivor also wedges the next same-email swap behind "may be the
+        only surviving copy", which is untrue of a copy this path abandoned.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-one")
+        switcher._write_account_credentials("2", email, "creds-two")
+
+        real_open, real_fdopen = os.open, os.fdopen
+        staged_fd, staged_n = -1, 0
+
+        def tracking_open(path, *args, **kwargs):
+            nonlocal staged_fd, staged_n
+            fd = real_open(path, *args, **kwargs)
+            if ".swap-staging-" in str(path):
+                staged_n += 1
+                staged_fd = fd
+            return fd
+
+        def interrupting_fdopen(fd, *args, **kwargs):
+            # A signal lands at a bytecode boundary, so it surfaces here and
+            # never inside os.open's syscall: the file already exists. Match
+            # on the fd just handed out, since a closed fd number is reused.
+            if fd == staged_fd and staged_n == 2:
+                raise KeyboardInterrupt
+            return real_fdopen(fd, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", tracking_open)
+        monkeypatch.setattr(os, "fdopen", interrupting_fdopen)
+
+        with pytest.raises(KeyboardInterrupt):
+            switcher.swap_accounts("1", "2")
+
+        assert staged_n == 2, "premise: staging never reached the second file"
+        assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+        # And the abort left both slots exactly as they were.
+        assert switcher._read_account_credentials("1", email) == "creds-one"
+        assert switcher._read_account_credentials("2", email) == "creds-two"
+
     def test_swap_failed_required_clear_aborts_commit(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
