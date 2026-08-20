@@ -973,31 +973,74 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # Resolved here, BEFORE the active account is classified, and read
+        # again at ranking time -- hoisted so the ranking bypass sees it on
+        # every path through the gate. A spend order states where quota
+        # should be consumed; it is not a reaction to how the stand-in is
+        # doing. Move this back inside the below-threshold branch and the
+        # setting goes dead on the one tick it matters most: the drain
+        # account resetting while the overflow account crosses the threshold,
+        # where ranking sends the user to the roomiest peer instead and
+        # stamps a cooldown that delays the real return further still.
+        drain_num = self._drain_account_target(
+            settings, headroom, quarantined, current
+        )
+        # `at-limit` skips the cooldown by design: sitting still on a spent
+        # account is never the right answer. A drain-return fired from that
+        # same state is the same move under a different name, so it must keep
+        # the bypass, or the user is stranded on a 100% account until the
+        # cooldown lapses. Tracked
+        # separately from the trigger because the trigger now says where we
+        # are going, while this says whether staying was ever an option.
+        # (`failover` needs no entry here: it keeps its own trigger name and
+        # was never in the cooldown tuple.)
+        must_move = active_headroom is not None and active_headroom <= 0
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
-                            ),
-                        )
+            if drain_num is not None:
+                # The drain account's window is back under the threshold, so
+                # resume spending it. `_at_drain_account` carries why this
+                # rule and `consume-first` cannot both be live.
+                trigger = "drain-return"
+            elif utilization >= settings.threshold:
+                trigger = "at-limit" if must_move else "proactive"
+            elif settings.strategy != "consume-first":
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        # Both sides through pct_label: .0f utilization could
+                        # display an impossible "100% < 99.9%".
+                        detail=(
+                            f"{pct_label(utilization)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
                     )
-                    return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                )
+                return TickOutcome.NO_ACTION
+            elif self._at_drain_account(settings, current):
+                # Placed HERE, after the strategy check, so every other
+                # strategy keeps emitting today's below-threshold event
+                # verbatim: consume-first is the only one that can reach a
+                # move from this state, so it is the only one that needs
+                # intercepting (see `_at_drain_account` for the cycle).
+                self._emit(
+                    NoSwitchEvent(
+                        reason="drain-preferred",
+                        detail=(
+                            "staying on the configured drain account "
+                            "while it is under the threshold"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                # consume-first: below the threshold we still proactively move
+                # to whichever account's weekly window resets soonest, to burn
+                # the most-perishable quota first. Candidate selection decides
+                # whether a sooner-resetting account with room actually exists.
+                trigger = "consume-first"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1046,7 +1089,11 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if (
+            (trigger in ("proactive", "consume-first")
+             or (trigger == "drain-return" and not must_move))
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1174,19 +1221,46 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        # Everything downstream keys on THIS, not on the trigger string: the
+        # freshness contract belongs to "we bypassed ranking for a named
+        # account", and `failover` reaching the same bypass under its own name
+        # slipped past a trigger-string check once already.
+        drain_forced = drain_num is not None and trigger in ("drain-return", "failover")
+        if drain_forced:
+            # Skipping `_rank` is what stops the hysteresis margin and the
+            # no-return bar from vetoing this. Both of those answer "is this
+            # a BETTER account?"; drain-return asks "is the drain account
+            # usable yet?", which the gate answered against this same
+            # headroom snapshot. Ranking here would strand the user on an
+            # away account that merely has more headroom — the normal case
+            # right after a reset, and the whole point of naming an account.
+            #
+            # PROVISIONAL. The two-phase block below re-asks the same question
+            # against a refetch and can overturn this pick — reading only this
+            # far would leave you thinking the target is settled here.
+            #
+            # `failover` rides this too, but keeps its own trigger name: the
+            # trigger records WHY we moved (the active account went
+            # unreadable), not where we landed. Relabelling it would rewrite
+            # `leftTrigger` in the state, and `_no_return_account` reads that
+            # to choose the more permissive release legs a failover departure
+            # is owed -- an ordinary-departure classification there would sit
+            # on a `leftHeadroom` of None that was never measured.
+            ordered, any_known, active_reset_ts = [drain_num], True, None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
-        if trigger == "consume-first" and ordered:
+        if (trigger == "consume-first" or drain_forced) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1205,17 +1279,98 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
-                trigger=trigger,
-                consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
-                usage=usage,
-                headroom=headroom,
-                current=current,
-                active_headroom=active_headroom,
-                settings=settings,
-                now=decided_now,
-            )
+            if drain_forced:
+                # Re-ask the same question of the fresh data. The drain
+                # account is a CANDIDATE, so its stored snapshot can be up to
+                # CANDIDATE_MAX_INTERVAL_S old, and a stale-LOW reading is
+                # exactly the case `_drain_account_target`'s no-flap argument
+                # cannot cover: that argument is about its TRUE utilization,
+                # which only falls on a window reset, while a stale value can
+                # read low because the account was burned from another machine
+                # or a `cswap run` terminal since. Returning on it would land
+                # on a spent account and leave again next tick.
+                drain_num = self._drain_account_target(
+                    settings, headroom, quarantined, current
+                )
+                # Two separate ways to fail, and the predicate above only
+                # covers one. It re-answers "does this account still qualify?"
+                # — but it answers it from whatever row the store holds, which
+                # the best-effort refetch may have failed to refresh (failure
+                # backoff, or a concurrent poller holding the claim). A row
+                # that qualifies on stale numbers is not evidence, so the age
+                # is checked separately from the verdict.
+                entry = entries.get(drain_num) if drain_num else None
+                stale = entry is None or not entry.fresh(self.clock())
+                if drain_num is not None and not stale:
+                    ordered = [drain_num]
+                # ORDER MATTERS. This arm sits ahead of the `drain_num is
+                # None` one on purpose: both conditions hold for a failover
+                # whose drain account stopped qualifying on the fresh data,
+                # and the other arm HOLDS — the one thing failover must never
+                # do. Pinned by
+                # `test_a_failover_moves_on_when_the_drain_account_stops_qualifying`,
+                # which fails if the two are swapped.
+                elif trigger == "failover":
+                    # Holding is what `drain-return` does here, and it is right
+                    # for it: staying put is a correct outcome when the active
+                    # account is fine. `failover` fires precisely because it is
+                    # NOT fine — we cannot even read it — so the must-move
+                    # contract outranks the drain order. Drop the hard target
+                    # and let ordinary ranking pick from the fresh data.
+                    #
+                    # The unverified account is dropped from that ranking too,
+                    # and it has to be: ranking scores on headroom, so a
+                    # stale-LOW drain row simply looks like the roomiest
+                    # candidate and gets re-picked, making the verification
+                    # above decorative. Measured with a 240s 20% drain row
+                    # against a fresh 50% peer. Excluded only for THIS tick —
+                    # the next one refetches and it competes normally.
+                    drain_forced = False
+                    unverified = self._resolved_drain_account(settings)
+                    ordered, any_known, active_reset_ts = _rank(
+                        trigger=trigger,
+                        consume_first=consume_first,
+                        oauth_candidates=[
+                            n for n in oauth_candidates if n != unverified
+                        ],
+                        usage=usage,
+                        headroom=headroom,
+                        current=current,
+                        active_headroom=active_headroom,
+                        settings=settings,
+                        now=decided_now,
+                    )
+                elif drain_num is None:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="drain-unavailable",
+                            detail=(
+                                "the drain account is no longer under the "
+                                "threshold on fresh usage; staying put"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                else:
+                    # Still qualifies, but the refetch could not refresh it
+                    # (failure backoff, or a concurrent poller holding the
+                    # claim). That is a different fact from "no longer under
+                    # the threshold" and must not borrow its message — leave
+                    # it to the commit loop's `stale-usage` gate, which says
+                    # so and retries next tick.
+                    ordered = [drain_num]
+            else:
+                ordered, any_known, active_reset_ts = _rank(
+                    trigger=trigger,
+                    consume_first=consume_first,
+                    oauth_candidates=oauth_candidates,
+                    usage=usage,
+                    headroom=headroom,
+                    current=current,
+                    active_headroom=active_headroom,
+                    settings=settings,
+                    now=decided_now,
+                )
 
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
@@ -1313,7 +1468,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger == "consume-first" or drain_forced:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1335,7 +1490,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, must_move)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1521,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, must_move)
 
         if systemic or transient_failure:
             self._emit(
@@ -1380,6 +1535,127 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _resolved_drain_account(self, settings: AutoSwitchSettings) -> str | None:
+        """``autoswitch.drainAccount`` as an account number, or None if not usable.
+
+        One definition shared by both questions the setting raises — "is it a
+        target?" (:meth:`_drain_account_target`) and "are we ON it?"
+        (:meth:`_at_drain_account`) — so the two can never disagree about
+        which slot the setting names.
+        """
+        if not settings.drain_account:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(settings.drain_account)
+        except ClaudeSwitchError:
+            # Unresolvable or ambiguous (e.g. two slots sharing an email).
+            # Never guess which slot the user meant — hold and let the
+            # below-threshold path answer as it does today.
+            return None
+
+    def _at_drain_account(
+        self, settings: AutoSwitchSettings, current: str
+    ) -> bool:
+        """Are we sitting on the drain account, and is it still in rotation?
+
+        Used to suppress a proactive consume-first DEPARTURE, because a
+        spend order can only have ONE anchor.
+
+        `drainAccount` and `consume-first` are not opposites, they are the
+        same kind of rule: both decide whose quota burns first, and
+        they differ only in who picks the anchor — a name the user gave, or
+        the soonest weekly reset found in the data. Two anchors cannot both
+        be live, and left alone they do not merely disagree once, they cycle
+        forever on data that never changes: measured 1 -> 2 -> 1 -> 3 -> 1 ->
+        2 across fixed snapshots a cooldown apart, because
+        `_no_return_account` bars only the account we most recently left and
+        a third account keeps feeding the loop a fresh target.
+
+        The user's anchor wins. It is an explicit standing instruction, while
+        consume-first is an inference from reset times; and the cost of
+        honouring it is bounded (perishable weekly quota that would have been
+        burned first is burned later, or lost) where the cost of the cycle is
+        not. Departures at/above the threshold are untouched — those are not
+        a spend-order question, they are the engine's whole point.
+
+        A DISABLED drain account does not win either — see
+        :meth:`_drain_account_target` for why disabling outranks it.
+        """
+        num = self._resolved_drain_account(settings)
+        return (
+            num is not None
+            and num == current
+            and num in self.switcher.switchable_account_numbers()
+        )
+
+    def _drain_account_target(
+        self,
+        settings: AutoSwitchSettings,
+        headroom: dict[str, float | None],
+        quarantined: set[str],
+        current: str,
+    ) -> str | None:
+        """The drain account, when it is both configured and usable again.
+
+        Returns None unless every check below passes, so a caller that gets
+        None falls through to today's below-threshold behaviour untouched.
+        The checks read plainly; two of them carry a decision that does not:
+
+        - ``switchable_account_numbers`` is what folds in ``cswap disable``,
+          and a disabled drain account staying out is the point — disabling
+          is the user's own "leave this one alone", newer and more specific
+          than a drain account set earlier and forgotten.
+        - unreadable headroom is refused, not assumed fine. Landing on an
+          account we cannot measure would re-trigger blind on the next tick,
+          the same harm the landing gate in ``_rank_candidates`` prevents.
+
+        WHY RETURNING HERE DOES NOT FLAP, despite bypassing the anti-flap
+        gates — and what that argument depends on. Returning fires only
+        strictly below the threshold, and its utilization rises
+        monotonically while it is active and cannot fall while it is not, so
+        the only thing that moves it back down is a window reset: the event
+        this feature exists to catch. That is a different shape from the
+        pair-relative gates ``_no_return_account`` guards, where burn
+        re-opens a move repeatedly and ``[1, 2, 1, 2]`` is reachable.
+
+        The argument holds only while two things stay true elsewhere, and
+        BOTH were violated by the first version of this feature:
+
+        - Departure from it must happen only at/above the threshold. It is
+          not intrinsic — ``consume-first`` departs BELOW it, on the
+          unrelated axis of which weekly window resets soonest, and the pair
+          cycled forever on unchanging data until
+          :meth:`_at_drain_account` suppressed that departure. Any future
+          strategy that can leave a healthy account needs the same
+          treatment or this predicate starts flapping again.
+        - The reading must be its TRUE utilization. The drain account is a
+          candidate, so what the caller holds may be minutes old, and a
+          stale-LOW value (burned from another machine or a ``cswap run``
+          since the snapshot) reads like a reset that never happened. The
+          caller therefore re-runs this predicate against the phase-2
+          refetch before committing.
+
+        On its own this predicate is necessary, not sufficient.
+        """
+        num = self._resolved_drain_account(settings)
+        if num is None or num == current or num in quarantined:
+            return None
+        if num not in self.switcher.switchable_account_numbers():
+            return None
+        if (
+            self.switcher.account_kind_for(num) == "api_key"
+            and not settings.include_api_key_accounts
+        ):
+            # The ranking path keeps metered accounts as a last resort; this
+            # path skips `_rank`, so it carries that rule itself rather than
+            # leaning on API-key accounts happening to report unreadable
+            # headroom somewhere else in the codebase.
+            return None
+        h = headroom.get(num)
+        if h is None or (100.0 - h) >= settings.threshold:
+            return None
+        return num
 
     def _no_return_account(
         self,
@@ -2102,6 +2378,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        must_move: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2124,7 +2401,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                (trigger in ("proactive", "consume-first")
+                 or (trigger == "drain-return" and not must_move))
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

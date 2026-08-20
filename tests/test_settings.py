@@ -273,6 +273,12 @@ class TestMergedWithCli:
         )
         assert merged.include_api_key_accounts is True
 
+    def test_drain_account_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(drain_account="work"), _args(drain_account="personal")
+        )
+        assert merged.drain_account == "personal"
+
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
