@@ -1280,6 +1280,60 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
+    def test_clear_dead_token_revokes_the_claim_by_default(self, store, clock):
+        """The credential-refresh callers (login/add/import) need this: a
+        fresh credential fences out any claim still bound to the OLD
+        lineage, so a superseded fetch's `record()` can't land — see
+        `test_credential_refresh_revokes_an_old_fetch_claim`. Default
+        behavior stays unchanged; ``revoke_claim=False`` is the opt-out for
+        callers with no credential change to fence (below)."""
+        store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        store.clear_dead_token(["1"], IDENT)
+        assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_clear_dead_token_can_preserve_a_live_claim(self, store, clock):
+        """`revoke_claim=False`: a lock-free heal (no credential change, no
+        network) must not be able to void a lease it did not issue.
+
+        Measured before this guard existed: a zero-strike row holding a
+        live fetch claim (a collector's in-flight lease) had `claimId`
+        nulled by `clear_dead_token` unconditionally — reachable from the
+        TUI's lock-free 3s `fetch=set()` poll, every tick, with no strikes
+        involved at all. `record()` fences its own writes on `claimId`, so
+        that silently discarded a concurrent collector's in-flight fetch
+        outcome — the engine's own measurement, thrown away by a stale
+        read one poll cycle later.
+
+        Control in the same test: strikes/backoff/error state are still
+        cleared with the flag off — only the CLAIM is preserved, proving
+        the mutator's real job (lifting the quarantine) survives the guard.
+        """
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert claims, "premise: the reserve won a live claim"
+        before = store.entries(IDENT)["1"]
+        assert before.auth_dead_strikes == 0, "premise: no strikes"
+        assert before.claimed(clock.now), "premise: the claim is live"
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False)
+
+        after = store.entries(IDENT)["1"]
+        assert after.claimed(clock.now), (
+            f"claim_until {before.claim_until!r} -> {after.claim_until!r}: "
+            "revoke_claim=False must leave a live claim untouched"
+        )
+        assert after.claim_until == before.claim_until
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, claims
+        ) == {"1"}, "the preserved claim must still fence a real record()"
+
+        # Control: strike/backoff/error state is still cleared with the flag
+        # off — the guard narrows the write, it does not disable it.
+        store.record({"2": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["2"].token_dead()
+        store.clear_dead_token(["2"], IDENT, revoke_claim=False)
+        assert not store.entries(IDENT)["2"].token_dead()
+
 
 class TestReserve:
     """Atomic fetch reservation: eligibility re-checked under the lock."""
@@ -1632,11 +1686,25 @@ class TestStruckFingerprintHygiene:
     unconditionally, and clearing a quarantine drops the fingerprint too."""
 
     def test_legacy_strike_overwrites_stale_fingerprint(self, store):
+        """I3 rewrite: the ORIGINAL version called ``clear_dead_token``
+        between the two strikes, which itself zeroes ``struckFingerprint`` --
+        so the asserted state (``None``) already existed before the second
+        ``record()`` ran, and the assertion could not tell the overwrite
+        under test from that setup step (it passed identically with the
+        overwrite guarded out: ``if rec.struck_fp is not None:``). Reaching
+        the asserted state ONLY via the second ``record()`` -- no intervening
+        clear -- makes the overwrite the sole mechanism that can produce it.
+        """
         ident = {"1": ("a@b.c", "")}
         store.record(
             {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
             ident,
         )
+        assert store.entries(ident)["1"].struck_fingerprint == "sha256:old", (
+            "premise: a fingerprint is on the row before the legacy strike"
+        )
+        # legacy writer strikes without a fingerprint -- no clear in between,
+        # so only THIS write can change struckFingerprint.
         store.clear_dead_token(["1"], ident)
         # legacy writer strikes without a fingerprint
         store.record({"1": FetchRecord(error="invalid_grant")}, ident)
@@ -1682,3 +1750,141 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestStrikeOnlyHeal:
+    """C1/I2: ``clear_dead_token(strike_only=True)`` clears the STRIKE only
+    -- ``authDeadStrikes``/``struckFingerprint`` -- and leaves the server's
+    own throttle state (``consecutiveFailures``/``lastError``/
+    ``backoffUntil``) untouched. The five credential-refresh callers keep
+    the full clear (``strike_only`` defaults False)."""
+
+    def test_strike_only_preserves_backoff(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        row = store._read_rows()["1"]
+        backoff_before = row["backoffUntil"]
+        assert backoff_before is not None
+        store.clear_dead_token(["1"], ident, revoke_claim=False,
+                                strike_only=True)
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert entry.backoff_until == backoff_before, (
+            "strike_only must not touch the server's own throttle deadline"
+        )
+        assert entry.last_error == "invalid_grant"
+        assert entry.consecutive_failures == 1
+
+    def test_default_full_clear_still_wipes_backoff(self, store):
+        """The five credential-refresh callers (login/add/import) must keep
+        today's full-clear behaviour -- a freshly written credential has no
+        history at all, so a stale backoff must not survive it either."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(["1"], ident)  # default: strike_only=False
+        entry = store.entries(ident)["1"]
+        assert entry.backoff_until is None
+        assert entry.last_error is None
+        assert entry.consecutive_failures == 0
+
+    def test_expected_fingerprint_mismatch_is_a_no_op(self, store):
+        """The TOCTOU re-check: a row whose struckFingerprint moved since
+        the caller's lock-free read (a fresh strike, or a different
+        collector's own heal, landed in the gap) must be left untouched."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        # A concurrent writer moved the fingerprint before this heal's lock.
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=60.0,
+                               struck_fp="sha256:concurrent")},
+            ident,
+        )
+        row_before = dict(store._read_rows()["1"])
+        store.clear_dead_token(
+            ["1"], ident, revoke_claim=False, strike_only=True,
+            expected_fingerprints={"1": "sha256:old"},  # the STALE read
+        )
+        row_after = store._read_rows()["1"]
+        assert row_after == row_before, (
+            "a stale-read heal must not overwrite a row that changed under it"
+        )
+
+    def test_expected_fingerprint_match_still_heals(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(
+            ["1"], ident, revoke_claim=False, strike_only=True,
+            expected_fingerprints={"1": "sha256:old"},  # matches
+        )
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+
+
+class TestHealPreservesTrustExtended:
+    """I2: the heal must not itself flip a decision-trusted entry to
+    unknown. Before the C1 fix, a struck entry's ``trust_extended`` rode on
+    ``consecutiveFailures``/``lastError``/``backoffUntil`` -- exactly the
+    fields the unconditional clear wiped -- so a stale-but-trusted entry
+    flipped to unknown purely from observing a healed fingerprint, which
+    ``autoswitch.py`` counts toward ``_unhealthy_ticks`` and a real
+    failover."""
+
+    def test_strike_only_heal_keeps_a_stale_entry_decision_trusted(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        # The strike is itself the failure state keeping this entry trusted
+        # past STALE_OK_S (consecutive_failures > 0).
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        pre = store.entries(IDENT)["1"]
+        assert pre.age_s > STALE_OK_S
+        assert pre.trust_extended, "premise: the strike itself trusts it"
+        assert pre.decision_value() == USAGE
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False,
+                                strike_only=True)
+        post = store.entries(IDENT)["1"]
+        assert post.trust_extended, (
+            "the heal flipped a decision-trusted entry to unknown -- "
+            "autoswitch.py counts this toward a failover"
+        )
+        assert post.decision_value() == USAGE
+
+    def test_full_clear_heal_does_flip_it_to_unknown(self, store, clock):
+        """Documents the CONTRASTING behaviour of the default (non-strike-
+        only) clear on the same setup, so the two tests together show the
+        fix is exactly the ``strike_only`` axis, not a side effect."""
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        store.clear_dead_token(["1"], IDENT)  # full clear
+        post = store.entries(IDENT)["1"]
+        assert not post.trust_extended
+        assert post.decision_value() is None

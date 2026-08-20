@@ -708,8 +708,16 @@ Defaults live in settings.json in the backup root; flags override them.
         if args.once:
             sys.exit(engine.tick().value)
 
-        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
+        # Loop mode: SIGTERM (systemd stop) and SIGINT (the Ctrl-C the banner
+        # below promises) both exit the loop cleanly. Without the SIGINT
+        # handler, KeyboardInterrupt is a BaseException — neither `except
+        # ClaudeSwitchError` nor `except Exception` in `tick()` catches it — so
+        # it propagated out of `_perform` between `switch_to` and the state
+        # write: the account switched, `lastSwitchAt` was never recorded, and
+        # the LIVE lock stayed held. The next engine then saw no cooldown and
+        # could switch again immediately.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        signal.signal(signal.SIGINT, lambda *_: engine.stop())
         if not args.json:
             print(
                 dimmed(
@@ -1171,6 +1179,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    # `cswap tui --auto`: open on the auto-switch view with the engine LIVE.
+    # The explicit flag is the consent the interactive path collects via the
+    # go-live modal. Not in the mutually-exclusive group — it modifies --tui.
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="tui_auto",
+        help=argparse.SUPPRESS,
+    )
     group.add_argument(
         "--menubar",
         action="store_true",
@@ -1342,7 +1359,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(
+                switcher, start="auto" if args.tui_auto else "dashboard"
+            ))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 

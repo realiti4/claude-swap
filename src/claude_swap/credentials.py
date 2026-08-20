@@ -314,6 +314,11 @@ class CredentialStore:
         # stick, but only the failure means the file may be behind Claude
         # Code's own writes — see _read_active_credentials.
         self._file_mode_is_ours: bool = False
+        # Set by the MANAGED-KEY read when THAT read could not reach the
+        # Keychain. The two credential axes fail asymmetrically — an API-key
+        # account has no OAuth item to deny, so the OAuth flag cannot stand in
+        # for this one. Cleared at the top of each active read.
+        self._managed_read_failed: bool = False
         # Whether any Keychain op has actually FAILED this process. Distinct
         # from _keychain_usable_cache, which is where ops should be ROUTED and
         # which _pin_file_mode sets deliberately: a routing choice must not
@@ -582,6 +587,7 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
+        self._managed_read_failed = False
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         #
         # READ THE ITEM FOR *THIS* PROFILE, NOT THE FIXED NAME.
@@ -644,9 +650,12 @@ class CredentialStore:
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
-        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
-        # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed, keychain_failed)
+        # Nothing anywhere — but "nothing" from a DENIED read is not the same
+        # claim as "nothing" from a clean one, on EITHER axis. Folding the
+        # managed read's own failure in is what stops an API-key account's live
+        # key reading as a genuinely empty slot.
+        unreachable = keychain_failed or self._managed_read_failed
+        return ActiveCredentials("", unreachable, unreachable)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -680,6 +689,14 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
+                # The caller needs this, not just the log. An API-key
+                # account has NO OAuth Keychain item, so the OAuth read
+                # answers rc-44 without decrypting and never raises —
+                # only this one is denied. Swallowing it made
+                # `_read_active_credentials` return ('', False, False),
+                # indistinguishable from an empty slot, while the key kept
+                # authenticating and billing per token.
+                self._managed_read_failed = True
                 self._host._logger.warning(f"Managed-key Keychain read failed: {e}")
                 val = None
             if val:
@@ -782,6 +799,9 @@ class CredentialStore:
         Returns whether no active item can shadow the file. ``delete_password``
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
+        to discard. Callers that must VERIFY a clear need this: a read cannot
+        answer for them once file mode is pinned, because then nothing asks the
+        Keychain at all. Off macOS there is no Keychain item, hence ``True``.
         to discard. Off macOS there is no Keychain item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
@@ -891,7 +911,7 @@ class CredentialStore:
             "keychain" if wrote_to_keychain else "file"
         )
 
-    def _clear_managed_key(self) -> None:
+    def _clear_managed_key(self) -> bool:
         """Clear any active managed API key (Claude Code ``removeApiKey`` semantics).
 
         Deletes the macOS Keychain "Claude Code" item (best-effort) and drops
@@ -900,6 +920,21 @@ class CredentialStore:
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
 
+        Returns whether no managed item can still shadow the config, the same
+        verdict :meth:`_delete_active_keychain_entry` reports for OAuth. Claude
+        Code reads the "Claude Code" Keychain item BEFORE ``primaryApiKey``, so
+        a survivor keeps authenticating; and under a pinned file mode a
+        post-clear READ never asks the Keychain, so nothing else can see it.
+
+        ``_read_global_config`` collapses ABSENT and UNREADABLE into the same
+        ``None`` — without the distinction below, an unreadable config
+        (permissions, mid-unmount) reads exactly like a genuinely keyless
+        profile, so the clear is silently skipped. Best-effort stays
+        best-effort here (never raises — the write path this feeds must not
+        block on a transient read glitch), but the two must not report the
+        same: a stale ``primaryApiKey`` surviving alongside a freshly
+        activated OAuth credential is a live cross-account key that bills per
+        token while it lies.
         I-2 (round 9): ``_read_global_config`` collapses ABSENT and UNREADABLE
         into the same ``None`` — without the distinction below, an unreadable
         config (permissions, mid-unmount) reads exactly like a genuinely
@@ -911,6 +946,7 @@ class CredentialStore:
         per token while it lies, and a caller/log reader must be able to
         tell "nothing to clear" from "could not check".
         """
+        cleared = True
         if self._host.platform == Platform.MACOS:
             try:
                 macos_keychain.delete_password(
@@ -918,15 +954,20 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except Exception:
-                pass  # best-effort; a down Keychain can't be cleaned now
+                cleared = False  # best-effort; a down Keychain can't be cleaned
         cfg = self._read_global_config()
         if cfg is None and get_global_config_path().exists():
+            # UNREADABLE, not absent — the same distinction this branch keeps
+            # having to make. The re-read is no help: `_read_managed_key` goes
+            # through the same reader and answers "", so every refusal term
+            # passed over a live `primaryApiKey`. An ABSENT config has nothing
+            # to clear and is a genuine success. The config is left in place
+            # rather than overwritten unread.
             self._host._logger.warning(
-                "Could not clear primaryApiKey: the global config exists "
-                "but could not be read (unreadable, not absent) — leaving "
-                "it in place rather than overwriting it unread"
+                "Cannot confirm the managed key was cleared: "
+                f"{get_global_config_path()} is unreadable"
             )
-            return
+            return False
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
@@ -935,21 +976,27 @@ class CredentialStore:
                 self._update_global_config(_drop)
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
+                cleared = False
+        return cleared
 
-    def _clear_oauth_credential(self) -> None:
+    def _clear_oauth_credential(self) -> bool:
         """Clear the active OAuth credential — Keychain item and plaintext file.
 
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        Returns the Keychain half's own verdict — see
+        :meth:`_delete_active_keychain_entry` for why a caller needs it.
         """
-        self._delete_active_keychain_entry()
+        cleared = self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
             if cred_file.exists():
                 cred_file.unlink()
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
+        return cleared
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.

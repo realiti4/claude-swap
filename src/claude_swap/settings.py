@@ -49,6 +49,7 @@ class AutoSwitchSettings:
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
+    decision_log: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -126,6 +127,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "decisionLog", "decision_log", "bool",
+            help="Record why each tick switched or did not, to its own log file",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,

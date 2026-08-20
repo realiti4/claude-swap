@@ -12,12 +12,20 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import TransferError
+from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
+from claude_swap.paths import get_credentials_path
 from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.usage_store import FetchRecord
+
+
+def _raise_locked(*args, **kwargs):
+    """Stand-in for a locked/unavailable Keychain operation."""
+    raise KeychainError("locked")
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +1916,164 @@ class TestImportClearsDeadTokenQuarantine:
                 assert not entry.token_dead()
                 assert entry.auth_dead_strikes == 0
 
+    def test_plain_import_does_not_overwrite_healed_active_slot_on_locked_keychain(
+        self, temp_home: Path, mock_claude_config: Path, capsys,
+        block_real_keychain,
+    ):
+        """C-1 (round 10): round 9 fixed the identical collapse for the
+        BACKUP read (`_entry_token_dead`'s unreadable branch now answers
+        `None`, not the raw strike count) but left it in the ACTIVE read one
+        branch earlier. `_slot_token_dead` builds `stored` via
+        `self._store._read_active_credentials().value or ""` -- `.value`
+        discards `keychain_unavailable`/`degraded` entirely, so a locked
+        Keychain and a genuinely empty slot produce byte-identical input
+        (`""`). `oauth.credential_fingerprint("")` is `None`, and
+        `entry.token_dead(stored_fp=None)` at switcher.py:4292 skips the
+        fingerprint compare and answers on the raw strike count alone --
+        before any `None` machinery downstream can run.
+
+        Driven end-to-end through the real `transfer.import_accounts` with
+        `force=False` (not just the predicate, which is what let this hide):
+        slot 2 is ACTIVE, already healed (the live credential was rewritten
+        to a new generation after the strike was recorded, so the struck
+        fingerprint matches nothing that exists anywhere), and the Keychain
+        is locked. The only thing separating this from
+        `test_plain_import_skips_healthy_slot` is that one fact -- whether
+        the Keychain answers -- yet a locked read must not license
+        `cswap import` to replace the slot's credentials without --force.
+
+        The active credential is written while the Keychain is USABLE, via
+        the normal `_write_credentials` path -- Keychain-only, no plaintext
+        `.credentials.json` fallback ever created. That fallback is exactly
+        what M-2 flags: a readable fallback under a locked Keychain hides
+        this bug (the read degrades but still returns bytes), so this test
+        deliberately avoids it to exercise the true macOS Keychain-only
+        shape (Shape A in the review)."""
+        from claude_swap.usage_store import FetchRecord as FR
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        old_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 1000}})
+        new_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 9999999999000}})
+
+        # Strike bound to the OLD generation.
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            ident,
+        )
+        # HEALED: a re-login rewrote the LIVE credential to the NEW
+        # generation (Keychain-only write -- no plaintext fallback file),
+        # bypassing clear_dead_token (mirrors a re-login through Claude
+        # Code itself). The struck fingerprint now matches nothing --
+        # neither the live bytes nor the backup.
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "bob@example.com", "accountUuid": "acct-2",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        s._write_credentials(new_gen)
+        assert not get_credentials_path().exists(), (
+            "setup error: a plaintext fallback file would mask C-1 (M-2)"
+        )
+        assert s.current_account_number() == "2"
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "SHOULD_NOT_LAND"
+        out.write_text(json.dumps(env))
+
+        # CONTROL: readable Keychain, same healed slot -> skipped, untouched.
+        import_accounts(s, str(out), force=False)
+        err = capsys.readouterr().err
+        assert "Skipped bob@example.com (already exists, use --force)" in err, (
+            f"control: a readable, healed active slot must be skipped, got: {err!r}"
+        )
+        creds = s._read_credentials()
+        assert json.loads(creds)["claudeAiOauth"]["accessToken"] == "sk-new", (
+            "control: creds must be untouched by the skipped import"
+        )
+
+        # PROBE: identical state, only the Keychain read now fails -- and
+        # there is no plaintext fallback to cover it (asserted above).
+        with patch.object(macos_keychain, "get_password", side_effect=_raise_locked):
+            import_accounts(s, str(out), force=False)
+            err = capsys.readouterr().err
+            assert "Skipped bob@example.com (already exists, use --force)" in err, (
+                "C-1 regression: a locked Keychain read let `cswap import` "
+                f"overwrite an already-healed active slot without --force, got: {err!r}"
+            )
+            assert "Replaced" not in err
+        # Read the creds back with a FRESH switcher (this process's
+        # capability cache stays pinned to file mode after a real failure,
+        # per _use_keychain's own contract -- a fresh instance re-probes
+        # cleanly against the same in-memory Keychain store): the SKIPPED
+        # import must have never written the imported payload underneath
+        # the ambiguity.
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.MACOS
+        creds = fresh._read_credentials()
+        assert json.loads(creds)["claudeAiOauth"]["accessToken"] == "sk-new", (
+            "C-1 regression: the imported payload landed on disk without --force"
+        )
+
+    def test_plain_import_does_not_overwrite_healed_active_slot_degraded_fallback(
+        self, temp_home: Path, mock_claude_config: Path, capsys,
+        block_real_keychain,
+    ):
+        """C-1 Shape B (review): a lagging plaintext fallback covers a
+        locked Keychain so the read RETURNS bytes (`keychain_unavailable`
+        stays False) but flags `degraded=True` -- those bytes may be a
+        stale generation Claude Code rotated past keychain-only. This shape
+        needs the `or active.degraded` half of the guard specifically:
+        Shape A (no fallback at all) sets `keychain_unavailable` and
+        `degraded` together and can't tell `or` from `and` apart."""
+        from claude_swap.usage_store import FetchRecord as FR
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        old_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 1000}})
+        new_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 9999999999000}})
+
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            ident,
+        )
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "bob@example.com", "accountUuid": "acct-2",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        # Healed via the Keychain (primary) while it's still usable.
+        s._write_credentials(new_gen)
+        # Now plant a STALE plaintext fallback file directly (simulates
+        # Claude Code's own keychain-only rotation lagging on disk) so a
+        # locked-Keychain read still returns bytes, just degraded ones.
+        get_credentials_path().write_text(old_gen, encoding="utf-8")
+
+        assert s.current_account_number() == "2"
 
 class TestForceOverwriteNarratesTheStrikeClear:
     """A forced overwrite of a slot whose row holds a dead-token strike must
@@ -1960,6 +2126,74 @@ class TestForceOverwriteNarratesTheStrikeClear:
         out = temp_home / "bob.cswap"
         export_accounts(s, str(out), account="2")
         env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
+        out.write_text(json.dumps(env))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" not in err
+
+    def test_plain_import_does_not_overwrite_healed_idle_slot_on_locked_keychain(
+        self, temp_home: Path, capsys, block_real_keychain,
+    ):
+        """C-1 Shape C (review): the IDLE slot has only one stored source --
+        the Keychain-only backup -- and `_read_account_credentials` collapses
+        both ABSENT and UNREADABLE to `""`. `_slot_token_dead` must ask
+        `_read_account_credentials_ex` for the idle branch too (mirroring
+        the active branch's guard), or a locked Keychain on an idle,
+        already-healed slot authorizes the same unforced overwrite."""
+        from claude_swap.usage_store import FetchRecord as FR
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        # Slot 2 is IDLE: no live login recorded for it (current_account_number
+        # resolves via .claude.json, which we never point at slot 2).
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        old_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 1000}})
+        new_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 9999999999000}})
+
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            ident,
+        )
+        # HEALED: the backup was rewritten to the new generation (Keychain
+        # write, since the Keychain is currently usable) -- the struck
+        # fingerprint now matches nothing.
+        s._write_account_credentials("2", "bob@example.com", new_gen)
+        assert s.current_account_number() != "2"  # genuinely idle
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "SHOULD_NOT_LAND"
+        out.write_text(json.dumps(env))
+
+        # CONTROL: readable Keychain, same healed slot -> skipped, untouched.
+        import_accounts(s, str(out), force=False)
+        err = capsys.readouterr().err
+        assert "Skipped bob@example.com (already exists, use --force)" in err, (
+            f"control: a readable, healed idle slot must be skipped, got: {err!r}"
+        )
+
+        # PROBE: identical state, only the Keychain read now fails.
+        with patch.object(macos_keychain, "get_password", side_effect=_raise_locked):
+            import_accounts(s, str(out), force=False)
+            err = capsys.readouterr().err
+            assert "Skipped bob@example.com (already exists, use --force)" in err, (
+                "C-1 Shape C regression: a locked Keychain read let import "
+                f"overwrite an already-healed idle slot without --force, got: {err!r}"
+            )
+            assert "Replaced" not in err
         env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
         out.write_text(json.dumps(env))
         import_accounts(s, str(out), force=True)

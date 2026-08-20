@@ -20,6 +20,21 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return super()._open()
 
 
+def decision_logger(log_dir: Path) -> logging.Logger:
+    """A per-engine logger for the auto-switch tick reasoning."""
+    # Constructed, not ``getLogger``: with no parent it cannot spill per-tick
+    # records into the rotating claude-swap.log. No formatter: the default is
+    # ``%(message)s`` and the caller supplies the UTC ``event.ts``
+    # (``%(asctime)s`` is naive LOCAL, which every other record of the same
+    # decision is not).
+    logger = logging.Logger("claude-swap.decisions", logging.INFO)
+    logger.addHandler(_LazyDirRotatingFileHandler(
+        log_dir / "autoswitch-decisions.log",
+        maxBytes=1024 * 1024, backupCount=2, delay=True,
+    ))
+    return logger
+
+
 def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     """Setup logging with file and optional console output.
 

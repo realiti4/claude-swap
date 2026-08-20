@@ -1153,27 +1153,79 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        revoke_claim: bool = True,
+        strike_only: bool = False,
+        expected_fingerprints: dict[str, str | None] | None = None,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
-        strike count (and the failure/backoff state riding with it) no longer
-        reflects reality, and the account must become fetch-eligible again so the
-        next pass can prove the new token good. A no-op for rows with no strikes.
+        strike count (and, for the default full clear, the failure/backoff
+        state riding with it) no longer reflects reality, and the account
+        must become fetch-eligible again so the next pass can prove the new
+        token good. A no-op for rows with no strikes.
+
+        ``revoke_claim`` (default True) also fences out any fetch lease bound
+        to the OLD credential generation — needed by the credential-refresh
+        callers (login/add/import), whose whole premise is that lineage is
+        now dead. Callers with no credential change of their own to fence —
+        the collector's fingerprint-healed strike-clear reachable from a
+        lock-free, no-network ``fetch=set()`` read every 3s — must pass
+        ``revoke_claim=False``: nulling `claimId` there voids a DIFFERENT
+        collector's live, in-flight lease on ``record()``'s own fencing
+        field, discarding its measurement.
+
+        ``strike_only`` (default False) limits the clear to the STRIKE
+        fields (``authDeadStrikes``/``struckFingerprint``) and leaves
+        ``consecutiveFailures``/``lastError``/``backoffUntil`` untouched.
+        The five credential-refresh callers keep the default full clear — a
+        freshly written credential has no history at all, so a stale
+        backoff must not survive it either. Only the collector's
+        fingerprint-healed strike-clear passes ``strike_only=True``: that
+        call is evidence a STRIKE healed, not that the server's throttle
+        lifted, and unconditionally zeroing ``backoffUntil`` there would
+        re-open a token still inside its own 429 block — the same
+        "no credential change of its own to fence" reasoning ``revoke_claim``
+        already applies, extended to the throttle fields.
+
+        ``expected_fingerprints`` re-checks, UNDER THIS METHOD'S LOCK, that
+        a row's ``struckFingerprint`` still matches what the caller's
+        lock-free read observed before deciding to heal. The collector
+        decides on a lock-free :meth:`entries` snapshot and had no re-check
+        between that decision and this write — a fresh strike (or a
+        different collector's own heal) landing in that gap must not be
+        silently overwritten by a decision made against stale data. A row
+        whose current fingerprint no longer matches is left alone entirely.
         """
         nums = list(nums)
         if not nums:
             return
 
-        def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+        def apply(num: str, row: dict) -> None:
+            if (
+                expected_fingerprints is not None
+                and row.get("struckFingerprint") != expected_fingerprints.get(num)
+            ):
+                return  # the row moved since the caller's lock-free read
+            if revoke_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
-            row["consecutiveFailures"] = 0
-            row["lastError"] = None
-            row["backoffUntil"] = None
+            if not strike_only:
+                # A strike heal is evidence the FINGERPRINT no longer matches,
+                # not evidence the server's own 429 throttle lifted:
+                # `backoffUntil`/`lastError` are the server's word, and erasing
+                # them re-opens a token still inside its own block. The
+                # unconditional copy of these three lines that the merge left
+                # below this guard defeated it entirely.
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 
