@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, session_resume
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -450,6 +450,21 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class SessionResumedEvent(AutoSwitchEvent):
+    """A limit-stopped Claude Code session was nudged back into work."""
+
+    kind: ClassVar[str] = "session-resumed"
+    session_id: str
+    cwd: str
+
+    def _fields(self) -> dict:
+        return {"sessionId": self.session_id, "cwd": self.cwd}
+
+    def human(self) -> str:
+        return f"resumed session in {self.cwd}"
+
+
+@dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
@@ -680,6 +695,14 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # Sessions seen stopped by a usage limit while every account was
+        # exhausted, keyed by session id (re-observing one is idempotent).
+        # Held in memory ON PURPOSE, not in autoswitch_state.json: a nudge is
+        # only meaningful to a session that is still running, and a pid from a
+        # previous run of the engine may since have been reused by an
+        # unrelated process. Losing the record on restart costs an un-resumed
+        # session; persisting it risks messaging a stranger.
+        self._stopped_sessions: dict[str, session_resume.StoppedSession] = {}
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -977,7 +1000,64 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            if active_headroom > 0:
+                # The account we are ON can work. That — not switching — is
+                # what makes a stopped session resumable, and the two come
+                # apart: when the ACTIVE account's own window rolls over there
+                # is nothing better to move to, so no switch ever fires. That
+                # is the ordinary shape of waiting out a weekly reset on a
+                # single busy account, and hanging the nudge on `_perform`
+                # alone stranded exactly the sessions this feature is for.
+                #
+                # Safe to call on every such tick because the record is
+                # cleared on use: with nothing recorded this is a no-op, and
+                # the recording side only ever fires from the all-exhausted
+                # path.
+                self._resume_stopped_sessions()
+            # consume-first ignores the threshold on the ACTIVE account: its
+            # whole point is to spend a perishable weekly window, and the last
+            # few percent are exactly what the threshold would strand. On a
+            # Max-x20 week that band is real money, and it evaporates at the
+            # reset whether or not it was used. So the proactive trigger is
+            # governed by the reset ordering alone, and the account is burned
+            # to its limit.
+            #
+            # The threshold keeps its OTHER two roles under this strategy, and
+            # neither is weakened here: the landing gate in `_rank` still
+            # refuses a target at/above it (never move onto an account that
+            # re-triggers next tick), and the at-limit escape below keys on
+            # `active_headroom <= 0` rather than on the threshold, so an
+            # exhausted account still escapes to any healthy peer even when
+            # nothing resets sooner.
+            #
+            # TWO conditions narrow the second clause, and both are
+            # load-bearing:
+            #
+            # `active_headroom > 0` — at zero headroom the account is spent,
+            # and that must fall through to the `at-limit` escape below
+            # rather than be re-labelled as a consume-first hold. Without it
+            # the escape is unreachable under this strategy and an exhausted
+            # account never leaves.
+            #
+            # `not _all_peers_above` — when the active account AND every peer
+            # are at/over the threshold, "land somewhere healthy" has no
+            # answer and the engine ranks on soonest RECOVERY instead, guarded
+            # by RECOVERY_HYSTERESIS_S (see `_every_account_above_threshold`).
+            # That state is the threshold's fourth role and is untouched here:
+            # holding for a sooner reset is pointless when nothing has room,
+            # and skipping the recovery gate lets two accounts rolling over a
+            # minute apart trade places forever.
+            _all_peers_above = _every_account_above_threshold(
+                [n for n in headroom if n != current],
+                headroom,
+                active_headroom,
+                settings.threshold,
+            )
+            if utilization < settings.threshold or (
+                settings.strategy == "consume-first"
+                and active_headroom > 0
+                and not _all_peers_above
+            ):
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -998,6 +1078,16 @@ class AutoSwitchEngine:
                 trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                if trigger == "at-limit":
+                    # The account in use is spent, so anything running on it
+                    # has stopped — and that is true whether or not a peer
+                    # still has quota. This is the COMMON case and the reason
+                    # auto-switch exists; the all-exhausted path below is the
+                    # rare one. Recording only there missed the everyday
+                    # shape entirely: measured, one account hit its 5h limit
+                    # while a peer sat at 0%, the engine took this ordinary
+                    # escape, and the stopped session was never nudged.
+                    self._record_stopped_sessions()
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1073,20 +1163,24 @@ class AutoSwitchEngine:
             and not oauth_candidates
             and active_headroom is not None
         ):
-            # Healthy below-threshold account with no OAuth peer to compare
-            # against — the same state `best` reports as below-threshold
-            # NO_ACTION before ever reaching candidate selection. API-key
-            # candidates don't change the outcome: they have no weekly window
-            # to consume, so a consume-first nudge never targets them. Keep
-            # the exit-code contract identical across strategies: cron
-            # wrappers keying on BLOCKED must not see false "blocked" from
-            # the flag alone.
+            # Healthy account with no OAuth peer to compare against — the same
+            # state `best` reports as below-threshold NO_ACTION before ever
+            # reaching candidate selection. API-key candidates don't change
+            # the outcome: they have no weekly window to consume, so a
+            # consume-first nudge never targets them. Keep the exit-code
+            # contract identical across strategies: cron wrappers keying on
+            # BLOCKED must not see false "blocked" from the flag alone.
+            #
+            # The detail cannot claim "below threshold" here: consume-first
+            # reaches this point at ANY utilization under 100%, so above the
+            # threshold that phrasing would print a false comparison
+            # ("95% < 90%"). Report the headroom that makes it a hold instead.
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
                     detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(100.0 - active_headroom)}% used, "
+                        "no peer to consume ahead of it"
                     ),
                 )
             )
@@ -1299,6 +1393,10 @@ class AutoSwitchEngine:
                     )
                 )
             )
+            # The only state in which a session can be stopped for a reason a
+            # later switch will fix. Recorded here, nudged in `_perform` once
+            # a switch actually lands on an account with quota.
+            self._record_stopped_sessions()
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
@@ -2169,7 +2267,71 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
             )
         )
+        # No resume nudge here on purpose. A switch is one way quota comes
+        # back, not the only one, so the trigger lives in `tick` where the
+        # ACTIVE account is known to have headroom — which covers a switch on
+        # the following tick and the active account's own reset alike. Nudging
+        # from here as well would fire before the freshly-switched account's
+        # headroom has been read, on the assumption the target is healthy.
         return TickOutcome.SWITCHED
+
+    # -- stopped-session resume ------------------------------------------------
+
+    def _record_stopped_sessions(self) -> None:
+        """Remember sessions stopped by a usage limit, while quota is gone.
+
+        Called from the all-exhausted path — the only state where a session
+        CAN be stopped for a reason a later switch will fix. Sessions are
+        accumulated across ticks (a long exhaustion can stop several at
+        different moments) and keyed by session id, so re-observing one is
+        idempotent.
+
+        Recording only what it witnessed is the deliberately conservative
+        half of this feature: a session that stopped before the engine
+        started, or that the user already resumed by hand, is never touched.
+        """
+        if not self.settings.resume_stopped_sessions:
+            return
+        try:
+            for stopped in session_resume.find_stopped_sessions():
+                self._stopped_sessions[stopped.session_id] = stopped
+        except Exception as e:
+            # Transcript/session scanning reads undocumented Claude Code
+            # state. A shape change there must cost the resume feature, never
+            # the auto-switch loop that keeps the user working.
+            _logger.warning("Could not scan for stopped sessions: %r", e)
+
+    def _resume_stopped_sessions(self) -> None:
+        """Nudge the recorded sessions, now that a switch has landed.
+
+        Fires after ANY successful switch rather than on a reset timer: the
+        switch is the event that makes quota available again, and the engine
+        already sleeps until the earliest reset to make it happen. A nudge
+        sent before the switch would resume a session onto the same exhausted
+        account and stop it again immediately.
+
+        The record is cleared unconditionally — including for sessions that
+        refused delivery. A failed nudge means the session is gone or its
+        socket is dead; retrying it on every subsequent switch would be noise
+        with no path to success.
+        """
+        if not self._stopped_sessions:
+            return
+        pending = list(self._stopped_sessions.values())
+        self._stopped_sessions.clear()
+        if not self.settings.resume_stopped_sessions:
+            # Turned off between recording and switching: drop the record
+            # rather than act on a setting the user has since revoked.
+            return
+        try:
+            resumed = session_resume.resume_sessions(pending)
+        except Exception as e:
+            _logger.warning("Could not resume stopped sessions: %r", e)
+            return
+        for stopped in resumed:
+            self._emit(SessionResumedEvent(
+                session_id=stopped.session_id, cwd=stopped.cwd
+            ))
 
     # -- helpers --------------------------------------------------------------
 

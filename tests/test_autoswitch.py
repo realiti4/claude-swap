@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, session_resume
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -24,6 +24,7 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SessionResumedEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -2863,6 +2864,63 @@ class TestConsumeFirstStrategy:
         )
         assert h.active_number() == 1
 
+    def test_burns_the_active_account_past_the_threshold(self, temp_home):
+        """consume-first does not stop consuming at ``threshold``.
+
+        The threshold is the `best` strategy's "start looking" line. Under
+        consume-first the point is to spend perishable weekly quota, so the
+        last few percent of the active account are exactly what must be
+        burned rather than stranded — on a Max-x20 week that band is real
+        money, and it evaporates at the weekly reset either way.
+
+        The active account here is over the threshold but NOT at its limit,
+        and no candidate resets sooner. `best` would move (proactive, ranked
+        on headroom); consume-first must stay and finish the window.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 95, _R_SOON),    # active: over threshold, resets FIRST
+            "2": _usage7(10, 10, _R_LATEST),  # healthy, but resets last
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "consume-first abandoned an account at 95% whose weekly window "
+            "resets soonest — the last 5% is perishable and was stranded"
+        )
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_at_limit_escape_survives_the_threshold_being_ignored(self, temp_home):
+        """Burning past the threshold must not cost the at-limit escape.
+
+        `at-limit` keys on ``active_headroom <= 0``, not on the threshold, so
+        ignoring the threshold for the proactive trigger leaves the escape
+        intact. Active is exhausted with NO sooner-resetting peer: the
+        strictly-sooner filter that governs a below-threshold consume-first
+        tick would strand us here, so this pins that at-limit takes any
+        healthy account instead.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 100, _R_SOON),   # active: spent, resets FIRST
+            "2": _usage7(10, 10, _R_LATEST),  # only escape, resets LAST
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "active account is at 100% with no sooner-resetting peer — the "
+            "at-limit escape must still move to a healthy account"
+        )
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s
         h.tick_with_usage({
@@ -3181,6 +3239,204 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestResumeStoppedSessions:
+    """Nudging Claude Code sessions that stopped on a usage limit.
+
+    The engine half only: transcript detection and the wire format are
+    covered in test_session_resume.py.
+    """
+
+    def test_one_exhausted_account_is_enough_to_record_a_stopped_session(
+        self, temp_home, monkeypatch
+    ):
+        """The COMMON case, and the one that shipped broken.
+
+        A session dies when the account it is on hits a limit — whether or
+        not any peer still has quota. Recording only from the all-exhausted
+        path missed exactly the everyday shape auto-switch exists for:
+        measured on a real machine, account 3 hit its 5h limit at 100% while
+        account 2 sat at 0%, so the engine took the ordinary `at-limit`
+        escape, nothing was ever recorded, and the stopped session was never
+        nudged.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+
+        # Active is spent; the PEER IS HEALTHY, so this is `at-limit`, not
+        # all-exhausted. The session stops here and must be recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(0),
+        }) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", "premise: the ordinary escape, not exhaustion"
+
+        # Next tick reads the new account's headroom and nudges.
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})
+        assert [s.session_id for s in calls[0]] == ["s-1"], (
+            "one account hitting its limit stopped a session and cswap "
+            "switched, but the session was never nudged"
+        )
+
+    def test_the_active_accounts_own_reset_resumes_without_a_switch(
+        self, temp_home, monkeypatch
+    ):
+        """Quota can return WITHOUT a switch, and the nudge must still fire.
+
+        Every account exhausted, sessions stop — then the account we are
+        already on resets first. There is no better account to move to, so no
+        switch happens and `_perform` is never reached. Hanging the nudge on a
+        switch alone strands exactly the sessions this feature exists for:
+        the user waits out a weekly reset and their sessions stay dead.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+
+        # Everything spent: sessions stop and are recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
+        assert calls == []
+
+        # The ACTIVE account's own window rolls over. Nothing to switch to
+        # (account 2 is still spent) — but we can work again.
+        outcome = h.tick_with_usage({"1": _usage(0), "2": _usage(100)})
+        assert outcome is not TickOutcome.SWITCHED, (
+            "premise: the active account recovering is not a switch"
+        )
+        assert [s.session_id for s in calls[0]] == ["s-1"], (
+            "the active account's window reset and quota is back, but the "
+            "stopped session was never nudged"
+        )
+
+    def test_resume_of_stopped_sessions_is_opt_in(self, temp_home, monkeypatch):
+        """Default-off, and it must not even LOOK at Claude Code's session
+        state until the user opts in — the scan reads undocumented files."""
+        h = EngineHarness(temp_home)  # resume_stopped_sessions defaults False
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        called = []
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions",
+            lambda *a, **k: called.append(1) or [],
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})
+        assert called == [], "scanned for stopped sessions while opted out"
+
+    def test_stopped_sessions_are_nudged_after_the_switch_lands(
+        self, temp_home, monkeypatch
+    ):
+        """The end-to-end shape: record while exhausted, nudge once quota is
+        back. Ordering is the point — a nudge sent before the switch would
+        resume the session onto the same spent account and stop it again.
+
+        On this path the nudge lands on the tick AFTER the switch, because the
+        trigger is "the active account has headroom" rather than "a switch
+        happened": the switching tick decides on the OLD active account's
+        (exhausted) numbers, and the new one's headroom is not read until the
+        next tick. Deliberate — the alternative is nudging on the assumption
+        that the account just switched to is healthy, and a target that turns
+        out to be spent would stop the session again immediately.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession(
+            session_id="s-1", pid=999, cwd="/w", socket_path="/w.sock", message="limit",
+        )
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        resumed_with: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: resumed_with.append(sessions) or sessions,
+        )
+
+        # Everything spent: the session stops, and is recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
+        assert resumed_with == [], "nudged while there was still no quota"
+
+        # Account 2's window resets: the switch lands.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(0),
+        }) is TickOutcome.SWITCHED
+        assert resumed_with == [], "nudged before the new account was verified"
+
+        # Next tick reads account 2's real headroom — now the nudge fires.
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})
+        assert [s.session_id for s in resumed_with[0]] == ["s-1"]
+        ev = next(e for e in h.events if isinstance(e, SessionResumedEvent))
+        assert ev.session_id == "s-1"
+        assert ev.cwd == "/w"
+
+    def test_a_session_is_nudged_only_once(self, temp_home, monkeypatch):
+        """The record is cleared on use. A later switch (a normal rotation
+        hours on) must not re-nudge a session that already resumed."""
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})   # record
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # switch
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # verify + nudge
+        assert len(calls) == 1
+        h.clock.advance(3600.0)
+        h.tick_with_usage({"2": _usage(100), "1": _usage(0)})     # ordinary switch
+        assert len(calls) == 1, "re-nudged a session that had already resumed"
+
+    def test_a_scan_failure_never_breaks_the_tick(self, temp_home, monkeypatch):
+        """The scan reads undocumented Claude Code state. A shape change there
+        must cost the resume feature, not the loop that keeps the user
+        working."""
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        def boom(*a, **k):
+            raise RuntimeError("session record shape changed")
+
+        monkeypatch.setattr(session_resume, "find_stopped_sessions", boom)
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
@@ -5071,9 +5327,18 @@ class TestHorizonAxisDoesNotFlap:
         outcomes = []
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
-                # unchanged since departure on BOTH axes
-                "1": _usage7(0.0, 0.0, self._days_out(h, 500)),
-                "2": _usage7(90.0, 0.0, self._days_out(h, 100)),
+                # Account 1 still holds the full 100.0 points it departed at —
+                # the headroom axis is unchanged, which is the lockout under
+                # test. The RESET axis is what makes it a candidate again:
+                # consume-first ranks on soonest weekly reset, so 1 resetting
+                # before the active account is this strategy's own reason to
+                # return. (Driving the return by burning the active account
+                # past the threshold no longer works, and shouldn't: under
+                # consume-first the threshold is not a trigger, so a
+                # threshold-crossing vehicle would be testing a path this
+                # strategy never takes.)
+                "1": _usage7(0.0, 0.0, self._days_out(h, 50)),
+                "2": _usage7(10.0, 0.0, self._days_out(h, 100)),
             }))
             h.clock.advance(301.0)
 

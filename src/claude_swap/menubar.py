@@ -34,6 +34,14 @@ from claude_swap.switcher import SENTINEL_NOTES
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
+# Strategy names as `autoswitch.strategy` stores them, mapped to menu labels.
+# Keys must match settings.SETTING_SPECS["autoswitch.strategy"].choices; the
+# labels say what the strategy DOES, since "best"/"consume-first" alone don't
+# convey that one waits for the limit and the other spends the soonest reset.
+STRATEGY_LABELS: dict[str, str] = {
+    "best": "Best (most quota left)",
+    "consume-first": "Consume first (soonest reset)",
+}
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
@@ -463,7 +471,7 @@ def run(switcher) -> int:
     )
 
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import load_settings, set_setting
+    from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -646,6 +654,26 @@ def run(switcher) -> int:
             except Exception:
                 return 0
 
+        def _resume_stopped(self) -> bool:
+            """Whether limit-stopped sessions are resumed (for the menu)."""
+            try:
+                return load_settings(self.switcher.backup_dir).resume_stopped_sessions
+            except Exception:
+                return AutoSwitchSettings.resume_stopped_sessions
+
+        def _strategy(self) -> str:
+            """Current auto-switch strategy from core settings (for the menu).
+
+            Falls back to the dataclass default rather than a sentinel: the
+            strategy names a menu item that must stay checkable, and an
+            unreadable settings file is not a reason to show every item
+            unchecked.
+            """
+            try:
+                return load_settings(self.switcher.backup_dir).strategy
+            except Exception:
+                return AutoSwitchSettings.strategy
+
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
@@ -768,7 +796,30 @@ def run(switcher) -> int:
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem("Auto-switch threshold")
+            resume_item = rumps.MenuItem(
+                "Resume limit-stopped sessions", callback=self.on_toggle_resume
+            )
+            resume_item.state = 1 if self._resume_stopped() else 0
+            menu.add(resume_item)
+
+            strategy = self._strategy()
+            strategy_menu = rumps.MenuItem("Auto-switch strategy")
+            for name, label in STRATEGY_LABELS.items():
+                ch = rumps.MenuItem(label, callback=self._make_strategy(name))
+                ch.state = 1 if strategy == name else 0
+                strategy_menu.add(ch)
+            menu.add(strategy_menu)
+
+            # Under consume-first the threshold is NOT the switch point — the
+            # engine burns the active account to its limit and moves on reset
+            # ordering instead, so the threshold only bars landing on a spent
+            # account. Naming it "Auto-switch threshold" there would promise a
+            # switch at 98% that deliberately never comes.
+            threshold_menu = rumps.MenuItem(
+                "Landing limit"
+                if strategy == "consume-first"
+                else "Auto-switch threshold"
+            )
             current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
@@ -945,6 +996,33 @@ def run(switcher) -> int:
                     rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
+                self.rebuild_menu()
+            return cb
+
+        def on_toggle_resume(self, _sender):
+            new = not self._resume_stopped()
+            try:
+                set_setting(
+                    self.switcher.backup_dir,
+                    "autoswitch.resumeStoppedSessions",
+                    "true" if new else "false",
+                )
+            except Exception as e:
+                rumps.alert(title="claude-swap", message=f"Couldn't set: {e}")
+                return
+            self._restart_engine()  # apply immediately if running
+            self.rebuild_menu()
+
+        def _make_strategy(self, name):
+            def cb(_sender):
+                try:
+                    set_setting(self.switcher.backup_dir, "autoswitch.strategy", name)
+                except Exception as e:
+                    rumps.alert(title="claude-swap", message=f"Couldn't set strategy: {e}")
+                    return
+                self._restart_engine()  # apply immediately if running
+                # Rebuild rather than just re-check: the threshold item's own
+                # label depends on the strategy (see _settings_menu).
                 self.rebuild_menu()
             return cb
 
