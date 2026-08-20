@@ -506,6 +506,28 @@ def block_real_keychain(request, monkeypatch):
     yield store
 
 
+@pytest.fixture(autouse=True)
+def block_real_oauth_profile_fetch(request, monkeypatch):
+    """Safety net: no test may make a live ``/api/oauth/profile`` request.
+
+    ``_reject_foreign_credential_capture`` (``add_account``'s identity guard)
+    calls ``oauth.fetch_oauth_profile`` unconditionally whenever a token is
+    extractable, and dozens of unrelated add/refresh/switch tests exercise
+    that path without mocking it — each one silently opens a real HTTPS
+    connection with a 5s timeout. Stub it to ``None`` (the documented
+    "unresolvable" answer, which the guard already treats as advisory and
+    never refuses on) so the whole suite stays hermetic and fast by default.
+    Tests that need to exercise the fetch itself patch it explicitly (this
+    module's own guard tests do); ``@pytest.mark.no_oauth_profile_fake`` opts
+    out for ``TestFetchOauthProfile``, which mocks ``urlopen`` beneath it.
+    """
+    if request.node.get_closest_marker("no_oauth_profile_fake"):
+        yield
+        return
+    monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

@@ -7,6 +7,8 @@ import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from claude_swap import oauth
 
 
@@ -1231,6 +1233,7 @@ class TestTokenAccountParsing:
         }
 
 
+@pytest.mark.no_oauth_profile_fake
 class TestFetchOauthProfile:
     """Access-token → account-identity resolution (/api/oauth/profile)."""
 
