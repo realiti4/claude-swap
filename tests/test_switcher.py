@@ -4752,6 +4752,72 @@ class TestPurgeLegacyCleanup:
         assert "Legacy backup directory" not in out
 
 
+class TestPurgeQuarantineWarning:
+    """``purge`` removes the whole backup directory, and the history-migration
+    quarantine tree lives inside it.
+
+    Those files are the losing half of a collided transcript -- the only copy
+    left of it anywhere, since the merge that produced them deliberately
+    refuses to delete. The confirm prompt lists credentials and profiles and
+    reassures the user that their Claude Code login is safe; it must not stay
+    silent about the one thing purge destroys that nothing can recreate.
+    """
+
+    def _quarantine(self, switcher: ClaudeAccountSwitcher, count: int) -> Path:
+        run_dir = (
+            switcher.backup_dir / "history-conflicts" / "2026-07-27T12-00-00"
+        )
+        losers = run_dir / "profile" / "-home-user-app"
+        losers.mkdir(parents=True)
+        for i in range(count):
+            (losers / f"{i}.jsonl").write_text("the other half\n")
+        return run_dir
+
+    def test_prompt_names_the_quarantined_transcripts(
+        self, temp_home: Path, capsys
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        run_dir = self._quarantine(switcher, 3)
+
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert "history-conflicts" in out
+        assert "3" in out
+        assert "only" in out.lower()  # "the only remaining copy"
+        assert run_dir.exists()  # declined, so nothing was removed
+
+    def test_prompt_omits_the_bullet_when_the_tree_is_empty(
+        self, temp_home: Path, capsys
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        # A migration that ran without collisions leaves the dir behind with
+        # nothing in it -- no warning to give.
+        (switcher.backup_dir / "history-conflicts" / "2026-07-27T12-00-00").mkdir(
+            parents=True
+        )
+
+        with patch("builtins.input", return_value="n"):
+            switcher.purge()
+
+        assert "history-conflicts" not in capsys.readouterr().out
+
+    def test_purge_still_removes_the_quarantine_tree(self, temp_home: Path):
+        """The warning is the fix, not a behavior change: purge is the user's
+        "remove everything" hammer and still removes everything."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        run_dir = self._quarantine(switcher, 1)
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not run_dir.exists()
+
+
 class TestAddAccountFromToken:
     """Tests for add_account_from_token (--add-token flow)."""
 
