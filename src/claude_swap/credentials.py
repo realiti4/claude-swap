@@ -39,6 +39,8 @@ from claude_swap.paths import (
     get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
+    get_default_credentials_path,
+    get_default_global_config_path,
     get_global_config_path,
 )
 
@@ -647,6 +649,78 @@ class CredentialStore:
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed, keychain_failed)
+
+    def _read_default_profile_credentials(self) -> ActiveCredentials:
+        """Read the default profile even when ``CLAUDE_CONFIG_DIR`` is inherited.
+
+        Recovery launches Claude with that override absent, so its ownership
+        checks must inspect the same default file paths.
+
+        The Keychain half names ``CLAUDE_CODE_KEYCHAIN_SERVICE`` explicitly
+        rather than going through :meth:`_read_active_oauth_keychain`, which
+        resolves a *per-profile* service from the environment. The unsuffixed
+        item is by definition the default profile's — claude only writes there
+        with no ``CLAUDE_CONFIG_DIR``/``CLAUDE_SECURESTORAGE_CONFIG_DIR`` in
+        play — so it is the one item that answers for the profile recovery is
+        about, whatever this process inherited.
+        """
+        keychain_failed = False
+        if self._use_keychain():
+            val, keychain_failed = self._read_one_oauth_keychain(
+                CLAUDE_CODE_KEYCHAIN_SERVICE
+            )
+            if val:
+                return ActiveCredentials(val, False)
+        elif self._host.platform == Platform.MACOS:
+            keychain_failed = True
+
+        # The default profile can be the live owner of an explicit recovery.
+        # A failed OAuth Keychain read may hide a newer credential than its
+        # plaintext seed, so unlike the ordinary display path it must not fall
+        # through to that seed (or to a managed key) on failure. A missing
+        # Keychain item is safe to fall through: there is no hidden generation.
+        if keychain_failed:
+            return ActiveCredentials(None, True)
+
+        cred_file = get_default_credentials_path()
+        if cred_file.exists():
+            try:
+                text = cred_file.read_text(encoding="utf-8")
+            except Exception as e:
+                self._host._logger.error(f"Failed to read credentials file: {e}")
+                return ActiveCredentials(None, False)
+            if text.strip():
+                return ActiveCredentials(text, False)
+
+        key = self._read_default_managed_key()
+        if key:
+            return ActiveCredentials(key, False)
+        return ActiveCredentials("", keychain_failed)
+
+    def _read_default_managed_key(self) -> str:
+        """Read the managed key from the default profile only."""
+        if self._use_keychain():
+            try:
+                val = self._kc_call(
+                    macos_keychain.get_password,
+                    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+                    macos_keychain.keychain_account_name(),
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                self._host._logger.warning(f"Managed-key Keychain read failed: {e}")
+                val = None
+            if val:
+                return val
+        path = get_default_global_config_path()
+        if not path.exists():
+            return ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            self._host._logger.warning(f"Failed to read global config: {e}")
+            return ""
+        key = data.get("primaryApiKey") if isinstance(data, dict) else None
+        return key if isinstance(key, str) and key else ""
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.

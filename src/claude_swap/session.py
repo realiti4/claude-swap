@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -57,6 +58,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
+from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
@@ -267,6 +269,33 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         )
     except macos_keychain.KEYCHAIN_ERRORS:
         pass  # best-effort; absent entry is already success (rc 44)
+
+
+def read_session_owner_credentials(session_dir: Path) -> ActiveCredentials:
+    """Read a session owner's credential without stale Keychain fallback.
+
+    A missing macOS Keychain item may legitimately mean Claude has not migrated
+    the plaintext seed yet, so the profile file remains valid. A Keychain read
+    failure is different: falling back then could select a consumed seed hidden
+    behind an unreadable newer Keychain generation. Recovery uses this strict
+    result to retry instead.
+    """
+    if not session_dir.is_dir():
+        return ActiveCredentials("", False)
+    if Platform.detect() == Platform.MACOS:
+        try:
+            creds = macos_keychain.get_password(
+                keychain_service_name(session_dir), _keychain_account_name()
+            )
+            if creds:
+                return ActiveCredentials(creds, False)
+        except KeychainError:
+            return ActiveCredentials(None, True)
+    try:
+        value = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ActiveCredentials("", False)
+    return ActiveCredentials(value, False)
 
 
 def read_session_credentials(session_dir: Path) -> str | None:

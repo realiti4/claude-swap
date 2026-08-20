@@ -82,6 +82,11 @@ def get_credentials_path() -> Path:
     return get_claude_config_home() / ".credentials.json"
 
 
+def get_default_credentials_path() -> Path:
+    """Return the default profile credential path, ignoring config overrides."""
+    return get_default_claude_config_home() / ".credentials.json"
+
+
 def get_legacy_backup_root() -> Path:
     """Return the legacy (pre-XDG) backup root: ``~/.claude-swap-backup``."""
     return Path.home() / LEGACY_BACKUP_DIRNAME
