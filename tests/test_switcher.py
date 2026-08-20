@@ -12134,3 +12134,77 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+def test_a_ctrl_c_during_the_roster_move_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The roster's temp file must not survive an interrupt.
+
+    It removed the temp only in the invalid-JSON branch, so an interrupt in
+    the chmod or the move stranded `sequence.<pid>.tmp` forever.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def interrupted(*_a, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod.shutil, "move", interrupted)
+    # `raises` is the guard: without it this passes when the interrupt never
+    # fires, and the assertion below would certify nothing.
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_failed_roster_write_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The write that CREATES the temp must be inside the guard too.
+
+    `write_text` opens, writes, closes; a failure after the open strands the
+    file. Guarding only the publish leaves the roster writer with the exact
+    defect the guard was added to close.
+    """
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    real_write = Path.write_text
+
+    def failing_write(self, *a, **kw):
+        real_write(self, *a, **kw)  # the file now exists on disk
+        raise OSError("injected: no space left on device")
+
+    monkeypatch.setattr(Path, "write_text", failing_write)
+    with pytest.raises(OSError):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_published_roster_is_not_unlinked_by_its_own_cleanup(temp_home: Path, monkeypatch):
+    """On success the move consumed the temp, so the name is not ours."""
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    unlinked = []
+    real_unlink = Path.unlink
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self, *a, **kw: (unlinked.append(str(self)), real_unlink(self, *a, **kw))[1],
+    )
+
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    # Instrument guard: the roster must actually have been published.
+    assert target.exists(), "premise: no sequence.json written"
+    assert not [u for u in unlinked if u.endswith(".tmp")], (
+        f"cleanup touched a name it no longer owns: {unlinked}"
+    )

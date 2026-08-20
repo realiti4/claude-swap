@@ -72,8 +72,12 @@ def ensure_notification_identity(
         if changed or not path.exists():
             # atomic: an interrupted write must not leave a half-written plist
             tmp = path.with_name(path.name + ".tmp")
-            tmp.write_bytes(plistlib.dumps(data))
-            os.replace(tmp, path)
+            try:
+                tmp.write_bytes(plistlib.dumps(data))
+                os.replace(tmp, path)
+            finally:
+                # The publish failure is swallowed below, so this must run.
+                tmp.unlink(missing_ok=True)
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
         logging.getLogger("claude-swap").warning(
             "Could not prepare menu-bar notification identity: %s", exc

@@ -556,3 +556,30 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+def test_a_failed_plist_replace_leaves_no_temp_file(tmp_path: Path, monkeypatch):
+    """A failed publish must not strand `Info.plist.tmp`.
+
+    The existing tests assert the temp is gone, but only on the SUCCESS path,
+    where `os.replace` consumed it anyway. The outer handler logs and returns
+    without unlinking, so the one path that can actually strand it was unseen.
+    """
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+
+    fired = {"replace": False}
+
+    def boom(*_a, **_kw):
+        fired["replace"] = True
+        raise OSError("injected: publish failed")
+
+    monkeypatch.setattr(menubar.os, "replace", boom)
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    # Instrument guard: `result is None` alone cannot tell a failed replace
+    # from a failed write, so a later edit could move the failure and this
+    # would still pass. The flag names the statement.
+    assert fired["replace"], "premise: the injected replace was never reached"
+    assert result is None, "premise: the failure path must have been taken"
+    assert not (executable.parent / "Info.plist.tmp").exists()

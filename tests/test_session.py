@@ -2740,3 +2740,58 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+def test_a_ctrl_c_during_the_manifest_replace_leaves_no_temp_file(
+    share_setup, monkeypatch
+):
+    """The manifest temp file must not survive an interrupt.
+
+    A failed manifest write is deliberately best-effort -- it is on the launch
+    path and must not fail a `cswap run`. But the handler named only OSError,
+    so a Ctrl-C anywhere in the write left a `.cswap-shared-*.tmp` in the
+    session dir that nothing ever collects.
+    """
+    _source, session_dir, mgr = share_setup
+    real = session_mod.replace_with_retry
+
+    def interrupt_only_the_manifest(src, dst, **kwargs):
+        if str(dst).endswith(SHARE_MANIFEST):
+            raise KeyboardInterrupt
+        return real(src, dst, **kwargs)
+
+    monkeypatch.setattr(session_mod, "replace_with_retry", interrupt_only_the_manifest)
+    # Reaching the raise at all proves the write got past mkstemp: the closure
+    # interrupts nowhere else.
+    with pytest.raises(KeyboardInterrupt):
+        mgr._sync_sharing(session_dir, share=True)
+
+    strays = list(session_dir.glob(".cswap-shared-*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_published_manifest_is_not_unlinked_by_its_own_cleanup(
+    share_setup, monkeypatch
+):
+    """On success the replace consumed the temp, so the name is not ours.
+
+    Without the reset the `finally` unlinks it anyway: harmless today because
+    the name is already gone, but it is a real window once a concurrent
+    `mkstemp` can draw the same one back.
+    """
+    _source, session_dir, mgr = share_setup
+    unlinked = []
+    real_unlink = session_mod.os.unlink
+    monkeypatch.setattr(
+        session_mod.os, "unlink",
+        lambda p, *a, **kw: (unlinked.append(str(p)), real_unlink(p, *a, **kw))[1],
+    )
+
+    mgr._sync_sharing(session_dir, share=True)
+
+    # Instrument guard: the manifest must actually have been published, or
+    # "nothing was unlinked" is true for the wrong reason.
+    assert (session_dir / SHARE_MANIFEST).exists(), "premise: no manifest written"
+    assert not [u for u in unlinked if u.endswith(".tmp")], (
+        f"cleanup touched a name it no longer owns: {unlinked}"
+    )

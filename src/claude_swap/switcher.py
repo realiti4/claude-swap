@@ -558,22 +558,31 @@ class ClaudeAccountSwitcher:
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
 
-        # Validate written content
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            temp_path.write_text(content, encoding="utf-8")
 
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            # Validate written content
+            try:
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                raise ConfigError("Generated invalid JSON")
+
+            # Permissions go on the temp file so the rename below is the final,
+            # atomic commit: nothing can fail after the file is published (a
+            # chmod on the final path could raise with the write already live,
+            # making callers roll back around committed metadata).
+            if sys.platform != "win32":
+                os.chmod(temp_path, 0o600)
+            shutil.move(str(temp_path), str(path))
+            temp_path = None  # consumed by the move; the name is no longer ours
+        finally:
+            # Every failure path, including the Ctrl-C no except can name.
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
