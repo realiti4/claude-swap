@@ -675,6 +675,95 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestDesktopCommand:
+    def test_dispatches_account_and_flags(self, capsys):
+        payload = {
+            "schemaVersion": 1,
+            "dryRun": True,
+            "account": {"number": 2, "email": "user@example.com"},
+            "sessions": {
+                "copied": 3,
+                "existing": 4,
+                "unavailable": 1,
+                "invalid": 0,
+            },
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.desktop.DesktopManager") as manager_cls, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(
+                 sys, "argv", ["claude-swap", "desktop", "2", "--dry-run", "--json"]
+             ):
+            manager_cls.return_value.run.return_value = payload
+            cli.main()
+
+        manager_cls.assert_called_once_with(switcher_cls.return_value)
+        manager_cls.return_value.run.assert_called_once_with(
+            "2", dry_run=True, json_output=True, confirm_login=False
+        )
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_prompts_for_one_time_desktop_login(self, capsys):
+        payload = {
+            "schemaVersion": 1,
+            "dryRun": False,
+            "account": {"number": 2, "email": "user@example.com"},
+            "profile": {"initialized": False, "isDefault": False},
+            "loginRequired": True,
+            "alreadyActive": False,
+            "sessions": {
+                "copied": 0,
+                "existing": 1,
+                "unavailable": 0,
+                "invalid": 0,
+            },
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.desktop.DesktopManager") as manager_cls, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "desktop", "2"]):
+            manager_cls.return_value.run.return_value = payload
+            cli.main()
+
+        output = capsys.readouterr().out
+        assert "Sign in once" in output
+        assert "--confirm-login" in output
+
+    def test_help_mentions_desktop(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "desktop <num|email>" in result.stdout
+
+    def test_rejects_non_default_claude_profile(self, capsys):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/tmp/isolated"}), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "desktop", "2"]), \
+             pytest.raises(SystemExit) as excinfo:
+            cli.main()
+
+        assert excinfo.value.code == 1
+        switcher_cls.assert_not_called()
+        assert "default Claude profile" in capsys.readouterr().err
+
+    def test_error_exits_cleanly(self, capsys):
+        from claude_swap.exceptions import DesktopError
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.desktop.DesktopManager") as manager_cls, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "desktop", "2"]), \
+             pytest.raises(SystemExit) as excinfo:
+            manager_cls.return_value.run.side_effect = DesktopError("boom")
+            cli.main()
+
+        assert excinfo.value.code == 1
+        assert "boom" in capsys.readouterr().err
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 

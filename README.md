@@ -138,6 +138,40 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 
 </details>
 
+### Switch Claude Desktop accounts (macOS)
+
+Switch the account used by Claude Desktop while keeping every resumable local
+Claude Code session visible in the Desktop sidebar:
+
+```bash
+cswap desktop 2
+cswap desktop user@example.com
+cswap desktop 2 --dry-run
+```
+
+Claude Desktop's web login is separate from Claude Code credentials. The command
+therefore keeps one isolated Desktop profile per account and shares only the
+local Claude Code session index between them. The first switch to an account
+opens Claude's normal login flow once. Later switches reuse that authenticated
+profile. After visually verifying the email on that first login, record it once:
+
+```bash
+cswap desktop 2 --confirm-login
+```
+
+The command closes Claude Desktop, switches credentials through the normal
+cswap path, copies only missing resumable index entries, and launches the target
+profile. Existing entries and transcripts under `~/.claude/projects/` are never
+changed. It refuses to close Desktop while a local task is active. The explicit
+first-login confirmation avoids depending on Claude's private login-storage
+format, which changes between Desktop releases.
+The Mac must be unlocked before a relaunch so encrypted login storage remains
+available. Claude Chat and remote Cowork history remain account-specific.
+
+Run the command outside any manually selected Claude profile;
+`CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, and
+`CLAUDE_USER_DATA_DIR` are rejected because cswap owns profile selection.
+
 <details>
 <summary>Map accounts to directories — auto-pick per repo</summary>
 
@@ -177,6 +211,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap desktop 2                 # Switch Claude Desktop accounts (macOS)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
