@@ -60,7 +60,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -652,6 +657,47 @@ def _thresholds_for(settings: AutoSwitchSettings) -> oauth.WindowThresholds:
         default=settings.threshold,
         five_hour=settings.threshold_5h,
         weekly=settings.threshold_7d,
+    )
+
+
+def policy_floor(settings: AutoSwitchSettings) -> float:
+    """The lowest ceiling this policy gates on, and what the bar tick shows."""
+    return _thresholds_for(settings).floor
+
+
+def shifted_to_floor(
+    settings: AutoSwitchSettings, target_floor: float
+) -> AutoSwitchSettings:
+    """``settings`` with its policy FLOOR moved to ``target_floor``.
+
+    The session control adjusts one number, but a split policy has two
+    ceilings, so "set the threshold to 72" has no single meaning. It moves
+    the floor instead, which is exactly what the bar tick renders, and
+    carries both ceilings by the same delta so the gap the user configured
+    survives the adjustment.
+
+    Under a UNIFORM policy the floor is the threshold, so this is the
+    original single-value update, unchanged. That is what keeps every
+    existing session-override behaviour identical.
+
+    Both ceilings clamp to the configured bounds, so a shift that would
+    push one out of range moves it to the bound instead of silently
+    inventing an out-of-policy value; the achieved floor is whatever the
+    clamped pair yields and may differ from ``target_floor``.
+    """
+    current = _thresholds_for(settings)
+    if current.uniform:
+        return replace(settings, threshold=target_floor)
+    spec = SETTING_SPECS["autoswitch.threshold5h"]
+
+    def _clamped(value: float) -> float:
+        return min(spec.hi, max(spec.lo, value))
+
+    delta = target_floor - current.floor
+    return replace(
+        settings,
+        threshold_5h=_clamped(current.for_label("5h") + delta),
+        threshold_7d=_clamped(current.for_label("7d") + delta),
     )
 
 
@@ -2528,15 +2574,24 @@ class AutoSwitchEngine:
         """Cut the current inter-tick sleep short and tick now."""
         self._wake.set()
 
-    def apply_threshold(self, threshold: float) -> None:
+    def apply_threshold(self, threshold: float) -> float:
         """Session override from the TUI: retarget the trigger and poll
         cadence mid-run. Threshold only — the model axes (and their derived
         state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
-        self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(
-            _thresholds_for(self.settings).floor, self._models
-        )
+        and each tick snapshots ``self.settings`` once, so no locking.
+
+        ``threshold`` is the target policy FLOOR, and the achieved floor is
+        returned. Under a uniform policy those are the same number and this
+        behaves exactly as it always did. Under a SPLIT policy they are not:
+        writing ``settings.threshold`` alone would be inert, because
+        ``for_label`` reads the per-window overrides and ignores the
+        fallback, so the control would report a change that moved no policy
+        at all. See ``shifted_to_floor``.
+        """
+        self.settings = shifted_to_floor(self.settings, threshold)
+        achieved = _thresholds_for(self.settings).floor
+        self.switcher.set_poll_policy_inputs(achieved, self._models)
+        return achieved
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
