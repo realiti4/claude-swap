@@ -16,6 +16,13 @@ import pytest
 from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
 
+# Codex fixtures live in their own module to keep this file navigable; importing
+# the names here is what makes them visible to every test.
+from tests.conftest_codex import (  # noqa: F401,E402
+    codex_home,
+    live_auth,
+)
+
 
 class RealStoreWriteBlocked(Exception):
     """A test process tried to write the REAL account store.

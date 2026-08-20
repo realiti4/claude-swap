@@ -422,13 +422,23 @@ def _adapt_snapshot(snap) -> dict:
     active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
+        # Non-Claude rows carry their composite row key in the `num` slot and a
+        # provider tag in the label. Slot numbers repeat across providers, so a
+        # bare number here would send a menu click to the wrong CLI's account —
+        # and the tuple shape stays 8-wide, which every consumer unpacks exactly.
+        provider = getattr(acc, "provider", "claude")
+        is_claude = provider == "claude"
+        num = acc.number if is_claude else acc.key
+        label = acc.email if is_claude else f"{acc.email} ({provider})"
         accounts.append(
             (
-                acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
+                num, label, acc.is_active, display, acc.usage.last_good,
                 acc.alias, acc.disabled, acc.usage.fetched_at,
             )
         )
-        if acc.is_active:
+        if acc.is_active and is_claude:
+            # The title bar keeps meaning the Claude account: it is what the
+            # user's `claude` command will run as.
             active_email, active_usage, active_alias = acc.email, display, acc.alias
     return {
         "accounts": accounts,
@@ -436,6 +446,23 @@ def _adapt_snapshot(snap) -> dict:
         "active_usage": active_usage,
         "active_alias": active_alias,
     }
+
+
+
+def _resolve_menu_row(app, num: str):
+    """``(provider, slot number)`` for a menu row's ``num`` field.
+
+    A bare number is the Claude switcher, so every pre-multi-provider path is
+    unchanged. Anything else is a composite row key from ``_adapt_snapshot``.
+    """
+    key = str(num)
+    if ":" not in key:
+        return app.switcher, key
+    provider_id, number = key.split(":", 1)
+    for provider in getattr(app, "providers", []):
+        if getattr(provider, "provider_id", "") == provider_id:
+            return provider, number
+    return app.switcher, number
 
 
 def run(switcher) -> int:
@@ -479,7 +506,11 @@ def run(switcher) -> int:
             # alternate, so an open menu costs O(1) requests per window instead
             # of a full pass per tick — which kept every token at its per-account
             # rate-limit edge. Reused across refreshes to hold its pacing state.
-            self._snapshot_source = SnapshotSource(switcher)
+            from claude_swap.providers.aggregate import MultiSnapshotSource
+            from claude_swap.providers.registry import available_providers
+
+            self.providers = available_providers(switcher)
+            self._snapshot_source = MultiSnapshotSource(self.providers)
             self.snapshot = dict(EMPTY_SNAPSHOT)
             self._dirty = False
             self._snapshot_at = 0.0
@@ -517,7 +548,9 @@ def run(switcher) -> int:
             # runs it already paces all fetching, so the display reads store-only.
             try:
                 try:
-                    raw = self._snapshot_source.take(
+                    # MultiSnapshotSource returns (snapshot, owners); the menu
+                    # resolves providers from `num` keys, so owners is unused here.
+                    raw, _owners = self._snapshot_source.take(
                         full=full, store_only=self._engine is not None
                     )
                 except Exception:
@@ -801,7 +834,8 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
+                _p, _n = _resolve_menu_row(self, num)
+                if self._guard(lambda: _p.switch_to(_n)):
                     self._notify_switched()
                     self.refresh_async()
             return cb
@@ -821,7 +855,8 @@ def run(switcher) -> int:
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
-                    if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
+                    _p, _n = _resolve_menu_row(self, num)
+                    if self._guard(lambda: _p.remove_account(_n, assume_yes=True)):
                         self.refresh_async()
             return cb
 
@@ -829,8 +864,9 @@ def run(switcher) -> int:
             # `disabled` is this row's current state; selecting it flips it.
             target = not disabled
             def cb(_sender):
+                provider, number = _resolve_menu_row(self, num)
                 if self._guard(
-                    lambda: self.switcher.set_account_disabled(str(num), target)
+                    lambda: provider.set_account_disabled(number, target)
                 ):
                     self.refresh_async()
             return cb

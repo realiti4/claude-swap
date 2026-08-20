@@ -303,6 +303,10 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
+    #: Identifies this switcher to provider-aware consumers. See
+    #: ``providers.base.ProviderSwitcher``.
+    provider_id = "claude"
+
     def __init__(self, debug: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
