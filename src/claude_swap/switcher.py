@@ -4314,6 +4314,44 @@ class ClaudeAccountSwitcher:
             retry_after_s=outcome.retry_after_s,
         )
 
+    def _backup_is_independent(self, account_num: str, backup: str) -> bool:
+        """Whether this slot's backup was acquired outside the live store.
+
+        The resync below exists for ONE shape: a backup that went stale because
+        Claude Code rotated the live credential the backup had been copied from
+        (rotation-before-collection). That makes the backup a *consumed
+        predecessor* of what is live now.
+
+        A credential that was never derived from the live store cannot be a
+        predecessor of anything in it — it belongs to a different lineage
+        entirely. Two independent grants for the same account are the case the
+        ownership probe cannot separate: it answers *whose account is this*, and
+        both answer "yours". Rotation leaves no observable link between
+        generations either, so nothing recoverable at this point distinguishes
+        them. Only a record written at acquisition time can, which is why
+        ``credentialOrigin`` exists.
+
+        Keyed by fingerprint so it self-invalidates: if the slot is later
+        re-provisioned by any derived path, the recorded fingerprint stops
+        describing the backup and this returns False — failing back to the
+        resync rather than protecting bytes the record never described.
+
+        Absent record → False, so every existing install behaves exactly as
+        before and no migration is required.
+        """
+        try:
+            data = self._get_sequence_data() or {}
+            record = (data.get("accounts") or {}).get(str(account_num)) or {}
+            origin = record.get("credentialOrigin") or {}
+            if origin.get("kind") != "independent":
+                return False
+            return bool(
+                origin.get("fingerprint")
+                and origin["fingerprint"] == oauth.credential_fingerprint(backup)
+            )
+        except Exception:
+            return False  # unreadable metadata must not block the heal
+
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str
     ) -> None:
@@ -4358,6 +4396,8 @@ class ClaudeAccountSwitcher:
                 == oauth.credential_fingerprint(backup)
             ):
                 return  # same lineage — nothing drifted
+            if backup and self._backup_is_independent(account_num, backup):
+                return  # never derived from live — nobody's predecessor
             fp = oauth.credential_fingerprint(creds) or ""
             verdict = self._probe_verdicts.get(
                 self._lineage_key(account_num, email, fp)
