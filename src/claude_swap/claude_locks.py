@@ -103,6 +103,7 @@ def proper_lockfile(
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
+    deadline = start + timeout
     while True:
         try:
             os.mkdir(lock_dir)
@@ -124,9 +125,15 @@ def proper_lockfile(
             try:
                 os.rmdir(lock_dir)
             except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+                # Can't remove it either; don't spin hot, and don't sleep
+                # past the deadline.
+                time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
-        time.sleep(0.25 + random.random() * 0.25)
+        # Clamped to the remaining budget, so `timeout` bounds the whole
+        # call: the deadline check above cannot fire while a full-length
+        # sleep is still running past it. With budget to spare the clamp is a
+        # no-op and the jitter still spreads waiters apart.
+        time.sleep(max(0.0, min(0.25 + random.random() * 0.25, deadline - time.monotonic())))
 
     stop_touching = threading.Event()
 
@@ -134,8 +141,16 @@ def proper_lockfile(
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
+            except FileNotFoundError:
+                return  # gone; nothing left to keep alive
             except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
+                # Transient, so stay armed. Returning on ANY OSError disarmed
+                # the heartbeat on a lock still held, and CONFIG_STALENESS_S
+                # later a waiter could steal it. The errno already in hand is
+                # what separates the two; re-checking the path is both a
+                # second syscall that can fail the same way and, from 3.14,
+                # an answer that reads absence out of a permission error.
+                pass
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()

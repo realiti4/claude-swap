@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import locking
 from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 
@@ -54,6 +55,82 @@ class TestFileLock:
         assert lock2.acquire(timeout=0.5) is False
 
         lock1.release()
+
+    def test_a_small_timeout_is_not_overshot_by_the_retry_sleep(
+            self, tmp_path: Path, monkeypatch):
+        """`timeout` must bound acquire(), the retry sleep included.
+
+        The deadline is checked before the sleep, so a flat sleep runs to
+        completion past a timeout shorter than itself and the check cannot
+        fire until it returns.
+
+        Asserted on the sleep ARGUMENT rather than on elapsed time alone: a
+        wall-clock ceiling only says "overshoot smaller than N", so shrinking
+        the flat sleep below N keeps it green while `timeout` is still
+        unbounded for every value under the new constant. It also makes the
+        test independent of clock granularity, which differs by platform.
+        """
+        lock_path = tmp_path / "overshoot.lock"
+        holder = FileLock(lock_path)
+        assert holder.acquire(timeout=1.0), "the fixture failed to take the lock"
+        waiter = FileLock(lock_path)
+        try:
+            slept = []
+            real_sleep = time.sleep
+
+            def recording(seconds):
+                slept.append((time.monotonic(), seconds))
+                return real_sleep(seconds)
+
+            monkeypatch.setattr(locking.time, "sleep", recording)
+            # SMALL ON PURPOSE. The invariant only discriminates against a
+            # flat sleep LARGER than the budget: with a generous budget a
+            # 0.1s sleep fits inside what is left and the assert passes on
+            # the very bug this exists for (measured: budget=0.5 lets flat
+            # 0.1 through).
+            budget = 0.01
+            begin = time.monotonic()
+            got = waiter.acquire(timeout=budget)
+            elapsed = time.monotonic() - begin
+
+            assert not got, "the lock was held; acquire must not succeed"
+            assert slept, "no retry sleep happened — the instrument, not the code"
+            # `begin` is anchored here, but `acquire` starts its own deadline
+            # AFTER `mkdir(parents=...)` + `open()`, so a correct clamp can
+            # sleep slightly past THIS deadline. Measured worst case for that
+            # skew: 0.9ms, which left only 12% headroom under a 1ms tolerance
+            # -- real flakiness on a slow first `open()`. Widened to `budget`,
+            # which is the most a correct clamp can produce: its own cap is
+            # the remaining internal budget, never more than `timeout`.
+            #
+            # NOT wider. At 0.05 a flat 0.02 and a flat 0.04 both PASS
+            # (measured), so a regression reintroducing a small flat sleep
+            # would ship green. A ceiling you can tune a flat sleep under is
+            # not an invariant, which is the whole point of the docstring
+            # above.
+            deadline = begin + budget
+            for at, seconds in slept:
+                left = deadline - at
+                assert seconds <= max(0.0, left) + budget, (
+                    f"slept {seconds:.3f}s with {left:.3f}s of budget left — "
+                    "the retry sleep ignored the deadline"
+                )
+                # Anchor-free, so no skew to absorb: the clamp is capped by
+                # the remaining budget, which never exceeds the whole timeout.
+                assert seconds <= budget + 1e-6, (
+                    f"a single retry sleep of {seconds:.3f}s exceeds the "
+                    f"whole {budget}s timeout"
+                )
+            # Kept alongside the invariant: this one catches an overshoot
+            # end to end, the invariant catches a flat sleep tuned under the
+            # wall-clock ceiling. Neither alone covers both.
+            assert elapsed < 0.05, (
+                f"a {budget}s timeout took {elapsed:.3f}s — the retry sleep "
+                "ignored the remaining budget"
+            )
+        finally:
+            waiter.release()
+            holder.release()
 
     def test_lock_acquired_after_release(self, tmp_path: Path):
         """Test that lock can be acquired after previous holder releases."""
