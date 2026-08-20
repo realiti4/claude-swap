@@ -610,6 +610,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    authoritative_resets: dict | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -619,8 +620,22 @@ def try_fetch_usage_for_account(
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
+
+    ``authoritative_resets`` (opt-in) maps ``{email: {window: iso}}`` of
+    worker-observed authoritative resets; when given, this account's windows are
+    clamped earlier by :func:`authoritative_reset.clamp_account_resets` (never
+    later). Default None = exact pre-existing behavior.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
+
+    def _built(data: dict) -> dict | None:
+        """Normalize the raw response, then clamp with any authoritative override."""
+        usage = build_usage_result(data)
+        if authoritative_resets:
+            from claude_swap.authoritative_reset import clamp_account_resets
+            usage = clamp_account_resets(usage, authoritative_resets.get(email))
+        return usage
+
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
@@ -671,7 +686,7 @@ def try_fetch_usage_for_account(
 
     try:
         data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return UsageOutcome(_built(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -720,7 +735,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return UsageOutcome(_built(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
