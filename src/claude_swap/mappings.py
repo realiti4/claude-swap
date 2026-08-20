@@ -134,7 +134,8 @@ class MappingStore:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             replace_with_retry(tmp, self.path)
-        except OSError:
+        except BaseException:
+            # Not just OSError: a Ctrl-C anywhere here strands the temp.
             try:
                 os.unlink(tmp)
             except OSError:

@@ -1429,11 +1429,16 @@ class SessionManager:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             replace_with_retry(tmp, manifest_path)
+            tmp = ""  # consumed by the replace; the name is no longer ours
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best-effort: a failed manifest must not fail a launch
+        finally:
+            # Every path, including the Ctrl-C the except cannot name.
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:
