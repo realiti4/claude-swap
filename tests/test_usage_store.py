@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from claude_swap import oauth, usage_store
+from claude_swap import oauth, poll_policy, usage_store
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -1386,6 +1386,67 @@ class TestLast429Marker:
         assert store.entries(IDENT)["1"].last_429_at is None
 
 
+class TestProbeRescued429ArmsTheCadenceFloor:
+    """A 429 the header probe rescued (issue #220's fallback) reports
+    ``error=None``, so it takes ``record``'s SUCCESS branch and clears the
+    failure fields. The 429 itself still happened, and the usage endpoint's
+    hour-scale budget is just as spent, so the rescued row must arm the same
+    cadence floor an unrescued 429 does. Without that the rescue hands the
+    busiest accounts the urgent 60s cadence -- around 60 usage requests an
+    hour against a measured budget near 28-30 -- and keeps the endpoint
+    permanently saturated on exactly the accounts whose quota is scarcest.
+    """
+
+    RESCUED = FetchRecord(usage=USAGE, rescued_from="http-429")
+
+    def test_the_rescued_measurement_is_recorded_as_a_success(
+        self, store, clock
+    ):
+        """The data is live and fresh, so no failure state may arm: this is a
+        cadence floor, not a backoff."""
+        store.record({"1": self.RESCUED}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.fetched_at == pytest.approx(clock.now)
+        assert entry.last_error is None
+        assert entry.backoff_until is None
+        assert entry.consecutive_failures == 0
+
+    def test_the_rescued_429_still_stamps_the_marker(self, store, clock):
+        store.record({"1": self.RESCUED}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_429_at == pytest.approx(clock.now)
+        assert entry.recent_429(clock.now) is True
+
+    def test_an_unrescued_success_arms_nothing(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_429_at is None
+        assert entry.recent_429(clock.now) is False
+
+    def test_the_floor_reaches_the_planner_instead_of_urgent_mode(
+        self, store, clock
+    ):
+        """The interaction, end to end through the store: an active account
+        burning inside the escalation band is precisely the shape that earns
+        ``URGENT_INTERVAL_S``, and the rescued 429 must veto it."""
+        store.record({"1": self.RESCUED}, IDENT)
+        before = store.entries(IDENT)["1"]
+        _next_poll, interval = poll_policy.plan_after_fetch(
+            prev_interval_s=before.poll_interval_s,
+            prev_usage={"five_hour": {"pct": 80.0}},
+            new_usage={"five_hour": {"pct": 90.0}},
+            is_active=True,
+            threshold=90.0,
+            models=(),
+            recent_429=before.recent_429(clock.now),
+            now=clock.now,
+            rng=lambda: 0.5,
+        )
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
+        assert interval > poll_policy.URGENT_INTERVAL_S
+
+
 class TestRecent429AcrossHonoredBlock:
     """The AIMD floor/growth keys on "did this token 429 recently?". A 429 with
     an hour-scale Retry-After is honored as one backoff spanning the whole
@@ -1583,6 +1644,28 @@ class TestClaimTrustBridge:
         assert store.entries(IDENT)["1"].decision_value() is None
 
 
+class TestPartialSurvivesTheStore:
+    """The ``partial`` marker is what keeps an incomplete measurement
+    unrankable, and every surface reads its usage back out of the store rather
+    than from the fetch. A marker that did not round-trip would restore the
+    confident headroom on the next read."""
+
+    PARTIAL = {"five_hour": {"pct": 0.0}, "partial": True, "source": "headers"}
+
+    def test_the_marker_and_the_source_round_trip(self, store, clock):
+        store.record(
+            {"1": FetchRecord(usage=self.PARTIAL, rescued_from="http-429")}, IDENT
+        )
+        last_good = store.entries(IDENT)["1"].last_good
+        assert last_good["partial"] is True
+        assert last_good["source"] == "headers"
+
+    def test_the_row_stays_unrankable_after_a_reload(self, store, clock):
+        store.record(
+            {"1": FetchRecord(usage=self.PARTIAL, rescued_from="http-429")}, IDENT
+        )
+        entry = store.entries(IDENT)["1"]
+        assert oauth.account_headroom(entry.decision_value()) is None
 class TestFingerprintBoundStrikes:
     """M3: a dead-token strike binds to the refresh-token fingerprint of the
     POSTed bytes. token_dead() holds only while the stored credential still

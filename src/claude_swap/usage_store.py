@@ -248,12 +248,20 @@ class FetchRecord:
     - sentinel: ``sentinel`` set — a derived state ("token expired" with an
       owner present, ...), recorded as a no-op: sentinels are re-derived every
       pass and never persisted.
+
+    ``rescued_from`` rides along on the success shape (see
+    ``oauth.UsageOutcome``) and carries the error kind a fallback source
+    recovered the measurement from. A success is still a success: the
+    measurement lands and the failure fields clear. But ``"http-429"`` here
+    also stamps ``last429At``, because that 429 really happened and the poll
+    cadence must still back off for it.
     """
 
     usage: dict | None = None
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    rescued_from: str | None = None
     # Fingerprint of the credential whose refresh token was POSTed when a
     # permanent auth error came back. Strikes bind to it: token_dead() holds
     # only while the stored credential still fingerprints to the struck
@@ -1055,6 +1063,17 @@ class UsageStore:
         only the claim and are otherwise never persisted. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
+
+        ``last429At`` is the one field written from OUTSIDE that split, and
+        deliberately so: it is not failure state but a rate-limit
+        observation, kept across later successes so the poll planner floors
+        the cadence while a 429 is recent (see ``UsageEntry.last_429_at``).
+        A ``FetchRecord`` whose measurement a fallback source rescued from a
+        429 (``rescued_from``) therefore stamps it on the success path too.
+        Scoping the stamp to the failure branch was measured to hand the
+        rescued account a 60-second cadence (around 60 usage requests per
+        hour against a budget of roughly 28 to 30), where the unrescued 429
+        had parked it for the best part of an hour.
         """
         if not outcomes:
             return set()
@@ -1069,6 +1088,8 @@ class UsageStore:
             if rec.sentinel is not None:
                 return
             row["lastAttemptAt"] = now
+            if rec.error == "http-429" or rec.rescued_from == "http-429":
+                row["last429At"] = now
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
@@ -1085,10 +1106,6 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 row["lastError"] = rec.error
-                if rec.error == "http-429":
-                    # Kept across later successes: the poll planner floors the
-                    # cadence while a 429 is recent (see UsageEntry.last_429_at).
-                    row["last429At"] = now
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,

@@ -1046,6 +1046,261 @@ class TestTryFetchUsageOutcome:
         assert outcome.error == "no-access-token"
 
 
+class TestUsageEndpointFallbackToHeaderProbe:
+    """A busy account's ``GET /api/oauth/usage`` 429s, but ``POST
+    /v1/messages`` rate-limits far more loosely (issue #220) and carries the
+    same utilization on its response headers. Only a 429 justifies spending
+    the probe's ~10 tokens of the account's own quota: an auth failure can't
+    be healed by spending quota, so it must never trigger this fallback."""
+
+    @staticmethod
+    def _make_credentials() -> str:
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": future_ms,
+            }
+        })
+
+    @staticmethod
+    def _http_error(code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", code, "error",
+            hdrs=None, fp=None,
+        )
+
+    def test_429_falls_back_to_header_probe(self):
+        probe_mock = MagicMock(return_value={"five_hour": {"pct": 11.0}})
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 11.0
+        assert outcome.usage["source"] == "headers"
+        probe_mock.assert_called_once_with("old-access")
+
+    def test_a_rescued_429_still_reports_the_429_it_rescued(self):
+        """``error=None`` says the data is good; ``rescued_from`` says the
+        endpoint budget is nonetheless spent. The usage store needs the
+        second fact to keep the post-429 cadence floor armed -- dropping it
+        would let the rescue unlock 60s polling on the very accounts already
+        429ing."""
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage",
+                  return_value={"five_hour": {"pct": 11.0}}),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.rescued_from == "http-429"
+
+    def test_an_endpoint_success_rescues_nothing(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.rescued_from is None
+
+    def test_non_429_errors_do_not_probe(self):
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(500)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-500"
+        assert outcome.usage is None
+
+    def test_401_does_not_probe(self):
+        """An active account's 401 has no refresh path either; the same
+        auth-failure guard must still hold the probe back."""
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(401)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=True,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-401"
+
+    def test_403_does_not_probe(self):
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(403)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-403"
+
+    def test_the_fallback_can_be_switched_off(self):
+        """``usage.headerFallback`` disabled: the 429 stands and no quota is
+        spent, because the probe is a real completion on the account's own
+        subscription."""
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+                header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-429"
+        assert outcome.usage is None
+
+    def test_the_fallback_is_on_when_no_caller_says_otherwise(self):
+        probe_mock = MagicMock(return_value={"five_hour": {"pct": 11.0}})
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        probe_mock.assert_called_once()
+        assert outcome.rescued_from == "http-429"
+
+    def test_the_switched_off_fallback_also_covers_the_refresh_retry(self):
+        def fake_request_usage_data(token):
+            if token == "old-access":
+                raise self._http_error(401)
+            raise self._http_error(429)
+
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen",
+                  return_value=self._token_response()),
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=fake_request_usage_data),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+                header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-429"
+
+    def test_probe_failure_leaves_the_original_error(self):
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(429)),
+            patch("claude_swap.oauth.probe_usage", return_value=None),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error == "http-429"
+        assert outcome.usage is None
+
+    def test_endpoint_success_carries_no_source_marker(self):
+        """Only the header-probe fallback is marked; a real endpoint fetch
+        must render exactly as it always has."""
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert "source" not in outcome.usage
+
+    @staticmethod
+    def _token_response() -> MagicMock:
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_429_after_401_refresh_retry_falls_back_to_probe(self):
+        """The other 429 site: a 401 on the first request refreshes the
+        token, and the retried request with the fresh token 429s. A real
+        browser-login account (refresh token present) hits this path on
+        every 401, so it needs the identical fallback the direct-429 site
+        gets."""
+        def fake_request_usage_data(token):
+            if token == "old-access":
+                raise self._http_error(401)
+            raise self._http_error(429)
+
+        probe_mock = MagicMock(return_value={"seven_day": {"pct": 42.0}})
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen",
+                  return_value=self._token_response()),
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=fake_request_usage_data),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.error is None
+        assert outcome.usage["seven_day"]["pct"] == 42.0
+        assert outcome.usage["source"] == "headers"
+        probe_mock.assert_called_once_with("new-access")
+
+    def test_non_429_error_on_retry_does_not_probe(self):
+        def fake_request_usage_data(token):
+            if token == "old-access":
+                raise self._http_error(401)
+            raise self._http_error(500)
+
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.urllib.request.urlopen",
+                  return_value=self._token_response()),
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=fake_request_usage_data),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        probe_mock.assert_not_called()
+        assert outcome.error == "http-500"
+
+
 class TestInvalidGrantPropagation:
     """A dead refresh-token lineage surfaces as error='invalid_grant', distinct
     from a transient 'refresh-failed', so the store can quarantine the account."""
@@ -1384,6 +1639,79 @@ class TestFetchOauthProfile:
         )
 
 
+class TestAHeaderRescueCannotAnswerForPerModelWindows:
+    """``anthropic-ratelimit-unified-*`` carries the 5h and 7d windows and
+    nothing per-model, so a rescued measurement (issue #220) has no view of the
+    ``scoped`` weekly limits the endpoint reports in its ``limits`` array. With
+    ``autoswitch.model`` set, that axis is the one the user said binds them, so
+    a confident headroom computed without it would rank an account whose model
+    quota is spent."""
+
+    RESCUED = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 20.0},
+        "source": "headers",
+    }
+    ENDPOINT_WITH_SCOPED = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 20.0},
+        "scoped": [{"name": "Fable", "pct": 100.0}],
+    }
+
+    def test_a_rescue_is_unrankable_once_a_model_is_configured(self):
+        assert oauth.account_headroom(self.RESCUED, ("Fable",)) is None
+
+    def test_the_same_rescue_still_ranks_without_a_model(self):
+        assert oauth.account_headroom(self.RESCUED) == 80.0
+
+    def test_an_endpoint_measurement_is_unaffected(self):
+        assert oauth.account_headroom(self.ENDPOINT_WITH_SCOPED, ("Fable",)) == 0.0
+        assert oauth.account_headroom(
+            {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}, ("Fable",)
+        ) == 80.0
+
+    def test_a_rescue_that_did_report_the_model_ranks_on_it(self):
+        """If a header source ever learns to report per-model windows, the
+        guard must stop firing on its own."""
+        rescued_with_scoped = dict(
+            self.RESCUED, scoped=[{"name": "Fable", "pct": 100.0}]
+        )
+        assert oauth.account_headroom(rescued_with_scoped, ("Fable",)) == 0.0
+
+    def test_the_all_sentinel_counts_as_a_configured_model(self):
+        assert oauth.account_headroom(self.RESCUED, ("all",)) is None
+
+
+class TestTheThinWrapperForwardsTheFallbackSetting:
+    """``fetch_usage_for_account`` is the dict-returning wrapper over
+    ``try_fetch_usage_for_account``. It must not quietly re-enable the probe:
+    the whole point of the setting is that no code path spends subscription
+    quota once a user has switched it off."""
+
+    def test_the_wrapper_carries_the_flag(self):
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": future_ms,
+        }})
+        error = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 429, "error",
+            hdrs=None, fp=None,
+        )
+        probe_mock = MagicMock()
+        with (
+            patch("claude_swap.oauth.request_usage_data", side_effect=error),
+            patch("claude_swap.oauth.probe_usage", probe_mock),
+        ):
+            usage = oauth.fetch_usage_for_account(
+                "1", "a@b.c", creds, False, header_fallback=False,
+            )
+        probe_mock.assert_not_called()
+        assert usage is None
 class TestInvalidGrantTaxonomy:
     """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
     parse — top-level error == "invalid_grant" in the JSON body. Substring

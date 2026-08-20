@@ -314,6 +314,22 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    sources: dict[str, str] = field(default_factory=dict)
+    """Account number → the fallback source that served this measurement.
+
+    Only accounts the usage endpoint did not answer for appear, and today the
+    only value is ``"headers"`` (the unified-header probe, issue #220).
+    Additive like ``fetch_errors``/``windows``, and the one place a watcher can
+    see metadata polling spending the account's own inference quota.
+    """
+    partial: tuple[str, ...] = ()
+    """Account numbers whose measurement could not read every gating window.
+
+    Their ``windowsPct`` entries are real numbers with no headroom behind them
+    (``headroomPct`` is null), so a consumer that ranked on the windows alone
+    would make exactly the mistake the engine no longer makes. Additive, and
+    marked in ``human()`` too, where a bare pct otherwise reads as healthy.
+    """
 
     def _fields(self) -> dict:
         fields = {
@@ -325,12 +341,23 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.sources:
+            fields["usageSources"] = self.sources
+        if self.partial:
+            fields["partialUsage"] = list(self.partial)
         return fields
 
-    def _describe(self, num: str) -> str:
+    def _windows_text(self, num: str) -> str:
+        """``"5h 12% · 7d 40%"`` for one account, or "" when none were read."""
         wins = self.windows.get(num)
-        if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+        if not wins:
+            return ""
+        return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+
+    def _describe(self, num: str) -> str:
+        shown = self._windows_text(num)
+        if shown:
+            return f"{shown} (partial)" if num in self.partial else shown
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -344,6 +371,9 @@ class PollEvent(AutoSwitchEvent):
         h = self.headroom.get(str(num))
         if h is not None:
             used = f"{100 - h:.0f}% used"
+        elif str(num) in self.partial:
+            shown = self._windows_text(str(num))
+            used = f"usage incomplete ({shown})" if shown else "usage incomplete"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -566,7 +596,10 @@ def _binding_recovery_ts(
     utilization among the windows that gate it (the same set
     ``account_headroom`` measures, so ranking and headroom can never disagree
     about which window matters). Its reset is the moment the account becomes
-    useful again.
+    useful again. The one asymmetry: this reads the windows even when
+    ``account_headroom`` withholds a headroom (an incomplete measurement, see
+    ``oauth.account_headroom``). Such an account is unrankable anyway, and here
+    the effect is a recovery estimate no later than the truth.
 
     Not the weekly window: with every account in the 90s the thing that
     decides where to go is which 5-hour window rolls over first, and that is
@@ -954,6 +987,16 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                sources={
+                    num: value["source"]
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and value.get("source")
+                },
+                partial=tuple(
+                    num
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and value.get("partial")
+                ),
             )
         )
 
@@ -1971,9 +2014,10 @@ class AutoSwitchEngine:
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
-        escalation condition (the deliberate exception: an owned-and-expired
-        active is excluded above, so a post-idle-hold failover can run
-        without escalating). The consume-first trigger can fire outside the
+        escalation condition (two deliberate exceptions: an owned-and-expired
+        active is excluded above, so a post-idle-hold failover can run without
+        escalating, and an account whose own post-429 plan is still in the
+        future keeps that plan, see below). The consume-first trigger can fire outside the
         escalation band, so it instead decides *provisionally* on the stored
         snapshot and, only when a switch would fire, re-runs an escalated
         collection and re-verifies the choice in ``_tick_inner`` (two-phase
@@ -1987,6 +2031,18 @@ class AutoSwitchEngine:
         idle-hold no candidate is polled at all (slow crawl for everything).
         Adapted cadences are persisted by the collector itself after each
         fetch (shared with every other surface), not by the engine.
+
+        Phase B also leaves out an account that 429'd recently and still has a
+        future poll plan, and a recent 429 likewise exempts the active account
+        from the ``stale_candidate_plan`` override below (a post-429 plan is
+        necessarily wider than any normal active cadence, so that heuristic
+        would read the floor itself as the leftover plan it exists to repair).
+        A 429'd fetch is served by the header probe (issue #220) and spends the
+        account's own inference quota, while both paths otherwise refetch on
+        the serve TTL alone: about 20 probes an hour on the account whose quota
+        is scarcest. The floored plan the planner already computed is the
+        budget. An account with no recent 429 escalates exactly as before: its
+        fetch costs no quota.
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
@@ -2018,6 +2074,7 @@ class AutoSwitchEngine:
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            and not active_pre.recent_429(now)
         )
         overslept_plan = (
             active_pre is not None
@@ -2074,19 +2131,22 @@ class AutoSwitchEngine:
             # that token at the bounded all-exhausted wake cadence.
             for num in tuple(escalation_fetch):
                 entry = entries.get(num)
+                if (
+                    entry is None
+                    or entry.next_poll_at is None
+                    or now >= entry.next_poll_at
+                ):
+                    continue
                 value = usage.get(num)
                 planned_headroom = oauth.account_headroom(
                     value if isinstance(value, dict) else None, self._models
                 )
                 if (
-                    entry is not None
-                    and entry.next_poll_at is not None
-                    and now < entry.next_poll_at
-                    and (entry.poll_interval_s or 0.0)
+                    (entry.poll_interval_s or 0.0)
                     > poll_policy.EXHAUSTED_INTERVAL_S
                     and planned_headroom is not None
                     and planned_headroom <= 0
-                ):
+                ) or entry.recent_429(now):
                     escalation_fetch.remove(num)
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
@@ -2188,7 +2248,9 @@ class AutoSwitchEngine:
         active while gating nothing. That's only provable once every
         relevant oauth account has readable usage this tick — adaptive
         polling legitimately leaves gaps before that — and never worth a
-        forced refresh of its own.
+        forced refresh of its own. A header-rescued row cannot see the
+        per-model axis at all (``oauth.scoped_axis_unseen``), so it proves
+        nothing either way and defers the check the same as a gap does.
         """
         wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
         if not wanted:
@@ -2204,6 +2266,8 @@ class AutoSwitchEngine:
         readable = [v for v in values if isinstance(v, dict)]
         if not readable or len(readable) != len(values):
             return  # not every account observed yet — re-check next tick
+        if any(oauth.scoped_axis_unseen(v, self._models) for v in readable):
+            return
         seen = {
             s["name"].lower()
             for v in readable
