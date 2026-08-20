@@ -382,6 +382,13 @@ class TestSwapAccounts:
             # never inside os.open's syscall: the file already exists. Match
             # on the fd just handed out, since a closed fd number is reused.
             if fd == staged_fd and staged_n == 2:
+                # Close it first, which is what the `with` does when the
+                # interrupt lands in the write -- the wider window by far.
+                # Leaving it open models only the one-bytecode gap before
+                # fdopen takes ownership, and there Windows refuses to
+                # unlink a file the process still holds (WinError 32), so
+                # the discard can only warn.
+                os.close(fd)
                 raise KeyboardInterrupt
             return real_fdopen(fd, *args, **kwargs)
 
