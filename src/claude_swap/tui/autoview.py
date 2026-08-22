@@ -51,7 +51,12 @@ _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
-    role = _EVENT_ROLES.get(event.kind)
+    role = (
+        "sev_warn"
+        if event.kind == "five-hour-timer"
+        and getattr(event, "status", "") == "failed"
+        else _EVENT_ROLES.get(event.kind)
+    )
     if role is not None:
         style = getattr(palette, role)
     else:
@@ -200,6 +205,8 @@ class AutoScreen(Screen):
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        if self._settings.start_timer_on_reset:
+            text.append(" · primes 5h timers", style=palette.muted)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -251,10 +258,16 @@ class AutoScreen(Screen):
         if self._engine is None:
             return
         if self._engine.dry_run:
+            timer_note = (
+                " and send a minimal message when an enabled account's 5h "
+                "window resets"
+                if self._settings.start_timer_on_reset
+                else ""
+            )
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
-                    "automatically when the threshold is reached.\n\n"
+                    f"automatically when the threshold is reached{timer_note}.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",
                     yes_label="Go live",

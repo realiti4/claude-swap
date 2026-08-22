@@ -17,10 +17,13 @@ from claude_swap.autoswitch import (
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
+    TIMER_CLAIM_TTL_S,
+    TIMER_RETRY_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    FiveHourTimerEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -35,6 +38,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.timer_start import TimerStartResult
 
 
 class FakeClock:
@@ -192,6 +196,213 @@ def harness(temp_home: Path) -> EngineHarness:
     h.seed(3, "c@example.com")
     h.make_live("a@example.com", 1)
     return h
+
+
+class TestFiveHourTimerPriming:
+    """Reset detection and the cross-process one-shot fence."""
+
+    @staticmethod
+    def _seeded(temp_home: Path, *, dry_run: bool = False) -> EngineHarness:
+        h = EngineHarness(temp_home, start_timer_on_reset=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        if dry_run:
+            h.engine = h._make_engine(dry_run=True)
+        return h
+
+    @staticmethod
+    def _usage_for(
+        h: EngineHarness,
+        boundary: str,
+        account_two_pct: float,
+        account_two_reset: str | None = None,
+    ) -> dict:
+        far_future = _iso_at(2_000_000)
+        return {
+            "1": _usage(10.0, far_future),
+            "2": _usage(account_two_pct, account_two_reset or boundary),
+            "3": _usage(20.0, far_future),
+        }
+
+    def test_first_observation_is_only_a_baseline(self, temp_home):
+        h = self._seeded(temp_home)
+        already_reset = _iso_at(h.clock.now - 60)
+        with patch("claude_swap.timer_start.start_five_hour_timer") as start:
+            h.tick_with_usage(
+                self._usage_for(
+                    h,
+                    already_reset,
+                    0.0,
+                    _iso_at(h.clock.now + 5 * 3600),
+                )
+            )
+
+        start.assert_not_called()
+        assert not [e for e in h.events if isinstance(e, FiveHourTimerEvent)]
+
+    def test_fresh_post_boundary_drop_starts_each_reset_once(self, temp_home):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start:
+            h.tick_with_usage(self._usage_for(h, boundary, 98.0))
+            start.assert_not_called()
+
+            h.clock.advance(61)
+            next_boundary = _iso_at(h.clock.now + 5 * 3600)
+            h.tick_with_usage(
+                self._usage_for(h, boundary, 0.0, next_boundary)
+            )
+            h.clock.advance(60)
+            h.tick_with_usage(
+                self._usage_for(h, boundary, 0.2, next_boundary)
+            )
+
+        start.assert_called_once_with(h.switcher, "2", "b@example.com")
+        timer_events = [
+            event for event in h.events if isinstance(event, FiveHourTimerEvent)
+        ]
+        assert [event.status for event in timer_events] == ["started"]
+        row = h.state()["fiveHourTimer"]["accounts"]["2"]
+        assert row["handledReset"] == boundary
+        assert "claimId" not in row
+
+    def test_drop_before_advertised_boundary_does_not_trigger(self, temp_home):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 600)
+        with patch("claude_swap.timer_start.start_five_hour_timer") as start:
+            h.tick_with_usage(self._usage_for(h, boundary, 80.0))
+            h.clock.advance(60)
+            h.tick_with_usage(self._usage_for(h, boundary, 20.0))
+
+        start.assert_not_called()
+
+    def test_past_boundary_stale_window_waits_until_window_disappears(
+        self, temp_home
+    ):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start:
+            h.tick_with_usage(self._usage_for(h, boundary, 100.0))
+            h.clock.advance(61)
+            # A fresh endpoint response can briefly retain the exhausted old
+            # window after its timestamp. Passing the clock alone is not a
+            # reset signal.
+            h.tick_with_usage(self._usage_for(h, boundary, 100.0))
+            start.assert_not_called()
+
+            h.clock.advance(60)
+            rolled = self._usage_for(h, boundary, 100.0)
+            rolled["2"] = {"seven_day": {"pct": 20.0}}
+            h.tick_with_usage(rolled)
+
+        start.assert_called_once_with(h.switcher, "2", "b@example.com")
+
+    def test_failure_backs_off_then_retries_same_reset(self, temp_home):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            side_effect=[
+                TimerStartResult(False, "temporary outage"),
+                TimerStartResult(True),
+            ],
+        ) as start:
+            h.tick_with_usage(self._usage_for(h, boundary, 95.0))
+            h.clock.advance(61)
+            next_boundary = _iso_at(h.clock.now + 5 * 3600)
+            reset_usage = self._usage_for(h, boundary, 0.0, next_boundary)
+            h.tick_with_usage(reset_usage)
+
+            h.clock.advance(60)
+            h.tick_with_usage(reset_usage)
+            assert start.call_count == 1
+
+            h.clock.advance(TIMER_RETRY_S - 60)
+            h.tick_with_usage(reset_usage)
+
+        assert start.call_count == 2
+        assert [
+            event.status
+            for event in h.events
+            if isinstance(event, FiveHourTimerEvent)
+        ] == ["failed", "started"]
+
+    def test_dry_run_reports_without_sending_or_writing_state(self, temp_home):
+        h = self._seeded(temp_home, dry_run=True)
+        boundary = _iso_at(h.clock.now + 60)
+        with patch("claude_swap.timer_start.start_five_hour_timer") as start:
+            h.tick_with_usage(self._usage_for(h, boundary, 95.0))
+            h.clock.advance(61)
+            h.tick_with_usage(
+                self._usage_for(
+                    h,
+                    boundary,
+                    0.0,
+                    _iso_at(h.clock.now + 5 * 3600),
+                )
+            )
+
+        start.assert_not_called()
+        event = next(e for e in h.events if isinstance(e, FiveHourTimerEvent))
+        assert event.status == "would-start"
+        assert h.state() == {}
+
+    def test_disabled_account_is_not_messaged(self, temp_home):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        h.tick_with_usage(self._usage_for(h, boundary, 95.0))
+        h.switcher.set_account_disabled("2", True)
+
+        with patch("claude_swap.timer_start.start_five_hour_timer") as start:
+            h.clock.advance(61)
+            h.tick_with_usage(
+                self._usage_for(
+                    h,
+                    boundary,
+                    0.0,
+                    _iso_at(h.clock.now + 5 * 3600),
+                )
+            )
+
+        start.assert_not_called()
+        assert "2" not in h.state()["fiveHourTimer"]["accounts"]
+
+    def test_live_claim_fences_a_second_engine_and_expires(self, temp_home):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        baseline = {
+            number: _entry_for(value, h.clock.now)
+            for number, value in self._usage_for(h, boundary, 95.0).items()
+        }
+        assert h.engine._claim_five_hour_resets(baseline, set()) == []
+
+        h.clock.advance(61)
+        reset_entries = {
+            number: _entry_for(value, h.clock.now)
+            for number, value in self._usage_for(
+                h,
+                boundary,
+                0.0,
+                _iso_at(h.clock.now + 5 * 3600),
+            ).items()
+        }
+        first = h.engine._claim_five_hour_resets(reset_entries, set())
+        second_engine = h._make_engine()
+        assert len(first) == 1
+        assert second_engine._claim_five_hour_resets(reset_entries, set()) == []
+
+        h.clock.advance(TIMER_CLAIM_TTL_S + 1)
+        reclaimed = second_engine._claim_five_hour_resets(reset_entries, set())
+        assert len(reclaimed) == 1
+        assert reclaimed[0].reset_at == boundary
 
 
 class TestEngineHarnessIsolation:
@@ -6893,4 +7104,3 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
-
