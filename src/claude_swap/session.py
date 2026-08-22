@@ -531,10 +531,16 @@ class SessionManager:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
             # meaningless (we may already be inside a session terminal), so
             # the same-account fast path below must not trigger.
-            warning(
+            # Logged as well as printed: this method ends in execvpe, and the
+            # wrapper Claude Code launches through blanks the main screen
+            # before the child starts, so a printed line does not survive it.
+            # The running account does, via the status line. This does not.
+            msg = (
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
+            warning(msg)
+            self._logger.warning(msg)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
@@ -552,10 +558,12 @@ class SessionManager:
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
-            warning(
+            msg = (
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
                 f"override the selected account inside Claude Code."
             )
+            warning(msg)
+            self._logger.warning(msg)
 
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
