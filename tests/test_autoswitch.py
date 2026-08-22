@@ -242,6 +242,77 @@ class TestFiveHourTimerPriming:
         start.assert_not_called()
         assert not [e for e in h.events if isinstance(e, FiveHourTimerEvent)]
 
+    def test_first_unstarted_zero_window_is_primed_immediately(self, temp_home):
+        h = self._seeded(temp_home)
+        usage = self._usage_for(h, _iso_at(h.clock.now + 3600), 10.0)
+        usage["2"] = _usage(0.0)
+
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start:
+            h.tick_with_usage(usage)
+            h.clock.advance(60)
+            h.tick_with_usage(usage)
+
+        start.assert_called_once_with(h.switcher, "2", "b@example.com")
+        timer_events = [
+            event for event in h.events if isinstance(event, FiveHourTimerEvent)
+        ]
+        assert [event.status for event in timer_events] == ["started"]
+
+    def test_an_existing_zero_baseline_self_heals_after_upgrade(self, temp_home):
+        h = self._seeded(temp_home)
+        state_path = h.switcher.backup_dir / "autoswitch_state.json"
+        h.switcher._write_json(
+            state_path,
+            {
+                "schemaVersion": 1,
+                "fiveHourTimer": {
+                    "accounts": {
+                        "2": {
+                            "email": "b@example.com",
+                            "lastFetchedAt": h.clock.now,
+                            "windowPresent": True,
+                            "pct": 0.0,
+                            "resetsAt": None,
+                        }
+                    }
+                },
+            },
+        )
+        usage = self._usage_for(h, _iso_at(h.clock.now + 3600), 10.0)
+        usage["2"] = _usage(0.0)
+
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start:
+            h.tick_with_usage(usage)
+
+        start.assert_called_once_with(h.switcher, "2", "b@example.com")
+
+    def test_reset_is_detected_when_provider_removes_reset_timestamp(
+        self, temp_home
+    ):
+        h = self._seeded(temp_home)
+        boundary = _iso_at(h.clock.now + 60)
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start:
+            # The timer-start prompt can be small enough to round to 0%, but
+            # its future reset timestamp proves that the window is running.
+            h.tick_with_usage(self._usage_for(h, boundary, 0.0))
+            start.assert_not_called()
+
+            h.clock.advance(61)
+            reset_usage = self._usage_for(h, boundary, 10.0)
+            reset_usage["2"] = _usage(0.0)
+            h.tick_with_usage(reset_usage)
+
+        start.assert_called_once_with(h.switcher, "2", "b@example.com")
+
     def test_fresh_post_boundary_drop_starts_each_reset_once(self, temp_home):
         h = self._seeded(temp_home)
         boundary = _iso_at(h.clock.now + 60)

@@ -113,6 +113,7 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 TIMER_CLAIM_TTL_S = 5 * 60.0
 TIMER_RETRY_S = 5 * 60.0
 TIMER_PCT_EPSILON = 0.01
+TIMER_UNSTARTED_RESET = "unstarted-window"
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -709,10 +710,11 @@ def _detected_five_hour_reset(previous: dict, current: dict) -> str | None:
 
     Five-hour utilization is monotone within a window. A reset is therefore
     proven when a fresh observation at/after the advertised boundary either
-    drops utilization or loses the window, or when the provider advances the
-    reset timestamp to the next cycle. Merely passing a cached ``resets_at``
-    is not enough: the usage endpoint can keep returning the exhausted window
-    briefly, and sending during that lag would just hit the old limit.
+    drops utilization, loses the window/reset timestamp, or when the provider
+    advances the reset timestamp to the next cycle. Merely passing a cached
+    ``resets_at`` is not enough: the usage endpoint can keep returning the
+    exhausted window briefly, and sending during that lag would just hit the
+    old limit.
     """
     if previous.get("windowPresent") is not True:
         return None
@@ -733,6 +735,12 @@ def _detected_five_hour_reset(previous: dict, current: dict) -> str | None:
     if advanced:
         return reset_at
     if current.get("windowPresent") is not True:
+        return reset_at
+    # Once an idle five-hour window has ended, the API keeps the window object
+    # (at 0%) but removes ``resets_at`` until the next message starts a clock.
+    # This is also the only reliable rollover signal when the tiny timer-start
+    # prompt rounded to 0%, so there is no numeric drop to observe.
+    if current.get("resetsAt") is None:
         return reset_at
 
     old_pct = previous.get("pct")
@@ -918,7 +926,34 @@ class AutoSwitchEngine:
                         claim_pending(number, email, row, pending)
                 continue
             if not isinstance(row, dict) or row.get("email") != email:
-                accounts[number] = {"email": email, **observation}
+                row = {"email": email, **observation}
+                accounts[number] = row
+                changed = True
+
+            # A present 0% window with no reset timestamp is not merely a low
+            # first sample: it is the provider's representation of a clock
+            # waiting for its first message. Prime it immediately. Requiring
+            # no prior pending/handled reset preserves the normal first-sample
+            # baseline for active windows and lets state written by the first
+            # feature version self-heal on upgrade.
+            if (
+                row.get("resetsAt") is None
+                and row.get("pendingReset") is None
+                and row.get("handledReset") is None
+                and observation.get("windowPresent") is True
+                and observation.get("resetsAt") is None
+                and isinstance(observation.get("pct"), (int, float))
+                and float(observation["pct"]) <= TIMER_PCT_EPSILON
+            ):
+                last_fetched = row.get("lastFetchedAt")
+                if not isinstance(last_fetched, (int, float)) or (
+                    observation["lastFetchedAt"] > float(last_fetched)
+                ):
+                    row.update(observation)
+                row["pendingReset"] = TIMER_UNSTARTED_RESET
+                claim_pending(
+                    number, email, row, TIMER_UNSTARTED_RESET
+                )
                 changed = True
                 continue
 
