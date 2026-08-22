@@ -251,7 +251,13 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
-        if event.kind == "switch":
+        if event.kind == "switch" or (
+            event.kind == "five-hour-timer"
+            and getattr(event, "status", "") == "started"
+        ):
+            # The engine has already persisted the targeted post-message
+            # usage fetch. Repaint the store-backed snapshot now instead of
+            # waiting up to POLL_INTERVAL_S for the next TUI tick.
             self.app.request_refresh()
 
     def action_toggle_live(self) -> None:

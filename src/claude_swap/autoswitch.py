@@ -1090,6 +1090,23 @@ class AutoSwitchEngine:
                     False, f"{type(exc).__name__}: {exc}"
                 )
             self._finish_five_hour_timer_claim(claim, result)
+            if result.success:
+                try:
+                    # The message creates a reset timestamp, but every view
+                    # would otherwise keep serving the pre-message 0% row
+                    # until its normal poll plan comes due. Refresh just this
+                    # account so the shared store — and therefore the TUI —
+                    # reflects the new countdown immediately.
+                    self.switcher.refresh_usage_accounts({claim.number})
+                except Exception as exc:
+                    # Priming already succeeded. A display refresh failure is
+                    # best-effort and must not turn that success into a retry,
+                    # which would send a duplicate message five minutes later.
+                    _logger.warning(
+                        "Post-timer usage refresh failed for account %s: %s",
+                        claim.number,
+                        exc,
+                    )
             self._emit(
                 FiveHourTimerEvent(
                     account=_ref(claim.number, claim.email),

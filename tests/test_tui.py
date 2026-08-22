@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1368,6 +1369,27 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
 
+    async def test_started_timer_event_repaints_shared_usage(
+        self, tmp_path, fake_engine
+    ):
+        from claude_swap.autoswitch import FiveHourTimerEvent
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            with patch.object(app, "request_refresh") as refresh:
+                app.screen._on_engine_event(
+                    FiveHourTimerEvent(
+                        account={"number": 2, "email": "user2@example.com"},
+                        reset_at="unstarted-window",
+                        status="started",
+                    )
+                )
+            refresh.assert_called_once_with()
+
     async def test_back_stops_engine_and_restores_fetching(
         self, tmp_path, fake_engine
     ):
@@ -1709,4 +1731,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-

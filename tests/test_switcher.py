@@ -1283,6 +1283,55 @@ class TestListAccountsUsage:
         assert "25%" in output
         assert "80%" in output
 
+    def test_known_mutation_refreshes_one_fresh_account_immediately(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Timer priming is a known usage mutation, so its slot may bypass
+        the ordinary serve TTL without making every dashboard row fetch."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-active"}}
+        )
+        backup_creds = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-backup"}}
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        ident = {"1": ("test@example.com", "")}
+        switcher._usage_store.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 0.0}})}, ident
+        )
+        switcher._usage_store.set_poll_plan(
+            {"1": (time.time() + 600.0, 600.0)}, ident
+        )
+
+        refreshed = {
+            "five_hour": {
+                "pct": 0.0,
+                "resets_at": "2099-01-01T05:00:00Z",
+            },
+            "seven_day": {"pct": 20.0},
+        }
+        with patch.object(
+            switcher,
+            "_read_active_credentials",
+            return_value=ActiveCredentials(active_creds, False),
+        ), patch.object(
+            switcher, "_read_account_credentials", return_value=backup_creds
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(refreshed),
+        ) as fetch:
+            entries = switcher.refresh_usage_accounts({"1"})
+
+        fetch.assert_called_once()
+        assert entries["1"].last_good == refreshed
+
     def test_list_refetches_stale_entries(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):

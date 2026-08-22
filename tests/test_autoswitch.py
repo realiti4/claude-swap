@@ -247,7 +247,9 @@ class TestFiveHourTimerPriming:
         usage = self._usage_for(h, _iso_at(h.clock.now + 3600), 10.0)
         usage["2"] = _usage(0.0)
 
-        with patch(
+        with patch.object(
+            h.switcher, "refresh_usage_accounts"
+        ) as refresh, patch(
             "claude_swap.timer_start.start_five_hour_timer",
             return_value=TimerStartResult(True),
         ) as start:
@@ -256,10 +258,38 @@ class TestFiveHourTimerPriming:
             h.tick_with_usage(usage)
 
         start.assert_called_once_with(h.switcher, "2", "b@example.com")
+        refresh.assert_called_once_with({"2"})
         timer_events = [
             event for event in h.events if isinstance(event, FiveHourTimerEvent)
         ]
         assert [event.status for event in timer_events] == ["started"]
+
+    def test_post_timer_refresh_failure_does_not_retry_the_message(
+        self, temp_home, caplog
+    ):
+        h = self._seeded(temp_home)
+        usage = self._usage_for(h, _iso_at(h.clock.now + 3600), 10.0)
+        usage["2"] = _usage(0.0)
+
+        with patch(
+            "claude_swap.timer_start.start_five_hour_timer",
+            return_value=TimerStartResult(True),
+        ) as start, patch.object(
+            h.switcher,
+            "refresh_usage_accounts",
+            side_effect=OSError("cache unavailable"),
+        ), caplog.at_level("WARNING", logger="claude-swap"):
+            h.tick_with_usage(usage)
+            h.clock.advance(TIMER_RETRY_S + 1)
+            h.tick_with_usage(usage)
+
+        assert start.call_count == 1
+        assert [
+            event.status
+            for event in h.events
+            if isinstance(event, FiveHourTimerEvent)
+        ] == ["started"]
+        assert "Post-timer usage refresh failed" in caplog.text
 
     def test_an_existing_zero_baseline_self_heals_after_upgrade(self, temp_home):
         h = self._seeded(temp_home)
