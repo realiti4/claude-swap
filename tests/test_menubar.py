@@ -348,6 +348,47 @@ def test_format_title_all_accounts_with_no_others_is_unchanged():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
 
 
+def test_format_title_countdown_appends_reset_time():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="both", title_countdown=True
+    )
+    now = _NOW
+    usage = {
+        "five_hour": {"pct": 42.0, "resets_at": _iso(2 * 3600 + 53 * 60)},
+        "seven_day": {"pct": 18.0, "resets_at": _iso(26 * 3600)},
+    }
+    assert menubar.format_title(
+        "loc@papaya.asia", usage, s, now=now
+    ) == "\u21c4 loc · 42% (2h 53m) · 18% (1d 2h)"
+
+
+def test_format_title_countdown_off_by_default():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    now = _NOW
+    usage = {"five_hour": {"pct": 42.0, "resets_at": _iso(3600)}}
+    assert menubar.format_title("loc@papaya.asia", usage, s, now=now) == "\u21c4 loc · 42%"
+
+
+def test_format_title_countdown_skips_window_without_resets_at():
+    # pct still renders; only the countdown is dropped when resets_at is absent.
+    s = menubar.MenuBarSettings(
+        show_account_name=False, title_pct="5h", title_countdown=True
+    )
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "\u21c4 42%"
+
+
+def test_format_title_countdown_applies_to_other_accounts():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="5h",
+        title_all_accounts=True, title_countdown=True,
+    )
+    now = _NOW
+    other = {"five_hour": {"pct": 7.0, "resets_at": _iso(45 * 60)}}
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, now=now, others=[("work", other)]
+    ) == "\u21c4 loc · 42% | work · 7% (45m)"
+
+
 def test_format_title_icon_only_when_off():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"

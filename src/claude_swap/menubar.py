@@ -97,6 +97,7 @@ class MenuBarSettings:
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     title_all_accounts: bool = False  # render every managed account in the title, not just the active one
+    title_countdown: bool = False  # append each window's live reset countdown to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -298,6 +299,24 @@ def _local_part(email: str, limit: int = 12) -> str:
     return local
 
 
+def _with_countdown(
+    text: str,
+    window: dict | str | None,
+    settings: MenuBarSettings,
+    now: float,
+) -> str:
+    """A title segment with its window's live reset countdown appended.
+
+    Same ``_live_countdown`` the dropdown rows use, so title and dropdown never
+    disagree. Returns ``text`` unchanged when the setting is off or the window
+    has no usable ``resets_at``.
+    """
+    if not settings.title_countdown:
+        return text
+    left = _live_countdown(window, now)
+    return f"{text} ({left})" if left else text
+
+
 def _account_segments(
     label: str,
     usage: dict | str | None,
@@ -315,20 +334,23 @@ def _account_segments(
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            five = usage.get("five_hour") if isinstance(usage, dict) else None
+            segments.append(_with_countdown(f"{p:.0f}%", five, settings, now))
     if settings.title_pct in ("7d", "both"):
         seven = usage.get("seven_day") if isinstance(usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(_with_countdown(f"{p:.0f}%", seven, settings, now))
     if settings.title_scoped and isinstance(usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
         for window in usage.get("scoped") or []:
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {window['pct']:.0f}%")
+                segments.append(_with_countdown(
+                    f"{window['name']} {window['pct']:.0f}%", window, settings, now
+                ))
     return segments
 
 
@@ -802,6 +824,12 @@ def run(switcher) -> int:
             all_accounts_item.state = 1 if self.settings.title_all_accounts else 0
             menu.add(all_accounts_item)
 
+            countdown_item = rumps.MenuItem(
+                "Show reset countdown in title", callback=self.on_toggle_countdown
+            )
+            countdown_item.state = 1 if self.settings.title_countdown else 0
+            menu.add(countdown_item)
+
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -958,6 +986,10 @@ def run(switcher) -> int:
 
         def on_toggle_all_accounts(self, _sender):
             self.settings.title_all_accounts = not self.settings.title_all_accounts
+            self._save_and_rebuild()
+
+        def on_toggle_countdown(self, _sender):
+            self.settings.title_countdown = not self.settings.title_countdown
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
