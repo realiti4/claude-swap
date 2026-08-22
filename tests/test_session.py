@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import hashlib
 import json
 import os
@@ -1369,6 +1370,71 @@ class TestRun:
         assert "ANTHROPIC_API_KEY" not in exc.value.env
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
+
+    def test_the_scrub_warning_outlives_the_terminal_it_was_printed_to(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        caplog,
+    ):
+        """The launch path prints and then execs, so print() is the whole life
+        of the message. The wrapper Claude Code launches through blanks the
+        terminal's main screen before starting the child, so anything printed
+        here is gone from view a moment later. The account itself is still
+        carried by the status line; "your env var was ignored" is carried by
+        nothing. Record it."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "ANTHROPIC_API_KEY" in logged
+        assert "ANTHROPIC_AUTH_TOKEN" in logged
+
+    def test_the_config_dir_override_warning_outlives_the_terminal(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        caplog,
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "overriding it for this launch" in logged
+
+    def test_a_clean_launch_logs_no_warning(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        caplog,
+    ):
+        """CONTROL. Without either condition the two records must be absent —
+        otherwise the assertions above pass on a logger that warns always."""
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"):
+            monkeypatch.delenv(var, raising=False)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "overriding it for this launch" not in logged
+        assert "ANTHROPIC_API_KEY" not in logged
 
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch
