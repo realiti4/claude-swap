@@ -312,6 +312,42 @@ def test_format_title_both_windows_with_name():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
 
 
+_OTHER = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 3.0}}
+
+
+def test_format_title_ignores_others_by_default():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", _OTHER)]
+    ) == "⇄ loc · 42% · 18%"
+
+
+def test_format_title_all_accounts_appends_others():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="both", title_all_accounts=True
+    )
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", _OTHER)]
+    ) == "⇄ loc · 42% · 18% | work · 7% · 3%"
+
+
+def test_format_title_all_accounts_skips_accounts_with_nothing_to_show():
+    s = menubar.MenuBarSettings(
+        show_account_name=False, title_pct="5h", title_all_accounts=True
+    )
+    # "no credentials" is a sentinel string, not a usage dict — no pct to render.
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", "no credentials")]
+    ) == "⇄ 42%"
+
+
+def test_format_title_all_accounts_with_no_others_is_unchanged():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="5h", title_all_accounts=True
+    )
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
+
+
 def test_format_title_icon_only_when_off():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"

@@ -35,6 +35,7 @@ ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+TITLE_SEP = " | "  # between accounts when title_all_accounts is on
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 
@@ -95,6 +96,7 @@ class MenuBarSettings:
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
+    title_all_accounts: bool = False  # render every managed account in the title, not just the active one
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -296,41 +298,70 @@ def _local_part(email: str, limit: int = 12) -> str:
     return local
 
 
+def _account_segments(
+    label: str,
+    usage: dict | str | None,
+    settings: MenuBarSettings,
+    now: float,
+) -> list[str]:
+    """Title segments for one account, in display order.
+
+    Shared by the active account and — under ``title_all_accounts`` — every
+    other managed account, so one account always reads the same either way.
+    """
+    segments: list[str] = []
+    if settings.show_account_name and label:
+        segments.append(label)
+    if settings.title_pct in ("5h", "both"):
+        p = _window_pct(usage, "five_hour")
+        if p is not None:
+            segments.append(f"{p:.0f}%")
+    if settings.title_pct in ("7d", "both"):
+        seven = usage.get("seven_day") if isinstance(usage, dict) else None
+        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
+        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
+        if p is not None:
+            segments.append(f"{p:.0f}%")
+    if settings.title_scoped and isinstance(usage, dict):
+        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
+        # dropdown rows; named so multiple scoped models stay distinguishable.
+        for window in usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+                segments.append(f"{window['name']} {window['pct']:.0f}%")
+    return segments
+
+
 def format_title(
     active_email: str | None,
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    others: list[tuple[str, dict | str | None]] | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``others`` carries ``(label, usage)`` for the non-active accounts. It is
+    rendered after the active account, ``TITLE_SEP``-separated, only when
+    ``title_all_accounts`` is on; an account with nothing to show is skipped.
+    """
     if active_email is None:
         return ICON
     if now is None:
         now = time.time()
-    segments: list[str] = []
-    if settings.show_account_name:
-        segments.append(alias if alias else _local_part(active_email))
-    if settings.title_pct in ("5h", "both"):
-        p = _window_pct(active_usage, "five_hour")
-        if p is not None:
-            segments.append(f"{p:.0f}%")
-    if settings.title_pct in ("7d", "both"):
-        seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
-        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
-        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
-        if p is not None:
-            segments.append(f"{p:.0f}%")
-    if settings.title_scoped and isinstance(active_usage, dict):
-        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
-        # dropdown rows; named so multiple scoped models stay distinguishable.
-        for window in active_usage.get("scoped") or []:
-            window = _rolled_weekly_window(window, now)
-            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {window['pct']:.0f}%")
+    segments = _account_segments(
+        alias if alias else _local_part(active_email), active_usage, settings, now
+    )
     if not segments:
         return ICON
-    return f"{ICON} " + " · ".join(segments)
+    groups = [" · ".join(segments)]
+    if settings.title_all_accounts:
+        for label, usage in others or []:
+            other = _account_segments(label, usage, settings, now)
+            if other:
+                groups.append(" · ".join(other))
+    return f"{ICON} " + TITLE_SEP.join(groups)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -648,11 +679,20 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            # Non-active accounts for the title. A sentinel display string says
+            # nothing useful in a menu bar, so fall back to the last good read.
+            others = [
+                (alias or _local_part(email), display if isinstance(display, dict) else last_good)
+                for _num, email, is_active, display, last_good, alias, _disabled, _fetched
+                in self.snapshot["accounts"]
+                if not is_active
+            ]
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                others=others,
             )
             self.menu.clear()
             account_items = []
@@ -755,6 +795,12 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            all_accounts_item = rumps.MenuItem(
+                "Show all accounts in title", callback=self.on_toggle_all_accounts
+            )
+            all_accounts_item.state = 1 if self.settings.title_all_accounts else 0
+            menu.add(all_accounts_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -908,6 +954,10 @@ def run(switcher) -> int:
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_all_accounts(self, _sender):
+            self.settings.title_all_accounts = not self.settings.title_all_accounts
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
