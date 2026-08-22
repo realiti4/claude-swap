@@ -638,6 +638,13 @@ def run(switcher) -> int:
                     # engine emits it once per run; dropping it would leave a
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
+                elif ev.kind == "five-hour-timer":
+                    title = (
+                        "Five-hour timer started"
+                        if getattr(ev, "status", "") == "started"
+                        else "Five-hour timer start failed"
+                    )
+                    rumps.notification("claude-swap", title, ev.human())
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""

@@ -1729,6 +1729,45 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
+    def refresh_usage_accounts(
+        self, numbers: set[str]
+    ) -> dict[str, UsageEntry]:
+        """Refetch selected slots after a known provider-side mutation.
+
+        Normal dashboards honor the shared serve TTL and poll plans. A
+        successful timer-start message changes five-hour state immediately,
+        though, so serving the pre-message row until its ordinary deadline
+        leaves the TUI without the new reset countdown. Pull only those slots'
+        plans due, then use the normal collector: claim fencing, auth backoff,
+        token refresh, and result persistence all remain unchanged.
+        """
+        wanted = {str(number) for number in numbers}
+        data = self._get_sequence_data() or {}
+        account_rows = data.get("accounts", {})
+        if not isinstance(account_rows, dict):
+            account_rows = {}
+        identities = {
+            number: (
+                str(account_rows[number].get("email") or ""),
+                str(account_rows[number].get("organizationUuid") or ""),
+            )
+            for number in wanted
+            if isinstance(account_rows.get(number), dict)
+            and account_rows[number].get("email")
+        }
+        if not identities:
+            return self.usage_entries_by_account(fetch=set())
+
+        now = self._usage_store.clock()
+        self._usage_store.set_poll_plan(
+            {
+                number: (now, poll_policy.MIN_INTERVAL_S)
+                for number in identities
+            },
+            identities,
+        )
+        return self.usage_entries_by_account(fetch=set(identities))
+
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 

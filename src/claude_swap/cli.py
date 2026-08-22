@@ -593,6 +593,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --start-timer-on-reset # start each new 5h timer with a tiny prompt
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -651,6 +652,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--start-timer-on-reset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "After detecting an enabled OAuth account's 5h reset, send one "
+            "minimal non-interactive Claude message to start its next timer "
+            "(opt-in; default: off)"
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=("best", "consume-first"),
         default=None,
@@ -684,7 +695,10 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in ("error", "account-quarantined") or (
+            event.kind == "five-hour-timer"
+            and getattr(event, "status", "") == "failed"
+        ):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
