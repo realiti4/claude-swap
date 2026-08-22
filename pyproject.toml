@@ -33,6 +33,35 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# A CORRECTNESS FLOOR, not a freshness one, and it moves with each release.
+#
+# This branch calls `apply_pin(identity=...)`; below the floor that is a
+# TypeError at the call rather than a degraded feature.
+#
+# NAME AN API THAT EXISTS, AND THE ERROR IT ACTUALLY RAISES. A floor comment
+# is the only record of why the number is what it is, so a reason that does
+# not survive checking makes a maintainer distrust the line or restore a call
+# that was never there.
+#
+# NOT EVERY DEPENDENCY IS FLOORED. `heal(identity=...)` is newer than this
+# number and deliberately NOT covered: the caller probes the installed
+# signature and falls back to the positional form, so an older package keeps
+# working rather than being forced to upgrade for an optional extra. Do not
+# raise the floor to cover it, and do not delete the probe as redundant.
+#
+# A floor that nobody raises is worse than none -- this one sat at 0.1.3
+# through thirty-six releases while `uv tool install 'claude-swap[pin]'`
+# resolved a pin from before the port handdown, the chain walk and the launch
+# hook, on a machine that looked correctly installed. Raise it for each API
+# this branch requires OUTRIGHT; probe for the ones it can do without.
+#
+# The package's git history carries which release did what; it has no
+# CHANGELOG.
+#
+# NO `; sys_platform != 'win32'` MARKER, and it has been proposed twice.
+# The dev group installs this so the cswap-pin seam test runs on Windows
+# too; a marker makes that test decorative instead of red.
+pin = ["cswap-pin>=0.1.143"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -51,7 +80,29 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `claude-swap[pin]`, NOT a second `cswap-pin>=…`. The extra above is the one
+# floor; spelling the version again here is how the two drift, and a stale
+# copy would pin CI to a package older than the behaviour the floor exists to
+# require.
+#
+# THE EXTRA HAS TO BE INSTALLED SOMEWHERE OR ITS CONTRACT IS UNTESTED. cswap
+# READS a marker cswap-pin WRITES and the two version independently, so
+# `test_the_marker_still_matches_the_package_that_writes_it` is the only thing
+# standing between a rename there and `--clear` reporting "No cloud account
+# pinned" over a live wiring. `uv sync --locked` installs base + dev only, so
+# that test skipped on every job on every platform — and, measured, in the
+# maintainer's own checkout too. It had never run once.
+#
+# This does NOT weaken "works without the extra": all three guarantees there
+# (`TestImportSafeWithoutTheExtra`, `TestClearRunsWithTheExtraGone`) block
+# `cswap_pin` at `sys.meta_path` or scan the AST, so they hold whether or not
+# the package is present.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "claude-swap[pin]",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -62,8 +113,22 @@ pythonpath = ["src"]
 # across the whole suite, with the top five totalling under 7 s of a 51 s run.
 # Measured here, 48 cores: 51.0s serial -> 12.1s (-n 8) -> 7.7s (-n 16), same
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
-# store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
-# cores) and this box both get the cores they have.
+# store hash unmoved.
+#
+# `auto` here so any machine scales from the cores it has. CI OVERRIDES IT
+# with `-n 8` (see .github/workflows/ci.yml): the work is mostly WAITING —
+# file locks, spawned interpreters, Textual pilots — so on a runner's 4 vCPUs
+# a worker parked on a syscall leaves its core idle and one-worker-per-core
+# cannot fill them. Measured on 4 CPUs (`taskset -c 0-3`), same 1995 passed:
+#
+#     -n auto (=4)  16.94s  16.97s
+#     -n 6          14.06s
+#     -n 8          15.49s  14.52s
+#     -n 10         14.69s
+#
+# xdist takes only `auto`, `logical`, or an integer — there is no multiplier
+# spelling, and `logical` is also 4 on a 4-vCPU runner. So the oversubscription
+# has to be a literal, and a literal belongs where the machine is known.
 addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [

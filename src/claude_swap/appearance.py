@@ -168,6 +168,23 @@ def resolve_theme(setting: str, detect=detect_terminal_background) -> str:
     return detect() or "dark"
 
 
+# The `cswap pin` invocations that are read by a script or an rc hook rather
+# than by a person. ONE SET, TWO CONSUMERS: this module refuses to probe the
+# terminal for them, and `cli.main` keeps the native-TLS fallback warning off
+# their stderr. A second copy of this list in the other file is a copy that
+# stops matching the first time a flag is added.
+_PIN_SCRIPT_FLAGS = frozenset({"--ensure", "--get_port", "--get_certdir"})
+
+
+def pin_invocation_is_script_consumed(argv) -> bool:
+    """Is this `cswap pin ...` answering a script rather than a human?
+
+    ON THE FLAG, NOT ON `pin`: `cswap pin 2` renders to a human and keeps its
+    theme, and is entitled to a warning on stderr.
+    """
+    return argv[:1] == ["pin"] and bool(_PIN_SCRIPT_FLAGS.intersection(argv))
+
+
 def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
     """Whether the CLI should probe the terminal background before dispatch.
 
@@ -181,6 +198,24 @@ def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
     if argv and argv[0] == "run":
         return False
     if "--json" in argv:
+        return False
+    # THE PIN'S LAUNCH FLAGS, for the two reasons already listed. Both run
+    # from an rc hook before EVERY hand-launched `claude`. `--ensure`
+    # promises silence and is budgeted in fractions of a second
+    # (`_LAUNCH_PROBE_S` 0.2, `_LAUNCH_LOCK_BUDGET_S` 0.5) — while the probe
+    # below puts the terminal into cbreak, writes OSC 11 to stdout and
+    # select-waits `_TIMEOUT_S` = 1.0, larger on its own than the whole
+    # budget the pin's launch path exists to protect. `--get_port` prints a
+    # bare number for a script to read, which is the `--json` reason under a
+    # different spelling. `--get_certdir` is the same contract with a
+    # different value — its own help says `D=$(cswap pin --get_certdir)` — and
+    # it was missing here, so the command whose whole purpose is answering
+    # instantly while somebody diagnoses a dead pin sat in cbreak for a second
+    # first, and could still leak a late terminal reply as keystrokes.
+    #
+    # ON THE FLAG, NOT ON `pin`: `cswap pin 2` renders to a human and keeps
+    # its theme.
+    if pin_invocation_is_script_consumed(argv):
         return False
     return True
 

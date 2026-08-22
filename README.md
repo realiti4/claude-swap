@@ -245,6 +245,50 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 </details>
 
+## Cloud pin (Remote Control / Artifacts)
+
+<details>
+<summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
+
+Needs the `pin` extra, and an account to point it at:
+
+```bash
+uv tool install 'claude-swap[pin]'   # or: pipx install 'claude-swap[pin]'
+cswap list                           # the numbers come from here
+cswap pin 2
+```
+
+Swapping accounts moves *everything*, including two things that are not inference:
+
+- **Remote Control** — a session's owner is fixed at creation by whichever bearer created it, so after a swap the phone/web loses the session and ghosts pile up on the old account.
+- **Artifacts** — owned by the publishing bearer, so a republish 403s and the artifact "disappears" from the account you are logged into.
+
+The pin keeps those on one account of your choosing while `cswap switch` / [`cswap auto`](#automatic-switching) keep steering inference. `/v1/messages` is never touched, so usage still bills the account you swapped onto.
+
+```bash
+cswap pin 2          # Remote Control / artifacts → account 2
+cswap pin            # show the current pin
+cswap pin --clear    # remove it
+cswap pin --heal     # restart a pin proxy that died, or unwire it
+cswap pin --get_port # the serving port, bare digits (exit 1 if none)
+cswap pin --get_certdir # the cert directory, a bare path
+cswap pin --set_port N   # serve on N from the next start (0 = dynamic)
+cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
+```
+
+`--get_port` exists so scripts stop reading our files: a pinned session's
+`HTTPS_PROXY` names the pin's own dynamic port, and without a way to ask for it
+the on-disk layout becomes a compatibility surface. It prints bare digits and
+probes the port first, so a stale record cannot report a dead daemon as live.
+
+The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
+
+If the pin's daemon dies, `.claude.json` keeps naming its dead port and every new session inherits it at boot — reach for `--heal` to restart the daemon, or, if it can't come back, remove the wiring so sessions fall back to what they had before the pin.
+
+Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the extra pulls in.
+
+</details>
+
 ## Advanced
 
 ### Configuration

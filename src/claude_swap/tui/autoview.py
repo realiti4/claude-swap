@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -301,6 +302,15 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
+        # The badge rides on that account's own row rather than the summary
+        # line: naming the pin separately makes you match an email against the
+        # list directly below it instead of just reading the list.
+        pinned_email = pin.pinned_email(self.app.switcher)
+        # ONCE PER RENDER, not once per row: this reads the daemon's record off
+        # disk, and the badge below is drawn inside the account loop. The same
+        # mistake was fixed for `pinned_email` itself — see the test that pins
+        # its call count.
+        pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_email else None
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -319,6 +329,23 @@ class AutoScreen(Screen):
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
+            # Outside the usage branches on purpose: an account whose usage is
+            # unknown still owns the claude.ai side, so the badge must not hang
+            # off whichever branch happened to run.
+            if pinned_email and acc.email == pinned_email:
+                entry.append("  · ", style=palette.muted)
+                # SET IS NOT APPLYING. This badge used to be lit by
+                # `pinned_email` alone, so it stayed green while the daemon
+                # could not mint the pinned token and every request went out
+                # unpinned — measured on the owner's laptop, with the
+                # statusline and pin-coherence agreeing with it. `False` is the
+                # only value worth shouting about; `None` means "could not
+                # tell" and must read as healthy here, same rule as
+                # `pin_is_broken`.
+                if pin_applying is False:
+                    entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
+                else:
+                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()

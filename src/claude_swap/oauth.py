@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import ssl
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -254,7 +257,9 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(
+            req, timeout=5, context=_pin_aware_ssl_context()
+        ) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -370,7 +375,9 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with urllib.request.urlopen(
+        req, timeout=5, context=_pin_aware_ssl_context()
+    ) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -378,10 +385,10 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -397,6 +404,16 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A TLS handshake the SERVER answered and we refused is not a
+        # transport failure, and calling it one sends you to DNS while the
+        # repair is a CA bundle. Measured 2026-08-17: a TLS-terminating proxy
+        # presented a CA urllib does not trust, every poll raised
+        # URLError(SSLCertVerificationError), all of it stored as "network",
+        # and one account sat unpolled for ten days with that one word as the
+        # whole record. The remedy is platform-dependent and lives in
+        # ERROR_NOTES["tls-cert"], where the operator actually reads it.
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, json.JSONDecodeError):
         return "bad-response", None
@@ -768,3 +785,318 @@ def _persist(
             f"Warning: failed to save refreshed token for account {account_num} ({email}). "
             f"If the next refresh fails, re-run `cswap --add-account` after logging in."
         )
+
+
+_BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
+
+
+_POLICY_LIMITS_URL = "https://api.anthropic.com/api/claude_code/policy_limits"
+
+
+def fetch_policy_limits(access_token: str,
+                        timeout_s: float = 10.0) -> dict | None:
+    """The org-policy document the SERVER returns for this credential.
+
+    Claude Code caches this at `<config home>/policy-limits.json` and reads it
+    once per process into a session cache; every gate check — `/remote-control`
+    among them — resolves against that copy. The fetch carries whichever
+    account is ACTIVE and the file is machine-wide, so the answer has to be
+    re-asked when the active account changes or one account's restrictions go
+    on gating every session on the machine.
+
+    ``None`` when it could not be asked, which the caller must keep distinct
+    from an empty document: ABSENT IS DENIED on the reader's side
+    (`Ms()` returns false for a gated capability when no document is present),
+    so writing nothing is never the safe default.
+    """
+    req = urllib.request.Request(_POLICY_LIMITS_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-client-platform": "cli",
+    })
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout_s, context=_pin_aware_ssl_context()
+        ) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — a switch must not fail on this
+        _logger.debug("policy_limits fetch failed: %r", e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# One entry per distinct CA state. Bounded by construction: a machine has one
+# pin CA, so this holds one context, two across a regeneration.
+# ONE SLOT, NOT A DICT. Keyed on the CA's path and mtime, so a regenerated CA
+# inserts a new entry — and the old `SSLContext`, holding a full parsed copy of
+# the system trust store (~130 roots), stayed referenced forever. In `cswap
+# tui`, the menu-bar app or a long-running `cswap auto`, repeated re-pins grew
+# it monotonically. The docstring's "bounded by construction: a machine has one
+# pin CA" is true only until the CA is regenerated, which is exactly what a
+# re-pin does.
+#
+# A single slot gives the same hit rate for the same reason the dict did — the
+# key changes only when the CA does, and when it changes the old context is
+# dead — with a ceiling of one.
+_PIN_CTX_SLOT: "tuple | None" = None
+
+
+def _pin_ca_fingerprint():
+    """What the cached context was built FOR — path and mtime, or None.
+
+    A REGENERATED CA MUST NOT KEEP THE OLD CONTEXT, which is the only way a
+    cache here can be wrong: `cswap pin` can mint a new CA at the same path,
+    and a context still trusting the old one fails every call afterwards with
+    exactly the error this helper exists to prevent. mtime answers that
+    without reading the file.
+
+    None when there is no pin at all — a real key, not an error: it caches the
+    plain default context for machines without the extra.
+    """
+    # THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
+    # "cannot ask", so the guard that used to live here is the seam's now.
+    from claude_swap import pin as _pin
+
+    ca = _pin.ca_path_for_trust()
+    if not ca:
+        return None
+    # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO PIN AT
+    # ALL, and collapsing the two hands the no-pin caller a context built for a
+    # pin. Distinct key, so each caches its own.
+    try:
+        stamp = os.stat(ca).st_mtime_ns
+    except OSError:
+        stamp = None
+    return (str(ca), stamp)
+
+
+def _pin_aware_ssl_context():
+    """A verifying context that ALSO trusts the pin's CA, if there is one.
+
+    NAMED FOR THE PROPERTY, NOT THE CALLER. It started as
+    `_bridge_ssl_context` because the bridge calls were the first to need it,
+    and this module has two more sites with the identical problem — profile
+    and usage. A helper named after its first caller is one the next caller
+    writes a second copy of.
+
+    TOKEN REFRESH IS NOT ONE OF THEM, and an earlier draft of this docstring
+    said it was, which is enough to make a reviewer file the missing `context=`
+    as a bug. The helper is only needed where the pin RE-SIGNS the host: it
+    MITMs `UPSTREAM_HOST` and blind-tunnels everything else, and
+    `OAUTH_TOKEN_URL` is on a different host, so that call is verified against
+    the real certificate by an ordinary default context. Adding ours there
+    would buy nothing and reload the system CA store on every refresh. The
+    relationship is pinned by a test rather than left here as prose, because
+    it holds between two packages and the day the pin re-signs a second host
+    it stops being true.
+
+    These calls are plain urllib through whatever proxy the session was wired
+    to. When that is the pin, it MITMs api.anthropic.com — so the default
+    context cannot verify it, every call dies CERTIFICATE_VERIFY_FAILED, and
+    `_list_bridge_sessions` swallows that to debug and returns None. That is
+    how the cloud session names stayed wrong for hours with nothing in any log.
+
+    ADD, NEVER REPLACE, and the difference is not cosmetic. `SSL_CERT_FILE`
+    REPLACES OpenSSL's file, so it is safe only where the bundle subsumes the
+    store it displaces. Measured per machine, by certificate SET:
+
+        host-a     ambient 124  bundle 126  safe
+        host-b      ambient 128  bundle 167  NOT — 27 missing
+        host-c  ambient 128  bundle   2  NOT — 128 missing
+
+    So the writer that sets it correctly refuses on both Macs, and the repair
+    stays dead there. Loading our CA into a default context keeps every
+    ambient root and needs no environment variable at all. Measured on
+    host-c, same process and proxy:
+
+        default ctx                 CERTIFICATE_VERIFY_FAILED
+        default ctx + our CA added  HTTP 200
+
+    NEVER RAISES and never returns None: with no pin installed, or an
+    unreadable CA, the caller still gets an ordinary verifying context. An
+    optional extra must not be able to break a call that worked without it.
+    """
+    # BUILT ONCE PER CA, NOT PER CALL. `create_default_context()` loads the
+    # whole system trust store (~130 certificates) and `load_verify_locations`
+    # parses ours on top — and this is on the polling path: once per account
+    # per usage poll, plus every profile fetch, every bridge listing and every
+    # rename. Nothing in the result changes unless the pin's CA file does, so
+    # the cache is keyed on that file's path and mtime and a regenerated CA
+    # invalidates it by itself.
+    global _PIN_CTX_SLOT
+
+    key = _pin_ca_fingerprint()
+    if _PIN_CTX_SLOT is not None and _PIN_CTX_SLOT[0] == key:
+        return _PIN_CTX_SLOT[1]
+
+    ctx = ssl.create_default_context()
+    from claude_swap import pin as _pin
+
+    try:
+        ca = _pin.ca_path_for_trust()
+        if ca:
+            ctx.load_verify_locations(cafile=str(ca))
+    except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
+        _logger.debug("bridge ssl context: pin CA not added: %r", e)
+    _PIN_CTX_SLOT = (key, ctx)
+    return ctx
+
+
+def _bridge_headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-client-platform": "cli",
+    }
+
+
+def _list_bridge_sessions(access_token: str) -> list[dict] | None:
+    """The account's cloud sessions, or ``None`` when the call failed.
+
+    NONE IS NOT AN EMPTY LISTING. A caller that reads a failed request as "no
+    bridges" would go on to act on no evidence; every caller here has to be
+    able to tell the two apart.
+    """
+    req = urllib.request.Request(
+        f"{_BRIDGE_SESSIONS_URL}?limit=100", headers=_bridge_headers(access_token)
+    )
+    try:
+        with urllib.request.urlopen(
+                req, timeout=10, context=_pin_aware_ssl_context()) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — cosmetic repair, never fatal
+        _logger.debug("bridge listing failed: %r", e)
+        return None
+    # SHAPED, NOT JUST PARSED, and this used to sit outside the try. A JSON
+    # array or string body — an error envelope, a captive-portal page that
+    # happens to parse — made `.get` raise AttributeError out of a function
+    # documented to return None on failure. The caller then recorded
+    # `raised:AttributeError` instead of `list-failed`, which collapses the
+    # exact distinction the (renamed, outcome) pair exists to preserve and
+    # files an ordinary transport fault under programming error.
+    if not isinstance(data, dict):
+        _logger.debug(
+            "bridge listing returned %s, not an object", type(data).__name__)
+        return None
+    items = data.get("data") or data.get("sessions") or []
+    return items if isinstance(items, list) else None
+
+
+def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
+    """Rename one cloud session. PUT, not PATCH — measured, PATCH is 405."""
+    req = urllib.request.Request(
+        f"{_BRIDGE_SESSIONS_URL}/{session_id}",
+        data=json.dumps({"title": title}).encode("utf-8"),
+        headers=_bridge_headers(access_token),
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(
+                req, timeout=10, context=_pin_aware_ssl_context()):
+            return True
+    except Exception as e:  # noqa: BLE001
+        _logger.debug("bridge rename failed for %s: %r", session_id, e)
+        return False
+
+
+#: How long the bridge-title repair may spend on PUTs in ONE pass. It runs
+#: inside `AutoSwitchEngine.tick()`, the loop body that decides when to switch
+#: before a rate-limit lockout, and each PUT carries its own 10s timeout with
+#: no cap on how many there are. Smaller than one tick's usual cost on purpose:
+#: a repair that delays the switch is worse than a repair that finishes next
+#: pass, and the cadence is 300s so there always is a next pass.
+#:
+#: THE CEILING IS THIS PLUS ONE TIMEOUT, not this. The deadline is tested
+#: BEFORE each PUT, so a PUT begun just under it still gets its full 10s and
+#: the worst case is 30s. Left that way deliberately: refusing to start a PUT
+#: that might overrun would idle the last third of every pass, and shortening
+#: the timeout to the remaining budget would report a starved PUT as a refusal
+#: and turn `all-puts-refused` into a lie about the server.
+_BRIDGE_TITLE_BUDGET_S = 20.0
+
+
+def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
+    """Put each live session's own name back on its cloud bridge.
+
+    WHY THIS EXISTS HERE AND NOT IN THE PROXY. cswap-pin already implements
+    this, and it has exactly one caller: `_sweep_bridges_after_connect`, which
+    runs when a `POST /v1/code/sessions` REACHES the proxy. So the repair is
+    triggered by the very thing it exists to survive. Measured 2026-08-17: all
+    24 claude processes carried `HTTPS_PROXY=127.0.0.1:9901` because Claude
+    Code reads the `~/.claude.json` env block once at boot and the pin wiring
+    landed after they exec'd. Nothing reached the proxy, nothing was restored,
+    and a session sat under `Fix Claude AI session naming issue` until it was
+    renamed by hand.
+
+    THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch —
+    only a listed bridge whose title the server invented, never one a human
+    typed — and duplicating that judgement here is how the two copies drift.
+    This module contributes the transport it already has, nothing more.
+
+    Returns ``(renamed, outcome)``. THE SECOND VALUE EXISTS BECAUSE THE FIRST
+    CANNOT TELL THE CASES APART: five distinct states all produced 0 — the
+    extra missing, the listing failing, the listing empty, nothing needing a
+    rename, every PUT refused — and the caller only spoke when it was
+    non-zero. Measured 2026-08-17: this ran ~20 times over 107 minutes with
+    every listing dying on CERTIFICATE_VERIFY_FAILED, and nothing anywhere
+    said so; the user found their cloud session names wrong before any log
+    did.
+
+    NEVER RAISES: the caller is `AutoSwitchEngine.tick()`, which is documented
+    "Never raises", and a cosmetic repair must not be able to end a tick that
+    was about to prevent a rate-limit lockout.
+    """
+    from claude_swap import pin as _pin
+
+    if not _pin.is_available():
+        return 0, "no-extra"
+    try:
+        sessions = _list_bridge_sessions(access_token)
+        if sessions is None:
+            # COULD NOT ASK. Distinct from an empty listing: this is the state
+            # that persisted for hours unnoticed, and it is the one worth
+            # waking someone for.
+            return 0, "list-failed"
+        if not sessions:
+            return 0, "no-bridges"
+        wanted = _pin.titles_to_restore(sessions, names)
+        if wanted is None:
+            # The extra went away between the check above and here, or the
+            # package raised. Same outcome as never having it: nothing to do.
+            return 0, "no-extra"
+        # THE ZERO-OUTCOME IS DECIDED BEFORE THE LOOP IT PRECEDES. This sat
+        # BELOW the loop, so the empty case walked a body that cannot execute
+        # before being detected and a reader had to prove the loop was a no-op
+        # to see the branch was reachable.
+        if not wanted:
+            return 0, "nothing-to-rename"
+        done = 0
+        # A DEADLINE, BECAUSE THIS RUNS INSIDE `tick()`. Each PUT carries a 10s
+        # timeout and `wanted` is unbounded, so 100 stale titles against a
+        # black-holing endpoint block the switch engine for ~1000s — on the
+        # very tick that was about to prevent a rate-limit lockout, which is
+        # the outcome moving this call into `finally` was meant to avoid. The
+        # cadence gate does not help: `_bridge_titles_next_at` is advanced
+        # before the work.
+        #
+        # LEFTOVERS ARE NOT LOST. This is a repair on a 300s cadence, so a pass
+        # that runs out of budget renames what it reached and the next one
+        # picks up the rest; the outcome says so rather than reporting a clean
+        # `renamed`.
+        deadline = time.monotonic() + _BRIDGE_TITLE_BUDGET_S
+        for sid, want in wanted:
+            if time.monotonic() >= deadline:
+                return done, f"partial-{done}-of-{len(wanted)}"
+            if _put_bridge_title(access_token, sid, want):
+                done += 1
+                _logger.info("restored the cloud title for %s to %r", sid, want)
+        if not done:
+            # Listed fine, had work, renamed none: every PUT was refused. A
+            # different fault from every other zero here.
+            return 0, "all-puts-refused"
+        return done, "renamed"
+    except Exception as e:  # noqa: BLE001 — see the docstring
+        _logger.debug("bridge title restore failed: %r", e)
+        return 0, f"raised:{type(e).__name__}"

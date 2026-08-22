@@ -400,7 +400,13 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     Claude records the logged-in account in the profile's ``.claude.json``
     ``oauthAccount`` and rewrites it on every (re-)login, so this reflects the
     profile's *current* identity — which an in-session ``/login`` can re-point
-    at a different account than the slot the profile was created for. Returns
+    at a different account than the slot the profile was created for.
+
+    THE PROFILE'S FILE, NOT THE GLOBAL ONE, and under a pin that distinction
+    decides the answer. A pin splices the pinned identity into the GLOBAL
+    ``~/.claude.json`` only, so this still reports who the profile is logged
+    in as. Read the global file here instead and every profile would report
+    the pin. Returns
     ``(email, organization_uuid)`` with ``""`` for a missing org, or ``None``
     when no identity is readable (missing dir/file/field).
     """
@@ -540,7 +546,11 @@ class SessionManager:
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
             # refresh token.
-            current = self.switcher._get_current_account()
+            # THE LOGIN, NOT THE IDENTITY FILE. Under a pin that file names
+            # the pinned account, so asking for the pinned account while
+            # another one serves took this fast path and exec'd claude with
+            # the SERVING account's environment.
+            current = self.switcher._live_login_identity()
             if current is not None and current == (email, org_uuid):
                 print(
                     dimmed(
@@ -594,7 +604,18 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
+
+        Every launch path funnels through here, so this is also where the
+        cloud pin routes the child through its proxy. Without the extra
+        installed — or with no pin set — the environment comes back unchanged;
+        an optional feature must never be able to block a launch.
         """
+        try:
+            from claude_swap import pin as _pin
+
+            env = _pin.wire_launch_env(self.switcher, env)
+        except Exception:  # noqa: BLE001 — an optional feature cannot block a launch
+            pass
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:
