@@ -34,6 +34,18 @@ uv tool upgrade claude-swap
 pipx upgrade claude-swap
 ```
 
+### Shell completions
+
+Fish completions live in [`completions/cswap.fish`](completions/cswap.fish) — every
+subcommand and flag, plus account numbers/emails completed live from `cswap list --json`.
+
+```bash
+curl -o ~/.config/fish/completions/cswap.fish \
+  https://raw.githubusercontent.com/realiti4/claude-swap/main/completions/cswap.fish
+```
+
+(fish picks up new files under `~/.config/fish/completions/` automatically, no restart needed)
+
 ## Usage
 
 ### Add your first account
