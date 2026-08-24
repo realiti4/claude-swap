@@ -36,15 +36,19 @@ pipx upgrade claude-swap
 
 ### Shell completions
 
-Fish completions live in [`completions/cswap.fish`](completions/cswap.fish) — every
-subcommand and flag, plus account numbers/emails completed live from `cswap list --json`.
+Fish completions live in [`completions/`](completions) — every subcommand and flag,
+plus account numbers, emails and aliases completed from your local account list, and
+setting keys and values for `cswap config`.
 
 ```bash
-curl -o ~/.config/fish/completions/cswap.fish \
-  https://raw.githubusercontent.com/realiti4/claude-swap/main/completions/cswap.fish
+base=https://raw.githubusercontent.com/realiti4/claude-swap/main/completions
+curl -o ~/.config/fish/completions/cswap.fish $base/cswap.fish
+curl -o ~/.config/fish/completions/claude-swap.fish $base/claude-swap.fish
 ```
 
-(fish picks up new files under `~/.config/fish/completions/` automatically, no restart needed)
+Fish picks up new files under `~/.config/fish/completions/` automatically, so there is
+nothing to restart. The second file is only needed if you use the long-form
+`claude-swap` command.
 
 ## Usage
 
