@@ -1543,3 +1543,40 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestManualSwitchResume:
+    """A human-driven switch wakes sessions the usage limit stopped.
+
+    The engine nudges from its own tick, but only while it is running — the
+    menu bar's copy can be switched off, and `cswap use` never had one. These
+    cover the CLI half of closing that gap; the two menu-bar call sites are
+    inside `MenuBarApp`, which is defined inside `run_menubar` and needs
+    `rumps`, so it has no unit tests by construction.
+    """
+
+    def _run(self, argv, slots):
+        """Run `argv` against a switcher whose live slot follows `slots`."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch(
+                 "claude_swap.session_resume.resume_after_manual_switch"
+             ) as resume, \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.current_account_number.side_effect = slots
+            cli.main()
+            return switcher_cls.return_value, resume
+
+    def test_use_resumes_stopped_sessions_after_landing(self):
+        """`cswap use 2` from slot 1 nudges, and reports where it came from."""
+        switcher, resume = self._run(
+            ["claude-swap", "--switch-to", "2"], ["1", "2"]
+        )
+        resume.assert_called_once_with(switcher, "1")
+
+    def test_bare_switch_resumes_stopped_sessions_after_landing(self):
+        """`cswap switch` rotates through switch(), not switch_to() — the
+        nudge has to hang off both or half the manual paths stay silent."""
+        switcher, resume = self._run(["claude-swap", "switch"], ["1", "2"])
+        resume.assert_called_once_with(switcher, "1")

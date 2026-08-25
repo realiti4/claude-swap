@@ -3,9 +3,14 @@
 When every account is exhausted, work in progress stops with a terminal
 rate-limit turn and nothing restarts it: the window reset arrives hours
 later, cswap switches to the recovered account, and the session sits idle
-until a human notices and presses enter. This module closes that gap —
-it records which sessions stopped while cswap was watching, and nudges
-exactly those once a switch has landed on an account with quota.
+until a human notices and presses enter. This module closes that gap.
+
+Whom to wake is decided two ways, because the two callers know different
+things. The auto-switch engine RECORDS the sessions it watched stop and
+nudges exactly those once a switch lands. A manual switch has no such
+record to draw on, so it SCANS at switch time
+(:func:`resume_after_manual_switch`) and takes its conservatism from the
+liveness filter instead.
 
 TWO Claude Code interfaces are used here, and NEITHER is a public API:
 
@@ -35,6 +40,7 @@ from pathlib import Path
 
 from claude_swap.paths import get_claude_config_home
 from claude_swap.process_detection import ClaudeSession, list_sessions
+from claude_swap.settings import load_settings
 
 _logger = logging.getLogger(__name__)
 
@@ -407,4 +413,48 @@ def resume_sessions(
             claude_dir=claude_dir,
         ):
             resumed.append(stopped)
+    return resumed
+
+
+def resume_after_manual_switch(
+    switcher, previous_account: str | None, claude_dir: Path | None = None
+) -> list[StoppedSession]:
+    """Nudge stopped sessions after a human-driven switch. Never raises.
+
+    The engine's rule is "only resume what I witnessed stopping", which it can
+    afford because it runs continuously and accumulates a record across ticks.
+    A manual switch has no such record: ``cswap use`` is a fresh process, and
+    the menu bar's copy lives inside an engine the user may have turned off —
+    which is exactly the case that stranded a session and prompted this.
+
+    So this SCANS instead of remembering, and takes its conservatism from
+    :func:`find_stopped_sessions` structurally rather than historically: the
+    process must still be running, it must still publish a socket this module
+    can speak to, and its transcript must still END in a terminal limit. A
+    session the user abandoned is not running; one they already answered by
+    hand no longer ends in a limit. Deliberately NOT time-bounded — a session
+    stopped days ago by a weekly limit is the case this feature exists for.
+
+    ``previous_account`` is the slot that was live before the switch. Both the
+    CLI and the menu bar report success for a switch onto the already-active
+    account, so comparing slots — not the call's return value — is what tells
+    a real landing from that no-op. Nothing changed means no quota appeared,
+    which means nothing to wake.
+    """
+    try:
+        if switcher.current_account_number() == previous_account:
+            return []
+        if not load_settings(switcher.backup_dir).resume_stopped_sessions:
+            return []
+        resumed = resume_sessions(find_stopped_sessions(claude_dir), claude_dir)
+    except Exception as e:
+        # Reading Claude Code's undocumented transcript/session state must
+        # cost the nudge, never the switch the user actually asked for.
+        _logger.warning("Could not resume stopped sessions: %r", e)
+        return []
+    if resumed:
+        _logger.info(
+            "Nudged %d stopped session(s) after the switch: %s",
+            len(resumed), ", ".join(s.session_id for s in resumed),
+        )
     return resumed

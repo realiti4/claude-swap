@@ -10,6 +10,7 @@ dropped.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import socket
@@ -28,6 +29,7 @@ from claude_swap.session_resume import (
     send_peer_message,
     transcript_path,
 )
+from claude_swap.settings import set_setting
 
 
 # --- real captured shapes ------------------------------------------------------
@@ -503,3 +505,112 @@ def test_resume_reports_only_the_sessions_that_accepted(tmp_path: Path, short_so
     thread.join(timeout=5)
 
     assert [s.session_id for s in resumed] == ["a"]
+
+
+# --- manual switches -----------------------------------------------------------
+
+# The engine remembers what it witnessed across ticks; a human-driven switch
+# has no such memory (`cswap use` is a fresh process, and the menu bar's record
+# lives inside an engine that may not be running at all). So the manual path
+# SCANS at switch time, and leans on the liveness filter in
+# `find_stopped_sessions` — process alive, socket published, transcript tail
+# still ending in a terminal limit — for the safety the engine gets from
+# having watched the stop happen.
+
+
+class _StubSwitcher:
+    """The two switcher members `resume_after_manual_switch` reads.
+
+    A real `ClaudeAccountSwitcher` needs a seeded account store, credentials,
+    and a platform backend — none of which this function touches. It asks the
+    switcher exactly two things: where settings live, and which slot is live
+    now.
+    """
+
+    def __init__(self, backup_dir: Path, account: str | None):
+        self.backup_dir = backup_dir
+        self._account = account
+
+    def current_account_number(self) -> str | None:
+        return self._account
+
+
+def _resume_enabled(backup_dir: Path) -> None:
+    set_setting(backup_dir, "autoswitch.resumeStoppedSessions", "true")
+
+
+@requires_af_unix
+def test_a_manual_switch_nudges_a_stopped_session(
+    tmp_path: Path, short_sock: Path, monkeypatch
+):
+    """The whole point: a human switch reaches the same inbox the engine does."""
+    _resume_enabled(tmp_path)
+    _write_transcript(tmp_path, [{"type": "user"}, LIMIT_STOP])
+    monkeypatch.setattr(
+        session_resume,
+        "list_sessions",
+        lambda d=None: [_session(tmp_path, messaging_socket_path=str(short_sock))],
+    )
+    received: list[bytes] = []
+    thread = _listener(short_sock, received)
+
+    resumed = session_resume.resume_after_manual_switch(
+        _StubSwitcher(tmp_path, "2"), "1", tmp_path
+    )
+    thread.join(timeout=5)
+
+    assert [s.session_id for s in resumed] == ["sess-1"]
+    assert session_resume.RESUME_MESSAGE.encode() in b"".join(received)
+
+
+def test_a_manual_switch_that_landed_nowhere_nudges_nobody(
+    tmp_path: Path, monkeypatch
+):
+    """`cswap use 2` while already on 2 changes no quota, so it wakes nothing.
+
+    Both the CLI and the menu bar report success for that no-op, so the slot
+    comparison — not the call's return value — is what tells them apart.
+    """
+    _resume_enabled(tmp_path)
+    _write_transcript(tmp_path, [LIMIT_STOP])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+
+    assert session_resume.resume_after_manual_switch(
+        _StubSwitcher(tmp_path, "2"), "2", tmp_path
+    ) == []
+
+
+def test_a_manual_switch_does_not_nudge_when_resume_is_off(
+    tmp_path: Path, monkeypatch
+):
+    """`resumeStoppedSessions` gates the manual path exactly as it gates the
+    engine's — it is one opt-in, not two."""
+    _write_transcript(tmp_path, [LIMIT_STOP])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+
+    assert session_resume.resume_after_manual_switch(
+        _StubSwitcher(tmp_path, "2"), "1", tmp_path
+    ) == []
+
+
+def test_a_broken_scan_never_fails_the_switch(tmp_path: Path, monkeypatch, caplog):
+    """Scanning reads undocumented Claude Code state. A shape change there must
+    cost the nudge, never the switch the user actually asked for."""
+    _resume_enabled(tmp_path)
+
+    def boom(_d=None):
+        raise RuntimeError("transcript shape changed")
+
+    monkeypatch.setattr(session_resume, "find_stopped_sessions", boom)
+
+    with caplog.at_level(logging.WARNING):
+        resumed = session_resume.resume_after_manual_switch(
+            _StubSwitcher(tmp_path, "2"), "1", tmp_path
+        )
+
+    assert resumed == []
+    assert "transcript shape changed" in caplog.text

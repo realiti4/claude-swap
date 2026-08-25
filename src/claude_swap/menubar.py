@@ -470,6 +470,7 @@ def run(switcher) -> int:
         AppKit.NSApplicationActivationPolicyAccessory
     )
 
+    from claude_swap import session_resume
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
@@ -850,17 +851,37 @@ def run(switcher) -> int:
                 "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
             )
 
+        def _resume_stopped_sessions(self, before):
+            """Wake sessions the usage limit stopped, after a switch from the menu.
+
+            The engine nudges from its own tick, but a user who has auto-switch
+            turned off — and is therefore switching by hand — has no engine
+            running to do it. Without this, `resumeStoppedSessions` is inert for
+            exactly the person driving the switches.
+            """
+            resumed = session_resume.resume_after_manual_switch(self.switcher, before)
+            if resumed:
+                rumps.notification(
+                    "claude-swap",
+                    "Resumed stopped sessions",
+                    f"{len(resumed)} session(s) stopped by the usage limit were nudged.",
+                )
+
         def _make_switch_to(self, num):
             def cb(_sender):
+                before = self.switcher.current_account_number()
                 if self._guard(lambda: self.switcher.switch_to(str(num))):
                     self._notify_switched()
+                    self._resume_stopped_sessions(before)
                     self.refresh_async()
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
+                before = self.switcher.current_account_number()
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
                     self._notify_switched()
+                    self._resume_stopped_sessions(before)
                     self.refresh_async()
             return cb
 

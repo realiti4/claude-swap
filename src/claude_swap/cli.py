@@ -903,6 +903,31 @@ def _use_native_tls() -> None:
         pass
 
 
+def _resume_stopped_sessions(
+    switcher: ClaudeAccountSwitcher, before: str | None, payload: dict | None
+) -> None:
+    """Wake sessions the usage limit stopped, now that this switch has landed.
+
+    The auto-switch engine does this from its own tick, but only while it is
+    running — the menu bar's engine can be turned off, and a one-shot `cswap
+    use` never had one. Without this, `autoswitch.resumeStoppedSessions` is
+    silently inert for every human-driven switch.
+
+    Imported lazily: this reads Claude Code's session directory and transcripts,
+    which no other subcommand needs and every subcommand would otherwise pay
+    for at import time.
+    """
+    from claude_swap import session_resume
+
+    resumed = session_resume.resume_after_manual_switch(switcher, before)
+    if not resumed:
+        return
+    if payload is not None:
+        payload["resumedSessions"] = [s.session_id for s in resumed]
+    else:
+        print(f"Resumed {len(resumed)} session(s) stopped by the usage limit")
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1314,19 +1339,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             else:
                 models = parse_model_names(load_settings(switcher.backup_dir).model)
                 model_source = "autoswitch.model" if models else None
+            before = switcher.current_account_number()
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
             )
+            _resume_stopped_sessions(switcher, before, payload)
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
+            before = switcher.current_account_number()
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+            _resume_stopped_sessions(switcher, before, payload)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

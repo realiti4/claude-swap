@@ -256,7 +256,36 @@ class CswapApp(App):
 
     def _action_blocking(self, label: str, fn, show_output: bool) -> None:
         result = run_action(fn)
+        self._resume_stopped_sessions(result)
         self.call_from_thread(self._action_done, label, result, show_output)
+
+    def _resume_stopped_sessions(self, result: ActionResult) -> None:
+        """Wake sessions the usage limit stopped, when this action was a switch
+        that landed.
+
+        Called from the worker thread on purpose: a nudge is socket I/O with a
+        per-session timeout, and the TUI must not block on it.
+
+        Every TUI action funnels through here, so the payload does the
+        filtering — ``switched`` is authoritative (these calls all pass
+        ``json_output=True``), and it carries the slot we came FROM, which is
+        what the CLI and menu bar have to probe for because their non-JSON
+        calls report an already-active no-op as plain success.
+        """
+        payload = result.payload or {}
+        if not result.ok or not payload.get("switched"):
+            return
+        from claude_swap import session_resume
+
+        resumed = session_resume.resume_after_manual_switch(
+            self.switcher, (payload.get("from") or {}).get("number")
+        )
+        if resumed:
+            self.call_from_thread(
+                self.notify,
+                f"Nudged {len(resumed)} session(s) stopped by the usage limit",
+                title="Resumed",
+            )
 
     def _action_done(
         self, label: str, result: ActionResult, show_output: bool
