@@ -3421,6 +3421,48 @@ class TestResumeStoppedSessions:
         h.tick_with_usage({"2": _usage(100), "1": _usage(0)})     # ordinary switch
         assert len(calls) == 1, "re-nudged a session that had already resumed"
 
+    def test_a_session_someone_else_already_woke_is_not_nudged_again(
+        self, temp_home, monkeypatch
+    ):
+        """The record says a session stopped; it does not say it is STILL
+        stopped.
+
+        Manual switches (`cswap use`, the menu bar, the TUI) nudge from a scan
+        of their own, and they can reach a session this engine also has
+        recorded — the user switches by hand while the engine is between
+        ticks. Nudging the record unconditionally then delivers a second
+        message to a session that is already working again.
+
+        A fresh scan is the arbiter: once a nudge lands, Claude Code appends a
+        user turn, so the transcript no longer ends in a limit and the session
+        drops out of `find_stopped_sessions`. Same guard covers a user who
+        pressed enter themselves.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        scan = [stopped]
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: list(scan)
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})   # record
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # switch
+        # Between the switch and the verify tick, a manual switch nudged it
+        # and it went back to work: it no longer reads as stopped.
+        scan.clear()
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # verify tick
+
+        assert [s.session_id for c in calls for s in c] == [], (
+            "nudged a session that had already been woken by a manual switch"
+        )
+
     def test_a_scan_failure_never_breaks_the_tick(self, temp_home, monkeypatch):
         """The scan reads undocumented Claude Code state. A shape change there
         must cost the resume feature, not the loop that keeps the user

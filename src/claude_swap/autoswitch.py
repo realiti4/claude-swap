@@ -2324,7 +2324,18 @@ class AutoSwitchEngine:
             # rather than act on a setting the user has since revoked.
             return
         try:
-            resumed = session_resume.resume_sessions(pending)
+            # The record says these STOPPED; it does not say they are still
+            # stopped. A manual switch (`cswap use`, the menu bar, the TUI)
+            # nudges from a scan of its own and can reach a session recorded
+            # here while the engine is between ticks — and a user can simply
+            # press enter. Either way Claude Code appends a user turn, so the
+            # transcript stops ending in a limit and a fresh scan no longer
+            # lists it. Intersecting with that scan is what keeps the second
+            # nudge from landing in a session already back at work.
+            still = {s.session_id for s in session_resume.find_stopped_sessions()}
+            resumed = session_resume.resume_sessions(
+                [s for s in pending if s.session_id in still]
+            )
         except Exception as e:
             _logger.warning("Could not resume stopped sessions: %r", e)
             return
