@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +25,15 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 # data migration against real accounts (touching the real Keychain on macOS). An empty,
 # isolated HOME has no ``sequence.json`` → the migration skips before any Keychain
 # access, and no ``.claude.json`` → no account to read.
-_ISOLATED_HOME = tempfile.mkdtemp(prefix="cswap-subproc-home-")
+# Allocated under pytest's basetemp so its own retention reclaims it, rather
+# than a sweep at exit that a signal-killed worker never reaches.
+_ISOLATED_HOME: str | None = None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_subprocess_home(tmp_path_factory):
+    global _ISOLATED_HOME
+    _ISOLATED_HOME = str(tmp_path_factory.mktemp("subproc-home"))
 
 
 def _subprocess_env(**extra: str) -> dict[str, str]:
@@ -40,6 +47,8 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
     env = {**os.environ, **extra}
     env["PYTHONPATH"] = _SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
     if "HOME" not in extra:
+        # Falling through here would point the child at the real HOME.
+        assert _ISOLATED_HOME is not None, "_isolated_subprocess_home did not run"
         env["HOME"] = _ISOLATED_HOME
         env["USERPROFILE"] = _ISOLATED_HOME
     elif "USERPROFILE" not in extra:
@@ -1580,3 +1589,29 @@ class TestManualSwitchResume:
         nudge has to hang off both or half the manual paths stay silent."""
         switcher, resume = self._run(["claude-swap", "switch"], ["1", "2"])
         resume.assert_called_once_with(switcher, "1")
+
+
+def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
+    """Import must allocate nothing; the fixture must allocate inside basetemp.
+
+    The child gets a private TMPDIR of its own rather than watching the shared
+    system one, which several checkouts write to concurrently. Both halves are
+    needed: re-adding the module-level ``mkdtemp`` is caught only by the empty
+    private tmp, and a fixture allocating outside basetemp only by containment.
+    """
+    child_tmp = tmp_path / "childtmp"
+    child_tmp.mkdir()
+    child = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]); import tests.test_cli",
+         str(Path(__file__).resolve().parent.parent)],
+        capture_output=True, text=True,
+        env=_subprocess_env(TMPDIR=str(child_tmp)), timeout=120,
+    )
+    assert child.returncode == 0, child.stderr
+    allocated = list(child_tmp.iterdir())
+    assert not allocated, f"import allocated {[a.name for a in allocated]}"
+
+    home = Path(_subprocess_env()["HOME"])
+    assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
+    assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
