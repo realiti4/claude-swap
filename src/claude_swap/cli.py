@@ -594,6 +594,7 @@ Examples:
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
+  cswap auto --notify              # desktop notification on switch/exhaustion
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
 
@@ -666,6 +667,16 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Send a desktop notification when the engine switches accounts, "
+            "quarantines one, or finds all exhausted (default: off; the "
+            "menu bar already notifies on its own)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -698,10 +709,15 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        emit = jsonl_emit if args.json else human_emit
+        if settings.notify:
+            from claude_swap.notifications import make_notifying_emit
+
+            emit = make_notifying_emit(emit)
         engine = AutoSwitchEngine(
             switcher,
             settings,
-            jsonl_emit if args.json else human_emit,
+            emit,
             dry_run=args.dry_run,
         )
 
