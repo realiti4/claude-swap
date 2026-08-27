@@ -30,6 +30,13 @@ which would fork history rather than share it. If the profile already
 accumulated its own history, it is merged into ``~/.claude`` first so nothing
 disappears from ``--resume``.
 
+Plugin sharing (``--share-plugins``, opt-in): additionally links ``plugins/``
+(the install store — installed plugins, marketplaces, per-plugin data) from
+``~/.claude``, so a plugin installed or updated in any account is available
+in all of them. POSIX-only, like history. If the profile already accumulated
+its own store, plugins the source lacks are merged into ``~/.claude`` first
+(source wins conflicts) so nothing is lost.
+
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 """
@@ -53,6 +60,7 @@ from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    LockError,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
@@ -67,10 +75,11 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
-# Deliberately excludes anything account- or instance-scoped: plugins/,
-# sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
-# telemetry. projects/ and history.jsonl are per-account by default and move
-# to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
+# Deliberately excludes anything account- or instance-scoped: sessions/,
+# ide/, .claude.json, .credentials.json, statsig/ and other telemetry.
+# projects/ and history.jsonl are per-account by default and move to
+# HISTORY_ITEMS sharing only with the opt-in --share-history flag; plugins/
+# likewise moves to PLUGIN_ITEMS sharing only with --share-plugins.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
 SHARED_ITEMS = (
@@ -88,6 +97,14 @@ HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
 )
+
+# The plugin store linked additionally under --share-plugins: one store
+# (installed plugins, marketplaces, per-plugin data) for every account.
+# POSIX symlinks only, same reason as HISTORY_ITEMS. Plugin ENABLEMENT
+# already travels with settings.json (`enabledPlugins`) under plain --share;
+# this flag shares the install store those entries point at, closing the
+# gap where a profile shows a plugin as enabled but has no copy of it.
+PLUGIN_ITEMS = ("plugins",)
 
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
@@ -204,6 +221,15 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
 _BOOTSTRAP_LOCK_TIMEOUT = 30.0
+
+# Serializes writers of the SHARED plugin store's registry files. The
+# lock-free last-writer-wins posture of the rest of the share sync is safe
+# only for symlinks, which self-heal next launch; a lost registry update
+# after the losing merge already removed its profile store has nothing left
+# to heal from. Not the backup-dir lock: _sync_sharing runs both under it
+# (bootstrap) and outside it (reuse), and FileLock is non-reentrant.
+_PLUGINS_STORE_LOCK = "plugins-share.lock"
+_PLUGINS_STORE_LOCK_TIMEOUT = 30.0
 
 
 def slugify_email(email: str) -> str:
@@ -507,6 +533,7 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        share_plugins: bool = False,
         require_session: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
@@ -527,6 +554,12 @@ class SessionManager:
                 "--share-history is not supported on Windows yet: sharing uses "
                 "re-synced copies there, which would fork the history instead "
                 "of sharing it."
+            )
+        if share_plugins and self.switcher.platform == Platform.WINDOWS:
+            raise SessionError(
+                "--share-plugins is not supported on Windows yet: sharing uses "
+                "re-synced copies there, which would fork the plugin store "
+                "instead of sharing it."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -575,7 +608,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, share_plugins
         )
 
         print(
@@ -639,7 +672,11 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        share_plugins: bool = False,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -656,7 +693,7 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, share_plugins)
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
@@ -758,11 +795,11 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                self._sync_sharing(session_dir, share, share_history, share_plugins)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, share_plugins)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
@@ -1016,14 +1053,19 @@ class SessionManager:
     # -- sharing ---------------------------------------------------------
 
     def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
+        self,
+        session_dir: Path,
+        share: bool,
+        share_history: bool = False,
+        share_plugins: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
         ``share`` governs SHARED_ITEMS (customizations) and the mcpServers
         mirror (see ``_sync_mcp_servers`` — its --no-share removal is gated
         on the adoption marker); ``share_history`` governs HISTORY_ITEMS
-        (conversation history) — independent concerns, so ``--no-share
+        (conversation history) and ``share_plugins`` PLUGIN_ITEMS (the
+        plugin store) — independent concerns, so ``--no-share
         --share-history`` gives a bare profile with unified history.
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
@@ -1036,12 +1078,15 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
-        # History links are POSIX-only (run() rejects the flag on Windows;
-        # this also drops any links left by a POSIX→Windows profile move).
+        # History and plugin links are POSIX-only (run() rejects the flags on
+        # Windows; this also drops links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+            share_plugins = False
+        active_items = (
+            (SHARED_ITEMS if share else ())
+            + (HISTORY_ITEMS if share_history else ())
+            + (PLUGIN_ITEMS if share_plugins else ())
         )
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
@@ -1049,14 +1094,36 @@ class SessionManager:
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
-        # For history items that holds even when the manifest claims them:
-        # a stale manifest (lock-free launches race) must never be able to
-        # delete real conversation history — only ever unlink symlinks.
+        # For history and plugin items that holds even when the manifest
+        # claims them: a stale manifest (lock-free launches race) must never
+        # be able to delete real conversation history or a real plugin store
+        # — only ever unlink symlinks.
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if (
+                    name in HISTORY_ITEMS + PLUGIN_ITEMS
+                    and dest.exists()
+                    and not dest.is_symlink()
+                ):
                     continue
+                if name in PLUGIN_ITEMS and dest.is_symlink():
+                    # Claude wrote registry paths spelled through this link
+                    # (see _normalize_registry_paths); removing it before
+                    # they are re-spelled would orphan those entries in the
+                    # SHARED store for every account. If the heal cannot
+                    # run, keep the link and retry next launch.
+                    src = Path.home() / ".claude" / name
+                    try:
+                        points_home = dest.resolve() == src.resolve()
+                    except OSError:
+                        continue
+                    if points_home:
+                        try:
+                            with self._plugins_store_lock():
+                                self._normalize_registry_paths(src, dest)
+                        except (LockError, OSError):
+                            continue
                 self._remove_managed(dest)
         if not active_items:
             manifest_path.unlink(missing_ok=True)
@@ -1070,6 +1137,11 @@ class SessionManager:
             dest = session_dir / name
 
             if name in HISTORY_ITEMS and not self._prepare_history_share(
+                src, dest, session_dir
+            ):
+                continue
+
+            if name in PLUGIN_ITEMS and not self._prepare_plugins_share(
                 src, dest, session_dir
             ):
                 continue
@@ -1426,13 +1498,323 @@ class SessionManager:
                     f.write("\n".join(lines) + "\n")
             dest.unlink()
 
+    def _prepare_plugins_share(
+        self, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Make the plugin store linkable; returns False to skip this launch.
+
+        Same two departures from a plain shared item as history: the profile
+        may already hold its own plugin store (merged into ``~/.claude``,
+        never discarded — the generic loop would just refuse), and the share
+        source may not exist yet (created empty so there is something to
+        link). A real store is merged even when the manifest claims the
+        entry is managed, for the same stale-manifest reason as history.
+        """
+        if dest.is_symlink():
+            try:
+                already_shared = dest.resolve() == src.resolve()
+            except OSError:
+                return False
+            if already_shared:
+                # Steady state. Claude running in this profile records
+                # registry paths spelled through its own CLAUDE_CONFIG_DIR
+                # — ``<session_dir>/plugins/…`` — which resolve only while
+                # the link exists. Re-spell them at the source so
+                # toggle-off or profile removal cannot orphan them.
+                self._locked_registry_heal(src, dest)
+                return True
+            if dest.exists():
+                # A live symlink to some OTHER store is still the profile's
+                # store; repointing it (the generic loop's adopt) would
+                # abandon that store unmerged. Merging through it is not
+                # obviously right either — leave the decision to the user.
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name}: the profile's "
+                        f"{dest.name} is a symlink to another store — "
+                        "remove it (or merge it yourself) to share plugins."
+                    )
+                )
+                return False
+            return True  # dangling link: nothing behind it; loop repoints
+        if dest.exists() and not dest.is_dir():
+            print(
+                dimmed(
+                    f"Not sharing {dest.name}: the profile has a "
+                    f"non-directory at {dest.name}."
+                )
+            )
+            return False
+        if dest.exists():
+            # Merging moves the store out from under any claude still running
+            # in this profile, so only migrate when the profile is quiescent.
+            if not profile_is_quiescent(session_dir):
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name} yet: another session is "
+                        "using this profile — retrying on the next launch."
+                    )
+                )
+                return False
+            try:
+                with self._plugins_store_lock():
+                    self._merge_plugins_into_source(src, dest)
+            except LockError:
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name} yet: another launch is "
+                        "merging a plugin store — retrying on the next "
+                        "launch."
+                    )
+                )
+                return False
+            except OSError as e:
+                self._logger.warning(
+                    f"Could not merge {dest.name} into {src}: {e}"
+                )
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name}: merging the profile's "
+                        "existing plugin store failed (see log)."
+                    )
+                )
+                return False
+            print(
+                dimmed(
+                    f"Merged the profile's plugin store into {src} — "
+                    "plugins are now shared."
+                )
+            )
+        if not src.exists():
+            try:
+                _mkdir_private(src)
+            except OSError as e:
+                self._logger.warning(f"Could not create {src}: {e}")
+                return False
+        return True
+
+    def _plugins_store_lock(self) -> FileLock:
+        return FileLock(
+            self.switcher.backup_dir / _PLUGINS_STORE_LOCK,
+            timeout=_PLUGINS_STORE_LOCK_TIMEOUT,
+        )
+
+    def _locked_registry_heal(self, src: Path, dest: Path) -> None:
+        """Best-effort ``_normalize_registry_paths`` under the store lock."""
+        try:
+            with self._plugins_store_lock():
+                self._normalize_registry_paths(src, dest)
+        except (LockError, OSError) as e:
+            self._logger.warning(
+                f"Could not re-spell shared plugin registry paths: {e}"
+            )
+
+    def _normalize_registry_paths(self, src: Path, dest: Path) -> None:
+        """Re-spell store paths recorded through a profile's link.
+
+        A pure registry rewrite — every ``dest``-spelled path and its
+        ``src``-spelled equivalent name the same file while the link exists
+        (and after an unlink only the ``src`` spelling still resolves, which
+        is exactly why the rewrite must happen). ``_adopt_entry_paths`` does
+        the rewriting; its copy step no-ops because the target already
+        exists. No-write when nothing is dest-spelled, which is the steady
+        state.
+        """
+        for filename, entries_key, path_keys in (
+            ("installed_plugins.json", "plugins", ("installPath",)),
+            ("known_marketplaces.json", None, ("installLocation",)),
+        ):
+            src_file = src / filename
+            doc = self._load_json_object(src_file)
+            if doc is None:
+                continue
+            mapping = doc.get(entries_key) if entries_key is not None else doc
+            if not isinstance(mapping, dict):
+                continue
+            changed = False
+            for name, entry in mapping.items():
+                adopted = self._adopt_entry_paths(entry, src, dest, path_keys)
+                if adopted != entry:
+                    mapping[name] = adopted
+                    changed = True
+            if changed:
+                atomic_write_json(src_file, doc)
+
+    def _merge_plugins_into_source(self, src: Path, dest: Path) -> None:
+        """Move the profile's own plugin store at ``dest`` into ``src``.
+
+        The merge is additive with source-wins conflicts: plugins and marketplaces
+        the source already has keep the source's copy (the store's own
+        auto-update converges versions), ones only the profile has are copied
+        over with their registry entries re-pointed at ``src``. Per-plugin
+        ``data/`` merges the same way; instance-scoped artifacts (catalog
+        cache, sweep timestamps, blocklist) follow source-wins and are
+        otherwise dropped. Registry-driven copying is the single path even
+        into a fresh ``src`` — a wholesale move would carry ``installPath``
+        values that still point at the removed profile dir. Any failure
+        raises OSError with copied entries left in place — the merge is
+        idempotent, so the next launch resumes where this one stopped.
+        ``dest`` is removed only after everything merged.
+        """
+        _mkdir_private(src)
+        self._merge_plugin_registry(
+            src,
+            dest,
+            "installed_plugins.json",
+            "plugins",
+            path_keys=("installPath",),
+        )
+        self._merge_plugin_registry(
+            src,
+            dest,
+            "known_marketplaces.json",
+            None,
+            path_keys=("installLocation",),
+        )
+
+        data_src, data_dest = src / "data", dest / "data"
+        # Never walk a symlinked data/: moving children would drain the
+        # link's TARGET, which is not this profile's data to take.
+        if data_dest.is_dir() and not data_dest.is_symlink():
+            _mkdir_private(data_src)
+            for child in sorted(data_dest.iterdir()):
+                target = data_src / child.name
+                if not target.exists():
+                    shutil.move(str(child), str(target))
+        shutil.rmtree(dest)
+
+    @staticmethod
+    def _merge_plugin_registry(
+        src: Path,
+        dest: Path,
+        filename: str,
+        entries_key: str | None,
+        path_keys: tuple[str, ...],
+    ) -> None:
+        """Union one registry file (and the content its entries point at).
+
+        ``entries_key`` names the mapping inside the JSON document
+        (``"plugins"``), or ``None`` when the document root is the mapping
+        (``known_marketplaces.json``). Only names missing from the source are
+        adopted; each adopted entry has any ``path_keys`` path that lives
+        under ``dest`` copied to the same relative location under ``src`` and
+        rewritten to point there. A source file that exists but will not
+        parse raises OSError: overwriting it would trade a recoverable file
+        for a silent loss, and skipping the launch is cheap.
+        """
+        dest_doc = SessionManager._load_json_object(dest / filename)
+        if dest_doc is None:
+            return  # nothing mergeable on the profile side
+        src_file = src / filename
+        if src_file.exists():
+            src_doc = SessionManager._load_json_object(src_file)
+            if src_doc is None:
+                raise OSError(f"{src_file} exists but is not a JSON object")
+        elif entries_key is None:
+            src_doc = {}  # the document root IS the mapping — seed it empty
+        else:
+            src_doc = {k: v for k, v in dest_doc.items() if k != entries_key}
+            src_doc[entries_key] = {}
+
+        if entries_key is not None:
+            src_map = src_doc.setdefault(entries_key, {})
+            dest_map = dest_doc.get(entries_key, {})
+        else:
+            src_map, dest_map = src_doc, dest_doc
+        if not isinstance(src_map, dict) or not isinstance(dest_map, dict):
+            raise OSError(f"{filename}: registry mapping is not an object")
+
+        changed = False
+        for name, entry in dest_map.items():
+            if name in src_map:
+                existing = src_map[name]
+                if isinstance(existing, list) and isinstance(entry, list):
+                    # A name on both sides can still hold DISJOINT installs:
+                    # entries are per-scope (user vs project@path). Union by
+                    # scope identity; genuine overlaps keep the shared copy.
+                    have = {
+                        (e.get("scope"), e.get("projectPath"))
+                        for e in existing
+                        if isinstance(e, dict)
+                    }
+                    extra = [
+                        e
+                        for e in entry
+                        if isinstance(e, dict)
+                        and (e.get("scope"), e.get("projectPath")) not in have
+                    ]
+                    if extra:
+                        src_map[name] = existing + [
+                            SessionManager._adopt_entry_paths(
+                                e, src, dest, path_keys
+                            )
+                            for e in extra
+                        ]
+                        changed = True
+                continue
+            src_map[name] = SessionManager._adopt_entry_paths(
+                entry, src, dest, path_keys
+            )
+            changed = True
+        if changed or not src_file.exists():
+            atomic_write_json(src_file, src_doc)
+
+    @staticmethod
+    def _adopt_entry_paths(entry, src: Path, dest: Path, path_keys: tuple[str, ...]):
+        """Copy an entry's dest-relative content to ``src`` and re-point it.
+
+        Entries are dicts or lists of dicts (per-scope installs); anything
+        else passes through untouched. Paths outside ``dest`` (external
+        directory marketplaces) stay as they are. Copies are staged and
+        renamed into place, so an existing target is complete by
+        construction and safe to keep on a resumed merge — adopting an
+        interrupted copy would end with ``dest``'s good copy removed and
+        only the truncated one left.
+        """
+        if isinstance(entry, list):
+            return [
+                SessionManager._adopt_entry_paths(e, src, dest, path_keys)
+                for e in entry
+            ]
+        if not isinstance(entry, dict):
+            return entry
+        adopted = dict(entry)
+        for key in path_keys:
+            raw = adopted.get(key)
+            if not isinstance(raw, str):
+                continue
+            # normpath first: is_relative_to is lexical, and a `..` segment
+            # would pass the guard yet land the copy outside the store.
+            path = Path(os.path.normpath(raw))
+            if not path.is_relative_to(dest):
+                continue
+            target = src / path.relative_to(dest)
+            if path.exists() and not target.exists():
+                _mkdir_private(target.parent)
+                staging = target.with_name(target.name + ".cswap-partial")
+                if staging.is_dir() and not staging.is_symlink():
+                    shutil.rmtree(staging)  # a previous attempt's leftover
+                else:
+                    staging.unlink(missing_ok=True)
+                if path.is_dir():
+                    shutil.copytree(path, staging, symlinks=True)
+                else:
+                    shutil.copy2(path, staging)
+                os.replace(staging, target)
+            adopted[key] = str(target)
+        return adopted
+
     @staticmethod
     def _read_manifest(manifest_path: Path) -> list[str]:
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             items = data.get("items", [])
             # Only ever act on names we could have created.
-            return [i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS]
+            return [
+                i
+                for i in items
+                if i in SHARED_ITEMS + HISTORY_ITEMS + PLUGIN_ITEMS
+            ]
         except (OSError, json.JSONDecodeError, AttributeError):
             return []
 

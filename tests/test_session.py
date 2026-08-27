@@ -20,6 +20,7 @@ from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
+    LockError,
     SessionError,
     ValidationError,
 )
@@ -1986,6 +1987,506 @@ class TestShareHistoryWindows:
 
         with pytest.raises(SessionError, match="Windows"):
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
+
+
+# ---------------------------------------------------------------------------
+# plugin-store sharing (--share-plugins)
+# ---------------------------------------------------------------------------
+
+
+def _seed_plugin_store(root: Path, plugins: dict, marketplaces: dict) -> None:
+    """A minimal but shape-faithful plugin store under ``root``."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": plugins})
+    )
+    (root / "known_marketplaces.json").write_text(json.dumps(marketplaces))
+
+
+def _plugin_entry(store: Path, marketplace: str, name: str, version: str) -> list:
+    install = store / "cache" / marketplace / name / version
+    install.mkdir(parents=True, exist_ok=True)
+    (install / "plugin.json").write_text(json.dumps({"name": name}))
+    return [{"scope": "user", "version": version, "installPath": str(install)}]
+
+
+def _marketplace_entry(store: Path, name: str) -> dict:
+    location = store / "marketplaces" / name
+    location.mkdir(parents=True, exist_ok=True)
+    (location / "marketplace.json").write_text("{}")
+    return {"source": {"source": "github", "repo": f"x/{name}"},
+            "installLocation": str(location)}
+
+
+@pytest.fixture
+def plugins_setup(share_setup, temp_home: Path):
+    """share_setup plus a populated plugin store on both sides."""
+    source, session_dir, mgr = share_setup
+    src_store = source / "plugins"
+    _seed_plugin_store(
+        src_store,
+        {"alpha@mp": _plugin_entry(src_store, "mp", "alpha", "2.0.0")},
+        {"mp": _marketplace_entry(src_store, "mp")},
+    )
+    dest_store = session_dir / "plugins"
+    _seed_plugin_store(
+        dest_store,
+        {
+            "alpha@mp": _plugin_entry(dest_store, "mp", "alpha", "1.0.0"),
+            "beta@mp": _plugin_entry(dest_store, "mp", "beta", "3.1.0"),
+        },
+        {
+            "mp": _marketplace_entry(dest_store, "mp"),
+            "other": _marketplace_entry(dest_store, "other"),
+        },
+    )
+    return source, session_dir, mgr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plugin sharing is POSIX-only")
+class TestSharePluginsPosix:
+    def test_not_shared_by_default(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert not (session_dir / "plugins").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_links_plugins_dir(self, share_setup):
+        source, session_dir, mgr = share_setup
+        src_store = source / "plugins"
+        _seed_plugin_store(src_store, {}, {})
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert (session_dir / "plugins").readlink() == src_store
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" in manifest["items"]
+
+    def test_creates_missing_source(self, share_setup):
+        source, session_dir, mgr = share_setup  # no plugins/ in ~/.claude yet
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert (source / "plugins").is_dir()
+        assert (source / "plugins").stat().st_mode & 0o777 == 0o700
+        assert (session_dir / "plugins").readlink() == source / "plugins"
+
+    def test_merges_missing_plugins_and_repoints_paths(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        src_store = source / "plugins"
+        registry = json.loads(
+            (src_store / "installed_plugins.json").read_text()
+        )["plugins"]
+        # Source's alpha won; profile's beta was adopted and re-pointed.
+        assert registry["alpha@mp"][0]["version"] == "2.0.0"
+        beta = registry["beta@mp"][0]
+        assert beta["installPath"] == str(
+            src_store / "cache" / "mp" / "beta" / "3.1.0"
+        )
+        assert (
+            Path(beta["installPath"]) / "plugin.json"
+        ).read_text() == json.dumps({"name": "beta"})
+        # And the profile now links to the shared store.
+        assert (session_dir / "plugins").readlink() == src_store
+
+    def test_merge_adopts_missing_marketplace(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        src_store = source / "plugins"
+        markets = json.loads(
+            (src_store / "known_marketplaces.json").read_text()
+        )
+        assert markets["other"]["installLocation"] == str(
+            src_store / "marketplaces" / "other"
+        )
+        assert (src_store / "marketplaces" / "other" / "marketplace.json").exists()
+
+    def test_merge_keeps_external_directory_paths(self, share_setup, tmp_path):
+        source, session_dir, mgr = share_setup
+        _seed_plugin_store(source / "plugins", {}, {})
+        external = tmp_path / "my-marketplace"
+        external.mkdir()
+        dest_store = session_dir / "plugins"
+        _seed_plugin_store(
+            dest_store,
+            {},
+            {"local": {"source": {"source": "directory", "path": str(external)},
+                       "installLocation": str(external)}},
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        markets = json.loads(
+            (source / "plugins" / "known_marketplaces.json").read_text()
+        )
+        assert markets["local"]["installLocation"] == str(external)
+
+    def test_merge_populates_fresh_source(self, share_setup):
+        source, session_dir, mgr = share_setup  # no plugins/ in ~/.claude yet
+        dest_store = session_dir / "plugins"
+        _seed_plugin_store(
+            dest_store,
+            {"beta@mp": _plugin_entry(dest_store, "mp", "beta", "3.1.0")},
+            {"mp": _marketplace_entry(dest_store, "mp")},
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        src_store = source / "plugins"
+        registry = json.loads(
+            (src_store / "installed_plugins.json").read_text()
+        )["plugins"]
+        # Adopted entries must point into the shared store, not the removed
+        # profile dir — the reason the merge is registry-driven even here.
+        assert registry["beta@mp"][0]["installPath"] == str(
+            src_store / "cache" / "mp" / "beta" / "3.1.0"
+        )
+        # The marketplace must be adopted the same way — a fresh source has
+        # no known_marketplaces.json, and seeding it from the dest document
+        # verbatim would keep dest-spelled paths while the dirs get removed.
+        markets = json.loads(
+            (src_store / "known_marketplaces.json").read_text()
+        )
+        assert markets["mp"]["installLocation"] == str(
+            src_store / "marketplaces" / "mp"
+        )
+        assert (src_store / "marketplaces" / "mp" / "marketplace.json").exists()
+        assert (session_dir / "plugins").readlink() == src_store
+
+    def test_merges_data_dir(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        (source / "plugins" / "data" / "alpha-mp").mkdir(parents=True)
+        (source / "plugins" / "data" / "alpha-mp" / "state.json").write_text("src")
+        dest_data = session_dir / "plugins" / "data"
+        (dest_data / "alpha-mp").mkdir(parents=True)
+        (dest_data / "alpha-mp" / "state.json").write_text("profile")
+        (dest_data / "beta-mp").mkdir()
+        (dest_data / "beta-mp" / "state.json").write_text("profile-beta")
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        data = source / "plugins" / "data"
+        assert (data / "alpha-mp" / "state.json").read_text() == "src"
+        assert (data / "beta-mp" / "state.json").read_text() == "profile-beta"
+
+    def test_merge_deferred_while_profile_live(self, plugins_setup, monkeypatch):
+        source, session_dir, mgr = plugins_setup
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert not (session_dir / "plugins").is_symlink()
+        assert (session_dir / "plugins" / "installed_plugins.json").exists()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_corrupt_source_registry_aborts_merge(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        (source / "plugins" / "installed_plugins.json").write_text("not json")
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        # Profile store untouched, nothing linked, corrupt file not replaced.
+        assert not (session_dir / "plugins").is_symlink()
+        assert (session_dir / "plugins" / "installed_plugins.json").exists()
+        assert (
+            source / "plugins" / "installed_plugins.json"
+        ).read_text() == "not json"
+
+    def test_resumed_merge_keeps_prior_copies(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        # A previous attempt already copied beta's cache dir but died before
+        # the registry write: the resume must keep it and not raise.
+        prior = source / "plugins" / "cache" / "mp" / "beta" / "3.1.0"
+        prior.mkdir(parents=True)
+        (prior / "plugin.json").write_text("prior-copy")
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert (prior / "plugin.json").read_text() == "prior-copy"
+        assert (session_dir / "plugins").readlink() == source / "plugins"
+
+    def test_toggle_off_removes_link_keeps_data(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+        mgr._sync_sharing(session_dir, share=True, share_plugins=False)
+
+        assert not (session_dir / "plugins").exists()
+        assert (source / "plugins" / "installed_plugins.json").exists()
+        assert (session_dir / "settings.json").is_symlink()
+
+    def test_share_plugins_independent_of_no_share(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=False, share_plugins=True)
+
+        assert (session_dir / "plugins").is_symlink()
+        assert not (session_dir / "settings.json").exists()
+
+    def test_stale_manifest_never_deletes_real_store(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        (session_dir / SHARE_MANIFEST).write_text(
+            json.dumps({"items": ["plugins"], "mode": "symlink"})
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=False)
+
+        # Real store is user data even when the manifest claims it.
+        assert (session_dir / "plugins" / "installed_plugins.json").exists()
+
+    def test_two_profiles_merge_into_one_source(self, plugins_setup):
+        # The second profile's merge must add to the shared registry, not
+        # replace the first one's contribution.
+        source, session_dir, mgr = plugins_setup
+        other_dir = session_dir.parent / "9-other_x.com"
+        other_dir.mkdir()
+        other_store = other_dir / "plugins"
+        _seed_plugin_store(
+            other_store,
+            {"gamma@mp": _plugin_entry(other_store, "mp", "gamma", "1.1.0")},
+            {"mp": _marketplace_entry(other_store, "mp")},
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+        mgr._sync_sharing(other_dir, share=True, share_plugins=True)
+
+        registry = json.loads(
+            (source / "plugins" / "installed_plugins.json").read_text()
+        )["plugins"]
+        assert {"alpha@mp", "beta@mp", "gamma@mp"} <= set(registry)
+        assert (other_dir / "plugins").readlink() == source / "plugins"
+
+    def test_merge_lock_timeout_fails_open(self, plugins_setup, monkeypatch):
+        source, session_dir, mgr = plugins_setup
+
+        class HeldLock:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                raise LockError("held elsewhere")
+
+            def __exit__(self, *a):
+                return None
+
+        monkeypatch.setattr(session_mod, "FileLock", HeldLock)
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        # Merge skipped, profile store intact, nothing linked or claimed.
+        assert (session_dir / "plugins" / "installed_plugins.json").exists()
+        assert not (session_dir / "plugins").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_stale_staging_replaced_by_complete_copy(self, plugins_setup):
+        # A previous merge died mid-copy: its staging dir is a truncated
+        # copy and must be discarded, never adopted as the install.
+        source, session_dir, mgr = plugins_setup
+        staging = (
+            source / "plugins" / "cache" / "mp" / "beta" / "3.1.0.cswap-partial"
+        )
+        staging.mkdir(parents=True)
+        (staging / "junk").write_text("truncated")
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        target = source / "plugins" / "cache" / "mp" / "beta" / "3.1.0"
+        assert (target / "plugin.json").read_text() == json.dumps(
+            {"name": "beta"}
+        )
+        assert not staging.exists()
+
+    def test_per_scope_entries_union(self, share_setup, tmp_path):
+        # The same plugin name can hold DISJOINT installs (user vs
+        # project scope); source-wins must not drop the profile's scopes.
+        source, session_dir, mgr = share_setup
+        src_store = source / "plugins"
+        _seed_plugin_store(
+            src_store,
+            {"alpha@mp": _plugin_entry(src_store, "mp", "alpha", "2.0.0")},
+            {"mp": _marketplace_entry(src_store, "mp")},
+        )
+        dest_store = session_dir / "plugins"
+        project_entry = _plugin_entry(dest_store, "mp", "alpha", "1.5.0")
+        project_entry[0]["scope"] = "project"
+        project_entry[0]["projectPath"] = str(tmp_path / "work")
+        _seed_plugin_store(
+            dest_store,
+            {"alpha@mp": project_entry},
+            {"mp": _marketplace_entry(dest_store, "mp")},
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        registry = json.loads(
+            (src_store / "installed_plugins.json").read_text()
+        )["plugins"]
+        scopes = {
+            (e["scope"], e.get("projectPath")) for e in registry["alpha@mp"]
+        }
+        assert ("user", None) in scopes
+        assert ("project", str(tmp_path / "work")) in scopes
+        adopted = next(
+            e for e in registry["alpha@mp"] if e["scope"] == "project"
+        )
+        assert adopted["installPath"] == str(
+            src_store / "cache" / "mp" / "alpha" / "1.5.0"
+        )
+        assert Path(adopted["installPath"]).is_dir()
+
+    def test_steady_state_respells_profile_paths(self, plugins_setup):
+        # Claude running in a shared profile writes registry paths spelled
+        # through its own link; every launch re-spells them at the source.
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+        src_store = source / "plugins"
+        registry_file = src_store / "installed_plugins.json"
+        registry = json.loads(registry_file.read_text())
+        registry["plugins"]["alpha@mp"][0]["installPath"] = str(
+            session_dir / "plugins" / "cache" / "mp" / "alpha" / "2.0.0"
+        )
+        registry_file.write_text(json.dumps(registry))
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        healed = json.loads(registry_file.read_text())["plugins"]
+        assert healed["alpha@mp"][0]["installPath"] == str(
+            src_store / "cache" / "mp" / "alpha" / "2.0.0"
+        )
+        assert (session_dir / "plugins").readlink() == src_store
+
+    def test_toggle_off_respells_before_unlink(self, plugins_setup, temp_home):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+        src_store = source / "plugins"
+        registry_file = src_store / "installed_plugins.json"
+        registry = json.loads(registry_file.read_text())
+        registry["plugins"]["alpha@mp"][0]["installPath"] = str(
+            session_dir / "plugins" / "cache" / "mp" / "alpha" / "2.0.0"
+        )
+        registry_file.write_text(json.dumps(registry))
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=False)
+
+        # Link removed only after the shared registry stopped spelling paths
+        # through it — otherwise every account's copy goes dangling at once.
+        assert not (session_dir / "plugins").exists()
+        healed = json.loads(registry_file.read_text())["plugins"]
+        assert healed["alpha@mp"][0]["installPath"] == str(
+            src_store / "cache" / "mp" / "alpha" / "2.0.0"
+        )
+
+    def test_toggle_off_keeps_link_when_heal_fails(
+        self, plugins_setup, monkeypatch
+    ):
+        source, session_dir, mgr = plugins_setup
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        class HeldLock:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                raise LockError("held elsewhere")
+
+            def __exit__(self, *a):
+                return None
+
+        monkeypatch.setattr(session_mod, "FileLock", HeldLock)
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=False)
+
+        # Better a lingering link than orphaned registry entries.
+        assert (session_dir / "plugins").is_symlink()
+
+    def test_foreign_symlink_skipped(self, share_setup, tmp_path, capsys):
+        source, session_dir, mgr = share_setup
+        _seed_plugin_store(source / "plugins", {}, {})
+        external = tmp_path / "elsewhere"
+        _seed_plugin_store(external, {}, {})
+        (session_dir / "plugins").symlink_to(external)
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        # Neither repointed nor merged — the user decides.
+        assert (session_dir / "plugins").readlink() == external
+        assert (external / "installed_plugins.json").exists()
+        assert "symlink to another store" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_registry_path_escape_not_copied(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        dest_store = session_dir / "plugins"
+        escape = str(dest_store) + "/../../escaped"
+        registry_file = dest_store / "installed_plugins.json"
+        registry = json.loads(registry_file.read_text())
+        registry["plugins"]["evil@mp"] = [
+            {"scope": "user", "version": "1.0.0", "installPath": escape}
+        ]
+        registry_file.write_text(json.dumps(registry))
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        # The lexical prefix check must not be fooled by `..`: nothing is
+        # copied outside the store and the path is carried verbatim.
+        assert not (session_dir.parent / "escaped").exists()
+        merged = json.loads(
+            (source / "plugins" / "installed_plugins.json").read_text()
+        )["plugins"]
+        assert merged["evil@mp"][0]["installPath"] == escape
+
+    def test_file_at_plugins_fails_open(self, share_setup, capsys):
+        source, session_dir, mgr = share_setup
+        _seed_plugin_store(source / "plugins", {}, {})
+        (session_dir / "plugins").write_text("not a store")
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert (session_dir / "plugins").read_text() == "not a store"
+        assert "non-directory" in capsys.readouterr().out
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_symlinked_data_dir_not_drained(self, plugins_setup, tmp_path):
+        source, session_dir, mgr = plugins_setup
+        external = tmp_path / "external-data"
+        (external / "alpha-mp").mkdir(parents=True)
+        (external / "alpha-mp" / "state.json").write_text("external")
+        (session_dir / "plugins" / "data").symlink_to(external)
+
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        # The link's target is not this profile's data to take.
+        assert (external / "alpha-mp" / "state.json").read_text() == "external"
+        assert (session_dir / "plugins").readlink() == source / "plugins"
+
+
+class TestSharePluginsWindows:
+    def test_sync_never_links_plugins_in_copy_mode(self, plugins_setup):
+        source, session_dir, mgr = plugins_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        mgr._sync_sharing(session_dir, share=True, share_plugins=True)
+
+        assert not (session_dir / "plugins").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "plugins" not in manifest["items"]
+
+    def test_run_rejects_flag(self, plugins_setup, monkeypatch):
+        source, session_dir, mgr = plugins_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
+        )
+
+        with pytest.raises(SessionError, match="Windows"):
+            mgr.run(ACCOUNT_NUM, [], share=True, share_plugins=True)
 
 
 class TestReadSessionCredentials:
