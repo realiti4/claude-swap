@@ -172,6 +172,13 @@ cswap add
 ```
 
 This will update the stored credentials without creating a duplicate.
+For a re-auth flow that must not change the globally active account, use
+`cswap add --preserve-active`. A caller refreshing a specific saved row can
+also pass `--expect-account NUM|EMAIL`, which implies `--preserve-active`; a
+different authenticated account is refused before any saved credential is
+changed. Existing accounts are matched
+by their stable Claude account UUID plus organization first, then by email plus
+organization for older records.
 
 ### Other commands
 
@@ -184,6 +191,8 @@ cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
+cswap add --preserve-active     # Add/refresh without changing the global account
+cswap add --expect-account 2    # Target account 2 and keep the global selection
 cswap remove 2                  # Remove an account
 cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
 cswap enable 2                  # Return a disabled account to rotation
