@@ -929,6 +929,7 @@ Examples:
   cswap chrome open             # open/focus the dedicated Claude Browser
   cswap chrome capture 3        # store account 3's tokens (connect it there first)
   cswap chrome refresh 3        # keep account 3's stored tokens alive (no browser)
+  cswap chrome bridge install   # relay so a running session follows a switch (LOCAL_BRIDGE=1)
   cswap chrome create-profile   # (re)create the dedicated Chrome profile
   cswap chrome enable | disable # turn the feature on/off
         """,
@@ -936,11 +937,17 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     sub = parser.add_subparsers(
         dest="action",
-        metavar="{setup,doctor,open,capture,refresh,create-profile,enable,disable}",
+        metavar="{setup,doctor,open,capture,refresh,bridge,create-profile,enable,disable}",
     )
     sub.add_parser("setup", help="Guided one-time setup")
     sub.add_parser("doctor", help="Report setup state and per-account coverage")
     sub.add_parser("status", help=argparse.SUPPRESS)  # alias for doctor
+    p_bridge = sub.add_parser(
+        "bridge", help="Local bridge relay so a running session follows a switch (LOCAL_BRIDGE=1)")
+    p_bridge.add_argument(
+        "op", nargs="?", choices=["run", "install", "uninstall", "status"], default="run",
+        help="run (foreground daemon), install/uninstall the LaunchAgent, or status")
+    p_bridge.add_argument("--port", type=int, default=None, help="Relay port (default: settings/8765)")
     p_open = sub.add_parser("open", help="Open the dedicated Claude Browser (launch if needed)")
     p_open.add_argument(
         "--ensure", action="store_true",
@@ -988,6 +995,38 @@ Examples:
         error("Chrome sync is macOS-only.")
         sys.exit(1)
     settings = load_chrome_settings(root)
+
+    # The bridge relay runs independently of the enable gate (LaunchAgent keeps
+    # it up), so `run` must not exit just because sync is toggled off.
+    if action == "bridge":
+        from claude_swap import chrome_bridge as cbr
+        port = args.port or settings.bridge_port
+        if args.op == "run":
+            import logging
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            lg = logging.getLogger("claude-swap")
+            lg.addHandler(h)
+            lg.setLevel(logging.INFO)
+            cbr.serve(root, port)
+            return
+        if args.op == "install":
+            path = cbr.install_launchagent(port)
+            print(f"{accent('Installed')} bridge relay LaunchAgent → {path}")
+            print(dimmed(f"Launch Claude Code with LOCAL_BRIDGE=1 to route it through the relay "
+                         f"(port {port})."))
+            return
+        if args.op == "uninstall":
+            removed = cbr.uninstall_launchagent()
+            print(f"{accent('Removed') if removed else accent('No')} bridge relay LaunchAgent")
+            return
+        if args.op == "status":
+            running = cbr.is_running(port)
+            loaded = cbr.launchd_loaded()
+            print(f"bridge relay: {'running' if running else 'not running'} on port {port}; "
+                  f"LaunchAgent {'loaded' if loaded else 'not loaded'}")
+            return
+
     if not settings.enabled:
         error("Chrome sync is disabled. Run: cswap chrome enable")
         sys.exit(1)

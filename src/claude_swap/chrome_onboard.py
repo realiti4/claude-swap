@@ -75,6 +75,15 @@ def print_doctor(switcher) -> None:
     else:
         print(f"  running:     {dimmed('· not running (opens on demand)')}")
 
+    from claude_swap import chrome_bridge as cbr
+    bport = settings.bridge_port
+    brun = cbr.is_running(bport)
+    bload = cbr.launchd_loaded()
+    extra = " · LaunchAgent loaded" if bload else ""
+    print(f"  bridge:      {_mark(brun or bload)} "
+          f"relay {'running' if brun else 'not running'} on {bport}{extra} "
+          f"{dimmed('(run Claude Code with LOCAL_BRIDGE=1)')}")
+
     # Per-account browser-session coverage.
     vault = cs.ChromeVault(root)
     accounts = _accounts(switcher)
