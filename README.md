@@ -287,6 +287,17 @@ cswap chrome enable | disable  # turn the feature on/off
 
 Once set up, `cswap switch <n>` (CLI or menu bar) flips the dedicated browser to account `<n>` too — the extension reconnects on its own, no side-panel reopen needed. A stored account's refresh token lasts about 28.5 days untouched; switching to it within that window is seamless (the extension self-refreshes an expired token), and `cswap chrome refresh <n>` (or any switch) rolls the window forward so it never lapses. Off until you turn it on (`chrome.enabled` in `settings.json`); when disabled, switching is CLI-only and behaves exactly as before.
 
+#### Making a *running* session follow a switch (bridge relay)
+
+A Claude Code session binds its browser-bridge account at startup, so a switch made **while it is running** is normally not picked up until you restart it. The optional bridge relay removes that restart:
+
+```bash
+cswap chrome bridge install   # background relay via a LaunchAgent (com.claude-swap.bridge)
+cswap chrome bridge status    # is it running?  (uninstall to remove)
+```
+
+Then launch Claude Code with `LOCAL_BRIDGE=1` (e.g. `LOCAL_BRIDGE=1 claude`). Claude Code's browser bridge then connects to the local relay instead of Anthropic's; the relay forwards it to the real bridge as the **current** cswap account and re-points live when you switch — so the browser follows account changes with no restart. The extension is never modified (it stays on the real bridge and keeps auto-updating). Verified TLS to the bridge (via the system trust store); the relay listens only on `127.0.0.1`. Note: `LOCAL_BRIDGE` is an internal Claude Code flag and may change between versions.
+
 </details>
 
 ## Advanced
