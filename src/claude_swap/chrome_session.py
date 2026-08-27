@@ -730,6 +730,7 @@ class ChromeSyncSettings:
     automation_dir: str = ""          # dedicated user-data-dir; default derived under backup_root
     source_profile: str = "Default"   # retained for settings compatibility (unused by token path)
     auto_launch: bool = True          # launch the automation Chrome on demand during a switch
+    bridge_port: int = 8765           # local bridge relay port (LOCAL_BRIDGE=1 targets this)
 
 
 def resolve_automation_dir(settings: "ChromeSyncSettings", backup_root: Path) -> Path:

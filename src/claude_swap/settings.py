@@ -283,6 +283,7 @@ def load_chrome_settings(backup_root: Path):
         automation_dir=_str("automationDir", defaults.automation_dir),
         source_profile=_str("sourceProfile", defaults.source_profile),
         auto_launch=_bool("autoLaunch", defaults.auto_launch),
+        bridge_port=_int("bridgePort", defaults.bridge_port),
     )
 
 
