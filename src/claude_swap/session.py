@@ -1520,7 +1520,10 @@ class SessionManager:
                 # registry paths spelled through its own CLAUDE_CONFIG_DIR
                 # — ``<session_dir>/plugins/…`` — which resolve only while
                 # the link exists. Re-spell them at the source so
-                # toggle-off or profile removal cannot orphan them.
+                # toggle-off cannot orphan them. Profile REMOVAL still can
+                # (nothing heals after the final run), but such entries
+                # self-repair: the content survives src-spelled and claude
+                # reinstalls the registry row.
                 self._locked_registry_heal(src, dest)
                 return True
             if dest.exists():
