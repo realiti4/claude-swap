@@ -4,6 +4,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# Rotation ceiling for claude-swap.log. Named because the menu bar reads a
+# tail of this file and has to size its window against the same number.
+LOG_MAX_BYTES = 1024 * 1024
+
 
 class _LazyDirRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler that creates its parent dir on first emit.
@@ -44,7 +48,7 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     log_file = log_dir / "claude-swap.log"
     file_handler = _LazyDirRotatingFileHandler(
         log_file,
-        maxBytes=1024 * 1024,  # 1MB
+        maxBytes=LOG_MAX_BYTES,
         backupCount=3,
         delay=True,
     )

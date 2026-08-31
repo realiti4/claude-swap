@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import pace
+from claude_swap.logging_config import LOG_MAX_BYTES
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -37,6 +38,21 @@ AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+TITLE_PCT_LABELS: dict[str, str] = {
+    "off": "None",
+    "5h": "Session (5h)",
+    "7d": "Weekly (7d)",
+    "both": "Both (5h · 7d)",
+}
+INTERVAL_LABELS: dict[int, str] = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+NO_ACCOUNTS = "No managed accounts"
+NO_HISTORY = "No switches logged yet"
+# The switch-history submenu needs only the last few matching lines, so the
+# model build reads a tail rather than the whole file. Sized to the log
+# rotation limit (``logging_config.LOG_MAX_BYTES``) so the window can never
+# be the reason an entry is missing: switch lines are sparse among usage
+# lines, and a smaller window silently truncates the history.
+LOG_TAIL_BYTES = LOG_MAX_BYTES
 
 
 def ensure_notification_identity(
@@ -375,6 +391,12 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
     Reads the ``Switched from account X to Y`` lines the switcher logs and pairs
     each with its timestamp (trimmed to the minute). Returns at most ``limit``
     entries like ``"3 → 1   2026-06-27 02:06"``. Any unparseable line is skipped.
+
+    Repeats collapse. Two identical switches inside one minute render as the
+    same string and carry no extra information, and de-duplicating *before*
+    the limit stops one from consuming a slot an older distinct switch could
+    fill. It also keeps the menu honest: rumps identifies items by title and
+    silently drops a duplicate.
     """
     out: list[str] = []
     for line in log_text.splitlines():
@@ -383,7 +405,7 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
             continue
         stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
         out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
-    return out[-limit:][::-1]
+    return list(_unique(reversed(out))[:limit])
 
 
 def _account_display_usage(entry) -> dict | str | None:
@@ -436,6 +458,151 @@ def _adapt_snapshot(snap) -> dict:
         "active_usage": active_usage,
         "active_alias": active_alias,
     }
+
+
+# ---- menu model (pure) ------------------------------------------------------
+# The menu's variable content as plain data, so a refresh tick can decide what
+# the UI needs to do without touching rumps. This exists because rebuilding the
+# whole menu on every tick leaks: rumps registers each MenuItem carrying a
+# callback in the global ``NSApp._ns_to_py_and_callback`` dict and never
+# unregisters it, so every discarded item — and the closure holding the app —
+# stays reachable for the life of the process.
+
+
+def read_log_tail(path: Path, max_bytes: int = LOG_TAIL_BYTES) -> str:
+    """Last ``max_bytes`` of a text file, decoded leniently.
+
+    Returns "" if the file is missing or unreadable. When the file is longer
+    than the window the first (probably partial) line is dropped, so callers
+    only ever see whole lines.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            raw = fh.read()
+    except OSError:
+        return ""
+    if size > max_bytes:
+        _, _, raw = raw.partition(b"\n")
+    return raw.decode("utf-8", errors="replace")
+
+
+@dataclass(frozen=True)
+class MenuRow:
+    """One variable menu row: the text shown and its check-mark state."""
+
+    label: str
+    state: int = 0
+
+
+@dataclass(frozen=True)
+class MenuModel:
+    """Everything in the menu that can change between refreshes.
+
+    Two models compare equal exactly when the rendered menu would look
+    identical, so an unchanged tick can skip all UI work. ``shape`` is the part
+    that cannot be fixed up by relabelling: menu callbacks are bound per
+    account slot when the item is created, so a changed slot list has to
+    rebuild rather than relabel — otherwise a row would keep a callback
+    pointing at whichever account used to occupy its position.
+    """
+
+    title: str
+    slots: tuple[str, ...]
+    accounts: tuple[MenuRow, ...]
+    remove: tuple[MenuRow, ...]
+    disable: tuple[MenuRow, ...]
+    history: tuple[str, ...]
+    settings_rows: tuple[MenuRow, ...]
+
+    @property
+    def shape(self) -> tuple:
+        """What must match for an in-place update to be safe."""
+        return (self.slots, len(self.history), len(self.settings_rows))
+
+
+def settings_rows(settings: MenuBarSettings, threshold: int) -> tuple[MenuRow, ...]:
+    """Settings check-marks, in the order the settings submenu builds them."""
+    rows = [MenuRow("Show account name in menu bar", 1 if settings.show_account_name else 0)]
+    rows += [
+        MenuRow(TITLE_PCT_LABELS[mode], 1 if settings.title_pct == mode else 0)
+        for mode in TITLE_PCT_CHOICES
+    ]
+    rows.append(MenuRow("Show model limits in title", 1 if settings.title_scoped else 0))
+    rows += [
+        MenuRow(INTERVAL_LABELS[secs], 1 if settings.refresh_interval == secs else 0)
+        for secs in REFRESH_CHOICES
+    ]
+    rows.append(MenuRow("Auto-switch accounts", 1 if settings.auto_switch_enabled else 0))
+    rows += [
+        MenuRow(f"{pct}%", 1 if threshold == pct else 0) for pct in AUTO_THRESHOLD_CHOICES
+    ]
+    return tuple(rows)
+
+
+def _unique(lines) -> tuple[str, ...]:
+    """De-duplicate while preserving order.
+
+    rumps identifies menu items by title and silently drops a duplicate, so
+    a model that lists one would not match the menu it produces.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return tuple(out)
+
+
+def build_menu_model(
+    snapshot: dict,
+    settings: MenuBarSettings,
+    *,
+    threshold: int,
+    history: list[str] | tuple[str, ...] = (),
+    now: float | None = None,
+) -> MenuModel:
+    """Render the menu's variable content. Pure: no rumps, no I/O."""
+    accounts: list[MenuRow] = []
+    remove: list[MenuRow] = []
+    disable: list[MenuRow] = []
+    slots: list[str] = []
+    for num, email, is_active, display, _last_good, alias, disabled, fetched_at in snapshot["accounts"]:
+        slots.append(str(num))
+        accounts.append(
+            MenuRow(
+                format_account_label(
+                    num, email, display, now, alias=alias,
+                    disabled=disabled, fetched_at=fetched_at,
+                ),
+                1 if is_active else 0,
+            )
+        )
+        named = f"{alias}  ({email})" if alias else email
+        remove.append(MenuRow(f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"))
+        disable.append(MenuRow(f"{num}  {named}", 1 if disabled else 0))
+    if not slots:
+        accounts = [MenuRow(NO_ACCOUNTS)]
+        remove = [MenuRow(NO_ACCOUNTS)]
+        disable = [MenuRow(NO_ACCOUNTS)]
+    return MenuModel(
+        title=format_title(
+            snapshot["active_email"],
+            snapshot["active_usage"],
+            settings,
+            now,
+            alias=snapshot.get("active_alias"),
+        ),
+        slots=tuple(slots),
+        accounts=tuple(accounts),
+        remove=tuple(remove),
+        disable=tuple(disable),
+        history=_unique(history) if history else (NO_HISTORY,),
+        settings_rows=settings_rows(settings, threshold),
+    )
 
 
 def run(switcher) -> int:
@@ -492,6 +659,11 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            # Menu state: the last rendered model plus the live items it
+            # produced, so a refresh can relabel in place instead of
+            # recreating (and stranding) every item.
+            self._model = None
+            self._items: dict[str, list] = {}
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -554,7 +726,7 @@ def run(switcher) -> int:
         def on_sync_tick(self, _timer):
             if self._dirty:
                 self._dirty = False
-                self.rebuild_menu()
+                self.sync_menu()
             self._detect_active_change()
             self._drain_engine_events()
 
@@ -647,133 +819,203 @@ def run(switcher) -> int:
                 return 0
 
         # ---- menu construction -----------------------------------------------
-        def rebuild_menu(self):
-            self.title = format_title(
-                self.snapshot["active_email"],
-                self.snapshot["active_usage"],
+        def _menu_model(self):
+            """Current menu content as plain data (see ``build_menu_model``)."""
+            return build_menu_model(
+                self.snapshot,
                 self.settings,
-                alias=self.snapshot.get("active_alias"),
+                threshold=self._threshold(),
+                history=parse_switch_history(read_log_tail(log_path)),
             )
+
+        def sync_menu(self):
+            """Bring the menu in line with the current snapshot.
+
+            Does the least work that can be correct: nothing at all when the
+            rendered content is unchanged, an in-place relabel when only text
+            or check-marks moved, and a full rebuild only when items have to be
+            created or destroyed. Rebuilding unconditionally on every tick is
+            what leaked — see ``MenuModel``.
+            """
+            model = self._menu_model()
+            if model == self._model:
+                return
+            if self._model is None or model.shape != self._model.shape:
+                self.rebuild_menu(model)
+            else:
+                self._apply_model(model)
+
+        def _apply_model(self, model):
+            """Update the existing menu items in place. Creates nothing."""
+            self._model = None  # only restored once the menu matches again
+            self.title = model.title
+            for section in ("accounts", "remove", "disable"):
+                rows = getattr(model, section)
+                for item, row in zip(self._items[section], rows, strict=True):
+                    item.title = row.label
+                    item.state = row.state
+            for item, line in zip(self._items["history"], model.history, strict=True):
+                item.title = line
+            for item, row in zip(self._items["settings"], model.settings_rows, strict=True):
+                item.state = row.state
+            self._model = model
+
+        def rebuild_menu(self, model=None):
+            """Recreate every menu item from scratch.
+
+            Only for structural change — a different set of account slots, a
+            different number of history lines. Every item created here lands in
+            rumps' global callback map, so the outgoing ones are unregistered
+            first.
+            """
+            model = self._menu_model() if model is None else model
+            # Cleared up front: a failure below leaves the menu half-built, and
+            # a stale _model would route the next tick into an in-place update
+            # against items that are no longer there. None forces a rebuild.
+            self._model = None
+            self._forget_menu_items()
+            self._items = {k: [] for k in ("accounts", "remove", "disable", "history", "settings")}
+            self.title = model.title
             self.menu.clear()
-            account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
-                    ),
-                    callback=self._make_switch_to(num),
-                )
-                item.state = 1 if is_active else 0
-                account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+
+            for index, row in enumerate(model.accounts):
+                callback = self._make_switch_to(model.slots[index]) if model.slots else None
+                item = rumps.MenuItem(row.label, callback=callback)
+                item.state = row.state
+                self._items["accounts"].append(item)
 
             self.menu = [
-                *account_items,
+                *self._items["accounts"],
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
                 rumps.MenuItem("Switch to best", callback=self._switch("best")),
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
-                self._add_menu(rumps),
-                self._disable_menu(rumps),
-                self._remove_menu(rumps),
+                self._add_menu(),
+                self._disable_menu(model),
+                self._remove_menu(model),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
-                self._history_menu(rumps),
+                self._history_menu(model),
                 None,
-                self._settings_menu(rumps),
+                self._settings_menu(model),
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+            self._model = model
 
-        def _add_menu(self, rumps):
+        def _forget_menu_items(self):
+            """Unregister the outgoing menu items from rumps' global callback map.
+
+            ``rumps`` adds every MenuItem carrying a callback to
+            ``NSApp._ns_to_py_and_callback`` and never removes it — ``clear()``
+            only empties the NSMenu. Left alone, each rebuild strands its items,
+            and the closures holding this app, for the life of the process.
+            Guarded: a rumps that reorganises this internal must not break the
+            menu, and the cost of a miss is the old leak, not a crash.
+            """
+            try:
+                registry = rumps.rumps.NSApp._ns_to_py_and_callback
+            except AttributeError:
+                self.switcher._logger.warning(
+                    "rumps callback registry not found; menu rebuilds will leak"
+                )
+                return
+
+            def forget(item):
+                nsitem = getattr(item, "_menuitem", None)
+                if nsitem is not None:
+                    registry.pop(nsitem, None)
+                if isinstance(item, rumps.MenuItem):
+                    for child in list(item.values()):
+                        forget(child)
+
+            try:
+                for item in list(self.menu.values()):
+                    forget(item)
+                # Also the items we hold directly: rumps drops a duplicate
+                # title on the floor, so one can exist without ever having
+                # been reachable from the menu.
+                for tracked in self._items.values():
+                    for item in tracked:
+                        forget(item)
+            except Exception:
+                self.switcher._logger.warning(
+                    "menu registry cleanup skipped", exc_info=True
+                )
+
+        def _add_menu(self):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if hasattr(self.switcher, "add_account_from_token"):
                 menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
             return menu
 
-        def _remove_menu(self, rumps):
+        def _remove_menu(self, model):
             menu = rumps.MenuItem("Remove account")
-            accounts = self.snapshot["accounts"]
-            if not accounts:
-                menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
-                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
-            return menu
-
-        def _disable_menu(self, rumps):
-            menu = rumps.MenuItem("Disable / enable account")
-            accounts = self.snapshot["accounts"]
-            if not accounts:
-                menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
-                item = rumps.MenuItem(
-                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
-                )
-                # A check-mark reads as "held out of rotation" — same glyph the
-                # active row uses, but here it means disabled, not selected.
-                item.state = 1 if disabled else 0
+            for index, row in enumerate(model.remove):
+                callback = self._make_remove(model.slots[index]) if model.slots else None
+                item = rumps.MenuItem(row.label, callback=callback)
+                self._items["remove"].append(item)
                 menu.add(item)
             return menu
 
-        def _history_menu(self, rumps):
+        def _disable_menu(self, model):
+            menu = rumps.MenuItem("Disable / enable account")
+            for index, row in enumerate(model.disable):
+                callback = (
+                    self._make_toggle_disabled(model.slots[index]) if model.slots else None
+                )
+                item = rumps.MenuItem(row.label, callback=callback)
+                # A check-mark reads as "held out of rotation" — same glyph the
+                # active row uses, but here it means disabled, not selected.
+                item.state = row.state
+                self._items["disable"].append(item)
+                menu.add(item)
+            return menu
+
+        def _history_menu(self, model):
             menu = rumps.MenuItem("Switch history")
-            try:
-                text = log_path.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
-            entries = parse_switch_history(text)
-            if entries:
-                for line in entries:
-                    menu.add(rumps.MenuItem(line, callback=None))
-            else:
-                menu.add(rumps.MenuItem("No switches logged yet", callback=None))
+            for line in model.history:
+                item = rumps.MenuItem(line, callback=None)
+                self._items["history"].append(item)
+                menu.add(item)
             menu.add(None)
             menu.add(rumps.MenuItem("Open full log…", callback=self.on_open_log))
             return menu
 
-        def _settings_menu(self, rumps):
+        def _settings_menu(self, model):
+            rows = iter(model.settings_rows)
             menu = rumps.MenuItem("Settings")
-            name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
-            name_item.state = 1 if self.settings.show_account_name else 0
-            menu.add(name_item)
+
+            def track(item):
+                self._items["settings"].append(item)
+                return item
+
+            def leaf(callback):
+                row = next(rows)
+                item = rumps.MenuItem(row.label, callback=callback)
+                item.state = row.state
+                return track(item)
+
+            menu.add(leaf(self.on_toggle_name))
 
             title_pct = rumps.MenuItem("Title percentage")
-            tp_labels = {"off": "None", "5h": "Session (5h)",
-                         "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
             for mode in TITLE_PCT_CHOICES:
-                ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
-                ch.state = 1 if self.settings.title_pct == mode else 0
-                title_pct.add(ch)
+                title_pct.add(leaf(self._make_title_pct(mode)))
             menu.add(title_pct)
 
-            scoped_item = rumps.MenuItem(
-                "Show model limits in title", callback=self.on_toggle_scoped
-            )
-            scoped_item.state = 1 if self.settings.title_scoped else 0
-            menu.add(scoped_item)
+            menu.add(leaf(self.on_toggle_scoped))
 
             interval = rumps.MenuItem("Refresh interval")
-            labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
-                choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
-                choice.state = 1 if self.settings.refresh_interval == secs else 0
-                interval.add(choice)
+                interval.add(leaf(self._make_interval(secs)))
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
-            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
-            menu.add(auto_item)
+            menu.add(leaf(self.on_toggle_autoswitch))
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
             for pct in AUTO_THRESHOLD_CHOICES:
-                ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
-                ch.state = 1 if current == pct else 0
-                threshold_menu.add(ch)
+                threshold_menu.add(leaf(self._make_threshold(pct)))
             menu.add(threshold_menu)
 
             return menu
@@ -781,7 +1023,7 @@ def run(switcher) -> int:
         # ---- callbacks --------------------------------------------------------
         def _save_and_rebuild(self):
             self.settings.save(settings_path)
-            self.rebuild_menu()
+            self.sync_menu()
 
         def _guard(self, fn):
             """Run a switcher action, surfacing ClaudeSwitchError via an alert."""
@@ -825,10 +1067,19 @@ def run(switcher) -> int:
                         self.refresh_async()
             return cb
 
-        def _make_toggle_disabled(self, num, disabled):
-            # `disabled` is this row's current state; selecting it flips it.
-            target = not disabled
+        def _slot_disabled(self, num) -> bool:
+            """Whether slot ``num`` is currently held out of rotation."""
+            for account in self.snapshot["accounts"]:
+                if str(account[0]) == str(num):
+                    return bool(account[6])
+            return False
+
+        def _make_toggle_disabled(self, num):
             def cb(_sender):
+                # Read the flag now, not at build time: with in-place menu
+                # updates this row survives a state change, so a captured
+                # value would toggle against a stale reading.
+                target = not self._slot_disabled(num)
                 if self._guard(
                     lambda: self.switcher.set_account_disabled(str(num), target)
                 ):
@@ -935,7 +1186,7 @@ def run(switcher) -> int:
                 self._start_engine()
             else:
                 self._stop_engine()
-            self.rebuild_menu()
+            self.sync_menu()
 
         def _make_threshold(self, pct):
             def cb(_sender):
@@ -945,7 +1196,7 @@ def run(switcher) -> int:
                     rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
-                self.rebuild_menu()
+                self.sync_menu()
             return cb
 
     MenuBarApp().run()
