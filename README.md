@@ -267,6 +267,27 @@ cswap config path                         # where settings.json lives
 
 </details>
 
+### Per-account MCP servers
+
+A switch rewrites only the `oauthAccount` block of `~/.claude.json`, so everything else in it — including the user-scope `mcpServers` block — is machine-wide and shared by every account. That is usually what you want: one set of MCP servers, whichever account you are on.
+
+If your accounts belong to different orgs and want different servers, turn on:
+
+```bash
+cswap config set swap.mcpServers true
+```
+
+Now `mcpServers` travels with the slot. Each account's servers are saved into its own backup when you switch away and restored when you switch back, so you can `claude mcp add` under one account without it showing up under the other. Off by default.
+
+Two things worth knowing:
+
+- **Nothing is wiped when you turn it on.** A slot added before you enabled this has no `mcpServers` of its own yet, so switching to it leaves your current servers in place and seeds the slot from them on the way out. Give each account one switch to pick up its own set.
+- **MCP server *logins* stay shared.** The `mcpOAuth` tokens in the credential store remain machine-wide (see [How it works](#how-it-works)), so a server you have authenticated once does not ask again after a switch. This setting moves the server *definitions*, not their sessions.
+
+- **Session mode still mirrors the default profile.** `cswap run` mirrors whatever `mcpServers` the default profile currently holds (issue #139), which under this setting is the set belonging to the account active there — not necessarily the account the session runs as. Sourcing a session's mirror from its own slot would change #139's single-source-of-truth design, so it is left alone here.
+
+Project-scope servers (`.mcp.json`, and per-project entries under `projects` in `~/.claude.json`) are untouched either way — those belong to the directory, not the account.
+
 ### Backup and migration
 
 Move account data between machines or back it up:

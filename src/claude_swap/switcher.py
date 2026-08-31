@@ -84,7 +84,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_swap_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -494,6 +499,29 @@ class ClaudeAccountSwitcher:
                 )
             return None
         return data
+
+    def _apply_swapped_mcp_servers(
+        self, live_config: dict, target_config_data: dict
+    ) -> None:
+        """Install the target slot's user-scope ``mcpServers``, if opted in.
+
+        A switch rewrites only ``oauthAccount``, so every other key in
+        ``~/.claude.json`` is machine-wide. With ``swap.mcpServers`` on, the
+        user-scope ``mcpServers`` block travels with the slot instead. The
+        departing account's copy needs no special handling: Step 1 of the
+        switch already backs the live config up into its own slot.
+
+        Only a key the target's backup actually HAS is applied. A slot added
+        before this setting existed has no ``mcpServers`` of its own, and
+        treating that absence as "an empty set" would delete the servers the
+        user is already running — the first switch after enabling the setting
+        would wipe them. Absence leaves the live block alone, and the next
+        switch away seeds the slot from it.
+        """
+        if not load_swap_settings(self.backup_dir).mcp_servers:
+            return
+        if "mcpServers" in target_config_data:
+            live_config["mcpServers"] = target_config_data["mcpServers"]
 
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
@@ -6750,6 +6778,9 @@ class ClaudeAccountSwitcher:
                         # the user it "could not be parsed", which is the same
                         # ""-vs-None conflation this branch exists to separate.
                         existing_config["oauthAccount"] = target_oauth
+                        self._apply_swapped_mcp_servers(
+                            existing_config, target_config_data
+                        )
                         self._write_json(config_path, existing_config)
                     else:
                         if config_path.exists():
@@ -7015,6 +7046,9 @@ class ClaudeAccountSwitcher:
                 current_config_data = self._read_json(config_path)
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = oauth_section
+                    self._apply_swapped_mcp_servers(
+                        current_config_data, target_config_data
+                    )
                     self._write_json(config_path, current_config_data)
                 else:
                     if config_path.exists():

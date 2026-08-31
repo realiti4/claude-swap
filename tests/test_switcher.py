@@ -27,6 +27,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
+from claude_swap.settings import set_setting
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -12134,3 +12135,124 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestSwapMcpServers:
+    """`swap.mcpServers` gives each account its own MCP server set.
+
+    A switch rewrites only `oauthAccount`, so `mcpServers` is machine-wide by
+    default. With the setting on it travels with the slot instead.
+    """
+
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    LIVE_SERVERS = {"live-server": {"command": "live"}}
+    TARGET_SERVERS = {"target-server": {"command": "target"}}
+    TARGET_CONFIG = {
+        "oauthAccount": {
+            "emailAddress": "account2@example.com", "accountUuid": "uuid-2",
+        },
+        "mcpServers": TARGET_SERVERS,
+    }
+
+    def _switch(
+        self, temp_home, sample_sequence_data, *, target_config: dict,
+    ) -> tuple[dict, dict]:
+        """Run a 1 -> 2 switch.
+
+        Returns (live ~/.claude.json after the switch, the config backup store).
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "test@example.com",
+                "accountUuid": "test-uuid-1234",
+            },
+            "mcpServers": self.LIVE_SERVERS,
+        }))
+        configs_store[("2", "account2@example.com")] = json.dumps(target_config)
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+        return json.loads(config_path.read_text()), configs_store
+
+    def test_off_by_default_the_live_servers_stay(
+        self, temp_home, sample_sequence_data,
+    ):
+        config, _ = self._switch(
+            temp_home, sample_sequence_data, target_config=self.TARGET_CONFIG,
+        )
+
+        assert config["mcpServers"] == self.LIVE_SERVERS
+        assert config["oauthAccount"]["emailAddress"] == "account2@example.com"
+
+    def test_enabled_installs_the_target_slots_servers(
+        self, temp_home, sample_sequence_data,
+    ):
+        set_setting(get_backup_root(), "swap.mcpServers", "true")
+
+        config, _ = self._switch(
+            temp_home, sample_sequence_data, target_config=self.TARGET_CONFIG,
+        )
+
+        assert config["mcpServers"] == self.TARGET_SERVERS
+
+    def test_enabled_carries_an_empty_set_across(
+        self, temp_home, sample_sequence_data,
+    ):
+        # An account that genuinely runs no MCP servers must arrive with none,
+        # not inherit whichever set happened to be live.
+        set_setting(get_backup_root(), "swap.mcpServers", "true")
+        target = dict(self.TARGET_CONFIG, mcpServers={})
+
+        config, _ = self._switch(
+            temp_home, sample_sequence_data, target_config=target,
+        )
+
+        assert config["mcpServers"] == {}
+
+    def test_a_slot_predating_the_setting_keeps_the_live_servers(
+        self, temp_home, sample_sequence_data,
+    ):
+        # No `mcpServers` in the backup is "this slot never stored any", not
+        # "this slot wants none" — wiping here would delete the servers the
+        # user is running the moment they turn the setting on.
+        set_setting(get_backup_root(), "swap.mcpServers", "true")
+        target = {k: v for k, v in self.TARGET_CONFIG.items() if k != "mcpServers"}
+
+        config, _ = self._switch(
+            temp_home, sample_sequence_data, target_config=target,
+        )
+
+        assert config["mcpServers"] == self.LIVE_SERVERS
+
+    def test_the_departing_slot_keeps_its_own_servers(
+        self, temp_home, sample_sequence_data,
+    ):
+        # Step 1 of the switch backs the live config into the departing slot,
+        # so the round trip is lossless without any extra capture step.
+        set_setting(get_backup_root(), "swap.mcpServers", "true")
+
+        _, configs_store = self._switch(
+            temp_home, sample_sequence_data, target_config=self.TARGET_CONFIG,
+        )
+
+        backed_up = json.loads(configs_store[("1", "test@example.com")])
+        assert backed_up["mcpServers"] == self.LIVE_SERVERS

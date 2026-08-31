@@ -67,7 +67,29 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class SwapSettings:
+    """What a switch carries across accounts, beyond the login itself.
+
+    A switch normally rewrites only ``oauthAccount`` in ``~/.claude.json``,
+    so everything else — including the user-scope ``mcpServers`` block — is
+    machine-wide and shared by every account. ``mcp_servers=True`` makes that
+    block travel with the slot instead: each account keeps its own MCP server
+    set, restored on arrival from the slot's config backup.
+
+    Off by default: sharing is the long-standing behavior, and an account
+    whose backup predates this setting has no ``mcpServers`` of its own to
+    restore.
+    """
+
+    mcp_servers: bool = False
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "swap": SwapSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +160,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "swap", "mcpServers", "mcp_servers", "bool",
+            help="Give each account its own MCP servers instead of sharing one set",
         ),
     )
 }
@@ -246,6 +272,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_swap_settings(backup_root: Path) -> SwapSettings:
+    """Load the swap section; missing/corrupt file or non-bool field → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("swap")
+    default = SwapSettings()
+    if not isinstance(section, dict):
+        return default
+    value = section.get("mcpServers", default.mcp_servers)
+    if not isinstance(value, bool):
+        _logger.warning(
+            "settings.json: swap.mcpServers must be true or false, got %r; using %r",
+            value, default.mcp_servers,
+        )
+        return default
+    return SwapSettings(mcp_servers=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +455,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "swap": load_swap_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
