@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
+import hashlib
 import json
 import logging
 import os
+import secrets
 import re
 import shutil
+import stat
 import threading
 import sys
 import time
@@ -50,7 +54,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -58,6 +62,7 @@ from claude_swap.models import (
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
+    _restore_atomically,
     get_timestamp,
     normalize_alias,
 )
@@ -264,6 +269,20 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     if status.startswith(prefix):
         return f"{source}: {status.removeprefix(prefix)}"
     return f"{source}: {status}"
+
+
+def _roster_snapshot(path: Path) -> str:
+    """The roster's bytes, for a rollback that cannot re-read them.
+
+    `_write_json`'s write-through recovery EMPTIES its destination when the
+    copy dies part-way, so a rollback that re-reads `sequence.json` restores
+    nothing. An empty roster is not a lost pointer: `_get_sequence_data`
+    reads it strictly and every later invocation refuses to run.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def _same_directory(left: Path, right: Path) -> bool:
@@ -531,18 +550,77 @@ class ClaudeAccountSwitcher:
         """
         stem = f"{path.name}.unreadable-{int(time.time())}"
         salvage = path.with_name(stem)
+        created = False
         n = 1
         while salvage.exists():
             salvage = path.with_name(f"{stem}.{n}")
             n += 1
         try:
-            shutil.copy(path, salvage)          # NOT copy2: mode is set below
-            if sys.platform != "win32":
-                os.chmod(salvage, 0o600)
-        except OSError as e:
+            # NARROW BEFORE THE BYTES, not after. The salvage holds the same
+            # payload as the config it copies, and `shutil.copy` CARRIES the
+            # source mode -- so a config another writer left at 0644 produced a
+            # 0644 copy of the credential, which a chmod below could only
+            # narrow afterwards and left permanently when refused. Created
+            # empty at 0600 (the name is fresh by the loop above, so O_EXCL
+            # cannot lose to us) and filled with `copyfile`, which truncates
+            # without touching the mode.
+            # CLAIMED BEFORE THE SYSCALL, cancelled only by the one errno
+            # that says the name is somebody else's. A record made AFTER the
+            # call misses a file that exists: a signal delivered between the
+            # create and the assignment leaves a 0-byte file under a name the
+            # docstring above calls a promise that the bytes survived, with
+            # nothing to remove it and nothing to announce it. This is the
+            # same ordering `_stage_overlap_material` already argues for.
+            created = True
+            try:
+                fd = os.open(
+                    salvage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError:
+                # `O_CREAT|O_EXCL` either creates the file or fails, so any
+                # errno means nothing of ours is on disk -- EEXIST because the
+                # name is somebody else's, anything else because the create
+                # did not happen. A SIGNAL is the case this ordering exists
+                # for and it is not an `OSError`, so `created` stays True
+                # there and the 0-byte file gets removed.
+                created = False
+                raise
+            try:
+                if sys.platform != "win32":
+                    os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            shutil.copyfile(path, salvage)
+        except BaseException as e:
+            # A PARTIAL COPY IS WORSE THAN NO COPY. The name is a promise the
+            # bytes survived, and a restore from a truncated one loses whatever
+            # the copy never reached -- silently, which is the loss this guard
+            # exists to prevent. BaseException because `except OSError` left the
+            # truncated file on every Ctrl-C.
+            #
+            # ONLY WHAT WE CREATED. `exists()` above is a check, not a claim on
+            # the name: a peer can take it in the gap, `O_EXCL` then fails, and
+            # unlinking here would delete THEIR complete copy. A create that
+            # never ran leaves nothing to remove and nothing to announce, so a
+            # missing file is silence, not a partial the user should go looking
+            # for.
+            left = ""
+            if created:
+                try:
+                    salvage.unlink()
+                except FileNotFoundError:
+                    pass  # the signal beat the kernel to it; nothing exists
+                except OSError:
+                    left = (f"; a PARTIAL copy is at {salvage.name} and is NOT "
+                            f"a usable backup")
+            if not isinstance(e, OSError):
+                if left:
+                    self._logger.warning(f"{path}{left}")
+                    if emit_output:
+                        warning(f"{path.name}{left}")
+                raise
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
-                f"({e}); aborting rather than destroying it"
+                f"({e}); aborting rather than destroying it{left}"
             )
         msg = (
             f"{path.name} could not be parsed — a copy was kept at "
@@ -556,27 +634,288 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON atomically: 0600 temp, read-back check, rename publish.
+
+        A destination that refuses the rename (EBUSY, a bind-mounted file) is
+        written through instead; that one path is not atomic and says so.
+        """
         content = json.dumps(data, indent=2)
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
+        # A PID IS RECYCLED, and past the EBUSY branch below this temp becomes
+        # the only complete copy of the payload -- a predecessor killed by a
+        # SIGKILL leaves the same name, and the writer that draws it again
+        # either dies on it or eats a file it did not create. `with_suffix`
+        # also dropped the real extension, so `a.json` and `a.txt` collided.
+        temp_path = path.parent / (
+            f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
 
-        # Validate written content
+        fd = -1
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            # 0600 from creation: this writer publishes `~/.claude.json`,
+            # which can carry `primaryApiKey`. `fchmod` is what enforces it —
+            # the open mode is masked by the umask. The mode arg only carries
+            # Windows, where there is no `fchmod`.
+            #
+            # O_EXCL, LIKE EVERY SIBLING WRITER. The comment above this
+            # function's temp name says a redrawn name leaves the writer to
+            # "either die on it or eat a file it did not create"; O_TRUNC
+            # chose to eat it. The name already carries a random token, so a
+            # collision means somebody else holds it and failing is the whole
+            # answer. It also refuses to follow a symlink planted at the name.
+            #
+            # TRACKED ACROSS THE HANDOVER. An interrupt between `os.open`
+            # returning and `fdopen` taking the fd leaks the descriptor;
+            # on Windows that held handle is what makes the cleanup
+            # unlink fail, so the temp is stranded rather than removed.
+            try:
+                fd = os.open(temp_path,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. O_EXCL refused because somebody holds
+                # the name, so the `finally` must not unlink their file. Both
+                # sibling writers here already do this -- `_salvage` tracks
+                # `created`, `_stage_overlap_material` drops the key on EEXIST.
+                temp_path = None
+                raise
+            owned, fd = fd, -1
+            # BINARY, so the file's bytes ARE `content.encode("utf-8")` by
+            # CONSTRUCTION rather than by a keyword argument. The recovery
+            # below compares the destination against a digest of `content`,
+            # and a text handle makes that comparison depend on newline
+            # translation: on Windows every completed copy would differ from
+            # the digest and the recovery would empty a destination the copy
+            # had written in full. `newline=""` also buys that, and nothing
+            # can pin a kwarg 80 lines above the comparison it protects.
+            with os.fdopen(owned, "wb") as fh:
+                if sys.platform != "win32":
+                    os.fchmod(fh.fileno(), 0o600)
+                fh.write(content.encode("utf-8"))
 
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            # Validate written content
+            try:
+                json.loads(read_text_with_retry(temp_path))
+            except json.JSONDecodeError:
+                raise ConfigError("Generated invalid JSON")
+
+            # A REAL rename, so the publish is the final atomic commit:
+            # shutil.move falls back to a copy on ANY rename error, and that
+            # copy overwrites the roster in place.
+            try:
+                replace_with_retry(temp_path, path)
+                temp_path = None  # consumed by the publish; the name is not ours
+            except OSError as e:
+                if e.errno != errno.EBUSY:
+                    raise
+                # A bind-mounted destination pins the inode (a container
+                # mounting ~/.claude.json), so writing through is the only
+                # way to update it. Disowned before and reclaimed after, so
+                # a copy that dies part-way leaves the complete content.
+                # BEFORE THE COPY, and before the disown. `copyfile` opens the
+                # destination `'wb'` -- truncating without touching the mode --
+                # so a chmod afterwards would publish the payload at whatever
+                # mode was already there. Past the disown the temp's name is
+                # held only by `source`, so a raise in between strands it
+                # unowned. `copy`/`copy2` cannot carry the mode instead:
+                # `copystat`'s `utime` fires after the bytes land, and a mount
+                # that refuses the rename can refuse that too.
+                #
+                # CAPTURED so the narrowing can be undone. Otherwise a failed
+                # copy leaves the destination at 0600 with nothing recording
+                # what it was.
+                prior_mode = None
+                if sys.platform != "win32":
+                    try:
+                        prior_mode = stat.S_IMODE(os.stat(path).st_mode)
+                    except OSError:
+                        prior_mode = None
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError as mode_err:
+                        # REFUSED, not logged. Nothing is committed at this
+                        # point, so refusing costs a switch; continuing writes
+                        # a credential the destination need not have held
+                        # before, at a mode other users can read.
+                        raise ConfigError(
+                            f"{path.name} could not be narrowed to 0600 "
+                            f"({mode_err}); refusing to write a credential "
+                            f"there. Fix the mode or the mount, then retry"
+                        ) from mode_err
+                # THE BYTES, not a proxy for them. `(size, mtime_ns)` is an
+                # inference: a partial written at exactly the prior length,
+                # inside the filesystem's mtime granule, moves neither -- and
+                # the destination keeps a truncated credential. A digest is
+                # affordable because only the EBUSY write-through reaches it.
+                #
+                # ABOVE THE DISOWN, and so is everything below it up to the
+                # copy. Past `source, temp_path = temp_path, None` the outer
+                # cleanup no longer owns the name and nothing prints it, so
+                # anything raising there strands the temp holding the complete
+                # new payload -- for `~/.claude.json` a credential-bearing one.
+                # `except OSError` does not cover a signal, and building
+                # `kept` enters `PurePath.name`, a Python-level property whose
+                # RESUME is where a pending SIGINT is delivered.
+                before = None
+                try:
+                    _raw = path.read_bytes()
+                    before = hashlib.sha256(_raw).hexdigest()
+                except OSError:
+                    before = None
+                # WHAT THE COPY PUBLISHES, TAKEN FROM WHAT WE WROTE. The
+                # temp holds exactly `content` -- the handle is binary, so no
+                # newline translation stands between them -- so
+                # this needs no read and therefore cannot fail -- which is
+                # what removes the arm this used to need. Reading the temp
+                # here made `landed` None on precisely the population that
+                # reaches the recovery through a source-side error, and a
+                # None there was indistinguishable from "the copy never
+                # opened the destination". It is the opposite: `copyfile`
+                # opens the destination `'wb'` before the first source byte.
+                landed = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                kept = (
+                    f"{path.name} may now be truncated; the complete content "
+                    f"was kept at {temp_path.name}"
+                )
+
+                def _unnarrow(copy_err: BaseException | None = None):
+                    # ONLY WHAT THE COPY ACTUALLY TRUNCATED. `copyfile` raises
+                    # on four paths BEFORE it opens the destination 'wb' --
+                    # SameFileError, SpecialFileError, any failure opening the
+                    # SOURCE, and a signal in that prologue -- and there the
+                    # destination still holds its original bytes. Emptying it
+                    # then destroys a live config the write never touched.
+                    #
+                    # SIZE ALONE CANNOT ASK THAT: the mainline splices into an
+                    # existing config, so the new payload is LARGER and a copy
+                    # dying past the old size looks untouched. A copy that died
+                    # on an already-empty file is the one case the pair cannot
+                    # see, and the one with nothing to see.
+                    #
+                    # TWO OBLIGATIONS, NOT ONE. Emptying a partial is about the
+                    # CONTENT and applies on every platform; restoring the mode
+                    # is POSIX-only, and `prior_mode` is captured only there.
+                    # Gating both on it left Windows holding a truncated
+                    # credential -- measured in CI, `mode 0o666` with the
+                    # secret still in the file.
+                    #
+                    # A COMPLETE COPY ALSO DIFFERS FROM `before` -- `copyfile`
+                    # uses `sendfile`, so the last byte lands before a signal is
+                    # delivered. Deciding on `before` alone empties a finished
+                    # write; compare against what the temp holds, which is
+                    # `content` byte for byte because the handle is binary.
+                    #
+                    # NOT A `return`. An unreadable destination cannot judge a
+                    # partial, and that is ALL it cannot do -- returning gated
+                    # the mode restore below on this read, the very coupling
+                    # the note above forbids.
+                    try:
+                        after = hashlib.sha256(path.read_bytes()).hexdigest()
+                    except OSError:
+                        after = None
+                    # `before is None` means the destination could not be
+                    # read BEFORE the copy, so nothing here can tell a partial
+                    # from the bytes that were already there, and emptying it
+                    # would destroy a config this write never reached.
+                    touched = (after is not None and after != landed
+                               and before is not None and after != before)
+                    if touched:
+                        try:
+                            with open(path, "wb"):
+                                pass
+                        except OSError:
+                            # THE ORDER WAS GIVEN BECAUSE THE FILE HOLDS A
+                            # PARTIAL. If the emptying is refused -- the same
+                            # fault that killed the copy also blocks this
+                            # write -- the partial is still there, so the mode
+                            # must stay narrow. `comparable` below only says
+                            # both digests were READ, never that it landed.
+                            return
+                    if prior_mode is None or prior_mode == 0o600:
+                        return
+                    # AND NEVER WIDER THAN WHAT THIS CAN VOUCH FOR. Restoring
+                    # the mode is not free when the destination may hold half a
+                    # token: it publishes whatever is there to every other uid,
+                    # and the narrowing refusal above already ranks that worse
+                    # than a stuck mode. Two ways to be sure nothing was
+                    # published, and with neither the narrow mode stands:
+                    #   - both digests read, so `touched` is a real verdict --
+                    #     it either emptied a partial or found the original;
+                    #   - `copyfile` raised BEFORE opening the destination.
+                    #     BOTH conjuncts are load-bearing, for different paths;
+                    #     neither alone decides it. Measured against real
+                    #     `shutil.copyfile`, `(filename, filename2)` is:
+                    #       SameFileError / SpecialFileError  (None, None)
+                    #       source open failed                (SRC,  None)
+                    #       destination open failed           (DST,  None)
+                    #       fast-copy helper, mid-copy        (SRC,  DST)
+                    #       copyfileobj fallback, mid-copy    (None, None)
+                    #     So `filename2 is None` is NOT "the destination was
+                    #     never opened" -- the fallback carries it with the
+                    #     destination already truncated. What excludes that row
+                    #     is `filename == source`. And what excludes the
+                    #     fast-copy row, whose `filename` IS the source, is
+                    #     `filename2`. Only the source-open failure satisfies
+                    #     both, which is the one row where nothing was written.
+                    # A COMPLETE COPY IS A SUCCESS THAT DID NOT GET TO RENAME.
+                    # `after == landed` means the destination already holds the
+                    # whole new payload, so it now carries a credential it need
+                    # not have held before -- exactly what the narrowing refusal
+                    # above ranks as unacceptable. The clean path skips this
+                    # recovery entirely and leaves 0600, so restoring the wider
+                    # mode here would make an interrupt arriving one instant
+                    # later END MORE EXPOSED than the run that finished.
+                    comparable = after is not None and before is not None
+                    untouched = (
+                        isinstance(copy_err, OSError)
+                        and getattr(copy_err, "filename2", None) is None
+                        and copy_err.filename == os.fspath(source)
+                    )
+                    # ONLY WHEN THE DESTINATION ACTUALLY CHANGED. `after ==
+                    # landed` also holds when nothing was written and the
+                    # payload equals what was already there -- a switch to the
+                    # already-active account re-serialises byte-identical
+                    # content. `untouched` recognises only the source-open row;
+                    # the destination-open and SameFile rows leave the file
+                    # untouched too and it says nothing about them, so this
+                    # keys on the CONTENT instead of on the error shape --
+                    # and `not untouched` sat here beside it saying otherwise.
+                    # It is implied: the source-open row never opened the
+                    # destination, so `after == before` and `after != before`
+                    # already excludes it. `untouched` stays live below.
+                    if (after is not None
+                            and after == landed and after != before):
+                        return
+                    if not (comparable or untouched):
+                        return
+                    try:
+                        os.chmod(path, prior_mode)
+                    except OSError:
+                        pass  # best effort; `kept` still names the survivor
+
+                source, temp_path = temp_path, None
+                try:
+                    shutil.copyfile(source, path)
+                except OSError as copy_err:
+                    _unnarrow(copy_err)
+                    raise ConfigError(f"{kept} ({copy_err})") from copy_err
+                except BaseException:
+                    _unnarrow()
+                    # An interrupt has to stay an interrupt, so the message
+                    # cannot ride it out. stderr, never stdout: that is the
+                    # `--json` envelope's channel.
+                    error(kept)
+                    raise
+                temp_path = source
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            # Every path where the name is still ours, including the Ctrl-C
+            # no except can name. The EBUSY branch disowns it deliberately.
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -1262,7 +1601,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1306,19 +1646,43 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(content)
-                    staged[f"{kind}-{num}"] = path
-        except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
-            raise
+                    # Claimed BEFORE the create: a signal arriving inside
+                    # `os.open` raises the instant it returns, so a record
+                    # made after the call can miss a file that exists.
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    # TRACKED ACROSS THE HANDOVER: an interrupt between
+                    # `os.open` returning and `fdopen` taking the fd leaks the
+                    # descriptor, and on Windows the held handle makes
+                    # `_discard_staging`'s unlink fail -- which then reports a
+                    # 0-byte file as holding pre-swap credentials.
+                    fd = -1
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                        owned, fd = fd, -1
+                        with os.fdopen(owned, "w", encoding="utf-8") as fh:
+                            fh.write(content)
+                    except FileExistsError:
+                        del staged[key]  # lost the race; not ours to remove
+                        raise
+                    except BaseException:
+                        if fd >= 0:
+                            os.close(fd)
+                        raise
         except OSError as e:
             self._discard_staging(staged)
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # The leftover ConfigError above and the Ctrl-C that reaches no
+            # named handler share one policy: remove only what THIS call
+            # created. The caller's rollback cannot help on the interrupt --
+            # it holds the empty dict this call never returned.
+            self._discard_staging(staged)
+            raise
         return staged
 
     def _swap_session_dirs(
@@ -6803,6 +7167,8 @@ class ClaudeAccountSwitcher:
                     # Fresh machine: normalize "" so the stash, composer, and
                     # rollback all see "nothing to preserve".
                     rollback_creds = rollback_creds or None
+                rollback_sequence_text = _roster_snapshot(self.sequence_file)
+                sequence_written = False
                 if config_path.exists():
                     try:
                         rollback_config_text = config_path.read_text(
@@ -6880,6 +7246,14 @@ class ClaudeAccountSwitcher:
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
                     )
+                    # ARMED BEFORE THE WRITE, not after. `_write_json`'s
+                    # write-through recovery EMPTIES the destination when the
+                    # copy dies part-way -- correctly, a partial credential is
+                    # worse than none -- and then raises. Armed after, the
+                    # token is still False there, so the rollback below skips
+                    # a restore whose bytes it is holding, and the caller is
+                    # told the switch "was rolled back" over an empty config.
+                    config_written = True
                     if existing_config is not None:
                         # `is not None`, not truthiness. A VALID but empty `{}`
                         # is readable and loses nothing by being spliced; the
@@ -6895,30 +7269,100 @@ class ClaudeAccountSwitcher:
                             )
                             del salvage
                         self._write_json(config_path, target_config_data)
-                    config_written = True
 
+                    sequence_written = True
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
-                except Exception:
-                    if config_written and rollback_config_text is not None:
+                except Exception as activation_error:
+                    # WHAT THE RESTORE COULD NOT PUT BACK. `_restore_atomically`
+                    # REFUSES a publish error that is not EBUSY, so each arm
+                    # below has a reachable failure branch that leaves the
+                    # destination destroyed. Logged alone it reaches nobody --
+                    # the console handler exists only under debug -- and the
+                    # caller is told only that the activation failed. The
+                    # transaction path says "rollback also failed"; so does
+                    # this one.
+                    unrestored: list[str] = []
+                    # COUNTED, NOT FLAGGED, and incremented where each guard
+                    # lives. A token says a write happened; the arm also needs
+                    # a snapshot to put back. One arm of three restoring is
+                    # not a rollback, and a flag cannot tell those apart.
+                    attempted = 0
+                    if sequence_written and rollback_sequence_text:
+                        attempted += 1
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
+                            # RESTORE, DO NOT INSPECT. The gate here asked
+                            # whether the roster was EMPTY, and the recovery
+                            # empties a partial only when that emptying
+                            # itself succeeds -- refused, half-written JSON
+                            # survives, which is neither empty nor parseable.
+                            # This arm runs only on a failed switch, so the
+                            # snapshot goes back verbatim.
+                            _restore_atomically(
+                                self.sequence_file, rollback_sequence_text
                             )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback the roster: {e}"
+                            )
+                            unrestored.append(f"{self.sequence_file.name} ({e})")
+                    if config_written and rollback_config_text is not None:
+                        attempted += 1
+                        try:
+                            # THE THIRD RESTORE ARM. `config_written` is armed
+                            # before the write, so this runs on faults where
+                            # `_write_json` never opened the destination and
+                            # those bytes are the intact original -- and
+                            # `write_text` opened with O_TRUNC destroyed them.
+                            _restore_atomically(
+                                config_path, rollback_config_text
+                            )
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"
                             )
+                            unrestored.append(f"{config_path.name} ({e})")
                     if creds_written and rollback_creds is not None:
+                        attempted += 1
                         try:
                             self._write_credentials(rollback_creds)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback credentials: {e}"
                             )
+                            unrestored.append(f"the live credential ({e})")
+                    if unrestored:
+                        raise SwitchError(
+                            f"Activation failed and rollback also failed: "
+                            f"{activation_error}. Could not restore "
+                            f"{'; '.join(unrestored)}. Manual recovery may be "
+                            f"needed."
+                        ) from activation_error
+                    armed = sequence_written + config_written + creds_written
+                    if armed:
+                        # THE OTHER HALF OF THE SAME MIRROR. The transaction
+                        # path wraps BOTH outcomes; wrapping only the failed
+                        # rollback left the common one raising `_write_json`'s
+                        # bare `OSError`, which is not a `ClaudeSwitchError` --
+                        # so `--json` printed nothing on stdout and a traceback
+                        # instead. Gated on a WRITE having happened, like the
+                        # sibling's `if transaction.completed_steps` -- wider
+                        # than the arms on purpose, because a machine with no
+                        # snapshot to restore still needs telling, just not
+                        # that it was rolled back.
+                        if attempted == armed:
+                            outcome = "was rolled back"
+                        elif attempted:
+                            outcome = ("was only PARTLY rolled back (no prior "
+                                       "state to restore for the rest)")
+                        else:
+                            outcome = ("could NOT be rolled back (no prior "
+                                       "state to restore)")
+                        raise SwitchError(
+                            f"Activation failed and {outcome}: "
+                            f"{activation_error}"
+                        ) from activation_error
                     raise
 
                 if force_activate and current_identity is not None:
@@ -6974,6 +7418,7 @@ class ClaudeAccountSwitcher:
                 original_account_num=current_account,
                 original_email=current_email,
                 config_path=config_path,
+                original_sequence=_roster_snapshot(self.sequence_file),
             )
 
             try:
@@ -7150,6 +7595,10 @@ class ClaudeAccountSwitcher:
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
+                # Armed before the write, for the reason at the sibling
+                # site: the write-through recovery empties the destination
+                # and then raises.
+                transaction.record_step("config_written")
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = oauth_section
                     self._write_json(config_path, current_config_data)
@@ -7159,14 +7608,16 @@ class ClaudeAccountSwitcher:
                             config_path, emit_output, warnings_out
                         )
                     self._write_json(config_path, target_config_data)
-                transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
-                # Step 5: Update sequence state
+                # Step 5: Update sequence state. Armed BEFORE the write, for
+                # the reason the config step is: the write-through recovery
+                # empties the destination and then raises, and the arm below
+                # restores from the snapshot the transaction carries.
+                transaction.record_step("sequence_updated")
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
-                transaction.record_step("sequence_updated")
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"

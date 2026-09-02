@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -54,7 +56,7 @@ def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
     data = plistlib.loads(info.read_bytes())
     assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
     assert data["CFBundleName"] == "claude-swap"
-    assert not (executable.parent / "Info.plist.tmp").exists()
+    assert list(executable.parent.glob("Info.plist*.tmp")) == []
 
 
 def test_notification_identity_is_noop_off_macos(tmp_path: Path):
@@ -556,3 +558,144 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+def test_a_failed_plist_replace_leaves_no_temp_file(tmp_path: Path, monkeypatch):
+    """A failed publish must not strand the plist temp.
+
+    The existing tests assert the temp is gone, but only on the SUCCESS path,
+    where `os.replace` consumed it anyway. The outer handler logs and returns
+    without unlinking, so the one path that can actually strand it was unseen.
+    """
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+
+    fired = {"replace": False}
+
+    def boom(*_a, **_kw):
+        fired["replace"] = True
+        raise OSError("injected: publish failed")
+
+    monkeypatch.setattr(menubar.os, "replace", boom)
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    # Instrument guard: `result is None` alone cannot tell a failed replace
+    # from a failed write, so a later edit could move the failure and this
+    # would still pass. The flag names the statement.
+    assert fired["replace"], "premise: the injected replace was never reached"
+    assert result is None, "premise: the failure path must have been taken"
+    assert list(executable.parent.glob("Info.plist*.tmp")) == []
+
+
+def test_a_published_plist_is_not_unlinked_by_its_own_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    """On success `os.replace` consumed the temp, so the name is not ours.
+
+    The publish consumes the name, so a cleanup that runs anyway is
+    reaching for a file it has already handed away.
+    """
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+
+    unlinked: list[str] = []
+    real_unlink = Path.unlink
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self, *a, **kw: (
+            unlinked.append(str(self)), real_unlink(self, *a, **kw)
+        )[1],
+    )
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    # Instrument guard: nothing is unlinked when nothing was published either.
+    assert result is not None and result.exists(), "premise: no plist written"
+    assert not [u for u in unlinked if u.endswith(".tmp")], (
+        f"cleanup touched a name it no longer owns: {unlinked}"
+    )
+
+
+def test_a_cleanup_failure_does_not_hide_why_the_plist_write_failed(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """The logged cause must be the write that failed, not the cleanup.
+
+    The cleanup runs inside the `finally`, so an exception from it replaces
+    the in-flight one and the outer handler logs the wrong error. The other
+    other writers here wrap their cleanup for exactly this reason.
+    """
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+
+    def no_space(*_a, **_kw):
+        raise OSError("injected: no space left on device")
+
+    def refused_unlink(*_a, **_kw):
+        raise PermissionError("injected: cleanup refused")
+
+    # THE CREATE, which is what the writer calls now: it opens the temp with
+    # `os.open`+O_EXCL like every sibling rather than `Path.write_bytes`.
+    monkeypatch.setattr(menubar.os, "open", no_space)
+    monkeypatch.setattr(Path, "unlink", refused_unlink)
+
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        assert menubar.ensure_notification_identity(executable, platform="darwin") is None
+
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert logged, "premise: nothing was logged at all"
+    assert "no space left" in logged, f"the cleanup masked the cause: {logged}"
+
+
+def test_the_plist_temp_name_is_not_shared_between_launches(
+    tmp_path: Path, monkeypatch
+):
+    """Two concurrent launches must not draw the same temp name.
+
+    A fixed name means launch A's publish consumes the name B is still
+    writing, and B's replace then fails on a file that is simply gone. Every
+    sibling writer here scopes its temp to the process for this reason.
+    """
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+
+    seen: list[str] = []
+    real_replace = menubar.os.replace
+
+    def recording_replace(src, dst, *a, **kw):
+        seen.append(Path(src).name)
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr(menubar.os, "replace", recording_replace)
+    menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert seen, "premise: nothing was published, so no temp name was drawn"
+    assert str(os.getpid()) in seen[0], (
+        f"temp name is not scoped to this process: {seen[0]}"
+    )
+
+
+class TestSaveGoesThroughTheSharedWriter:
+    """`save` delegates so a menu-bar toggle is interrupt-safe; `load` returns
+    all-defaults on an unparseable file without a word, so a torn write turns
+    auto-switch off silently."""
+
+    def test_a_saved_file_round_trips(self, tmp_path):
+        p = tmp_path / "menubar_settings.json"
+        original = menubar.MenuBarSettings(auto_switch_enabled=True)
+        original.save(p)
+        assert menubar.MenuBarSettings.load(p) == original
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+    def test_the_file_is_not_left_at_the_umask_default(self, tmp_path):
+        """The round trip alone passes against a plain `write_text`, so it
+        cannot see the delegation. The mode can: the shared writer sets 0600
+        on the fd, a `write_text` takes whatever the umask allows. The umask
+        is pinned because a runner already at 0077 gets 0600 either way."""
+        p = tmp_path / "menubar_settings.json"
+        previous = os.umask(0o022)
+        try:
+            menubar.MenuBarSettings().save(p)
+        finally:
+            os.umask(previous)
+        assert oct(p.stat().st_mode & 0o777) == "0o600"

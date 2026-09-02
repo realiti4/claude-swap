@@ -39,10 +39,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -1439,18 +1439,39 @@ class SessionManager:
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
         mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(manifest_path.parent), prefix=".cswap-shared-", suffix=".tmp"
-        )
+        # THE NAME BEFORE THE FILE, and the fd tracked until `fdopen` owns it:
+        # `mkstemp` mints the name inside the syscall, so an interrupt there
+        # strands a temp nothing can name, and an interrupt before the handover
+        # leaks the descriptor that makes a Windows unlink fail.
+        tmp = str(manifest_path.parent
+                  / f".cswap-shared-{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        fd = -1
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                fd = os.open(
+                    tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE, and this arm SWALLOWS -- so without the
+                # disown the `finally` below deletes the winner's file with
+                # no raise, no log, and nothing to notice.
+                tmp = ""
+                raise
+            owned, fd = fd, -1
+            with os.fdopen(owned, "w", encoding="utf-8") as f:
                 f.write(payload)
             replace_with_retry(tmp, manifest_path)
+            tmp = ""  # consumed by the replace; the name is no longer ours
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best-effort: a failed manifest must not fail a launch
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            # Every path, including the Ctrl-C the except cannot name.
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:

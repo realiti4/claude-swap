@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import builtins
 import base64
+import errno
 import json
+import logging
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -25,7 +29,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
-from claude_swap.models import Platform, normalize_alias
+from claude_swap.models import Platform, _restore_atomically, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
 from claude_swap.credentials import ActiveCredentials
@@ -3625,6 +3629,570 @@ class TestPerformSwitchPostDisplay:
             "target-token"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is the one fault that fails the write AND the "
+               "restore; `resource` is POSIX-only, and no Windows API gives "
+               "the same single-fault shape",
+    )
+    def test_a_rollback_does_not_truncate_a_destination_it_cannot_rewrite(
+        self,
+        temp_home: Path,
+    ):
+        """The rollback runs on failures where the write never opened the
+        destination, and `Path.write_text` opens with O_TRUNC -- so the one
+        fault that fails the write also destroys the intact original when
+        the restore fails the same way.
+        """
+        import resource
+        import signal
+
+        from claude_swap.models import SwitchTransaction
+
+        roster = temp_home / "sequence.json"
+        original = json.dumps({
+            "activeAccountNumber": 1,
+            "accounts": {
+                str(i): {"email": f"a{i}@example.com", "uuid": "",
+                         "organizationUuid": "", "organizationName": "",
+                         "added": "2024-01-01T00:00:00Z"}
+                for i in range(1, 6)
+            },
+        }, indent=2)
+        roster.write_text(original, encoding="utf-8")
+        before = roster.stat().st_size
+
+        class _Switcher:
+            sequence_file = roster
+
+            class _logger:
+                @staticmethod
+                def info(*_a, **_k):
+                    pass
+
+                @staticmethod
+                def error(*_a, **_k):
+                    pass
+
+            def _write_credentials(self, *_a):
+                pass
+
+            def _get_sequence_data(self):
+                return None
+
+            def _write_json(self, *_a, **_k):
+                raise AssertionError("the restore must not re-enter _write_json")
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text("{}", encoding="utf-8")
+        tx = SwitchTransaction(
+            original_credentials="", original_config="{}",
+            original_account_num="1", original_email="a1@example.com",
+            config_path=config_path, original_sequence=original,
+        )
+        tx.record_step("sequence_updated")
+
+        # RESTORED, like its three siblings. A disposition is PROCESS-WIDE and
+        # pytest runs the file in one process, so leaving SIGXFSZ at SIG_IGN
+        # leaks into every later test in this worker -- a case that means to
+        # be killed by the signal then sees an EFBIG it never asked for.
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        # PREMISE: a quota that cannot hold the roster, so the restore fails
+        # for the same reason the write did.
+        assert before // 2 < before
+        resource.setrlimit(resource.RLIMIT_FSIZE, (before // 2, hard))
+        try:
+            tx.rollback(_Switcher())
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        text = roster.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the rollback truncated a roster the failed write never "
+            "touched. `_get_sequence_data` reads strictly, so a partial file "
+            f"makes every later cswap invocation refuse to run ({before}B -> "
+            f"{len(text)}B)"
+        )
+        assert not [p for p in temp_home.iterdir() if ".restore." in p.name], (
+            "a failed restore must not strand its temp"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a 0o500 parent and RLIMIT_FSIZE are POSIX shapes",
+    )
+    def test_a_restore_never_rewrites_a_destination_in_place(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """A rename it cannot make is not a rewrite it may make.
+
+        The only evidence available at that point is the errno from the
+        TEMP, which is a fact about the PARENT DIRECTORY -- and the
+        destination need not even be on the same filesystem. A rewrite
+        authorised that way truncates a file whose own room nothing
+        measured, which is the loss this helper exists to prevent.
+        """
+        import resource
+        import signal
+
+        dest = temp_home / "sub" / ".claude.json"
+        dest.parent.mkdir()
+        original = json.dumps({"projects": {f"/p/{i}": [1] * 20 for i in range(2500)}})
+        dest.write_text(original, encoding="utf-8")
+        cap = len(original) // 2
+        # PREMISE: the parent refuses the temp, so the errno the helper sees
+        # is EACCES -- nothing about the destination's own room.
+        os.chmod(dest.parent, 0o500)
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            with pytest.raises(PermissionError):
+                (dest.parent / "probe").touch()
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+            os.chmod(dest.parent, 0o700)
+
+        text = dest.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the restore rewrote a destination in place on the "
+            "strength of an errno about a different filesystem, and the "
+            f"rewrite ran out of room ({len(original)}B -> {len(text)}B)"
+        )
+        assert caught.value.errno == errno.EACCES, (
+            "the refusal must carry the temp's own errno, not one from a "
+            "rewrite it should never have attempted"
+        )
+        assert not [
+            p for p in dest.parent.iterdir() if ".restore." in p.name
+        ], "a refused restore must not strand its temp"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_a_restore_refuses_rather_than_write_through_a_space_fault(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """The write-through above must not swallow the fault it exists for.
+
+        A full filesystem fails the rewrite too, and the rewrite truncates
+        first — so on those errnos the intact destination is worth more than
+        the attempt.
+        """
+        dest = temp_home / ".claude.json"
+        original = json.dumps({"projects": {f"/p/{i}": [1] * 20 for i in range(2500)}})
+        dest.write_text(original, encoding="utf-8")
+        cap = len(original) // 2
+        # PREMISE: the payload cannot fit under the cap, so the write faults.
+        assert cap < len(original)
+
+        import resource
+        import signal
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        assert caught.value.errno == errno.EFBIG
+        assert dest.read_text(encoding="utf-8") == original, (
+            "DEFECT: the write-through fallback truncated a destination the "
+            f"failed write never touched ({len(original)}B -> "
+            f"{dest.stat().st_size}B)"
+        )
+
+    def test_a_restore_refuses_a_publish_error_that_is_not_ebusy(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """Only EBUSY authorises the in-place rewrite.
+
+        EBUSY on the publish is a fact about the DESTINATION -- a bind-mounted
+        file pins the inode, so no rename can ever land there and writing
+        through is the only way. Every other publish errno says something
+        else (an immutable destination answers EPERM), and rewriting on that
+        reading opens the destination with O_TRUNC on nothing but a guess.
+        Refusing costs the caller a restore it is told about; rewriting can
+        cost it the file.
+
+        The second half is the control: the same call, the same instrument,
+        the one errno that DOES write through -- without it "no rewrite
+        happened" is a claim the test has no power to make.
+        """
+        from claude_swap import models as models_mod
+
+        dest = temp_home / ".claude.json"
+        original = json.dumps({"userID": "u", "projects": {"/p": [1, 2, 3]}})
+        dest.write_text(original, encoding="utf-8")
+
+        def refuse(src, dst, *a, **k):
+            raise OSError(errno.EPERM, "operation not permitted")
+
+        with patch.object(models_mod, "replace_with_retry", side_effect=refuse):
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
+
+        assert caught.value.errno == errno.EPERM, (
+            "DEFECT: a publish error that is not EBUSY was swallowed by an "
+            "in-place rewrite, so the caller is told the restore landed when "
+            f"nothing checked whether it could ({caught.value.errno})"
+        )
+        assert dest.read_text(encoding="utf-8") == original, (
+            "the refused restore must leave the destination as it was"
+        )
+
+        # CONTROL: the one errno that IS about the destination. The rename
+        # never succeeds under either patch, so a destination that comes back
+        # holding `original` can only have been written through -- which is
+        # what proves the case above measured a refusal and not an inert test.
+        dest.write_text("", encoding="utf-8")
+
+        def busy(src, dst, *a, **k):
+            raise OSError(errno.EBUSY, "device or resource busy")
+
+        with patch.object(models_mod, "replace_with_retry", side_effect=busy):
+            _restore_atomically(dest, original)
+
+        assert dest.read_text(encoding="utf-8") == original, (
+            "premise: EBUSY must still write through, or the case above "
+            "proves nothing about the narrowing"
+        )
+
+    def test_a_write_through_that_empties_the_roster_is_rolled_back(
+        self,
+        temp_home: Path,
+    ):
+        """The roster has the same exposure as the config, one write later.
+
+        `_write_json`'s recovery empties the destination when the copy dies
+        part-way and raises. A zero-byte `sequence.json` is not merely a lost
+        active-account pointer: `_get_sequence_data` reads it strictly, so the
+        next cswap invocation refuses to run at all.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "current@example.com", "accountUuid": "",
+            "organizationUuid": "", "organizationName": "",
+        }}))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        roster = {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {"email": "target@example.com", "uuid": "",
+                      "organizationUuid": "", "organizationName": "",
+                      "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": "current@example.com", "uuid": "",
+                      "organizationUuid": "", "organizationName": "",
+                      "added": "2024-01-01T00:00:00Z"},
+            },
+        }
+        switcher._write_json(switcher.sequence_file, roster)
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}),
+            ("2", "current@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "c", "refreshToken": "cr"}}),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "target@example.com", "accountUuid": "",
+                "organizationUuid": "", "organizationName": "",
+            }}),
+        }
+        live_state = {"creds": creds_store[("2", "current@example.com")]}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        real_copyfile = switcher_mod.shutil.copyfile
+        calls = []
+
+        def busy_replace(src, dst):
+            if os.path.basename(str(dst)) == "sequence.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return switcher_mod.replace_with_retry.__wrapped__(src, dst) \
+                if hasattr(switcher_mod.replace_with_retry, "__wrapped__") \
+                else os.replace(src, dst)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(str(dest)) == "sequence.json":
+                calls.append("copy")
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        try:
+            with patch.object(
+                switcher_mod, "replace_with_retry", side_effect=busy_replace,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), pytest.raises(SwitchError):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISE: the write-through really ran on the ROSTER, or this case
+        # asserts the absence of damage nothing attempted.
+        assert calls == ["replace", "copy"], (
+            f"premise: the roster's write-through must run, got {calls}"
+        )
+
+        text = switcher.sequence_file.read_text(encoding="utf-8")
+        assert text.strip(), (
+            "DEFECT: the roster was emptied and nothing restored it. Every "
+            "slot's email, uuid and org are gone, and `_get_sequence_data` "
+            "reads strictly, so the next cswap invocation refuses to run."
+        )
+        back = json.loads(text)
+        assert back["accounts"] == roster["accounts"], (
+            "the roster survived but its accounts did not"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_the_transaction_rollback_does_not_truncate_an_intact_config(
+        self,
+        temp_home: Path,
+        caplog,
+    ):
+        """The transaction's config arm, on a destination the write never
+        opened.
+
+        `record_step("config_written")` is armed BEFORE the write, so the arm
+        runs on faults where `_write_json`'s temp write failed and
+        `~/.claude.json` still holds the intact original. `Path.write_text`
+        opens with O_TRUNC, so restoring that way destroys the very bytes it
+        is holding when the rewrite hits the same fault.
+
+        The direct-activation path has this witness; the transaction path is
+        the sibling that did not.
+        """
+        import resource
+        import signal
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "current@example.com", "accountUuid": "",
+                "organizationUuid": "", "organizationName": "",
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {
+                f"/p/{i}": {"allowedTools": ["Bash", "Read"] * 8}
+                for i in range(700)
+            },
+        }))
+        original = config_path.read_text(encoding="utf-8")
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                n: {"email": f"{w}@example.com", "uuid": f"u{n}",
+                    "organizationUuid": "", "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z"}
+                for n, w in (("1", "target"), ("2", "current"))
+            },
+        })
+        for n, w in (("1", "target"), ("2", "current")):
+            switcher._write_account_credentials(n, f"{w}@example.com", json.dumps(
+                {"claudeAiOauth": {"accessToken": f"t-{w}", "refreshToken": "r"}}))
+            switcher._write_account_config(n, f"{w}@example.com", json.dumps(
+                {"oauthAccount": {"emailAddress": f"{w}@example.com",
+                                  "accountUuid": f"u{n}"}}))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "t-current", "refreshToken": "r"}}))
+
+        cap = 100_000
+        # PREMISE: the config cannot fit under the cap, so the write faults.
+        assert len(original) > cap
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            # The backup step writes this SAME oversized config to the slot
+            # store, which the cap also refuses -- that raise lands before any
+            # step is recorded, so the rollback would never run and this case
+            # would certify a branch it never entered.
+            with patch.object(switcher, "_write_account_config"), patch.object(
+                switcher, "list_accounts"
+            ), pytest.raises(SwitchError):
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        # PREMISE: the arm really ran, or this asserts the absence of damage
+        # nothing attempted. The step NAME, not its outcome -- the rollback
+        # logs "Rolled back step" or "Failed to rollback step" for the same
+        # step, and a restore that truncates takes the second, so keying on
+        # success would fail the premise on exactly the defect under test.
+        assert "config_written" in caplog.text, (
+            f"premise: the config arm must run in the rollback, got "
+            f"{caplog.text!r}"
+        )
+        text = config_path.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the transaction rollback truncated the config the failed "
+            f"write never touched ({len(original)}B -> {len(text)}B) -- "
+            "`oauthAccount`, `userID`, `mcpServers` and `projects` are gone"
+        )
+
+    def test_a_write_through_that_empties_the_config_is_rolled_back(
+        self,
+        temp_home: Path,
+    ):
+        """A destination that refuses the rename makes `_write_json` copy
+        THROUGH it, and a copy that dies part-way empties it -- correctly,
+        a partial credential is worse than none -- and then raises.
+
+        The rollback token must already be armed at that point, or the
+        caller skips a restore whose bytes it is holding and tells the user
+        the switch "was rolled back" over an emptied config.
+        """
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "current@example.com",
+                "accountUuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+            },
+            "projects": {"/some/repo": {"allowedTools": []}},
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+                "2": {
+                    "email": "current@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}),
+            ("2", "current@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "c", "refreshToken": "cr"}}),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                }
+            }),
+        }
+        live_state = {"creds": creds_store[("2", "current@example.com")]}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        from claude_swap import switcher as switcher_mod
+
+        real_copyfile = switcher_mod.shutil.copyfile
+
+        calls = []
+
+        import claude_swap.fsutil as fsutil_mod
+
+        real_replace = fsutil_mod.os.replace
+
+        def busy_replace(src, dst, *a, **k):
+            # AT THE SHARED CALLEE, not at one module's binding. `models`
+            # holds its own `from claude_swap.fsutil import
+            # replace_with_retry`, so patching switcher's name leaves the
+            # RESTORE's rename real -- it succeeds, and this case then
+            # certifies a branch it never entered.
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                calls.append(("replace", str(dst)))
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            # `copyfile` opens the destination 'wb' before the first source
+            # byte, so the destination is already empty when this raises.
+            calls.append(("copy", str(dest)))
+            with open(dest, "wb") as handle:
+                handle.write(b"{par")
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        try:
+            with patch.object(
+                fsutil_mod.os, "replace", side_effect=busy_replace,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), pytest.raises(SwitchError) as excinfo:
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISES: the write-through really ran, or this case asserts the
+        # absence of damage nothing attempted.
+        assert [c[0] for c in calls] == ["replace", "copy", "replace"], (
+            "premise: the write's EBUSY, its write-through, AND the "
+            f"restore's own rename must all run, got {calls}"
+        )
+        assert "may now be truncated" in str(excinfo.value), (
+            "premise: the failure must be the write-through's own"
+        )
+        assert config_path.read_text() != "{par", (
+            "premise: the partial must not survive -- the recovery empties it"
+        )
+        assert config_path.read_text() == original_config_text, (
+            "DEFECT: the write-through emptied the config and raised, and "
+            "the rollback did not restore it -- the caller's token is armed "
+            "only after the write returns, so a failure DURING the write "
+            "leaves it False while the original bytes sit in memory. The "
+            "user is told the switch was rolled back."
+        )
+
     def test_direct_activation_rolls_back_live_creds_on_sequence_write_failure(
         self,
         temp_home: Path,
@@ -3697,7 +4265,7 @@ class TestPerformSwitchPostDisplay:
         try:
             with patch.object(
                 switcher, "_write_json", side_effect=failing_write_json,
-            ), pytest.raises(OSError, match="disk full"):
+            ), pytest.raises(SwitchError, match=r"was rolled back.*disk full"):
                 switcher._perform_switch("1")
         finally:
             for p in patches:
@@ -7758,6 +8326,668 @@ class TestDirectActivationPreservation:
         assert _read_safety_copy(switcher, entry_id) == unmanaged
         assert entries[entry_id]["reason"] == "displaced-live-login"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_direct_activation_rollback_does_not_truncate_the_config(
+        self, temp_home
+    ):
+        """The THIRD restore arm, on ~/.claude.json.
+
+        `config_written` is armed before the write, so this arm runs on the
+        faults where `_write_json` never opened the destination and those
+        bytes are the intact original. A truncating rewrite there destroys
+        `oauthAccount`, `projects`, `mcpServers` and `userID` — and the cap
+        refuses the restore's own temp too, so this fault is a refused
+        rollback as well, which the caller must hear about.
+        """
+        import resource
+        import signal
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {
+                f"/p/{i}": {"allowedTools": ["Bash", "Read"] * 8}
+                for i in range(700)
+            },
+        }))
+        original = config_path.read_text(encoding="utf-8")
+        cap = 100_000
+        # PREMISE: the config cannot fit under the cap, so the write faults.
+        assert len(original) > cap
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            # `SwitchError`, not the write's own `OSError`. The cap refuses
+            # the RESTORE's temp too, so this fault is also a refused
+            # rollback -- and a refused rollback is now reported rather than
+            # logged, exactly as the transaction path reports it. The report
+            # is conservative on this shape: it says the bytes were not put
+            # back, which is true, while the assertion below shows the
+            # destination never lost them.
+            with patch.object(switcher, "list_accounts"):
+                with pytest.raises(SwitchError) as excinfo:
+                    switcher._perform_switch("1", emit_output=False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the direct-activation rollback truncated the config the "
+            f"failed write never touched ({len(original)}B -> {len(text)}B)"
+        )
+        assert "rollback also failed" in str(excinfo.value), (
+            "a restore the helper refused must reach the caller, not just "
+            f"the log: {excinfo.value}"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a 0o444 destination refusing the recovery's own emptying is "
+               "a POSIX shape",
+    )
+    def test_direct_activation_rollback_restores_a_partial_roster(
+        self, temp_home
+    ):
+        """The roster arm must restore, not inspect what it finds.
+
+        `_write_json`'s write-through recovery empties a partial only when
+        the emptying itself succeeds; refused, the destination keeps a few
+        bytes of half-written JSON. An arm that restores only an EMPTY
+        roster leaves that partial in place, and `_get_sequence_data` reads
+        strictly -- so every later cswap invocation refuses to run.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher, _ = self._setup(temp_home)
+        original = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+        real_write_json = ClaudeAccountSwitcher._write_json
+        calls = []
+        at_arm = {}
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == "sequence.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == "sequence.json":
+                calls.append("copy")
+                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
+                os.write(fd, b"{par")
+                os.close(fd)
+                # THE SAME FAULT BLOCKS THE RECOVERY'S OWN EMPTYING, which
+                # `_unnarrow` performs by opening the destination 'wb'. That
+                # is the branch it documents: refused, the partial stays.
+                os.chmod(dest, 0o444)
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        def spy_write_json(self, path, data):
+            # WHAT THE ARM IS HANDED, read independently of the arm -- an
+            # arm that never runs must still fail on the defect assertion,
+            # not on this premise.
+            try:
+                return real_write_json(self, path, data)
+            except BaseException:
+                if os.path.basename(os.fspath(path)) == "sequence.json":
+                    at_arm["text"] = path.read_text(encoding="utf-8")
+                raise
+
+        with patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(
+            ClaudeAccountSwitcher, "_write_json", spy_write_json,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(SwitchError):
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISES: the roster's write-through really ran, and the recovery
+        # really could not empty what it left -- or this case asserts the
+        # repair of damage nothing did.
+        assert calls == ["replace", "copy"], (
+            f"premise: the roster's write-through must run, got {calls}"
+        )
+        assert at_arm.get("text") == "{par", (
+            "premise: the arm must be entered on a PARTIAL roster, got "
+            f"{at_arm.get('text')!r}"
+        )
+
+        text = switcher.sequence_file.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the rollback left a partial roster in place. The arm "
+            "restores only an EMPTY one, and a few bytes of half-written "
+            f"JSON is not empty ({len(original)}B -> {len(text)}B, "
+            f"{text[:16]!r})"
+        )
+        # The consequence, at the seam that suffers it.
+        later = ClaudeAccountSwitcher()
+        later.platform = Platform.LINUX
+        assert (later._get_sequence_data() or {}).get("accounts", {}).keys() == {
+            "1"
+        }, "the roster came back but cswap still cannot read it"
+
+    def test_direct_activation_rollback_restores_an_emptied_config(
+        self, temp_home
+    ):
+        """The `config_written` token must be armed BEFORE the write.
+
+        A destination that refuses the rename makes `_write_json` copy
+        THROUGH it, and a copy that dies part-way empties it -- correctly, a
+        partial credential is worse than none -- and then raises. Armed
+        after the write returns, the token is still False there, so the arm
+        skips a restore whose bytes it is holding and the user keeps an
+        empty `~/.claude.json`.
+        """
+        from claude_swap import switcher as switcher_mod
+        import claude_swap.fsutil as fsutil_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {"/some/repo": {"allowedTools": ["Bash", "Read"]}},
+        }))
+        original = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = fsutil_mod.os.replace
+        calls = []
+
+        def busy_replace(src, dst, *a, **k):
+            # AT THE SHARED CALLEE. `models` holds its own binding of
+            # `replace_with_retry`, so patching switcher's name leaves the
+            # RESTORE's rename real and this case certifies a branch it
+            # never entered.
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == ".claude.json":
+                calls.append("copy")
+                # `copyfile` opens the destination 'wb' before the first
+                # source byte, so it is already empty when this raises.
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        with patch.object(
+            fsutil_mod.os, "replace", side_effect=busy_replace,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(SwitchError):
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the write's EBUSY and its write-through must run, or this
+        # asserts the repair of damage nothing did. ONLY THE FIRST TWO. The
+        # restore's own rename is the third, and that one is the arm under
+        # test -- asserting it here would make an unarmed token fail the
+        # premise instead of the defect, which is the failure this case
+        # exists to report.
+        assert calls[:2] == ["replace", "copy"], (
+            f"premise: the config's write-through must run, got {calls}"
+        )
+        assert config_path.read_text() != "{par", (
+            "premise: the partial must not survive -- the recovery empties it"
+        )
+        assert config_path.read_text(encoding="utf-8") == original, (
+            "DEFECT: the write-through emptied the config and raised, and "
+            "the direct-activation rollback did not restore it. `userID`, "
+            "`mcpServers` and `projects` are gone -- and an unarmed token "
+            "attempts no restore, so nothing is reported either and the user "
+            "is told only that the activation failed"
+        )
+
+    def test_direct_activation_reports_a_rollback_it_could_not_make(
+        self, temp_home
+    ):
+        """A refused restore must reach the caller, not just the log.
+
+        `_restore_atomically` REFUSES a publish error that is not EBUSY --
+        that refusal is the point of the helper -- so the arm has a reachable
+        failure branch. It used to be `_logger.error`d and nothing more, and
+        the console handler exists only under debug, so the user was told the
+        activation failed while `~/.claude.json` was empty. The transaction
+        path is the control: it raises "rollback also failed".
+        """
+        from claude_swap import switcher as switcher_mod
+        from claude_swap import models as models_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "projects": {"/some/repo": {"allowedTools": ["Bash"]}},
+        }))
+        original = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == ".claude.json":
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        def refuse_restore(src, dst, *a, **k):
+            # THE RESTORE'S OWN PUBLISH, at `models`' binding so only
+            # `_restore_atomically` sees it. A non-EBUSY refusal, so the
+            # helper raises rather than rewriting in place.
+            raise OSError(errno.EACCES, "permission denied")
+
+        with patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(
+            models_mod, "replace_with_retry", side_effect=refuse_restore,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the config really was lost, or "the caller must be told"
+        # is a message about nothing.
+        assert config_path.read_text(encoding="utf-8") != original, (
+            "premise: the restore must actually have been refused"
+        )
+        assert "rollback also failed" in str(excinfo.value), (
+            "DEFECT: the restore was refused and `~/.claude.json` is empty, "
+            "and the caller is told only that the activation failed. The "
+            f"config is unrecoverable and nothing says so: {excinfo.value}"
+        )
+
+    def test_direct_activation_names_every_arm_it_could_not_restore(
+        self, temp_home
+    ):
+        """All three arms, not just the one that happened to be covered.
+
+        The report exists so a refused restore reaches the caller, and there
+        are three destinations it can name. The credentials one matters most:
+        its failure means the live OAuth credential was NOT put back, so the
+        machine keeps the target's token while `~/.claude.json` says
+        otherwise, and this message is the only thing that says so.
+
+        One fault reaches all three: the roster write fails with every arm
+        already armed, and every restore is then refused.
+        """
+        from claude_swap import models as models_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+        }))
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+        real_write_creds = switcher._write_credentials
+        wrote = {"creds": 0}
+
+        def fail_the_roster(self, path, data):
+            # LAST write in the block, so `creds_written`, `config_written`
+            # and `sequence_written` are all armed when it raises.
+            if os.path.basename(os.fspath(path)) == "sequence.json" and \
+                    data.get("activeAccountNumber") == 1:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        refused = []
+
+        def refuse_every_restore(src, dst, *a, **k):
+            # At `models`' own binding, so only `_restore_atomically` sees it.
+            # EACCES is not EBUSY, so the helper refuses instead of rewriting.
+            refused.append(os.path.basename(os.fspath(dst)))
+            raise OSError(errno.EACCES, "permission denied")
+
+        def creds_ok_then_refused(creds):
+            wrote["creds"] += 1
+            if wrote["creds"] == 1:
+                return real_write_creds(creds)
+            raise OSError(errno.EACCES, "permission denied")
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_roster,
+        ), patch.object(
+            models_mod, "replace_with_retry", side_effect=refuse_every_restore,
+        ), patch.object(
+            switcher, "_write_credentials", creds_ok_then_refused,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the rollback really attempted the credential restore, or
+        # the assertion below is about an arm that never ran.
+        assert wrote["creds"] == 2, (
+            f"premise: the credentials arm must run, got {wrote['creds']} "
+            "write(s)"
+        )
+        # PREMISE: the other two arms were entered and refused too. Without
+        # this an arm that stopped RUNNING would fail below as though the
+        # report had gone silent, which is a different defect.
+        assert {"sequence.json", ".claude.json"} <= set(refused), (
+            f"premise: both file arms must attempt a restore, got {refused}"
+        )
+        message = str(excinfo.value)
+        for destination in (
+            switcher.sequence_file.name, config_path.name, "the live credential",
+        ):
+            assert destination in message, (
+                f"DEFECT: {destination!r} could not be restored and the "
+                f"report does not name it. The user is told the activation "
+                f"failed and nothing else: {message}"
+            )
+
+    def test_direct_activation_does_not_claim_a_rollback_it_never_made(
+        self, temp_home
+    ):
+        """The tokens say an arm was ARMED, not that it restored anything.
+
+        Each arm carries a second condition the report must mirror: there
+        has to be a snapshot to put back. On a machine with no prior live
+        login and no `~/.claude.json` -- fresh, post-purge, or just
+        imported, which is the population this path exists for -- the
+        target credential is written and then the config write fails. Every
+        snapshot is None, so every arm is skipped and nothing is restored.
+
+        Announcing "was rolled back" there is the same false sentence this
+        branch treats as a defect everywhere else, and it is worse than
+        silence: the target's token IS the live credential now, and the
+        roster does not know it.
+        """
+        switcher, _ = self._setup(temp_home, live_identity_email=None)
+        # No prior live login either: both snapshots are absent.
+        (temp_home / ".claude" / ".credentials.json").unlink()
+        config_path = temp_home / ".claude.json"
+        assert not config_path.exists(), "premise: no prior config"
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_config(self, path, data):
+            if os.path.basename(os.fspath(path)) == ".claude.json":
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_config,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: nothing was restored, or there is no false claim to make.
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one", (
+            "premise: the target credential must be live and unrestored"
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: the report claims a rollback that never happened. Every "
+            "snapshot was absent so every arm was skipped, and the target's "
+            "credential is the live login while the roster does not know it: "
+            f"{excinfo.value}"
+        )
+        # And POSITIVELY, or any replacement text passes -- including none.
+        assert "could NOT be rolled back" in str(excinfo.value), (
+            f"the report must say what did not happen: {excinfo.value}"
+        )
+
+    def test_direct_activation_does_not_call_a_partial_rollback_a_whole_one(
+        self, temp_home
+    ):
+        """One arm of three is not "was rolled back".
+
+        The flag says SOME arm ran; the sentence speaks for all of them. On a
+        machine with no `~/.claude.json` and no prior live login but a
+        populated roster, the roster write fails with all three tokens armed
+        -- and only the roster has a snapshot. It goes back; the credential
+        and the config do not.
+
+        The user is then told the switch was rolled back while the target's
+        token is the live login and a config that never existed names the
+        target: the orphaned-identity state the snapshot exists to prevent.
+        """
+        switcher, _ = self._setup(temp_home, live_identity_email=None)
+        (temp_home / ".claude" / ".credentials.json").unlink()
+        config_path = temp_home / ".claude.json"
+        assert not config_path.exists(), "premise: no prior config"
+        roster_before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_roster(self, path, data):
+            # LAST write in the block: all three tokens are armed, and only
+            # the roster has anything to put back.
+            if os.path.basename(os.fspath(path)) == "sequence.json" and \
+                    data.get("activeAccountNumber") == 1:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_roster,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISES: exactly one arm restored, and the other two left the
+        # machine changed -- or there is no partial to misdescribe.
+        assert switcher.sequence_file.read_text(encoding="utf-8") == roster_before, (
+            "premise: the roster arm must have restored"
+        )
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one", (
+            "premise: the target credential must still be live"
+        )
+        assert config_path.exists(), (
+            "premise: a config that did not exist must now name the target"
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: one arm of three restored and the report calls it a "
+            "rollback. The target's token is the live login and a config "
+            "that never existed names the target, which is the orphaned "
+            f"identity the snapshot exists to prevent: {excinfo.value}"
+        )
+        assert "PARTLY" in str(excinfo.value), (
+            f"the report must say which way it was partial: {excinfo.value}"
+        )
+
+    def test_direct_activation_calls_a_whole_rollback_whole(
+        self, temp_home
+    ):
+        """The denominator's other reachable value.
+
+        Two arms armed, both with snapshots, both restoring, is a COMPLETE
+        rollback -- the roster write is never reached, so it was never
+        written and owes nothing. Counting a fixed three there downgrades a
+        true rollback to a false partial and sends the user hunting for
+        damage that does not exist.
+        """
+        switcher, unmanaged = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        original_config = config_path.read_text(encoding="utf-8")
+        roster_before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_config(self, path, data):
+            if os.path.basename(os.fspath(path)) == ".claude.json":
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_config,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: everything that was written really did come back, or
+        # "whole" is not what this state is.
+        assert config_path.read_text(encoding="utf-8") == original_config
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+        assert switcher.sequence_file.read_text(encoding="utf-8") == (
+            roster_before
+        ), "premise: the roster was never written, so it owes nothing"
+
+        message = str(excinfo.value)
+        assert "was rolled back" in message, (
+            f"DEFECT: a complete rollback must say so, got: {message}"
+        )
+        assert "PARTLY" not in message, (
+            "DEFECT: two arms armed and two restored is WHOLE. A fixed "
+            "denominator calls it partial and sends the user looking for "
+            f"damage that is not there: {message}"
+        )
+
+    def test_direct_activation_does_not_wrap_a_failure_before_any_write(
+        self, temp_home
+    ):
+        """Nothing written is not a rollback of any kind.
+
+        The wrap is gated on a write having happened. When the very first
+        write fails, no token is set, nothing needs undoing, and the
+        original error is the whole story -- wrapping it would invent a
+        rollback that had nothing to act on.
+        """
+        switcher, unmanaged = self._setup(temp_home)
+
+        def fail_first_write(_creds):
+            raise OSError(errno.EACCES, "permission denied")
+
+        with patch.object(
+            switcher, "_write_credentials", fail_first_write,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            # BOTH CANDIDATES, so the assertion below is what discriminates.
+            # Naming only `OSError` makes a wrap fail at this boundary and
+            # the DEFECT message never reaches the log.
+            (OSError, SwitchError)
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the live login is untouched, so there was nothing to undo.
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+        assert not isinstance(excinfo.value, SwitchError), (
+            "DEFECT: no write happened, so the wrap must not fire and "
+            f"rename the failure: {excinfo.value!r}"
+        )
+        assert "rolled back" not in str(excinfo.value), (
+            f"DEFECT: nothing was written, so nothing was rolled back: "
+            f"{excinfo.value}"
+        )
+
+    def test_direct_activation_counts_only_arms_that_had_a_snapshot(
+        self, temp_home
+    ):
+        """An armed token with no snapshot must not count as restored.
+
+        `_roster_snapshot` answers "" when its read fails -- its documented
+        behaviour -- so the roster arm can be armed with nothing to put
+        back, while the write that armed it EMPTIES the file. The counter
+        has to mirror the arm's second conjunct, not just its token, or the
+        roster is left unreadable under a sentence saying it came back.
+
+        This is the conjunct the two earlier false sentences turned on, on
+        the one arm where nothing else pins it.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher, unmanaged = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        original_config = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == "sequence.json":
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == "sequence.json":
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        with patch.object(
+            # THE SNAPSHOT READ LOST THE RACE. `_get_sequence_data` had
+            # already succeeded, so the switch runs; the read that follows
+            # hit an OSError and answered "", exactly as documented.
+            switcher_mod, "_roster_snapshot", return_value="",
+        ), patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISES: the roster really was destroyed and really was NOT put
+        # back, while the other two arms did restore -- so exactly one arm
+        # is outstanding and the sentence has something to be wrong about.
+        assert not switcher.sequence_file.read_text(encoding="utf-8").strip(), (
+            "premise: the write-through must have emptied the roster"
+        )
+        assert config_path.read_text(encoding="utf-8") == original_config
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: the roster arm was armed with no snapshot, restored "
+            "nothing, and the report counts it as though it had. "
+            "`sequence.json` is empty -- every later cswap invocation "
+            f"refuses to run -- and the user is told it came back: "
+            f"{excinfo.value}"
+        )
+
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
         with patch.object(
@@ -7834,7 +9064,7 @@ class TestDirectActivationPreservation:
 
         with patch.object(
             switcher, "_write_json", side_effect=fail_sequence_write
-        ), pytest.raises(OSError, match="disk full"):
+        ), pytest.raises(SwitchError, match=r"was rolled back.*disk full"):
             switcher._perform_switch("1", emit_output=False)
 
         # Both halves rolled back: the settings config and the orphaned login.
@@ -12301,3 +13531,2575 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+def test_a_ctrl_c_during_the_roster_move_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The roster's temp file must not survive an interrupt.
+
+    It removed the temp only in the invalid-JSON branch, so an interrupt in
+    the chmod or the move stranded `sequence.<pid>.tmp` forever.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def interrupted(*_a, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", interrupted)
+    # `raises` is the guard: without it this passes when the interrupt never
+    # fires, and the assertion below would certify nothing.
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_failed_roster_write_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The call that CREATES the temp must be inside the guard too.
+
+    `os.open` creates the file before a single byte is written; a failure
+    anywhere after it strands the name. Guarding only the publish leaves the
+    roster writer with the exact defect the guard was added to close. The
+    injection sits at the first call after the create, which is where the
+    file exists and is still empty — the widest version of the case.
+    """
+    if sys.platform == "win32":
+        pytest.skip("fchmod is POSIX-only; the create path differs on Windows")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def failing_fchmod(fd, mode):
+        raise OSError("injected: no space left on device")
+
+    monkeypatch.setattr(switcher_mod.os, "fchmod", failing_fchmod)
+    with pytest.raises(OSError):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_published_roster_is_not_unlinked_by_its_own_cleanup(temp_home: Path, monkeypatch):
+    """On success the move consumed the temp, so the name is not ours."""
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    unlinked = []
+    real_unlink = Path.unlink
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self, *a, **kw: (unlinked.append(str(self)), real_unlink(self, *a, **kw))[1],
+    )
+
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    # Instrument guard: the roster must actually have been published.
+    assert target.exists(), "premise: no sequence.json written"
+    assert not [u for u in unlinked if u.endswith(".tmp")], (
+        f"cleanup touched a name it no longer owns: {unlinked}"
+    )
+
+
+def test_an_invalid_roster_readback_leaves_no_temp_file(temp_home: Path, monkeypatch):
+    """The validation branch is a failure path too, and it owns the temp.
+
+    It raises before the move, so the name is still ours and the cleanup
+    must take it. Nothing in the suite reached this branch before.
+    """
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    real_read = Path.read_text
+
+    def truncating_read(self, *a, **kw):
+        # Only the temp read-back: a corrupt file is what this branch is for.
+        if self.name.endswith(".tmp"):
+            return "{"
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", truncating_read)
+    with pytest.raises(ConfigError, match="Generated invalid JSON"):
+        switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    assert not target.exists(), "premise: nothing may be published"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"
+
+
+def test_a_non_ebusy_publish_failure_never_truncates_the_live_roster(
+    temp_home: Path, monkeypatch
+):
+    """Only EBUSY earns a write-through; every other error keeps the roster.
+
+    `shutil.move` fell back to copying on ANY rename error, and that copy
+    overwrites the live roster in place -- so a failure part-way truncated it
+    while the cleanup removed the last complete copy.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    copies: list[str] = []
+    fired = {"publish": False}
+
+    def refused(*_a, **_kw):
+        fired["publish"] = True
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    def recording_copy(src, dst, *a, **kw):
+        copies.append(str(dst))
+        raise AssertionError("a non-EBUSY failure must not write through")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", refused)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", recording_copy)
+
+    with pytest.raises(OSError):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    # Instrument guard: patching the wrong name makes every assertion below
+    # trivially true -- `os.replace` does NOT route through `os.rename`.
+    assert fired["publish"], "premise: the injected publish failure never fired"
+    assert copies == [], f"a non-EBUSY error wrote through: {copies}"
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 1
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+
+
+def test_a_destination_that_refuses_rename_is_written_through(
+    temp_home: Path, monkeypatch
+):
+    """A bind-mounted destination refuses rename; it must still be writable.
+
+    `-v ~/.claude.json:/root/.claude.json` pins the inode, so `os.replace`
+    raises EBUSY and writing through the mount is the only way to update it.
+    `shutil.move` did this implicitly, for any error; only EBUSY earns it.
+
+    The same mount refuses `utime`, so that is injected here too: `copystat`
+    does not guard the call, and `copy2` would fail the publish AFTER the
+    content had landed, turning a switch that worked into one the caller
+    rolls back.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    fired = {"replace": False}
+
+    def busy(*_a, **_kw):
+        fired["replace"] = True
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def refused_utime(*_a, **_kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    if sys.platform != "win32":
+        os.chmod(target, 0o644)
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(os, "utime", refused_utime)
+    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    assert fired["replace"], "premise: the injected EBUSY was never reached"
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+    if sys.platform != "win32":
+        # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
+        # once published a key world-readable; the write-through must carry it.
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
+    temp_home: Path, monkeypatch
+):
+    """The chmod has to sit ABOVE the disown, not merely above the copy.
+
+    `_write_json` hands the temp's name to `source` and clears `temp_path` so a
+    dying copy leaves the complete content somewhere named. Anything that
+    raises AFTER that hand-off and BEFORE the copy is stranded instead: the
+    outer cleanup no longer owns the name and nothing prints it.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"chmod": False}
+
+    def interrupt_at_chmod(*_a, **_kw):
+        fired["chmod"] = True
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.os, "chmod", interrupt_at_chmod)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["chmod"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"an interrupt at the mode call stranded {strays}"
+
+
+def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
+    temp_home: Path, monkeypatch
+):
+    """The source digest has to be taken while the temp is known-good.
+
+    Read inside the recovery, it shares an `except OSError` with the
+    destination's read — and the temp is unreadable on exactly the population
+    that ARRIVES there through a source-side error, which is not an
+    independent failure. Both obligations then became no-ops on the very
+    failures that need them: a partial destination stays partial, and the
+    narrowing to 0600 is never undone.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    posix = sys.platform != "win32"
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    if posix:
+        os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copied": False}
+
+    def partial_then_the_source_goes_away(src, dst, **kw):
+        payload = Path(src).read_bytes()
+        Path(dst).write_bytes(payload[:20])   # a genuine partial
+        os.unlink(src)                        # ...and now the temp is gone
+        fired["copied"] = True
+        raise OSError(errno.EIO, "source went away mid-copy")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(
+        switcher_mod.shutil, "copyfile", partial_then_the_source_goes_away
+    )
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["copied"], "premise: the copy never ran"
+    assert target.read_bytes() == b"", (
+        "the recovery left a PARTIAL destination on disk because it could no "
+        f"longer read the temp: {target.read_bytes()[:40]!r}"
+    )
+    # ONLY THE MODE HALF IS POSIX. Emptying a partial is a CONTENT obligation
+    # and applies on every platform -- gating both on one skip is the mistake
+    # the production comment records, where Windows kept a truncated
+    # credential at 0o666.
+    if posix:
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+            "the narrowing to 0600 was never undone, so another uid reading "
+            "this config gets EACCES for ever with only the copy error to go on"
+        )
+
+
+def test_an_unreadable_destination_is_not_EMPTIED_by_the_recovery(
+    temp_home: Path, monkeypatch
+):
+    """THE OTHER READER. Its sibling above covers an unreadable TEMP; this is
+    the destination.
+
+    The digest read's `except OSError: return` sits ABOVE the mode restore, so
+    a destination that becomes unreadable between the `before` read and the
+    recovery -- EIO or ESTALE on the network mount that produced the EBUSY in
+    the first place -- keeps 0600 for ever. The production comment argues that
+    the two obligations must not be gated on one another; an early return
+    gates them just as surely as a shared `except` did.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def partial_copy(src, dst, **kw):
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        raise OSError(errno.EIO, "copy died mid-write")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", partial_copy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    # AND IT MUST NOT EMPTY WHAT IT COULD NOT READ. Dropping the `return`
+    # frees the mode restore; it must not also hand the emptying a digest of
+    # None, which differs from everything and so looks like a partial every
+    # time. This is the `before is None` reasoning on the other read: with no
+    # comparand, a complete write and a partial one are the same picture.
+    assert os.stat(target).st_size != 0, (
+        "the recovery emptied a destination it could not read, so it cannot "
+        "have known whether it was destroying a partial or a finished write"
+    )
+    # THE MODE IS NOT ASSERTED HERE, and that is the point. This case's copy
+    # died LATE, past the destination open, so the bytes on disk may be half a
+    # token -- and the recovery cannot read them to find out. Widening there
+    # publishes whichever it is, which the narrowing refusal above ranks worse
+    # than a stuck mode. The restore has its own case, on the one shape where
+    # the destination is provably untouched:
+    # `test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it`.
+
+
+def test_an_unreadable_destination_is_not_WIDENED_over_a_late_failure(
+    temp_home: Path, monkeypatch
+):
+    """Freeing the mode restore must not publish what we cannot read.
+
+    When the destination read fails, `touched` is False and the recovery
+    cannot tell a finished write from a partial one holding half a token. The
+    file's own ranking, at the narrowing refusal above, is that continuing
+    "writes a credential the destination need not have held before, at a mode
+    other users can read" -- so in THAT state the narrow mode is the safe
+    answer, not the stale one.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def partial_copy(src, dst, **kw):
+        # LATE, past the destination open: the bytes are on disk.
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        raise OSError(errno.EIO, "copy died mid-write", os.fspath(dst))
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", partial_copy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "the recovery widened a destination it could NOT read, after a copy "
+        "that had already written to it — so a truncated credential is now "
+        "readable by every other uid on the box"
+    )
+
+
+def test_an_emptying_that_FAILED_must_not_be_followed_by_a_widen(
+    temp_home: Path, monkeypatch
+):
+    """`touched` orders the emptying; a swallowed failure keeps the verdict.
+
+    `touched` being True IS the finding that the destination holds neither the
+    original nor the complete payload -- a partial, with half a token in it.
+    The recovery then empties the file. If that write is REFUSED, the file
+    still holds the partial, and restoring the mode publishes it to every
+    other uid.
+
+    Reachable because the emptying is a write to the destination whose write
+    just failed, so one fault produces both: a mount that went read-only
+    mid-write, EIO on a failing disk, an overlay refusing truncate.
+    `comparable` says only "I read both digests", never "the emptying landed".
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False, "emptying_refused": 0}
+    real_open = builtins.open
+
+    def refusing_open(file, mode="r", *a, **kw):
+        if "w" in mode and os.fspath(file) == os.fspath(target):
+            state["emptying_refused"] += 1
+            raise OSError(errno.EROFS, "read-only file system")
+        return real_open(file, mode, *a, **kw)
+
+    def midcopy(src, dst, **kw):
+        # shutil's real field shape on a mid-copy failure: the destination was
+        # opened and truncated, and BOTH names are set.
+        whole = Path(src).read_bytes()
+        # A GENUINE PARTIAL. A slice longer than the payload copies all of it,
+        # `after == landed`, and `touched` never fires -- the premise assert
+        # below is what catches that, and did.
+        assert len(whole) > 20, "payload too small to truncate meaningfully"
+        Path(dst).write_bytes(whole[:20])
+        state["copied"] = True
+        err = OSError(errno.ENOSPC, "No space left on device")
+        err.filename, err.filename2 = os.fspath(src), os.fspath(dst)
+        raise err
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", midcopy)
+    monkeypatch.setattr(builtins, "open", refusing_open)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert state["emptying_refused"] >= 1, (
+        "premise: the emptying was never attempted, so this says nothing "
+        "about what happens when it fails"
+    )
+    body = os.stat(target)
+    assert stat.S_IMODE(body.st_mode) == 0o600, (
+        "the emptying was REFUSED and the recovery widened anyway, so the "
+        f"partial payload ({body.st_size} bytes) is now readable by every "
+        "other uid on the box"
+    )
+
+
+def test_a_real_midcopy_failure_names_the_SOURCE_and_must_not_widen(
+    temp_home: Path, monkeypatch
+):
+    """`copyfile` NAMES THE SOURCE ON A LATE FAILURE TOO, so `filename` alone
+    cannot say the destination was never opened.
+
+    Every fast-copy helper does `err.filename = fsrc.name; err.filename2 =
+    fdst.name` before re-raising -- AFTER `open(dst, 'wb')` has truncated and
+    partly written it. Measured with real, unmocked `shutil.copyfile` under
+    RLIMIT_FSIZE: errno EFBIG, `filename == src`, `filename2 == dst`, and the
+    destination holding a fragment of the credential.
+
+    `filename2` alone is NOT the discriminator -- measured, the `copyfileobj`
+    fallback raises with BOTH names None and the destination truncated, so it
+    is `filename == source` that excludes that row. Neither conjunct decides
+    alone: None on every path that raises
+    before the destination is opened, set on every one that raises after.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def midcopy(src, dst, **kw):
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        # EXACTLY WHAT shutil SETS: the source in `filename`, the destination
+        # in `filename2`. An injected `filename=dst` is a shape real copyfile
+        # never produces for a late failure, and testing that one is what let
+        # this through.
+        err = OSError(errno.EFBIG, "File too large")
+        err.filename = os.fspath(src)
+        err.filename2 = os.fspath(dst)
+        raise err
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", midcopy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "a copy that DID open the destination was read as untouched because "
+        "`filename` names the source on that path too — so a truncated "
+        "credential was published at 0644"
+    )
+
+
+@pytest.mark.parametrize("shape", ["source-open", "destination-open", "same-file"])
+def test_a_matching_destination_the_copy_never_opened_is_still_restored(
+    temp_home: Path, monkeypatch, shape
+):
+    """The complete-copy short-circuit ranks ABOVE the predicate that separates
+    a copy that FINISHED from one that never opened the destination.
+
+    `after == landed` is read as "the destination already holds the whole new
+    payload". It is equally true when nothing was written and the payload
+    happens to equal what was already there -- a switch to the account that is
+    already active re-serialises byte-identical content. The mode restore is
+    then skipped for a file nothing touched, so a 0644 config comes back 0600
+    and whoever else reads it loses access over a write that never happened.
+    """
+    import shutil as shutil_mod
+
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"activeAccountNumber": 1, "accounts": {}}
+    switcher._write_json(target, payload)
+    os.chmod(target, 0o644)
+
+    state = {"tried": False}
+
+    def source_open_failure(src, dst, **kw):
+        state["tried"] = True
+        # THREE ROWS OF THE (filename, filename2) TABLE LEAVE THE DESTINATION
+        # UNTOUCHED, and `untouched` recognises only the first. The other two
+        # reach the short-circuit below with `after == landed` true for the
+        # ordinary reason -- the payload equals what was already there.
+        if shape == "source-open":
+            raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+        if shape == "destination-open":
+            raise PermissionError(errno.EACCES, "cannot open", os.fspath(dst))
+        raise shutil_mod.SameFileError("source and destination are the same")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", source_open_failure)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, payload)  # byte-identical to what is there
+
+    monkeypatch.undo()
+    assert state["tried"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "a write that never opened the destination narrowed it anyway, because "
+        "the payload happened to match what was already on disk"
+    )
+
+
+def test_write_all_finishes_a_short_write():
+    """The behaviour the structural guard above only points at.
+
+    `os.write` accepting fewer bytes is the whole reason the helper exists,
+    and nothing else in the suite makes it happen.
+    """
+    from claude_swap.fsutil import write_all
+
+    got = bytearray()
+    real_write = os.write
+
+    def one_byte_at_a_time(fd, data):
+        got.extend(bytes(data[:1]))
+        return 1
+
+    payload = b'{"refreshToken": "rt-EXAMPLE"}'
+    with patch.object(os, "write", one_byte_at_a_time):
+        write_all(-1, payload)
+    assert bytes(got) == payload, (
+        f"a short write lost bytes: wrote {bytes(got)!r} of {payload!r}"
+    )
+
+    # CAPPED, so a DELETED guard fails instead of hanging. With the guard gone
+    # a stub that always returns 0 never advances the view and the loop spins
+    # for ever -- measured, the run had to be SIGKILLed at 45s, which reads as
+    # a stuck CI rather than as this assertion. After the cap the same
+    # deletion completes the write and `pytest.raises` fails, naming the guard.
+    stalls = {"n": 0}
+
+    def stalls_then_completes(fd, data):
+        stalls["n"] += 1
+        if stalls["n"] <= 3:
+            return 0
+        return len(data)
+
+    # THE ERRNO, NOT MERELY AN OSError. `write_all(-1, ...)` raises EBADF on
+    # its own, so a patch that silently stopped taking effect would satisfy a
+    # bare `raises(OSError)` with the guard never reached.
+    with patch.object(os, "write", stalls_then_completes):
+        with pytest.raises(OSError) as excinfo:
+            write_all(-1, payload)
+    assert excinfo.value.errno == errno.EIO, (
+        "the raise came from somewhere other than the zero-progress guard: "
+        f"errno {excinfo.value.errno}"
+    )
+
+
+def _os_names(tree) -> set[str]:
+    """Names this module can reach the `os` module through.
+
+    Matching the literal `os` leaves `import os as _o` invisible, and one
+    alias hid a regression from every scan that keys on it.
+    """
+    import ast
+
+    names = {"os"} | {
+        (a.asname or a.name)
+        for imp in ast.walk(tree) if isinstance(imp, ast.Import)
+        for a in imp.names if a.name == "os"
+    }
+    # AND A PLAIN REBINDING. `import os as _o` is not the only way to get a
+    # second name for the module -- `_o = os` does it too, and an
+    # `_o.open(..., O_TRUNC)` writer was invisible to every scan keying on
+    # this. A fixpoint, because `_p = _o` chains.
+    while True:
+        grown = names | {
+            t.id
+            for n in ast.walk(tree) if isinstance(n, ast.Assign)
+            for t in n.targets if isinstance(t, ast.Name)
+            if isinstance(n.value, ast.Name) and n.value.id in names
+        }
+        if grown == names:
+            return names
+        names = grown
+
+
+def _flat(body):
+    """Statements in this block's OWN scope -- a nested `def` is not it.
+
+    Recursive rather than `ast.walk`, which cannot PRUNE: filtering its
+    output drops the `def` node and still yields the body underneath it, so
+    an assignment inside a function that never runs counted as a disown.
+    """
+    import ast
+
+    for st in body:
+        # A LITERAL-FALSE BRANCH DOES NOT RUN, so a `raise` inside one is not
+        # a re-raise. Only a constant is folded here -- anything needing real
+        # analysis is left to count, which is the loud direction.
+        if isinstance(st, ast.If) and isinstance(st.test, ast.Constant) \
+                and not st.test.value:
+            yield from _flat(st.orelse)
+            continue
+        yield st
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef,
+                           ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(st):
+            if isinstance(child, ast.stmt):
+                yield from _flat([child])
+            else:
+                for sub in ast.iter_child_nodes(child):
+                    if isinstance(sub, ast.stmt):
+                        yield from _flat([sub])
+
+
+def _bound_names(st) -> set[str]:
+    """Names this statement binds or unbinds."""
+    import ast
+
+    def _bare(t):
+        # ONLY A NAME IS BOUND. `self.x = 1` and `d[k] = 1` READ their base;
+        # collecting it made `self._last_error = e; raise` -- the archetypal
+        # record-and-re-raise this predicate exists to refuse -- a disown.
+        if isinstance(t, ast.Name):
+            return {t.id}
+        if isinstance(t, (ast.Tuple, ast.List)):
+            return {n for e in t.elts for n in _bare(e)}
+        return set()
+
+    if isinstance(st, ast.Assign):
+        return {n for t in st.targets for n in _bare(t)}
+    if isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+        return _bare(st.target)
+    if isinstance(st, ast.Delete):
+        # A DELETE OF A SUBSCRIPT DISOWNS ITS CONTAINER. `del staged[key]`
+        # drops the entry the discard walks, which is a real disown even
+        # though the container itself stays bound.
+        out = set()
+        for t in st.targets:
+            out |= _bare(t)
+            out |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        return out
+    return set()
+
+
+def _removes_a_file(node) -> bool:
+    """Does this subtree call something that REMOVES a path."""
+    import ast
+
+    for n in ast.walk(node):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+        if name in {"unlink", "remove", "rmtree", "rmdir"} or "discard" in name:
+            return True
+    return False
+
+
+def _cleanup_reads(tries, this_handler) -> set[str]:
+    """Names that reach the cleanup's REMOVAL, not everything it reads.
+
+    "Something the cleanup reads" is too wide: every cleanup here is
+    `if fd >= 0: os.close(fd)` followed by the unlink, so `fd` is in the read
+    set at almost every site -- and `fd = -1` is already written inside the
+    guarded functions. A handler that binds it disowns nothing and the temp
+    is still removed.
+
+    So only the removal counts: the statement that removes the path, and the
+    condition of any `if` guarding it. The handler's own `except` clause is
+    excluded, or it would answer about itself.
+    """
+    import ast
+
+    out: set[str] = set()
+
+    def collect(st):
+        if isinstance(st, ast.If) and _removes_a_file(st):
+            for n in ast.walk(st.test):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    out.add(n.id)
+            for sub in st.body + st.orelse:
+                collect(sub)
+            return
+        if not _removes_a_file(st):
+            return
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+
+    for t in tries:
+        blocks = list(t.finalbody) + [
+            st for h in t.handlers if h is not this_handler for st in h.body]
+        for st in blocks:
+            collect(st)
+    return out
+
+
+
+def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
+    """Bare names this module can call `os.<func>` through.
+
+    `from os import open as _open` and `_open = os.open` both bind a NAME,
+    which an attribute match cannot see at all.
+    """
+    import ast
+
+    names = {
+        (a.asname or a.name)
+        for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+        and imp.module == "os"
+        for a in imp.names if a.name == func
+    }
+
+    def targets_of(n):
+        # ANNASSIGN AND TUPLES TOO. The hoist resolver in the flags scan
+        # already reads `AnnAssign`; these two were written knowing only
+        # `Assign` with a bare `Name`, which is the same hole one node type
+        # over.
+        if isinstance(n, ast.Assign):
+            ts = n.targets
+        elif isinstance(n, ast.AnnAssign):
+            ts = [n.target]
+        else:
+            return []
+        out = []
+        for t in ts:
+            out += ([e for e in t.elts]
+                    if isinstance(t, (ast.Tuple, ast.List)) else [t])
+        return [t.id for t in out if isinstance(t, ast.Name)]
+
+    # A FIXPOINT, because `_a = os.open; _b = _a` chains -- `_os_names` was
+    # given one and this was not, so the chain walked past both scans.
+    # AND THE BASE MUST BE AN `os` NAME: `X = shutil.open` is not an alias,
+    # and accepting it accuses an unrelated call of being a temp writer.
+    while True:
+        grown = names | {
+            t
+            for n in ast.walk(tree)
+            for t in targets_of(n)
+            if (isinstance(getattr(n, "value", None), ast.Attribute)
+                and n.value.attr == func
+                and isinstance(n.value.value, ast.Name)
+                and n.value.value.id in os_names)
+            or (isinstance(getattr(n, "value", None), ast.Name)
+                and n.value.id in names)
+            # `X = getattr(os, "open")` -- the sibling write scan already
+            # reads this spelling at its call site, and neither open scan
+            # could see it: the site left BOTH denominators and an `O_TRUNC`
+            # weakening ran green.
+            or (isinstance(getattr(n, "value", None), ast.Call)
+                and isinstance(n.value.func, ast.Name)
+                and n.value.func.id == "getattr" and 2 <= len(n.value.args) <= 3
+                and isinstance(n.value.args[0], ast.Name)
+                and n.value.args[0].id in os_names
+                and isinstance(n.value.args[1], ast.Constant)
+                and n.value.args[1].value == func)
+        }
+        if grown == names:
+            return names
+        names = grown
+
+
+def _resolved_flags(tree, node) -> str:
+    """The `os.open` flags of this call, with a single hoisted binding resolved.
+
+    Both open scans key on the flag names, and a name is not a verdict: a
+    hoist hid a writer from the flags scan's offender list once, and from the
+    disown scan's site set entirely.
+    """
+    import ast
+
+    kw = {k.arg: k.value for k in node.keywords}
+    arg = node.args[1] if len(node.args) >= 2 else kw.get("flags")
+    if arg is None:
+        return ""
+    flags = ast.unparse(arg)
+    if not flags.isidentifier():
+        return flags
+    bound = [
+        ast.unparse(a.value) for a in ast.walk(tree)
+        if ((isinstance(a, ast.Assign) and len(a.targets) == 1
+             and isinstance(a.targets[0], ast.Name)
+             and a.targets[0].id == flags)
+            or (isinstance(a, ast.AnnAssign)
+                and isinstance(a.target, ast.Name)
+                and a.target.id == flags))
+        and a.value is not None
+    ]
+    return bound[0] if len(bound) == 1 else flags
+
+def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
+    """Does this `Call` reach `os.<func>` under ANY of its spellings."""
+    import ast
+
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return (f.attr == func and isinstance(f.value, ast.Name)
+                and f.value.id in os_names)
+    # `getattr(os, "open")(...)` called DIRECTLY. The assigned form
+    # (`X = getattr(os, "open")`) is already an alias; without this the
+    # direct call leaves both scans -- offenders AND denominator -- so no
+    # floor can notice it and `unreadable` never fires.
+    if (isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
+            and f.func.id == "getattr" and 2 <= len(f.args) <= 3
+            and isinstance(f.args[0], ast.Name) and f.args[0].id in os_names
+            and isinstance(f.args[1], ast.Constant)
+            and f.args[1].value == func):
+        return True
+    return isinstance(f, ast.Name) and f.id in aliases
+
+
+def test_no_writer_calls_os_write_bare():
+    """`os.write` is write(2): it may write FEWER bytes than it was given.
+
+    These callers publish credentials, and the `replace_with_retry` that
+    follows succeeds either way -- so a short write does not surface as a
+    failed write, it surfaces as a corrupt account. The count is the only
+    thing that says which happened and every site discarded it.
+
+    Structural for the same reason as its two siblings above: the fix is one
+    line per call site, so a per-site assertion goes stale the moment a
+    seventh writer is added.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders = []
+    for mod in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # THE LOOP THAT EXISTS TO DO THIS IS THE ONE PLACE ALLOWED TO. Named
+        # rather than exempting its module, so a second exemption has to be
+        # written down here to take effect.
+        # THE HELPER'S OWN MODULE, not any function of that name. A second
+        # `def write_all` elsewhere in src/ would otherwise exempt itself.
+        exempt = {
+            id(n) for f in ast.walk(tree)
+            if mod.name == "fsutil.py"
+            and isinstance(f, ast.FunctionDef) and f.name == "write_all"
+            for n in ast.walk(f)
+        }
+        # EVERY NAME THAT REACHES THE MODULE, not the literal `os`. Matching
+        # `os.write` alone left `import os as _o; _o.write(...)` invisible --
+        # and in a module with other `write_all` sites it did not even move
+        # the denominator, so a live regression in the credential writer ran
+        # green.
+        os_names = _os_names(tree)
+        # `from os import write as _w` binds a bare NAME, which an attribute
+        # match cannot see; resolve the aliases this module actually created.
+        aliases = _os_call_aliases(tree, "write", os_names)
+        # A LOCAL BOUND TO THE FUNCTION IS THE FUNCTION. `w = os.write` then
+        # `w(fd, ...)` is the same call under a name the scans above cannot
+        # see, and it is the spelling a reader reaches for when the call is
+        # in a loop.
+        aliases |= {
+            t.id
+            for a in ast.walk(tree) if isinstance(a, ast.Assign)
+            for t in a.targets if isinstance(t, ast.Name)
+            if isinstance(a.value, ast.Attribute) and a.value.attr == "write"
+            and isinstance(a.value.value, ast.Name)
+            and a.value.value.id in os_names
+        }
+        # A STAR IMPORT MAKES THE QUESTION UNANSWERABLE, so it is the answer.
+        # Nothing in this package does it, and the first thing that does would
+        # otherwise silently turn every scan here into a pass.
+        if any(isinstance(imp, ast.ImportFrom) and imp.module == "os"
+               and any(a.name == "*" for a in imp.names)
+               for imp in ast.walk(tree)):
+            offenders.append(f"{mod.name}: `from os import *` hides every "
+                             "bare write from this scan")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or id(node) in exempt:
+                continue
+            f = node.func
+            bare = isinstance(f, ast.Name) and f.id in aliases
+            dotted = (isinstance(f, ast.Attribute) and f.attr == "write"
+                      and isinstance(f.value, ast.Name)
+                      and f.value.id in os_names)
+            # `getattr(os, "write")(fd, ...)` -- the call's func is itself a
+            # `getattr` call, which neither branch above is shaped to see.
+            fetched = (
+                isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
+                and f.func.id == "getattr" and 2 <= len(f.args) <= 3
+                and isinstance(f.args[0], ast.Name)
+                and f.args[0].id in os_names
+                and isinstance(f.args[1], ast.Constant)
+                and f.args[1].value == "write"
+            )
+            if bare or dotted or fetched:
+                offenders.append(f"{mod.name}:{node.lineno}")
+
+    # THE SUBJECT FIRST. A denominator that runs ahead of it reports a code
+    # regression as an instrument failure -- reverting one call site drops the
+    # helper's user count below the floor, and "the instrument, not the code"
+    # is then the wrong sentence about the right defect.
+    assert not offenders, (
+        "a writer discards `os.write`'s count, so a short write publishes a "
+        f"truncated file and the rename still succeeds: {offenders}"
+    )
+    # THE DENOMINATOR THAT SURVIVES THE FIX. Counting bare `os.write` cannot
+    # be one: it is zero once this passes, so a guard resting on it would
+    # report clean over a package that had stopped writing anything.
+    # CALL SITES, STRUCTURALLY, AND WITH SLACK. The substring form counted
+    # MODULES -- three sites in one file counted once -- and broke on any
+    # other variable name, so `write_all(owned, ...)` would not have matched.
+    # It also sat exactly ON its floor, which makes the CORRECT refactor
+    # (hand the fd to `os.fdopen` and let the buffered writer loop) fail RED
+    # with "the instrument, not the code" -- the wrong sentence about a good
+    # change. That is the refactor `_write_json` itself already uses.
+    users = 0
+    for mod in src_dir.rglob("*.py"):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        named = {
+            (a.asname or a.name)
+            for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+            and (imp.module or "").endswith("fsutil")
+            for a in imp.names if a.name == "write_all"
+        }
+        users += sum(
+            1 for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in named
+        )
+    assert users >= 4, (
+        f"the instrument, not the code: only {users} call site(s) of the "
+        "checked helper, so this would pass over almost nothing"
+    )
+
+
+def test_no_writer_chmods_after_it_publishes():
+    """The try block must end AT the publish, everywhere it was moved once.
+
+    `replace_with_retry` is the commit point. A `chmod` on the TARGET after it
+    can only fail, and the `except BaseException` around these writers then
+    reports a write that LANDED as a failure — the caller rolls back or
+    retries a file that is already correct. The mode is not what is at stake:
+    `O_EXCL` opens at 0600 and a umask only clears bits, so these temps are
+    never wider, which is why one site moved the call onto the fd and the
+    others can too.
+
+    Structural because it is an ORDERING, and orderings do not survive being
+    asserted one site at a time: the round that moved the first of six left
+    five behind and the suite stayed green.
+    """
+    import re
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, publishes = [], 0
+    for mod in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            pub, chmods = None, []
+            for i, stmt in enumerate(node.body):
+                text = ast.unparse(stmt)
+                if "replace_with_retry(" in text and pub is None:
+                    pub = i
+                    publishes += 1
+                # ANY RECEIVER, AND THE LOOKBEHIND WAS EXCLUDING THE ONES
+                # THAT OCCUR: `(?<![\w.])` rejected the dot in
+                # `self.path.chmod(`, the natural regression beside a
+                # `replace_with_retry(tmp, self.path)` publish. `os.fchmod`
+                # is deliberately NOT here -- it takes an fd, which is the
+                # cure this scan exists to push writers towards.
+                if re.search(r"\.(chmod|lchmod|copymode)\(|(?<!\w)chmod\(",
+                             text):
+                    chmods.append(i)
+            # EVERY chmod, not the first. Keeping only the first one recorded
+            # the `os.fchmod` CURE that runs before the publish and then
+            # compared THAT index, so a real chmod after the publish could
+            # not be reached -- the widening masked the offence it added.
+            after = [i for i in chmods if pub is not None and i > pub]
+            offenders += [f"{mod.name}:{node.body[i].lineno}" for i in after]
+
+    # THE SUBJECT FIRST, like its two siblings. A refactor that consolidates
+    # publishes takes the count under the floor, and a real post-publish
+    # chmod then reports as "the instrument, not the code" with the offender
+    # list never printed -- measured, 10 live against a floor of 5.
+    assert not offenders, (
+        "a chmod runs AFTER the publish, so its failure reports a landed "
+        f"write as a failed one: {offenders}"
+    )
+    assert publishes >= 5, (
+        f"the instrument, not the code: only {publishes} publish(es) were "
+        "found inside a try block, so this would pass over almost nothing"
+    )
+
+
+def test_a_temp_name_already_taken_is_not_deleted(temp_home: Path, monkeypatch):
+    """O_EXCL refuses the name; the cleanup must not then remove their file.
+
+    The refusal means somebody else holds it. `temp_path` is still set when
+    `os.open` raises, so the `finally` unlinks a file this writer never
+    created -- and under O_TRUNC that case could not arise, so the conversion
+    is what opened it. Both sibling writers in this file already guard it:
+    `_salvage` tracks `created`, and `_stage_overlap_material` drops the key
+    on EEXIST because it "lost the race; not ours to remove".
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(switcher_mod.secrets, "token_hex", lambda n: "deadbeef")
+    squatted = target.parent / f".{target.name}.{os.getpid()}.deadbeef.tmp"
+    squatted.write_text("A PEER'S IN-PROGRESS FILE", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        switcher._write_json(target, {"activeAccountNumber": 1})
+
+    assert squatted.exists(), (
+        "the cleanup removed a temp this writer refused to create; O_EXCL "
+        "raised because somebody else holds that name"
+    )
+    assert squatted.read_text(encoding="utf-8") == "A PEER'S IN-PROGRESS FILE"
+
+
+def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
+    """`O_EXCL` is what makes `FileExistsError` reachable, so the conversion is
+    what opened this. A writer that refuses the name and then unlinks it in a
+    `finally` deletes the file the OTHER process is in the middle of writing --
+    and two of them swallow the exception, so that happens with no error at all.
+
+    Derived, because the guard was added at ONE of the twelve converted sites.
+    A per-site test is right until the thirteenth writer, and the thirteenth is
+    the one nobody checks -- the same argument the sibling scans make.
+
+    THE OPEN'S OWN `try`, not the function's. Asking whether the FUNCTION
+    mentions `FileExistsError` anywhere would pass a handler wrapped round the
+    wrong statement, and it reported `_salvage_unreadable` -- which catches the
+    create's `OSError` and clears its `created` claim -- as an offender. What
+    has to exist is a branch on THIS call's failure, running before any
+    cleanup: either spelling of the catch does the job, and neither is
+    substitutable by a handler somewhere else in the function.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, seen = [], 0
+    for mod in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # Every `Try` that lexically contains each node, innermost last.
+        guarding: dict[int, list[ast.Try]] = {}
+        def descend(node, stack):
+            guarding[id(node)] = stack
+            for child in ast.iter_child_nodes(node):
+                deeper = stack
+                if isinstance(node, ast.Try) and any(
+                        child is st for st in node.body):
+                    deeper = stack + [node]
+                descend(child, deeper)
+        descend(tree, [])
+
+        os_names = _os_names(tree)
+        open_aliases = _os_call_aliases(tree, "open", os_names)
+        for node in ast.walk(tree):
+            if not _is_os_call(node, "open", os_names, open_aliases):
+                continue
+            # THE SAME HOIST ITS SIBLING RESOLVES. A substring test on the
+            # unparsed call drops `os.open(tmp, _EXCL_FLAGS, 0o600)` out of
+            # this scan entirely -- measured, with the disown deleted and
+            # both scans green -- while the flags scan still reads it.
+            if "O_EXCL" not in _resolved_flags(tree, node):
+                continue
+            seen += 1
+            # NOT "IS THERE A HANDLER" -- that is true of every site here,
+            # so it discriminates nothing. What has to be true is that the
+            # handler for THIS call DISOWNS the name before the cleanup can
+            # reach it: it assigns something (the temp name, or the flag the
+            # cleanup consults) and re-raises. A bare `except OSError: raise`
+            # satisfies the weaker question and still deletes the winner's
+            # file -- measured, with the suite green.
+            name = (node.args[0].id if node.args
+                    and isinstance(node.args[0], ast.Name) else None)
+            ok = False
+            t_stack = guarding.get(id(node), [])
+            # THE INNERMOST `Try` ONLY. A disown in an enclosing handler runs
+            # AFTER the inner cleanup has already unlinked the winner's file,
+            # so crediting it certifies the exact harm this scan forbids.
+            for t in t_stack[-1:]:
+                for h in t.handlers:
+                    if h.type is None:
+                        continue
+                    caught = ast.unparse(h.type)
+                    if not ("FileExistsError" in caught or "OSError" in caught):
+                        continue
+                    # IT MUST CHANGE SOMETHING THE CLEANUP READS. "is
+                    # there an Assign" is satisfied by `_msg = str(e)`, by
+                    # `del payload`, and by an assignment inside a nested
+                    # `def` that never runs -- each leaves the name in reach
+                    # of the cleanup, measured with the suite green. The real
+                    # disowns are not all rebindings of the temp name either:
+                    # one clears the flag the cleanup guards its unlink with,
+                    # another drops the entry the discard walks.
+                    # THE CLEANUP'S OWN SUBJECT. Adding the `os.open` arg
+                    # unconditionally accepted a disown of the wrong name:
+                    # the staging cleanup walks `staged`, never the temp, so
+                    # `path = None` satisfied it while the discard still
+                    # unlinked the winner's file.
+                    reads = _cleanup_reads(t_stack, h)
+                    # THE HANDLER'S OWN STRAIGHT LINE. A scope walk asks
+                    # whether the disown is PRESENT; what has to hold is that
+                    # it RUNS. `if fd >= 0: tmp = None` is false on every
+                    # EEXIST path -- `fd` is -1 there -- so the temp is back
+                    # in the cleanup's reach, and nine of twelve sites stayed
+                    # green with the suite byte-identical.
+                    disowns = any(_bound_names(st) & reads for st in h.body)
+                    reraises = any(isinstance(st, ast.Raise) for st in h.body)
+                    if disowns and reraises:
+                        ok = True
+            if not ok:
+                offenders.append(f"{mod.name}:{node.lineno}"
+                                 + (f" ({name})" if name else ""))
+
+    # THE SUBJECT FIRST. A denominator ahead of it reports a real regression
+    # as a broken parser: reverting six writers to `O_TRUNC` DROPS the count,
+    # so the compound regression came out as "the instrument, not the code"
+    # and the offender list was never printed.
+    assert not offenders, (
+        "an `O_EXCL` open has no branch on its own failure, so the name it "
+        "was REFUSED is still in reach of the cleanup below -- it deletes "
+        f"whatever the holder is writing: {offenders}"
+    )
+    assert seen >= 8, (
+        f"the instrument, not the code: only {seen} `O_EXCL` open(s) were "
+        "found, so this would pass over almost nothing"
+    )
+
+
+def test_every_temp_writer_opens_with_O_EXCL():
+    """The invariant `_write_json`'s own docstring states, checked structurally.
+
+    "Temps ... are created with ``O_EXCL`` and never overwrite an existing
+    file" -- and one writer of the dozen opened `O_TRUNC`, which does exactly
+    what that sentence forbids. Derived from the source rather than listed:
+    a per-site literal is right until the next writer is added, and the
+    thirteenth is the one nobody checks.
+
+    `O_EXCL` is not decoration here. The temp names carry a random token, so
+    a collision means somebody else holds the name -- and the safe answer to
+    that is to fail, not to truncate what they are writing. It also refuses
+    to follow a symlink planted at the name.
+    """
+    import ast
+    import re
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, unreadable, seen = [], [], 0
+    for mod in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # EVERY NAME THAT REACHES THE MODULE. Its sibling scan resolves
+        # `import os as _o` and this one did not, so that one alias hid an
+        # `O_TRUNC` regression from BOTH -- the disown scan filters on the
+        # literal `O_EXCL`, which the aliased call no longer carries.
+        # PER MODULE, not per node: both resolvers walk the whole tree, so
+        # calling them inside the loop is quadratic on the larger modules.
+        os_names = _os_names(tree)
+        open_aliases = _os_call_aliases(tree, "open", os_names)
+        for node in ast.walk(tree):
+            if not _is_os_call(node, "open", os_names, open_aliases):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            arg = (node.args[1] if len(node.args) >= 2
+                   else kw.get("flags"))
+            if arg is None:
+                continue  # a read; no creation flags to judge
+            flags = ast.unparse(arg)
+            # A NAME IS NOT A VERDICT. Hoisting the flags into a local hid the
+            # writer from the offender list AND from the denominator, so the
+            # count fell and nothing complained. Resolve a single binding --
+            # `ast.AnnAssign` too, which the first cut of this missed.
+            if flags.isidentifier():
+                # THE ISINSTANCE FIRST. `ast.walk` yields the Module before
+                # anything else and a Module has no `.value`, so leading with
+                # that test raises `AttributeError` the moment any site
+                # spells its flags as a name -- and a real weakening then
+                # reports as a crashed instrument instead of an offender.
+                bound = [
+                    ast.unparse(a.value) for a in ast.walk(tree)
+                    if ((isinstance(a, ast.Assign) and len(a.targets) == 1
+                         and isinstance(a.targets[0], ast.Name)
+                         and a.targets[0].id == flags)
+                        or (isinstance(a, ast.AnnAssign)
+                            and isinstance(a.target, ast.Name)
+                            and a.target.id == flags))
+                    and a.value is not None
+                ]
+                flags = bound[0] if len(bound) == 1 else flags
+            # UNREADABLE IS NOT SAFE, and this is where the previous cut let
+            # six spellings through. A numeric literal, a partial hoist
+            # (`_base | os.O_TRUNC`), a module alias, a tuple unpack -- each
+            # one failed the `O_CREAT` substring test and took the `continue`
+            # that means "not creating anything". "I could not read it" and
+            # "it is safe" must not share a branch, so anything that is not a
+            # plain `|` chain of `os.O_*` names is an offender.
+            # ITS OWN VERDICT, because "I could not read it" is not "it can
+            # overwrite an existing file" -- reported under the offenders'
+            # sentence, a portable `| getattr(os, "O_NOFOLLOW", 0)` (strictly
+            # safer, `O_EXCL` intact) is accused of the opposite of what it
+            # does. A `getattr` with a literal name IS readable, so it is not
+            # unreadable either.
+            terms = [t.strip() for t in flags.split("|")]
+            # THE SAME NAMES THE MATCHER RESOLVED. Hardcoding `os` here
+            # made an aliased chain unreadable, so safe code (`O_EXCL`
+            # intact under `import os as _o`) failed under the "can be
+            # neither proven nor refuted" sentence, and a real aliased
+            # `O_TRUNC` was filed there too instead of as an offender.
+            readable = re.compile(
+                r'(?:' + '|'.join(re.escape(n) for n in sorted(os_names))
+                + r')\.O_[A-Z_]+'
+                r'|getattr\(\s*\w+\s*,\s*[\'"]O_[A-Z_]+[\'"]\s*(?:,[^)]*)?\)')
+            if not all(readable.fullmatch(t) for t in terms):
+                unreadable.append(f"{mod.name}:{node.lineno} `{flags}`")
+                continue
+            if "O_CREAT" not in flags:
+                continue  # not creating anything
+            seen += 1
+            if "O_EXCL" not in flags:
+                offenders.append(f"{mod.name}:{node.lineno} {flags}")
+
+    # THE SUBJECT FIRST, for the reason its sibling states: reverting writers
+    # to `O_TRUNC` moves the count as well as the offender list, so a
+    # denominator asserted ahead of it blames the parser for the regression.
+    assert not offenders, (
+        "a temp writer can overwrite an existing file, which is what the "
+        f"`_write_json` docstring says none of them does: {offenders}"
+    )
+    assert not unreadable, (
+        "a temp writer's open flags are not a plain `os.O_*` chain, so "
+        f"`O_EXCL` can be neither proven nor refuted here: {unreadable}"
+    )
+    assert seen >= 10, (
+        f"the instrument, not the code: only {seen} creating `os.open` call(s) "
+        "were found, so this would pass over almost nothing"
+    )
+
+
+def test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it(
+    temp_home: Path, monkeypatch
+):
+    """THE CONTROL, and the case the narrow answer must not swallow.
+
+    `copyfile` raises on four paths BEFORE it opens the destination, and there
+    the destination still holds its original bytes -- so there is nothing that
+    could have been published and the mode must come back. `copy_err.filename`
+    is the SOURCE on exactly those paths, which is how the two are told apart
+    without reading a destination that will not answer.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"tried": False, "src": None}
+    real_read = Path.read_bytes
+
+    def unreadable_destination(self):
+        if state["tried"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def source_open_failure(src, dst, **kw):
+        state["tried"], state["src"] = True, os.fspath(src)
+        # The destination is NEVER opened; filename names the SOURCE.
+        raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", source_open_failure)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_destination)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["tried"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "the narrowing was never undone on a destination the copy never "
+        "opened — nothing could have been published, so leaving it at 0600 "
+        "gives another uid EACCES for ever over a write that never happened"
+    )
+
+
+def test_a_completed_copy_is_not_emptied_by_the_recovery(
+    temp_home: Path, monkeypatch
+):
+    """The recovery must empty only what the copy TRUNCATED.
+
+    `copyfile` uses `sendfile` on Linux, and the last byte lands before the
+    signal is delivered -- so the ordinary interrupt here is one where the
+    destination is already complete and correct. Deciding on "differs from
+    `before`" cannot tell that from a partial: a finished write differs too.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_copyfile = switcher_mod.shutil.copyfile
+    fired = {"copied": False}
+
+    def copy_then_interrupt(src, dst, **kw):
+        real_copyfile(src, dst, **kw)          # every byte lands
+        fired["copied"] = True
+        raise KeyboardInterrupt                # ...and then the signal
+
+    payload = {"activeAccountNumber": 2, "accounts": {"2": {"email": "x@y.z"}}}
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", copy_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, payload)
+
+    assert fired["copied"], "premise: the copy never ran, so nothing completed"
+    assert target.read_bytes(), (
+        "the recovery emptied a destination the copy had COMPLETED, turning a "
+        "benign interrupt into a destroyed config plus a manual restore"
+    )
+    assert json.loads(target.read_text()) == payload, (
+        "the destination survived but does not hold the new payload"
+    )
+    # THE SAME AS A SUCCESS, and for the same reason. A completed copy leaves
+    # the destination holding the new payload, so it now carries a credential
+    # it need not have held before -- which is the state the narrowing refusal
+    # above ranks as unacceptable. The clean success path skips the recovery
+    # entirely and leaves 0600; an interrupt arriving one instant later must
+    # not end MORE exposed than the run that finished.
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "an interrupt after a COMPLETED copy left the destination wider than "
+        "the identical successful run, publishing the new credential to every "
+        "other uid"
+    )
+
+
+def test_an_interrupt_while_naming_the_survivor_does_not_strand_it(
+    temp_home: Path, monkeypatch
+):
+    """`kept` and `def _unnarrow()` have to sit ABOVE the disown.
+
+    Past `source, temp_path = temp_path, None` the outer cleanup no longer
+    owns the temp and nothing prints where it went, so a signal there leaves
+    the complete new payload -- for `~/.claude.json` a credential-bearing
+    file -- stranded and unnamed. Building `kept` reads `PurePath.name`, a
+    Python-level property whose RESUME is where a pending SIGINT lands, so
+    the window is reachable rather than theoretical.
+    """
+    import pathlib as _pathlib
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_name = _pathlib.PurePath.name
+    fired = {"named": False}
+
+    def interrupt_when_the_temp_is_named(self):
+        value = real_name.fget(self)
+        if not fired["named"] and value.endswith(".tmp"):
+            fired["named"] = True
+            raise KeyboardInterrupt
+        return value
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(
+        _pathlib.PurePath, "name", property(interrupt_when_the_temp_is_named)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    monkeypatch.undo()
+
+    assert fired["named"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], (
+        f"an interrupt while naming the survivor stranded {strays}, which "
+        "holds the complete payload with nothing owning or printing it"
+    )
+
+
+def test_an_interrupt_at_the_digest_does_not_strand_the_temp(
+    temp_home: Path, monkeypatch
+):
+    """The `before` digest has to sit above the disown too.
+
+    Its own `except OSError` does not cover a signal or a MemoryError, and
+    past `source, temp_path = temp_path, None` the outer cleanup no longer
+    owns the name -- so the stray holds the COMPLETE new payload, which for
+    `~/.claude.json` is a credential-bearing file, with nothing naming it.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"digest": False}
+    real_sha256 = switcher_mod.hashlib.sha256
+
+    def interrupt_at_digest(*a, **kw):
+        if not fired["digest"]:
+            fired["digest"] = True
+            raise KeyboardInterrupt
+        return real_sha256(*a, **kw)
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.hashlib, "sha256", interrupt_at_digest)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["digest"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"an interrupt at the digest stranded {strays}"
+
+
+def test_a_refused_mode_refuses_the_write_through(temp_home: Path, monkeypatch):
+    """A destination that cannot be narrowed must not receive the payload.
+
+    Nothing is committed at that point -- the chmod precedes the copy -- so
+    refusing costs a switch, while continuing publishes a credential the
+    destination did not previously hold, at a mode other users can read.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Previous content carries NO credential, so "it was already exposed" is
+    # false here: the write is what would expose one.
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def refused(*_a, **_kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.os, "chmod", refused)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert "primaryApiKey" not in target.read_text(encoding="utf-8"), (
+        "the payload was written to a destination whose mode could not be narrowed"
+    )
+
+
+def test_the_salvage_copy_is_never_wider_than_0600(temp_home: Path, monkeypatch):
+    """The unreadable-config copy carries the same payload and the same rule.
+
+    `shutil.copy` creates at the umask default and the mode was narrowed after,
+    so the copy held the content at 0644 for the width of that window -- and a
+    refused chmod aborted the switch while LEAVING the 0644 copy on disk.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+
+    switcher = ClaudeAccountSwitcher()
+    path = switcher.backup_dir / "sequence.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"primaryApiKey": "sk-ant-EXAMPLE"} not json', encoding="utf-8")
+    # 0644 ON PURPOSE, and it is the realistic state: `shutil.copy` CARRIES the
+    # source mode, so pinning the source at 0600 makes the copy 0600 whatever
+    # the code does and the case proves nothing. A config another writer left
+    # world-readable is exactly the one worth salvaging safely.
+    os.chmod(path, 0o644)
+
+    from claude_swap import switcher as switcher_mod
+
+    seen: list[int] = []
+    real_copy = switcher_mod.shutil.copyfile
+
+    def sampling_copy(src, dst, *a, **kw):
+        # Sampled between the copy and whatever narrows it: the widest point of
+        # the window, with the payload fully on disk.
+        result = real_copy(src, dst, *a, **kw)
+        seen.append(os.stat(dst).st_mode & 0o777)
+        return result
+
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", sampling_copy)
+    switcher._salvage_unreadable(path, emit_output=False, warnings_out=[])
+
+    assert seen, "premise: no salvage file was created"
+    assert all(m == 0o600 for m in seen), (
+        f"the salvage copy existed at {[oct(m) for m in seen]} while it held the payload"
+    )
+
+
+def test_the_write_through_never_lands_the_secret_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The chmod has to precede `copyfile`, not follow it.
+
+    `copyfile` opens the destination `'wb'`: it truncates without touching the
+    mode, so the payload lands at whatever Claude Code left there, which is
+    0644. A copy that dies part-way never reaches a chmod placed after it, and
+    a refused one leaves that mode permanently.
+
+    What keeps this from being vacuous is the explicit 0644 below, not a
+    umask: measured, the case reads the same at 022, 077 and 000.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    seen: list[int] = []
+    real_copyfile = switcher_mod.shutil.copyfile
+
+    def dying_copy(src, dst, *a, **kw):
+        real_copyfile(src, dst, *a, **kw)
+        seen.append(os.stat(dst).st_mode & 0o777)
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", dying_copy)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert seen, "premise: the write-through never ran"
+    assert oct(seen[0]) == "0o600", (
+        f"the payload landed at {oct(seen[0])} and the copy then died; a chmod "
+        f"below the copy never runs at all"
+    )
+
+
+def test_the_temp_is_created_narrow_on_a_name_that_does_not_exist(
+    temp_home: Path, monkeypatch
+):
+    """The 0600 in `os.open` is the ONLY thing narrowing a first-time temp.
+
+    On a fresh name `O_CREAT` honours its mode argument, so nothing else is
+    protecting the payload before `fchmod` runs -- and widening the literal
+    leaves the whole suite green, because the sibling case pre-creates its temp
+    at 0644 and measures a path where the argument is ignored.
+
+    The umask IS load-bearing here, unlike in that sibling: 0o600 & ~0o077 is
+    still 0o600, so a runner already at 077 cannot tell the literal apart from
+    a wider one.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    prefix = f".{target.name}.{os.getpid()}."
+    assert not list(target.parent.glob(prefix + "*.tmp")), (
+        "premise: the temp name must be fresh for O_CREAT to apply its mode"
+    )
+
+    seen: list[int] = []
+    real_open = os.open
+
+    def sampling_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        # The writer draws a random suffix, so the name cannot be predicted.
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
+            seen.append(os.fstat(fd).st_mode & 0o777)
+        return fd
+
+    prev_umask = os.umask(0o000)
+    try:
+        monkeypatch.setattr(switcher_mod.os, "open", sampling_open)
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: the temp was never created through os.open"
+    assert seen[0] == 0o600, (
+        f"the temp was created at {oct(seen[0])}; on a fresh name the O_CREAT "
+        f"mode is what narrows it"
+    )
+
+
+def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
+    temp_home: Path, monkeypatch
+):
+    """`~/.claude.json` routes through this writer and can carry
+    `primaryApiKey` plus inline MCP credentials.
+
+    The mode is sampled during the read-back — the widest point of the window,
+    where the payload is fully on disk and the publish has not happened.
+
+    The temp is WIDENED to 0644 the instant it is created, which is the only
+    state `fchmod` covers and the one a reused name produces: the open carries
+    no `O_EXCL`, so an existing name is reopened and `O_CREAT`'s mode argument
+    is ignored. On a name that does not exist the open already yields 0600
+    under any umask this would run with, and the case passes with the `fchmod`
+    deleted. It widens rather than pre-creating because the writer's name now
+    carries a random suffix and cannot be predicted.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    prefix = f".{target.name}.{os.getpid()}."
+    drawn: list[Path] = []
+    real_open = os.open
+
+    def widening_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
+            # 0644 the instant the file exists: the state a reused name leaves,
+            # reached without predicting a name that now carries randomness.
+            os.chmod(path, 0o644)
+            drawn.append(Path(path))
+        return fd
+
+    seen: list[int] = []
+    real_loads = json.loads
+
+    def spy(s, *a, **kw):
+        if drawn and drawn[0].exists():
+            seen.append(drawn[0].stat().st_mode & 0o777)
+        return real_loads(s, *a, **kw)
+
+    monkeypatch.setattr(switcher_mod.os, "open", widening_open)
+    monkeypatch.setattr(switcher_mod.json, "loads", spy)
+    switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert seen, "premise: the read-back never sampled the temp"
+    assert [oct(m) for m in seen] == ["0o600"] * len(seen)
+
+
+# `test_a_refused_mode_carry_does_not_fail_a_publish_that_landed` lived here. It
+# asserted that a refused chmod warns rather than raises, on the reasoning that
+# "once the bytes are through the mount the write is committed" -- true while the
+# chmod sat BELOW the copy. It sits above it now, so a refusal happens with
+# nothing committed and the rollback it feared cannot occur. The contract it
+# guarded moved to `test_a_refused_mode_refuses_the_write_through`, which asserts
+# the destination does not receive the payload at all.
+
+
+def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypatch):
+    """A truncated destination is recoverable only if the user is told where.
+
+    The write-through is the one publish that is not atomic, so a failure
+    part-way leaves the destination short and the temp holding the only
+    complete content. `_salvage_unreadable` in this same file sets the
+    standard: raise with the path, do not leave a bare errno.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def truncating_copy(src, dst, *a, **kw):
+        Path(dst).write_text('{"activeAcc', encoding="utf-8")
+        raise OSError("injected: no space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", truncating_copy)
+
+    with pytest.raises(ConfigError) as exc:
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert len(strays) == 1, "the only complete copy was removed"
+    assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert strays[0].name in str(exc.value), (
+        f"the surviving copy was not named: {exc.value}"
+    )
+
+
+def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
+    temp_home: Path, monkeypatch, capsys
+):
+    """The interrupt this whole change is about, at the one non-atomic publish.
+
+    `except OSError` around the copy is the same too-narrow handler the rest
+    of this change exists to widen: a Ctrl-C leaves the destination short and
+    the temp holding the only complete content, and nothing names it. The
+    message cannot ride an exception here, because the interrupt has to stay
+    an interrupt -- so it goes to stderr, which the `--json` envelope on
+    stdout does not share.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def interrupted_copy(src, dst, *a, **kw):
+        Path(dst).write_text('{"activeAcc', encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", interrupted_copy)
+
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert len(strays) == 1, "the only complete copy was removed"
+    assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+
+    out, err = capsys.readouterr()
+    assert strays[0].name in err, f"the surviving copy was not named: {err!r}"
+    assert out == "", f"a machine-readable channel was written to: {out!r}"
+
+
+# EVERY atomic writer, not the three the first pass reached. A test named "no
+# writer" needs the whole population behind it; parametrised over three of
+# eight it was a true statement about a sample and a false one about its name.
+_ALL_ATOMIC_WRITERS = [
+    "settings", "mappings", "session",
+    "global_config", "active_creds", "backup_enc", "write_json", "plist",
+    # ENUMERATED BY STRUCTURE, not by memory: every site that publishes a
+    # temp through `replace_with_retry`/`os.replace`. These two were missed by
+    # the first sweep, and `transfer` writes the export payload -- live OAuth
+    # refresh tokens, into a directory the user chose.
+    "migrations", "transfer",
+]
+
+
+def _writer_site(site: str, temp_home: Path, tmp_path: Path):
+    """-> (dir the temp is drawn in, a call that publishes, a stray temp name,
+    the module whose `os` the writer uses).
+
+    The stray is what a predecessor killed by a SIGKILL would have left: the
+    same pid-derived name, without whatever randomness the writer adds.
+    """
+    pid = os.getpid()
+    d = tmp_path / "d"
+    d.mkdir(exist_ok=True)
+    if site == "settings":
+        from claude_swap import settings as mod
+        from claude_swap.settings import atomic_write_json
+
+        t = d / "s.json"
+        return (d, (lambda: atomic_write_json(t, {"a": 1})),
+                d / f".{t.name}.{pid}.tmp", mod)
+    if site == "mappings":
+        from claude_swap import mappings as mod
+        from claude_swap.mappings import MappingStore
+
+        store = MappingStore(d)
+        return (d, (lambda: store._write({})),
+                d / f".mappings-{pid}.tmp", mod)
+    if site == "session":
+        from claude_swap import session as mod
+        from claude_swap.session import SessionManager
+
+        mgr = SessionManager(ClaudeAccountSwitcher())
+        return (d, (lambda: mgr._write_manifest(d / "m.json", [])),
+                d / f".cswap-shared-{pid}.tmp", mod)
+    if site == "plist":
+        from claude_swap import menubar
+
+        exe = d / "bin" / "python3"
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        return (exe.parent,
+                (lambda: menubar.ensure_notification_identity(
+                    exe, platform="darwin")),
+                exe.parent / f"Info.plist.{pid}.tmp", menubar)
+    if site == "write_json":
+        from claude_swap import switcher as mod
+
+        sw = ClaudeAccountSwitcher()
+        t = d / "seq.json"
+        return (d, (lambda: sw._write_json(t, {"a": 1})),
+                d / f".{t.name}.{pid}.tmp", mod)
+
+    if site == "migrations":
+        from claude_swap import migrations as mod
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        t = mod._state_path(sw)
+        t.parent.mkdir(parents=True, exist_ok=True)
+        return (t.parent, (lambda: mod._mark_applied(sw, "probe")),
+                t.parent / f".{t.name}.{pid}.tmp", mod)
+    if site == "transfer":
+        from claude_swap import transfer as mod
+
+        t = d / "out.cswap"
+        return (d, (lambda: mod._atomic_write_file(t, "{}")),
+                d / f".{t.name}.{pid}.tmp", mod)
+
+    from claude_swap import credentials as _cred_mod
+    store = ClaudeAccountSwitcher()._store
+    if site == "global_config":
+        from claude_swap.credentials import get_global_config_path
+
+        cfg = get_global_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        return (cfg.parent,
+                (lambda: store._update_global_config(
+                    lambda c: c.__setitem__("primaryApiKey", "sk-ant-REDACTED"))),
+                cfg.parent / f".{cfg.name}.{pid}.tmp", _cred_mod)
+    if site == "active_creds":
+        from claude_swap.credentials import get_claude_config_home
+
+        cd = get_claude_config_home()
+        cd.mkdir(parents=True, exist_ok=True)
+        return (cd,
+                (lambda: store._write_active_credentials_file("{}")),
+                cd / f".credentials.json.{pid}.tmp", _cred_mod)
+    assert site == "backup_enc", site
+    cd = store._host.credentials_dir
+    cd.mkdir(parents=True, exist_ok=True)
+    t = cd / "1-probe.enc"
+    return (cd, (lambda: store._atomic_b64_write(t, "{}")),
+            cd / f".{t.name}.{pid}.tmp", _cred_mod)
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
+def test_no_writer_mints_its_temp_name_inside_the_syscall(
+    temp_home: Path, monkeypatch, tmp_path: Path, site: str
+):
+    """An interrupt inside the CREATE must still leave a name to unlink.
+
+    `tempfile.mkstemp` picks the name internally and opens the file before it
+    returns, so a `KeyboardInterrupt` in that window leaves a temp whose name
+    never reached the caller — no handler can remove what it cannot name. The
+    roster writer does not have this window: it computes the name first and
+    calls `os.open` inside its own guard.
+
+    Measured before the fix, same injection at each site:
+    `settings.atomic_write_json` -> `tmp*.tmp`, `mappings._write` ->
+    `.mappings-*.tmp`, `session._write_manifest` -> `.cswap-shared-*.tmp`;
+    the roster writer -> nothing.
+    """
+    import tempfile as tempfile_mod
+
+    def exploding(*_a, **_kw):
+        raise AssertionError(
+            "the temp name is minted inside mkstemp, so an interrupt there "
+            "strands a file nothing can name"
+        )
+
+    monkeypatch.setattr(tempfile_mod, "mkstemp", exploding)
+
+    d, write, _stray, _mod = _writer_site(site, temp_home, tmp_path)
+    write()
+    assert list(d.glob(".*tmp")) == [] and list(d.glob("*tmp*")) == [], (
+        "a temp survived a completed write"
+    )
+
+
+def test_an_interrupted_salvage_leaves_no_partial_copy(
+    temp_home: Path, monkeypatch, capsys
+):
+    """The `.unreadable-` name promises the bytes survived. A partial breaks it.
+
+    `except OSError` does not catch `KeyboardInterrupt`, so a Ctrl-C inside
+    `copyfile` left a truncated copy of the credential under a name a later
+    restore trusts — and printed, logged, and returned nothing about it.
+    Measured before the fix: 29 of 55 bytes, mode 0600, `warnings_out == []`.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    def truncating_copy(src, dst, *_a, **_kw):
+        Path(dst).write_text('{"primaryApiKey": "sk-ant-RED')
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", truncating_copy)
+    warnings_out: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        switcher._salvage_unreadable(path, True, warnings_out)
+
+    strays = list(path.parent.glob(f"{path.name}.unreadable-*"))
+    assert strays == [], (
+        f"a partial salvage survived as {[s.name for s in strays]} — the name "
+        "says the bytes are there and they are not"
+    )
+
+
+def test_a_signal_between_the_create_and_the_record_strands_nothing(
+    temp_home: Path, monkeypatch
+):
+    """A record made AFTER the call misses a file that exists.
+
+    `created = True` sat below `os.open`, so a signal delivered in that gap
+    left a 0-byte file under the `.unreadable-` name -- which the docstring
+    calls a promise that the bytes survived -- with `created` False, nothing
+    to remove it and nothing to announce it. `_stage_overlap_material` two
+    thousand lines down already argues this ordering for its own create.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    real_open = switcher_mod.os.open
+
+    def interrupted_open(target, *a, **kw):
+        fd = real_open(target, *a, **kw)   # the file now exists
+        os.close(fd)
+        raise KeyboardInterrupt("between the create and the record")
+
+    monkeypatch.setattr(switcher_mod.os, "open", interrupted_open)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._salvage_unreadable(path, False, [])
+
+    strays = list(path.parent.glob(f"{path.name}.unreadable-*"))
+    assert strays == [], (
+        f"a 0-byte salvage survived as {[s.name for s in strays]} — the name "
+        "says the bytes are there and the file is empty"
+    )
+
+
+def test_a_lost_salvage_race_does_not_delete_the_other_process_copy(
+    temp_home: Path, monkeypatch
+):
+    """`exists()` is a check, not a claim on the name.
+
+    Two switches hitting an unreadable config in the same second draw the same
+    `.unreadable-<epoch>` name. The `while salvage.exists()` loop settles who
+    goes first only until it returns; the winner creates the file in the gap,
+    our `O_EXCL` fails, and the cleanup then unlinks THEIR complete copy of the
+    credential — the one thing on disk that still had it.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    real_open = switcher_mod.os.open
+    theirs: list[Path] = []
+
+    def losing_open(target, *a, **kw):
+        # The other process wins the name between `exists()` and here.
+        p = Path(target)
+        p.write_text("their complete copy")
+        theirs.append(p)
+        raise FileExistsError(errno.EEXIST, "File exists")
+
+    monkeypatch.setattr(switcher_mod.os, "open", losing_open)
+    with pytest.raises(SwitchError):
+        switcher._salvage_unreadable(path, False, [])
+    monkeypatch.setattr(switcher_mod.os, "open", real_open)
+
+    assert theirs and theirs[0].exists(), (
+        f"the loser deleted the winner's salvage at {theirs[0].name}"
+    )
+    assert theirs[0].read_text() == "their complete copy"
+
+
+def test_a_salvage_that_was_never_created_is_not_announced_as_a_partial(
+    temp_home: Path, monkeypatch
+):
+    """A message naming a file that is not there sends the user after nothing.
+
+    When the create itself fails there is no copy at all, but `unlink` then
+    raises `FileNotFoundError` — an `OSError` — and the handler read that as
+    "the partial could not be removed" and named it in the error the user gets.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    def refusing_open(*_a, **_kw):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(switcher_mod.os, "open", refusing_open)
+    with pytest.raises(SwitchError) as excinfo:
+        switcher._salvage_unreadable(path, False, [])
+
+    assert list(path.parent.glob(f"{path.name}.unreadable-*")) == [], (
+        "premise: this case is about a salvage that does not exist"
+    )
+    assert "PARTIAL" not in str(excinfo.value), (
+        f"named a partial copy that was never created: {excinfo.value}"
+    )
+
+
+def test_a_failed_write_through_does_not_keep_the_narrowed_mode(
+    temp_home: Path, monkeypatch
+):
+    """The 0600 is a committed side effect when the copy after it fails.
+
+    The write-through path narrows the destination BEFORE the copy, because
+    `copyfile` truncates without touching the mode and a chmod after it would
+    publish the payload at whatever mode was there. When the copy then fails
+    the narrowing stands, the old mode was never captured, and nothing can put
+    it back — on the deployment this branch exists for (a bind-mounted
+    `~/.claude.json` at 0644 so another uid can read it) a full disk narrows
+    the host file permanently and reports only the copy error.
+
+    `copyfile` has already truncated by then, so the destination is emptied
+    before the mode goes back: an empty file at the old mode leaks nothing,
+    and the complete content is at the temp the message names.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    import stat as stat_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"activeAccountNumber": 1}')
+    os.chmod(path, 0o644)
+    # READ IT BACK rather than assuming 0644 landed. Windows honours only the
+    # write bit, so the same chmod yields 0666 there -- and the production
+    # narrowing is POSIX-only, so on Windows the property under test is that
+    # nothing moved at all. Comparing against what the file actually holds says
+    # the same thing on both.
+    before = stat_mod.S_IMODE(path.stat().st_mode)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def out_of_space(src, dst, *_a, **_kw):
+        Path(dst).write_text("")          # copyfile truncates first
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", out_of_space)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2})
+
+    mode = stat_mod.S_IMODE(path.stat().st_mode)
+    assert mode == before, (
+        f"the destination went {oct(before)} -> {oct(mode)} — the narrowing "
+        "outlived the write it was for, and nothing recorded what to restore"
+    )
+
+
+def test_a_copy_that_never_opened_the_destination_leaves_it_alone(
+    temp_home: Path, monkeypatch
+):
+    """`_unnarrow` may only empty what `copyfile` already truncated.
+
+    `shutil.copyfile` raises before it opens the destination `'wb'` on four
+    paths — `SameFileError`, `SpecialFileError`, any failure opening the
+    SOURCE, and a signal anywhere in that prologue. In every one of them the
+    destination still holds its original bytes, and emptying it destroys a
+    live config the write never touched. At the merge base the copy fallback
+    left it fully intact, so undoing the narrowing this way is a regression
+    the narrowing-fix introduced.
+    """
+    import stat as stat_mod
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    original = '{"activeAccountNumber": 1}'
+    path.write_text(original)
+    os.chmod(path, 0o644)
+    before = stat_mod.S_IMODE(path.stat().st_mode)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def never_opened_dst(_src, _dst, *_a, **_kw):
+        # The source could not be read; `_dst` was never touched.
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", never_opened_dst)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2})
+
+    assert path.read_text() == original, (
+        f"the destination was emptied by a copy that never opened it: "
+        f"{path.read_text()!r}"
+    )
+    assert stat_mod.S_IMODE(path.stat().st_mode) == before, (
+        "the narrowing outlived the write it was for"
+    )
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
+def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
+    temp_home: Path, tmp_path: Path, site: str
+):
+    """`O_EXCL` on a pid-derived name is not the collision safety mkstemp gave.
+
+    `mkstemp` RETRIES on EEXIST; `O_EXCL` on a fixed name can only fail. A
+    SIGKILL (a container stop, an OOM) strands `.mappings-<pid>.tmp`, a later
+    process draws the same pid, and the write dies — and the handler then
+    unlinks a file it did not create, which is exactly what
+    `_stage_overlap_material` refuses to do.
+
+    A random suffix keeps I1's property (the name is known before the file
+    exists) AND mkstemp's collision profile.
+    """
+    _d, write, stray, _mod = _writer_site(site, temp_home, tmp_path)
+    stray.write_text("a predecessor died holding this")
+    write()
+    assert stray.read_text() == "a predecessor died holding this", (
+        "the writer deleted a stranded file it did not create"
+    )
+
+
+#: The plist carries no credential, so its temp is created at the ordinary
+#: mode. Everything else on this roster holds one at some point.
+_WIDE_BY_DESIGN = {"plist"}
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
+def test_the_temp_is_created_narrow_at_every_writer(
+    temp_home: Path, tmp_path: Path, monkeypatch, site: str
+):
+    """The 0600 literal was pinned at TWO of the ten writers.
+
+    `credentials.py` has no `os.fchmod` at all, so on those three the literal
+    on `os.open` is the ONLY thing narrowing a temp that holds a live OAuth
+    token for the whole write window -- and widening every create to 0o666
+    failed just two cases, one of them pre-existing. On NINE of the ten the
+    name is fresh (`O_EXCL`), so nothing else can have set the mode. The
+    tenth opens `O_TRUNC` and would reopen an existing name with the mode
+    argument ignored, which is why that one carries an `os.fchmod` as well.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    d, write, _stray, mod = _writer_site(site, temp_home, tmp_path)
+    seen: list[int] = []
+    real_open = os.open
+
+    def sampling_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        name = os.path.basename(os.fspath(path))
+        if name.endswith(".tmp"):
+            seen.append(os.fstat(fd).st_mode & 0o777)
+        return fd
+
+    prev_umask = os.umask(0o000)          # permissive: 0o644 if nothing narrows
+    try:
+        monkeypatch.setattr(mod.os, "open", sampling_open)
+        write()
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: no temp was created through os.open"
+    ceiling = 0o644 if site in _WIDE_BY_DESIGN else 0o600
+    wide = [oct(m) for m in seen if m & ~ceiling]
+    assert wide == [], (
+        f"{site}'s temp was created at {wide} against a {oct(ceiling)} "
+        "ceiling — the payload is readable by another uid for the whole "
+        "write window"
+    )
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
+def test_an_interrupt_at_the_create_strands_nothing(
+    temp_home: Path, tmp_path: Path, monkeypatch, site: str
+):
+    """The BEHAVIOUR I1 is about, which its sibling case cannot see.
+
+    `test_no_writer_mints_its_temp_name_inside_the_syscall` injects no
+    interrupt: it makes `mkstemp` explode and calls each writer on its SUCCESS
+    path, so it only asserts "this module does not call mkstemp". Measured —
+    with `os.open` moved back outside the guard (the name still computed
+    first, so that premise holds) it stays green on a tree that strands the
+    temp. This one interrupts at the create and looks at the directory.
+    """
+    d, write, _stray, mod = _writer_site(site, temp_home, tmp_path)
+    before = set(os.listdir(d))
+
+    real_open = os.open
+
+    def exploding(path, *a, **k):
+        fd = real_open(path, *a, **k)   # the file now exists
+        os.close(fd)
+        raise KeyboardInterrupt("inside the create")
+
+    monkeypatch.setattr(mod.os, "open", exploding)
+    with pytest.raises(KeyboardInterrupt):
+        write()
+
+    strays = sorted(set(os.listdir(d)) - before)
+    assert strays == [], f"an interrupt at the create left {strays}"
+
+
+def test_a_partial_of_the_SAME_LENGTH_is_not_left_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The mtime half of the pair, which nothing pinned.
+
+    `_unnarrow` asks `(st_size, st_mtime_ns) != before`. Freezing
+    `st_mtime_ns` degrades that back to the size proxy round 5 replaced, and
+    the whole write-through group stays green: every case there changes the
+    length, so the size half alone answers them all. This one does not —
+    the partial is written at EXACTLY the prior byte count, so only the
+    mtime can say the file was touched.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    original = '{"a": "000000000000000000000000000"}'
+    path.write_text(original)
+    os.chmod(path, 0o644)
+
+    partial = '{"primaryApiKey": "sk-ant-SECRET-P"}'
+    assert len(partial) == len(original), (
+        "premise: the partial must be exactly the prior length, or the size "
+        "half answers this and the mtime half is untested"
+    )
+
+    def same_length_partial(src, dst, *_a, **_kw):
+        Path(dst).write_text(partial)
+        raise OSError(errno.EIO, "the mount went away mid-copy")
+
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", same_length_partial)
+    monkeypatch.setattr(
+        switcher_mod, "replace_with_retry",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError(errno.EBUSY, "bind mount")))
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"primaryApiKey": "sk-ant-SECRET-PAYLOAD"})
+
+    left = path.read_text()
+    assert "SECRET" not in left, (
+        f"a same-length partial credential survived at "
+        f"mode {oct(path.stat().st_mode & 0o777)}: {left[:40]!r}"
+    )
+
+
+def test_a_partial_larger_than_the_original_is_not_left_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The size proxy reads the ORDINARY direction as "never touched".
+
+    `_unnarrow` inferred "the copy truncated it" from `st_size < before_size`.
+    The mainline switch splices `oauthAccount` INTO an existing config, so the
+    new payload is larger — and a copy dying past the old size then reads as
+    untouched, leaving a partial `primaryApiKey` at the destination's old
+    world-readable mode. That is the exposure the narrowing exists to prevent,
+    re-opened by the guard added to stop it emptying an untouched file.
+
+    Measured before this fix: mode 0o644 -> 0o644 with the secret on disk.
+    """
+    import stat as stat_mod
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"a": 1}')            # 8 bytes
+    os.chmod(path, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def dies_past_the_old_size(_src, dst, *_a, **_kw):
+        # `copyfile` opens 'wb' (truncating) and then writes; it died after
+        # writing MORE than the original held.
+        Path(dst).write_text('{"primaryApiKey": "sk-ant-SECRET-PARTIAL')
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", dies_past_the_old_size)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2, "pad": "x" * 200})
+
+    left = path.read_text()
+    mode = stat_mod.S_IMODE(path.stat().st_mode)
+    assert "SECRET" not in left, (
+        f"a partial credential survived at mode {oct(mode)}: {left[:40]!r}"
+    )
+
+
+def test_a_partial_copy_is_emptied_not_left_at_the_prior_mode(
+    temp_home: Path, monkeypatch
+):
+    """The state the recovery exists for, and the one it skipped.
+
+    CPython's `copyfile` opens the destination `'wb'` -- truncating it --
+    before reading a single source byte, so a copy that dies mid-stream leaves
+    a PREFIX of the new payload behind. For `~/.claude.json` that prefix is a
+    truncated credential, and the mode restore then puts the permissive prior
+    mode back over it.
+
+    It was skipped whenever the digest of what we published was unavailable,
+    which the recovery used to obtain by re-READING the temp -- unreadable on
+    exactly the population that reaches the recovery through a source-side
+    error. Taking the digest from `content` removes that state entirely.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    import shutil as _shutil
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+    original = target.read_bytes()
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copy": False}
+
+    def truncating_partial(src, dst, **_kw):
+        fired["copy"] = True
+        # EXACTLY CPython's order: the destination is opened 'wb' before the
+        # source is read, so the truncation has already happened.
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            d.write(s.read(18))
+        raise OSError(errno.EIO, "injected mid-copy")
+
+    real_read_bytes = Path.read_bytes
+
+    def is_the_temp(name: str) -> bool:
+        return name.startswith(f".{target.name}.") and name.endswith(".tmp")
+
+    def unreadable_temp(self):
+        if is_the_temp(self.name):
+            raise OSError(errno.EIO, "the temp's medium answered EIO")
+        return real_read_bytes(self)
+
+    # THE MEDIUM THAT USED TO DISARM THIS, kept so the case still fails on a
+    # WHOLE revert to reading the digest out of the temp. It does NOT catch
+    # the half of that revert which re-points the digest and leaves `touched`
+    # alone -- measured, 27 passed -- so it is INERT on correct code and
+    # partial against a wrong one. Not a premise either way; the check below
+    # is what keeps it from going stale in silence.
+    #
+    # DERIVED FROM PRODUCTION, not from the test's own spelling. Handing the
+    # predicate a name this file constructs asks whether it matches itself,
+    # which is true however the temp is really named -- so it would report a
+    # healthy instrument after the writer moved to `tmpXXXXXXXX.tmp`.
+    opened: list[str] = []
+    real_os_open = os.open
+
+    def recording_open(path, *a, **k):
+        if not isinstance(path, int):
+            opened.append(os.path.basename(os.fspath(path)))
+        return real_os_open(path, *a, **k)
+
+    monkeypatch.setattr(switcher_mod.os, "open", recording_open)
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(_shutil, "copyfile", truncating_partial)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_temp)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE-SECRET"})
+    monkeypatch.undo()
+
+    assert fired["copy"], "premise: the partial copy never ran"
+    assert any(is_the_temp(n) for n in opened), (
+        f"the injection matches none of the names the writer actually opened "
+        f"({opened}) — it is inert for a reason that has nothing to do with "
+        "the fix, and this case has stopped guarding the revert"
+    )
+    now = target.read_bytes()
+    assert now != original, (
+        "premise: the copy did not truncate, so there is no partial to judge"
+    )
+    assert now == b"", (
+        f"a partial destination survived: {now[:40]!r} at mode "
+        f"{oct(os.stat(target).st_mode & 0o777)}"
+    )
+
+
+def test_an_unreadable_destination_before_the_copy_is_left_alone(
+    temp_home: Path, monkeypatch
+):
+    """THE `before is not None` TERM, which nothing else reaches.
+
+    A partial copy is normally emptied. When the destination could not be READ
+    before the copy, nothing here can tell that partial from bytes that were
+    already there, so the conservative answer is to leave it: the alternative
+    destroys a config this write never finished reaching.
+
+    Measured before this case existed: deleting the term left the file
+    byte-identical at 547 passed.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    import shutil as _shutil
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copy": False, "before": False}
+    real_read_bytes = Path.read_bytes
+
+    def unreadable_before(self):
+        # ONLY the pre-copy read. The recovery reads the destination a second
+        # time afterwards, and that one must succeed or the case proves
+        # nothing about the term -- an early `return` would leave the file
+        # alone for a completely different reason.
+        if not fired["copy"] and os.fspath(self) == os.fspath(target):
+            fired["before"] = True
+            raise OSError(errno.EIO, "injected pre-copy read")
+        return real_read_bytes(self)
+
+    def truncating_partial(src, dst, **_kw):
+        fired["copy"] = True
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            d.write(s.read(18))
+        raise OSError(errno.EIO, "injected mid-copy")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(_shutil, "copyfile", truncating_partial)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_before)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE-SECRET"})
+    monkeypatch.undo()
+
+    assert fired["before"], "premise: the pre-copy read never failed"
+    assert fired["copy"], "premise: the partial copy never ran"
+    assert target.read_bytes() != b"", (
+        "the recovery emptied a destination it could not read beforehand — it "
+        "cannot tell a partial from what was already there, and emptying is "
+        "the destructive answer to that question"
+    )

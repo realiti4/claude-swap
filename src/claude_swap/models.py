@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import secrets
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -161,6 +164,67 @@ class AccountsSnapshot:
     taken_at: float
 
 
+def _restore_atomically(path: Path, text: str) -> None:
+    """Put `text` back without truncating what is already there.
+
+    `Path.write_text` opens with O_TRUNC, so it destroys the destination
+    BEFORE it can fail -- and the rollback runs on failures where the write
+    never opened the destination at all (a temp-write ENOSPC, an invalid
+    payload, a non-EBUSY rename error), where those bytes are the intact
+    original. The one fault that produces both halves is a full filesystem
+    or an exhausted quota, which is the failure class this restore exists
+    for. Name first, publish by rename, so a failed restore leaves the
+    destination exactly as it was.
+
+    A FAILURE TO NAME THE TEMP NEVER FALLS BACK. That errno is a fact
+    about the parent directory, and a bind-mounted destination is not even
+    on the same filesystem, so a rewrite authorised on that reading
+    truncates a file whose own room nothing measured. Only EBUSY on the
+    PUBLISH does, because that errno IS about the destination and says the
+    one thing that makes a rewrite the only option.
+    """
+    tmp = path.parent / f".{path.name}.restore.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = -1
+    try:
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # DISOWN A NAME WE DID NOT CREATE. `O_EXCL` refused it, so it
+            # belongs to whoever is writing it; the cleanup below must not
+            # reach for it.
+            tmp = None
+            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+        if sys.platform != "win32":
+            os.chmod(tmp, 0o600)
+        try:
+            replace_with_retry(tmp, path)
+            tmp = None
+        except OSError as e:
+            if e.errno != errno.EBUSY:
+                raise
+            # A BIND-MOUNTED DESTINATION PINS THE INODE, so no rename can
+            # ever land there and writing through is the only way -- which
+            # is exactly what `_write_json` does at this same destination,
+            # and how it EMPTIED the file whose bytes this restore is
+            # holding. Scoped to the PUBLISH: a temp that could not be
+            # created says nothing about the destination's own room, and
+            # rewriting on that reading is what truncated one.
+            path.write_text(text, encoding="utf-8")
+            if sys.platform != "win32":
+                os.chmod(path, 0o600)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 @dataclass
 class SwitchTransaction:
     """Represents a switch operation that can be rolled back."""
@@ -170,6 +234,11 @@ class SwitchTransaction:
     original_account_num: str
     original_email: str
     config_path: Path
+    # THE ROSTER'S OWN BYTES. The arm below used to re-read the file, which
+    # answers nothing when the write that failed EMPTIED it -- and an empty
+    # `sequence.json` is not a lost pointer, it is a cswap that refuses to
+    # run, because `_get_sequence_data` reads it strictly.
+    original_sequence: str = ""
     completed_steps: list[str] = field(default_factory=list)
 
     def record_step(self, step: str) -> None:
@@ -188,17 +257,25 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    _restore_atomically(self.config_path, self.original_config)
                 elif step == "sequence_updated":
-                    data = switcher._get_sequence_data()
-                    if data:
-                        data["activeAccountNumber"] = int(self.original_account_num)
-                        data["lastUpdated"] = get_timestamp()
-                        switcher._write_json(switcher.sequence_file, data)
+                    if self.original_sequence:
+                        # PLAIN WRITE, like the config arm above. Restoring
+                        # through `_write_json` re-enters the very recovery
+                        # that emptied the file, so the restore empties it
+                        # again. The snapshot already carries the original
+                        # `activeAccountNumber`, so it goes back verbatim.
+                        _restore_atomically(
+                            switcher.sequence_file, self.original_sequence
+                        )
+                    else:
+                        data = switcher._get_sequence_data()
+                        if data:
+                            data["activeAccountNumber"] = int(
+                                self.original_account_num
+                            )
+                            data["lastUpdated"] = get_timestamp()
+                            switcher._write_json(switcher.sequence_file, data)
                 switcher._logger.info(f"Rolled back step: {step}")
             except Exception as e:
                 switcher._logger.error(f"Failed to rollback step {step}: {e}")

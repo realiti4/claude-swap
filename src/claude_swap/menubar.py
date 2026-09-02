@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import plistlib
 import re
 import sys
@@ -71,9 +72,44 @@ def ensure_notification_identity(
             changed = True
         if changed or not path.exists():
             # atomic: an interrupted write must not leave a half-written plist
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_bytes(plistlib.dumps(data))
-            os.replace(tmp, path)
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            )
+            try:
+                # `os.open` with O_EXCL, like every sibling writer: a
+                # `write_bytes` creates the file inside a call nothing can
+                # interrupt-and-name, and it accepts a name that already
+                # exists. No credential rides here, so the mode is the
+                # ordinary one -- the create is what had to match.
+                # TRACKED ACROSS THE HANDOVER: an interrupt between
+                # `os.open` returning and `fdopen` taking the fd leaks the
+                # descriptor, and on Windows the held handle makes the unlink
+                # below fail, stranding the temp it exists to remove.
+                fd = -1
+                try:
+                    fd = os.open(
+                        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    # NOT OURS TO REMOVE. The outer handler swallows, so
+                    # without the disown the `finally` deletes the winner's
+                    # in-progress file behind a warning about our own write.
+                    tmp = None
+                    raise
+                owned, fd = fd, -1
+                with os.fdopen(owned, "wb") as fh:
+                    fh.write(plistlib.dumps(data))
+                os.replace(tmp, path)
+                tmp = None
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                # Only while the name is still ours; the publish consumes
+                # it. Swallowed so cleanup cannot mask the real failure.
+                if tmp is not None:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
         logging.getLogger("claude-swap").warning(
             "Could not prepare menu-bar notification identity: %s", exc
@@ -120,9 +156,16 @@ class MenuBarSettings:
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
-        """Write settings as pretty JSON, creating parent directories."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        """Write settings atomically, creating parent directories.
+
+        A truncate-then-write here loses the settings on an interrupt, and
+        `load` treats an unparseable file as absent and returns the DEFAULTS
+        without a word — so a Ctrl-C during a menu-bar toggle silently turns
+        auto-switch off. The shared helper does mkdir, 0600 and temp+replace.
+        """
+        from claude_swap.settings import atomic_write_json
+
+        atomic_write_json(path, asdict(self))
 
 
 # ---- pure display helpers (operate on the usage-window dict shape produced by
