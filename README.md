@@ -241,6 +241,13 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
 Needs the `menubar` extra (macOS only):
 
+> [!IMPORTANT]
+> Install it on **Python 3.13**. On Python 3.14 the menu bar starts, runs and logs nothing, but no status item is ever drawn ([#310](https://github.com/realiti4/claude-swap/issues/310)). `uv` picks the newest interpreter by default, so ask for 3.13 explicitly:
+>
+> ```bash
+> uv tool install --python 3.13 'claude-swap[menubar]'
+> ```
+
 ```bash
 uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
 cswap menubar

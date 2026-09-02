@@ -550,6 +550,36 @@ class TestCLI:
         assert seen["menubar_ran"] is False
         assert "installed" in capsys.readouterr().out
 
+    def test_install_service_warns_when_the_interpreter_draws_nothing(
+        self, monkeypatch, capsys
+    ):
+        # Installing a login service for a menu bar that cannot draw is the
+        # worst case: it survives reboots and shows nothing. See issue #310.
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(
+            "claude_swap.menubar.python_support_warning", lambda *a: "3.14 draws nothing"
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "3.14 draws nothing" in (captured.out + captured.err)
+
+    def test_install_service_stays_quiet_on_a_supported_interpreter(
+        self, monkeypatch, capsys
+    ):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(
+            "claude_swap.menubar.python_support_warning", lambda *a: None
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "draws nothing" not in (captured.out + captured.err)
+
     def test_menubar_uninstall_service_routes_to_launch_agent(self, monkeypatch, capsys):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--uninstall-service"])
 

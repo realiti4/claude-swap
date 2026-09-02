@@ -556,3 +556,32 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+class TestPythonSupportWarning:
+    """The menu bar draws nothing on Python 3.14; say so instead of pretending.
+
+    See issue #310. Nothing in this project can fix the incompatibility, so the
+    tests here are about the warning existing and being accurate, not about the
+    status item.
+    """
+
+    def test_no_warning_on_an_interpreter_that_works(self):
+        assert menubar.python_support_warning((3, 13, 15)) is None
+
+    def test_warns_on_314(self):
+        msg = menubar.python_support_warning((3, 14, 6))
+        assert msg is not None
+        assert "3.14" in msg
+
+    def test_warns_on_untested_newer_interpreters_too(self):
+        # Not known broken, but nobody has seen a status item there either.
+        assert menubar.python_support_warning((3, 15, 0)) is not None
+
+    def test_the_warning_carries_the_remedy_not_just_the_diagnosis(self):
+        msg = menubar.python_support_warning((3, 14, 0))
+        assert "--python 3.13" in msg
+
+    def test_older_interpreters_are_never_warned_about(self):
+        for minor in (10, 11, 12, 13):
+            assert menubar.python_support_warning((3, minor, 0)) is None

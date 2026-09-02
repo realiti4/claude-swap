@@ -926,6 +926,12 @@ def _menubar_service(args) -> int:
     from claude_swap import launch_agent
 
     if args.install_service:
+        # Installing a service for a menu bar that this interpreter cannot draw
+        # is the worst version of the bug: it survives reboots and shows
+        # nothing. Say so here too, not only when the menu bar is launched.
+        from claude_swap.menubar import python_support_warning
+
+        unsupported = python_support_warning()
         result = launch_agent.install()
         print(f"Menu bar service installed ({result['label']}).")
         print(f"  plist: {result['plist']}")
@@ -936,6 +942,8 @@ def _menubar_service(args) -> int:
                 "upgrade to point launchd at the new build."
             )
         )
+        if unsupported:
+            warning(unsupported)
         return 0
 
     if args.uninstall_service:

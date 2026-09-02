@@ -29,6 +29,7 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
@@ -438,9 +439,44 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+# Interpreters where rumps draws no status item. Measured on macOS 26.6.2 with
+# rumps 0.4.0: under Python 3.14 the app starts, the event loop runs, nothing is
+# logged and no icon appears; the same app on 3.13 draws it with pyobjc held
+# constant, so the interpreter is the variable. 3.15+ is included because it is
+# untested, not because it is known broken — the point is to stop claiming a
+# working menu bar on interpreters where nobody has seen one.
+STATUS_ITEM_UNTESTED_PYTHON = (3, 14)
+
+
+def python_support_warning(version_info=None) -> str | None:
+    """Text to show when this interpreter is not known to draw a status item.
+
+    Returns None on interpreters where the menu bar is known to work. Nothing
+    here can fix the incompatibility; the silence is what makes it expensive,
+    so the point is only to say it out loud instead of starting a process that
+    will look healthy and show nothing.
+    """
+    info = tuple((version_info or sys.version_info)[:2])
+    if info < STATUS_ITEM_UNTESTED_PYTHON:
+        return None
+    return (
+        f"Python {info[0]}.{info[1]} is not known to draw the menu bar icon "
+        "on macOS: the process runs and logs nothing, but no status item "
+        "appears. Reinstall on 3.13 to get it back:\n"
+        "  uv tool install --python 3.13 --force 'claude-swap[menubar]'"
+    )
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
+    _warn = python_support_warning()
+    if _warn:
+        warning(_warn)
+        # Under launchd stdout is a log file, not a tty, so this would sit in
+        # a block buffer for as long as the process lives — which for a menu
+        # bar is days. Flush it now or it never reaches the log at all.
+        sys.stdout.flush()
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
