@@ -37,6 +37,16 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
 _BACK = ("← back", "back")
 
+def _row_action_id(prefix: str, acc) -> str:
+    """Menu action id for an account row.
+
+    Claude rows keep the historical bare-number form, so a Claude-only install
+    — and every test written against it — is untouched. Other providers use the
+    composite row key, which the app resolves back to the owning switcher.
+    """
+    return f"{prefix}:{acc.number}" if acc.provider == "claude" else f"{prefix}:{acc.key}"
+
+
 
 class DashboardScreen(Screen):
     BINDINGS = [
@@ -97,7 +107,7 @@ class DashboardScreen(Screen):
             (
                 f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
                 f"  [{acc.display_tag}]",
-                f"remove:{acc.number}",
+                _row_action_id("remove", acc),
             )
             for acc in (snap.accounts if snap else ())
         ]
@@ -114,7 +124,7 @@ class DashboardScreen(Screen):
             action = "→ enable" if acc.disabled else "→ disable"
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
-                (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+                (f"{acc.number}  {name}{state}   {action}", _row_action_id("disable", acc))
             )
         entries.append(_BACK)
         return entries
@@ -172,13 +182,11 @@ class DashboardScreen(Screen):
         elif action_id == "remove-menu":
             await self._push_menu("remove account", self._remove_entries())
         elif action_id.startswith("remove:"):
-            number = action_id.split(":", 1)[1]
-            snap = app.snapshot
-            email = next(
-                (a.email for a in (snap.accounts if snap else ()) if a.number == number),
-                "?",
-            )
-            app.confirm_remove(number, email)
+            # The tail is a row key ("codex:1"), not a bare slot number: slot
+            # numbers repeat across providers.
+            key = action_id.split(":", 1)[1]
+            row = app._row_for(key)
+            app.confirm_remove(key, row.email if row else "?")
         elif action_id == "theme-menu":
             await self._push_menu("theme", self._theme_entries())
         elif action_id.startswith("theme:"):
@@ -189,8 +197,8 @@ class DashboardScreen(Screen):
         elif action_id == "disable-menu":
             await self._push_menu("disable / enable", self._disable_entries())
         elif action_id.startswith("disable:"):
-            number = action_id.split(":", 1)[1]
-            app.do_toggle_disabled(number)
+            key = action_id.split(":", 1)[1]
+            app.do_toggle_disabled(key)
             await self._pop_menu()
         else:
             actions[action_id]()
@@ -317,7 +325,7 @@ class SwitchScreen(AccountListScreen):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
+            self.app.do_switch(item.key_id)
             self.app.pop_screen()
 
     def action_select_highlighted(self) -> None:
@@ -404,7 +412,7 @@ class WatchScreen(AccountListScreen):
             return  # e.g. a stray click while just watching
         item = event.item
         if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
+            self.app.do_switch(item.key_id)
             self._set_selecting(False)  # stay here, keep watching
 
     def action_select_highlighted(self) -> None:
