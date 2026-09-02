@@ -7,9 +7,11 @@ currently running. Uses the same mechanism Claude Code itself uses internally.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +19,16 @@ from pathlib import Path
 from claude_swap.paths import get_claude_config_home
 
 logger = logging.getLogger(__name__)
+
+# A session record names a pid, and the OS recycles pids: once the claude
+# that wrote the record is gone, the number can belong to anything. The
+# record also carries claude's ``ps -o lstart`` reading of its own start, so
+# a process that started later than that is not the recorded one. The slack
+# absorbs the small wall-clock steps that, on Linux, move every ps start time.
+PID_REUSE_SLACK_S = 120
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 @dataclass
@@ -86,8 +98,109 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
+def _ps(pid: int, *columns: str) -> str | None:
+    """``ps -o`` ``columns`` for ``pid``, or None when unknowable.
+
+    POSIX only, under ``LC_ALL=C TZ=UTC`` like claude's own reading. Windows
+    and every failure answer None: not knowing must never be read as "not
+    the recorded process".
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", ",".join(f"{c}=" for c in columns), "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = proc.stdout.strip()
+    if proc.returncode != 0 or not text:
+        return None
+    return text
+
+
+def process_started_at(pid: int) -> int | None:
+    """Epoch seconds at which ``pid`` started, or None when unknowable.
+
+    Read the way claude stamps ``procStart`` into its record, ``ps -o
+    lstart=`` under ``LC_ALL=C TZ=UTC``, so the two agree to the second for
+    the same process.
+    """
+    text = _ps(pid, "lstart")
+    if text is None:
+        return None
+    try:
+        return _lstart_seconds(text)
+    except ValueError:
+        return None
+
+
+def _lstart_seconds(text: str) -> int:
+    """``Wed Sep  2 20:35:59 2026``, the ``ps -o lstart`` format under
+    ``LC_ALL=C TZ=UTC``, as epoch seconds. Parsed by hand because ``strptime``
+    reads month names in the process locale."""
+    parts = text.split()
+    if len(parts) != 5 or parts[1] not in _MONTHS:
+        raise ValueError(text)
+    _, month, day, clock, year = parts
+    hours, minutes, seconds = (int(p) for p in clock.split(":"))
+    return calendar.timegm(
+        (int(year), _MONTHS.index(month) + 1, int(day), hours, minutes, seconds, 0, 0, 0)
+    )
+
+
+def process_is_claude(pid: int) -> bool | None:
+    """Does the process at ``pid`` look like a claude, or None when unknowable.
+
+    Judged from ``ps -o comm=,args=``: the native binary and the symlink to
+    it are named ``claude``, and an npm install runs ``cli.js`` out of a
+    ``claude-code`` package directory.
+    """
+    text = _ps(pid, "comm", "args")
+    if text is None:
+        return None
+    return "claude" in text.lower()
+
+
+def pid_matches_record(pid: int, proc_start: str | None) -> bool:
+    """Is the live process at ``pid`` the one that wrote a record stamped
+    ``proc_start``, claude's ``ps -o lstart`` reading of itself?
+
+    A recycled pid belongs to a process that started after the recorded
+    claude did. Only that direction disqualifies, and only a stranger: on
+    Linux ``ps`` builds every start time from the boot time in
+    ``/proc/stat``, which the kernel moves with each wall-clock step (a WSL2
+    resume re-syncing the clock steps it by the whole sleep), so a live
+    session can read as younger than its own record. A claude at the pid is
+    kept either way; a pid genuinely recycled by another claude lingers only
+    for that process's lifetime, which is what happened before this check.
+    Everything unknowable (Windows, ``ps`` unavailable, an unstamped or
+    unparseable record) passes, because "cannot tell" must never turn a live
+    session into "nobody there".
+    """
+    if not proc_start:
+        return True
+    try:
+        recorded = _lstart_seconds(proc_start)
+    except ValueError:
+        return True
+    started = process_started_at(pid)
+    if started is None or started <= recorded + PID_REUSE_SLACK_S:
+        return True
+    return process_is_claude(pid) is not False
+
+
 def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], int]:
     """Live sessions, and how many records could NOT be read.
+
+    A record counts as live only when its pid is alive AND still belongs to
+    the claude that wrote it (see ``pid_matches_record``): a crashed claude
+    leaves its record behind, and the OS can hand the number to something
+    else.
 
     Two kinds of caller read this directory and they need opposite things from
     an unparseable record:
@@ -114,6 +227,11 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = data["pid"]
             if not is_pid_alive(pid):
+                continue
+            if not pid_matches_record(pid, data.get("procStart")):
+                logger.debug(
+                    "Skipping session file %s: pid %s was recycled", path, pid
+                )
                 continue
             sessions.append(ClaudeSession(
                 pid=pid,

@@ -11,13 +11,18 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap.process_detection import (
+    PID_REUSE_SLACK_S,
     ClaudeSession,
     IdeInstance,
+    _lstart_seconds,
     get_claude_dir,
     get_running_instances,
     is_pid_alive,
     list_ide_instances,
     list_sessions,
+    pid_matches_record,
+    process_is_claude,
+    process_started_at,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -85,6 +90,160 @@ class TestIsPidAlive:
         assert is_pid_alive(-1) is False
 
 
+# --- process start time / pid reuse ---
+
+
+LSTART = "Wed Sep  2 20:35:59 2026"
+LSTART_S = 1788381359
+
+
+class TestLstartSeconds:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            (LSTART, LSTART_S),
+            ("Thu Jan  1 00:00:00 1970", 0),
+            ("Tue Nov 14 22:13:20 2023", 1_700_000_000),
+        ],
+    )
+    def test_parses_ps_lstart(self, text, expected):
+        assert _lstart_seconds(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        ["", "abc", "Wed Sep 2 20:35 2026", "Wed Foo  2 20:35:59 2026",
+         "Wed Sep  2 20:35:59", "Wed Sep  2 20:35:xx 2026"],
+    )
+    def test_rejects_garbage(self, text):
+        with pytest.raises(ValueError):
+            _lstart_seconds(text)
+
+
+class TestProcessStartedAt:
+    def test_windows_is_unknowable(self):
+        with patch("claude_swap.process_detection.sys.platform", "win32"), \
+             patch("claude_swap.process_detection.subprocess.run") as run:
+            assert process_started_at(1234) is None
+        run.assert_not_called()
+
+    def test_ps_failure_is_unknowable(self):
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run",
+                   side_effect=OSError("no ps")):
+            assert process_started_at(1234) is None
+
+    def test_unknown_pid_is_unknowable(self):
+        proc = subprocess_result(returncode=1, stdout="")
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run", return_value=proc):
+            assert process_started_at(1234) is None
+
+    def test_garbage_is_unknowable(self):
+        proc = subprocess_result(returncode=0, stdout="??\n")
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run", return_value=proc):
+            assert process_started_at(1234) is None
+
+    def test_reads_lstart_the_way_claude_does(self):
+        """The record's ``procStart`` is claude's own ``LC_ALL=C TZ=UTC ps -o
+        lstart=`` output; the live reading must match it to the second."""
+        proc = subprocess_result(returncode=0, stdout=f"{LSTART}    \n")
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run",
+                   return_value=proc) as run:
+            assert process_started_at(1234) == LSTART_S
+        args, kwargs = run.call_args
+        assert args[0] == ["ps", "-o", "lstart=", "-p", "1234"]
+        assert kwargs["env"]["LC_ALL"] == "C"
+        assert kwargs["env"]["TZ"] == "UTC"
+
+    @pytest.mark.skipif(os.name != "posix", reason="ps is POSIX")
+    def test_own_process_started_in_the_past(self):
+        started = process_started_at(os.getpid())
+        assert started is not None
+        assert started <= time.time()
+
+
+def subprocess_result(returncode: int, stdout: str):
+    from subprocess import CompletedProcess
+
+    return CompletedProcess(["ps"], returncode, stdout=stdout, stderr="")
+
+
+class TestProcessIsClaude:
+    def test_ps_failure_is_unknowable(self):
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run",
+                   side_effect=OSError("no ps")):
+            assert process_is_claude(1234) is None
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ("claude           claude --resume 2d6cbe5d", True),
+            ("node             node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js", True),
+            ("2.1.258          /home/u/.local/share/claude/versions/2.1.258", True),
+            ("vim              vim notes.md", False),
+        ],
+    )
+    def test_judges_comm_and_args(self, line, expected):
+        proc = subprocess_result(returncode=0, stdout=f"{line}\n")
+        with patch("claude_swap.process_detection.sys.platform", "linux"), \
+             patch("claude_swap.process_detection.subprocess.run",
+                   return_value=proc) as run:
+            assert process_is_claude(1234) is expected
+        assert run.call_args[0][0] == ["ps", "-o", "comm=,args=", "-p", "1234"]
+
+
+class TestPidMatchesRecord:
+    @pytest.mark.parametrize("proc_start", [None, "", "garbage"])
+    def test_unstamped_or_garbage_record_passes(self, proc_start):
+        with patch("claude_swap.process_detection.process_started_at") as started:
+            assert pid_matches_record(1234, proc_start) is True
+        started.assert_not_called()
+
+    def test_unknowable_start_passes(self):
+        with patch("claude_swap.process_detection.process_started_at",
+                   return_value=None), \
+             patch("claude_swap.process_detection.process_is_claude") as is_claude:
+            assert pid_matches_record(1234, LSTART) is True
+        is_claude.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "started", [LSTART_S, LSTART_S - 3600, LSTART_S + PID_REUSE_SLACK_S // 2]
+    )
+    def test_process_not_younger_than_record_passes(self, started):
+        with patch("claude_swap.process_detection.process_started_at",
+                   return_value=started), \
+             patch("claude_swap.process_detection.process_is_claude") as is_claude:
+            assert pid_matches_record(1234, LSTART) is True
+        is_claude.assert_not_called()
+
+    def test_stranger_younger_than_record_is_a_recycled_pid(self):
+        with patch("claude_swap.process_detection.process_started_at",
+                   return_value=LSTART_S + 86400), \
+             patch("claude_swap.process_detection.process_is_claude",
+                   return_value=False):
+            assert pid_matches_record(1234, LSTART) is False
+
+    def test_claude_younger_than_record_is_kept(self):
+        """Linux ps derives start times from a boot time that moves with the
+        wall clock, so after a clock step a live session reads as younger
+        than its own record. A claude at the pid is never a recycled pid."""
+        with patch("claude_swap.process_detection.process_started_at",
+                   return_value=LSTART_S + 86400), \
+             patch("claude_swap.process_detection.process_is_claude",
+                   return_value=True):
+            assert pid_matches_record(1234, LSTART) is True
+
+    def test_unknowable_identity_is_kept(self):
+        with patch("claude_swap.process_detection.process_started_at",
+                   return_value=LSTART_S + 86400), \
+             patch("claude_swap.process_detection.process_is_claude",
+                   return_value=None):
+            assert pid_matches_record(1234, LSTART) is True
+
+
 # --- list_sessions ---
 
 
@@ -132,6 +291,39 @@ class TestListSessions:
 
         assert len(result) == 1
         assert result[0].pid == 1001
+
+    def test_filters_recycled_pids(self, tmp_path):
+        """A crashed claude's record survives it; the OS may hand its pid to
+        something else. Only a process that started when the record says its
+        claude did is the recorded one."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 1001, procStart=LSTART)
+        _write_session(sessions_dir, 1002, procStart=LSTART)
+
+        def started(pid):
+            return LSTART_S if pid == 1002 else LSTART_S + 86400
+
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), \
+             patch("claude_swap.process_detection.process_started_at",
+                   side_effect=started), \
+             patch("claude_swap.process_detection.process_is_claude",
+                   return_value=False):
+            result = list_sessions(tmp_path)
+
+        assert [s.pid for s in result] == [1002]
+
+    def test_unknowable_start_time_keeps_session(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 1001, procStart=LSTART)
+
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), \
+             patch("claude_swap.process_detection.process_started_at",
+                   return_value=None):
+            result = list_sessions(tmp_path)
+
+        assert [s.pid for s in result] == [1001]
 
     def test_missing_sessions_dir(self, tmp_path):
         assert list_sessions(tmp_path) == []
