@@ -575,7 +575,11 @@ def run(switcher) -> int:
             if mtime == self._config_mtime:
                 return
             self._config_mtime = mtime
-            current = self.switcher._get_current_account()
+            # THE LOGIN, NOT THE IDENTITY FILE — the snapshot's
+            # `active_email` is cswap's own view, and under a pin the file
+            # names the pinned account, so these never agree and the UI
+            # refreshed on every touch of the file.
+            current = self.switcher._live_login_identity()
             email = current[0] if current else None
             if email and email != self.snapshot.get("active_email"):
                 self.refresh_async()

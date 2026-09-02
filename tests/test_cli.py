@@ -63,6 +63,36 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
     return env
 
 
+@pytest.fixture(scope="session")
+def main_help() -> str:
+    """`python -m claude_swap --help` stdout, spawned ONCE per worker.
+
+    Eight tests asserted on different substrings of this exact command's
+    output, each paying its own interpreter boot: same argv, same env, same
+    stdout, and nothing any of them does can change what the next one sees.
+    A process spawn is the most expensive thing in this file (0.12s of a
+    0.13s test on Linux, and Windows spends ~4x on spawn — 74s there against
+    24s here for the same suite), so the eight boots were most of the cost of
+    the whole class.
+
+    Session-scoped rather than module-scoped because xdist gives each worker
+    its own session: 4 workers pay 4 boots total instead of 8 each.
+
+    The subprocess stays. `--help` is argparse output assembled at import from
+    every subcommand's registration, and calling the parser in-process would
+    stop testing the thing that broke before — a subcommand that fails to
+    register in a real interpreter run.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "claude_swap", "--help"],
+        capture_output=True,
+        text=True,
+        env=_subprocess_env(),
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
 class TestCLI:
     """Test CLI argument parsing and execution."""
 
@@ -77,30 +107,23 @@ class TestCLI:
         assert result.returncode == 0
         assert __version__ in result.stdout
 
-    def test_help_flag(self):
+    def test_help_flag(self, main_help):
         """Test --help flag."""
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert result.returncode == 0
-        assert "Multi-Account Switcher" in result.stdout
+        assert "Multi-Account Switcher" in main_help
         # Bare subcommands are the documented interface and lead the help.
-        assert "cswap add" in result.stdout or "add " in result.stdout
-        assert "switch <num|email>" in result.stdout
-        assert "list " in result.stdout
-        assert "status " in result.stdout
+        assert "cswap add" in main_help or "add " in main_help
+        assert "switch <num|email>" in main_help
+        assert "list " in main_help
+        assert "status " in main_help
         # The legacy `--flag` spellings still work but are hidden from the
         # options section; only the "keep working" note may mention them.
-        options_section = result.stdout.split("Flags combine with subcommands:")[0]
+        options_section = main_help.split("Flags combine with subcommands:")[0]
         assert "--add-account" not in options_section
         assert "--switch " not in options_section
         assert "--list" not in options_section
         assert "--status" not in options_section
         # ...and the note that they keep working is still present.
-        assert "keep working" in result.stdout
+        assert "keep working" in main_help
 
     def test_no_args_shows_error(self):
         """Test that running without args (non-TTY) shows a clean no-command error."""
@@ -269,15 +292,9 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--slot can only be used with 'add' or 'add-token'" in capsys.readouterr().err
 
-    def test_slot_flag_in_help(self):
+    def test_slot_flag_in_help(self, main_help):
         """--slot should appear in help output."""
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "--slot" in result.stdout
+        assert "--slot" in main_help
 
     def test_account_flag_requires_export(self, capsys):
         """--account should only be accepted alongside --export."""
@@ -343,16 +360,10 @@ class TestCLI:
         assert result.returncode != 0
         assert "not allowed" in result.stderr.lower()
 
-    def test_export_in_help(self):
+    def test_export_in_help(self, main_help):
         """The export/import subcommands should appear in help output."""
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "export <path>" in result.stdout
-        assert "import <path>" in result.stdout
+        assert "export <path>" in main_help
+        assert "import <path>" in main_help
 
     def test_export_dispatch_calls_transfer(self):
         """--export dispatches into transfer.export_accounts."""
@@ -404,15 +415,9 @@ class TestCLI:
             switcher_cls.return_value, "/tmp/x", force=True
         )
 
-    def test_upgrade_in_help(self):
+    def test_upgrade_in_help(self, main_help):
         """The upgrade subcommand should appear in help output."""
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "upgrade " in result.stdout
+        assert "upgrade " in main_help
 
     def test_upgrade_dispatches_without_constructing_switcher(self):
         """--upgrade should call run_self_upgrade and skip switcher init."""
@@ -683,16 +688,10 @@ class TestCLICommands:
             token="tok", email="u@example.com", slot=3
         )
 
-    def test_add_token_in_help(self):
+    def test_add_token_in_help(self, main_help):
         """The add-token subcommand and the still-visible --email modifier appear."""
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "add-token [TOKEN|-]" in result.stdout
-        assert "--email" in result.stdout  # modifier flag stays visible
+        assert "add-token [TOKEN|-]" in main_help
+        assert "--email" in main_help  # modifier flag stays visible
 
 
 class TestRunCommand:
@@ -774,23 +773,11 @@ class TestRunCommand:
         assert "--no-share" in out
         assert "this terminal only" in out
 
-    def test_main_help_mentions_run(self):
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "run 2" in result.stdout
+    def test_main_help_mentions_run(self, main_help):
+        assert "run 2" in main_help
 
-    def test_main_help_mentions_alias(self):
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "alias <num|email>" in result.stdout
+    def test_main_help_mentions_alias(self, main_help):
+        assert "alias <num|email>" in main_help
 
     def test_session_error_exits_cleanly(self, capsys):
         class FailingSessionManager:
@@ -1136,14 +1123,8 @@ class TestAutoCommand:
         assert "--once" in out
         assert "Exit codes" in out
 
-    def test_main_help_mentions_auto(self):
-        result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
-            capture_output=True,
-            text=True,
-            env=_subprocess_env(),
-        )
-        assert "auto" in result.stdout
+    def test_main_help_mentions_auto(self, main_help):
+        assert "auto" in main_help
 
     def test_switcher_error_exits_1(self, temp_home, capsys):
         from claude_swap.exceptions import ConfigError

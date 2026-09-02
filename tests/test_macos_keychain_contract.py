@@ -18,6 +18,8 @@ accidentally swap their default keychain by running pytest.
 
 from __future__ import annotations
 
+import json
+
 import os
 import subprocess
 import sys
@@ -453,6 +455,51 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         with pytest.raises(CredentialReadError) as exc:
             macos_switcher._read_capture_credentials()
         assert "superseded generation" in str(exc.value), exc.value
+
+    def test_a_managed_api_key_is_not_refused_by_the_degraded_guard(
+        self, macos_switcher, monkeypatch
+    ):
+        """The guard owns OAuth generations, and an API key has none.
+
+        Its sibling above drives the one arm the suite covered: a locked
+        Keychain with a readable plaintext OAuth blob. Three more arms reach
+        the same raise, and this is the one where the refusal is not merely
+        vacuous but points AWAY from the fix — `--add-token` is the door, and
+        `_reject_live_api_key_capture` names it correctly a few lines on. On a
+        session with no GUI the Keychain never becomes readable in-process,
+        so refusing here means that message is never printed at all.
+
+        Mutation: dropping the `looks_like_api_key` term makes the read raise
+        `CredentialReadError` instead of returning the key.
+        """
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.paths import get_credentials_path, get_global_config_path
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("get_password", "set_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
+
+        # No OAuth blob anywhere, and a managed key in the config: the arm
+        # where the active credential IS the API key.
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        if cred.exists():
+            cred.unlink()
+        cfg = get_global_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-EXAMPLE"}))
+
+        value = macos_switcher._read_capture_credentials()
+        assert value and value.startswith("sk-ant-api"), (
+            "premise: this arm did not produce the managed key, so it is not "
+            f"the arm under test: {value!r}"
+        )
 
     def test_a_real_keychain_failure_still_reports_unreadable(
         self, macos_switcher, monkeypatch

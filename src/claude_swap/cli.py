@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 
@@ -95,6 +96,164 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
         return [flag, *rest]
 
     return argv
+
+
+def _pin_command(argv: list[str]) -> None:
+    """Handle `cswap pin [NUM|EMAIL] [--clear]`.
+
+    Pre-dispatched like `run`/`auto`: a positional subcommand cannot coexist
+    with main()'s mutually-exclusive flag group, and `--clear` needs a parser
+    of its own. The work lives in claude_swap.pin, which is import-safe
+    without the extra — a missing 'cswap-pin' surfaces from run() as a
+    ClaudeSwitchError with the install hint, the same way menubar does.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pin",
+        description=(
+            "Keep Remote Control and Artifacts on one account while inference "
+            "follows the account swap. Needs the 'pin' extra."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pin 2          pin Remote Control / artifacts to account 2
+  cswap pin            show the current pin
+  cswap pin --clear    remove the pin
+  cswap pin --heal     restart a pin proxy that died, or unwire it
+  cswap pin --get_port print the serving port (for scripts), or exit 1
+  cswap pin --get_certdir  print the cert directory (for scripts)
+  cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
+  cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
+        """,
+    )
+    # EXACTLY ONE OF THESE. `--debug` stays outside the group; everything else
+    # is an action or a query, and a discarded one reads as a performed one.
+    one_of = parser.add_mutually_exclusive_group()
+    one_of.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
+    )
+    one_of.add_argument("--clear", action="store_true", help="Remove the pin")
+    one_of.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "Restart the pin proxy if it died; if it cannot be restarted, "
+            "remove the wiring so sessions fall back instead of failing"
+        ),
+    )
+    # A query, so consumers stop reading our files: a pinned session's
+    # HTTPS_PROXY names the pin's own dynamic port, and with no way to ask for
+    # it the on-disk layout and schema become a compatibility surface.
+    one_of.add_argument(
+        "--get_port",
+        action="store_true",
+        help=(
+            "Print the port a live pin proxy is serving, and nothing else "
+            "(exit 1 if none). For scripts: PORT=$(cswap pin --get_port)"
+        ),
+    )
+    # The same argument, for the path: the state directory is not at the same
+    # location on every platform, and what cannot be asked for gets searched
+    # for -- an unbounded `find` over a home directory in one measured case.
+    one_of.add_argument(
+        "--get_certdir",
+        action="store_true",
+        help=(
+            "Print this host's pin state directory, and nothing else. For "
+            "scripts: D=$(cswap pin --get_certdir). Answers whether or not a "
+            "daemon is running; diagnosing a dead pin is when it is asked."
+        ),
+    )
+    # The WRITE side. Persisted in the pin's own settings file, not in
+    # ~/.claude.json — that file is for what Claude Code reads.
+    one_of.add_argument(
+        "--set_port",
+        type=int,
+        metavar="N",
+        help=(
+            "Serve on port N from the next daemon start. 0 means dynamic: "
+            "the kernel picks the port, which is the default."
+        ),
+    )
+    # The launch hook: `--heal` prints its verdict for a human, while this is
+    # called by an rc hook before every hand-launched `claude`. Silent, always
+    # exit 0, free when nothing is wired.
+    one_of.add_argument(
+        "--ensure",
+        action="store_true",
+        help=(
+            "Repair a stale pin wiring before a launch. Silent, never fails, "
+            "and does nothing when no pin is set. For rc hooks."
+        ),
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.pin import run as pin_run
+
+    # `--ensure` promises silence and exit 0, and the promise has to cover
+    # everything it runs, not only `pin_run`. Both lines below sit outside that
+    # function: `_guard_root` raises SystemExit, which passes through every
+    # handler here, and a switcher that cannot be constructed raises
+    # ClaudeSwitchError into the printing handler. In a bare-metal root shell
+    # that meant an error line on every launch, and under `set -e` it aborted
+    # the rc file. The promise is about FAILURE, not output.
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        # And the print, not only the exit: `_guard_root` calls `error()`
+        # BEFORE `sys.exit(1)` and a handler can only catch the second half.
+        # Ask the same question instead of running the printing guard.
+        if args.ensure and _is_refused_root(switcher):
+            sys.exit(0)
+        _guard_root(switcher)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — SystemExit is the point
+        # NOT BaseException: a Ctrl-C during construction must still reach the
+        # user as one, even under a flag that promises never to fail.
+        if args.ensure:
+            sys.exit(0)
+        # Render what the siblings render: the `except ClaudeSwitchError` that
+        # prints `Error: ...` wraps only `pin_run`, so the faults above left
+        # `cswap pin` as a traceback while `cswap run` printed one line for the
+        # same cause. SystemExit passes through untouched -- it carries its own
+        # exit code and was raised by a guard that already printed.
+        if isinstance(exc, ClaudeSwitchError):
+            error(f"Error: {exc}")
+            sys.exit(1)
+        raise
+    try:
+        sys.exit(
+            pin_run(
+                switcher,
+                args.account,
+                clear=args.clear,
+                heal_only=args.heal,
+                get_port=args.get_port,
+                get_certdir=args.get_certdir,
+                set_port=args.set_port,
+                ensure=args.ensure,
+            )
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+    except Exception as e:  # noqa: BLE001
+        # A broken package root is not a ClaudeSwitchError: `_impl` re-raises
+        # the underlying ImportError so "installed but unusable" stays distinct
+        # from "not installed", and unrendered it reaches the user as a
+        # traceback. Through `_safe`, because the proxy's own URL carries
+        # userinfo and would otherwise print verbatim.
+        from claude_swap.pin import _safe
+
+        error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
+        # NOT an unconditional promise: `cswap pin --clear` works without the
+        # package, but a contended config lock can still make it skip a
+        # config it never got to try (see clear_wiring's budget) — reword
+        # rather than promise an outcome the code cannot guarantee.
+        error("  `cswap pin --clear` still works, and removes the wiring unless the config is locked.")
+        sys.exit(1)
 
 
 def _run_command(argv: list[str]) -> None:
@@ -229,12 +388,23 @@ Examples:
         sys.exit(130)
 
 
+def _is_refused_root(switcher: ClaudeAccountSwitcher) -> bool:
+    """The state :func:`_guard_root` refuses, as a question rather than an act.
+
+    One rule, two reactions: `--ensure` also has to know about root and its
+    contract is to say nothing, so it cannot call the printing guard, and
+    re-deriving the rule at its call site would be a second copy of it.
+    """
+    if sys.platform == "win32":  # no euid; the guard does not apply
+        return False
+    return os.geteuid() == 0 and not switcher._is_running_in_container()
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
-    if sys.platform != "win32":
-        if os.geteuid() == 0 and not switcher._is_running_in_container():
-            error("Error: Do not run this script as root (unless running in a container)")
-            sys.exit(1)
+    if _is_refused_root(switcher):
+        error("Error: Do not run this script as root (unless running in a container)")
+        sys.exit(1)
 
 
 def _map_command(argv: list[str]) -> None:
@@ -890,7 +1060,10 @@ Examples:
         sys.exit(130)
 
 
-def _use_native_tls() -> None:
+_logger = logging.getLogger("claude-swap")
+
+
+def _use_native_tls(quiet: bool = False) -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
     Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
@@ -905,14 +1078,33 @@ def _use_native_tls() -> None:
     with its own bundled roots) is unaffected. ``truststore`` delegates to them.
 
     Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety.
+    the CLI over a TLS-trust nicety -- but SAY SO, because the fallback is not
+    trust-neutral. Measured on macOS, the OS keychains carry 173 unique roots
+    against stdlib's 128, and 67 are trusted by the OS and not by stdlib, four
+    of them in the system keychain where an administrator installs a corporate
+    MITM CA. A swallowed failure can withdraw the exact root the machine was
+    configured with, and ``ERROR_NOTES["tls-cert"]`` then sends the user to a
+    store nothing is reading.
     """
     try:
         import truststore
 
         truststore.inject_into_ssl()
-    except Exception:
-        pass
+    except Exception as e:
+        if quiet:
+            # See `main`: an rc-hook invocation whose contract is silence. The
+            # fallback still happened and is still worth knowing about, so it
+            # goes to debug rather than nowhere.
+            _logger.debug("native TLS trust unavailable (%s: %s)",
+                          type(e).__name__, e)
+            return
+        _logger.warning(
+            "native TLS trust unavailable (%s: %s); falling back to stdlib "
+            "ssl, which does not read the OS certificate store; a CA trusted "
+            "only there will not verify",
+            type(e).__name__,
+            e,
+        )
 
 
 def _menubar_service(args) -> int:
@@ -963,8 +1155,16 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
-    _use_native_tls()
     argv = sys.argv[1:]
+    # Quiet for the invocations that promise silence. The failure branch logs
+    # a WARNING with no handler configured, so `logging.lastResort` puts it on
+    # stderr -- and `pin --ensure` runs from an rc hook before EVERY
+    # hand-launched `claude` while `--get_port`/`--get_certdir` print a bare
+    # value into `$(...)`. Suppressed, not moved: running it after the dispatch
+    # would leave the pin commands themselves on stdlib trust.
+    from claude_swap.appearance import pin_invocation_is_script_consumed
+
+    _use_native_tls(quiet=pin_invocation_is_script_consumed(argv))
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -977,6 +1177,9 @@ def main() -> None:
         pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    if argv and argv[0] == "pin":
+        _pin_command(argv[1:])
+        return
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
@@ -1050,6 +1253,8 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s pin [num|email]            pin Remote Control/artifacts to one account
+  %(prog)s pin --clear                unpin
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data

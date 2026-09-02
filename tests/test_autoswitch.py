@@ -4957,7 +4957,7 @@ class TestHorizonAxisDoesNotFlap:
         WALKED PAST THE OLD BOUNDARY: the pre-fix dominance leg was a bare
         `h > active x RATIO`, which held only up to and including ratio
         exactly 2.00 (`active=2.0` pts) and opened on the very next cell
-        (`active=1.8`) — measured, on this fleet. The fixed leg adds a flat
+        (`active=1.8`) — measured on three machines. The fixed leg adds a flat
         `+SPENT_HEADROOM_PCT` on top of the ratio, so the boundary against
         this same 4.0-pt frozen
         peer moves from `active=2.0` to `active=0.5` — the walk below covers
@@ -5466,7 +5466,7 @@ class TestHorizonAxisDoesNotFlap:
         account frozen at 4 pts, the new active burning from 4 pts down past
         the exact boundary (98.2%) a bare dominance leg opens at —
         `4.0 > 1.8 x 2` — walked further still, to a bare sliver (99.9%,
-        0.1 pts). Measured on this exact fleet, the bare leg switched back
+        0.1 pts). Measured on a live rotation, the bare leg switched back
         to the frozen peer at 98.2%. This leaves the ORDINARY-path shape
         (`test_the_release_needs_the_barred_account_to_have_improved`) as
         the sibling proving the general
@@ -6894,3 +6894,462 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestTheEngineActuallyRunsTheTitleRestore:
+    """Wiring, not logic — the half that keeps being the one that is missing.
+
+    The restore existed in cswap-pin, was correct, and had one caller that
+    could not fire; that is how a session sat under a server-invented title for
+    hours on 2026-08-17. Removing the call from `tick` must break a test, or the
+    same gap reopens the next time someone tidies the method.
+
+    BUILT ON THE REAL HARNESS, after two rounds of not being. The first version
+    used `object.__new__` to skip `__init__`, which was invisible while `tick`
+    read no instance state — and then a merge brought a `tick` that does:
+
+        self._announce_demotion()      a method: patchable, and I patched it
+        self._tick_in_flight.clear()   an attribute: no patch can reach it
+
+    Two merge-only failures in a row, each one line further down. Any
+    construction that skips `__init__` is coupled to the internals of the method
+    it is only trying to observe, so this one does not skip it.
+    """
+
+    def test_tick_calls_the_restore(self, harness, monkeypatch):
+        from claude_swap.autoswitch import AutoSwitchEngine
+
+        called = []
+        monkeypatch.setattr(
+            AutoSwitchEngine, "_restore_bridge_titles_if_due",
+            lambda self: called.append(True))
+        harness.engine.tick()
+        assert called == [True], "tick no longer runs the title restore"
+
+    def test_a_restore_that_explodes_does_not_fail_the_tick(
+        self, harness, monkeypatch
+    ):
+        """It runs BEFORE the try in `tick`, so an unguarded raise there would
+        end a tick that was about to prevent a rate-limit lockout. The method
+        owns its own guard; this pins that it keeps owning it."""
+        from claude_swap.autoswitch import AutoSwitchEngine
+
+        def boom(self):
+            raise RuntimeError("restore on fire")
+
+        monkeypatch.setattr(
+            AutoSwitchEngine, "_restore_bridge_titles_if_due", boom)
+        with pytest.raises(RuntimeError):
+            harness.engine.tick()
+
+    def test_the_restore_cannot_block_the_switch_engine(self, monkeypatch):
+        """UNBOUNDED WORK INSIDE `tick()`, THE LOOP THAT PREVENTS A LOCKOUT.
+
+        `restore_bridge_titles` PUT once per stale title with a 10s timeout
+        each and no cap on how many, so 100 of them against a black-holing
+        endpoint blocked the engine ~1000s — on the very tick that was about to
+        switch before a rate-limit lockout, which is the outcome moving the
+        call into `finally` was meant to avoid. The 300s cadence does not help:
+        `_bridge_titles_next_at` is advanced BEFORE the work.
+
+        Driven with a clock that jumps per PUT rather than by sleeping, so the
+        case measures the budget rather than the machine it runs on.
+        """
+
+        from claude_swap import oauth as _oauth
+
+        # The policy deliberately lives in the pin, so the stub goes at the
+        # seam that carries it, never on the oauth module.
+        self._seam(
+            monkeypatch,
+            titles_to_restore=(
+                lambda sessions, names: [(x["id"], "mine") for x in sessions]),
+        )
+
+        now = [1000.0]
+        monkeypatch.setattr(_oauth.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            _oauth, "_list_bridge_sessions",
+            lambda _tok: [{"id": f"cse_{i}", "title": "server-name"}
+                          for i in range(100)])
+
+        puts = []
+
+        def slow_put(tok, sid, title):
+            puts.append(sid)
+            now[0] += 10.0          # one PUT, one timeout
+            return True
+
+        monkeypatch.setattr(_oauth, "_put_bridge_title", slow_put)
+        done, outcome = _oauth.restore_bridge_titles("tok", {"x": "mine"})
+
+        spent = now[0] - 1000.0
+        assert spent <= _oauth._BRIDGE_TITLE_BUDGET_S + 10.0, (
+            f"the repair spent {spent}s inside one tick against a budget of "
+            f"{_oauth._BRIDGE_TITLE_BUDGET_S}s; a tick that is about to "
+            "prevent a lockout cannot wait that long")
+        assert len(puts) < 100, "every PUT ran, so nothing bounded the pass"
+        # AND IT SAYS SO. A pass that renamed some of them and stopped must not
+        # report the same `renamed` as one that finished — the leftovers are
+        # picked up next cadence, and the outcome is the only place that says
+        # there ARE leftovers.
+        assert outcome.startswith("partial-"), (
+            f"a truncated pass reported {outcome!r}, indistinguishable from a "
+            "complete one")
+        assert done == len(puts)
+
+    def test_a_dry_run_engine_does_not_rename_the_users_sessions(
+        self, harness, monkeypatch, caplog
+    ):
+        """DRY RUN MUST NOT WRITE, and this one PUTs to the cloud.
+
+        `_tick_inner` gates every mutation on `self.dry_run` — "Dry-run must
+        not write anything", "no token refresh, no quarantine writes". The
+        restore hook runs from `tick()`'s `finally`, OUTSIDE `_tick_inner`, and
+        had no such gate: `cswap auto --dry-run` and the TUI's demoted engine
+        both issue `PUT /v1/code/sessions/<id>` and rename the user's real
+        sessions.
+
+        AND IT BREAKS THE METHOD'S OWN PREMISE. The design note says "LIVE is
+        single-instance, so two of them cannot both PUT". True of LIVE engines;
+        a second TUI is DEMOTED to dry-run rather than stopped, so without this
+        gate the demoted one PUTs against the same bridges as the live one.
+        """
+        import logging
+
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: {"cse_x": "my-session"},
+            titles_to_restore=lambda sessions, names: [("cse_x", "my-session")],
+        )
+
+        put = []
+        monkeypatch.setattr(
+            oauth, "_list_bridge_sessions",
+            lambda _tok: [{"id": "cse_x", "title": "renamed-by-server"}])
+        monkeypatch.setattr(
+            oauth, "_put_bridge_title",
+            lambda tok, sid, title: put.append(sid) or True)
+
+        harness.engine.dry_run = True
+        harness.engine._bridge_titles_next_at = 0.0
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._restore_bridge_titles_if_due()
+        assert put == [], (
+            "a dry-run engine renamed the user's cloud sessions: PUT "
+            f"{put}")
+
+        # AND THE CONTROL, or the assertion above passes for any reason at all
+        # — a wrong module stub, a cadence that never came due, a listing that
+        # returned nothing. A LIVE engine on the same wiring must PUT.
+        harness.engine.dry_run = False
+        harness.engine._bridge_titles_next_at = 0.0
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._restore_bridge_titles_if_due()
+        assert put == ["cse_x"], (
+            "the live engine did not rename either, so the dry-run assertion "
+            f"above proved nothing: {put}")
+
+    def test_a_restore_that_can_do_nothing_says_so_ONCE(self, harness,
+                                                        monkeypatch, caplog):
+        """FIVE STATES, ONE RETURN VALUE, AND A CALLER THAT ONLY SPOKE ON WIN.
+
+        `restore_bridge_titles` returned a count, and every distinct failure
+        collapsed to 0: the extra missing, the listing failing, the listing
+        empty, nothing needing a rename, every PUT refused. The caller was
+        `if done: _logger.info(...)`, so all five were the same silence as a
+        perfect run.
+
+        Measured: the engine ran this ~20 times over 107 minutes
+        with every listing dying on CERTIFICATE_VERIFY_FAILED
+        (`_list_bridge_sessions` swallows to debug and returns None), and the
+        user's cloud session names stayed wrong with nothing in any log. The
+        symptom reached them before any signal did.
+
+        ONCE, not every tick: this runs on a 300 s timer, so a broken state
+        that logs each pass is a log nobody reads by morning.
+
+        THE FAKE EXTRA IS THE POINT, not scaffolding. `cswap_pin` is an
+        optional package and is absent here, so without it the engine returns
+        at its import guard and this test would pass having executed none of
+        the code it names — which is exactly how the first version of it
+        passed. The `reached` assertion below is what stops that.
+        """
+        import logging
+
+        from claude_swap import oauth
+
+        reached = []
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: {"cse_x": "my-session"},
+            titles_to_restore=lambda sessions, names: [],
+        )
+
+        def listing_is_dead(_tok):
+            reached.append(True)
+            return None
+        monkeypatch.setattr(oauth, "_list_bridge_sessions", listing_is_dead)
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            assert reached, (
+                "the engine never reached the listing — this test would have "
+                "certified silence it never executed")
+            warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warns, "a restore that could do nothing said nothing"
+            assert "list-failed" in warns[0].getMessage(), warns[0].getMessage()
+
+            caplog.clear()
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            assert not [r for r in caplog.records
+                        if r.levelno >= logging.WARNING], (
+                "the same broken outcome logged twice — on a 300s timer that "
+                "is a log nobody reads")
+
+            # AND RECOVERY IS ITS OWN TRANSITION. A watch that goes quiet on
+            # the way back up cannot be trusted to have meant anything on the
+            # way down.
+            caplog.clear()
+            monkeypatch.setattr(oauth, "_list_bridge_sessions", lambda _t: [])
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            msgs = [r.getMessage() for r in caplog.records]
+            assert any("no-bridges" in m for m in msgs), msgs
+
+    def test_the_real_restore_is_guarded_and_returns_quietly(self, harness):
+        """The real method, on a machine whose optional extra may be absent and
+        whose clock is at zero: it must return rather than propagate. This is
+        the case that would have caught the guard being removed."""
+        harness.engine._bridge_titles_next_at = 0.0
+        harness.engine._restore_bridge_titles_if_due()  # no raise
+
+    def test_the_cadence_is_honoured(self, harness, monkeypatch):
+        """Ticks are frequent; a listing per tick would put this next to usage
+        polling on the wire for a repair needed once in a blue moon."""
+        import time
+
+        from claude_swap import autoswitch
+
+        seen = []
+        harness.engine._bridge_titles_next_at = time.time() + 10_000
+        monkeypatch.setattr(autoswitch, "oauth", type(
+            "O", (), {"restore_bridge_titles": staticmethod(
+                lambda *a: seen.append(a))})())
+        harness.engine._restore_bridge_titles_if_due()
+        assert seen == [], "the restore ran while it was not due"
+
+    def _seam(self, monkeypatch, **fns):
+        """The optional extra, present, INSTALLED AT THE SEAM.
+
+        Four cases below each built the same `types.ModuleType("cswap_pin")`
+        stub into sys.modules. That stopped reaching the code when autoswitch
+        and oauth were rewired to ask `claude_swap.pin` instead of importing
+        the package: `pin._impl` resolves through `find_spec`, and a bare
+        ModuleType has no `__spec__`, which it treats as not-installed
+        (`except ValueError`) — on purpose.
+
+        WITHOUT THIS the cases return at the availability guard having run
+        none of the code they name, which is exactly how the first version of
+        the sibling case in test_oauth.py passed.
+        """
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        for name, fn in fns.items():
+            monkeypatch.setattr(f"claude_swap.pin.{name}", fn)
+
+    def _fake_pin_module(self, monkeypatch, names=None):
+        """The optional extra, present. Without it every case below returns at
+        the import guard having executed none of the code it names — the way
+        the first version of the sibling case passed."""
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: (names or {"cse_x": "my-session"}),
+            titles_to_restore=lambda sessions, names_: [],
+        )
+
+    def test_the_token_belongs_to_the_account_that_owns_the_bridges(
+        self, harness, monkeypatch
+    ):
+        """A PIN EXISTS PRECISELY SO BRIDGES LIVE ON AN ACCOUNT THE SWITCHER IS
+        NOT ACTIVE ON, and this repair was authenticating as the active one.
+
+        The import guard means it only runs at all when a pin is installed, so
+        the mismatched case is not an edge — it is the only case. Listing with
+        the active account's bearer returns that account's sessions, the
+        pinned account's bridges are never in the response, and every PUT
+        against one is refused. Permanent `no-bridges`, titles never restored.
+
+        It appears to work only when cswap's own process happens to sit behind
+        the pin proxy, which rewrites the bearer for us — a property of the
+        machine's environment, not of this code.
+        """
+        from claude_swap import autoswitch, oauth, pin
+
+        self._fake_pin_module(monkeypatch)
+        monkeypatch.setattr(pin, "pinned_email", lambda sw: "c@example.com")
+        # THE SLOT COMES FROM THE SEAM NOW, on the composite. The loop this
+        # replaced matched on the address alone and read from
+        # `switchable_account_numbers()`, which excludes disabled slots.
+        monkeypatch.setattr(pin, "pinned_slot", lambda sw: "3")
+
+        used = []
+        real_read = harness.switcher.read_account_credentials
+
+        def _spy(num, email):
+            used.append((num, email))
+            return real_read(num, email)
+
+        monkeypatch.setattr(harness.switcher, "read_account_credentials", _spy)
+        monkeypatch.setattr(autoswitch, "_access_token_of", lambda c: "tok")
+        monkeypatch.setattr(oauth, "restore_bridge_titles",
+                            lambda tok, names: (0, "no-bridges"))
+
+        harness.engine._bridge_titles_next_at = 0.0
+        harness.engine._restore_bridge_titles_if_due()
+
+        assert used, (
+            "no credential was read at all — the case never reached the code "
+            "it names and would certify anything")
+        assert used[0][1] == "c@example.com", (
+            "the repair authenticated as the ACTIVE account while the bridges "
+            f"it repairs belong to the PINNED one. read={used[0]}")
+
+    def test_every_way_out_says_why(self, harness, monkeypatch, caplog):
+        """FIVE REASONS FOR RENAMING NOTHING WERE ALL THE SAME SILENCE — that
+        is `_report_bridge_titles`' own docstring, and three bare `return`s
+        one frame above it went straight past the reporter.
+
+        `not token` is the persistent one: an API-key slot, an unreadable
+        credential blob, or a locked keychain makes it None on every 300 s pass
+        forever, and the log says nothing. The same 107-minute silent failure
+        the taxonomy was built for, through a higher door.
+        """
+        import logging
+
+        from claude_swap import autoswitch, pin
+
+        self._fake_pin_module(monkeypatch)
+        monkeypatch.setattr(pin, "pinned_email", lambda sw: None)
+        monkeypatch.setattr(autoswitch, "_access_token_of", lambda c: None)
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+
+        warns = [r.getMessage() for r in caplog.records
+                 if r.levelno >= logging.WARNING]
+        assert warns, (
+            "a slot whose credential yields no bearer renamed nothing and "
+            "said nothing — indistinguishable from a healthy pass, forever")
+        assert "token" in warns[0], warns[0]
+
+    def test_a_partial_pass_does_not_speak_every_time(self, harness, caplog):
+        """`_report_bridge_titles` speaks on a TRANSITION, and its docstring
+        says why: a 300 s timer that logs every pass is a log nobody reads by
+        morning.
+
+        `partial-3-of-40` carries its counts IN the outcome string, so a
+        persistently slow endpoint makes every pass a different "outcome" and
+        the dedup never fires. Forty stale titles against an endpoint that
+        fits a few PUTs into the 20 s budget then logs forever — the exact
+        noise this reporter exists to prevent.
+        """
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            for done in (3, 5, 4):
+                harness.engine._report_bridge_titles(
+                    f"partial-{done}-of-40", done)
+
+        lines = [r.getMessage() for r in caplog.records
+                 if "bridge titles" in r.getMessage()]
+        assert len(lines) == 1, (
+            "a partial pass spoke on every tick because its counts are part "
+            f"of the outcome it dedups on: {lines}")
+
+    def test_the_timer_reads_the_injected_clock(self, harness, monkeypatch):
+        """THIRTEEN OTHER TIME READS IN THIS CLASS GO THROUGH `self.clock`.
+
+        This one called the module's `time.time()`, so a test that advances the
+        injected clock cannot make the repair due and a run with a shifted
+        clock has one timer on a different time base. It is wall-clock rather
+        than monotonic too: an NTP step backwards suspends the repair for the
+        length of the step.
+        """
+        from claude_swap import autoswitch
+
+        self._fake_pin_module(monkeypatch)
+        reached = []
+        monkeypatch.setattr(autoswitch, "_access_token_of",
+                            lambda c: reached.append(True))
+        # NOT DUE ON THE ENGINE'S CLOCK, long past due on the wall's.
+        harness.engine._bridge_titles_next_at = harness.clock.now + 1_000
+        monkeypatch.setattr(autoswitch.time, "time", lambda: 1e12)
+
+        harness.engine._restore_bridge_titles_if_due()
+
+        assert not reached, (
+            "the repair ran because the WALL clock said it was due, while the "
+            "clock this engine was constructed with said it was not")
+
+
+class TestTheBridgeOwnerIsResolvedOnTheComposite:
+    """Two ways `_bridge_owner_number` returned None forever, both silent.
+
+    Its failure has one symptom: `no-account` on every 300s pass, requirement
+    2 never running, and a single WARNING line saying so. Nothing else marks
+    it, which is why both of these could sit.
+
+    BY EMAIL: the loop compared `account_email(n) == pinned_email` and took
+    whichever slot came first. This roster holds a personal+org pair sharing
+    one address, so the bearer was a coin flip and the wrong one sees none of
+    these bridges.
+
+    OVER `switchable_account_numbers()`: that list excludes DISABLED slots,
+    and disabling the pinned account is the only way today to keep the
+    rotation off it. Pin a slot, disable it, and the loop never found it.
+
+    `pin.pinned_slot` answers both — composite, and no rotation filter, which
+    is right because this wants the account's BEARER and not its eligibility.
+    """
+
+    def _engine(self, monkeypatch, *, pinned_email, slot):
+        import types
+
+        from claude_swap import autoswitch, pin
+
+        monkeypatch.setattr(pin, "pinned_email", lambda _sw: pinned_email)
+        monkeypatch.setattr(pin, "pinned_slot", lambda _sw: slot)
+        eng = autoswitch.AutoSwitchEngine.__new__(autoswitch.AutoSwitchEngine)
+        eng.switcher = types.SimpleNamespace(
+            current_account_number=lambda: "9",
+            # would answer for the WRONG slot if anything still asked it
+            switchable_account_numbers=lambda: ["1", "2"],
+            account_email=lambda n: "shared@example.com",
+        )
+        return eng
+
+    def test_a_pinned_slot_excluded_from_rotation_is_still_found(
+            self, monkeypatch):
+        """Pinned AND disabled — the only way today to keep rotation off it."""
+        eng = self._engine(monkeypatch,
+                           pinned_email="shared@example.com", slot="3")
+        assert eng._bridge_owner_number() == "3", (
+            "a pinned slot outside switchable_account_numbers resolved to "
+            "None — requirement 2 then never runs and only one WARNING says so")
+
+    def test_CONTROL_no_pin_still_falls_back_to_the_active_account(
+            self, monkeypatch):
+        eng = self._engine(monkeypatch, pinned_email=None, slot=None)
+        assert eng._bridge_owner_number() == "9"
+
+    def test_CONTROL_a_pin_the_seam_cannot_resolve_is_None_not_the_active_one(
+            self, monkeypatch):
+        """NO SILENT FALLBACK: with a pin set and its slot unresolvable we
+        have no credential for the account that owns the bridges, and saying
+        so once beats a repair that cannot work and does not admit it."""
+        eng = self._engine(monkeypatch,
+                           pinned_email="shared@example.com", slot=None)
+        assert eng._bridge_owner_number() is None

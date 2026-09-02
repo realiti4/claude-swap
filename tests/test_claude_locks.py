@@ -197,3 +197,70 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
+
+
+class TestTheRetrySleepIsClampedToTheBudget:
+    """`timeout` must bound the call, sleeps included.
+
+    The deadline is checked at the TOP of the loop, so a sleep longer than
+    what is left runs to completion first and the raise lands late. At the
+    production default the jitter is up to 0.5s, and a caller asking for a
+    sub-sleep budget waits multiples of what it asked for.
+
+    Asserted against the CONTENDED path, because the free path never sleeps
+    and would pass on any implementation.
+    """
+
+    def _held(self, tmp_path):
+        d = tmp_path / "target.lock"
+        d.mkdir()
+        # Fresh, so the staleness branch does not take it and the loop reaches
+        # the retry sleep this class is about.
+        return d
+
+    @pytest.mark.parametrize("budget", [0.01, 0.1, 0.6])
+    def test_a_contended_acquire_returns_near_its_budget(self, tmp_path, budget):
+        held = self._held(tmp_path)
+        t0 = time.monotonic()
+        with pytest.raises(claude_locks.ClaudeCodeLockTimeout):
+            with claude_locks.proper_lockfile(held, timeout=budget):
+                pass
+        elapsed = time.monotonic() - t0
+        # One jitter draw of headroom, not one per attempt: the point is that a
+        # sleep cannot outlive what is left, not that the call is instant.
+        assert elapsed < budget + 0.15, (
+            f"timeout={budget} took {elapsed:.3f}s — the retry sleep ran past "
+            f"the deadline instead of clamping to what was left of it"
+        )
+
+    def test_it_still_waits_when_the_budget_allows(self, tmp_path, monkeypatch):
+        """THE CONTROL, and it counts ATTEMPTS rather than elapsed time.
+
+        Wall clock cannot separate "slept properly" from "spun hot for the same
+        0.6s": both end at the deadline. Measured — a clamp that always slept 0
+        passed an elapsed-time assertion and was a hot spin, 7,275 mkdir+stat
+        cycles in 0.3s. The number of retries is the quantity that actually
+        moves, so count it.
+        """
+        held = self._held(tmp_path)
+        tries = {"n": 0}
+        real_mkdir = os.mkdir
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(held):
+                tries["n"] += 1
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        with pytest.raises(claude_locks.ClaudeCodeLockTimeout):
+            with claude_locks.proper_lockfile(held, timeout=0.6):
+                pass
+        assert tries["n"] > 1, "premise: the loop must have retried at all"
+        # 6, NOT 40. The jittered arm sleeps 0.25-0.5s, so a 0.6s budget is a
+        # deterministic 3 attempts and 40 tolerated a 13x shrink in silence.
+        # Attempts are budget/sleep, so a slow or loaded machine yields FEWER
+        # -- the noise runs only downward and a tight bound cannot flake up.
+        assert tries["n"] <= 6, (
+            f"{tries['n']} acquire attempts in a 0.6s budget — the retries are "
+            f"not sleeping, which is a hot spin on a lock somebody holds"
+        )
