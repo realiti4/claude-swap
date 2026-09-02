@@ -624,6 +624,9 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
+    def _read_default_profile_credentials(self) -> ActiveCredentials:
+        return self._store._read_default_profile_credentials()
+
     def _refuse_degraded_capture(self) -> str | None:
         """Refuse to CAPTURE bytes a degraded read produced.
 
@@ -942,6 +945,13 @@ class ClaudeAccountSwitcher:
             os.chmod(config_file, 0o600)
 
     # -- public accessors for session mode (claude_swap.session) ---------
+
+    def recover(self, identifier: str) -> dict:
+        """Ask the credential-owning Claude profile to refresh an expired token."""
+        from claude_swap.recovery import recover_account
+
+        account_num, email, org_uuid = self.resolve_account(identifier)
+        return recover_account(self, account_num, email, org_uuid)
 
     def resolve_account(self, identifier: str) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
@@ -4729,6 +4739,7 @@ class ClaudeAccountSwitcher:
 
         from claude_swap.session import (
             read_session_credentials,
+            read_session_identity,
             session_identity_drifted,
         )
 
@@ -4769,16 +4780,19 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                     )
-                if has_live_session:
-                    # The live claude refreshes lazily on its next API call;
-                    # requesting now would just 401 (same rule as the owned
-                    # active account in _fetch_active_usage).
+                # A provably matching profile remains the credential owner
+                # while idle. Its expired access token needs Claude's native
+                # refresh; falling back to the backup can test a consumed
+                # generation and falsely quarantine the whole account. A live
+                # process already proves profile ownership; an idle profile
+                # must carry exact identity plus refresh material.
+                if session_oauth.get("refreshToken") and (
+                    has_live_session
+                    or read_session_identity(session_dir)
+                    == (email, org_uuid or "")
+                ):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                session_creds = None
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
@@ -4860,7 +4874,7 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                sentinels[num] = self._dead_lineage_sentinel(num, _i)
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -5045,6 +5059,41 @@ class ClaudeAccountSwitcher:
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
+
+    def _dead_lineage_sentinel(self, num: str, info: tuple) -> str:
+        """Name the quarantine a dead stored lineage actually earns.
+
+        A matching session profile supersedes the backup: an ``invalid_grant``
+        recorded from that consumed backup generation says nothing about the
+        owner-held session lineage. When an idle slot's session profile still
+        holds this account's identity and an expired-but-refreshable OAuth
+        credential, surface it as recoverable (``cswap recover``) rather than
+        falsely demanding a browser re-login.
+
+        The ACTIVE slot is excluded: its live credential is the one the strike
+        was bound against, so there is no second lineage to appeal to.
+        """
+        from claude_swap.session import (
+            read_session_credentials,
+            read_session_identity,
+        )
+
+        account_num, email, _org_name, org_uuid, is_active, _creds, _alias = info
+        if is_active:
+            return USAGE_RELOGIN_REQUIRED
+        session_dir = self._session_dir(str(account_num), email)
+        session_oauth = oauth.extract_oauth_data(
+            read_session_credentials(session_dir) or ""
+        )
+        if (
+            session_oauth
+            and session_oauth.get("accessToken")
+            and session_oauth.get("refreshToken")
+            and read_session_identity(session_dir) == (email, org_uuid or "")
+            and oauth.is_oauth_token_expired(session_oauth.get("expiresAt"))
+        ):
+            return USAGE_TOKEN_EXPIRED
+        return USAGE_RELOGIN_REQUIRED
 
     def _plans_after_fetch(
         self,
