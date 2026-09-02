@@ -1303,8 +1303,14 @@ class CredentialStore:
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
-    ) -> None:
+    ) -> bool:
         """Write account credentials to backup (pure I/O — no session invalidation).
+
+        Returns whether the write RETAINED a previous generation, i.e. whether
+        it displaced a value that differed from the one going in. The rollback
+        purge keys on that answer, so the type is load-bearing: the switcher
+        wrapper and `_retain_previous_backup` were both updated and this one
+        was missed, which `uv run pytest` cannot see.
 
         macOS writes the Keychain when usable, then reconciles the ``.enc`` away
         (see ``_reconcile_enc_after_keychain_write``). When the Keychain is unusable
@@ -1320,7 +1326,7 @@ class CredentialStore:
         giving a misclassified overwrite a best-effort chance of recovery without
         a /login.
         """
-        self._retain_previous_backup(account_num, email, credentials)
+        retained = self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:
                 self._kc_write_backup(account_num, email, credentials)
@@ -1332,7 +1338,7 @@ class CredentialStore:
                 )
             else:
                 self._reconcile_enc_after_keychain_write(account_num, email, credentials)
-                return
+                return retained
 
         # File mode: write the .enc atomically, then (macOS) best-effort drop the
         # stale Keychain copy so a recovered Keychain can't shadow the fresh file.
@@ -1343,6 +1349,7 @@ class CredentialStore:
             raise
         if self._host.platform == Platform.MACOS:
             self._delete_backup_keychain_quiet(account_num, email)
+        return retained
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup (both backends on macOS).
@@ -1459,8 +1466,14 @@ class CredentialStore:
 
     def _retain_previous_backup(
         self, account_num: str, email: str, new_credentials: str
-    ) -> None:
+    ) -> bool:
         """Retain the slot's current backup as ``.prev`` before it is replaced.
+
+        Returns whether a ``.prev`` was actually written. That is the ONE
+        authoritative answer to "did this write displace anything", and the
+        rollback purge needs it: inferring it from a second read of the same
+        value lets the two reads disagree, and a disagreement there strands a
+        recovery generation holding another account's credential.
 
         C1: when the current generation can't be read (a locked Keychain, an
         unreadable ``.enc``), the caller's overwrite proceeds regardless — the
@@ -1473,7 +1486,7 @@ class CredentialStore:
             current, unreadable = self._read_account_credentials_ex(account_num, email)
         except Exception as e:  # pragma: no cover - _read swallows its own errors
             self._host._logger.warning(f"Could not read backup for retention: {e}")
-            return
+            return False
         if unreadable:
             # WITHDRAWN (round 10): rounds 8 and 9 tried to salvage this path by
             # checkpointing the INCOMING bytes as `.prev`. Both attempts shipped
@@ -1504,9 +1517,9 @@ class CredentialStore:
                 "could not be read (not absent) — no .prev recovery copy "
                 "will exist for this write"
             )
-            return
+            return False
         if not current or current == new_credentials:
-            return
+            return False
         try:
             if self._use_keychain():
                 self._kc_call(
@@ -1524,6 +1537,8 @@ class CredentialStore:
                 f"Failed to retain previous credential generation for "
                 f"account {account_num}: {e}"
             )
+            return False
+        return True
 
     def _read_previous_backup(self, account_num: str, email: str) -> str:
         """Read the retained previous generation. ``""`` when absent/corrupt.

@@ -306,6 +306,13 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
+    # CLASS-level, not set in __init__: the credential wrapper is reached
+    # by objects built with `__new__` -- a case constructs one that way to
+    # drive the write/invalidate pair directly -- and an instance-only
+    # default makes that an AttributeError instead of the "not moving
+    # keys" it means.
+    _moving_keys = False
+
     def __init__(self, debug: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
@@ -384,6 +391,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.migrations import run_migrations
 
         run_migrations(self)
+        self._moving_keys = False
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -780,7 +788,7 @@ class ClaudeAccountSwitcher:
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
         self._store._delete_backup_keychain_quiet(account_num, email)
 
-    def _post_backup_write(self, account_num: str, email: str) -> None:
+    def _post_backup_write(self, account_num: str, email: str) -> bool:
         """Invalidate the slot's session profile after backup credentials change.
 
         Backup credentials changed (re-login via --add-account, --add-token,
@@ -792,7 +800,15 @@ class ClaudeAccountSwitcher:
         manages it; pulling credentials out from under a running process would be
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
+
+        Returns whether the profile was invalidated or marked stale.
         """
+        # ANSWERED, NOT ONLY LOGGED. The live branch cannot invalidate a
+        # profile in use, so a refused marker leaves it serving a superseded
+        # generation -- logged below, but a caller that must decide whether
+        # recovery material is still needed cannot act on a log line. The
+        # forward path at `_write_account_credentials` ignores this; the
+        # rollback's repair counts it.
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -803,16 +819,22 @@ class ClaudeAccountSwitcher:
                     "serving the superseded generation once it exits.",
                     account_num,
                 )
+                return False
         else:
             self._invalidate_session_credentials(account_num, email)
+        return True
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
-    ) -> None:
+    ) -> bool:
         """Write account credentials to backup, then invalidate the slot's session.
+
+        Returns whether the write displaced a value the store retained as
+        ``.prev`` — the store's own verdict, passed through, so the rollback
+        purge never has to re-derive it from a second read.
 
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
@@ -843,9 +865,24 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
-        self._store._write_account_credentials(account_num, email, credentials)
+        retained = self._store._write_account_credentials(
+            account_num, email, credentials)
         try:
-            self._post_backup_write(account_num, email)
+            # A KEY MOVE IS NOT A CREDENTIAL CHANGE. The chokepoint exists
+            # because a CHANGED backup makes the profile's copy stale. A
+            # swap or a move writes the SAME bytes under a new key and takes
+            # the matching profile with them, and a rollback's restore puts
+            # back the very value that profile was bootstrapped from -- it
+            # can only make the backup OLDER than the profile, never newer.
+            # Either way the profile still holds the generation claude
+            # rotated to, and nothing syncs that back, so deleting it leaves
+            # only a grant the server has already seen consumed.
+            #
+            # HERE, not inside the chokepoint: the rollback's crossed-key
+            # repair calls it DIRECTLY, on the other slot's profile, and
+            # that one really is stale.
+            if not self._moving_keys:
+                self._post_backup_write(account_num, email)
         except OSError:
             from claude_swap.session import mark_session_stale
 
@@ -866,6 +903,7 @@ class ClaudeAccountSwitcher:
                     "keep serving the superseded generation until its token "
                     "expires.", account_num, exc_info=True,
                 )
+        return retained
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -1148,21 +1186,23 @@ class ClaudeAccountSwitcher:
         config_b = self._read_account_config(num_b, email_b)
 
         staging: dict[str, Path] = {}
-        try:
-            if email_a == email_b:
-                # Same email: the two slots' backup keys fully overlap, so
-                # every write below overwrites the other account's material.
-                # Park durable copies first — a failure mid-write can then
-                # never leave a credential existing only in this process's
-                # memory. (Staging fails -> abort before anything changed.)
-                staging = self._stage_overlap_material(
-                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
-                )
+        if email_a == email_b:
+            # Same email: the two slots' backup keys fully overlap, so every
+            # write below overwrites the other account's material. Park
+            # durable copies first: a failure mid-write can then never leave a
+            # credential existing only in this process's memory. Kept outside
+            # the try because it can fail with nothing mutated, and a rollback
+            # is not free — it rewrites both slots, which drops both session
+            # profiles' stored credentials.
+            staging = self._stage_overlap_material(
+                {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+            )
 
-            # Move each session profile to its owner's new slot key. When both
-            # accounts share an email the two paths swap directly, so stage the
-            # first through a temporary name.
-            self._swap_session_dirs(num_a, email_a, num_b, email_b)
+        # Move each session profile to its owner's new slot key.
+        moved: list[Path] = []
+        wrote_backups = False
+        try:
+            self._swap_session_dirs(num_a, email_a, num_b, email_b, moved)
 
             # Set each destination key to its owner's exact state: write
             # material that exists, actively clear what doesn't. An empty
@@ -1171,22 +1211,34 @@ class ClaudeAccountSwitcher:
             # separate old-key cleanup runs) or a stale file leaked by an
             # earlier crash. The old keys are cleared only after the commit
             # below, so the records never point at missing material.
-            if creds_a:
-                self._write_account_credentials(num_b, email_a, creds_a)
-            else:
-                self._delete_account_credentials_strict(num_b, email_a)
-            if config_a:
-                self._write_account_config(num_b, email_a, config_a)
-            else:
-                self._delete_config_backup(num_b, email_a)
-            if creds_b:
-                self._write_account_credentials(num_a, email_b, creds_b)
-            else:
-                self._delete_account_credentials_strict(num_a, email_b)
-            if config_b:
-                self._write_account_config(num_a, email_b, config_b)
-            else:
-                self._delete_config_backup(num_a, email_b)
+            #
+            # Armed one statement early on purpose: an abort in the gap costs
+            # one needless restore, while arming it after the first write
+            # would let an abort skip a restore that was owed.
+            wrote_backups = True
+            # Scoped to the FORWARD writes only. The rollback's restores put
+            # back a value the profile's lineage really did move past, so
+            # they must invalidate as usual.
+            self._moving_keys = True
+            try:
+                if creds_a:
+                    self._write_account_credentials(num_b, email_a, creds_a)
+                else:
+                    self._delete_account_credentials_strict(num_b, email_a)
+                if config_a:
+                    self._write_account_config(num_b, email_a, config_a)
+                else:
+                    self._delete_config_backup(num_b, email_a)
+                if creds_b:
+                    self._write_account_credentials(num_a, email_b, creds_b)
+                else:
+                    self._delete_account_credentials_strict(num_a, email_b)
+                if config_b:
+                    self._write_account_config(num_a, email_b, config_b)
+                else:
+                    self._delete_config_backup(num_a, email_b)
+            finally:
+                self._moving_keys = False
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
@@ -1210,7 +1262,7 @@ class ClaudeAccountSwitcher:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
-                staging,
+                staging, moved, wrote_backups,
             )
             raise
 
@@ -1218,8 +1270,26 @@ class ClaudeAccountSwitcher:
         # the new keys only. A failure here leaks a stale file, never a wrong
         # read — logged loudly because a stale key under a freed slot would
         # poison a future same-email account landing on that number.
+        # BY THE PROFILE PATHS TOO, not by the addresses alone.
+        # `slugify_email` is documented non-injective and says uniqueness
+        # comes from the `<num>-` prefix -- which a swap is precisely the
+        # operation that exchanges. Two addresses with one slug make the OLD
+        # keys' profile paths the two NEW homes, so this prune deletes both
+        # accounts' profiles. A leaked backup is the failure mode this block
+        # already accepts; a deleted profile is not.
         if email_a != email_b:
+            homes = {
+                self._session_dir(num_b, email_a),
+                self._session_dir(num_a, email_b),
+            }
             for num, email in ((num_a, email_a), (num_b, email_b)):
+                if self._session_dir(num, email) in homes:
+                    self._logger.error(
+                        "Stale backup left under old key %s: its session "
+                        "profile path is now the other account's home "
+                        "(the two addresses share one slug)", num,
+                    )
+                    continue
                 try:
                     self._delete_account_files(num, email)
                 except Exception as e:
@@ -1322,7 +1392,7 @@ class ClaudeAccountSwitcher:
         return staged
 
     def _swap_session_dirs(
-        self, num_a: str, email_a: str, num_b: str, email_b: str
+        self, num_a: str, email_a: str, num_b: str, email_b: str, moved: list[Path]
     ) -> None:
         """Exchange two slots' session profile directories, best effort.
 
@@ -1331,22 +1401,81 @@ class ClaudeAccountSwitcher:
         session profiles too), and setup_session re-bootstraps a missing
         profile from the relocated backups, so a skipped move costs at most
         that slot's session history.
+
+        Appends to ``moved`` from a ``finally``: the rename and its record are
+        two statements and a signal lands between them. ``os.path.exists``
+        after an atomic rename is exactly "it landed", and the guards proved
+        each destination free, so a failed rename records nothing. It is
+        ``os.path`` and not ``Path.exists`` because the latter re-raises
+        EACCES/EIO/ESTALE before 3.14, and a raise here would replace the
+        exception being unwound with one this helper then swallows.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
         new_a = self._session_dir(num_b, email_a)  # account A's new home
         new_b = self._session_dir(num_a, email_b)  # account B's new home
 
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        # THE FLAG IS A SIBLING OF THE DIRECTORY, so the renames below move
+        # the profile and leave it behind. Captured here and re-applied
+        # after, because with one shared email the two marker names are each
+        # other's destination.
+        stale_a = stale_marker_for(dir_a).exists()
+        stale_b = stale_marker_for(dir_b).exists()
+
         staging = None
+        a_landed = False
+        b_landed = False
         try:
             if dir_a.exists():
-                staging = dir_a.with_name(dir_a.name + ".swapping")
-                os.replace(dir_a, staging)
+                # ASSIGNED ONLY ONCE THE PARK LANDS, so `staging is not None`
+                # means "A is under that name" and not merely "that name was
+                # computed" -- a leftover `.swapping` raises ENOTEMPTY here
+                # with A still at dir_a. Recorded from a `finally` for the
+                # reason the B move below is: the rename and its record are
+                # two statements and a signal can land between them.
+                parked = dir_a.with_name(dir_a.name + ".swapping")
+                try:
+                    os.replace(dir_a, parked)
+                    staging = parked
+                except OSError:
+                    # THE RENAME ITSELF FAILED, so A is still at `dir_a` and
+                    # `parked` holds whatever was already there. Re-raised
+                    # before the arm below so a vanished `dir_a` cannot be
+                    # read as "the park landed" -- that would name the
+                    # leftover as A.
+                    raise
+                except BaseException:
+                    # AN ASYNC EXCEPTION, which can land between the rename
+                    # and its record: a signal in that gap left A under the
+                    # staging name with the strand recovery disarmed. Only
+                    # here is the filesystem the one thing that can say
+                    # whether the rename went through.
+                    if not os.path.exists(dir_a):
+                        staging = parked
+                    raise
             if dir_b.exists() and not new_b.exists():
-                os.replace(dir_b, new_b)
+                try:
+                    os.replace(dir_b, new_b)
+                finally:
+                    if os.path.exists(new_b):
+                        moved.append(new_b)
+                        b_landed = True
             if staging is not None and not new_a.exists():
-                os.replace(staging, new_a)
-                staging = None
+                try:
+                    os.replace(staging, new_a)
+                finally:
+                    if os.path.exists(new_a):
+                        moved.append(new_a)
+                        a_landed = True
+                    if not os.path.exists(staging):
+                        # CLEARED ONCE THE MOVE LANDS. Left set, the strand
+                        # recovery below runs on every SUCCESSFUL swap and
+                        # relies on its own `except OSError` to swallow an
+                        # ENOENT -- so the happy path is carried by an error
+                        # handler rather than by not being an error.
+                        staging = None
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
         finally:
@@ -1357,6 +1486,31 @@ class ClaudeAccountSwitcher:
                         os.replace(staging, dir_a)
                 except OSError:
                     pass
+            # Keyed on where each profile actually ENDED UP, so a skipped or
+            # strand-recovered move is not misreported. Every old name is
+            # cleared before any new one is set: with one shared email they
+            # are the same two names, and setting first would erase it.
+            # WHETHER THE RENAME LANDED, never whether the destination
+            # exists: with one shared email `new_a` IS `dir_b`, so existence
+            # is true when nothing moved at all. And a profile that did not
+            # land is not necessarily at its old name -- it is parked under
+            # the staging name, and the recovery refuses to put it back when
+            # the other one has arrived there.
+            if a_landed:
+                here_a = new_a
+            elif staging is not None and os.path.exists(staging):
+                here_a = staging
+            else:
+                here_a = dir_a
+            here_b = new_b if b_landed else dir_b
+            for old_dir in (dir_a, dir_b):
+                try:
+                    stale_marker_for(old_dir).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for here, was_stale in ((here_a, stale_a), (here_b, stale_b)):
+                if was_stale and os.path.exists(here):
+                    mark_session_stale(here)
 
     def _rollback_swap(
         self,
@@ -1369,6 +1523,8 @@ class ClaudeAccountSwitcher:
         creds_b: str,
         config_b: str,
         staging: dict[str, "Path"],
+        moved: list[Path],
+        wrote_backups: bool,
     ) -> None:
         """Best-effort restore of both slots after a failed swap mutation.
 
@@ -1381,23 +1537,207 @@ class ClaudeAccountSwitcher:
         staged pre-swap copies are kept on disk for manual recovery instead
         of being deleted.
         """
-        self._logger.error(
-            f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
-        )
+        # ANNOUNCED BEFORE THE FACTS EXIST, so this line carries only what is
+        # certain here and the summary after the loop is the report. THREE
+        # STATES, NOT TWO: `bool(moved) or wrote_backups` collapsed a
+        # profile-only reversal into "restoring both slots", and an interrupt
+        # just past a rename runs no credential restore at all. `wrote_backups`
+        # is armed one statement BEFORE the first write on purpose -- "armed"
+        # and "wrote something" are different claims.
+        self._logger.error(f"Swap {num_a} <-> {num_b} failed; rolling back")
         failures = 0
-        # Undo the session-profile exchange (same staging trick, reversed).
-        self._swap_session_dirs(num_b, email_a, num_a, email_b)
+        # ITS OWN COUNTER. The crossed-profile repair below fails on a
+        # SESSION MARKER, which lives in a sibling tree of the credential
+        # store -- so its refusal says nothing about whether the restores
+        # landed. Counted as a credential failure it retained the other
+        # account's material in this key's `.prev` (the block below calls
+        # that pure contamination) and kept a plaintext staged copy that
+        # cannot repair an unmarked profile anyway. Reported, not gating.
+        repairs = 0
+        wrote_any = False
+        # NOT A NO-OP when its forward half never ran: with one email the two
+        # slots' keys are each other's destinations, so it would exchange two
+        # untouched profiles. ITS OWN SINK, because `_swap_session_dirs`
+        # swallows `OSError` by design -- a reverse can put back FEWER profiles
+        # than the forward move took, and the value-equal skip below must not
+        # leave the leftover serving that account's token.
+        undone: list[Path] = []
+        if moved:
+            self._swap_session_dirs(num_b, email_a, num_a, email_b, undone)
+            if undone:
+                self._logger.error("Reversed the session-profile exchange")
+        # PER KEY, AND FROM TWO LISTS ASKED OF DIFFERENT NAMES. `moved` records
+        # where the FORWARD move landed each profile; `undone` records the HOME
+        # each reverse put one back to, so a key is still crossed when its
+        # crossed location is in `moved` and its home is not in `back`.
+        # `moved` non-empty alone marks a slot crossed whose profile never left
+        # home, and `home in moved` disables the guard outright -- with
+        # distinct emails no home is ever a move DESTINATION. Either way a
+        # correctly restored slot is forced through a write that costs it its
+        # session credentials, the price the value-equal skip exists to avoid.
+        back = set(undone)
+        crossed_keys = {
+            (num, email)
+            for num, email, home, crossed in (
+                (num_a, email_a, self._session_dir(num_a, email_a),
+                 self._session_dir(num_b, email_a)),
+                (num_b, email_b, self._session_dir(num_b, email_b),
+                 self._session_dir(num_a, email_b)),
+            )
+            if crossed in moved and home not in back
+        }
         overlap = email_a == email_b
-        for kind, num, email, original in (
+        # Restoring a key that was never written is not a no-op: rewriting it
+        # with the value already under it still drops that slot's session
+        # credentials, so an abort that changed nothing would cost both
+        # profiles their credential material.
+        # `wrote_backups` ALONE IS NOT THE GATE. `moved` is appended from a
+        # `finally`, so a signal past a rename records it while `wrote_backups`
+        # is still False -- every restore was then skipped, the repair below
+        # never ran, and both profiles stayed crossed and live.
+        restores = (
             ("creds", num_a, email_a, creds_a),
             ("config", num_a, email_a, config_a),
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
-        ):
+        ) if (wrote_backups or crossed_keys) else ()
+        # WHAT A RESTORE ACTUALLY DISPLACED, TAKEN FROM THE WRITE ITSELF.
+        # The purge below may only drop a `.prev` its own restore created, and
+        # the store already knows: `_retain_previous_backup` writes one exactly
+        # when the value it displaces differs from the one going in, and now
+        # says so. Asking a SECOND read of the same value instead let the two
+        # disagree -- a probe reading unreadable while retention read fine left
+        # the retained generation holding the OTHER account's credential, with
+        # nothing to purge it. One reader, one answer.
+        displaced: set[tuple[str, str]] = set()
+        for kind, num, email, original in restores:
             try:
                 if original:
                     if kind == "creds":
-                        self._write_account_credentials(num, email, original)
+                        # A NO-OP WRITE IS NOT FREE. Every credential write
+                        # routes through `_post_backup_write`, so restoring a
+                        # value the key already holds costs the slot its
+                        # session profile -- measured on a first-write failure
+                        # as both slots losing their session credentials for a
+                        # swap that stored nothing. `wrote_backups` is armed
+                        # before the first write deliberately (arming it after
+                        # would skip a restore that was owed); this is what
+                        # makes that cheap rather than what the comment there
+                        # priced it at.
+                        #
+                        # Used ONLY to skip. `displaced` still comes from the
+                        # store's own retention verdict, so a read that
+                        # disagrees costs at most a needless write and can
+                        # never widen the purge.
+                        try:
+                            now, unread = self._store._read_account_credentials_ex(
+                                num, email)
+                        except Exception:  # noqa: BLE001 - a failed read writes
+                            now, unread = None, True  # rather than skips
+                        if unread or (num, email) in crossed_keys \
+                                or now != original:
+                            # AFTER THE CALL. A raising write lands in the
+                            # `except` below, and setting this first made the
+                            # summary report restores that every slot refused.
+                            # A restore puts back the value this key's profile
+                            # was bootstrapped from, so it is a key move too;
+                            # scoped, because the crossed repair below must
+                            # still invalidate the OTHER slot's profile.
+                            self._moving_keys = True
+                            try:
+                                retained = self._write_account_credentials(
+                                    num, email, original)
+                            finally:
+                                self._moving_keys = False
+                            if retained:
+                                displaced.add((num, email))
+                            wrote_any = True
+                            # AND THE PROFILE THAT IS ACTUALLY CROSSED. The
+                            # write above invalidates `_session_dir(num,
+                            # email)` -- this key's HOME -- and a key is in
+                            # `crossed_keys` precisely because its profile is
+                            # NOT there. It is not a served key while the
+                            # roster still reads num_a->email_a, but
+                            # `move_account` resolves `_session_dir(target,
+                            # email)` and adopts the orphan as live, carrying
+                            # a superseded generation the reuse check accepts.
+                            #
+                            # THROUGH THE CHOKEPOINT, not around it. A direct
+                            # call opts out of the live-session policy on the
+                            # profile most likely to BE live, and an OSError
+                            # on a session directory would land in the
+                            # `except` below, which counts CREDENTIAL restore
+                            # failures. Contained the way the chokepoint
+                            # contains its own: a failure leaves the marker.
+                            if (num, email) in crossed_keys:
+                                other = num_b if num == num_a else num_a
+                                try:
+                                    if not self._post_backup_write(
+                                            other, email):
+                                        # THE LIVE DOOR TO THE SAME STATE. No
+                                        # raise here -- the chokepoint took
+                                        # its marker branch and the marker was
+                                        # refused, so the profile keeps a
+                                        # superseded credential unmarked. It
+                                        # is counted so the summary says
+                                        # so; `failures` would also throw away
+                                        # this key's `.prev`, which a marker
+                                        # refusal gives no reason to doubt.
+                                        repairs += 1
+                                        self._logger.error(
+                                            "Rollback restored slot %s but "
+                                            "its crossed session profile is "
+                                            "LIVE and could not be marked "
+                                            "stale; it may keep serving the "
+                                            "superseded generation until it "
+                                            "exits.", other,
+                                        )
+                                except OSError:
+                                    from claude_swap.session import (
+                                        mark_session_stale,
+                                    )
+
+                                    # AND SAY SO WHEN NEITHER LANDED. Nothing
+                                    # else reports this: the crossed clause in
+                                    # the summary is computed BEFORE the
+                                    # repair and prints the same when it
+                                    # succeeds. `setup_session` gates its
+                                    # re-bootstrap on the marker and checks
+                                    # identity, not generation, so an
+                                    # unmarked profile is reused.
+                                    if not mark_session_stale(
+                                            self._session_dir(other, email)):
+                                        # COUNTED, for the reason its
+                                        # `except Exception` sibling below
+                                        # states: the summary owes this. This
+                                        # state is the worse of the two -- the
+                                        # profile keeps a superseded
+                                        # credential AND carries no marker.
+                                        repairs += 1
+                                        self._logger.error(
+                                            "Rollback could NOT invalidate "
+                                            "slot %s's crossed session "
+                                            "profile OR mark it stale; it "
+                                            "may keep serving the superseded "
+                                            "generation until its token "
+                                            "expires.", other, exc_info=True,
+                                        )
+                                except Exception as e:
+                                    # NAMED FOR WHAT FAILED. Anything not an
+                                    # OSError fell through to the per-key
+                                    # handler below, which says "Rollback
+                                    # creds restore failed" -- about a
+                                    # credential restore that in fact landed,
+                                    # in the same report whose summary says
+                                    # credentials were restored. The count
+                                    # still has to happen here: the
+                                    # summary owes this one too.
+                                    repairs += 1
+                                    self._logger.error(
+                                        "Rollback could not invalidate slot "
+                                        "%s's crossed session profile: %s",
+                                        other, e,
+                                    )
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:
@@ -1412,10 +1752,58 @@ class ClaudeAccountSwitcher:
                         self._delete_config_backup(num, email)
             except Exception as e:
                 failures += 1
+                # THE VERB THE BRANCH ACTUALLY TOOK. The overlap arm CLEARS a
+                # key -- `original` is falsy there and no restore is attempted
+                # -- so "restore failed" named a step that never ran, the same
+                # mis-naming the repair arm above was fixed for.
+                did = "restore" if original else "clear"
                 self._logger.error(
-                    f"Rollback {kind} restore failed for slot {num}: {e}"
+                    f"Rollback {kind} {did} failed for slot {num}: {e}"
                 )
-        if email_a != email_b:
+        # THE SUMMARY, from what ran, and EVERY CLAUSE TRUE IN EVERY STATE IT
+        # COVERS. "nothing was written" came from `wrote_any`, which only the
+        # credential arm sets, so an all-raising rollback and a configs-only
+        # one both reported it. `failures` counts config restores, overlap
+        # deletes and refused repairs too, hence "steps". Staged copies exist only when the two
+        # slots share an email, so their clause is gated on having any, not on
+        # having failed.
+        kept = "; the staged copies are kept" if staging else ""
+        if wrote_any and failures:
+            what = f"credentials were restored; {failures} step(s) failed{kept}"
+        elif wrote_any:
+            what = "credentials were restored"
+        elif failures:
+            # CREDENTIAL-ONLY ON THE SUCCESS SIDE, because `wrote_any` is:
+            # `_write_account_config` never sets it. Widening this noun to
+            # "restore" denies config restores that DID land and wrote files.
+            what = (f"no credential restore landed and {failures} "
+                    f"step(s) failed{kept}")
+        elif undone:
+            what = "the session-profile exchange was reversed; no credential was written"
+        else:
+            what = "no credential needed restoring"
+        # THE OTHER AXIS. Every arm above describes CREDENTIALS, so a reverse
+        # that could not put a profile back falls in none of them -- `elif
+        # undone` needs `wrote_any` False AND `failures` zero. "credentials
+        # were restored" was printed while a profile still lived under the
+        # other slot's key, which needs nothing injected: a leftover directory
+        # at the home raises ENOTEMPTY and `_swap_session_dirs` swallows it.
+        # ONE clause rather than five, because the fact is independent of which
+        # arm fired and a sixth arm would otherwise silently not carry it.
+        if crossed_keys:
+            what += (
+                f"; {len(crossed_keys)} session profile(s) are still under "
+                "the other slot's key"
+            )
+            # AND WHICH OF THEM THE REPAIR COULD NOT REACH. A repair failure
+            # gates nothing now, so this clause is the whole of its report.
+            if repairs:
+                what += (
+                    f", {repairs} of which could not be invalidated or "
+                    "marked stale"
+                )
+        self._logger.error(f"Swap {num_a} <-> {num_b} rollback: {what}")
+        if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still
             # point at the old slots. (When the emails match, the "new" keys
             # are the keys just restored — nothing stale exists.)
@@ -1426,7 +1814,16 @@ class ClaudeAccountSwitcher:
                 except Exception as e:
                     failures += 1
                     self._logger.error(f"Rollback cleanup failed for slot {num}: {e}")
-        if not failures:
+        if wrote_backups and displaced and not failures:
+            # ONLY THE KEYS A RESTORE ABOVE ACTUALLY DISPLACED. Two states
+            # look identical from here and must not: a swap that wrote all
+            # four keys (the retained generation IS contamination) and one
+            # that aborted before the first write (it is the user's only
+            # recovery copy). Neither the emails nor `wrote_backups` separate
+            # them -- `wrote_backups` is armed one statement BEFORE the first
+            # write on purpose -- and the stored credentials are correct in
+            # both, so nothing else signals the loss.
+            #
             # The restore writes above pushed the half-written material into
             # the keys' retained .prev generations; both keys now hold their
             # exact originals, so those generations are pure contamination.
@@ -1436,7 +1833,11 @@ class ClaudeAccountSwitcher:
                 (num_a, email_a, creds_a),
                 (num_b, email_b, creds_b),
             ):
-                if original:
+                # PER KEY. `displaced` was built per key and then acted on for
+                # both: one displaced key purged the other's genuine pre-swap
+                # generation, which is the loss this whole block exists to
+                # avoid.
+                if original and (num, email) in displaced:
                     self._store.delete_previous_backup(num, email)
         if staging:
             if failures:
@@ -1571,6 +1972,15 @@ class ClaudeAccountSwitcher:
             # old slot's backups, and setup_session re-bootstraps a missing
             # one from the relocated backups — a skipped move costs at most
             # this slot's history.
+            from claude_swap.session import (
+                mark_session_stale,
+                stale_marker_for,
+            )
+
+            # Same sibling problem as the swap: the rename below takes the
+            # profile and leaves its flag at the old key, where the post-
+            # commit prune deletes it.
+            was_stale = stale_marker_for(src_dir).exists()
             if src_dir.exists() and not dst_dir.exists():
                 try:
                     os.replace(src_dir, dst_dir)
@@ -1578,20 +1988,33 @@ class ClaudeAccountSwitcher:
                     self._logger.warning(
                         f"Session profile move skipped during move: {e}"
                     )
+            if was_stale and dst_dir.exists():
+                try:
+                    stale_marker_for(src_dir).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                mark_session_stale(dst_dir)
 
             # Set the target key to the account's exact state: write material
             # that exists, actively clear what doesn't — an unbacked account
             # must not adopt stale material leaked under the target key by an
             # earlier crash. The old key is cleared only after the commit
             # below, so the records never point at missing material.
-            if creds:
-                self._write_account_credentials(target, email, creds)
-            else:
-                self._delete_account_credentials_strict(target, email)
-            if config:
-                self._write_account_config(target, email, config)
-            else:
-                self._delete_config_backup(target, email)
+            # A MOVE IS A KEY MOVE, like the swap. `os.replace` above took
+            # the matching profile to the new key, so it is still this
+            # account's own and still newer than these bytes.
+            self._moving_keys = True
+            try:
+                if creds:
+                    self._write_account_credentials(target, email, creds)
+                else:
+                    self._delete_account_credentials_strict(target, email)
+                if config:
+                    self._write_account_config(target, email, config)
+                else:
+                    self._delete_config_backup(target, email)
+            finally:
+                self._moving_keys = False
 
             data["accounts"][target] = record
             del data["accounts"][num_src]
