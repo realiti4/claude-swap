@@ -119,6 +119,129 @@ class TestStaleOnError:
         assert entry.decision_value() is None
 
 
+# The exact placeholder shape confirmed to come back for a non-active/idle
+# credential (2026-09-01 field case; matches upstream claude-swap#146):
+# ``utilization: 0`` on every window and no ``resets_at`` anywhere.
+HOLLOW_ZERO = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}
+
+
+class TestHollowSuccessNeverOverwritesRealCache:
+    """A "success" carrying no real detail must never clobber a real cache.
+
+    The bug: the background probe for a non-active account can 200 with
+    ``HOLLOW_ZERO`` instead of a real measurement. Before this guard,
+    ``record()`` treated ANY error-free round trip as a real update — writing
+    ``lastGood`` and resetting ``fetchedAt`` to now — so the hollow read
+    silently overwrote a real cached value AND kept ``usageAgeSeconds``
+    artificially fresh, masking the loss for as long as the placeholder kept
+    arriving (Matt's proof: activating each account one at a time showed real
+    numbers, which reverted to 0.0 within ~60s of switching away).
+    """
+
+    def test_hollow_zero_is_discarded_against_a_real_cache(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(30)
+        store.record({"1": FetchRecord(usage=HOLLOW_ZERO)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        # The real measurement survives untouched...
+        assert entry.last_good == USAGE
+        # ...and its age is measured from the REAL fetch, not reset by the
+        # hollow one — this is the field symptom (age stayed near-zero while
+        # the value silently went to 0.0).
+        assert entry.age_s == 30.0
+        assert entry.decision_value() == USAGE
+
+    def test_hollow_zero_does_not_touch_failure_bookkeeping(self, store, clock):
+        # No information was gained from a hollow round trip — it must not
+        # be read as proof of health either: prior failure/backoff state is
+        # left exactly as it was.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        before = store.entries(IDENT)["1"]
+        store.record({"1": FetchRecord(usage=HOLLOW_ZERO)}, IDENT)
+        after = store.entries(IDENT)["1"]
+        assert after.consecutive_failures == before.consecutive_failures == 1
+        assert after.last_error == before.last_error == "timeout"
+        assert after.backoff_until == before.backoff_until
+
+    def test_hollow_zero_still_advances_the_poll_plan(self, store, clock):
+        # Discarding the measurement must not stall the schedule: a supplied
+        # plan still commits so the next fetch isn't due immediately.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record(
+            {"1": FetchRecord(usage=HOLLOW_ZERO)},
+            IDENT,
+            plans={"1": (clock.now + 900.0, 900.0)},
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == clock.now + 900.0
+        assert entry.poll_interval_s == 900.0
+        assert entry.last_good == USAGE  # measurement itself still untouched
+
+    # -- must-say-NO: the guard is scoped to hollow reads, not a blanket
+    # refusal to ever update a slot that already has real data. --
+
+    def test_a_hollow_zero_is_stored_when_there_is_nothing_to_protect(
+        self, store
+    ):
+        # No prior real lastGood exists, so there is nothing to discard
+        # against — the hollow reading is recorded like any other success
+        # (same as the pre-existing test_success_with_no_windows).
+        store.record({"1": FetchRecord(usage=HOLLOW_ZERO)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == HOLLOW_ZERO
+        assert entry.fetched_at is not None
+
+    def test_a_genuine_zero_with_a_reset_time_does_overwrite(self, store, clock):
+        # A real 0% carries a resets_at because its window is open — that IS
+        # real detail, and must overwrite normally, not be mistaken for the
+        # hollow placeholder just because its percentages are also 0.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(30)
+        genuine_zero = self._usage_resetting_at_zero(clock)
+        store.record({"1": FetchRecord(usage=genuine_zero)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == genuine_zero
+        assert entry.age_s == 0.0
+
+    def test_a_positive_reading_with_no_reset_does_overwrite(self, store, clock):
+        # A positive percentage is real evidence on its own, resets_at or
+        # not — only "0 and no reset time, everywhere" is hollow.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(30)
+        positive_no_reset = {
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+        }
+        store.record({"1": FetchRecord(usage=positive_no_reset)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == positive_no_reset
+        assert entry.age_s == 0.0
+
+    def test_hollow_zero_after_hollow_zero_stays_discarded(self, store, clock):
+        # Repeated hollow probes don't eventually "win" by attrition.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        for _ in range(5):
+            clock.advance(10)
+            store.record({"1": FetchRecord(usage=HOLLOW_ZERO)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.age_s == 50.0
+
+    @staticmethod
+    def _usage_resetting_at_zero(clock):
+        from datetime import datetime, timezone
+
+        iso = (
+            datetime.fromtimestamp(clock.now + 3600, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        return {
+            "five_hour": {"pct": 0.0, "resets_at": iso},
+            "seven_day": {"pct": 0.0, "resets_at": iso},
+        }
+
+
 class TestExtendedTrust:
     """Deliberate staleness (failure state, scheduler cadence) stays trusted."""
 

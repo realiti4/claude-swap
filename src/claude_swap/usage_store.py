@@ -481,6 +481,35 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
     return min(resets) if resets else None
 
 
+def _usage_has_real_detail(usage: dict | None) -> bool:
+    """Whether a usage reading carries real evidence, not a hollow placeholder.
+
+    Confirmed field case (2026-09-01): the usage endpoint can 200 for a
+    non-active/idle credential with every window's ``utilization`` sent back
+    as ``0`` and no ``resets_at`` anywhere — a "nothing to report" placeholder,
+    not a genuine zero-usage measurement (matches upstream claude-swap#146's
+    "empty 5h rows are what the server sends for idle accounts" finding). A
+    genuine reading, including a real 0%, carries a ``resets_at`` because the
+    window it describes is open; one with neither a reset time nor a positive
+    percentage anywhere is evidence-free. Uses ``oauth.relevant_windows`` (the
+    canonical window source; the ``"all"`` sentinel model pulls in every
+    scoped window too) so this stays in sync with whatever windows the API
+    adds there.
+    """
+    if not isinstance(usage, dict):
+        return False
+    for _, pct, resets_at in oauth.relevant_windows(usage, models=("all",)):
+        if resets_at:
+            return True
+        if pct > 0:
+            return True
+    # extra-usage spend carries its own used/limit evidence independent of
+    # the rate-limit windows; build_usage_result only populates it when
+    # used_credits/monthly_limit/utilization are all non-null, so its mere
+    # presence here is already real.
+    return isinstance(usage.get("spend"), dict)
+
+
 def _rate_limited_trust_ok(
     last_good: dict | None,
     age_s: float | None,
@@ -1054,7 +1083,10 @@ class UsageStore:
         in the same transaction as its measurement. Sentinel records clear
         only the claim and are otherwise never persisted. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
-        Returns the accepted slots.
+        A "success" carrying no real detail (see ``_usage_has_real_detail``)
+        never overwrites a real cached measurement either — same as a
+        failure, it is discarded, only advancing the poll plan. Returns the
+        accepted slots.
         """
         if not outcomes:
             return set()
@@ -1070,6 +1102,25 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
+                if not _usage_has_real_detail(rec.usage) and _usage_has_real_detail(
+                    row.get("lastGood")
+                ):
+                    # A hollow "nothing to report" success must never
+                    # overwrite a real cached measurement — discard it.
+                    # Still advance the poll plan so cadence progresses and
+                    # this isn't re-fetched immediately, but leave
+                    # lastGood/fetchedAt/failure bookkeeping untouched: age
+                    # must accrue honestly against the last REAL
+                    # measurement, not reset on a hollow round trip. That
+                    # reset-on-hollow-success is exactly what let a
+                    # non-active account's stale-but-real usage silently
+                    # read as a fresh 0% for as long as the placeholder
+                    # kept arriving (usageAgeSeconds stayed near-zero while
+                    # the value was wrong).
+                    plan = plans.get(num) if plans is not None else None
+                    if plan is not None:
+                        row["nextPollAt"], row["pollIntervalS"] = plan
+                    return
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
