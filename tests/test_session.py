@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,8 +25,10 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_global_config_path
+from claude_swap.process_detection import ClaudeSession
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
@@ -1927,8 +1930,16 @@ class TestShareHistoryPosix:
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
         (session_dir / "projects" / "x.jsonl").write_text("live\n")
+        blocker = ClaudeSession(
+            pid=1,
+            session_id="live",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
         monkeypatch.setattr(
-            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
+            session_mod, "scan_live_sessions", lambda _dir: ([blocker], 0)
         )
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -1938,6 +1949,224 @@ class TestShareHistoryPosix:
         assert (session_dir / "projects" / "x.jsonl").read_text() == "live\n"
         manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
         assert "projects" not in manifest["items"]
+
+    def test_deferral_names_the_blocking_session_and_the_command(
+        self, history_setup, monkeypatch, capsys
+    ):
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        blocker = ClaudeSession(
+            pid=63802,
+            session_id="abc",
+            cwd="/Users/matt/Documents/GitHub/soribashi",
+            started_at=1785041704563,
+            kind="interactive",
+            entrypoint="cli",
+        )
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda p: ([blocker], 0)
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        out = capsys.readouterr().out
+        assert "63802" in out
+        assert "soribashi" in out
+        assert "cswap run 2 --share-history" in out
+        # Pin the epoch-ms -> local-time conversion itself, not just the
+        # surrounding text — a timezone bug (UTC mislabeled as local) or an
+        # off-by-1000 that still lands in a plausible-looking date would slip
+        # past a loose "2026-" substring check.
+        expected_started = datetime.fromtimestamp(
+            blocker.started_at / 1000, tz=timezone.utc
+        ).astimezone()
+        assert f"{expected_started:%Y-%m-%d %H:%M}" in out
+
+    def test_migration_rechecks_liveness_under_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        calls = {"n": 0}
+        blocker = ClaudeSession(
+            pid=2,
+            session_id="a-session",
+            cwd="/tmp",
+            started_at=0,
+            kind="interactive",
+            entrypoint="cli",
+        )
+
+        def fake_scan(path):
+            # Quiescent on the pre-lock check, busy once the lock is held.
+            calls["n"] += 1
+            return ([], 0) if calls["n"] == 1 else ([blocker], 0)
+
+        monkeypatch.setattr(session_mod, "scan_live_sessions", fake_scan)
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert calls["n"] >= 2, "liveness must be re-checked under the lock"
+        assert (proj / "bbb.jsonl").exists(), "migration must not have run"
+        assert not (session_dir / "projects").is_symlink()
+
+    def test_migration_does_not_deadlock_against_the_bootstrap_lock(
+        self, history_setup, monkeypatch
+    ):
+        """setup_session calls _sync_sharing while still holding
+        switcher.lock_file (its re-validate-under-lock and post-bootstrap
+        paths). Migration must not try to re-acquire that same lock: flock
+        is per-fd, not per-process, so a second open of the same lock file
+        from inside this same process would self-block rather than proceed,
+        timing out into an error instead of migrating.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        # Fail fast instead of hanging the suite if the regression reappears.
+        monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
+
+        # Simulate the bootstrap lock already being held around this call,
+        # exactly as setup_session holds it across its _sync_sharing calls.
+        with FileLock(mgr.switcher.lock_file):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        merged = source / "projects" / "-home-user-app"
+        assert merged.joinpath("aaa.jsonl").read_text() == "main-a\n"
+        assert merged.joinpath("bbb.jsonl").read_text() == "profile-b\n"
+        assert (session_dir / "projects").readlink() == source / "projects"
+
+    def test_last_merge_counts_accumulate_across_history_items(self, history_setup):
+        """_prepare_history_share runs once per HISTORY_ITEMS entry (projects,
+        then history.jsonl), each merge assigning into the same field. A
+        profile with real history in both must not have the projects/ counts
+        (and its quarantine dir) clobbered by the history.jsonl merge that
+        runs right after — the file-merge branch never quarantines and always
+        reports (0, 0, None), so an overwrite would silently lose both.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        # A genuine collision in projects/: profile copy is newer, so it
+        # wins — moved in, incumbent quarantined (moved=1, quarantined=1).
+        (source / "projects" / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+        # Real profile-side history.jsonl too, merged by the separate
+        # (0, 0, None)-always file-merge branch, right after projects/.
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        moved, quarantined, run_dir = mgr._last_merge_counts
+        assert (moved, quarantined) == (1, 1)
+        assert run_dir is not None, "the quarantine directory must not be lost"
+
+    def test_migration_lock_timeout_degrades_instead_of_raising(
+        self, history_setup, monkeypatch
+    ):
+        """A LockError from the per-profile migration lock must degrade like
+        every other failure in this function (dimmed message, return False)
+        rather than escape and abort the launch — a lock timeout means a
+        peer is still working on this profile, which is expected, not broken.
+        """
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        # Fail fast instead of waiting out the real 30s timeout.
+        monkeypatch.setattr(session_mod, "_MIGRATION_LOCK_TIMEOUT", 0.2)
+
+        # Hold the per-profile migration lock open, simulating a peer already
+        # migrating this same profile.
+        with FileLock(session_dir / session_mod.MIGRATION_LOCK):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Degraded, not raised: no migration happened, nothing linked.
+        assert (proj / "bbb.jsonl").exists()
+        assert not (session_dir / "projects").is_symlink()
+
+    def _lock_that_lets_a_peer_finish_first(self, monkeypatch, on_acquire):
+        """Stand in for the migration lock a peer is already holding.
+
+        The precondition that decided to merge (``dest.exists() and not
+        dest.is_symlink()``) is evaluated *before* the wait, so whatever the
+        peer did while we queued has to be re-checked once we hold the lock.
+        """
+
+        class PeerFinishedFirst:
+            def __init__(self, path, timeout=None):
+                pass
+
+            def __enter__(self):
+                on_acquire()
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(session_mod, "FileLock", PeerFinishedFirst)
+
+    def test_peer_removed_dest_while_we_waited_on_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """The peer migrated and removed the profile's copy. Merging a dest
+        that is no longer there raises FileNotFoundError and reports "merging
+        failed" for what was in fact a successful migration."""
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+        self._lock_that_lets_a_peer_finish_first(
+            monkeypatch,
+            lambda: session_mod.shutil.rmtree(session_dir / "projects"),
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "projects").is_symlink()
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+
+    def test_peer_linked_dest_while_we_waited_on_the_lock(
+        self, history_setup, monkeypatch
+    ):
+        """The peer got all the way to the symlink. dest.is_dir() follows it,
+        so the merge would walk ~/.claude/projects against itself: every
+        shared transcript collides with itself, gets quarantined, and the
+        shared directory is emptied out underneath the link."""
+        source, session_dir, mgr = history_setup
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "bbb.jsonl").write_text("profile-b\n")
+
+        def peer_migrated_and_linked():
+            session_mod.shutil.rmtree(session_dir / "projects")
+            (session_dir / "projects").symlink_to(source / "projects")
+
+        self._lock_that_lets_a_peer_finish_first(
+            monkeypatch, peer_migrated_and_linked
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert not (mgr.switcher.backup_dir / "history-conflicts").exists()
+        assert (
+            source / "projects" / "-home-user-app" / "aaa.jsonl"
+        ).read_text() == "main-a\n"
+        assert (session_dir / "projects").readlink() == source / "projects"
 
     def test_toggle_off_removes_links_keeps_data(self, history_setup):
         source, session_dir, mgr = history_setup
@@ -2014,6 +2243,191 @@ class TestShareHistoryPosix:
 
         # Real history is user data even when the manifest claims it.
         assert (proj / "bbb.jsonl").read_text() == "profile-b\n"
+
+    def test_collision_keeps_newer_profile_copy_and_quarantines_target(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-21T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "2026-07-23" in shared.read_text()
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        assert "2026-07-21" in quarantined[0].read_text()
+
+    def test_collision_keeps_newer_target_and_quarantines_profile_copy(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert "2026-07-23" in shared.read_text()
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        assert "2026-07-21" in quarantined[0].read_text()
+
+    def test_quarantine_never_overwrites_an_earlier_quarantine(
+        self, history_setup, tmp_path
+    ):
+        # Two runs inside one timestamp granule land in the same run dir, so
+        # the uniquify path is exercised directly rather than through a merge.
+        source, session_dir, mgr = history_setup
+        run_dir = mgr.switcher.backup_dir / "history-conflicts" / "same-granule"
+        run_dir.mkdir(parents=True)
+        rel = Path("-home-user-app") / "aaa.jsonl"
+
+        first = tmp_path / "first.jsonl"
+        first.write_text("first-loser\n")
+        second = tmp_path / "second.jsonl"
+        second.write_text("second-loser\n")
+
+        landed_first = mgr._quarantine(first, rel, run_dir, "profile")
+        landed_second = mgr._quarantine(second, rel, run_dir, "profile")
+
+        assert landed_first != landed_second
+        assert landed_first.read_text() == "first-loser\n"
+        assert landed_second.read_text() == "second-loser\n"
+
+    def test_merge_return_counts_when_profile_copy_wins(
+        self, history_setup, tmp_path
+    ):
+        _, _, mgr = history_setup
+        src = tmp_path / "shared" / "projects"
+        dest = tmp_path / "profile" / "projects"
+        (src / "-home-user-app").mkdir(parents=True)
+        (dest / "-home-user-app").mkdir(parents=True)
+        (src / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+        (dest / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        moved, quarantined, run_dir = mgr._merge_history_into_source(src, dest)
+
+        assert (moved, quarantined) == (1, 1)
+        assert run_dir is not None
+        assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
+        assert "2026-07-21" in (
+            run_dir / "shared" / "-home-user-app" / "aaa.jsonl"
+        ).read_text()
+
+    def test_merge_return_counts_when_target_wins(self, history_setup, tmp_path):
+        _, _, mgr = history_setup
+        src = tmp_path / "shared" / "projects"
+        dest = tmp_path / "profile" / "projects"
+        (src / "-home-user-app").mkdir(parents=True)
+        (dest / "-home-user-app").mkdir(parents=True)
+        (src / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+        (dest / "-home-user-app" / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        moved, quarantined, run_dir = mgr._merge_history_into_source(src, dest)
+
+        assert (moved, quarantined) == (0, 1)
+        assert run_dir is not None
+        assert "2026-07-23" in (src / "-home-user-app" / "aaa.jsonl").read_text()
+        assert "2026-07-21" in (
+            run_dir / "profile" / "-home-user-app" / "aaa.jsonl"
+        ).read_text()
+
+    def test_no_transcript_is_ever_deleted(self, history_setup):
+        source, session_dir, mgr = history_setup
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The merge must actually have happened (not silently skipped): the
+        # profile's projects/ is a symlink into the shared tree, so its own
+        # copy of aaa.jsonl no longer exists to double-count as "kept".
+        assert (session_dir / "projects").is_symlink()
+        bodies = {
+            p.read_text()
+            for p in (mgr.switcher.backup_dir / "history-conflicts").rglob(
+                "aaa.jsonl"
+            )
+        } | {shared.read_text()}
+        assert any("2026-07-21" in b for b in bodies)
+        assert any("2026-07-23" in b for b in bodies)
+
+    def test_quarantine_records_provenance_in_path_profile_wins(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        # Profile copy is newer — it wins, shared copy is quarantined.
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-21T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-23T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The shared-side loser should be under .../shared/, not .../profile/.
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        quarantine_path = quarantined[0]
+        assert "/shared/" in str(quarantine_path)
+        assert "/profile/" not in str(quarantine_path)
+        assert "2026-07-21" in quarantine_path.read_text()
+
+    def test_quarantine_records_provenance_in_path_target_wins(
+        self, history_setup
+    ):
+        source, session_dir, mgr = history_setup
+        # Target (shared) copy is newer — it wins, profile copy is quarantined.
+        shared = source / "projects" / "-home-user-app" / "aaa.jsonl"
+        shared.write_text('{"timestamp": "2026-07-23T20:00:00.000Z"}\n')
+        proj = session_dir / "projects" / "-home-user-app"
+        proj.mkdir(parents=True)
+        (proj / "aaa.jsonl").write_text(
+            '{"timestamp": "2026-07-21T20:00:00.000Z"}\n'
+        )
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # The profile-side loser should be under .../profile/, not .../shared/.
+        quarantined = list(
+            (mgr.switcher.backup_dir / "history-conflicts").rglob("aaa.jsonl")
+        )
+        assert len(quarantined) == 1
+        quarantine_path = quarantined[0]
+        assert "/profile/" in str(quarantine_path)
+        assert "/shared/" not in str(quarantine_path)
+        assert "2026-07-21" in quarantine_path.read_text()
 
 
 class TestShareHistoryWindows:
@@ -2812,3 +3226,63 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+
+class TestSurvivorSelection:
+    """Which of two same-named transcripts wins a merge collision."""
+
+    def _write(self, path: Path, lines: list[str]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{line}\n" for line in lines))
+        return path
+
+    def test_last_timestamp_scans_past_untimestamped_trailer(self, tmp_path):
+        # ~99% of real transcripts end on an untimestamped state line.
+        f = self._write(tmp_path / "a.jsonl", [
+            '{"type": "user", "timestamp": "2026-07-22T01:33:08.788Z"}',
+            '{"type": "last-prompt", "prompt": "hi"}',
+        ])
+        assert session_mod._last_timestamp(f) == "2026-07-22T01:33:08.788Z"
+
+    def test_last_timestamp_none_when_absent(self, tmp_path):
+        f = self._write(tmp_path / "a.jsonl", ['{"type": "last-prompt"}'])
+        assert session_mod._last_timestamp(f) is None
+
+    def test_last_timestamp_skips_unparseable_lines(self, tmp_path):
+        f = self._write(tmp_path / "a.jsonl", [
+            '{"timestamp": "2026-07-01T00:00:00.000Z"}',
+            "not json at all",
+        ])
+        assert session_mod._last_timestamp(f) == "2026-07-01T00:00:00.000Z"
+
+    def test_later_timestamp_wins(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-21T20:39:55.399Z"}'] * 5)
+        cand = self._write(tmp_path / "c.jsonl", [
+            '{"timestamp": "2026-07-23T18:03:53.827Z"}'])
+        # Shorter but newer still wins: a compacted continuation must not lose.
+        assert session_mod._profile_copy_wins(target, cand) is True
+
+    def test_earlier_timestamp_loses(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-23T18:03:53.827Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", [
+            '{"timestamp": "2026-07-21T20:39:55.399Z"}'] * 99)
+        assert session_mod._profile_copy_wins(target, cand) is False
+
+    def test_untimestamped_loses_to_timestamped(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", [
+            '{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", ['{"type": "mode"}'] * 50)
+        assert session_mod._profile_copy_wins(target, cand) is False
+
+    def test_neither_timestamped_falls_back_to_line_count(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", ["# a"])
+        cand = self._write(tmp_path / "c.jsonl", ["# a", "# b"])
+        assert session_mod._profile_copy_wins(target, cand) is True
+
+    def test_exact_tie_keeps_the_target(self, tmp_path):
+        target = self._write(tmp_path / "t.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        cand = self._write(tmp_path / "c.jsonl", ['{"timestamp": "2026-07-01T00:00:00.000Z"}'])
+        assert session_mod._profile_copy_wins(target, cand) is False
