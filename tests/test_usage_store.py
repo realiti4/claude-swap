@@ -1682,3 +1682,111 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestWeeklyResetCarry:
+    """The weekly (7-day) window resets at a fixed per-account slot, but the
+    usage endpoint omits ``resets_at`` for some tokens while utilization is 0
+    (live evidence: the same account, two tokens, one response carrying a
+    real ``resets_at`` and the other not). Losing the slot there would rank
+    the account "reset unknown -> last" for consume-first even though its
+    real reset is the soonest. ``_carry_weekly_reset`` pins the slot from a
+    previously-measured ``resets_at``, stepped forward by whole weeks to the
+    next future occurrence.
+    """
+
+    def _iso(self, ts: float) -> str:
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+    def _ts(self, resets_at: str) -> float:
+        from claude_swap import poll_policy
+
+        return poll_policy.parse_reset_ts(resets_at)
+
+    def test_zero_pct_after_measured_reset_is_carried_forward(self):
+        now = 1_000_000.0
+        previous = {"seven_day": {"pct": 80.0, "resets_at": self._iso(now - 10.0)}}
+        new = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new, previous, now)
+        d7 = new["seven_day"]
+        assert d7["resets_at_inferred"] is True
+        assert self._ts(d7["resets_at"]) == pytest.approx(now - 10.0 + usage_store.WEEK_S)
+        assert "countdown" in d7 and "clock" in d7
+
+    def test_real_resets_at_in_new_sample_is_untouched(self):
+        now = 1_000_000.0
+        previous = {"seven_day": {"pct": 80.0, "resets_at": self._iso(now - 10.0)}}
+        real_reset = self._iso(now + 500.0)
+        new = {"seven_day": {"pct": 5.0, "resets_at": real_reset}}
+        usage_store._carry_weekly_reset(new, previous, now)
+        assert new["seven_day"]["resets_at"] == real_reset
+        assert "resets_at_inferred" not in new["seven_day"]
+
+    def test_previous_reset_ten_days_old_steps_by_whole_weeks(self):
+        now = 1_000_000.0
+        ten_days_ago = now - 10 * 24 * 3600
+        previous = {"seven_day": {"pct": 80.0, "resets_at": self._iso(ten_days_ago)}}
+        new = {"seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new, previous, now)
+        # 10 days old steps by 2 whole weeks (+14d) landing 4 days in the
+        # future, not a single +7d step (which would still be in the past).
+        assert self._ts(new["seven_day"]["resets_at"]) == pytest.approx(
+            now + 4 * 24 * 3600
+        )
+
+    def test_no_previous_last_good_is_a_noop(self):
+        new = {"seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new, None, 1_000_000.0)
+        assert "resets_at" not in new["seven_day"]
+
+    def test_previous_without_resets_at_is_a_noop(self):
+        now = 1_000_000.0
+        previous = {"seven_day": {"pct": 50.0}}  # no resets_at
+        new = {"seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new, previous, now)
+        assert "resets_at" not in new["seven_day"]
+
+    def test_five_hour_is_never_touched(self):
+        now = 1_000_000.0
+        previous = {
+            "five_hour": {"pct": 50.0, "resets_at": self._iso(now - 5.0)},
+            "seven_day": {"pct": 80.0, "resets_at": self._iso(now - 10.0)},
+        }
+        new = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new, previous, now)
+        assert new["five_hour"] == {"pct": 0.0}
+        assert "resets_at" in new["seven_day"]
+
+    def test_chaining_two_successive_zero_pct_samples_keep_the_slot(self):
+        now1 = 1_000_000.0
+        previous1 = {"seven_day": {"pct": 80.0, "resets_at": self._iso(now1 - 10.0)}}
+        new1 = {"seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new1, previous1, now1)
+        ts1 = self._ts(new1["seven_day"]["resets_at"])
+
+        now2 = ts1 + 1.0  # just past the first carried reset
+        new2 = {"seven_day": {"pct": 0.0}}
+        usage_store._carry_weekly_reset(new2, new1, now2)
+        assert new2["seven_day"]["resets_at_inferred"] is True
+        assert self._ts(new2["seven_day"]["resets_at"]) == pytest.approx(
+            ts1 + usage_store.WEEK_S
+        )
+
+    def test_record_carries_weekly_reset_on_zero_pct_sample(self, store, clock):
+        """Integration through ``UsageStore.record`` (not just the helper):
+        exercises the wiring at the ``lastGood`` transition point."""
+        measured = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 80.0, "resets_at": self._iso(clock.now + 3600.0)},
+        }
+        store.record({"1": FetchRecord(usage=measured)}, IDENT)
+        clock.advance(3601.0)  # past that reset
+        zero = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}
+        store.record({"1": FetchRecord(usage=zero)}, IDENT)
+        d7 = store.entries(IDENT)["1"].last_good["seven_day"]
+        assert d7["resets_at_inferred"] is True
+        assert self._ts(d7["resets_at"]) == pytest.approx(
+            clock.now + 3600.0 - 3601.0 + usage_store.WEEK_S
+        )

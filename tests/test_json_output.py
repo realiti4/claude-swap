@@ -47,6 +47,24 @@ class TestJsonHelpers:
         assert out["spend"]["used"] == 12.5
         assert out["spend"]["resetsAt"] == resets_at
 
+    def test_usage_to_json_emits_resets_at_inferred_for_carried_reset(self):
+        # usage_store._carry_weekly_reset marks a carried-forward weekly
+        # reset with resets_at_inferred=True; the JSON projection must
+        # surface that so clients can distinguish it from a real reset.
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        usage = {
+            "seven_day": {"pct": 0.0, "resets_at": resets_at,
+                          "resets_at_inferred": True},
+        }
+        out = usage_to_json(usage)
+        assert out["sevenDay"]["resetsAtInferred"] is True
+
+    def test_usage_to_json_omits_resets_at_inferred_for_a_real_reset(self):
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        usage = {"seven_day": {"pct": 16.0, "resets_at": resets_at}}
+        out = usage_to_json(usage)
+        assert "resetsAtInferred" not in out["sevenDay"]
+
     def test_usage_to_json_projects_scoped_windows(self):
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=3, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
