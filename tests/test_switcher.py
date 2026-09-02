@@ -1115,7 +1115,7 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1175,7 +1175,7 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1238,7 +1238,7 @@ class TestListAccountsUsage:
             return oauth.RefreshOutcome(refreshed_creds, None)
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch.object(switcher, "consume_backup_grant", side_effect=mock_gate), \
@@ -1410,7 +1410,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.list_accounts()
 
@@ -1451,7 +1451,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1481,7 +1481,7 @@ class TestListAccountsUsage:
         }
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)):
             switcher.list_accounts()
@@ -1526,7 +1526,7 @@ class TestListAccountsUsage:
         }
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1572,7 +1572,7 @@ class TestListAccountsUsage:
             "_read_active_credentials",
             return_value=ActiveCredentials(active_creds, False),
         ), patch.object(
-            switcher, "_read_account_credentials", return_value=backup_creds
+            switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)
         ), patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
             return_value=oauth.UsageOutcome(refreshed),
@@ -1673,7 +1673,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch=set())
@@ -1682,7 +1682,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch={"2"})
@@ -9213,6 +9213,52 @@ class TestBackupUnreadableDisplay:
         info = (2, "b@example.com", "", "", False, "", "")
         assert s._static_usage_sentinel(info) == USAGE_NO_CREDENTIALS
 
+    def test_idle_slot_stale_empty_creds_but_retry_finds_valid_backup(
+        self, temp_home: Path, block_real_keychain,
+    ):
+        """A slot whose row carries stale EMPTY ``creds`` — as
+        ``_build_accounts_info`` records when its own backup read hit a
+        transient hiccup and swallowed it to ``""`` — must not report 'no
+        credentials' when the sentinel's OWN retry (via
+        ``_read_account_credentials_ex``, called right here) reaches the
+        Keychain and finds a real, healthy credential.
+
+        Reproduces a field case: ``cswap list --token-status`` showed 'no
+        credentials' for an inactive slot while a plain ``security -w``
+        read of that exact item, moments later, returned valid JSON. The
+        retry below IS that later, successful read — the sentinel found it
+        and threw the value away, keeping only the boolean "was it
+        unreadable" (False) instead of asking "did it find something".
+        """
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshToken": "rt-backup",
+            "expiresAt": 9999999999000}})
+        # Seed the fake Keychain directly: the backup item genuinely exists
+        # and is healthy, unrelated to whatever made the EARLIER read (the
+        # one that produced this row's stale `creds`) come back empty.
+        block_real_keychain.set_password(
+            SECURITY_SERVICE,
+            s._store._backup_username("2", "b@example.com"),
+            creds,
+        )
+
+        # The row as `_build_accounts_info` would have recorded it after a
+        # transient hiccup on ITS read: `creds` is empty even though the
+        # backup is, right now, readable and real.
+        info = (2, "b@example.com", "", "", False, "", "")
+
+        assert s._static_usage_sentinel(info) != USAGE_NO_CREDENTIALS, (
+            "the retry found a real, readable credential in the Keychain — "
+            "it must not still report 'no credentials' and send the user "
+            "to re-add a slot that already has one"
+        )
+
     # -- I-1: the active-slot branch collapses the same tri-state on Linux --
 
     def test_active_slot_unreadable_credential_shows_keychain_unavailable_on_linux(
@@ -9273,6 +9319,44 @@ class TestBackupUnreadableDisplay:
         s._record_active_verdict(active_bad)
         info_bad = (1, "a@example.com", "", "", True, active_bad.value or "", "")
         assert s._static_usage_sentinel(info_bad) == USAGE_KEYCHAIN_UNAVAILABLE
+
+
+class TestBuildAccountsInfoReadRouting:
+    """_build_accounts_info's inactive-slot read routes through
+    _read_account_credentials_ex, not the bare _read_account_credentials
+    (which takes no `failed` list and always swallows a Keychain read
+    failure to ""). Using the `_ex` variant makes a transient failure at
+    least distinguishable at the read site, matching every other backup
+    read call site in this module (`_read_account_credentials_ex` is
+    already used at the other seven)."""
+
+    def test_inactive_slot_read_uses_the_ex_variant(
+        self, temp_home: Path, block_real_keychain,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+
+        calls: list[tuple[str, str]] = []
+        real_ex = s._read_account_credentials_ex
+
+        def spy(account_num, email):
+            calls.append((account_num, email))
+            return real_ex(account_num, email)
+
+        monkeypatch.setattr(s, "_read_account_credentials_ex", spy)
+        monkeypatch.setattr(
+            s, "_read_account_credentials",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not call the bare (non-_ex) reader")
+            ),
+        )
+        s._build_accounts_info()
+        assert len(calls) == 2, (
+            f"both inactive slots must read through the _ex variant, got {calls}"
+        )
 
 
 class TestSwitchUnreadableBackup:

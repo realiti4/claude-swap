@@ -4063,7 +4063,16 @@ class ClaudeAccountSwitcher:
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
-                creds = self._read_account_credentials(str(num), email)
+                # `_ex` (not the bare reader): a transient Keychain failure
+                # on this read must not be silently indistinguishable from
+                # a genuinely absent backup — the bare variant takes no
+                # `failed` list and always swallows to "". This call site's
+                # `unreadable` verdict isn't threaded further today (the
+                # sentinel does its own independent re-read), but reading
+                # through `_ex` here matches every other backup read site
+                # in this module and keeps the door open without widening
+                # this tuple's shape.
+                creds, _unreadable = self._read_account_credentials_ex(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
@@ -4782,9 +4791,7 @@ class ClaudeAccountSwitcher:
                 self._active_keychain_unavailable or self._active_read_unreadable
             ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
-            if not is_active and self._read_account_credentials_ex(
-                str(num), email
-            )[1]:
+            if not is_active:
                 # THIS slot's own read, not the process flag — which one
                 # slot's clean read erased for every other slot. Measured with
                 # every read denied and a real backup on slot 2:
@@ -4794,7 +4801,30 @@ class ClaudeAccountSwitcher:
                 #
                 # "no credentials" sends the user to re-add a slot that has one
                 # — the dead end 41313b9 removed from three other sites.
-                return USAGE_KEYCHAIN_UNAVAILABLE
+                retried, unreadable = self._read_account_credentials_ex(
+                    str(num), email
+                )
+                if unreadable:
+                    return USAGE_KEYCHAIN_UNAVAILABLE
+                # The retry above is a SECOND, independent Keychain read —
+                # `_build_accounts_info` already made the first one and its
+                # result is `creds`, which is why we're in this branch at
+                # all. A transient hiccup on that first call (swallowed to
+                # "" — it passes no `failed` list) is not proof the slot is
+                # empty: this retry just reached the Keychain and either
+                # found nothing (genuinely absent, fall through below) or
+                # found the real backup, which the old code discarded —
+                # keeping only "was the retry unreadable" and never asking
+                # "did the retry find something". Rescue it here instead of
+                # reporting "no credentials" out from under a slot that has
+                # one (field case: `security -w` on the same item, moments
+                # later, returned valid JSON while the sentinel still said
+                # "no credentials").
+                if retried:
+                    if looks_like_api_key(retried):
+                        return USAGE_API_KEY
+                    if oauth.extract_access_token(retried):
+                        return None
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
         # refreshes it under Claude Code's own lock protocol (owner or not),
