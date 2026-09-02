@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -132,12 +133,13 @@ def auth_status_tracks_seed(monkeypatch):
     """Fake `claude auth status --json`: logged in iff the profile is seeded.
 
     Reads CLAUDE_CONFIG_DIR from the probe env, so it also exercises that the
-    probe points at the right profile. Records every probe env for assertions.
+    probe points at the right profile.
+
+    It does NOT keep the envs it was handed. It did, for assertions nothing
+    ever wrote -- and a kept env dict is what a failing case prints.
     """
-    probe_envs: list[dict] = []
 
     def fake_run(cmd, env=None, **kwargs):
-        probe_envs.append(env)
         config_dir = Path(env["CLAUDE_CONFIG_DIR"])
         if (config_dir / ".credentials.json").exists():
             payload = {
@@ -151,7 +153,6 @@ def auth_status_tracks_seed(monkeypatch):
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
-    return probe_envs
 
 
 @pytest.fixture
@@ -403,6 +404,46 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        "kind, expected",
+        [
+            # No note: the bare kind is the whole classification.
+            ("transient", "transient"),
+            # ERROR_NOTES has prose for this one, and the raw kind would
+            # report a failure where nothing failed.
+            ("consume-busy", "another cswap surface holds the slot"),
+            # The opposite direction: this one IS fatal, and the line ends
+            # "continuing with the stored credentials", so a bare kind reads
+            # as reassurance.
+            ("invalid_grant", "refresh lineage is dead"),
+            # NO PRODUCER ON THIS BRANCH -- `_classify_usage_error` answers
+            # `http-<code>`/`timeout`/`network`/`bad-response`, and the kind
+            # is added for the merged tree. Witnessed here anyway: without a
+            # reader, a sibling branch renaming it is a silent un-wiring, and
+            # this file has already had one.
+            ("tls-cert", "certificate chain was not trusted"),
+        ],
+    )
+    def test_the_refresh_failure_warning_outlives_the_terminal(
+        self, manager, auth_status_tracks_seed, monkeypatch, capsys, caplog,
+        kind, expected,
+    ):
+        """The sibling above proves the warning is printed; this proves it is
+        kept, and that the cause is rendered the way every other surface
+        renders it. Nothing else carries either: the status line names the
+        account, not the refresh, and oauth logs the kind at DEBUG."""
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(None, kind),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            manager.setup_session("2", share=False)
+
+        assert "Could not refresh" in capsys.readouterr().out
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Could not refresh the token for Account-2" in logged
+        assert expected in logged
+
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
     ):
@@ -459,12 +500,839 @@ class TestBootstrap:
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
         block_real_keychain.set_password(service, account, "stale")
+        # The account's own conversation history, which a validation failure
+        # must not take with it.
+        (session_dir / "projects" / "a-repo").mkdir(parents=True, exist_ok=True)
+        transcript = session_dir / "projects" / "a-repo" / "chat.jsonl"
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
 
         with pytest.raises(SessionError, match="failed\\s+validation"):
             manager.setup_session("2", share=False)
 
-        assert not session_dir.exists()
+        assert transcript.exists(), (
+            "DEFECT: a failed validation deleted the account's conversation "
+            "history -- reachable from an upstream change alone, since a "
+            "`claude auth status --json` that exits non-zero reads as invalid"
+        )
+        assert transcript.read_text(encoding="utf-8") == '{"type":"user"}\n', (
+            "the history survived the cleanup but its content did not"
+        )
+
+        # THE SEED, not the directory. A failed validation must stop the
+        # profile being reused; the account's own conversation history is
+        # user data and survives.
+        assert not (session_dir / ".credentials.json").exists()
         assert block_real_keychain.get_password(service, account) is None
+
+    def test_validation_failure_takes_the_share_links_with_the_manifest(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates, block_real_keychain
+    ):
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        # `_sync_sharing` mirrors from the DEFAULT ~/.claude, so the source
+        # has to exist for any history link to be created at all.
+        source = Path.home() / ".claude"
+        (source / "projects").mkdir(parents=True, exist_ok=True)
+        (source / "history.jsonl").touch()
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session("2", share=False, share_history=True)
+
+        # PREMISE: the run took the sharing path and the sweep ran. Without
+        # these the assertions below are the absence of something that was
+        # never created -- measured: the first cut of this case passed
+        # against the unfixed code for exactly that reason.
+        assert manager.switcher.platform != session_mod.Platform.WINDOWS
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep ran"
+        )
+        manifest = session_dir / session_mod.SHARE_MANIFEST
+        assert not manifest.exists(), "premise: the sweep took the manifest"
+
+        for name in session_mod.HISTORY_ITEMS:
+            assert not (session_dir / name).is_symlink(), (
+                f"DEFECT: the share link {name!r} outlived the manifest that "
+                "is the only record cswap created it. `_sync_sharing` removes "
+                "a link only if the manifest names it, so this one can never "
+                "be removed again -- every later plain `cswap run` writes the "
+                "account's history into the DEFAULT profile, with no flag."
+            )
+
+    def test_an_unreadable_record_does_not_delete_the_profiles_credential(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`_live_session_pids` is scan-shaped; a destructive guard is not.
+
+        An unreadable record contributes no PID, so the chokepoint of every
+        backup write reads it as "nothing is running" and deletes the
+        profile's seed and its Keychain entry. Nothing can say whether a
+        claude is in there, and the launch gate one frame later refuses to
+        re-seed it -- so the slot is unlaunchable by any cswap command, and
+        `--add-account` fires the same chokepoint again.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "live-generation", encoding="utf-8"
+        )
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "4242.json").write_text(
+            '{"pid": 4242, "cw', encoding="utf-8"
+        )
+        # PREMISES: nothing can certify the profile as idle, and the
+        # scan-shaped question answers "nothing is running".
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert seeded_switcher._live_session_pids(
+            ACCOUNT_NUM, ACCOUNT_EMAIL) == []
+
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL,
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-new",
+                                          "refreshToken": "rt-new"}}),
+        )
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the backup write deleted the credential of a profile "
+            "nothing could certify as idle, and the launch gate then "
+            "refuses to re-seed it"
+        )
+
+    def test_a_skipped_re_seed_does_not_promote_an_unknown_verdict(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The promotion's premise is that a bootstrap just ran.
+
+        `_artifacts_say_usable` reads an unreadable identity as "no drift",
+        which is sound only when the artifacts are the BACKUP's. On a live
+        profile the re-seed is skipped, so they are the profile's own -- and
+        an in-session /login plus a torn `.claude.json` then launches under
+        the account it drifted to, announced as the one that was asked for.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "ANOTHER-ACCOUNTS-CREDENTIAL", encoding="utf-8"
+        )
+        # A torn identity: present, so `_artifacts_say_usable` says "no
+        # drift", and unreadable, so nothing can contradict it.
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+        make_live(session_dir)
+        # PREMISES: the re-seed is skipped, and the artifacts would read
+        # usable if one had run -- `reseeded=True` is what that says. Without
+        # it the unreadable identity now refuses on its own, which is a
+        # different reason and would leave this test asserting nothing.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, "", reseeded=True
+        )
+        assert not session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, "", reseeded=False
+        )
+
+        import subprocess
+
+        probes = []
+
+        def timing_out(cmd, env=None, **kwargs):
+            # invalid, invalid, then a timeout: the reuse path refuses, the
+            # re-seed is skipped, and the third probe reaches the promotion.
+            probes.append(1)
+            if len(probes) <= 2:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "loggedIn": True, "authMethod": "claudeai",
+                        "email": "someone-else@example.com",
+                    }),
+                    stderr="",
+                )
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", timing_out)
+        outcome = "LAUNCH"
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            outcome = "RAISE"
+        # PREMISE: the reuse path did NOT answer; this reached the arm
+        # after the skipped re-seed.
+        assert len(probes) >= 2, "premise: the bootstrap arm must be reached"
+        assert outcome == "RAISE", (
+            "DEFECT: the unknown verdict was promoted to valid on a profile "
+            "the gate had just refused to re-seed, so the launch runs under "
+            "whatever account the profile drifted to"
+        )
+
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == "ANOTHER-ACCOUNTS-CREDENTIAL", (
+            "premise: nothing may have re-seeded the profile"
+        )
+
+    def test_a_readable_identity_does_not_promote_without_a_re_seed_either(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The premise is the RE-SEED, and no artifact substitutes for it.
+
+        `_artifacts_say_usable` answers from the profile's own files, and on
+        this path the probe has already contradicted them twice: it reported
+        another account, then stopped answering. Promoting on the third
+        result -- the one that said nothing -- launches `claude` under the
+        credential those two verdicts were about, announced as the slot's.
+
+        The re-seed is what makes the artifacts the BACKUP's and worth
+        believing. Skipped, they are the record of whatever the profile
+        drifted to, readable or not.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "ANOTHER-ACCOUNTS-CREDENTIAL", encoding="utf-8"
+        )
+        # READABLE and matching -- the only difference from the torn-identity
+        # case beside it, so what this pins is the re-seed and nothing else.
+        (session_dir / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": ACCOUNT_EMAIL,
+                              "organizationUuid": ORG_UUID}}
+        ), encoding="utf-8")
+        make_live(session_dir)
+        # PREMISES: the re-seed is skipped, and the artifacts DO read usable
+        # -- so only the missing re-seed can be what refuses.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID, reseeded=False
+        )
+
+        import subprocess
+
+        probes = []
+
+        def timing_out(cmd, env=None, **kwargs):
+            # invalid, invalid, then a timeout: the reuse path refuses, the
+            # re-seed is skipped, and the third probe reaches the promotion.
+            probes.append(1)
+            if len(probes) <= 2:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "loggedIn": True, "authMethod": "claude.ai",
+                        "email": "someone-else@example.com",
+                    }),
+                    stderr="",
+                )
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", timing_out)
+        outcome = "LAUNCH"
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            outcome = "RAISE"
+        assert len(probes) >= 3, "premise: the promotion arm must be reached"
+        assert outcome == "RAISE", (
+            "DEFECT: the launch carries the credential two probes just "
+            "reported as another account's, promoted by a third that "
+            "answered nothing"
+        )
+
+    def test_a_stuck_profile_names_the_repair_that_actually_works(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """An unreadable record makes every gate on this path defer, and
+        nothing in cswap prunes a record -- so `--add-account` routes
+        through the same chokepoint and repairs nothing, and
+        `--remove-account` refuses for the same reason. Naming it is the
+        difference between a slot the user can fix and one they cannot.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "9999.json").write_text('{"pid": 9999, "cw')
+        # PREMISES: not quiescent, and nothing live -- the permanent case.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        live, unreadable = session_mod.scan_live_sessions(session_dir)
+        assert live == [] and unreadable == 1
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert "could not be read" in message and "sessions" in message, (
+            "DEFECT: the launch refuses and names none of the obstruction "
+            f"that blocked it: {message}"
+        )
+        assert "--add-account" not in message, (
+            "DEFECT: the launch names a remedy that routes through the same "
+            "chokepoint and repairs nothing on this state"
+        )
+
+    def test_an_unspawnable_claude_names_PATH_not_the_live_instance(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`unreachable` is the BINARY's reason, and the gate has no better one.
+
+        The gate's own reason is owed to the user only when it is the gate
+        that blocked the launch. A `claude` that cannot be spawned blocked it
+        before any gate looked, so "exit the live instance" spends a running
+        session -- the user's in-progress work -- to reach a retry that
+        cannot spawn it either.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        make_live(session_dir)
+        # PREMISE: the re-seed is skipped, which is what routes a non-valid
+        # verdict into the gate's-own-reason block.
+        assert not session_mod.profile_is_quiescent(session_dir)
+
+        def unspawnable(cmd, env=None, **kwargs):
+            raise OSError("claude: no such file")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unspawnable)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert "on PATH" in message, (
+            f"DEFECT: the binary could not be spawned and the launch says "
+            f"nothing about it: {message}"
+        )
+        assert "Exit it" not in message, (
+            "DEFECT: the launch tells the user to exit a live claude to fix "
+            "a binary that cannot be spawned -- it costs them the session "
+            "and the retry fails identically"
+        )
+
+    @pytest.mark.parametrize("probe_fails", [False, True])
+    def test_a_live_profile_that_could_not_launch_names_its_pid(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain, probe_fails
+    ):
+        """CONTROL for the test above, and the remedy's own guard.
+
+        The gate is what blocked the launch: the re-seed was skipped because
+        a claude is live in there. `--add-account` routes through the same
+        chokepoint and refuses, so the only remedy is the instance, and the
+        user cannot act on it without the PID.
+
+        BOTH verdicts, because only one of them is tested by accident. An
+        answered probe (`invalid`) and one that timed out (`unknown`) reach
+        this raise by different routes, and narrowing the gate to `invalid`
+        would drop the `unknown` user onto the PATH message with every
+        committed test still green -- and `unknown` + live is the cell this
+        whole branch is about.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        make_live(session_dir)
+        live, unreadable = session_mod.scan_live_sessions(session_dir)
+        # PREMISES: live, and readable -- so the unreadable-record raise
+        # above it cannot be the one that fires.
+        assert len(live) == 1 and unreadable == 0
+
+        import subprocess
+
+        def probe(cmd, env=None, **kwargs):
+            if probe_fails:
+                raise subprocess.TimeoutExpired(cmd, 10)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", probe)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert str(live[0].pid) in message, (
+            f"DEFECT: the only remedy is a process the message does not "
+            f"name: {message}"
+        )
+        assert "--add-account" not in message, (
+            "DEFECT: the launch names a remedy that routes through the same "
+            "liveness chokepoint and refuses"
+        )
+
+    def test_a_marker_that_cannot_be_honoured_is_announced(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain, capsys
+    ):
+        """Both readers of the flag require quiescence, so on an unreadable
+        record the reuse path serves the very generation the flag exists to
+        retire -- and says nothing."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "SUPERSEDED", encoding="utf-8"
+        )
+        (session_dir / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": ACCOUNT_EMAIL,
+                              "accountUuid": "u"}}))
+        assert session_mod.mark_session_stale(session_dir)
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "9999.json").write_text('{"pid": 9999, "cw')
+        # PREMISES: flagged, not quiescent, nothing live.
+        assert session_mod.is_session_stale(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod.scan_live_sessions(session_dir)[0] == []
+
+        def valid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": True, "authMethod": "claudeai",
+                                   "email": ACCOUNT_EMAIL}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", valid)
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            pass
+        said = capsys.readouterr()
+        assert "cannot be honoured" in (said.out + said.err), (
+            "DEFECT: the profile is flagged for re-bootstrap, the flag can "
+            "never be honoured, and the launch says nothing"
+        )
+
+    def test_a_live_profile_is_not_swept_at_all(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The sweep deletes the seed and the identity. Under a running
+        claude that is the rewrite every other invalidation site in this
+        file refuses to do."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("seed", encoding="utf-8")
+        make_live(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir), (
+            "premise: the live record must make the profile non-quiescent"
+        )
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the sweep ran under a live claude, deleting the seed "
+            "and the identity out from under a running instance"
+        )
+
+    def test_a_live_profile_is_not_reseeded_when_the_probe_fails(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """A failed probe is not evidence that nothing is running.
+
+        `_bootstrap` deletes the Keychain entry and overwrites
+        `.credentials.json` with the backup lineage. Under a live claude
+        that is the generation the running instance rotated into, held
+        nowhere else — its next refresh gets invalid_grant and the session
+        dies. The raise that follows says the profile was left in place.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "live-generation", encoding="utf-8"
+        )
+        make_live(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir)
+
+        def unreachable(cmd, env=None, **kwargs):
+            raise OSError("claude is mid-update")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unreachable)
+        with pytest.raises(SessionError, match="left in place"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        seed = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        print(f"\nSEED AFTER: {seed[:60]!r}")
+        assert seed == "live-generation", (
+            "DEFECT: _bootstrap rewrote a LIVE profile's credential, and the "
+            "error the user sees says the profile is left in place"
+        )
+
+    @staticmethod
+    def _spy_on_sweep(monkeypatch) -> list[str]:
+        """Record every `_cleanup_failed_session`, still running the real one."""
+        swept: list[str] = []
+        real = session_mod.SessionManager._cleanup_failed_session
+
+        def spy(self, path):
+            swept.append(str(path))
+            return real(self, path)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_cleanup_failed_session", spy
+        )
+        return swept
+
+    def test_a_swept_profile_keeps_the_only_copy_of_its_mcp_servers(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`_sync_sharing` can write the stash minutes before the sweep runs.
+
+        `_stash_displaced_mcp` is write-once and refuses to reset a profile's
+        MCP servers unless this file already holds them, so it is the only
+        copy of the profile's pre-mirror definitions. Sweeping it destroys
+        exactly what that refusal exists to preserve, and nothing re-derives
+        it: the definitions it held are gone from the profile too.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        stash = session_dir / session_mod.MCP_DISPLACED_STASH
+        stash.write_text(json.dumps(
+            {"schemaVersion": 1, "mcpServers": {"pre-feature": LOCAL_MCP}}
+        ), encoding="utf-8")
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISE: the sweep ran. Without this the assert below passes on a
+        # version that simply never cleans anything up.
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep did not run, so this proves nothing"
+        )
+        assert stash.exists() and json.loads(stash.read_text())[
+            "mcpServers"
+        ] == {"pre-feature": LOCAL_MCP}, (
+            "DEFECT: the sweep took the write-once stash, which is the only "
+            "copy of the profile's pre-mirror MCP definitions"
+        )
+
+    def test_a_probe_that_failed_never_reaches_the_sweep(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The premise the reuse gate's strictness rests on.
+
+        Refusing to REUSE an unreadable identity sends the launch down the
+        bootstrap path, where a probe that then times out must not be read as
+        a verdict about the profile: the sweep deletes the seed and the
+        Keychain entry over nothing worse than a loaded machine (#224).
+
+        The re-seed must NOT promote the timeout, or this passes without ever
+        reaching the arm it is about -- so the backup names another account,
+        which is drift the promotion still refuses post-bootstrap.
+        """
+        seeded_switcher._write_account_config(
+            ACCOUNT_NUM, ACCOUNT_EMAIL,
+            json.dumps({"oauthAccount": {
+                "emailAddress": "someone-else@example.com",
+                "organizationUuid": ORG_UUID}, "theme": "dark"}),
+        )
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+
+        swept = self._spy_on_sweep(monkeypatch)
+
+        import subprocess
+
+        def times_out(cmd, env=None, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISE: the verdict stayed "unknown" and reached the probe-failure
+        # raise. Anything else and this asserts about an arm it never entered.
+        assert "could not be verified" in str(caught.value), str(caught.value)
+        assert swept == [], (
+            "DEFECT: a probe that merely timed out destroyed a profile it "
+            "never managed to look at"
+        )
+
+    def test_an_invalid_verdict_still_reaches_the_sweep(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """CONTROL for the test above: a spy that can never see a sweep would
+        pass it on a version that swept every launch."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+
+        swept = self._spy_on_sweep(monkeypatch)
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert swept, "premise: the spy cannot see a sweep, so it proves nothing"
+
+    def test_a_swept_profile_keeps_its_liveness_ledger(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`sessions/` is what `scan_sessions` reads, and it reads nothing
+        else. Sweeping it makes `profile_is_quiescent` answer True forever,
+        so every guard that asks whether a claude is running goes blind."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("seed", encoding="utf-8")
+        # A record for a pid that is NOT alive: the ledger exists, and the
+        # profile is quiescent, so the sweep really runs.
+        make_live(session_dir, pid=2**22 + 12345)
+        assert session_mod.profile_is_quiescent(session_dir), (
+            "premise: a dead record leaves the profile quiescent, or the "
+            "sweep is skipped and this case measures nothing"
+        )
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep must have run"
+        )
+        assert (session_dir / "sessions").is_dir(), (
+            "DEFECT: the sweep took the liveness ledger. `scan_sessions` "
+            "reads nothing else, so `profile_is_quiescent` now answers True "
+            "for this profile forever and the removal, the swap, the move "
+            "and the purge all stop seeing a live claude"
+        )
+
+    def test_a_swept_profile_is_RE_BOOTSTRAPPED_on_the_next_launch(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The behaviour, not the flag: the next launch must re-seed.
+
+        Asserting the marker is a proxy -- the stale arm consumes it and
+        then re-asks validity, which answers from the same artifacts that
+        made the sweep's verdict unprovable, so the profile passed as
+        usable and `claude` was exec'd into an empty directory.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        svc = session_mod.keychain_service_name(session_dir)
+        acct = session_mod._keychain_account_name()
+        real_get = session_mod.macos_keychain.get_password
+        real_del = session_mod.macos_keychain.delete_password
+
+        def locked(real):
+            def _f(service, account, *a, **k):
+                if (service, account) == (svc, acct):
+                    raise session_mod.macos_keychain.KeychainError("locked")
+                return real(service, account, *a, **k)
+            return _f
+
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "get_password", locked(real_get))
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "delete_password", locked(real_del))
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISES: the sweep really emptied it, and the flag really landed.
+        assert manager.switcher.platform == session_mod.Platform.MACOS
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep took the seed"
+        )
+        assert session_mod.is_session_stale(session_dir), (
+            "premise: the sweep flagged it for re-bootstrap"
+        )
+
+        # The next launch: the probe merely TIMES OUT, which is what makes
+        # the artifacts alone decide.
+        def times_out(cmd, env=None, **kwargs):
+            raise session_mod.subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        # PREMISES that hold in BOTH worlds and pin the exact combination
+        # the reuse check decides on: the keychain is unreadable so material
+        # leans PRESENT, and the identity the sweep deleted is absent.
+        assert session_mod._may_have_credential_material(session_dir) is True, (
+            "premise: an unreadable keychain reads as material-may-be-present"
+        )
+        assert not (session_dir / ".claude.json").exists(), (
+            "premise: the sweep took the recorded identity"
+        )
+        assert manager._session_validity(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID) == "unknown", (
+            "premise: the probe merely did not answer, so artifacts decide"
+        )
+
+        manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the launch after a swept profile REUSED it. The stale "
+            "arm consumed the marker and then re-asked validity, which "
+            "answers from the same unprovable artifacts, so claude is "
+            "exec'd into a directory with no credential and no identity -- "
+            "any login there writes to the profile, never to the backup"
+        )
+
+    def test_a_swept_profile_is_not_reused_on_the_next_launch(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """A profile the cleanup swept must re-bootstrap, never be reused.
+
+        The sweep spares user data, so the directory now SURVIVES and
+        `_session_validity` no longer short-circuits on `not is_dir()`. On
+        macOS the seed is not the only credential material: the keychain
+        delete is best-effort, so a later probe TIMEOUT falls to
+        `_artifacts_say_usable`, where an unreadable entry reads as present
+        and the deleted `.claude.json` reads as "no drift".
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        svc = session_mod.keychain_service_name(session_dir)
+        acct = session_mod._keychain_account_name()
+        real_get = session_mod.macos_keychain.get_password
+        real_del = session_mod.macos_keychain.delete_password
+
+        def locked(real):
+            def _f(service, account, *a, **k):
+                if (service, account) == (svc, acct):
+                    raise session_mod.macos_keychain.KeychainError("locked")
+                return real(service, account, *a, **k)
+            return _f
+
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "get_password", locked(real_get))
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "delete_password", locked(real_del))
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISES: the state that makes the reuse check answer "usable".
+        assert manager.switcher.platform == session_mod.Platform.MACOS
+        assert session_dir.is_dir(), "premise: the sweep spares the directory"
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / ".claude.json").exists()
+        assert session_mod._may_have_credential_material(session_dir) is True, (
+            "premise: the unreadable keychain reads as material-may-be-present"
+        )
+
+        def times_out(cmd, env=None, **kwargs):
+            raise session_mod.subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        assert manager._session_validity(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID) == "unknown", (
+            "premise: the next launch's probe merely did not answer"
+        )
+
+        assert session_mod.is_session_stale(session_dir), (
+            "DEFECT: the profile that FAILED validation carries no "
+            "re-bootstrap flag, so the next launch takes the reuse fast "
+            "path and execs claude into a profile with no identity and a "
+            "credential that just failed -- any login there writes to the "
+            "profile and never to the slot's backup"
+        )
+        assert session_mod.profile_is_quiescent(session_dir), (
+            "control: the flag is only honoured on a quiescent profile"
+        )
 
     def test_stale_keychain_entry_deleted_before_seed(
         self,
@@ -733,21 +1601,27 @@ class TestIsSessionValid:
         self._probe_times_out(monkeypatch)
         assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
-    def test_probe_timeout_lenient_on_unreadable_identity(
+    def test_probe_timeout_refuses_an_unreadable_identity(
         self, manager, tmp_path, monkeypatch
     ):
-        """A broken .claude.json degrades to trusting the profile.
+        """A broken .claude.json is not a profile we may REUSE.
 
-        Mirrors session_identity_drifted's stance: unreadable metadata is
-        not drift. Failing closed here would re-open the destructive
-        cleanup path #224 removed: a backup whose oauthAccount lacks an
-        emailAddress keeps the identity unreadable even after re-bootstrap,
-        so the post-bootstrap check would delete the profile on every
-        loaded launch.
+        Reuse runs before any bootstrap, so the artifacts are the profile's
+        own: an in-session /login plus a torn `.claude.json` would otherwise
+        exec claude into the account it drifted to.
         """
         tmp_path.mkdir(exist_ok=True)
         self._seed_profile(tmp_path)
         (tmp_path / ".claude.json").write_text("not json")
+        self._probe_times_out(monkeypatch)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_a_readable_identity_still_survives_a_probe_timeout(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """CONTROL: the leniency is gone only for the unreadable case."""
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
         self._probe_times_out(monkeypatch)
         assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
@@ -1269,6 +2143,54 @@ class TestMcpMirror:
 # ---------------------------------------------------------------------------
 
 
+def test_the_isolating_fixture_really_cleared_every_outbound_hop():
+    """The subject is `_isolate_real_home`, not this process's environment.
+
+    Every double here forwards `os.environ` into the thing it fakes, and pytest
+    prints whatever a failing assertion touched -- so one unrelated red case
+    would publish `https://user:secret@host` into the log. The autouse fixture
+    deletes those names before any body runs; this asserts it did.
+
+    So it fails when the fixture STOPS deleting, and only on a machine that
+    has a hop set -- vacuous elsewhere, which is most CI. It is not a check on
+    the operator's shell, and reading it as one credits it with reach it does
+    not have.
+    """
+    from tests.conftest import outbound_hop_names
+
+    present = outbound_hop_names(os.environ)
+    assert present == [], (
+        f"the suite is running with {present} set; a failing assertion that "
+        f"touches an env dict prints their values"
+    )
+
+
+def test_the_hop_selection_is_by_shape_not_a_hand_written_list():
+    """`urllib` decides what an outbound hop is by SHAPE, so this must too.
+
+    `urllib.request.getproxies()` treats any ``<scheme>_proxy`` as a hop, and
+    the default opener installs a ``ProxyHandler`` built from it -- so the set
+    is open-ended and a literal tuple goes stale the first time an operator's
+    network needs SOCKS or FTP. What it misses is not a flag: it is a URL that
+    can carry ``user:secret@host``, which is the whole exposure.
+    """
+    from tests.conftest import outbound_hop_names
+
+    env = {
+        "HTTPS_PROXY": "x", "no_proxy": "y",          # the ones a list catches
+        "SOCKS_PROXY": "socks5://u:s@gw:1080",        # the ones it does not
+        "FTP_PROXY": "http://u:s@h:3128",
+        "NODE_USE_ENV_PROXY": "1",
+        "PATH": "/usr/bin", "PROXY_MODE": "z",        # controls: neither is a hop
+    }
+    assert outbound_hop_names(env) == [
+        "FTP_PROXY", "HTTPS_PROXY", "NODE_USE_ENV_PROXY", "SOCKS_PROXY", "no_proxy",
+    ], (
+        "the selection missed a hop urllib would read, or claimed one it would "
+        "not -- PROXY_MODE is not a hop and PATH is not either"
+    )
+
+
 class _ExecCalled(Exception):
     def __init__(self, binary, argv, env):
         self.binary, self.argv, self.env = binary, argv, env
@@ -1320,7 +2242,10 @@ class TestRun:
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        # NAMES, not the mapping. A failing `not in` renders the whole dict,
+        # and this one is the process environment: pytest keeps its head and
+        # tail, so a token sitting at either end is printed with it.
+        assert "CLAUDE_CONFIG_DIR" not in sorted(exc.value.env)
         assert "already the active default login" in capsys.readouterr().out
 
     def test_require_session_refuses_fast_path(
@@ -1390,9 +2315,194 @@ class TestRun:
         # `cswap run 2` means account 2, not whatever the API key resolves to.
         out = capsys.readouterr().out
         assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
-        assert "ANTHROPIC_API_KEY" not in exc.value.env
-        assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
+        # NAMES, for the reason above.
+        exec_env_names = sorted(exc.value.env)
+        assert "ANTHROPIC_API_KEY" not in exec_env_names
+        assert "ANTHROPIC_AUTH_TOKEN" not in exec_env_names
         assert exc.value.env["UNRELATED_VAR"] == "kept"
+
+    @pytest.mark.parametrize(
+        "env, logged_, not_logged",
+        [
+            (
+                {"ANTHROPIC_API_KEY": "sk-ant-key", "ANTHROPIC_AUTH_TOKEN": "tok"},
+                ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                [],
+            ),
+            ({"CLAUDE_CONFIG_DIR": "/x"}, ["overriding it for this launch"], []),
+            # The control: with neither var set, both rows above would pass
+            # against a logger that warned unconditionally.
+            ({}, [], ["overriding it for this launch", "ANTHROPIC_API_KEY"]),
+        ],
+        ids=["scrub", "config_dir", "control"],
+    )
+    def test_the_launch_warnings_outlive_the_terminal(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        caplog,
+        env,
+        logged_,
+        not_logged,
+    ):
+        """The account is still carried by the status line after the exec;
+        "the value you set was overridden" is carried by nothing."""
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"):
+            monkeypatch.delenv(var, raising=False)
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+        records = "\n".join(r.getMessage() for r in caplog.records)
+        for expected in logged_:
+            assert expected in records
+        for absent in not_logged:
+            assert absent not in records
+
+    def test_our_own_config_dir_is_neither_printed_nor_logged(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        capsys,
+        caplog,
+    ):
+        """run() sets CLAUDE_CONFIG_DIR to a session profile, so a nested
+        `cswap run` takes this branch on every launch. Those records would
+        bury the one the log exists for: a value the USER set.
+
+        PRINTED-BUT-NOT-LOGGED WAS THE WRONG HALF TO KEEP. That is the
+        print-only shape this whole file guards against -- the exec clears
+        the screen, so the notice reached nobody either way. Saying nothing
+        about a nested launch we caused ourselves is the honest version, and
+        it leaves every notice that IS printed also recorded.
+        """
+        monkeypatch.setenv(
+            "CLAUDE_CONFIG_DIR", str(manager.sessions_dir / "2-b_example.com")
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        assert "overriding it for this launch" not in capsys.readouterr().out
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "overriding it for this launch" not in logged
+
+    def test_every_note_and_warn_on_the_launch_path_reaches_the_log(
+        self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
+        refresh_rotates, caplog,
+    ):
+        """FIVE OF NINE had no behavioural case at all.
+
+        Swapping each `self._note` / `self._warn` for a print-only
+        `warning(...)`, one at a time, left the whole file green at
+        `session.py` 562, 582, 1113, 1347 and 1358 — including the
+        non-quiescent notice the structural guard's own docstring cites as
+        its motivating discovery, and the `Launching` line, whose text
+        appears nowhere else in this file.
+
+        Rather than nine injections, this asserts the invariant over the
+        routed writers: on a launch everything printed THROUGH `_note`/`_warn`
+        is also recorded, whichever line it is on. A bare `print` on the same
+        path bypasses this collection entirely and is
+        `test_no_launch_notice_is_print_only`'s subject, not this one's.
+        """
+        import re as _re
+
+        printed: list[str] = []
+        real_note, real_warn = manager._note, manager._warn
+        monkeypatch.setattr(
+            manager, "_note",
+            # FORWARDED, not swallowed. A `**kw` that drops what it received
+            # would accept a call shape the real method does not.
+            lambda m, **kw: (printed.append(m), real_note(m, **kw))[1],
+            raising=False)
+        monkeypatch.setattr(
+            manager, "_warn",
+            lambda m: (printed.append(m), real_warn(m))[1], raising=False)
+
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        assert printed, "premise: the launch printed no notice at all"
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        strip = lambda t: _re.sub(r"\x1b\[[0-9;]*m", "", t)
+        missing = [m for m in printed if strip(m) not in logged]
+        assert missing == [], (
+            "a launch notice reached the terminal and not the log, so the "
+            f"exec's screen blank erases it and nothing records why: {missing}"
+        )
+
+    def test_the_launch_banner_is_not_dimmed_over_its_own_accent(
+        self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
+        refresh_rotates, capsys, caplog,
+    ):
+        """`_note` wraps in `dimmed` by design; this one line carries its own.
+
+        `accent('Launching')` closes with its own reset, so a `dimmed` wrap
+        around the whole string dims exactly that word and nothing after it --
+        a visible change to a line the durable-warning fix only meant to
+        RECORD. `dim=False` at the call site is what prevents it, and dropping
+        it is invisible to every other case here: they read the LOG, which
+        `_plain` strips either way.
+        """
+        import logging
+
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        # THE RECORD, TOO. `_plain` is the identity function when colour is
+        # off, and every case that reads `caplog` runs colour-off -- so
+        # dropping it from `_note`/`_warn` left the whole suite green while
+        # the log the README points a user at filled with escape sequences.
+        # This is the one case that turns colour ON.
+        styled = [r.getMessage() for r in caplog.records if "\x1b[" in r.getMessage()]
+        assert not styled, (
+            f"the log record carries SGR escapes: {styled[:1]}"
+        )
+
+        line = next((l for l in capsys.readouterr().out.splitlines()
+                     if "Launching" in l), None)
+        assert line is not None, "premise: the launch banner was never printed"
+        assert "\x1b[" in line, (
+            "premise: colour is off on this line, so the wrap is invisible "
+            "and this case proves nothing"
+        )
+        assert not line.startswith("\x1b[2m"), (
+            f"the banner is wrapped in dimmed(), so its accent renders dim: "
+            f"{line!r}"
+        )
+
+    def test_the_two_data_moves_outlive_the_terminal(
+        self, manager, tmp_path, caplog
+    ):
+        """Both notices record where the user's own data WENT, and both are
+        printed on the launch path the exec clears. Every failure beside them
+        is already logged; only the successful moves were not."""
+        from claude_swap.session import MCP_DISPLACED_STASH
+
+        session_dir = tmp_path / "profile"
+        session_dir.mkdir()
+        src, dest = tmp_path / "shared", session_dir / "projects"
+        dest.mkdir()
+        (dest / "a.jsonl").write_text("{}")
+
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            assert manager._stash_displaced_mcp(session_dir, {"x": {}})
+            assert manager._prepare_history_share(src, dest, session_dir)
+
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert MCP_DISPLACED_STASH in logged
+        assert "projects" in logged
 
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch
@@ -2721,7 +3831,10 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         with pytest.raises(SessionError, match="failed validation"):
             manager.setup_session(ACCOUNT_NUM, share=False)
 
-        assert not session_dir.exists()
+        # THE SEED, not the directory. A failed validation must stop the
+        # profile being reused; the account's own conversation history is
+        # user data and survives.
+        assert not (session_dir / ".credentials.json").exists()
 
     def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
@@ -2811,4 +3924,788 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "Fix the storage failure" in msg
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
+        )
+
+
+#: Methods whose `print` IS the sanctioned one. A set, not a single name, so
+#: adding a second printer with the same print-and-log contract is a one-line
+#: change rather than a guard failure.
+_SANCTIONED_PRINTERS = {"_note", "_warn"}
+
+def _own_scope(func):
+    """Statements `func` binds names in -- its body, minus every nested scope.
+
+    A `def` inside an `if` inside `func` binds in `func`; one inside a nested
+    `def`, or in a `class` body, does not. `ast.walk` cannot tell those apart.
+    """
+    import ast
+
+    out = []
+    stack = list(func.body)
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue          # its body binds in ITS scope, not in `func`'s
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _bare_print_printers(src: str | None = None) -> set[str]:
+    """`printer`'s own functions that reach the builtin `print`.
+
+    PROSPECTIVE ON THIS TREE, and worth saying plainly: `printer.py` has
+    eight module-level assignments and every one is a `Dict` or a `Constant`,
+    so `bindings`, `_names` and the alias promotion contribute NOTHING to
+    today's answer. They fire the day it grows an alias, a `partial` or a
+    delegating printer. A re-export (`from ._impl import warning`) is the one
+    shape still missed on purpose -- proving that name is a printer needs the
+    other module, which this function does not read.
+
+    DERIVED, not listed: a list is right until someone adds a function, and
+    then it is silently short. Measured today this returns `{"error",
+    "warning"}` -- the same answer a top-level scan gives, so nothing on this
+    tree changes. What the walk and the fixpoint add is the two shapes that
+    scan misses and that a future printer is most likely to take: one defined
+    inside an `if`/`try`, and one that DELEGATES to a printer instead of
+    calling `print` itself. Measured, appending either to `printer.py`: the
+    top-level scan still answers `{"error", "warning"}`, this answers with the
+    new name.
+    """
+    import ast
+
+    # `src` SO THE FILTERS BELOW HAVE A POPULATION. Against `printer.py` alone
+    # both of them remove nothing -- measured, 0 nodes and 0 names -- so each
+    # could be deleted with the suite green, and one of them shipped inverted
+    # for exactly that reason. The default is still the real module.
+    if src is None:
+        src = (Path(__file__).resolve().parent.parent
+               / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # REACHABLE AS `printer.<name>(...)` IS A MODULE-LEVEL BINDING, not a
+    # nesting depth. Keyed on nesting this exported `_make_banner`, which
+    # prints nothing, and missed the `banner` that factory returns, which
+    # does -- the filter inverted on the one shape it was reasoning about.
+    # A def inside a module-level `if`/`try` binds here; one inside a class
+    # or another function does not, unless a module-level name of its own
+    # spelling is bound to it. Over-reporting costs a loud false alarm in the
+    # matcher; under-reporting is silent.
+    def _names(value):
+        """Function names this module-level value can be reaching."""
+        if isinstance(value, ast.Name):
+            return {value.id}
+        if isinstance(value, ast.Call):
+            out = _names(value.func)
+            # ONLY THE CALLABLE `partial` IS GIVEN, not every argument. In
+            # `partial(f, *bound)` the rest are data, so following them
+            # promotes a target on a name that is merely bound to it.
+            if _is_partial(value.func):
+                for a in (value.args[:1]
+                          + [k.value for k in value.keywords
+                             if k.arg == "func"]):
+                    out |= _names(a)
+            return out
+        # A LAMBDA REACHES WHATEVER ITS BODY CALLS. `banner = lambda m:
+        # warning(m)` is a printer under a name a `Name`/`Call` match cannot
+        # see, and missing it is the silent direction.
+        if isinstance(value, ast.Lambda):
+            return {n.func.id for n in ast.walk(value.body)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)}
+        return set()
+
+    # THE SOURCE'S OWN NAMES, not the literal `partial` -- the same rule
+    # `_print_only_offenders` states for the printer module a hundred lines
+    # below. A literal misses `from functools import partial as pt` and
+    # `p2 = partial` (silent), and fires on an unrelated `c.partial(...)`
+    # and on a local `def partial` that shadows the import (loud).
+    _partial_names = {"functools.partial"}
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and _n.module == "functools":
+            _partial_names |= {a.asname or a.name for a in _n.names
+                               if a.name == "partial"}
+        elif isinstance(_n, ast.Import):
+            _partial_names |= {f"{a.asname or a.name}.partial"
+                               for a in _n.names if a.name == "functools"}
+    _shadowed_partial = {
+        f.name for f in _own_scope(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } | {
+        t.id for n in _own_scope(tree) if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)
+    }
+
+    def _is_partial(f) -> bool:
+        if isinstance(f, ast.Name):
+            return f.id in _partial_names and f.id not in _shadowed_partial
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            return f"{f.value.id}.{f.attr}" in _partial_names
+        return False
+
+    exported: set[str] = set()
+    bindings: dict[str, set[str]] = {}
+    for n in _own_scope(tree):
+        # A RE-EXPORT IS A BINDING. `from ._impl import warning` makes it
+        # reachable as `printer.warning`, and `ImportFrom` was not a binder
+        # here at all -- the whole name derived nothing.
+        if isinstance(n, ast.ImportFrom):
+            exported |= {a.asname or a.name for a in n.names}
+            for a in n.names:
+                if a.asname:
+                    bindings.setdefault(a.asname, set()).add(a.name)
+            continue
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            exported.add(n.name)
+            continue
+        targets, value = [], None
+        if isinstance(n, ast.Assign):
+            targets = [t.id for t in n.targets if isinstance(t, ast.Name)]
+            value = n.value
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            targets, value = [n.target.id], n.value
+        exported |= set(targets)
+        for t in targets:
+            # A SET, NOT THE LAST ONE. `_names` returns a set, so assigning
+            # per element kept whichever came last in ITERATION order -- i.e.
+            # PYTHONHASHSEED. Measured: `banner = partial(_emit, 'x')` derived
+            # the printer on 2 of 6 seeds and lost it on 4.
+            bindings.setdefault(t, set()).update(_names(value))
+    funcs = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and n.name in exported]
+    # `ast.walk`, not `tree.body`: a printer defined inside an `if` or a
+    # `try` is still a printer -- one inside a class is NOT, and the filter
+    # above drops it, because it is not reachable as `printer.<name>(...)`. And a FIXPOINT, because a printer that
+    # DELEGATES to one reaches `print` just as surely -- a new `notice()`
+    # that calls `warning()` dies in the same screen blank, and the top-level
+    # scan alone reports it as safe.
+    found: set[str] = set()
+    while True:
+        grown = set()
+        for f in funcs:
+            # A NAME THE FUNCTION DEFINES ITSELF IS NOT THE PRINTER. A local
+            # `def warning(x): return x` shadows the module one, prints
+            # nothing, and would otherwise promote its enclosing function --
+            # which then marks every unrelated call of that name elsewhere.
+            # `ast.walk` HERE WAS THE BUG. It descends into nested CLASS
+            # bodies and doubly-nested defs, and neither binds anything in
+            # this function -- so an unrelated `_Fmt.print` suppressed a real
+            # `print(...)` and the printer went unexported. Only a def in
+            # this function's OWN scope shadows the module one.
+            # EVERY BINDER, not only `def`. A walrus, a `for` target, a
+            # `with ... as`, an `except ... as`, an `import ... as` and a
+            # plain assignment all rebind the name just as a nested `def`
+            # does, and the comment here used to say only a `def` could --
+            # a false statement about Python, and seven shapes reported as
+            # printers for a call to a name they had rebound.
+            shadowed = set()
+            for n in _own_scope(f):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    shadowed.add(n.name)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    shadowed |= {(a.asname or a.name).split(".")[0]
+                                 for a in n.names}
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    shadowed.add(n.name)
+                else:
+                    tgts = []
+                    if isinstance(n, ast.Assign):
+                        tgts = n.targets
+                    elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.NamedExpr):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.For):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.withitem) and n.optional_vars:
+                        tgts = [n.optional_vars]
+                    for t in tgts:
+                        if isinstance(t, ast.Name):
+                            shadowed.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            shadowed |= {e.id for e in t.elts
+                                         if isinstance(e, ast.Name)}
+            # THE CALL SCAN STAYS `ast.walk`, DELIBERATELY. Scoping it the
+            # way the shadow set is scoped would stop seeing a print inside
+            # a nested helper this function calls, and that miss is SILENT.
+            # Left wide it over-reports a function whose nested helper prints
+            # but is never called -- a loud false alarm in the matcher, which
+            # is the direction this guard is allowed to be wrong in.
+            if any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                   and sub.func.id not in shadowed
+                   and (sub.func.id == "print" or sub.func.id in found)
+                   for sub in ast.walk(f)):
+                grown.add(f.name)
+        # THE NAME IT IS EXPORTED UNDER, which need not be the name of the
+        # def: `banner = _emit`, `banner = _make_banner()`. Resolved in a
+        # SECOND loop after this one, the names it promotes could never be
+        # consumed by the delegation scan above, so a printer delegating to
+        # an ALIASED printer was silently missed.
+        # `print` TOO. `found` holds module functions that REACH the
+        # builtin, so it never contains the builtin itself -- and a
+        # binding whose only candidate is `print` (`banner = print`,
+        # `banner = lambda m: print(m)`) then promoted nothing. That is
+        # the most direct printer there is.
+        grown |= {t for t, v in bindings.items()
+                  if v & (found | grown | {"print"})}
+        if grown <= found:
+            break
+        found |= grown
+    # NO FLOOR ON THE POPULATION. An empty answer is what a printer module
+    # with no bare `print` gives, and that tree is strictly healthier. Asserted
+    # here it fires at IMPORT: measured, rewriting the two printers to
+    # `sys.stdout.write` -- a real weakening, still erased by the screen blank
+    # -- collected 0 of 199 tests and blamed "the parse or the layout". The
+    # matcher keeps its own denominator, and `_PRINTERS` always holds `print`.
+    return found
+
+
+#: Everything in `printer` that ends in a bare `print`, plus the builtin
+#: itself. A notice routed through any of these dies in the screen blank
+#: exactly as `print` does.
+_PRINTERS = {"print"} | _bare_print_printers()
+
+#: Fallback when the source binds the printer module under no name we can
+#: see. A LOGGER answers to `.warning`/`.error` too, and five modules here
+#: hold a module-level `_logger = logging.getLogger(...)`, so matching any
+#: Name base turns the CURE into an offender the moment this module adopts
+#: that idiom.
+_PRINTER_MODULES = {"printer"}
+
+
+def _print_only_offenders(src: str) -> tuple[list[int], int]:
+    """Lines carrying a print-only notice, and how many printer calls were seen.
+
+    The second number is the DENOMINATOR: a matcher that matches nothing --
+    a typo, a renamed helper -- is green for ever without it.
+
+    EVERY PRINTER, not the builtin alone. `printer.warning` IS
+    `print(_style(...))` and `printer.error` the same, so a bare `warning(msg)`
+    is a print-only notice the screen blank erases. `printer.warning(...)` as
+    well as `warning(...)`: an attribute call has no `.id`.
+
+    A NAMED PRINTER MODULE, though. `self._logger.warning(...)` and a
+    module-level `_logger.warning(...)` are attribute calls whose `attr` is
+    also "warning", and they are the CURE this guards for, not the defect.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    # THE SOURCE'S OWN NAMES, not a literal. `from claude_swap import printer
+    # as p` binds the module under `p`, and a literal set misses it -- a miss
+    # this guard did not have before the set was introduced.
+    bases = set(_PRINTER_MODULES)
+    # THE FUNCTIONS TOO, by the same rule. `from claude_swap.printer import
+    # warning as print_warning` binds a printer under a name no literal set
+    # can hold -- and that is not a hypothetical spelling: `oauth.py` uses it.
+    # The module half of this took the source's own names and the function
+    # half kept a literal, so the guard read one alias and not the other.
+    printers = set(_PRINTERS)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "claude_swap":
+            bases |= {a.asname or a.name for a in node.names if a.name == "printer"}
+        elif isinstance(node, ast.ImportFrom) and node.module == "claude_swap.printer":
+            printers |= {a.asname or a.name for a in node.names
+                         if a.name in _PRINTERS}
+        elif isinstance(node, ast.Import):
+            bases |= {a.asname for a in node.names
+                      if a.name == "claude_swap.printer" and a.asname}
+    found: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name):
+            called = f.id
+        elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id in bases):
+            called = f.attr
+        else:
+            continue
+        # ARGS OR KEYWORDS. `printer.warning(msg="...")` is a print-only
+        # notice with an empty `node.args`, and the filter was inert in both
+        # directions: deleting it changed nothing either.
+        if called not in printers or not (node.args or node.keywords):
+            continue
+        found.append((node.lineno, id(node)))
+    # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by line
+    # range, and scoped to CLASS BODIES: `ast.walk` reaches a nested
+    # `def _note(m): print(...)` written inside the function under test, so
+    # the bypass would otherwise be one line long.
+    sanctioned = {
+        id(c)
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for fn in cls.body
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and fn.name in _SANCTIONED_PRINTERS
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call)
+    }
+    return [n for n, node_id in found if node_id not in sanctioned], len(found)
+
+
+def _notices_before_exec(src: str) -> tuple[list[int], int]:
+    """Print-only calls in the statements that lead straight into an exec.
+
+    For every `<x>.exec_default(...)` statement, EVERY statement before it in
+    the same block is the notice's whole life on screen -- a branch that
+    returns first included. Narrowing to the paths that reach the exec has no
+    shape to key on: a `return` marking one is either nested in an `if`, and
+    so not a statement of this block, or a statement of it, and so makes the
+    exec below unreachable.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    offender_lines = set(_print_only_offenders(src)[0])
+    found: list[int] = []
+    execs = 0
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for i, stmt in enumerate(body):
+            call = stmt.value if isinstance(stmt, ast.Expr) else None
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "exec_default"):
+                continue
+            execs += 1
+            found += [c.lineno for prev in body[:i] for c in ast.walk(prev)
+                      if isinstance(c, ast.Call) and c.lineno in offender_lines]
+    return sorted(set(found)), execs
+
+
+class TestEveryLaunchNoticeOutlivesTheBlank:
+    """The screen blank erases stdout, so a print-only notice reaches nobody.
+
+    This PR converted the success line in `_sync_sharing` to `_note` and left
+    two failure notices beside it on the same `run()` path. Measured: with a
+    non-quiescent profile the reason is printed and the log holds nothing, so
+    `--share-history` silently does not share and the explanation is gone.
+
+    STRUCTURAL, because a behavioural case per site invites the next one to be
+    added without one: no bare `print(dimmed(...))` may survive in the module
+    whose whole subject is notices that outlive the blank.
+    """
+
+    def test_a_styled_line_reaches_the_log_plain(self, manager, caplog):
+        """`_plain` on BOTH routes.
+
+        The colour-on launch case reads records the launch path produced, and
+        no `_warn` fires there -- measured, dropping `_plain` from `_warn`
+        alone left the whole suite green. Every other case runs colour-off,
+        where `_plain` is the identity function, so nothing held the warning
+        route at all.
+
+        The escape is written literally rather than through `accent`, so the
+        premise does not depend on the printer's colour detection.
+        """
+        import logging
+
+        styled = "\x1b[38;5;173mLaunching\x1b[0m into \x1b[2ma slot\x1b[0m"
+        assert "\x1b[" in styled, (
+            "premise: the input carries no escape, so a logger that recorded "
+            "it verbatim would pass this too"
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            manager._warn(styled)
+            manager._note(styled)
+
+        got = [r.getMessage() for r in caplog.records]
+        assert len(got) == 2, f"premise: both routes did not record: {got}"
+        assert [m for m in got if "\x1b[" in m] == [], (
+            "a record carries SGR escapes, so the log the README points a "
+            f"user at fills with them: {got}"
+        )
+
+    def test_no_launch_notice_is_print_only(self):
+        import pathlib
+
+        import claude_swap.session as session_mod
+
+        src = pathlib.Path(session_mod.__file__).read_text(encoding="utf-8")
+        offenders, seen = _print_only_offenders(src)
+        # THE DERIVED NAMES, NOT THE BUILTIN. `_PRINTERS` always holds
+        # `print`, and session.py always has one sanctioned `print`, so
+        # `seen` could not reach zero however badly the derivation failed:
+        # replacing it wholesale with `{"print"}` left this assert green.
+        derived = _bare_print_printers() - {"print"}
+        assert derived, (
+            "the derivation produced no printer name beyond the builtin, so "
+            "every call this matcher could newly catch is invisible to it"
+        )
+        assert seen, (
+            "the walk found no `print` at all in session.py — the matcher is "
+            "broken, not the module clean"
+        )
+        assert offenders == [], (
+            "a launch notice is print-only, so the screen blank erases it and "
+            f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
+            "Use `_note`."
+        )
+
+    def test_no_launch_notice_in_the_cli_is_print_only(self):
+        """The CLI's own launch path: a notice printed and then `exec_default`.
+
+        The sibling of the `session.py` defect this PR fixed. The block that
+        precedes the exec in the same function is the notice's whole life on
+        screen; anything printed there without a log record is gone with the
+        blank."""
+        import pathlib
+
+        import claude_swap.cli as cli_mod
+
+        src = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
+        offenders, execs = _notices_before_exec(src)
+        assert execs, "no `exec_default` call found in cli.py — the matcher is blind"
+        # AND THE OTHER HALF. `execs` covers finding the exec; this covers
+        # finding the notices. It is the exact set the narrowing intersects, so
+        # populated, an empty result above is a clean block, not a blind walk.
+        printed_anywhere, _ = _print_only_offenders(src)
+        assert printed_anywhere, (
+            "the print-only matcher reported nothing anywhere in cli.py, so an "
+            "empty result above means the matcher is blind, not the block clean"
+        )
+        assert offenders == [], (
+            "a launch notice is print-only in the block before an exec, so the "
+            f"screen blank erases it: {[f'cli.py:{n}' for n in offenders]}. "
+            "Route it through the manager's `_warn`/`_note`."
+        )
+
+    def test_the_derivation_does_not_depend_on_the_hash_seed(self):
+        """The regression case for the seed defect was itself seed-dependent.
+
+        A two-candidate binding is 50/50 under a last-wins `bindings`, so the
+        case written to catch that defect passed on 4 runs in 10 -- and the
+        direction that ships is the silent one. Nothing about a source shape
+        can fix this: an n-candidate set is 1/n by construction. The seed has
+        to be forced, and forcing it needs a subprocess.
+
+        HOME and XDG_DATA_HOME are pointed at a scratch dir so that even an
+        import side effect cannot reach the real account store.
+        """
+        import json
+        import pathlib
+        import subprocess
+        import sys
+        import tempfile
+
+        src = (
+            "from functools import partial\n"
+            "def _emit(p, m): print(m)\n"
+            "banner = partial(_emit, 'x')\n"
+        )
+        here = pathlib.Path(__file__).resolve()
+        prog = (
+            "import importlib.util, json, sys\n"
+            f"spec = importlib.util.spec_from_file_location('t', {str(here)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "print(json.dumps(sorted(m._bare_print_printers(sys.argv[1]))))\n"
+        )
+        answers = {}
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {
+                **os.environ, "HOME": scratch, "XDG_DATA_HOME": scratch,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            for seed in ("0", "1", "2", "3", "4", "5"):
+                out = subprocess.run(
+                    [sys.executable, "-c", prog, src],
+                    env={**env, "PYTHONHASHSEED": seed},
+                    capture_output=True, text=True, timeout=120,
+                )
+                assert out.returncode == 0, (
+                    f"seed {seed}: the probe did not run, so this case "
+                    f"measured nothing: {out.stderr[-400:]}"
+                )
+                answers[seed] = json.loads(out.stdout.strip().splitlines()[-1])
+        distinct = {json.dumps(v) for v in answers.values()}
+        assert len(distinct) == 1, (
+            "the derived set changes with PYTHONHASHSEED, so the guard's "
+            f"answer is a coin flip: {answers}"
+        )
+        # AND THE RIGHT ANSWER, not merely a stable one. A derivation that
+        # returned nothing at all would be perfectly consistent.
+        assert "banner" in answers["0"], (
+            f"stable but wrong -- the exported printer is absent: {answers['0']}"
+        )
+
+    def test_a_printer_delegating_to_an_ALIASED_printer_is_derived(self):
+        """Resolving aliases in a loop AFTER the delegation fixpoint misses them.
+
+        Both features shipped together and did not compose: the names the
+        alias pass promoted could never re-enter the loop that consumes
+        `found`, so `notice` -- which reaches `print` through `warning = _emit`
+        -- was absent from `_PRINTERS` and every `notice(...)` in session.py
+        went unflagged. Silent, which is the direction that matters.
+        """
+        found = _bare_print_printers("""
+def _emit(m): print(m)
+warning = _emit
+def notice(m): warning(m)
+def deeper(m): notice(m)
+""")
+        assert {"notice", "deeper"} <= found, (
+            "delegation through an alias was not resolved: "
+            f"{sorted(found)}"
+        )
+
+    def test_a_constant_built_from_a_call_is_not_a_printer(self):
+        """Following EVERY call's arguments promotes non-printers without bound.
+
+        A module constant built by a call that merely mentions a printer would
+        become a printer, and then anything built from that constant too. The
+        cost is not a bounded false alarm: `_PRINTERS` holds a name that prints
+        nothing, and the matcher then fails on session.py lines that are not
+        notices -- a red suite with a wrong diagnosis.
+        """
+        found = _bare_print_printers("""
+def warning(m): print(m)
+def _len(x): return 1
+WIDTH = _len(warning)
+TABLE = dict(WIDTH)
+LABEL = str(TABLE)
+""")
+        assert found == {"warning"}, (
+            f"a non-printer was promoted through a call chain: {sorted(found)}"
+        )
+
+    def test_a_factory_exported_printer_is_not_filtered_out(self):
+        """The nesting filter dropped the reachable name and kept the unreachable
+        one.
+
+        Its question is "is this reachable as `printer.<name>(...)`", and it
+        answered it by NESTING -- so `banner = _make_banner()` exported
+        `_make_banner`, which prints nothing, and missed `banner`, which does.
+        Reachability is a module-level BINDING, which is what it keys on now.
+        Over-reporting a name only costs a loud false alarm in the matcher;
+        under-reporting is silent, and silent is the failure this guard exists
+        to prevent.
+        """
+        missed = []
+        for label, src in (
+            # THE INNER DEF IS RENAMED, so a match on `.name` cannot find it.
+            # Spelled `banner` this case passes by coincidence, which is how
+            # the first cut shipped resolving nothing.
+            ("factory", """
+def _make_banner():
+    def _inner(msg): print(msg)
+    return _inner
+banner = _make_banner()
+"""),
+            ("plain alias", """
+def _emit(m): print(m)
+banner = _emit
+"""),
+            ("partial", """
+import functools
+def _emit(p, m): print(m)
+banner = functools.partial(_emit, 'x')
+"""),
+            # SPELLED BARE, so the candidate set is {'partial', '_emit'} and
+            # not the single name an `Attribute` callee leaves. Keeping one
+            # candidate per target answered this by PYTHONHASHSEED -- measured
+            # on the shipped code, derived on 2 of 6 seeds and lost on 4.
+            ("bare partial", """
+from functools import partial
+def _emit(p, m): print(m)
+banner = partial(_emit, 'x')
+"""),
+            # AND THE KEYWORD FORM, which the argument scan did not read.
+            ("partial by keyword", """
+from functools import partial
+def _emit(m): print(m)
+banner = partial(func=_emit)
+"""),
+            # THE MOST DIRECT PRINTER THERE IS, and it derived nothing: the
+            # promotion tests membership in `found`, which never holds the
+            # builtin.
+            ("lambda straight to print", """
+banner = lambda m: print(m)
+"""),
+            ("plain alias of the builtin", """
+banner = print
+"""),
+            # `partial` UNDER AN IMPORT ALIAS. Matched by the literal
+            # spelling this was a silent miss.
+            ("partial imported as another name", """
+from functools import partial as pt
+def _emit(p, m): print(m)
+banner = pt(_emit, 'x')
+"""),
+            ("functools under an alias", """
+import functools as ft
+def _emit(p, m): print(m)
+banner = ft.partial(_emit, 'x')
+"""),
+        ):
+            # COLLECTED, NOT ASSERTED PER ROW. Asserting inside the loop
+            # stops at the first failure, so a mutation that kills rows 2-5
+            # is reported as a row-1 failure and the other four never run.
+            if "banner" not in _bare_print_printers(src):
+                missed.append(label)
+        assert not missed, (
+            f"the exported printer was not derived for: {missed}"
+        )
+
+    @pytest.mark.parametrize("shape,body,expected", [
+        (
+            "a nested class method of the same name",
+            """
+def print_helper():
+    class _Fmt:
+        def print(self): pass
+    print("x")
+""",
+            {"print_helper"},
+        ),
+        (
+            "a doubly-nested def of the same name",
+            """
+def banner(msg):
+    def outer():
+        def print(x): return x
+    print(msg)
+""",
+            {"banner"},
+        ),
+        (
+            "a genuine same-scope shadow",
+            """
+def banner(msg):
+    def print(x): return x
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "a walrus rebinding the name",
+            """
+def banner(msg):
+    (print := (lambda x: x))
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "an `except ... as` rebinding it",
+            """
+def banner(msg):
+    try: pass
+    except Exception as print: pass
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "a plain assignment rebinding it",
+            """
+def banner(msg):
+    print = str
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "a comprehension, which has its OWN scope and shadows nothing",
+            """
+def banner(msg):
+    [print for print in []]
+    print(msg)
+""",
+            {"banner"},
+        ),
+    ])
+    def test_a_shadow_only_counts_in_the_scope_that_binds_it(
+        self, shape, body, expected
+    ):
+        """Source of its own, because `printer.py` gives the filters NOTHING.
+
+        Measured on the real module: the nested-def filter removes 0 nodes and
+        the shadow filter removes 0 names, so either could be deleted with the
+        suite green -- and one of them shipped over-broad for exactly that
+        reason. `shadowed` was collected with `ast.walk`, which descends into
+        nested CLASS bodies and doubly-nested defs. Neither binds anything in
+        the enclosing function, so an unrelated `_Fmt.print` suppressed a real
+        `print(...)` and the printer went unexported -- the launch notice it
+        carries then reads as safe. Only the third case is a shadow Python
+        agrees with.
+        """
+        assert _bare_print_printers(body) == expected, shape
+
+    def test_the_matcher_sees_both_call_shapes_and_spares_the_cure(self):
+        """Source of its own, because session.py exercises ONE of the halves.
+
+        The module has no `printer.warning(...)` and eleven
+        `self._logger.warning(...)`, so the attribute branch never fires on
+        it: deleting that branch, or widening it to any `attr`, is invisible
+        from the real file. Handing the matcher each shape is what makes both
+        halves answerable.
+        """
+        cases = [
+            ("the builtin", "print('x')", True),
+            ("a bare printer name", "warning('x')", True),
+            ("a module alias", "printer.warning('x')", True),
+            ("printer.error too", "printer.error('x')", True),
+            ("a keyword-only notice", "printer.warning(msg='x')", True),
+            ("a blank-line separator", "print()", False),
+            ("an ALIASED printer module",
+             "import x\nfrom claude_swap import printer as p\np.warning('x')",
+             True),
+            # NOT A HYPOTHETICAL SPELLING: `oauth.py` imports the printer this
+            # way today, so a launch notice copied from it was invisible here.
+            ("an ALIASED printer FUNCTION",
+             "from claude_swap.printer import warning as print_warning\n"
+             "print_warning('x')",
+             True),
+            ("...and an alias of something that is not a printer",
+             "from claude_swap.printer import accent as a\na('x')",
+             False),
+            ("the logger, which is the CURE", "self._logger.warning('x')", False),
+            ("a MODULE-LEVEL logger, the sibling modules' idiom",
+             "_logger.warning('x')", False),
+            ("a sanctioned printer", "self._warn('x')", False),
+        ]
+        for label, expr, flagged in cases:
+            src = f"class C:\n    def f(self):\n        {expr}\n"
+            offenders, seen = _print_only_offenders(src)
+            assert bool(offenders) is flagged, (
+                f"{label}: `{expr}` was "
+                f"{'missed' if flagged else 'flagged'} by the matcher "
+                f"(offenders={offenders}, printer calls seen={seen})"
+            )
+
+    def test_a_sanctioned_printers_own_print_is_not_an_offender(self):
+        """The exclusion is by node identity, and it must survive a rename."""
+        src = ("class C:\n"
+               "    def _note(self, m):\n"
+               "        print(m)\n"
+               "    def other(self, m):\n"
+               "        print(m)\n")
+        offenders, seen = _print_only_offenders(src)
+        assert seen == 2, f"premise: the matcher saw {seen} prints, not 2"
+        assert offenders == [5], (
+            f"only `other`'s print is an offender; got {offenders}"
+        )
+
+    def test_a_nested_sanctioned_name_does_not_sanction_its_own_print(self):
+        """The exclusion is scoped to CLASS BODIES, and that is load-bearing.
+
+        `ast.walk` reaches a `def _note(...)` written INSIDE the function
+        under test, so an unscoped walk lets one line sanction itself. Nothing
+        held that: replacing the class-body walk with a bare one over the tree
+        left every case green.
+        """
+        src = ("class C:\n"
+               "    def run(self, m):\n"
+               "        def _note(x):\n"
+               "            print(x)\n"
+               "        _note(m)\n")
+        offenders, seen = _print_only_offenders(src)
+        assert seen == 1, f"premise: the matcher saw {seen} prints, not 1"
+        assert offenders == [4], (
+            "a `_note` nested inside a method sanctioned its own print, so "
+            f"the bypass is one line long: {offenders}"
         )

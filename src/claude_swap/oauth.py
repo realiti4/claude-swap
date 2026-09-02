@@ -68,6 +68,41 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
+# Error KINDS carrying a remedy. Every surface that shows one renders it
+# through here, so they describe the same state identically.
+ERROR_NOTES = {
+    "tls-cert": (
+        "the certificate chain was not trusted, most often a TLS-terminating "
+        "proxy whose CA is missing here, sometimes an expired duplicate root "
+        "shadowing a valid one; fix it in the OS store on macOS/Windows, or "
+        "via SSL_CERT_FILE on Linux (REQUESTS_CA_BUNDLE and "
+        "NODE_EXTRA_CA_CERTS are not read on this path)"
+    ),
+    "store-unmirrored": (
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
+        "normal shell"
+    ),
+    "no_refresh_token": (
+        "this slot's stored credential carries no refresh token — log in as "
+        "this account again, then re-add the slot"
+    ),
+    "invalid_grant": (
+        "this slot's refresh lineage is dead — log in as this account "
+        "again, then re-add the slot"
+    ),
+    "invalid_client": (
+        "cswap's OAuth client was rejected — systemic, not this account"
+    ),
+    "consume-busy": (
+        "another cswap surface holds the slot — retries next pass"
+    ),
+    "stash-unreadable": (
+        "this slot's stashed successor is unreadable — unlock the keychain "
+        "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+}
+
+
 @dataclass(frozen=True)
 class RefreshOutcome:
     """Result of a refresh-token grant attempt.

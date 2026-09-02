@@ -74,6 +74,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import (
     get_backup_root,
     get_credentials_path,
@@ -178,22 +179,6 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-store-unreadable",
 )
 
-ERROR_NOTES = {
-    "store-unmirrored": (
-        "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
-        "normal shell"
-    ),
-    "invalid_client": (
-        "cswap's OAuth client was rejected — systemic, not this account"
-    ),
-    "consume-busy": (
-        "another cswap surface holds the slot — retries next pass"
-    ),
-    "stash-unreadable": (
-        "this slot's stashed successor is unreadable — unlock the keychain "
-        "or fix the file, then retry; `cswap unclaimed` inspects it"
-    ),
-}
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
@@ -793,9 +778,18 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
+        from claude_swap.session import mark_session_stale, profile_is_quiescent
 
+        # BOTH, because they answer different halves. `_live_session_pids`
+        # is scan-shaped -- an unreadable record contributes no PID, so it
+        # reads as "nothing is running" and the else-branch DELETES the seed
+        # and the Keychain entry. Not knowing is not knowing nothing is
+        # there, and every other destructive site in the pair of files asks
+        # the readability-aware question. Either saying "it might be live"
+        # takes the non-destructive branch.
+        if self._live_session_pids(account_num, email) or not profile_is_quiescent(
+            self._session_dir(account_num, email)
+        ):
             if not mark_session_stale(self._session_dir(account_num, email)):
                 self._logger.error(
                     "Account %s's backup credentials changed but its live "
@@ -1837,6 +1831,31 @@ class ClaudeAccountSwitcher:
             and not self._disabled_from_data(data, str(num))
         ]
 
+    def _empty_rotation_advice(self, any_readable: bool) -> str:
+        """Why nothing is selectable, and the remedy that matches the cause.
+
+        Takes the verdict: the caller has already read every slot to reach
+        this branch, and on a locked store each read costs a subprocess.
+
+        `_account_is_switchable` discards the absent-vs-unreadable verdict
+        that `_read_account_credentials_ex` carries, so the second arm must
+        not lead with a re-add — it would overwrite a credential the user
+        simply cannot see right now.
+        """
+        if any_readable:
+            return (
+                "No accounts remain in rotation — auto-switch and bare switch "
+                "have nothing to pick. Re-enable one with "
+                "cswap enable <num|email>."
+            )
+        return (
+            "No managed account is usable — their stored credentials/config "
+            "could not be read, so auto-switch and bare switch have nothing "
+            "to pick. If a credential store is locked or a volume is "
+            "unmounted, fix that first; otherwise re-add a slot with "
+            "cswap --add-account --slot <number>."
+        )
+
     @staticmethod
     def _disabled_from_data(data: dict, account_num: str) -> bool:
         """Whether a slot is flagged out of rotation in already-loaded data."""
@@ -1904,12 +1923,14 @@ class ClaudeAccountSwitcher:
                     "  It is the active account — it stays live until you switch "
                     "away; it just won't be an automatic switch target."
                 ))
-            if not self.switchable_account_numbers():
-                warning(
-                    "  No accounts remain in rotation — auto-switch and bare "
-                    "switch have nothing to pick. Re-enable one with "
-                    "cswap enable <num|email>."
-                )
+            # One pass serves both: the gate is "every readable slot is
+            # disabled", which is vacuously true when none is readable.
+            readable = [
+                n for n in map(str, data.get("sequence", []))
+                if self._account_is_switchable(n)
+            ]
+            if all(self._disabled_from_data(data, n) for n in readable):
+                warning("  " + self._empty_rotation_advice(bool(readable)))
         else:
             print(dimmed("  It is back in the rotation."))
 
@@ -5846,17 +5867,10 @@ class ClaudeAccountSwitcher:
                     None,
                 )
                 if not fallback:
-                    if any(
-                        self._account_is_switchable(str(num)) for num in sequence
-                    ):
-                        raise ConfigError(
-                            "No accounts remain in rotation. Re-enable one with: "
-                            "cswap enable <num|email>"
-                        )
-                    raise ConfigError(
-                        "No managed accounts have valid stored credentials/config. "
-                        "Re-add a slot with: cswap --add-account --slot <number>"
-                    )
+                    raise ConfigError(self._empty_rotation_advice(
+                        any(self._account_is_switchable(str(num))
+                            for num in sequence)
+                    ))
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
             return (

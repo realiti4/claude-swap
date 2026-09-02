@@ -1516,6 +1516,14 @@ class TestRunAutoResolve:
             def exec_default(self, claude_args):
                 calls.append(("exec_default", claude_args))
 
+            # The launch notices go through these so they outlive the exec's
+            # screen blank; the fake prints them the way the real ones do.
+            def _warn(self, msg):
+                print(msg)
+
+            def _note(self, msg, *, dim=True):
+                print(msg)
+
         return FakeSessionManager
 
     def _fake_switcher(self, backup, seq):

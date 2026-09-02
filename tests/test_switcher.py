@@ -5433,8 +5433,24 @@ class TestSwitchSkipsBrokenSlots:
         self._seed(s, 1, "a@example.com", creds=False)
         self._seed(s, 2, "b@example.com", config=False)
 
-        with pytest.raises(ConfigError, match="No managed accounts have valid"):
+        # The blocking site gets the same advice as the informational one:
+        # _account_is_switchable cannot tell an absent backup from one it
+        # failed to read, so neither site may lead with a destructive re-add.
+        #
+        # Matched on a phrase only THIS message carries. "could not be read"
+        # appears fifteen times across three modules, so it passed for an
+        # unrelated ConfigError raised anywhere in the call.
+        with pytest.raises(ConfigError, match="No managed account is usable"):
             s.switch()
+        # The ORDER is the finding, not just the wording: a locked store or an
+        # unmounted volume must be offered before a re-add that overwrites the
+        # credential the user simply cannot see right now.
+        with pytest.raises(ConfigError) as exc:
+            s.switch()
+        text = str(exc.value)
+        assert text.index("fix that first") < text.index("re-add a slot"), (
+            f"the destructive remedy is offered before the recoverable one: {text}"
+        )
 
     def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
         s = self._setup(temp_home)
@@ -8769,6 +8785,87 @@ class TestDisableEnableAccount:
         s.set_account_disabled("2", True)  # now nothing left in rotation
 
         assert "No accounts remain in rotation" in capsys.readouterr().out
+
+    def test_disable_warns_about_nothing_while_a_slot_is_still_in_rotation(
+        self, temp_home, capsys
+    ):
+        """CONTROL for both warnings above. Every other test here asserts a
+        message is present, which a predicate that fired unconditionally would
+        also satisfy."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("1", True)  # 2 is readable and still enabled
+
+        assert "nothing to pick" not in capsys.readouterr().out
+
+    def test_the_empty_rotation_verdict_reads_each_slot_once(
+        self, temp_home, capsys
+    ):
+        """The gate and the advice need the same per-slot read.
+
+        Taking it twice doubles a keychain subprocess per miss, and every
+        failed read logs a warning — so the branch whose advice is "a store
+        may be locked" would write each such failure into the log twice.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        with patch.object(
+            s, "_account_is_switchable", wraps=s._account_is_switchable
+        ) as spy:
+            s.set_account_disabled("1", True)   # rotation still has slot 2
+            s.set_account_disabled("2", True)   # empties it: advice branch
+
+        assert spy.call_count == 4
+
+    def test_disable_warns_about_credentials_when_no_slot_is_readable(
+        self, temp_home, capsys
+    ):
+        """An empty rotation from unreadable slots must not advise `cswap enable`.
+
+        switchable_account_numbers() is empty when a slot is disabled OR when
+        its stored credentials cannot be read. Only the first is fixed by
+        re-enabling, so the second needs the other remedy.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        # No slot readable, the disabled one included: _account_is_switchable
+        # never consults the disabled flag, so a readable slot 1 would still
+        # be a re-enable candidate and select the other branch.
+        with patch.object(s, "_read_account_credentials", return_value=""):
+            s.set_account_disabled("1", True)
+
+        out = capsys.readouterr().out
+        assert "cswap enable" not in out
+        assert "could not be read" in out
+        assert "cswap --add-account" in out
+
+    def test_the_unreadable_advice_does_not_vary_by_platform(
+        self, temp_home, capsys
+    ):
+        """The platform says which store exists, never whether it was READ.
+
+        An unreadable slot is a locked store on macOS and an unreadable file
+        elsewhere, and both take the same remedy, so branching on the platform
+        only lets one arm drift.
+        """
+        out = {}
+        for platform in (Platform.LINUX, Platform.MACOS):
+            s = self._setup(temp_home)
+            self._seed(s, 1, "a@example.com")
+            s.platform = platform
+            capsys.readouterr()
+            with patch.object(s, "_read_account_credentials", return_value=""):
+                s.set_account_disabled("1", True)
+            out[platform] = capsys.readouterr().out
+
+        assert out[Platform.LINUX] == out[Platform.MACOS]
+        assert "could not be read" in out[Platform.LINUX]
 
     # -- display -----------------------------------------------------------
 
