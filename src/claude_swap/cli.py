@@ -915,6 +915,178 @@ def _use_native_tls() -> None:
         pass
 
 
+def _chrome_command(argv: list[str]) -> None:
+    """Handle `cswap chrome [setup|doctor|open|capture N|create-profile|enable|disable]`.
+
+    Pre-dispatched like `config`/`run`/`auto`. Drives the optional (macOS-only)
+    Chrome extension sync: a dedicated Chrome profile whose extension account
+    (OAuth tokens) follows `cswap switch`. Disabled by default — `cswap chrome
+    enable` / `cswap chrome setup` opt in; CLI account switching is unaffected.
+    """
+    from claude_swap import chrome_onboard
+    from claude_swap import chrome_session as cs
+    from claude_swap.settings import load_chrome_settings, set_chrome_enabled
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} chrome",
+        description=(
+            "Optional (macOS): switch the Claude browser extension's account "
+            "alongside the CLI account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap chrome setup            # guided one-time setup
+  cswap chrome doctor           # what's set up + per-account coverage
+  cswap chrome open             # open/focus the dedicated Claude Browser
+  cswap chrome capture 3        # store account 3's tokens (connect it there first)
+  cswap chrome refresh 3        # keep account 3's stored tokens alive (no browser)
+  cswap chrome bridge install   # relay so a running session follows a switch (LOCAL_BRIDGE=1)
+  cswap chrome create-profile   # (re)create the dedicated Chrome profile
+  cswap chrome enable | disable # turn the feature on/off
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(
+        dest="action",
+        metavar="{setup,doctor,open,capture,refresh,bridge,create-profile,enable,disable}",
+    )
+    sub.add_parser("setup", help="Guided one-time setup")
+    sub.add_parser("doctor", help="Report setup state and per-account coverage")
+    sub.add_parser("status", help=argparse.SUPPRESS)  # alias for doctor
+    p_bridge = sub.add_parser(
+        "bridge", help="Local bridge relay so a running session follows a switch (LOCAL_BRIDGE=1)")
+    p_bridge.add_argument(
+        "op", nargs="?", choices=["run", "install", "uninstall", "status"], default="run",
+        help="run (foreground daemon), install/uninstall the LaunchAgent, or status")
+    p_bridge.add_argument("--port", type=int, default=None, help="Relay port (default: settings/8765)")
+    p_open = sub.add_parser("open", help="Open the dedicated Claude Browser (launch if needed)")
+    p_open.add_argument(
+        "--ensure", action="store_true",
+        help="Launch only if not already running; no-op if it is (for hooks)",
+    )
+    p_open.add_argument(
+        "--focus", action="store_true",
+        help="Bring the browser window to the foreground (off by default)",
+    )
+    p_cap = sub.add_parser("capture", help="Store the account the extension is connected to")
+    p_cap.add_argument("account", metavar="N", help="Account number to store the current tokens for")
+    p_ref = sub.add_parser("refresh", help="Offline-refresh a stored account's tokens (keep-alive)")
+    p_ref.add_argument("account", metavar="N", help="Account number to refresh")
+    p_cp = sub.add_parser("create-profile", help="(Re)create the dedicated Chrome profile")
+    p_cp.add_argument("--rebuild", action="store_true", help="Delete and recreate the profile")
+    sub.add_parser("enable", help="Turn Chrome sync on")
+    sub.add_parser("disable", help="Turn Chrome sync off")
+
+    args = parser.parse_args(argv)
+    action = args.action or "doctor"
+
+    switcher = ClaudeAccountSwitcher(debug=args.debug)
+    if sys.platform != "win32":
+        if os.geteuid() == 0 and not switcher._is_running_in_container():
+            error("Error: Do not run this script as root (unless running in a container)")
+            sys.exit(1)
+    root = switcher.backup_dir
+
+    if action in ("doctor", "status"):
+        chrome_onboard.print_doctor(switcher)
+        return
+    if action == "setup":
+        sys.exit(chrome_onboard.run_setup(switcher))
+    if action == "enable":
+        set_chrome_enabled(root, True)
+        print(f"{accent('Enabled')} Chrome sync. Next: {accent('cswap chrome setup')}")
+        return
+    if action == "disable":
+        set_chrome_enabled(root, False)
+        print(f"{accent('Disabled')} Chrome sync (CLI account switching is unaffected).")
+        return
+
+    # The remaining verbs act on the dedicated browser: need macOS + the feature on.
+    if not cs.is_supported():
+        error("Chrome sync is macOS-only.")
+        sys.exit(1)
+    settings = load_chrome_settings(root)
+
+    # The bridge relay runs independently of the enable gate (LaunchAgent keeps
+    # it up), so `run` must not exit just because sync is toggled off.
+    if action == "bridge":
+        from claude_swap import chrome_bridge as cbr
+        port = args.port or settings.bridge_port
+        if args.op == "run":
+            import logging
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            lg = logging.getLogger("claude-swap")
+            lg.addHandler(h)
+            lg.setLevel(logging.INFO)
+            cbr.serve(root, port)
+            return
+        if args.op == "install":
+            path = cbr.install_launchagent(port)
+            print(f"{accent('Installed')} bridge relay LaunchAgent → {path}")
+            print(dimmed(f"Launch Claude Code with LOCAL_BRIDGE=1 to route it through the relay "
+                         f"(port {port})."))
+            return
+        if args.op == "uninstall":
+            removed = cbr.uninstall_launchagent()
+            print(f"{accent('Removed') if removed else accent('No')} bridge relay LaunchAgent")
+            return
+        if args.op == "status":
+            running = cbr.is_running(port)
+            loaded = cbr.launchd_loaded()
+            print(f"bridge relay: {'running' if running else 'not running'} on port {port}; "
+                  f"LaunchAgent {'loaded' if loaded else 'not loaded'}")
+            return
+
+    if not settings.enabled:
+        error("Chrome sync is disabled. Run: cswap chrome enable")
+        sys.exit(1)
+    sync = cs.ChromeSync(settings, root)
+
+    if action == "create-profile":
+        udd = cs.resolve_automation_dir(settings, root)
+        if args.rebuild and udd.exists():
+            import shutil
+            shutil.rmtree(udd, ignore_errors=True)
+        cs.ensure_automation_profile(udd)
+        cs.set_profile_display_name(udd)
+        cs.launch_automation_chrome(udd, settings.debug_port, start_url=cs.CLAUDE_EXTENSION_STORE_URL)
+        print(f"{accent('Profile ready')} at {udd}")
+        print(dimmed("Install the Claude extension in the opened window, then run `cswap chrome doctor`."))
+        return
+    if action == "open":
+        # --ensure: leave a running browser (and any in-progress session)
+        # untouched — used by a PreToolUse hook before each browser tool call.
+        if getattr(args, "ensure", False) and cs.automation_chrome_running(settings.debug_port):
+            return
+        focus = getattr(args, "focus", False)
+        data = switcher._get_sequence_data() or {}
+        active = data.get("activeAccountNumber")
+        if active is not None:
+            sync.open_and_activate(str(active), focus=focus)
+            print(f"{accent('Claude Browser')} open on account {active}")
+        else:
+            sync._ensure_up()
+            if focus:
+                cs.bring_automation_to_front(settings.debug_port)
+            print(f"{accent('Claude Browser')} open")
+        return
+    if action == "capture":
+        if sync.capture_from_browser(args.account):
+            print(f"{accent('Captured')} account {args.account} from the extension's current pairing")
+            return
+        error(f"Capture failed — open the Claude Browser and connect account {args.account} first")
+        sys.exit(1)
+    if action == "refresh":
+        if sync.refresh_account(args.account):
+            print(f"{accent('Refreshed')} stored tokens for account {args.account}")
+            return
+        error(f"Refresh failed for account {args.account} — no stored tokens, or the refresh "
+              f"token expired (re-capture: cswap chrome capture {args.account})")
+        sys.exit(1)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -958,6 +1130,9 @@ def main() -> None:
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
+        return
+    if argv and argv[0] == "chrome":
+        _chrome_command(argv[1:])
         return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like

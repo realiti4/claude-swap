@@ -281,10 +281,13 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    chrome_bound: bool = False,
 ) -> str:
     """Build one account row's menu label."""
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
+    if chrome_bound:
+        marker += "  (chrome)"
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
@@ -674,11 +677,13 @@ def run(switcher) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            chrome_bound = self.switcher._chrome_bound_accounts()
             account_items = []
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at, chrome_bound=str(num) in chrome_bound,
                     ),
                     callback=self._make_switch_to(num),
                 )

@@ -248,6 +248,61 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 </details>
 
+## Chrome extension sync (macOS)
+
+<details>
+<summary>Optional — also switch the "Claude in Chrome" extension's account when you switch</summary>
+
+`cswap switch` changes the account the `claude` CLI uses. This opt-in add-on also switches the account the **Claude browser extension** uses, so Claude Code's browser automation follows the same account.
+
+Two separate logins are involved, linked by account number:
+
+- **CLI** — the `claude` command's account (Keychain OAuth), managed already.
+- **Browser** — the Claude in Chrome extension's own OAuth pairing.
+
+The extension authenticates with OAuth tokens (not a cookie), held in its
+service worker's in-memory storage. Switching stores each account's tokens and,
+on a switch, injects the target account's tokens into the extension and restarts
+its service worker so it reconnects as that account. Because modern Chrome won't
+let a tool drive your everyday profile, this runs a dedicated, lean "Claude Code"
+Chrome profile alongside your normal browser (a separate window just for Claude
+Code).
+
+> **Security:** stored tokens are bearer credentials (`sk-ant-oat01-` /
+> `sk-ant-ort01-`, equivalent to a password) kept in `chrome_sessions.json`
+> (chmod 600) beside your other cswap state. Anyone with that file can act as
+> those accounts until the tokens expire.
+
+```bash
+cswap chrome setup      # guided: enable → create profile → install extension → capture accounts
+cswap chrome doctor     # what's set up + per-account coverage
+```
+
+The wizard installs the extension into the dedicated profile (one click from the Web Store), has you connect it to Claude Code, and captures each account's tokens. Other commands:
+
+```bash
+cswap chrome open              # open/focus the dedicated Claude Browser
+cswap chrome capture <n>       # store account <n>'s tokens (connect it there first)
+cswap chrome refresh <n>       # keep account <n>'s stored tokens alive (no browser)
+cswap chrome create-profile    # (re)create the dedicated profile  (--rebuild to reset)
+cswap chrome enable | disable  # turn the feature on/off
+```
+
+Once set up, `cswap switch <n>` (CLI or menu bar) flips the dedicated browser to account `<n>` too — the extension reconnects on its own, no side-panel reopen needed. A stored account's refresh token lasts about 28.5 days untouched; switching to it within that window is seamless (the extension self-refreshes an expired token), and `cswap chrome refresh <n>` (or any switch) rolls the window forward so it never lapses. Off until you turn it on (`chrome.enabled` in `settings.json`); when disabled, switching is CLI-only and behaves exactly as before.
+
+#### Making a *running* session follow a switch (bridge relay)
+
+A Claude Code session binds its browser-bridge account at startup, so a switch made **while it is running** is normally not picked up until you restart it. The optional bridge relay removes that restart:
+
+```bash
+cswap chrome bridge install   # background relay via a LaunchAgent (com.claude-swap.bridge)
+cswap chrome bridge status    # is it running?  (uninstall to remove)
+```
+
+Then launch Claude Code with `LOCAL_BRIDGE=1` (e.g. `LOCAL_BRIDGE=1 claude`). Claude Code's browser bridge then connects to the local relay instead of Anthropic's; the relay forwards it to the real bridge as the **current** cswap account and re-points live when you switch — so the browser follows account changes with no restart. The extension is never modified (it stays on the real bridge and keeps auto-updating). Verified TLS to the bridge (via the system trust store); the relay listens only on `127.0.0.1`. Note: `LOCAL_BRIDGE` is an internal Claude Code flag and may change between versions.
+
+</details>
+
 ## Advanced
 
 ### Configuration
