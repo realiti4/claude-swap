@@ -75,6 +75,7 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.paths import (
+    AUTOSWITCH_STATE_FILENAME,
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
@@ -1770,7 +1771,31 @@ class ClaudeAccountSwitcher:
             active_number=active_number,
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
+            pinging=self._read_pinging_state(),
         )
+
+    def _read_pinging_state(self) -> dict | None:
+        """Best-effort read of `autoswitch_state.json`'s "pinging" key (a
+        `settings.warm_on_reset` isolated priming ping some `cswap auto` may
+        be mid-touch on right now). Display-only, so any read failure —
+        including no engine ever having run — is silently "nothing to
+        show", never an error.
+
+        ``AUTOSWITCH_STATE_FILENAME`` (also `autoswitch.STATE_FILENAME`)
+        lives in ``paths.py``, not ``autoswitch`` itself: ``autoswitch``
+        imports this module for the ``ClaudeAccountSwitcher`` type, so the
+        reverse import would cycle.
+        """
+        try:
+            raw = json.loads(
+                (self.backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        pinging = raw.get("pinging")
+        return pinging if isinstance(pinging, dict) else None
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file

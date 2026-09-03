@@ -46,16 +46,22 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.paths import AUTOSWITCH_STATE_FILENAME
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.session import SessionManager
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
-STATE_FILENAME = "autoswitch_state.json"
+# Re-exported for callers that already spell it `autoswitch.STATE_FILENAME`;
+# `paths.AUTOSWITCH_STATE_FILENAME` is the source of truth so a reader
+# elsewhere in the package (e.g. `switcher.py`) can name it without an
+# `autoswitch` import, which would cycle (`autoswitch` imports `switcher`).
+STATE_FILENAME = AUTOSWITCH_STATE_FILENAME
 STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
@@ -102,6 +108,7 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -436,6 +443,42 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class WarmPingEvent(AutoSwitchEvent):
+    """A `warm_on_reset` priming touch: one throwaway message sent through a
+    reset account's own isolated session profile (`SessionManager.
+    ping_to_warm`), never the active credential — see the module docstring.
+
+    ``status``: ``"sent"`` (the ping ran and exited cleanly — the account's
+    5h window should start once Anthropic's side reflects it) or
+    ``"failed"`` (bootstrap, spawn, or the ping itself failed; the reset
+    stays pending and is retried next cycle).
+    """
+
+    kind: ClassVar[str] = "warm-ping"
+    number: str
+    email: str
+    status: str
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "email": self.email,
+            "status": self.status,
+            "dryRun": self.dry_run,
+        }
+
+    def human(self) -> str:
+        if self.status == "failed":
+            return (
+                f"Account-{self.number} ({self.email}) priming failed, "
+                "will retry (warm-on-reset)"
+            )
+        prefix = "[dry-run] would prime" if self.dry_run else "Primed"
+        return f"{prefix} Account-{self.number} ({self.email}) (warm-on-reset)"
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -557,6 +600,25 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _five_hour_active(usage_value: dict | str | None) -> bool | None:
+    """Is this account's 5h window currently ticking (has a live reset
+    timer)? ``None`` when unreadable this tick — never evidence of a reset.
+
+    ``oauth.build_usage_result`` keeps emitting a ``five_hour`` dict
+    (``pct`` only, no ``resets_at``) for an account that has just reset and
+    has not yet had a request land in the new window — so the key's mere
+    presence is NOT proof the window is ticking. ``resets_at`` (added once
+    the API starts reporting a real countdown) is the ground truth
+    ``warm_on_reset`` watches for a transition on.
+    """
+    if not isinstance(usage_value, dict):
+        return None
+    fh = usage_value.get("five_hour")
+    if not isinstance(fh, dict):
+        return False
+    return "resets_at" in fh
+
+
 def _binding_recovery_ts(
     usage: dict | str | None, models: Sequence[str], now: float
 ) -> float:
@@ -649,6 +711,9 @@ class AutoSwitchEngine:
         clock: Callable[[], float] = time.time,
     ):
         self.switcher = switcher
+        # `warm_on_reset`'s isolated ping reuses the same per-account session
+        # profile `cswap run` bootstraps — never the active credential.
+        self._session_manager = SessionManager(switcher)
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -684,6 +749,16 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # `warm_on_reset` bookkeeping mirrors `_unhealthy_ticks` above for
+        # dry-run: real ticks read/write it through the (locked, persisted)
+        # state file, but dry-run must never touch disk, so a `cswap auto
+        # --dry-run` LOOP still needs *some* place to remember the previous
+        # tick's `five_hour` presence across ticks of this one process. This
+        # is that place, read/written only when `self.dry_run` is true; real
+        # runs use `state["fiveHourSeen"]` exclusively (see
+        # `_maybe_warm_reset`). No hold to track in memory either way — the
+        # ping is a one-shot action, never a multi-tick borrow.
+        self._dry_run_five_hour_seen: dict[str, bool] = {}
 
     # -- state file ---------------------------------------------------------
 
@@ -978,6 +1053,12 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
+                if settings.warm_on_reset:
+                    warm_outcome = self._maybe_warm_reset(
+                        state, usage, current, quarantined
+                    )
+                    if warm_outcome is not None:
+                        return warm_outcome
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -2124,7 +2205,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2170,6 +2254,132 @@ class AutoSwitchEngine:
             )
         )
         return TickOutcome.SWITCHED
+
+    # -- warm-on-reset ----------------------------------------------------
+
+    def _maybe_warm_reset(
+        self,
+        state: dict,
+        usage: dict[str, dict | str | None],
+        current: str,
+        quarantined: set[str],
+    ) -> TickOutcome | None:
+        """``settings.warm_on_reset``: the moment a non-active account's 5h
+        window resets, send it one throwaway message through its own
+        isolated session profile (``SessionManager.ping_to_warm`` — the
+        same isolation ``cswap run`` uses), so its clock starts now rather
+        than whenever ``strategy`` would otherwise get around to it. Never
+        touches the active credential, so no other running Claude Code
+        session is ever redirected mid-conversation or loses its prompt
+        cache (cache is scoped per Anthropic org and switching accounts
+        means switching orgs — a redirected session would reprocess its
+        whole history at full price on its next message).
+
+        Called only while the active account is healthy (below threshold) —
+        an urgent trigger (at-limit/failover) must never be preempted by
+        this. Returns a :class:`TickOutcome` to make the caller return it
+        immediately (a ping was attempted this tick), or ``None`` to fall
+        through to the caller's own normal-strategy logic unchanged
+        (nothing to do this tick).
+
+        ``fiveHourSeen`` lives in the persisted state file for a real run
+        (so cron-driven ``cswap auto --once`` remembers across processes,
+        like the rest of this module's state), but dry-run must never
+        touch disk — it instead reads/writes the in-memory fallback seeded
+        in ``__init__``. The ping is a one-shot action: unlike the old
+        switch-based touch, there is no multi-tick hold to persist either
+        way, since nothing is ever borrowed from the active session.
+        """
+        oauth_candidates = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current
+            and n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+
+        seen_before = (
+            self._dry_run_five_hour_seen if self.dry_run else state.get("fiveHourSeen")
+        )
+        seen_before = dict(seen_before) if isinstance(seen_before, dict) else {}
+        seen_now = dict(seen_before)
+        reset_candidates: list[str] = []
+        for num in (*oauth_candidates, current):
+            active5h = _five_hour_active(usage.get(num))
+            if active5h is None:
+                continue  # unreadable this tick — not evidence either way
+            if seen_before.get(num) is True and active5h is False and num != current:
+                # A detected reset stays PENDING (baseline left at True) until
+                # it is actually acted on — committing it here regardless
+                # would drop the reset for good the moment a ping hiccup
+                # skips this tick: `prior is True` is what makes the
+                # transition visible at all, and once flipped to False here
+                # it can never re-arm on its own (5h resets are a one-way
+                # edge, not a level). Retried candidates the engine
+                # explicitly gave up on (quarantine) never reach this branch
+                # again anyway — they drop out of `oauth_candidates`.
+                reset_candidates.append(num)
+                continue
+            seen_now[num] = active5h
+        if seen_now != seen_before:
+            if self.dry_run:
+                self._dry_run_five_hour_seen = seen_now
+            else:
+                self._mutate_state(lambda s: s.__setitem__("fiveHourSeen", seen_now))
+
+        if not reset_candidates:
+            return None
+
+        target = reset_candidates[0]
+        email = self.switcher.account_email(target)
+        if self.dry_run:
+            self._emit(
+                WarmPingEvent(number=target, email=email, status="sent", dry_run=True)
+            )
+            self._dry_run_five_hour_seen = {
+                **self._dry_run_five_hour_seen, target: False
+            }
+            return TickOutcome.NO_ACTION
+        # `_freshen_target`'s pre-flight: dead/conflicting credential ->
+        # quarantine same as any other candidate; a live manual `cswap run`
+        # already owning this slot -> "skip-live-session", never interfered
+        # with; either way `ping_to_warm` (below) is never reached.
+        status = self._freshen_target(target, email)
+        if status == "identity-conflict":
+            self._quarantine(target, email, "identity-conflict")
+            return None  # quarantined for next tick; active account is fine
+        if status == "invalid_grant":
+            self._quarantine(target, email, "invalid_grant")
+            return None
+        if status != "ok":
+            # transient / systemic / skip-live-session — leave it for the
+            # normal below-threshold path this tick, retry the warm touch
+            # next tick.
+            return None
+        # `pinging` is display-only and lives only for the duration of the
+        # blocking call below — set right before, cleared right after,
+        # regardless of outcome — so a TUI reading the state file mid-call
+        # can badge the account "priming" while it's actually happening.
+        now = self.clock()
+        self._mutate_state(
+            lambda s: s.__setitem__("pinging", {"number": target, "since": now})
+        )
+        try:
+            sent = self._session_manager.ping_to_warm(target)
+        finally:
+            self._mutate_state(lambda s: s.pop("pinging", None))
+        self._emit(
+            WarmPingEvent(
+                number=target, email=email, status="sent" if sent else "failed"
+            )
+        )
+        if sent:
+            self._mutate_state(
+                lambda s: s.__setitem__(
+                    "fiveHourSeen", {**(s.get("fiveHourSeen") or {}), target: False}
+                )
+            )
+        return TickOutcome.NO_ACTION
 
     # -- helpers --------------------------------------------------------------
 
@@ -2282,6 +2492,16 @@ class AutoSwitchEngine:
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
+
+    def apply_warm_on_reset(self, enabled: bool) -> None:
+        """Session override from the TUI, mirroring :meth:`apply_threshold`.
+
+        No poll-policy re-pin needed — unlike the threshold, this axis
+        doesn't feed the collector's cadence, only ``_tick_inner``'s own
+        below-threshold branch, which reads ``self.settings`` fresh every
+        tick.
+        """
+        self.settings = replace(self.settings, warm_on_reset=enabled)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
