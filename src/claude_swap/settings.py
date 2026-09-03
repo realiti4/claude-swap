@@ -57,6 +57,15 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Account identifier (alias, slot number, or email) whose quota is spent
+    # FIRST; every other account is overflow, and the engine returns here as
+    # soon as this account's binding window is back under ``threshold``.
+    # Reads as a spend order, not a resting place: naming an account makes it
+    # burn SOONER. Cannot be live at the same time as
+    # ``strategy: consume-first``, which answers the same question from a
+    # different anchor -- see ``AutoSwitchEngine._at_drain_account``, which
+    # owns that rule. None = no drain account (default).
+    drain_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +143,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "drainAccount", "drain_account", "string",
+            help="Spend this account first; others are overflow while it is at its limit",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +444,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("drain_account", "drain_account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
