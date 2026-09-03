@@ -75,6 +75,7 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.paths import (
+    AUTOSWITCH_STATE_FILENAME,
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
@@ -1780,13 +1781,14 @@ class ClaudeAccountSwitcher:
         including no engine ever having run — is silently "nothing to
         show", never an error.
 
-        Duplicates ``autoswitch.STATE_FILENAME``'s value rather than
-        importing it: ``autoswitch`` imports this module for the
-        ``ClaudeAccountSwitcher`` type, so the reverse import would cycle.
+        ``AUTOSWITCH_STATE_FILENAME`` (also `autoswitch.STATE_FILENAME`)
+        lives in ``paths.py``, not ``autoswitch`` itself: ``autoswitch``
+        imports this module for the ``ClaudeAccountSwitcher`` type, so the
+        reverse import would cycle.
         """
         try:
             raw = json.loads(
-                (self.backup_dir / "autoswitch_state.json").read_text(encoding="utf-8")
+                (self.backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None

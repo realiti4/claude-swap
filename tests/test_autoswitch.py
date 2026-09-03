@@ -7043,6 +7043,50 @@ class TestWarmOnReset:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
+    def test_hold_ends_but_return_account_is_disabled_stays_put(self, temp_home):
+        """The account we'd return to was pulled out of rotation (`cswap
+        disable`) while we were away priming the target —
+        `switchable_account_numbers()` is the one gate every strategy
+        respects for that, and the return must honor it too rather than
+        reactivating a slot the user deliberately disabled."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch onto 2
+        h.switcher.set_account_disabled("1", True)
+        h.events.clear()
+
+        h.clock.advance(30.0)
+        outcome = h.tick_with_usage(
+            {"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(2.0, "2030-01-01T00:00:00Z")}
+        )
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
+        assert ended.status == "started"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_hold_ends_but_return_account_is_quarantined_stays_put(self, temp_home):
+        """The account we'd return to got quarantined (e.g. a dead refresh
+        token found elsewhere) while we were away priming the target — the
+        return must never reactivate a quarantined slot."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch onto 2
+        h.engine._quarantine("1", "a@example.com", "invalid_grant")
+        h.events.clear()
+
+        h.clock.advance(30.0)
+        outcome = h.tick_with_usage(
+            {"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(2.0, "2030-01-01T00:00:00Z")}
+        )
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
+        assert ended.status == "started"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
     def test_manual_switch_away_supersedes_the_hold(self, temp_home):
         h = self._two_account_harness(temp_home)
         h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline

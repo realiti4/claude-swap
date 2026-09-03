@@ -46,6 +46,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.paths import AUTOSWITCH_STATE_FILENAME
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -55,7 +56,11 @@ from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_mo
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
-STATE_FILENAME = "autoswitch_state.json"
+# Re-exported for callers that already spell it `autoswitch.STATE_FILENAME`;
+# `paths.AUTOSWITCH_STATE_FILENAME` is the source of truth so a reader
+# elsewhere in the package (e.g. `switcher.py`) can name it without an
+# `autoswitch` import, which would cycle (`autoswitch` imports `switcher`).
+STATE_FILENAME = AUTOSWITCH_STATE_FILENAME
 STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
