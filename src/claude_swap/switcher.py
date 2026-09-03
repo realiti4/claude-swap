@@ -1770,7 +1770,30 @@ class ClaudeAccountSwitcher:
             active_number=active_number,
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
+            warming=self._read_warming_state(),
         )
+
+    def _read_warming_state(self) -> dict | None:
+        """Best-effort read of `autoswitch_state.json`'s "warming" key (a
+        `settings.warm_on_reset` priming hold some `cswap auto` may be
+        mid-touch on right now). Display-only, so any read failure —
+        including no engine ever having run — is silently "nothing to
+        show", never an error.
+
+        Duplicates ``autoswitch.STATE_FILENAME``'s value rather than
+        importing it: ``autoswitch`` imports this module for the
+        ``ClaudeAccountSwitcher`` type, so the reverse import would cycle.
+        """
+        try:
+            raw = json.loads(
+                (self.backup_dir / "autoswitch_state.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        warming = raw.get("warming")
+        return warming if isinstance(warming, dict) else None
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file

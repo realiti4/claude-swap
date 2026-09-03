@@ -343,6 +343,32 @@ class TestFormatting:
         ).plain
         assert "last seen" not in api_key
 
+    def test_warming_badge_tags_the_genuinely_active_touched_account(self):
+        # A `warm_on_reset` hold means the live credential really is on the
+        # touched account (here #2) for the moment — "active" must keep
+        # tracking that ground truth, with "priming" added alongside it as
+        # context for why the active account just changed automatically.
+        from claude_swap.tui.widgets import account_card_text
+
+        warming = {"number": "2", "since": 0.0, "returnTo": "1"}
+
+        untouched = account_card_text(
+            make_account(1, active=False), 80, warming=warming
+        ).plain
+        assert "active" not in untouched
+        assert "priming" not in untouched
+
+        touched = account_card_text(
+            make_account(2, active=True), 80, warming=warming
+        ).plain
+        assert "● active" in touched
+        assert "◐ priming" in touched
+
+        # No hold in flight: no priming tag, badge is just the real slot.
+        no_hold = account_card_text(make_account(2, active=True), 80).plain
+        assert "● active" in no_hold
+        assert "priming" not in no_hold
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text

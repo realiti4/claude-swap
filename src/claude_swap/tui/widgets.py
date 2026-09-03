@@ -167,9 +167,20 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    warming: dict | None = None,
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows.
+
+    ``warming`` is the raw ``autoswitch_state.json`` "warming" entry
+    (``{"number", ...}``), when `settings.warm_on_reset` has some
+    `cswap auto` mid-touch right now. "active" always tracks the real live
+    credential (``acc.is_active``) — while a hold is open, the account it
+    landed on (``number``) additionally gets a "priming" tag alongside it,
+    since it genuinely is the live account for the moment, just briefly and
+    for an automated reason.
+    """
     now = now if now is not None else time.time()
+    warming_target = str(warming["number"]) if warming and "number" in warming else None
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
@@ -181,6 +192,8 @@ def account_card_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
+    if acc.number == warming_target:
+        text.append("   ◐ priming", style=f"bold {palette.sev_warn}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -340,7 +353,7 @@ class AccountsPanel(Static):
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, warming=snap.warming,
                     )
                 )
             elif self._show_minis:
@@ -362,34 +375,43 @@ class AccountsPanel(Static):
 class AccountCard(Static):
     """One account rendered full-size (used by the switch screen's list)."""
 
-    def __init__(self, acc: AccountSnapshot, *, threshold: float | None = None) -> None:
+    def __init__(
+        self,
+        acc: AccountSnapshot,
+        *,
+        threshold: float | None = None,
+        warming: dict | None = None,
+    ) -> None:
         super().__init__()
         self._acc = acc
         self._threshold = threshold
+        self._warming = warming
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, warming: dict | None = None) -> None:
         self._acc = acc
+        self._warming = warming
         self.refresh(layout=True)
 
     def render(self) -> Text:
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            warming=self._warming,
         )
 
 
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
-    def __init__(self, acc: AccountSnapshot) -> None:
-        super().__init__(AccountCard(acc))
+    def __init__(self, acc: AccountSnapshot, *, warming: dict | None = None) -> None:
+        super().__init__(AccountCard(acc, warming=warming))
         self.number = acc.number
         self.email = acc.email
 
-    def set_account(self, acc: AccountSnapshot) -> None:
+    def set_account(self, acc: AccountSnapshot, warming: dict | None = None) -> None:
         self.number = acc.number
         self.email = acc.email
-        self.query_one(AccountCard).set_account(acc)
+        self.query_one(AccountCard).set_account(acc, warming)
 
 
 class MenuItem(ListItem):

@@ -159,6 +159,14 @@ class AccountsSnapshot:
     active_number: str | None
     accounts: tuple[AccountSnapshot, ...]
     taken_at: float
+    # `settings.warm_on_reset`'s in-flight priming hold, straight from
+    # `autoswitch_state.json`'s "warming" key (``{"number", "since",
+    # "returnTo"}``) if some `cswap auto` is mid-touch right now, else
+    # ``None``. Display-only: TUIs use ``number`` to tag that account
+    # "priming" alongside its (genuinely real) "active" badge, so a warm
+    # touch reads as a labeled automated event rather than an unexplained
+    # account change.
+    warming: dict | None = None
 
 
 @dataclass
