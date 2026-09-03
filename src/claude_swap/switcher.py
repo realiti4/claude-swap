@@ -60,6 +60,7 @@ from claude_swap.models import (
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_account_order,
     normalize_account_threshold,
     normalize_alias,
 )
@@ -1883,7 +1884,23 @@ class ClaudeAccountSwitcher:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
                 threshold = None
-        return AccountPolicy(threshold=threshold, backup=bool(record.get("backup")))
+        raw_order = record.get("order")
+        order: int | None
+        if raw_order is None:
+            order = None
+        else:
+            try:
+                order = normalize_account_order(raw_order)
+            except ValueError:
+                # Same degradation as ``threshold`` above, and the same reason:
+                # an unusable pin reads as "unpinned", which is precisely how
+                # this account behaved before the feature existed.
+                order = None
+        return AccountPolicy(
+            threshold=threshold,
+            backup=bool(record.get("backup")),
+            order=order,
+        )
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -1897,6 +1914,23 @@ class ClaudeAccountSwitcher:
             str(num): self._policy_from_data(data, str(num))
             for num in data.get("sequence", [])
         }
+
+    def account_orders(self) -> dict[str, int]:
+        """Every slot holding an explicit chain order, from one sequence read.
+
+        Keyed by slot number in sequence order, and containing **only** the
+        accounts that carry a pin — an unpinned fleet yields ``{}``, which is
+        what lets the engine skip the whole tier when nobody uses the feature.
+        Mirrors :meth:`account_policies`, including its single-read discipline:
+        the auto-switch engine calls this once per tick.
+        """
+        data = self._get_sequence_data() or {}
+        orders: dict[str, int] = {}
+        for num in data.get("sequence", []):
+            order = self._policy_from_data(data, str(num)).order
+            if order is not None:
+                orders[str(num)] = order
+        return orders
 
     def backup_account_numbers(self) -> list[str]:
         """Managed slots marked as backup ("last man standing"), in sequence order.
@@ -2019,6 +2053,74 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
+
+    def set_account_order(self, identifier: str, order: object | None) -> None:
+        """Set or clear one account's position in the switch chain.
+
+        A pinned account is preferred over every unpinned one, and a lower pin
+        over a higher one, *before* the ranking strategy is consulted — the pin
+        is a primary selector, not a tie-break. Equal pins are a group rather
+        than an error: they tie on the leading key element and fall through to
+        the strategy, which load-balances within the group.
+
+        ``order=None`` removes the pin and returns the account to strategy-only
+        ranking. The key is popped rather than written as ``null``, so a fleet
+        that has never pinned anything keeps a ``sequence.json`` byte-identical
+        to one from before this feature existed.
+
+        Pinning has a cost worth stating: it defeats the strategy's own
+        self-demotion. An account pinned first stays first even once a rival
+        has more headroom or resets sooner, so a pin used as a soft "prefer"
+        knob can cost throughput. It is a hard ordering, not a hint.
+
+        Args:
+            identifier: Slot number, email, or alias.
+            order: Whole number in ``[ACCOUNT_ORDER_MIN, ACCOUNT_ORDER_MAX]``,
+                or ``None`` to clear.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not a whole number in range. Raised
+                *before* any write, so a rejected value leaves the store
+                byte-identical.
+        """
+        # Validate first: a bad value must never reach the file, and must not
+        # depend on the identifier resolving. Mirrors set_account_threshold.
+        normalized = None if order is None else normalize_account_order(order)
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+
+        current = record.get("order")
+        if normalized is None and "order" not in record:
+            print(dimmed(
+                f"Account-{account_num} ({email}) has no chain order "
+                f"— already ranked by strategy alone."
+            ))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already order {normalized}."
+            ))
+            return
+
+        if normalized is None:
+            record.pop("order", None)
+        else:
+            record["order"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if normalized is None:
+            self._logger.info(f"Cleared order for account {account_num}: {email}")
+            print(f"{accent('Cleared')} chain order for Account-{account_num} ({email}) "
+                  f"— now ranked by strategy alone.")
+        else:
+            self._logger.info(
+                f"Set order {normalized} for account {account_num}: {email}"
+            )
+            print(f"{accent('Set')} Account-{account_num} ({email}) "
+                  f"chain order to {normalized}.")
 
     def set_account_backup(self, identifier: str, backup: bool) -> None:
         """Mark an account as backup ("last man standing") or clear the mark.

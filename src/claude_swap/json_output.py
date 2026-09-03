@@ -249,6 +249,8 @@ def account_row(
         row["threshold"] = policy.threshold
     if policy.backup:
         row["backup"] = True
+    if policy.order is not None:
+        row["order"] = policy.order
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

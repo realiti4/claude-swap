@@ -180,12 +180,22 @@ class TestAccountPolicy:
         assert len({AccountPolicy(), AccountPolicy()}) == 1
 
     def test_field_types_are_declared_as_specified(self):
+        """A closed-world fence on the field set.
+
+        Written for PR 1 as ``{"threshold", "backup"}`` with the note that
+        ``order`` belonged to PR 2 and must not appear early. PR 2 (MEU-ORD-01,
+        AC-5) is that event, so the fence moves rather than being deleted — its
+        job is to make any *further* field an explicit decision, and PR 2's own
+        ``tests/test_account_order_values.py`` asserts the same set from the
+        other side.
+        """
         fields = {f.name: f for f in dataclasses.fields(AccountPolicy)}
-        assert set(fields) == {"threshold", "backup"}, (
-            "AC-3 fixes the field set; `order` belongs to PR 2 and must not appear here"
+        assert set(fields) == {"threshold", "backup", "order"}, (
+            "the field set is fixed; a new field is a deliberate, tested addition"
         )
         assert fields["threshold"].default is None
         assert fields["backup"].default is False
+        assert fields["order"].default is None
 
 
 class TestAccountSnapshotPolicyField:

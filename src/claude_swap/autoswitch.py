@@ -47,6 +47,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.models import ORDER_UNSET_RANK
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -395,6 +396,23 @@ class SwitchEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class NoSwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "no-switch"
+    # Enumerated for the same reason `SwitchEvent.trigger` above carries its
+    # own list: `reason` is what the TUI and `--json` consumers switch on, so
+    # an undocumented value is invisible to the next person extending this
+    # event.
+    #
+    #   active-account census:
+    #     "no-active-account" | "unmanaged-active-account" | "active-api-key"
+    #     | "active-idle" | "active-usage-unknown"
+    #   departure gate:
+    #     "below-threshold" | "cooldown" | "reset-unknown"
+    #   candidate census:
+    #     "no-candidates" | "no-comparison" | "no-qualifying-candidate"
+    #     | "no-viable-target" | "already-active" | "stale-usage"
+    #   strategy holds:
+    #     "already-consuming-soonest"
+    #     | "failback-hold" — a backup account is active and no primary has
+    #       recovered yet; detail "primaries still exhausted"
     reason: str
     detail: str = ""
 
@@ -610,6 +628,25 @@ class ThresholdMap(dict):
 
     def __missing__(self, key: str) -> float:
         return self.default
+
+
+class OrderMap(dict):
+    """Chain rank per account number - total by construction.
+
+    Mirrors :class:`ThresholdMap` for the same reason: ranking subscripts it
+    directly while building sort keys, so a partial map would raise mid-tick
+    in an unattended loop. An account with no ``order`` pin reads
+    ``ORDER_UNSET_RANK``, which is ``ACCOUNT_ORDER_MAX + 1`` and therefore
+    sorts *after* every legal rank - the sentinel must not be
+    ``ACCOUNT_ORDER_MIN``, or an unpinned fleet would outrank every pin and
+    the feature would be inverted.
+
+    ``__missing__`` deliberately does not memoise: the map is rebuilt per tick
+    and a caching sentinel would make it grow with every key ever asked for.
+    """
+
+    def __missing__(self, key: str) -> int:
+        return ORDER_UNSET_RANK
 
 
 def _every_account_above_threshold(
@@ -946,6 +983,20 @@ class AutoSwitchEngine:
             effective.threshold,
         )
 
+    def _resolve_orders(self) -> OrderMap:
+        """Every pinned account's chain rank, resolved once per tick.
+
+        Threaded DOWN into ``_rank_candidates`` as a parameter for the same
+        reason thresholds are: ranking is documented pure and runs twice per
+        tick under the consume-first two-phase commit, so a store read inside
+        it could rank phase 1 and phase 2 against different pins.
+
+        Unlike thresholds there is no global default to fall back to - "no
+        pin" is its own tier - so the map carries only the accounts that set
+        one and ``OrderMap.__missing__`` supplies the sentinel for the rest.
+        """
+        return OrderMap(self.switcher.account_orders())
+
     def _min_effective_threshold(
         self, thresholds: ThresholdMap | None = None
     ) -> float:
@@ -1045,6 +1096,13 @@ class AutoSwitchEngine:
         # account absent from it (never sequenced, just removed) reads the
         # global rather than raising mid-tick.
         thresholds = self._resolve_thresholds(settings)
+        # Same discipline, one resolution per tick: `_rank_candidates` runs
+        # twice under the consume-first two-phase commit and once more per
+        # backup pass, and all of them must rank against the same pins.
+        # Deliberately NOT passed to `_refresh_poll_policy_inputs` below:
+        # cadence is threshold-driven, and a pin says where to go, never how
+        # often to look.
+        orders = self._resolve_orders()
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
@@ -1357,6 +1415,7 @@ class AutoSwitchEngine:
             settings=settings,
             now=decided_now,
             thresholds=thresholds,
+            orders=orders,
         )
 
         if trigger in ("consume-first", "failback") and ordered:
@@ -1389,6 +1448,7 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
                 thresholds=thresholds,
+                orders=orders,
             )
 
         if trigger == "consume-first" and current not in backups and ordered:
@@ -1428,18 +1488,24 @@ class AutoSwitchEngine:
             because the departure gate stops at `below-threshold` before any
             ranking happens. The whole contract of this trigger is that a
             fleet which merely *configures* a reserve never starts seeing
-            `BLOCKED` or `ERROR` where it used to see a quiet hold — so the
-            hold reuses the gate's own event verbatim rather than inventing a
-            reason string. A diagnostic reason ("primaries still exhausted")
-            is a new observable and ships with its TUI surfacing in PR 2.
+            `BLOCKED` or `ERROR` where it used to see a quiet hold, and that is
+            still true: only the reason STRING changes here.
+
+            PR 1 held that string back on purpose and named PR 2 as its owner.
+            It borrowed the departure gate's `below-threshold` event verbatim,
+            which is a true statement about the active account and a useless
+            one about the tick: on a failback tick the active account IS the
+            reserve, and a reserve sitting under its own line is the normal
+            state rather than a reason. `failback-hold` says the one thing an
+            operator reading a stuck fleet needs — the primaries have not come
+            back yet.
+
+            Both hold sites call this closure, so the wording lives here once.
             """
             self._emit(
                 NoSwitchEvent(
-                    reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - (active_headroom or 0.0))}% < "
-                        f"{pct_label(thresholds[current])}%"
-                    ),
+                    reason="failback-hold",
+                    detail="primaries still exhausted",
                 )
             )
             return TickOutcome.NO_ACTION
@@ -1456,8 +1522,18 @@ class AutoSwitchEngine:
             # expensive thing in the fleet. The same two-pass filter applies
             # here, so a reserve that happens to be an API-key account is the
             # last thing reached rather than the first.
+            # Here order really is a list pre-sort. Metered API-key accounts
+            # have no measurable headroom and no weekly window, so there is no
+            # strategy key to prepend a tier to - the list itself is the
+            # ranking. `sorted` is stable, so an unpinned fleet keeps today's
+            # sequence order exactly. Each pass is sorted separately so the
+            # two-pass reserve filter still wins: a pinned API-key reserve is
+            # ordered among the reserves, never promoted past a primary.
+            def _by_rank(pool: list[str]) -> list[str]:
+                return sorted(pool, key=lambda n: orders[n])
+
             primary_api_keys = [n for n in api_key_candidates if n not in backups]
-            ordered = primary_api_keys or api_key_candidates
+            ordered = _by_rank(primary_api_keys) or _by_rank(api_key_candidates)
 
         if not ordered:
             if trigger == "failback":
@@ -2061,6 +2137,12 @@ class AutoSwitchEngine:
         # for every account, so a caller without per-account context behaves
         # exactly as this function did before per-account thresholds existed.
         thresholds: Mapping[str, float] | None = None,
+        # Chain ranks, same contract as `thresholds`: optional, and absent it
+        # behaves exactly as this function did before per-account order
+        # existed. `OrderMap()` (empty) maps every account to the sentinel, so
+        # every key gains an identical leading element and the sort is
+        # unchanged - identity by construction, not by luck.
+        orders: Mapping[str, int] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -2119,6 +2201,13 @@ class AutoSwitchEngine:
             _binding_recovery_ts(usage.get(current), self._models, now)
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
+        )
+
+        # Total by construction, so the key builders below can subscript it
+        # unguarded. An absent `orders` yields the sentinel for EVERY account,
+        # which is a constant leading element and therefore no reordering.
+        rank: Mapping[str, int] = (
+            orders if orders is not None else OrderMap()
         )
 
         qualifying: list[tuple[tuple, str]] = []
@@ -2201,7 +2290,15 @@ class AutoSwitchEngine:
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
-                                fallback.append(((0, recovery_ts, -h), num))
+                                # Tiered like `qualifying` below, and for a
+                                # reason that is easy to miss: the two lists
+                                # are SELECTED between (`qualifying or
+                                # fallback`), never merged, so a tier applied
+                                # to only one of them silently drops order on
+                                # every tick that takes the other path.
+                                fallback.append(
+                                    ((rank[num], 0, recovery_ts, -h), num)
+                                )
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -2262,7 +2359,12 @@ class AutoSwitchEngine:
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
-            qualifying.append((key, num))
+            # Order is a PRIMARY selector, not a tie-break: it is prepended to
+            # the strategy key rather than appended to it. Appended, it would
+            # decide only exact ties, and neither strategy key ties in practice
+            # (headroom and reset timestamps are floats), so the feature would
+            # be inert. Within a tier the strategy still decides everything.
+            qualifying.append(((rank[num], *key), num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])

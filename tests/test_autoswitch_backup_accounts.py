@@ -434,8 +434,8 @@ class TestFailbackUnderBest:
         h = self._stage(temp_home)
         outcome, _ = _tick(h, [{"1": _u(20.0), "2": _u(90.0)}])
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
-        assert _details(h) == ["20% < 90%"]
+        assert _reasons(h) == ["failback-hold"]
+        assert _details(h) == ["primaries still exhausted"]
         assert _switches(h) == []
 
 
@@ -661,7 +661,7 @@ class TestFailbackTriggerScope:
         _backup(h, 1)
         outcome, _ = _tick(h, [{"1": _u(20.0), "2": None}])
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
+        assert _reasons(h) == ["failback-hold"]
         assert "no-comparison" not in _reasons(h)
 
 
@@ -693,7 +693,7 @@ class TestFailbackRefetchesBeforeCommitting:
         outcome, mock = _tick(h, [phase1, phase1, phase2])
         assert mock.call_count == BASE_CALLS + 1
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
+        assert _reasons(h) == ["failback-hold"]
         assert h.active_number() == 1
 
     def test_an_unrefreshable_target_holds_rather_than_commits(
@@ -773,7 +773,7 @@ class TestFailbackKeepsTheLandingGate:
             "1": _u(20.0), "2": _u(90.0), "3": _u(88.0),
         }])
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
+        assert _reasons(h) == ["failback-hold"]
         assert _switches(h) == []
 
     def test_ii_the_all_above_relaxation_is_not_borrowed(self, temp_home):
@@ -801,7 +801,7 @@ class TestFailbackKeepsTheLandingGate:
         outcome, mock = _tick(h, [phase1, phase1, phase2])
         assert mock.call_count == BASE_CALLS + 1
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
+        assert _reasons(h) == ["failback-hold"]
         assert h.active_number() == 1
 
 
@@ -829,7 +829,7 @@ class TestFailbackNeverFallsBackToAnApiKeyAccount:
             "1": _u(20.0), "2": _u(95.0), "3": _u(5.0),
         }])
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
+        assert _reasons(h) == ["failback-hold"]
         assert h.active_number() == 1
 
     def test_the_last_resort_still_fires_for_an_exhausted_reserve(
@@ -880,8 +880,8 @@ class TestFailbackSurvivesTheTargetLoop:
         ):
             outcome, _ = _tick(h, [self._snapshot()])
         assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == ["below-threshold"]
-        assert _details(h) == ["20% < 90%"]
+        assert _reasons(h) == ["failback-hold"]
+        assert _details(h) == ["primaries still exhausted"]
         assert h.active_number() == 1
 
     def test_b_dead_credentials_hold_and_the_quarantine_survives(
@@ -894,7 +894,7 @@ class TestFailbackSurvivesTheTargetLoop:
         ):
             outcome, _ = _tick(h, [self._snapshot(3)])
         assert outcome is TickOutcome.NO_ACTION
-        assert "below-threshold" in _reasons(h)
+        assert "failback-hold" in _reasons(h)
         # The hold sits after the loop: both durable findings are on disk.
         quarantine = h.state().get("quarantine", {})
         assert "2" in quarantine
@@ -913,7 +913,7 @@ class TestFailbackSurvivesTheTargetLoop:
         ):
             outcome, _ = _tick(h, [self._snapshot()])
         assert outcome is TickOutcome.NO_ACTION
-        assert "below-threshold" in _reasons(h)
+        assert "failback-hold" in _reasons(h)
         assert not any(isinstance(e, ErrorEvent) for e in h.events)
         assert not h.state().get("quarantine")
 
