@@ -84,7 +84,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -209,14 +214,21 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
     Public: the TUI renders the same note under sentinel states (see
     ``SENTINEL_NOTES``), so both surfaces stay word-for-word identical.
+
+    Reads the windows rather than ``account_headroom`` so a ``partial``
+    measurement keeps its number: withholding the headroom is a decision rule,
+    and this line is display, where a number beats "unavailable". Marked
+    ``(partial)`` so the surviving window is not read as the whole account. For
+    a complete measurement the two paths give the identical figure.
     """
     if entry.last_good is None or entry.fetched_at is None:
         return None
-    headroom = oauth.account_headroom(entry.last_good)
-    if headroom is None:
+    pcts = [pct for _, pct, _ in oauth.relevant_windows(entry.last_good)]
+    if not pcts:
         return None
+    marker = " (partial)" if entry.last_good.get("partial") else ""
     return (
-        f"last seen {100 - headroom:.0f}% used · "
+        f"last seen {max(pcts):.0f}% used{marker} · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
 
@@ -331,6 +343,7 @@ class ClaudeAccountSwitcher:
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
+        self._header_fallback_cache: tuple[float | None, bool] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
@@ -1820,6 +1833,31 @@ class ClaudeAccountSwitcher:
         inputs = (loaded.threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _header_fallback_enabled(self) -> bool:
+        """Whether a 429'd usage fetch may fall back to the header probe.
+
+        ``usage.headerFallback`` (default on): the probe answers issue #220 on
+        the accounts the usage endpoint refuses, and spends about 10 tokens of
+        that account's own quota to do it. Read here, not in ``oauth``, because
+        every surface fetches through this class.
+
+        Cached on the settings file's mtime, like ``_poll_policy_inputs`` right
+        above: the fetches that ask run concurrently in a thread pool, so an
+        uncached read is one parse of the same file per account per pass. A
+        racing double read costs one extra parse and cannot disagree.
+        """
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        cached = self._header_fallback_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        enabled = load_usage_settings(self.backup_dir).header_fallback
+        self._header_fallback_cache = (mtime, enabled)
+        return enabled
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4137,6 +4175,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                header_fallback=self._header_fallback_enabled(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4177,6 +4216,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    rescued_from=outcome.rescued_from,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4620,11 +4660,13 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            header_fallback=self._header_fallback_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            rescued_from=outcome.rescued_from,
         )
 
     def _resync_rotated_backup(
@@ -4869,11 +4911,13 @@ class ClaudeAccountSwitcher:
                 if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     outcome = oauth.try_fetch_usage_for_account(
                         str(num), email, session_creds, is_active=True,
+                        header_fallback=self._header_fallback_enabled(),
                     )
                     return FetchRecord(
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        rescued_from=outcome.rescued_from,
                     )
                 # The live claude refreshes lazily on its next API call;
                 # requesting now would just 401 (same rule as the owned
@@ -4883,6 +4927,7 @@ class ClaudeAccountSwitcher:
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=has_live_session,
+            header_fallback=self._header_fallback_enabled(),
             refresh_via=(
                 None if has_live_session else self.consume_backup_grant
             ),
@@ -4891,6 +4936,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            rescued_from=outcome.rescued_from,
             struck_fp=outcome.struck_fp,
         )
 
@@ -5156,6 +5202,12 @@ class ClaudeAccountSwitcher:
 
         Failures are paced by the store's backoff and keep their past-due plan
         for when the backoff lifts.
+
+        A fetch the header probe rescued from a 429 (``rescued_from``) counts
+        as a recent 429 for its OWN plan, not only for the next one. ``record``
+        stamps ``last429At`` afterwards, so reading the pre-fetch row alone
+        would hand the first rescue the 60s urgent cadence on the very account
+        whose usage endpoint just refused it.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
@@ -5164,7 +5216,9 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            recent_429 = before is not None and before.recent_429(now)
+            recent_429 = rec.rescued_from == "http-429" or (
+                before is not None and before.recent_429(now)
+            )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
@@ -5223,11 +5277,16 @@ class ClaudeAccountSwitcher:
 
         A configured name that no account reports gates nothing while looking
         active. Only claimed when every account's usage is readable (an
-        unreadable account could be the one carrying the window)."""
+        unreadable account could be the one carrying the window) and every
+        measurement could see the per-model axis at all: a header-rescued row
+        never reports ``scoped`` windows (``oauth.scoped_axis_unseen``), so it
+        cannot tell an absent model from an unobservable one."""
         wanted = {m.lower(): m for m in models if m.lower() != "all"}
         if not wanted or not usage:
             return
         if any(not isinstance(v, dict) for v in usage.values()):
+            return
+        if any(oauth.scoped_axis_unseen(v, models) for v in usage.values()):
             return
         seen = {
             s["name"].lower()
