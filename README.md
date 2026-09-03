@@ -91,6 +91,7 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --warm-on-reset            # touch an idle account right when its 5h window resets
 ```
 
 <details>
@@ -103,6 +104,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
+- **`--warm-on-reset`** (or `cswap config set autoswitch.warmOnReset true`): Anthropic's usage API reports no `five_hour` window at all for an account that hasn't been used since its last one reset — the 5h clock doesn't start until a request actually lands. Left alone, an idle account's fresh window starts at whatever moment `best`/`consume-first` eventually rotates onto it, which is fine for that account but means your fleet's 5h windows drift out of any predictable schedule. With this on, the moment cswap notices a non-active account's window has reset, it switches to it once — so the next message you send lands there and starts its clock right away — then hands back to your configured strategy as soon as that's confirmed (or after a bounded wait, if nothing was sent). Off by default: it costs one proactive switch per idle account per 5h cycle, worthwhile mainly if you keep a live session busy enough to pick the touch up immediately.
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
 
@@ -230,7 +232,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown, quarantined accounts, and `--warm-on-reset` bookkeeping; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -334,7 +336,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`, and (with `--warm-on-reset`) `warm-hold-ended`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 

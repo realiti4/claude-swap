@@ -608,6 +608,7 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --warm-on-reset       # touch an idle account right when its 5h window resets
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -670,6 +671,16 @@ Defaults live in settings.json in the backup root; flags override them.
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest)"
+        ),
+    )
+    parser.add_argument(
+        "--warm-on-reset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Touch a non-active account once when its 5h window resets, so "
+            "its clock starts now instead of whenever it's next needed, "
+            "then resume the configured strategy (default: off)"
         ),
     )
     parser.add_argument(

@@ -103,6 +103,16 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
+# `warm_on_reset` hold cap: once the engine touches a freshly-reset account,
+# it waits for `five_hour` to reappear in that account's usage (proof a
+# request actually landed and the window is ticking) before handing control
+# back to `strategy`. Bounded because cswap cannot itself make Claude Code
+# send a message — an idle terminal would otherwise pin the engine off its
+# best account forever. Long enough for a live session's next turn to land
+# under normal conversational pacing, short enough that giving up costs at
+# most one cycle of this constant before the configured strategy resumes.
+WARM_HOLD_MAX_S = 15 * 60.0
+
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
 # sooner than the account we are leaving. Five minutes is comfortably longer
@@ -362,7 +372,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "warm-reset"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -433,6 +443,37 @@ class UnquarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+
+
+@dataclass(frozen=True)
+class WarmResetHoldEndedEvent(AutoSwitchEvent):
+    """A `warm_on_reset` priming hold ended; control returns to `strategy`.
+
+    ``status``: ``"started"`` (the target's `five_hour` reappeared — the
+    touch worked), ``"timeout"`` (no confirmation within ``WARM_HOLD_MAX_S``
+    — nothing sent it a request), or ``"superseded"`` (something else moved
+    the active account off the target before either of those — a manual
+    switch, or another trigger).
+    """
+
+    kind: ClassVar[str] = "warm-hold-ended"
+    number: str
+    email: str
+    status: str
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "email": self.email, "status": self.status}
+
+    def human(self) -> str:
+        verb = {
+            "started": "confirmed ticking",
+            "timeout": "no confirmation in time",
+            "superseded": "no longer the active account",
+        }.get(self.status, self.status)
+        return (
+            f"Account-{self.number} ({self.email}) warm-up ended ({verb}); "
+            "resuming normal auto-switch"
+        )
 
 
 @dataclass(frozen=True)
@@ -555,6 +596,20 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _five_hour_active(usage_value: dict | str | None) -> bool | None:
+    """Is this account's 5h window currently ticking (has accrued usage this
+    cycle)? ``None`` when unreadable this tick — never evidence of a reset.
+
+    ``oauth.build_usage_result`` omits the ``five_hour`` key entirely when
+    the API reports none — which it does until a request lands in the
+    current window — so the key's mere presence is the ground truth
+    ``warm_on_reset`` watches for a transition on.
+    """
+    if not isinstance(usage_value, dict):
+        return None
+    return isinstance(usage_value.get("five_hour"), dict)
 
 
 def _binding_recovery_ts(
@@ -684,6 +739,16 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # `warm_on_reset` bookkeeping mirrors `_unhealthy_ticks` above for
+        # dry-run: real ticks read/write it through the (locked, persisted)
+        # state file, but dry-run must never touch disk, so a `cswap auto
+        # --dry-run` LOOP still needs *some* place to remember the previous
+        # tick's `five_hour` presence and an in-flight hold across ticks of
+        # this one process. These two are that place, read/written only
+        # when `self.dry_run` is true; real runs use `state["fiveHourSeen"]`
+        # / `state["warming"]` exclusively (see `_maybe_warm_reset`).
+        self._dry_run_five_hour_seen: dict[str, bool] = {}
+        self._dry_run_warming: dict | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -978,6 +1043,12 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
+                if settings.warm_on_reset:
+                    warm_outcome = self._maybe_warm_reset(
+                        state, usage, headroom, current, quarantined
+                    )
+                    if warm_outcome is not None:
+                        return warm_outcome
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -2124,7 +2195,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first", "warm-reset")
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2170,6 +2244,172 @@ class AutoSwitchEngine:
             )
         )
         return TickOutcome.SWITCHED
+
+    # -- warm-on-reset ----------------------------------------------------
+
+    def _maybe_warm_reset(
+        self,
+        state: dict,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        current: str,
+        quarantined: set[str],
+    ) -> TickOutcome | None:
+        """``settings.warm_on_reset``: touch an account the moment its 5h
+        window resets, so its clock starts now rather than whenever
+        ``strategy`` would otherwise get around to it.
+
+        Called only while the active account is healthy (below threshold) —
+        an urgent trigger (at-limit/failover) must never be preempted by
+        this. Returns a :class:`TickOutcome` to make the caller return it
+        immediately (a warm switch happened, or a hold is in progress), or
+        ``None`` to fall through to the caller's own normal-strategy logic
+        unchanged (nothing to do, or a hold just ended and this same tick
+        should decide normally).
+
+        ``fiveHourSeen``/``warming`` live in the persisted state file for a
+        real run (so cron-driven ``cswap auto --once`` remembers across
+        processes, like the rest of this module's state), but dry-run must
+        never touch disk — it instead reads/writes the in-memory fallback
+        seeded in ``__init__``, which only ever survives for the life of
+        this one process (fine: a dry-run loop is a live preview, never a
+        cron invocation restarting cold).
+        """
+        now = self.clock()
+        oauth_candidates = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current
+            and n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+
+        seen_before = (
+            self._dry_run_five_hour_seen if self.dry_run else state.get("fiveHourSeen")
+        )
+        seen_before = dict(seen_before) if isinstance(seen_before, dict) else {}
+        seen_now = dict(seen_before)
+        reset_candidates: list[str] = []
+        for num in (*oauth_candidates, current):
+            active5h = _five_hour_active(usage.get(num))
+            if active5h is None:
+                continue  # unreadable this tick — not evidence either way
+            if seen_before.get(num) is True and active5h is False and num != current:
+                # A detected reset stays PENDING (baseline left at True) until
+                # it is actually acted on — committing it here regardless
+                # would drop the reset for good the moment cooldown or a
+                # freshen hiccup skips this tick: `prior is True` is what
+                # makes the transition visible at all, and once flipped to
+                # False here it can never re-arm on its own (5h resets are a
+                # one-way edge, not a level). Retried candidates the engine
+                # explicitly gave up on (quarantine) never reach this branch
+                # again anyway — they drop out of `oauth_candidates`.
+                reset_candidates.append(num)
+                continue
+            seen_now[num] = active5h
+        if seen_now != seen_before:
+            if self.dry_run:
+                self._dry_run_five_hour_seen = seen_now
+            else:
+                self._mutate_state(lambda s: s.__setitem__("fiveHourSeen", seen_now))
+
+        warming = self._dry_run_warming if self.dry_run else state.get("warming")
+        if isinstance(warming, dict) and warming.get("number") is not None:
+            target = str(warming["number"])
+            if target != current:
+                # Something else moved the active account off the target
+                # (a manual switch, or another engine instance) — the hold
+                # no longer applies to whatever is active now; let this
+                # tick's normal logic decide fresh.
+                self._end_warm_hold(warming, "superseded")
+                return None
+            if _five_hour_active(usage.get(target)) is True:
+                self._end_warm_hold(warming, "started")
+                return None
+            since = warming.get("since")
+            elapsed = now - since if isinstance(since, (int, float)) else WARM_HOLD_MAX_S
+            if elapsed >= WARM_HOLD_MAX_S:
+                self._end_warm_hold(warming, "timeout")
+                return None
+            # Suppress the caller's own below-threshold strategy branch —
+            # for `consume-first` that branch would otherwise proactively
+            # move again (possibly right back off the account we just
+            # touched) before it ever gets a chance to tick.
+            self._emit(
+                NoSwitchEvent(
+                    reason="warming",
+                    detail=(
+                        f"priming account {target}'s 5h window "
+                        f"({WARM_HOLD_MAX_S - elapsed:.0f}s left before "
+                        f"resuming '{self.settings.strategy}')"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+
+        if not reset_candidates or self._in_cooldown(state):
+            return None
+
+        target = reset_candidates[0]
+        email = self.switcher.account_email(target)
+        left = (
+            headroom.get(current),
+            _binding_recovery_ts(usage.get(current), self._models, now),
+        )
+        if self.dry_run:
+            outcome = self._perform(target, email, "warm-reset", left)
+            if outcome is TickOutcome.SWITCHED:
+                self._dry_run_warming = {"number": target, "since": now}
+                self._dry_run_five_hour_seen = {
+                    **self._dry_run_five_hour_seen, target: False
+                }
+            return outcome
+        status = self._freshen_target(target, email)
+        if status == "identity-conflict":
+            self._quarantine(target, email, "identity-conflict")
+            return None  # quarantined for next tick; active account is fine
+        if status == "invalid_grant":
+            self._quarantine(target, email, "invalid_grant")
+            return None
+        if status != "ok":
+            # transient / systemic / skip-live-session — leave it for the
+            # normal below-threshold path this tick, retry the warm touch
+            # next tick.
+            return None
+        outcome = self._perform(target, email, "warm-reset", left)
+        if outcome is TickOutcome.SWITCHED:
+            def commit(s: dict) -> None:
+                s["warming"] = {"number": target, "since": now}
+                # Only NOW is the pending transition actually consumed — see
+                # the comment above `reset_candidates.append` for why it was
+                # deliberately left out of the earlier bookkeeping write.
+                fh = s.get("fiveHourSeen")
+                fh = dict(fh) if isinstance(fh, dict) else {}
+                fh[target] = False
+                s["fiveHourSeen"] = fh
+
+            self._mutate_state(commit)
+        return outcome
+
+    def _end_warm_hold(self, warming: dict, status: str) -> None:
+        number = str(warming.get("number", ""))
+
+        def drop(s: dict) -> None:
+            w = s.get("warming")
+            if isinstance(w, dict) and str(w.get("number")) == number:
+                s.pop("warming", None)
+
+        if self.dry_run:
+            self._dry_run_warming = None
+        else:
+            self._mutate_state(drop)
+        self._emit(
+            WarmResetHoldEndedEvent(
+                number=number,
+                email=self.switcher.account_email(number) or "",
+                status=status,
+            )
+        )
 
     # -- helpers --------------------------------------------------------------
 
@@ -2282,6 +2522,16 @@ class AutoSwitchEngine:
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
+
+    def apply_warm_on_reset(self, enabled: bool) -> None:
+        """Session override from the TUI, mirroring :meth:`apply_threshold`.
+
+        No poll-policy re-pin needed — unlike the threshold, this axis
+        doesn't feed the collector's cadence, only ``_tick_inner``'s own
+        below-threshold branch, which reads ``self.settings`` fresh every
+        tick.
+        """
+        self.settings = replace(self.settings, warm_on_reset=enabled)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
