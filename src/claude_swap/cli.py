@@ -1142,6 +1142,22 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Set a short display alias for the account (use with 'add')",
     )
     parser.add_argument(
+        "--preserve-active",
+        action="store_true",
+        help=(
+            "Keep the currently active global account when adding or "
+            "refreshing an account (use with 'add')"
+        ),
+    )
+    parser.add_argument(
+        "--expect-account",
+        metavar="NUM|EMAIL",
+        help=(
+            "Refuse the add if the authenticated identity is not this existing "
+            "account (use with 'add')"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -1328,6 +1344,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
+    if args.preserve_active and not args.add_account:
+        parser.error("--preserve-active can only be used with 'add'")
+
+    if args.expect_account is not None and not args.add_account:
+        parser.error("--expect-account can only be used with 'add'")
+
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
@@ -1370,7 +1392,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            switcher.add_account(
+                slot=args.slot,
+                alias=args.alias,
+                preserve_active=(
+                    args.preserve_active or args.expect_account is not None
+                ),
+                expect_account=args.expect_account,
+            )
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,

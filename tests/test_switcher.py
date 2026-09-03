@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -8539,6 +8540,361 @@ class TestAddAccountAlias:
              patch.object(switcher, "_delete_account_credentials"):
             with pytest.raises(ValidationError):
                 switcher.add_account(alias="dev")
+
+
+class TestAddAccountPreserveActive:
+    @staticmethod
+    def _seed(switcher: ClaudeAccountSwitcher) -> None:
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"] = {
+            "1": {
+                "email": "selected@example.com",
+                "uuid": "uuid-selected",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": "2026-01-01T00:00:00Z",
+            },
+            "2": {
+                "email": "refresh@example.com",
+                "uuid": "uuid-refresh",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": "2026-01-01T00:00:00Z",
+            },
+        }
+        data["sequence"] = [1, 2]
+        data["activeAccountNumber"] = 1
+        switcher._write_json(switcher.sequence_file, data)
+        for number, email, uuid in (
+            ("1", "selected@example.com", "uuid-selected"),
+            ("2", "refresh@example.com", "uuid-refresh"),
+        ):
+            switcher._write_account_credentials(
+                number,
+                email,
+                json.dumps({"claudeAiOauth": {"accessToken": f"old-{number}"}}),
+            )
+            switcher._write_account_config(
+                number,
+                email,
+                json.dumps({"oauthAccount": {
+                    "emailAddress": email,
+                    "accountUuid": uuid,
+                    "organizationUuid": "",
+                }}),
+            )
+
+    @staticmethod
+    def _land_login(
+        switcher: ClaudeAccountSwitcher,
+        *,
+        email: str = "refresh@example.com",
+        uuid: str = "uuid-refresh",
+    ) -> None:
+        switcher._get_claude_config_path().write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": uuid,
+                "organizationUuid": "",
+                "organizationName": "",
+            }}),
+            encoding="utf-8",
+        )
+
+    def test_refresh_keeps_global_selection_and_updates_real_identity(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher)
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+
+        with patch.object(switcher, "_read_capture_credentials", return_value=fresh), \
+             patch.object(
+                 switcher,
+                 "_reject_foreign_credential_capture",
+                 side_effect=lambda credentials, *_: credentials,
+             ):
+            switcher.add_account(
+                preserve_active=True,
+                expect_account="2",
+            )
+
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert set(data["accounts"]) == {"1", "2"}
+        assert "fresh" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+
+    def test_concurrent_switch_after_capture_wins_over_preserved_reauth(
+        self, temp_home: Path,
+    ):
+        from claude_swap.locking import FileLock
+
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher)
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        captured = threading.Event()
+        selection_changed = threading.Event()
+        failures: list[BaseException] = []
+
+        def capture_then_wait() -> str:
+            captured.set()
+            assert selection_changed.wait(timeout=5)
+            return fresh
+
+        def run_reauth() -> None:
+            try:
+                switcher.add_account(
+                    preserve_active=True,
+                    expect_account="2",
+                )
+            except BaseException as exc:  # surfaced in the assertion below
+                failures.append(exc)
+
+        with patch.object(
+            switcher,
+            "_read_capture_credentials",
+            side_effect=capture_then_wait,
+        ), patch.object(
+            switcher,
+            "_reject_foreign_credential_capture",
+            side_effect=lambda credentials, *_: credentials,
+        ):
+            worker = threading.Thread(target=run_reauth)
+            worker.start()
+            try:
+                assert captured.wait(timeout=5)
+                # Model a lock-honoring `cswap switch 2` that lands after the
+                # re-auth captured its pre-OAuth roster but before publication.
+                with FileLock(switcher.lock_file):
+                    data = switcher._get_sequence_data()
+                    data["activeAccountNumber"] = 2
+                    switcher._write_json(switcher.sequence_file, data)
+            finally:
+                selection_changed.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 2
+        assert "fresh" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+
+    def test_legacy_org_migration_is_serialized_with_account_switches(
+        self, temp_home: Path,
+    ):
+        from claude_swap.locking import FileLock
+
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        legacy = switcher._get_sequence_data()
+        for account in legacy["accounts"].values():
+            account.pop("organizationUuid", None)
+            account.pop("organizationName", None)
+        switcher._write_json(switcher.sequence_file, legacy)
+        self._land_login(switcher)
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        real_migrate = switcher._migrate_org_fields
+        lock_observed: list[bool] = []
+
+        def verify_lock_then_migrate() -> None:
+            contender = FileLock(switcher.lock_file, timeout=0)
+            acquired = contender.acquire(timeout=0)
+            lock_observed.append(not acquired)
+            if acquired:
+                contender.release()
+            real_migrate()
+
+        with patch.object(
+            switcher,
+            "_migrate_org_fields",
+            side_effect=verify_lock_then_migrate,
+        ), patch.object(
+            switcher,
+            "_read_capture_credentials",
+            return_value=fresh,
+        ), patch.object(
+            switcher,
+            "_reject_foreign_credential_capture",
+            side_effect=lambda credentials, *_: credentials,
+        ):
+            switcher.add_account(
+                preserve_active=True,
+                expect_account="2",
+            )
+
+        assert lock_observed == [True]
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_targeted_reauth_repairs_a_genuinely_missing_credential(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        switcher._delete_account_credentials("2", "refresh@example.com")
+        assert not switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+        self._land_login(switcher)
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+
+        with patch.object(switcher, "_read_capture_credentials", return_value=fresh), \
+             patch.object(
+                 switcher,
+                 "_reject_foreign_credential_capture",
+                 side_effect=lambda credentials, *_: credentials,
+             ):
+            switcher.add_account(
+                preserve_active=True,
+                expect_account="2",
+            )
+
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert "fresh" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+
+    def test_uuid_dedup_refreshes_in_place_after_email_change(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher, email="renamed@example.com")
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+
+        with patch.object(switcher, "_read_capture_credentials", return_value=fresh), \
+             patch.object(
+                 switcher,
+                 "_reject_foreign_credential_capture",
+                 side_effect=lambda credentials, *_: credentials,
+             ):
+            switcher.add_account(preserve_active=True, expect_account="2")
+
+        data = switcher._get_sequence_data()
+        assert set(data["accounts"]) == {"1", "2"}
+        assert data["accounts"]["2"]["email"] == "renamed@example.com"
+        assert data["activeAccountNumber"] == 1
+
+    def test_expected_identity_mismatch_writes_nothing(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher)
+        before = switcher.sequence_file.read_bytes()
+        before_selected = switcher._read_account_credentials(
+            "1", "selected@example.com"
+        )
+
+        with pytest.raises(ValidationError, match="does not match"):
+            switcher.add_account(
+                preserve_active=True,
+                expect_account="1",
+            )
+
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._read_account_credentials(
+            "1", "selected@example.com"
+        ) == before_selected
+
+    def test_expected_identity_rejects_same_email_with_different_uuid(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher, uuid="uuid-different-person")
+        before = switcher.sequence_file.read_bytes()
+
+        with pytest.raises(ValidationError, match="does not match"):
+            switcher.add_account(
+                preserve_active=True,
+                expect_account="2",
+            )
+
+        assert switcher.sequence_file.read_bytes() == before
+        assert "old-2" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+
+    def test_failed_credential_commit_restores_roster_and_config(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher)
+        before_sequence = switcher.sequence_file.read_bytes()
+        before_config = switcher._read_account_config(
+            "2", "refresh@example.com"
+        )
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        real_write = switcher._write_account_credentials
+
+        def fail_fresh(number: str, email: str, credentials: str) -> None:
+            if credentials == fresh:
+                raise OSError("simulated credential-store failure")
+            real_write(number, email, credentials)
+
+        with patch.object(switcher, "_read_capture_credentials", return_value=fresh), \
+             patch.object(
+                 switcher,
+                 "_reject_foreign_credential_capture",
+                 side_effect=lambda credentials, *_: credentials,
+             ), \
+             patch.object(
+                 switcher,
+                 "_write_account_credentials",
+                 side_effect=fail_fresh,
+             ):
+            with pytest.raises(OSError, match="simulated"):
+                switcher.add_account(
+                    preserve_active=True,
+                    expect_account="2",
+                )
+
+        assert switcher.sequence_file.read_bytes() == before_sequence
+        assert switcher._read_account_config(
+            "2", "refresh@example.com"
+        ) == before_config
+        assert "old-2" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
+
+    def test_failed_config_commit_restores_previous_credentials(
+        self, temp_home: Path,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher)
+        self._land_login(switcher)
+        before_sequence = switcher.sequence_file.read_bytes()
+        fresh = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+
+        with patch.object(switcher, "_read_capture_credentials", return_value=fresh), \
+             patch.object(
+                 switcher,
+                 "_reject_foreign_credential_capture",
+                 side_effect=lambda credentials, *_: credentials,
+             ), \
+             patch.object(
+                 switcher,
+                 "_write_account_config",
+                 side_effect=OSError("simulated config-store failure"),
+             ):
+            with pytest.raises(OSError, match="config-store"):
+                switcher.add_account(
+                    preserve_active=True,
+                    expect_account="2",
+                )
+
+        assert switcher.sequence_file.read_bytes() == before_sequence
+        assert "old-2" in switcher._read_account_credentials(
+            "2", "refresh@example.com"
+        )
 
 
 # ---------------------------------------------------------------------------

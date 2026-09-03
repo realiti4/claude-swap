@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import logging
@@ -3087,6 +3088,63 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    @staticmethod
+    def _find_account_slot_by_identity(
+        data: dict,
+        email: str,
+        organization_uuid: str,
+        account_uuid: str,
+    ) -> str | None:
+        """Resolve a real Claude identity, preferring account UUID + org.
+
+        Older slots may not carry a UUID, so the established
+        ``(email, organizationUuid)`` composite remains the compatibility
+        fallback only for those legacy rows. A conflicting UUID in the same
+        organization is a different real identity even when the email happens
+        to match; the same person in a different organization remains a
+        separate managed seat. Ambiguous UUID/org or legacy matches are corrupt
+        roster state, never a license to choose whichever slot happens to be
+        iterated first.
+        """
+        accounts = data.get("accounts", {})
+        if account_uuid:
+            uuid_matches = [
+                str(num)
+                for num, account in accounts.items()
+                if (
+                    (account.get("uuid") or "") == account_uuid
+                    and (account.get("organizationUuid", "") or "")
+                    == (organization_uuid or "")
+                )
+            ]
+            if len(uuid_matches) > 1:
+                raise ConfigError(
+                    "Multiple managed accounts have the authenticated Claude "
+                    "account UUID and organization; repair the roster before "
+                    "re-authenticating."
+                )
+            if uuid_matches:
+                return uuid_matches[0]
+        normalized_email = email.strip().casefold()
+        legacy_matches = [
+            str(num)
+            for num, account in accounts.items()
+            if (
+                (not account_uuid or not (account.get("uuid") or ""))
+                and str(account.get("email") or "").strip().casefold()
+                == normalized_email
+                and (account.get("organizationUuid", "") or "")
+                == (organization_uuid or "")
+            )
+        ]
+        if len(legacy_matches) > 1:
+            raise ConfigError(
+                "Multiple managed accounts have the authenticated Claude "
+                "email and organization; repair the roster before "
+                "re-authenticating."
+            )
+        return legacy_matches[0] if legacy_matches else None
+
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
@@ -3478,11 +3536,352 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def _refresh_managed_account(
+        self,
+        *,
+        identity: tuple[str, str, str],
+        current_creds: str,
+        current_config: str,
+        alias: str | None,
+        preserve_active: bool,
+        expect_account: str | None,
+    ) -> tuple[str, str]:
+        """Commit a managed-account credential refresh under the account lock.
+
+        OAuth and credential capture happen before this method: network or user
+        interaction must never hold ``self.lock_file``. Once the bytes are
+        ready, re-resolve both the authenticated identity and the requested
+        target against the locked roster. This makes a concurrent switch win
+        naturally (``preserve_active`` leaves the freshly read selection
+        untouched) and prevents a concurrent move/remove from redirecting the
+        refresh to a stale slot number.
+
+        Returns the refreshed slot number and its organization display name.
+        """
+        current_email, current_org_uuid, current_account_uuid = identity
+
+        with FileLock(self.lock_file):
+            seq = self._get_sequence_data() or {}
+            account_num = self._find_account_slot_by_identity(
+                seq,
+                current_email,
+                current_org_uuid,
+                current_account_uuid,
+            )
+
+            if expect_account is not None:
+                expected_slot = self._resolve_account_identifier(expect_account)
+                if expected_slot is None:
+                    raise AccountNotFoundError(
+                        f"No managed account matches: {expect_account}"
+                    )
+                if account_num != expected_slot:
+                    raise ValidationError(
+                        "The authenticated Claude identity does not match the "
+                        "account requested for re-authentication. No saved "
+                        "credentials were changed."
+                    )
+
+            if account_num is None:
+                raise ConfigError(
+                    "The managed account roster changed while credentials were "
+                    "being captured. No saved credentials were changed; retry "
+                    "the add."
+                )
+
+            existing_record = seq.get("accounts", {}).get(account_num)
+            if not existing_record:
+                raise ConfigError(
+                    "The managed account roster changed while credentials were "
+                    "being captured. No saved credentials were changed; retry "
+                    "the add."
+                )
+            existing_email = existing_record.get("email", current_email)
+            matched_org_name = existing_record.get("organizationName", "")
+
+            if alias is not None:
+                conflict = self._alias_in_use(alias, exclude_num=account_num)
+                if conflict is not None:
+                    raise ValidationError(
+                        f"Alias '{alias}' is already used by account {conflict}"
+                    )
+
+            previous_seq = copy.deepcopy(seq)
+            previous_config = self._read_account_config(
+                account_num, existing_email
+            )
+            previous_creds, previous_creds_unreadable = (
+                self._read_account_credentials_ex(account_num, existing_email)
+            )
+            if previous_creds_unreadable:
+                raise CredentialReadError(
+                    "The existing saved credentials could not be read, so "
+                    "they were not replaced. Retry when the credential store "
+                    "is available."
+                )
+
+            next_record = copy.deepcopy(existing_record)
+            next_record.update({
+                "email": current_email,
+                "uuid": current_account_uuid,
+                "organizationUuid": current_org_uuid,
+            })
+            if alias is not None:
+                next_record["alias"] = alias
+            seq["accounts"][account_num] = next_record
+            if not preserve_active:
+                seq["activeAccountNumber"] = int(account_num)
+            seq["lastUpdated"] = get_timestamp()
+
+            credentials_started = False
+            config_written = False
+            roster_written = False
+            try:
+                # Land the new credential/config under their destination key
+                # before the roster points at them. With an email change the
+                # old key stays intact until the final roster commit, so an
+                # interruption cannot strand the managed row between names.
+                credentials_started = True
+                self._write_account_credentials(
+                    account_num, current_email, current_creds
+                )
+                self._write_account_config(
+                    account_num, current_email, current_config
+                )
+                config_written = True
+                self._write_json(self.sequence_file, seq)
+                roster_written = True
+            except Exception as write_error:
+                rollback_errors: list[Exception] = []
+                if credentials_started:
+                    try:
+                        if existing_email == current_email and previous_creds:
+                            self._write_account_credentials(
+                                account_num, existing_email, previous_creds
+                            )
+                        else:
+                            self._delete_account_credentials(
+                                account_num, current_email
+                            )
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if roster_written:
+                    try:
+                        self._write_json(self.sequence_file, previous_seq)
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if config_written:
+                    try:
+                        if previous_config:
+                            self._write_account_config(
+                                account_num, existing_email, previous_config
+                            )
+                        new_config_path = (
+                            self.configs_dir
+                            / f".claude-config-{account_num}-{current_email}.json"
+                        )
+                        if existing_email != current_email or not previous_config:
+                            new_config_path.unlink(missing_ok=True)
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise ConfigError(
+                        "Re-authentication could not be committed and rollback "
+                        "was incomplete; the retained previous credential "
+                        "generation may require recovery."
+                    ) from write_error
+                raise
+
+            if existing_email != current_email:
+                self._delete_account_credentials(account_num, existing_email)
+                old_config_path = (
+                    self.configs_dir
+                    / f".claude-config-{account_num}-{existing_email}.json"
+                )
+                try:
+                    old_config_path.unlink(missing_ok=True)
+                except OSError:
+                    self._logger.warning(
+                        "Updated account %s but could not remove its obsolete "
+                        "config backup; the roster uses the new identity.",
+                        account_num,
+                        exc_info=True,
+                    )
+
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, current_org_uuid)}
+            )
+            return account_num, matched_org_name
+
+    def _commit_new_managed_account(
+        self,
+        *,
+        slot: int | None,
+        approved_displace: tuple[str, str, str, str] | None,
+        identity: tuple[str, str, str],
+        current_creds: str,
+        current_config: str,
+        organization_name: str,
+        alias: str | None,
+        preserve_active: bool,
+    ) -> tuple[str, str | None]:
+        """Publish a new slot without overwriting a concurrent roster change.
+
+        The overwrite prompt and all credential capture happen before the
+        lock. Under the lock, verify that any approved occupant is still the
+        same real identity, re-resolve a concurrent move of the authenticated
+        identity, and snapshot the *current* active record. The final active
+        selection is then derived from that locked snapshot, so a switch that
+        completed while capture was in progress is never undone.
+        """
+        current_email, organization_uuid, account_uuid = identity
+
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            accounts = data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            existing_slot = self._find_account_slot_by_identity(
+                data,
+                current_email,
+                organization_uuid,
+                account_uuid,
+            )
+
+            if slot is None:
+                if existing_slot is not None:
+                    raise ConfigError(
+                        "The managed account roster changed while credentials "
+                        "were being captured. The identity is already managed; "
+                        "no duplicate was added. Retry the add to refresh it."
+                    )
+                account_num = str(
+                    max((int(num) for num in accounts), default=0) + 1
+                )
+            else:
+                account_num = str(slot)
+
+            locked_displace: tuple[str, str, str] | None = None
+            target_record = accounts.get(account_num)
+            if target_record and account_num != existing_slot:
+                if approved_displace is None:
+                    raise ConfigError(
+                        f"Slot {account_num} changed while credentials were "
+                        "being captured. Nothing was overwritten; retry and "
+                        "confirm the current occupant."
+                    )
+                approved_num, approved_email, approved_org, approved_uuid = (
+                    approved_displace
+                )
+                approved_still_target = self._find_account_slot_by_identity(
+                    {"accounts": {account_num: target_record}},
+                    approved_email,
+                    approved_org,
+                    approved_uuid,
+                )
+                if approved_num != account_num or approved_still_target != account_num:
+                    raise ConfigError(
+                        f"Slot {account_num} changed while credentials were "
+                        "being captured. Nothing was overwritten; retry and "
+                        "confirm the current occupant."
+                    )
+                locked_displace = (
+                    account_num,
+                    target_record.get("email", ""),
+                    target_record.get("organizationUuid", "") or "",
+                )
+
+            migrate_from = (
+                existing_slot
+                if existing_slot is not None and existing_slot != account_num
+                else None
+            )
+
+            active_number = data.get("activeAccountNumber")
+            active_record = copy.deepcopy(
+                accounts.get(str(active_number))
+            )
+
+            existing_alias = None
+            if target_record and account_num == existing_slot:
+                existing_alias = target_record.get("alias")
+            if migrate_from:
+                existing_alias = (
+                    accounts[migrate_from].get("alias") or existing_alias
+                )
+
+            if alias is not None:
+                conflict = self._alias_in_use(alias, exclude_num=account_num)
+                if conflict is not None and conflict != migrate_from:
+                    raise ValidationError(
+                        f"Alias '{alias}' is already used by account {conflict}"
+                    )
+
+            if locked_displace:
+                d_num, d_email, d_org = locked_displace
+                self._delete_account_files(d_num, d_email)
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del accounts[d_num]
+
+            if migrate_from:
+                old_email = accounts[migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del accounts[migrate_from]
+
+            self._write_account_credentials(
+                account_num, current_email, current_creds
+            )
+            self._write_account_config(
+                account_num, current_email, current_config
+            )
+
+            accounts[account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            carried_alias = alias if alias is not None else existing_alias
+            if carried_alias:
+                accounts[account_num]["alias"] = carried_alias
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+
+            if preserve_active and active_record:
+                preserved_slot = self._find_account_slot_by_identity(
+                    data,
+                    active_record.get("email", ""),
+                    active_record.get("organizationUuid", "") or "",
+                    active_record.get("uuid", "") or "",
+                )
+                data["activeAccountNumber"] = (
+                    int(preserved_slot)
+                    if preserved_slot is not None
+                    else int(account_num)
+                )
+            else:
+                data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+            if locked_displace:
+                self._prune_mappings(d_email, d_org)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+            return account_num, migrate_from
+
     def add_account(
         self,
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
+        preserve_active: bool = False,
+        expect_account: str | None = None,
     ) -> None:
         """Add current account to managed accounts.
 
@@ -3495,11 +3894,27 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+            preserve_active: Keep the global active account selected before
+                  this add. If the roster was empty, the new account becomes
+                  active as usual.
+            expect_account: Existing NUM|EMAIL identity this OAuth result must
+                  match. A mismatch fails before any managed credential write.
         """
         self._refuse_session_shell()
         self._setup_directories()
-        self._init_sequence_file()
-        self._migrate_org_fields()
+        # Initialization and the legacy roster migration both write
+        # sequence.json. Serialize them with switch/move/refresh before OAuth
+        # capture begins; otherwise a migration that read the old active slot
+        # could publish it after a concurrent switch and make the later
+        # preserve-active commit faithfully preserve the wrong selection.
+        with FileLock(self.lock_file):
+            self._init_sequence_file()
+            self._migrate_org_fields()
+
+        # A targeted re-auth is selection-preserving by definition. Keep the
+        # invariant even for direct API callers that omit the redundant flag.
+        if expect_account is not None:
+            preserve_active = True
 
         if alias is not None:
             try:
@@ -3512,19 +3927,31 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
 
-        # When no slot specified and account already exists, refresh credentials in place
-        if slot is None and self._account_exists(current_email, current_org_uuid):
-            seq = self._get_sequence_data()
-            account_num = self._find_account_slot(seq, current_email, current_org_uuid)
-            matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
+        initial_data = self._get_sequence_data() or {}
+        existing_slot = self._find_account_slot_by_identity(
+            initial_data,
+            current_email,
+            current_org_uuid,
+            current_account_uuid,
+        )
 
-            if alias is not None:
-                conflict = self._alias_in_use(alias, exclude_num=account_num)
-                if conflict is not None:
-                    raise ValidationError(
-                        f"Alias '{alias}' is already used by account {conflict}"
-                    )
+        if expect_account is not None:
+            expected_slot = self._resolve_account_identifier(expect_account)
+            if expected_slot is None:
+                raise AccountNotFoundError(
+                    f"No managed account matches: {expect_account}"
+                )
+            if existing_slot != expected_slot:
+                raise ValidationError(
+                    "The authenticated Claude identity does not match the "
+                    "account requested for re-authentication. No saved "
+                    "credentials were changed."
+                )
 
+        # When no slot specified and the real identity already exists, refresh
+        # credentials in place. UUID-first matching prevents an email/slot alias
+        # from creating a duplicate row.
+        if slot is None and existing_slot is not None:
             current_creds = self._read_capture_credentials()
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
@@ -3558,18 +3985,14 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, current_org_uuid)}
+            account_num, matched_org_name = self._refresh_managed_account(
+                identity=identity,
+                current_creds=current_creds,
+                current_config=current_config,
+                alias=alias,
+                preserve_active=preserve_active,
+                expect_account=expect_account,
             )
-
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
-
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3582,7 +4005,6 @@ class ClaudeAccountSwitcher:
         # Determine slot number and collect confirmation decisions
         # (no destructive operations until new account is verified readable)
         displace_slot = None  # slot to clean up (occupied by different account)
-        migrate_from = None   # old slot to clean up (same account, different slot)
 
         if slot is not None:
             if slot < 1:
@@ -3590,20 +4012,11 @@ class ClaudeAccountSwitcher:
             account_num = str(slot)
             data = self._get_sequence_data()
 
-            # Find if current account already exists in a different slot
-            if self._account_exists(current_email, current_org_uuid):
-                old_num = self._find_account_slot(
-                    data, current_email, current_org_uuid
-                )
-                if old_num and old_num != account_num:
-                    migrate_from = old_num
-
             # Check if target slot is occupied by a different account
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
-                is_same = (existing_email == current_email
-                           and existing.get("organizationUuid", "") == current_org_uuid)
+                is_same = account_num == existing_slot
                 if not is_same:
                     existing_tag = self._get_display_tag(
                         existing_email,
@@ -3627,22 +4040,10 @@ class ClaudeAccountSwitcher:
                         account_num,
                         existing_email,
                         existing.get("organizationUuid", "") or "",
+                        existing.get("uuid", "") or "",
                     )
         else:
             account_num = str(self._get_next_account_number())
-
-        # Capture any alias to carry forward before destructive cleanup below
-        # deletes the old record (same account moving slots, or refreshing in place).
-        existing_alias = None
-        if slot is not None:
-            prior = data.get("accounts", {}).get(account_num) or {}
-            if (
-                prior.get("email") == current_email
-                and prior.get("organizationUuid", "") == current_org_uuid
-            ):
-                existing_alias = prior.get("alias")
-            if migrate_from:
-                existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -3671,61 +4072,27 @@ class ClaudeAccountSwitcher:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID and org fields
+        # Get organization display fields from the captured profile config.
         config_data = self._read_json(config_path)
         oauth_data = config_data.get("oauthAccount", {})
-        account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
+        # All captures are complete. Publish under the account lock and derive
+        # the preserved selection from the latest roster, not the pre-capture
+        # snapshot used only for confirmation UI.
+        account_num, migrate_from = self._commit_new_managed_account(
+            slot=slot,
+            approved_displace=displace_slot,
+            identity=identity,
+            current_creds=current_creds,
+            current_config=current_config,
+            organization_name=organization_name,
+            alias=alias,
+            preserve_active=preserve_active,
         )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
