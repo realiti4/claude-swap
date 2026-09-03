@@ -639,9 +639,21 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        *,
+        sync_sharing: bool = True,
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        ``sync_sharing=False`` is for short-lived internal consumers that need
+        an account-isolated Claude process without changing the user's
+        persistent ``cswap run`` sharing choice.  A newly bootstrapped profile
+        is still private; an existing profile keeps whichever sharing links
+        its interactive owner selected.
+        """
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
@@ -656,7 +668,8 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            if sync_sharing:
+                self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
@@ -758,11 +771,13 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                if sync_sharing:
+                    self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            if sync_sharing:
+                self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`

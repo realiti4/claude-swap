@@ -1100,6 +1100,13 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def test_timer_start_flag_overrides_opt_in_setting(self, temp_home):
+        self._run(["--once", "--start-timer-on-reset"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.start_timer_on_reset is True
+
+        self._run(["--once", "--no-start-timer-on-reset"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.start_timer_on_reset is False
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
 
