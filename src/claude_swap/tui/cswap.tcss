@@ -76,6 +76,13 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     color: $secondary;
 }
 
+#meters {
+    width: 1fr;
+    height: 1fr;
+    background: $background;
+    padding: 1 2 0 1;
+}
+
 /* -- auto screen ---------------------------------------------------------- */
 
 #auto-top {
@@ -91,6 +98,29 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 
 #mode-badge {
     width: auto;
+    text-style: bold;
+}
+
+/* Meters watch: the footer shares its row with the auto-switch readout. */
+#footer-row {
+    dock: bottom;
+    height: 1;
+    background: $footer-background;
+}
+
+#footer-row Footer {
+    dock: none;
+    width: 1fr;
+}
+
+#auto-readout {
+    width: auto;
+    padding: 0 1;
+    color: $footer-description-foreground;
+}
+
+#auto-readout.live {
+    color: $primary;
     text-style: bold;
 }
 

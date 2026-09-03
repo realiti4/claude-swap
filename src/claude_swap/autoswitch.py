@@ -314,6 +314,11 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # The account number the engine would move to if the active account
+    # crossed the threshold on this tick's snapshot; None when nothing
+    # qualifies. A prediction for watch screens, computed every tick —
+    # see `_predict_next_target`. Additive field.
+    next_target: str | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -325,6 +330,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.next_target is not None:
+            fields["nextTarget"] = self.next_target
         return fields
 
     def _describe(self, num: str) -> str:
@@ -665,6 +672,11 @@ class AutoSwitchEngine:
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
+        # Held for the whole switch transaction in `_perform`; `stop()` takes
+        # it after signalling, so it cannot return while a switch is under
+        # way on another thread. Re-entrant: a stop() issued from the tick
+        # thread itself (SIGTERM handler) must never wait on its own switch.
+        self._switch_lock = threading.RLock()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
@@ -942,6 +954,9 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                next_target=self._predict_next_target(
+                    state, current, quarantined, usage, headroom, settings
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1100,81 +1115,10 @@ class AutoSwitchEngine:
 
         consume_first = settings.strategy == "consume-first"
 
-        def _rank(**kw):
-            """Rank with the no-return bar, and WITHOUT it if that empties AND
-            the barred account is a different proposition from the one we left.
-
-            Emptiness alone cannot be the release. On two accounts there is
-            exactly one candidate, so barring it ALWAYS empties the list —
-            measured, sweeping active x barred headroom x both reset shapes,
-            `n=2 barred-rank EMPTY=320 NONEMPTY=0`. An emptiness-only release
-            therefore fires every tick and the bar is inert at the fleet size
-            the flap was reported on: pcts 92/92, resets 500h/400h, 60 ticks
-            gave `[1, 2, 1, 2]` with the bar on and the identical `[1, 2, 1, 2]`
-            with `lastSwitchFrom` popped every tick.
-
-            "BARRING LEAVES NOTHING" AND "WE ARE FLAPPING" ARE DIFFERENT
-            STATES, and at n=2 they are always the same state — which is how
-            one swallowed the other. The ranking cannot separate them: it sees
-            only the present, and both look like an empty list. What separates
-            them is WHY the ranking flipped. Traced at each leg of that walk:
-
-                t8   1->2   left 1 holding 4.0 pts, 500h out
-                t20  2->1   account 1 still 4.0 pts, still 500h out
-                t22  1->2   account 2 still 2.0 pts, still 400h out
-
-            Every return won because the ACTIVE burned down, never because the
-            target recovered. So the release asks the one question the ranking
-            cannot: is the account we left better than when we left it?
-
-            ON BOTH AXES THE RANKING USES, and with the margins it already
-            uses — ``SPENT_HEADROOM_PCT`` of headroom (below that an edge is
-            under two poll intervals of work) or ``RECOVERY_HYSTERESIS_S``
-            sooner. An account's headroom rises only when a window rolls over
-            and its binding reset only moves nearer when a nearer window
-            starts binding, so both are real events rather than the boundary
-            crossings burn manufactures for free.
-
-            Emptiness still decides whether to ASK. Where the bar leaves a
-            real alternative it simply applies, so a fleet with somewhere else
-            to go is untouched by any of this.
-
-            Cheap: the retry runs only when the barred list came back empty,
-            which is the tick that was about to do nothing anyway.
-            """
-            # Recomputed per snapshot, never once per tick: the consume-first
-            # two-phase commit replaces `headroom` and `active_headroom` and
-            # re-ranks, and the ratio release consumes exactly those two
-            # values. Computed once, the bar answered from a snapshot the
-            # ranking had already thrown away — `left=20 active=30` bars,
-            # `left=90 active=10` releases, and phase 2 is where that flips.
-            recovered = self._left_account_recovered(
-                state,
-                kw["usage"],
-                kw["headroom"],
-                kw["active_headroom"],
-                kw["settings"],
-                kw["now"],
-                kw["current"],
-            )
-            no_return = self._no_return_account(
-                trigger,
-                state,
-                kw["headroom"],
-                kw["active_headroom"],
-                recovered,
-                kw["settings"],
-                kw["current"],
-            )
-            ranked = self._rank_candidates(no_return=no_return, **kw)
-            if no_return is not None and not ranked[0] and recovered:
-                unbarred = self._rank_candidates(no_return=None, **kw)
-                if unbarred[0]:
-                    return unbarred
-            return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
+        ordered, any_known, active_reset_ts = self._rank_with_bar(
+            state,
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
@@ -1205,7 +1149,8 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
+            ordered, any_known, active_reset_ts = self._rank_with_bar(
+                state,
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
@@ -1752,6 +1697,150 @@ class AutoSwitchEngine:
             < was - RECOVERY_HYSTERESIS_S
         )
 
+    def _predict_next_target(
+        self,
+        state: dict,
+        current: str,
+        quarantined: set[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        settings: AutoSwitchSettings,
+    ) -> str | None:
+        """The account the engine would move to if the active account crossed
+        the threshold on this snapshot, or None when nothing qualifies.
+
+        `best` never ranks while the active account is healthy, so below the
+        threshold the ranking runs as though the active account sat exactly at
+        it — the state a real proactive decision is made in. consume-first and
+        over-threshold ticks are ranked on their real trigger and headroom.
+        Same ranking and no-return bar as a real decision; consume-first's
+        phase-2 refetch can still land elsewhere, which is fine for a
+        prediction. Pure — no emits, no state writes.
+        """
+        if (
+            self.switcher.account_kind_for(current) == "api_key"
+            and not settings.include_api_key_accounts
+        ):
+            return None
+        active_headroom = headroom.get(current)
+        if active_headroom is None:
+            return None
+        candidates = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num != current and num not in quarantined
+        ]
+        oauth_candidates = [
+            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+        ]
+        consume_first = settings.strategy == "consume-first"
+        if 100.0 - active_headroom < settings.threshold:
+            if consume_first:
+                trigger, decided_headroom = "consume-first", active_headroom
+            else:
+                trigger, decided_headroom = "proactive", 100.0 - settings.threshold
+        else:
+            trigger = "at-limit" if active_headroom <= 0 else "proactive"
+            decided_headroom = active_headroom
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            return None  # the decision path holds here too
+        if not oauth_candidates:
+            ordered: list[str] = []
+        else:
+            ordered, _, _ = self._rank_with_bar(
+                state,
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=decided_headroom,
+                settings=settings,
+                now=self.clock(),
+            )
+        if not ordered and settings.include_api_key_accounts and trigger != "consume-first":
+            # Same last resort as the decision: a metered API-key account.
+            ordered = [
+                n for n in candidates if self.switcher.account_kind_for(n) == "api_key"
+            ]
+        return ordered[0] if ordered else None
+
+    def _rank_with_bar(
+        self, state: dict, **kw
+    ) -> tuple[list[str], bool, float | None]:
+        """Rank with the no-return bar, and WITHOUT it if that empties AND
+        the barred account is a different proposition from the one we left.
+
+        Emptiness alone cannot be the release. On two accounts there is
+        exactly one candidate, so barring it ALWAYS empties the list —
+        measured, sweeping active x barred headroom x both reset shapes,
+        `n=2 barred-rank EMPTY=320 NONEMPTY=0`. An emptiness-only release
+        therefore fires every tick and the bar is inert at the fleet size
+        the flap was reported on: pcts 92/92, resets 500h/400h, 60 ticks
+        gave `[1, 2, 1, 2]` with the bar on and the identical `[1, 2, 1, 2]`
+        with `lastSwitchFrom` popped every tick.
+
+        "BARRING LEAVES NOTHING" AND "WE ARE FLAPPING" ARE DIFFERENT
+        STATES, and at n=2 they are always the same state — which is how
+        one swallowed the other. The ranking cannot separate them: it sees
+        only the present, and both look like an empty list. What separates
+        them is WHY the ranking flipped. Traced at each leg of that walk:
+
+            t8   1->2   left 1 holding 4.0 pts, 500h out
+            t20  2->1   account 1 still 4.0 pts, still 500h out
+            t22  1->2   account 2 still 2.0 pts, still 400h out
+
+        Every return won because the ACTIVE burned down, never because the
+        target recovered. So the release asks the one question the ranking
+        cannot: is the account we left better than when we left it?
+
+        ON BOTH AXES THE RANKING USES, and with the margins it already
+        uses — ``SPENT_HEADROOM_PCT`` of headroom (below that an edge is
+        under two poll intervals of work) or ``RECOVERY_HYSTERESIS_S``
+        sooner. An account's headroom rises only when a window rolls over
+        and its binding reset only moves nearer when a nearer window
+        starts binding, so both are real events rather than the boundary
+        crossings burn manufactures for free.
+
+        Emptiness still decides whether to ASK. Where the bar leaves a
+        real alternative it simply applies, so a fleet with somewhere else
+        to go is untouched by any of this.
+
+        Cheap: the retry runs only when the barred list came back empty,
+        which is the tick that was about to do nothing anyway.
+        """
+        # Recomputed per snapshot, never once per tick: the consume-first
+        # two-phase commit replaces `headroom` and `active_headroom` and
+        # re-ranks, and the ratio release consumes exactly those two
+        # values. Computed once, the bar answered from a snapshot the
+        # ranking had already thrown away — `left=20 active=30` bars,
+        # `left=90 active=10` releases, and phase 2 is where that flips.
+        recovered = self._left_account_recovered(
+            state,
+            kw["usage"],
+            kw["headroom"],
+            kw["active_headroom"],
+            kw["settings"],
+            kw["now"],
+            kw["current"],
+        )
+        no_return = self._no_return_account(
+            kw["trigger"],
+            state,
+            kw["headroom"],
+            kw["active_headroom"],
+            recovered,
+            kw["settings"],
+            kw["current"],
+        )
+        ranked = self._rank_candidates(no_return=no_return, **kw)
+        if no_return is not None and not ranked[0] and recovered:
+            unbarred = self._rank_candidates(no_return=None, **kw)
+            if unbarred[0]:
+                return unbarred
+        return ranked
+
     def _rank_candidates(
         self,
         *,
@@ -2122,44 +2211,35 @@ class AutoSwitchEngine:
         # and backs off instead of double-switching. No deadlock cycle: the
         # switch path (cswap FileLock + Claude Code locks) never takes the
         # state lock.
-        with self._state_lock():
-            state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
-                self._emit(NoSwitchEvent(reason="cooldown"))
-                return TickOutcome.NO_ACTION
-
-            result = self.switcher.switch_to(number, json_output=True)
-            if not result or not result.get("switched"):
-                self._emit(
-                    NoSwitchEvent(
-                        reason="already-active",
-                        detail=(result or {}).get("reason", ""),
-                    )
-                )
-                return TickOutcome.NO_ACTION
-
-            state["schemaVersion"] = STATE_SCHEMA_VERSION
-            state["lastSwitchAt"] = self.clock()
-            state["lastSwitchTo"] = number
-            # WHERE we came from, so the next tick can refuse to undo this,
-            # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
-            # cannot fake. See `_left_account_recovered` for why the present
-            # state alone cannot supply one. `inf` is stored as null: it is not
-            # portable JSON, and every other reader of this file would have to
-            # learn about it.
-            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
-            # A `consume-first` phase-2 refetch can write the SAME (None,
-            # None) shape a `failover` departure writes, whenever the
-            # refetched active row has a `pct` but is otherwise unmeasurable
-            # in the same tick its weekly reset is known --
-            # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
-            # needs only `resets_at`. Inferring the trigger from the two
-            # nulls then runs the wrong legs. Record it directly so the
-            # reader never has to guess.
-            state["leftTrigger"] = trigger
-            atomic_write_json(self.state_path, state)
+        #
+        # Nothing is emitted while `_switch_lock` is held: the TUI delivers
+        # events synchronously onto the thread that calls `stop()`, and
+        # `stop()` waits for this lock — an emit in here would have the two
+        # threads waiting on each other.
+        held: AutoSwitchEvent | None = None
+        with self._switch_lock, self._state_lock():
+            if self._stop.is_set():
+                # stop() landed while this tick was deciding: the caller no
+                # longer wants switches, so the last one must not slip out.
+                held = NoSwitchEvent(reason="stopped")
+            else:
+                state = self._read_state()
+                if trigger in ("proactive", "consume-first") and self._in_cooldown(
+                    state
+                ):
+                    held = NoSwitchEvent(reason="cooldown")
+                else:
+                    result = self.switcher.switch_to(number, json_output=True)
+                    if not result or not result.get("switched"):
+                        held = NoSwitchEvent(
+                            reason="already-active",
+                            detail=(result or {}).get("reason", ""),
+                        )
+                    else:
+                        self._record_switch(state, number, trigger, result, left)
+        if held is not None:
+            self._emit(held)
+            return TickOutcome.NO_ACTION
 
         self._emit(
             SwitchEvent(
@@ -2170,6 +2250,39 @@ class AutoSwitchEngine:
             )
         )
         return TickOutcome.SWITCHED
+
+    def _record_switch(
+        self,
+        state: dict,
+        number: str,
+        trigger: str,
+        result: dict,
+        left: tuple[float | None, float],
+    ) -> None:
+        """Persist a completed switch into the state file (caller holds the
+        state lock)."""
+        state["schemaVersion"] = STATE_SCHEMA_VERSION
+        state["lastSwitchAt"] = self.clock()
+        state["lastSwitchTo"] = number
+        # WHERE we came from, so the next tick can refuse to undo this,
+        # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
+        # cannot fake. See `_left_account_recovered` for why the present
+        # state alone cannot supply one. `inf` is stored as null: it is not
+        # portable JSON, and every other reader of this file would have to
+        # learn about it.
+        state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+        state["leftHeadroom"], recovery = left
+        state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+        # A `consume-first` phase-2 refetch can write the SAME (None,
+        # None) shape a `failover` departure writes, whenever the
+        # refetched active row has a `pct` but is otherwise unmeasurable
+        # in the same tick its weekly reset is known --
+        # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
+        # needs only `resets_at`. Inferring the trigger from the two
+        # nulls then runs the wrong legs. Record it directly so the
+        # reader never has to guess.
+        state["leftTrigger"] = trigger
+        atomic_write_json(self.state_path, state)
 
     # -- helpers --------------------------------------------------------------
 
@@ -2267,9 +2380,18 @@ class AutoSwitchEngine:
     def stop(self) -> None:
         """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
         before the loop starts — the stop is never cleared, so the loop
-        exits immediately (engines are single-use)."""
+        exits immediately (engines are single-use).
+
+        Called from another thread, returns only once no switch is in
+        flight: a tick that has not yet reached its switch transaction will
+        refuse it, and one already inside it is allowed to finish first, so
+        after this returns the active account no longer changes. Called from
+        the tick thread itself (the SIGTERM handler in ``cswap auto``) it
+        returns at once and the in-flight switch, if any, completes."""
         self._stop.set()
         self._wake.set()
+        with self._switch_lock:
+            pass
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""

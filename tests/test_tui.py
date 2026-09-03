@@ -19,11 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.autoswitch import NoSwitchEvent, PollEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
+from claude_swap.tui.widgets import bar_v, gradient_color, meter_grid_dims, meter_windows
 from claude_swap.usage_store import UsageEntry
 
 
@@ -238,9 +239,18 @@ class BlockingSnapshotSwitcher(FakeSwitcher):
         )
 
 
-def make_app(fake: FakeSwitcher):
+def set_watch_style(backup_dir: Path, style: str) -> None:
+    """Persist ui.watch_style so the app picks that watch layout at launch."""
+    from claude_swap.settings import set_setting
+
+    set_setting(backup_dir, "ui.watchStyle", style)
+
+
+def make_app(fake: FakeSwitcher, *, watch_style: str | None = None):
     from claude_swap.tui.app import CswapApp
 
+    if watch_style is not None:
+        set_watch_style(fake.backup_dir, watch_style)
     return CswapApp(fake)
 
 
@@ -1095,13 +1105,514 @@ class TestDashboard:
 
 
 @pytest.mark.asyncio
-class TestWatchScreen:
+class TestMeterWatchScreen:
+    """The opt-in ``ui.watch_style = meters`` vertical-meter grid layout."""
+
     def _fake(self, tmp_path):
         return FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
         )
 
     async def test_w_opens_monitor_without_cursor(self, tmp_path):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import MeterWatchScreen
+            from claude_swap.tui.widgets import MetersGrid
+
+            assert isinstance(app.screen, MeterWatchScreen)
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid.cursor is None  # monitor mode: no cursor
+            await pilot.press("enter")  # inert while just watching
+            await settle(pilot)
+            assert not any(call[0] == "switch_to" for call in fake_calls(app))
+
+    async def test_no_monitor_title_but_prompt_when_armed(self, tmp_path):
+        # The meters view drops the "watching all accounts" header (the grid is
+        # self-evident) but still shows the selection prompt once armed.
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            assert "watching all accounts" not in str(title.render())
+            assert str(title.render()) == ""  # blank while just watching
+            assert title.display is False  # row collapsed — no wasted space
+            await pilot.press("s")  # arm selection
+            await pilot.pause()
+            assert "switch to which account?" in str(title.render())
+            assert title.display is True  # prompt row appears while selecting
+
+    async def test_s_arms_selection_at_active_index(self, tmp_path):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid.cursor == 0  # armed on the active account
+
+    async def test_nav_right_moves_cursor_one(self, tmp_path):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid.cursor == 0
+            await pilot.press("l")  # two accounts side by side at this width
+            await pilot.pause()
+            assert grid.cursor == 1
+
+    async def test_grid_content_fits_small_terminal_without_clipping(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(44, 38)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid._ncols() == 2
+            rendered_lines = grid.render().plain.count("\n") + 1
+            assert rendered_lines <= grid.size.height
+
+    async def test_grid_fallback_cursor_moves_through_compact_list(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(30, 12)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid._ncols() == 1  # fallback list is effectively one column
+            assert grid.cursor == 0
+            rendered_lines = grid.render().plain.count("\n") + 1
+            assert rendered_lines <= grid.size.height
+            await pilot.press("j")  # down moves to the next account in the list
+            await pilot.pause()
+            assert grid.cursor == 1
+            assert grid.selected_number() == "2"
+
+    async def test_selection_anchors_to_active_after_pre_snapshot_arm(self, tmp_path):
+        """``s`` pressed before the initial snapshot lands must still end up
+        selecting the active account once data arrives, not slot 1."""
+
+        class BlockingFakeSwitcher(FakeSwitcher):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.release = threading.Event()
+
+            def accounts_snapshot(self, fetch=None):
+                self.release.wait(5)
+                return super().accounts_snapshot(fetch)
+
+        fake = BlockingFakeSwitcher(
+            [make_account(1), make_account(2, active=True), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            assert app.snapshot is None  # initial refresh hasn't landed yet
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid.cursor == 0  # arms at the fallback default, snapshot unknown
+
+            fake.release.set()
+            await settle(pilot)
+
+            assert grid.selected_number() == "2"  # anchored to the active account
+
+            # Membership changing later must keep the cursor in range too.
+            shrunk = dataclasses.replace(
+                app.snapshot, accounts=app.snapshot.accounts[:1]
+            )
+            app.snapshot = shrunk
+            await pilot.pause()
+            assert grid.cursor is not None
+            assert grid.cursor < len(shrunk.accounts)
+
+    async def test_armed_cursor_follows_account_across_reorder(self, tmp_path):
+        """An external move/swap that reorders accounts while selection is
+        armed must keep the cursor on the *same account*, not the same slot —
+        otherwise Enter would switch to the wrong target."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("l")  # move selection off the active account
+            await pilot.pause()
+            from claude_swap.tui.widgets import MetersGrid
+
+            grid = app.screen.query_one("#meters", MetersGrid)
+            selected = grid.selected_number()
+            assert selected == "2"
+
+            # Reorder so account "2" moves to a different index.
+            accts = app.snapshot.accounts
+            reordered = dataclasses.replace(
+                app.snapshot, accounts=(accts[2], accts[0], accts[1])
+            )
+            app.snapshot = reordered
+            await pilot.pause()
+            assert grid.selected_number() == selected  # still on account "2"
+
+    async def test_s_arms_selection_switch_stays_watching(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import MeterWatchScreen
+            from claude_swap.tui.widgets import MetersGrid
+
+            await pilot.press("l", "enter")
+            await settle(pilot)
+            assert ("switch_to", "2") in fake.calls
+            assert isinstance(app.screen, MeterWatchScreen)  # stayed watching
+            grid = app.screen.query_one("#meters", MetersGrid)
+            assert grid.cursor is None  # disarmed after switch
+            assert app.snapshot.active_number == "2"
+
+    async def test_escape_disarms_then_leaves(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("escape")  # disarm selection only
+            await pilot.pause()
+            from claude_swap.tui.dashboard import DashboardScreen, MeterWatchScreen
+            from claude_swap.tui.widgets import MetersGrid
+
+            assert isinstance(app.screen, MeterWatchScreen)
+            assert app.screen.query_one("#meters", MetersGrid).cursor is None
+            await pilot.press("escape")  # now leave
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+            assert not any(call[0] == "switch_to" for call in fake.calls)
+
+    async def test_menu_watch_entry_opens_it(self, tmp_path):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "watch")
+            from claude_swap.tui.dashboard import MeterWatchScreen
+
+            assert isinstance(app.screen, MeterWatchScreen)
+
+    async def test_app_start_watch_stacks_over_dashboard(self, tmp_path):
+        from claude_swap.tui.app import CswapApp
+
+        fake = self._fake(tmp_path)
+        set_watch_style(fake.backup_dir, "meters")
+        app = CswapApp(fake, start="watch")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.dashboard import DashboardScreen, MeterWatchScreen
+
+            assert isinstance(app.screen, MeterWatchScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+
+@pytest.mark.asyncio
+class TestMeterWatchAutoSwitch:
+    """``a`` runs a dry-run auto-switch engine from the meters view so the
+    grid can highlight the predicted next target; ``L`` arms real switching."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2, alias="peer")], tmp_path
+        )
+
+    async def _open(self, app, pilot):
+        await settle(pilot)
+        await pilot.press("w")
+        await pilot.pause()
+        from claude_swap.tui.widgets import MetersGrid
+
+        return app.screen.query_one("#meters", MetersGrid)
+
+    async def _emit(self, pilot, engine, event) -> None:
+        """Deliver ``event`` the way the real engine does: from a worker
+        thread, so ``call_from_thread`` hands it to the app loop."""
+        await asyncio.to_thread(engine.on_event, event)
+        await pilot.pause()
+
+    async def test_a_toggles_a_dry_run_engine_and_store_only(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(app, pilot)
+            assert fake_engine.instances == []  # off until asked
+            assert app._store_only is False
+
+            await pilot.press("a")
+            await pilot.pause()
+            assert len(fake_engine.instances) == 1
+            assert fake_engine.instances[0].dry_run is True
+            assert app._store_only is True
+
+            await pilot.press("a")
+            await pilot.pause()
+            assert fake_engine.instances[0].stopped is True
+            assert len(fake_engine.instances) == 1
+            assert app._store_only is False
+
+
+    async def test_poll_events_drive_the_predicted_highlight_and_title(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            grid = await self._open(app, pilot)
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            readout = app.screen.query_one("#auto-readout", Static)
+            assert readout.display is False  # nothing to say while auto is off
+            await pilot.press("a")
+            await pilot.pause()
+            engine = fake_engine.instances[0]
+
+            await self._emit(pilot, engine, PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 40.0, "2": 90.0},
+                threshold=90.0,
+                next_target="2",
+            ))
+            assert grid.predicted == "2"
+            assert grid.urgency == pytest.approx(0.0)  # 30 points of margin
+            # The readout lives in the footer, so the meters keep every row.
+            assert title.display is False
+            assert readout.display is True
+            assert str(readout.render()) == "dry-run · next → peer"
+
+            await self._emit(pilot, engine, PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 12.0, "2": 90.0},
+                threshold=90.0,
+                next_target="2",
+            ))
+            assert grid.urgency == pytest.approx(0.9)  # 2 points of margin
+
+            await self._emit(pilot, engine, PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 12.0, "2": 0.0},
+                threshold=90.0,
+            ))
+            assert grid.predicted is None
+            assert str(readout.render()) == "dry-run · next → none"
+
+            await pilot.press("a")  # off: highlight and readout both go
+            await pilot.pause()
+            assert grid.predicted is None
+            assert readout.display is False
+            assert title.display is False
+
+
+    async def test_L_confirms_before_going_live_and_returns_to_dry_run(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(app, pilot)
+            from textual.widgets import Static
+            from claude_swap.tui.modals import ConfirmModal
+
+            readout = app.screen.query_one("#auto-readout", Static)
+            await pilot.press("L")  # inert while auto is off
+            await pilot.pause()
+            assert fake_engine.instances == []
+            assert not isinstance(app.screen, ConfirmModal)
+
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("L")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("n")  # declined: still dry-run
+            await pilot.pause()
+            assert len(fake_engine.instances) == 1
+            assert fake_engine.instances[0].stopped is False
+
+            await pilot.press("L")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            assert fake_engine.instances[0].stopped is True
+            assert len(fake_engine.instances) == 2
+            assert fake_engine.instances[1].dry_run is False
+            assert app._store_only is True
+            assert str(readout.render()).startswith("LIVE")
+
+            await pilot.press("L")  # back to dry-run needs no confirmation
+            await pilot.pause()
+            assert fake_engine.instances[1].stopped is True
+            assert fake_engine.instances[2].dry_run is True
+            assert str(readout.render()).startswith("dry-run")
+
+    async def test_a_live_switch_sweeps_the_frames_and_refreshes(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            grid = await self._open(app, pilot)
+            await pilot.press("a")
+            await pilot.pause()
+            engine = fake_engine.instances[0]
+            await settle(pilot)
+            snapshots_before = len(app.switcher.fetch_sets)
+
+            def switch(dry_run):
+                return SwitchEvent(
+                    trigger="proactive",
+                    from_ref={"number": 1, "email": "a@example.com"},
+                    to_ref={"number": 2, "email": "b@example.com"},
+                    dry_run=dry_run,
+                )
+
+            await self._emit(pilot, engine, PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 5.0, "2": 80.0},
+                threshold=90.0,
+                next_target="2",
+            ))
+            assert grid.predicted == "2"
+
+            await self._emit(pilot, engine, switch(dry_run=True))
+            assert grid._sweep is None  # a would-switch is not a handoff
+            assert grid.predicted == "2"
+
+            await self._emit(pilot, engine, switch(dry_run=False))
+            assert grid._sweep is not None
+            assert grid._sweep[:2] == ("1", "2")
+            # The landed account is active now, not "next": the prediction is
+            # dropped until the engine re-ranks from the new vantage point.
+            assert grid.predicted is None
+            assert grid._anim is not None  # the sweep alone keeps frames coming
+            await settle(pilot)
+            assert len(app.switcher.fetch_sets) > snapshots_before  # cards re-read the store
+
+    async def test_footer_offers_live_only_while_auto_runs(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(app, pilot)
+            assert "L" not in app.screen.active_bindings
+            await pilot.press("a")
+            await pilot.pause()
+            assert "L" in app.screen.active_bindings
+            await pilot.press("a")
+            await pilot.pause()
+            assert "L" not in app.screen.active_bindings
+
+    async def test_stopping_auto_unpins_the_poll_policy(self, tmp_path, fake_engine):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(app, pilot)
+            app.switcher._poll_inputs_override = (90.0, ())  # as the engine pins it
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert app.switcher._poll_inputs_override is None
+
+    async def test_events_from_a_replaced_engine_are_ignored(
+        self, tmp_path, fake_engine
+    ):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            grid = await self._open(app, pilot)
+            await pilot.press("a")
+            await pilot.pause()
+            old = fake_engine.instances[0]
+            await pilot.press("L")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            assert old.stopped
+            # The old worker may still finish a tick after being replaced.
+            await self._emit(pilot, old, PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 40.0, "2": 90.0},
+                threshold=90.0,
+                next_target="2",
+            ))
+            assert grid.predicted is None
+
+    async def test_layout_swap_stops_the_engine(self, tmp_path, fake_engine):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(app, pilot)
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("ctrl+v")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import ClassicWatchScreen
+
+            assert isinstance(app.screen, ClassicWatchScreen)
+            assert fake_engine.instances[0].stopped is True
+            assert app._store_only is False
+
+
+@pytest.mark.asyncio
+class TestClassicWatchScreen:
+    """The default horizontal-bar account-list watch layout (``classic``)."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+
+    async def test_w_opens_monitor_without_cursor(self, tmp_path):
+        # No ui.watch_style set → default classic.
         app = make_app(self._fake(tmp_path))
         async with app.run_test(size=(100, 40)) as pilot:
             await settle(pilot)
@@ -1109,16 +1620,68 @@ class TestWatchScreen:
             await pilot.pause()
             from textual.widgets import ListView
 
-            from claude_swap.tui.dashboard import WatchScreen
-            from claude_swap.tui.widgets import AccountItem
+            from claude_swap.tui.dashboard import ClassicWatchScreen
 
-            assert isinstance(app.screen, WatchScreen)
+            assert isinstance(app.screen, ClassicWatchScreen)
             listview = app.screen.query_one("#accounts", ListView)
-            assert len(list(listview.query(AccountItem))) == 2  # full cards
             assert listview.index is None  # monitor mode: no cursor
             await pilot.press("enter")  # inert while just watching
             await settle(pilot)
             assert not any(call[0] == "switch_to" for call in fake_calls(app))
+
+    async def test_monitor_title_preserved(self, tmp_path):
+        # The classic screen is the author's default view — keep its
+        # "watching all accounts" header (only the meters view drops it).
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            assert "watching all accounts" in str(title.render())
+
+    async def test_s_arms_selection_at_active_index(self, tmp_path):
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert listview.index == 0  # armed on the active account
+
+    async def test_armed_cursor_follows_account_across_reorder(self, tmp_path):
+        """A reorder while selection is armed keeps the cursor on the same
+        account, not the same row — so Enter can't switch to the wrong one."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("down")  # highlight account 2
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert app.snapshot.accounts[listview.index].number == "2"
+
+            accts = app.snapshot.accounts
+            app.snapshot = dataclasses.replace(
+                app.snapshot, accounts=(accts[2], accts[0], accts[1])
+            )
+            await pilot.pause()
+            assert app.snapshot.accounts[listview.index].number == "2"
 
     async def test_s_arms_selection_switch_stays_watching(self, tmp_path):
         fake = self._fake(tmp_path)
@@ -1129,17 +1692,16 @@ class TestWatchScreen:
             await pilot.pause()
             await pilot.press("s")
             await pilot.pause()
+            await pilot.press("down", "enter")  # move to account 2, confirm
+            await settle(pilot)
             from textual.widgets import ListView
 
-            from claude_swap.tui.dashboard import WatchScreen
+            from claude_swap.tui.dashboard import ClassicWatchScreen
 
-            listview = app.screen.query_one("#accounts", ListView)
-            assert listview.index == 0  # cursor armed, on the active account
-            await pilot.press("down", "enter")
-            await settle(pilot)
             assert ("switch_to", "2") in fake.calls
-            assert isinstance(app.screen, WatchScreen)  # stayed watching
-            assert app.screen.query_one("#accounts", ListView).index is None
+            assert isinstance(app.screen, ClassicWatchScreen)  # stayed watching
+            listview = app.screen.query_one("#accounts", ListView)
+            assert listview.index is None  # disarmed after switch
             assert app.snapshot.active_number == "2"
 
     async def test_escape_disarms_then_leaves(self, tmp_path):
@@ -1155,9 +1717,9 @@ class TestWatchScreen:
             await pilot.pause()
             from textual.widgets import ListView
 
-            from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
+            from claude_swap.tui.dashboard import ClassicWatchScreen, DashboardScreen
 
-            assert isinstance(app.screen, WatchScreen)
+            assert isinstance(app.screen, ClassicWatchScreen)
             assert app.screen.query_one("#accounts", ListView).index is None
             await pilot.press("escape")  # now leave
             await pilot.pause()
@@ -1169,9 +1731,9 @@ class TestWatchScreen:
         async with app.run_test(size=(100, 40)) as pilot:
             await settle(pilot)
             await menu_select(pilot, "watch")
-            from claude_swap.tui.dashboard import WatchScreen
+            from claude_swap.tui.dashboard import ClassicWatchScreen
 
-            assert isinstance(app.screen, WatchScreen)
+            assert isinstance(app.screen, ClassicWatchScreen)
 
     async def test_app_start_watch_stacks_over_dashboard(self, tmp_path):
         from claude_swap.tui.app import CswapApp
@@ -1179,9 +1741,83 @@ class TestWatchScreen:
         app = CswapApp(self._fake(tmp_path), start="watch")
         async with app.run_test(size=(100, 40)) as pilot:
             await settle(pilot)
-            from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
+            from claude_swap.tui.dashboard import ClassicWatchScreen, DashboardScreen
 
-            assert isinstance(app.screen, WatchScreen)
+            assert isinstance(app.screen, ClassicWatchScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+
+def test_watch_screen_factory_maps_styles():
+    from claude_swap.tui.dashboard import (
+        ClassicWatchScreen,
+        MeterWatchScreen,
+        watch_screen,
+    )
+
+    assert isinstance(watch_screen("classic"), ClassicWatchScreen)
+    assert isinstance(watch_screen("meters"), MeterWatchScreen)
+    # An unexpected value falls back to the classic default.
+    assert isinstance(watch_screen("hologram"), ClassicWatchScreen)
+
+
+@pytest.mark.asyncio
+class TestWatchStyle:
+    """ui.watch_style selects which watch layout the launcher opens."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+
+    async def test_unset_setting_opens_classic(self, tmp_path):
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import ClassicWatchScreen
+
+            assert isinstance(app.screen, ClassicWatchScreen)
+
+    async def test_meters_setting_opens_meters(self, tmp_path):
+        app = make_app(self._fake(tmp_path), watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import MeterWatchScreen
+
+            assert isinstance(app.screen, MeterWatchScreen)
+
+    async def test_ctrl_v_toggles_layout_live_and_persists(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake, watch_style="meters")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import (
+                ClassicWatchScreen,
+                DashboardScreen,
+                MeterWatchScreen,
+            )
+            from claude_swap.settings import load_ui_settings
+
+            assert isinstance(app.screen, MeterWatchScreen)
+            await pilot.press("ctrl+v")  # swap to the classic view live
+            await pilot.pause()
+            assert isinstance(app.screen, ClassicWatchScreen)
+            assert app._watch_style == "classic"
+            assert load_ui_settings(fake.backup_dir).watch_style == "classic"
+
+            await pilot.press("ctrl+v")  # and back to meters
+            await pilot.pause()
+            assert isinstance(app.screen, MeterWatchScreen)
+            assert load_ui_settings(fake.backup_dir).watch_style == "meters"
+
+            # Esc still lands on the dashboard, not app-exit (stack intact).
             await pilot.press("escape")
             await pilot.pause()
             assert isinstance(app.screen, DashboardScreen)
@@ -1320,6 +1956,9 @@ def fake_engine(monkeypatch):
     _FakeEngine.instances = []
     monkeypatch.setattr(
         "claude_swap.tui.autoview.AutoSwitchEngine", _FakeEngine
+    )
+    monkeypatch.setattr(
+        "claude_swap.tui.dashboard.AutoSwitchEngine", _FakeEngine
     )
     return _FakeEngine
 
@@ -1710,3 +2349,920 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+def test_bar_color_maxed_is_all_red_else_green_climb():
+    from claude_swap.tui.widgets import _bar_color, gradient_color
+    from claude_swap.tui.theme import SEV_OK
+
+    # A maxed window's whole bar is red-dominant (no calm green at the base)
+    for t in (0.0, 0.5, 1.0):
+        c = _bar_color(100.0, t)
+        r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+        assert r > g and r > b, (t, c)
+    assert _bar_color(100.0, 0.0) != gradient_color(0.0)  # maxed base != green
+
+    # Below 100%, the bar keeps the green→amber→red climb (green at the base)
+    assert _bar_color(50.0, 0.0) == SEV_OK
+    assert _bar_color(50.0, 1.0) == gradient_color(1.0)
+
+
+def test_gradient_color_hits_stops_and_interpolates():
+    assert gradient_color(0.0) == "#87af87"   # SEV_OK
+    assert gradient_color(0.5) == "#d7af5f"   # SEV_WARN
+    assert gradient_color(1.0) == "#d75f5f"   # SEV_CRIT
+    # quarter point = midpoint of SEV_OK(135,175,135) and SEV_WARN(215,175,95)
+    assert gradient_color(0.25) == "#afaf73"  # (175,175,115)
+    assert gradient_color(-1.0) == "#87af87"  # clamp low
+    assert gradient_color(2.0) == "#d75f5f"   # clamp high
+
+
+def test_bar_v_fill_from_bottom():
+    from claude_swap.tui.widgets import bar_v
+    assert bar_v(100.0, 4) == ["█", "█", "█", "█"]
+    assert bar_v(0.0, 4)   == [" ", " ", " ", " "]
+    assert bar_v(50.0, 4)  == [" ", " ", "█", "█"]   # 2 full at bottom
+    assert bar_v(75.0, 4)  == [" ", "█", "█", "█"]
+    assert bar_v(62.5, 4)  == [" ", "▄", "█", "█"]   # partial top cell
+    assert bar_v(150.0, 2) == ["█", "█"]             # clamps to 100
+
+
+def test_meter_windows_order_and_fields():
+    now = 1_000_000.0
+
+    def _iso(offset: float) -> str:
+        return datetime.fromtimestamp(now + offset, tz=timezone.utc).isoformat()
+
+    last_good = {
+        "five_hour": {"pct": 78.0, "resets_at": _iso(3 * 3600)},
+        "seven_day": {"pct": 34.0, "resets_at": _iso(4 * 86400)},
+        "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(3600)}],
+    }
+    rows = meter_windows(last_good, now)
+    assert [r[0] for r in rows] == ["5h", "7d", "Fable"]
+    assert [r[1] for r in rows] == [78.0, 34.0, 100.0]
+    assert [r[3] for r in rows] == [False, False, True]
+    assert meter_windows(None, now) == []
+
+
+def test_meter_grid_dims_fluid():
+    from claude_swap.tui.widgets import meter_grid_dims
+    # 44x16, 3 accounts -> 2 columns, card_width (44-1)//2
+    ncols, cw, bh = meter_grid_dims(44, 16, 3)
+    assert ncols == 2
+    assert cw == 21
+    # 96x34, 3 accounts -> 3 columns, card_width (96-2)//3
+    ncols, cw, bh = meter_grid_dims(96, 34, 3)
+    assert ncols == 3
+    assert cw == 31
+    # narrow: single column; bars shrink to fit (floor is 1, not 3)
+    ncols, cw, bh = meter_grid_dims(30, 12, 3)
+    assert ncols == 1
+    assert bh >= 1
+
+
+def test_meter_grid_dims_fits_height():
+    from claude_swap.tui.widgets import CARD_CHROME, meter_grid_dims
+
+    # (44, 16, 3) is deliberately excluded: at that size the bar floors at
+    # bar_min before the chrome fits, which is exactly the case
+    # meters_grid_text's _cards_fit check catches to fall back to the
+    # compact view instead of overflowing.
+    for w, h, n in ((44, 31, 3), (96, 34, 3), (21, 16, 1)):
+        ncols, _cw, bh = meter_grid_dims(w, h, n)
+        rows = -(-n // ncols)  # ceil
+        assert rows * (bh + CARD_CHROME) + (rows - 1) <= h, (w, h, n, ncols, bh)
+
+
+def test_meter_grid_dims_honors_gutter_min_card_width():
+    from claude_swap.tui.widgets import meter_grid_dims
+
+    # 40 wide, 3 accounts: gutters must not push cards below min_card_w (20)
+    ncols, cw, _bh = meter_grid_dims(40, 16, 3)
+    assert cw >= 20
+
+
+def test_meter_grid_dims_bars_fill_tall_terminal():
+    from claude_swap.tui.widgets import meter_grid_dims
+
+    # one account on a tall terminal: the bar consumes the spare rows
+    # (no fixed height cap), leaving only the 12-line card chrome.
+    _ncols, _cw, bh = meter_grid_dims(40, 40, 1)
+    assert bh == 40 - 12
+
+
+def test_meter_bar_width_fills_cell():
+    from claude_swap.tui.widgets import _meter_bar_width
+
+    # bar spans its cell minus a one-column gutter each side (no width cap)
+    assert _meter_bar_width(15) == 13
+    assert _meter_bar_width(30) == 28
+    assert _meter_bar_width(4) == 2
+
+
+def test_big_number_pixel_5_rows():
+    from claude_swap.tui.widgets import big_number
+
+    rows = big_number("100")
+    assert len(rows) == 5
+    # three digits, each 3 cols, joined by a one-space gap: 3+1+3+1+3 = 11
+    assert all(len(r) == 11 for r in rows)
+
+    rows7 = big_number("7")
+    assert len(rows7) == 5
+    assert all(len(r) == 3 for r in rows7)
+
+    # the pixel font uses only the full block and spaces
+    for r in rows + rows7:
+        assert set(r) <= {"█", " "}
+
+
+def test_meter_card_has_plain_label_row():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, scoped=[("Fable", 100.0)]),
+    )
+    now = time.time()
+    bar_height = 10
+    card = meter_card(acc, 34, bar_height, now=now)
+    lines = card.plain.split("\n")
+    # header + bar rows + baseline + label + 5 percent + reset + bottom
+    assert len(lines) == bar_height + 12
+    assert all(len(ln) == 34 for ln in lines)
+
+    label_row = lines[bar_height + 2]  # header(1) + bars(bar_height) + baseline(1)
+    assert "5h" in label_row
+    assert "7d" in label_row
+    assert "Fable" in label_row
+
+    # not carved into the bars: no bar row contains the label text
+    bar_rows = lines[1 : 1 + bar_height]
+    assert not any("5h" in row or "7d" in row or "Fable" in row for row in bar_rows)
+
+    # a label longer than its cell truncates with an ellipsis rather than
+    # overflowing or wrapping
+    narrow_acc = make_account(
+        2,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=None, pct7=None, scoped=[("AnthropicMaxPlan", 50.0)]),
+    )
+    narrow_bar_height = 3
+    narrow_card = meter_card(narrow_acc, 8, narrow_bar_height, now=now)
+    narrow_lines = narrow_card.plain.split("\n")
+    narrow_label_row = narrow_lines[narrow_bar_height + 2]
+    assert "…" in narrow_label_row
+    assert "AnthropicMaxPlan" not in narrow_card.plain
+
+
+def test_meter_card_line_count_chrome_12():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, scoped=[("Fable", 100.0)]),
+    )
+    card = meter_card(acc, 40, 12, now=time.time())
+    lines = card.plain.split("\n")
+    # bar_height (12) + chrome (12): 2 borders + baseline + label + blank +
+    # 5 percent + blank + reset
+    assert len(lines) == 12 + 12
+    assert all(len(ln) == 40 for ln in lines)
+
+
+def test_meter_card_reset_is_plain_single_row():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.usage_store import UsageEntry
+
+    now = 1_000_000.0
+
+    def _iso(offset: float) -> str:
+        return datetime.fromtimestamp(now + offset, tz=timezone.utc).isoformat()
+
+    last_good = {
+        "five_hour": {"pct": 78.0, "resets_at": _iso(3 * 3600)},
+        "seven_day": {"pct": 34.0, "resets_at": _iso(3 * 86400)},
+    }
+    entry = UsageEntry(last_good=last_good, fetched_at=now - 5.0, age_s=5.0)
+    # inactive account: keeps the single-line frame this test's glyph checks
+    # rely on — the active card's border is covered separately.
+    acc = make_account(1, email="work@acme.dev", entry=entry)
+    bar_height = 10
+    card = meter_card(acc, 34, bar_height, now=now)
+    lines = card.plain.split("\n")
+    assert len(lines) == bar_height + 12
+    assert all(len(ln) == 34 for ln in lines)
+
+    def is_blank_interior(line: str) -> bool:
+        return line[0] == "│" and line[-1] == "│" and line[1:-1].strip() == ""
+
+    # header(1) + bars(bar_height) + baseline(1) + label(1) -> percent block
+    # starts right after a blank margin row; below it, another blank margin
+    # row precedes a SINGLE plain reset row, then the bottom border.
+    label_row = bar_height + 2
+    percent_start = label_row + 2
+    assert is_blank_interior(lines[percent_start - 1])
+    percent_end = percent_start + 5
+    assert is_blank_interior(lines[percent_end])  # blank margin below percent
+
+    reset_row = lines[percent_end + 1]
+    assert "3d" in reset_row  # seven_day resets in 3 days
+    assert not is_blank_interior(reset_row)
+    # the reset row is a single row: the very next line is the bottom border
+    assert lines[percent_end + 2] == lines[-1]
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+
+    # not a half-block pixel font: the reset row itself has no block glyphs
+    # (the bar rows above legitimately use them for the meter fill)
+    assert not (set(reset_row) & set("█▀▄"))
+
+
+def test_meter_card_percent_has_margin_rows():
+    from claude_swap.tui.widgets import meter_card
+
+    # inactive account: keeps the single-line frame this test's glyph checks
+    # rely on — the active card's border is covered separately.
+    acc = make_account(
+        1,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, scoped=[("Fable", 100.0)]),
+    )
+    bar_height = 10
+    card = meter_card(acc, 34, bar_height, now=time.time())
+    lines = card.plain.split("\n")
+    assert len(lines) == bar_height + 12
+    assert all(len(ln) == 34 for ln in lines)
+
+    def is_blank_interior(line: str) -> bool:
+        return line[0] == "│" and line[-1] == "│" and line[1:-1].strip() == ""
+
+    # header(1) + bars(bar_height) + baseline(1) + label(1) -> percent block
+    # starts right after a blank margin row.
+    label_row = bar_height + 2
+    percent_start = label_row + 2
+    assert is_blank_interior(lines[percent_start - 1])
+    assert not is_blank_interior(lines[percent_start])  # first percent row has content
+
+    # the percent block is exactly 5 rows, followed by a blank margin row
+    # before the reset row.
+    percent_end = percent_start + 5
+    assert not is_blank_interior(lines[percent_end - 1])  # last percent row has content
+    assert is_blank_interior(lines[percent_end])
+
+
+def test_meter_card_active_double_green_border():
+    from claude_swap.tui.widgets import _ACTIVE_GREEN, meter_card
+    from claude_swap.tui.theme import MUTED
+
+    entry = make_entry(pct5=78.0, pct7=34.0)
+    active = make_account(1, active=True, email="work@acme.dev", entry=entry)
+    inactive = make_account(2, active=False, email="work@acme.dev", entry=entry)
+    now = time.time()
+    acard = meter_card(active, 21, 5, now=now)
+    icard = meter_card(inactive, 21, 5, now=now)
+    active_style = f"{_ACTIVE_GREEN} bold"
+
+    def frame_styles(card, glyphs):
+        return {
+            sp.style
+            for sp in card.spans
+            if set(card.plain[sp.start : sp.end]) & set(glyphs)
+        }
+
+    # active: double-line box glyphs, bold bright-green frame, no single-line
+    # glyphs anywhere in the card
+    assert "║" in acard.plain
+    assert all(g in acard.plain for g in "╔╗╚╝")
+    assert "│" not in acard.plain
+    assert not (set(acard.plain) & set("╭╮╰╯"))
+    assert active_style in frame_styles(acard, "║")
+    assert active_style in frame_styles(acard, "╔╗╚╝")
+
+    # active: the header number, name, and active dot render in the same
+    # bold bright-green style as the frame, not ACCENT/FOREGROUND
+    def texts_with_style(card, style):
+        return [card.plain[sp.start : sp.end] for sp in card.spans if sp.style == style]
+
+    assert "1" in texts_with_style(acard, active_style)
+    assert "work" in texts_with_style(acard, active_style)
+    assert "●" in texts_with_style(acard, active_style)
+
+    # inactive: unchanged thin rounded single-line frame, muted, never green
+    assert "│" in icard.plain
+    assert all(g in icard.plain for g in "╭╮╰╯")
+    assert "║" not in icard.plain
+    assert not (set(icard.plain) & set("╔╗╚╝"))
+    assert MUTED in frame_styles(icard, "│")
+    assert active_style not in frame_styles(icard, "│")
+    assert active_style not in frame_styles(icard, "╭╮╰╯")
+
+
+def test_meter_card_percent_is_five_big_rows():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=None),
+    )
+    now = time.time()
+    card = meter_card(acc, 30, 5, now=now)
+    lines = card.plain.split("\n")
+    # top border + 5 bar rows + baseline + 5 percent rows + reset + bottom
+    assert len(lines) == 5 + 12
+    assert all(len(ln) == 30 for ln in lines)
+    # the single window's cell is wide enough for the pixel digits, so the
+    # small "78%" token never appears — the percent is drawn as block glyphs
+    # spanning five rows instead.
+    assert "78%" not in card.plain
+    assert "█" in card.plain  # the pixel-block digit font
+
+
+def test_meter_card_structure():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.tui.theme import SEV_OK
+
+    # inactive account: keeps the single-line frame this test's glyph checks
+    # rely on — the active card's border is covered separately.
+    acc = make_account(
+        1,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, scoped=[("Fable", 100.0)]),
+    )
+    now = time.time()
+    card = meter_card(acc, 21, 5, now=now)
+    lines = card.plain.split("\n")
+    assert len(lines) == 5 + 12
+    assert all(len(ln) == 21 for ln in lines)
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    # window labels render as plain text in the label row beneath the bars.
+    assert "5h" in card.plain and "7d" in card.plain
+    assert "Fable" in card.plain
+    # Fable's cell is too narrow for the pixel digits ("100" needs 11 cols),
+    # so it degrades to the small "100%" token.
+    assert "100%" in card.plain
+    # bottom cell of a filled bar is the green (SEV_OK) end of the gradient
+    assert any(SEV_OK in str(span.style) for span in card.spans)
+
+
+def test_meter_card_handles_no_windows():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(1, active=True, entry=make_entry(pct5=None, pct7=None))
+    card = meter_card(acc, 21, 5, now=time.time())
+    lines = card.plain.split("\n")
+    assert len(lines) == 5 + 12
+    assert all(len(ln) == 21 for ln in lines)
+    # the placeholder message is actually rendered, not just blank rows
+    assert "usage unavailable" in card.plain
+
+
+def test_meter_card_sentinel_message_wraps_full():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(1, active=True, entry=UsageEntry(sentinel=USAGE_TOKEN_EXPIRED))
+    now = time.time()
+    card = meter_card(acc, 21, 5, now=now)
+    lines = card.plain.split("\n")
+    assert len(lines) == 5 + 12
+    assert all(len(ln) == 21 for ln in lines)
+    # the full sentinel label wraps across rows rather than truncating to one
+    # line — its last word must survive.
+    label = tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
+    assert label.split()[-1] in card.plain
+
+
+def test_meter_card_exact_width_at_narrow_widths():
+    from claude_swap.tui.widgets import meter_card
+
+    acc = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, scoped=[("Fable", 100.0)]),
+    )
+    now = time.time()
+    for w in (1, 2, 3, 6, 8, 12, 21):
+        card = meter_card(acc, w, 3, now=now)
+        assert all(len(ln) == w for ln in card.plain.split("\n")), (
+            w,
+            card.plain.split("\n"),
+        )
+
+
+def test_meter_card_header_and_row_styling():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.tui.theme import ACCENT, FOREGROUND, SEV_CRIT, Palette
+    from claude_swap.usage_store import UsageEntry
+
+    severity_color = Palette.DARK.severity  # meter_card() defaults to Palette.DARK
+
+    now = 1_000_000.0
+
+    def _iso(offset: float) -> str:
+        return datetime.fromtimestamp(now + offset, tz=timezone.utc).isoformat()
+
+    last_good = {
+        "five_hour": {"pct": 78.0, "resets_at": _iso(3 * 3600)},
+        "seven_day": {"pct": 34.0, "resets_at": _iso(4 * 86400)},
+        "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(2 * 86400)}],
+    }
+    entry = UsageEntry(last_good=last_good, fetched_at=now - 5.0, age_s=5.0)
+    # inactive account: the active card's header renders in the bright-green
+    # frame style instead of ACCENT/FOREGROUND — covered separately.
+    acc = make_account(1, email="work@acme.dev", entry=entry)
+
+    card = meter_card(acc, 21, 5, now=now)
+
+    def texts_with_style(style: str) -> list[str]:
+        return [card.plain[sp.start : sp.end] for sp in card.spans if sp.style == style]
+
+    # header: number in ACCENT, name in FOREGROUND
+    assert "1" in texts_with_style(ACCENT)
+    assert "work" in texts_with_style(FOREGROUND)
+
+    # percent rows: 5h and 7d's cells fit big digits (no "%" glyph rendered),
+    # each styled by severity_color(pct); Fable's cell is too narrow for its
+    # 3-digit "100" and degrades to the small "100%" token.
+    for pct in (78.0, 34.0):
+        assert any(
+            any(ch != " " for ch in t) for t in texts_with_style(severity_color(pct))
+        )
+    assert any("100%" in t for t in texts_with_style(severity_color(100.0)))
+
+    # MAXED window's reset (Fable, exactly 2 days out -> "2d") renders as
+    # plain text styled SEV_CRIT.
+    assert any("2d" in t for t in texts_with_style(SEV_CRIT))
+
+
+def test_meter_card_renders_in_light_palette():
+    # The meters follow ui.theme: a light-palette render paints its text in the
+    # light theme's colours, never the dark constants.
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.tui.theme import (
+        ACCENT,
+        ACCENT_LIGHT,
+        FOREGROUND,
+        FOREGROUND_LIGHT,
+        CSWAP_LIGHT,
+        Palette,
+    )
+    from claude_swap.usage_store import UsageEntry
+
+    now = 1_000_000.0
+    entry = UsageEntry(
+        last_good={"five_hour": {"pct": 50.0}}, fetched_at=now - 5.0, age_s=5.0
+    )
+    acc = make_account(1, email="work@acme.dev", entry=entry)
+
+    light = Palette.from_theme(CSWAP_LIGHT)
+    card = meter_card(acc, 21, 5, now=now, palette=light)
+    styles = {str(sp.style) for sp in card.spans}
+
+    # Header number/name pick up the light accent/foreground, not the dark ones.
+    assert any(ACCENT_LIGHT in s for s in styles)
+    assert any(FOREGROUND_LIGHT in s for s in styles)
+    assert not any(ACCENT in s and ACCENT_LIGHT not in s for s in styles)
+    assert not any(FOREGROUND in s and FOREGROUND_LIGHT not in s for s in styles)
+
+
+def test_meter_card_header_honors_alias():
+    from claude_swap.tui.widgets import meter_card
+
+    now = time.time()
+    aliased = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        alias="acme",
+        entry=make_entry(pct5=78.0, pct7=34.0),
+    )
+    unaliased = make_account(
+        2,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0),
+    )
+
+    aliased_card = meter_card(aliased, 21, 5, now=now)
+    unaliased_card = meter_card(unaliased, 21, 5, now=now)
+
+    assert "acme" in aliased_card.plain
+    assert "work" not in aliased_card.plain
+    assert "work" in unaliased_card.plain
+
+    for card in (aliased_card, unaliased_card):
+        lines = card.plain.split("\n")
+        assert len(lines) == 5 + 12
+        assert all(len(ln) == 21 for ln in lines)
+
+
+def test_meter_card_stale_dims_bars_and_percent():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.usage_store import STALE_OK_S
+
+    now = time.time()
+    stale = make_account(
+        1,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, age_s=STALE_OK_S + 60),
+    )
+    fresh = make_account(
+        2,
+        active=True,
+        email="work@acme.dev",
+        entry=make_entry(pct5=78.0, pct7=34.0, age_s=5.0),
+    )
+    stale_card = meter_card(stale, 21, 5, now=now)
+    fresh_card = meter_card(fresh, 21, 5, now=now)
+
+    assert any("dim" in str(sp.style) for sp in stale_card.spans)
+    assert not any("dim" in str(sp.style) for sp in fresh_card.spans)
+
+
+def test_meter_card_flash_highlights_top_border():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.tui.theme import ACCENT
+
+    acc = make_account(
+        1, active=True, email="work@acme.dev", entry=make_entry(pct5=78.0, pct7=34.0)
+    )
+    now = time.time()
+    plain = meter_card(acc, 21, 5, now=now)
+    flashed = meter_card(acc, 21, 5, now=now, flash=True)
+
+    # flash never changes layout or text, only the top border's style
+    assert plain.plain == flashed.plain
+    lines = flashed.plain.split("\n")
+    assert len(lines) == 5 + 12
+    assert all(len(ln) == 21 for ln in lines)
+
+    header_end = len(lines[0])
+    flash_style = f"bold {ACCENT}"
+    assert any(
+        sp.start == 0 and sp.end == header_end and sp.style == flash_style
+        for sp in flashed.spans
+    )
+    assert not any(
+        sp.start == 0 and sp.end == header_end and sp.style == flash_style
+        for sp in plain.spans
+    )
+
+
+def test_meter_card_frame_style_overrides_the_border_only():
+    from claude_swap.tui.widgets import meter_card
+    from claude_swap.tui.theme import Palette
+
+    acc = make_account(2, email="peer@example.com", entry=make_entry(pct5=40.0))
+    now = time.time()
+    plain = meter_card(acc, 21, 5, now=now)
+    styled = meter_card(acc, 21, 5, now=now, frame_style="#ff00ff")
+
+    assert styled.plain == plain.plain  # never changes layout or text
+    lines = styled.plain.split("\n")
+    # Every line's left and right border cell carries the override; the
+    # muted default is gone from the frame entirely.
+    from rich.console import Console
+
+    console = Console()
+    offset = 0
+    for ln in lines:
+        for pos in (offset, offset + len(ln) - 1):
+            assert styled.get_style_at_offset(console, pos).color.triplet.hex == "#ff00ff"
+        offset += len(ln) + 1
+    muted = Palette.DARK.muted.lstrip("#")
+    assert plain.get_style_at_offset(console, 0).color.triplet.hex == f"#{muted}"
+
+
+def test_meters_grid_text_flash_marks_only_flashed_account():
+    from claude_swap.tui.theme import ACCENT
+    from claude_swap.tui.widgets import meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    flash_style = f"bold {ACCENT}"
+
+    plain_out = meters_grid_text(accounts, 44, 31, now=time.time())
+    assert not [sp for sp in plain_out.spans if sp.style == flash_style]
+
+    flashed_out = meters_grid_text(
+        accounts, 44, 31, now=time.time(), flashed={accounts[1].number}
+    )
+    assert flashed_out.plain == plain_out.plain  # flash never changes layout/text
+    assert len([sp for sp in flashed_out.spans if sp.style == flash_style]) == 1
+
+
+def test_meters_grid_text_frame_styles_mark_only_named_accounts():
+    from rich.console import Console
+    from claude_swap.tui.widgets import meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    console = Console()
+    plain_out = meters_grid_text(accounts, 44, 31, now=time.time())
+    styled_out = meters_grid_text(
+        accounts, 44, 31, now=time.time(),
+        frame_styles={accounts[1].number: "#ff00ff"},
+    )
+    assert styled_out.plain == plain_out.plain
+
+    def border_colours(text, line_idx, card_idx):
+        # Cards are 21 wide with a one-space gutter: left border at col 0/22,
+        # right border at col 20/42.
+        line_start = sum(len(ln) + 1 for ln in text.plain.split("\n")[:line_idx])
+        left = line_start + card_idx * 22
+        right = left + 20
+        return {
+            text.get_style_at_offset(console, pos).color.triplet.hex
+            for pos in (left, right)
+        }
+
+    for line_idx in range(3):
+        assert border_colours(styled_out, line_idx, 1) == {"#ff00ff"}
+        assert border_colours(styled_out, line_idx, 0) == border_colours(plain_out, line_idx, 0)
+    assert "#ff00ff" not in {sp.style for sp in plain_out.spans}
+
+
+def test_fit_center_truncates_oversized_content():
+    from claude_swap.tui.widgets import _fit_center
+
+    long_label = "Anthropic-Claude-Max-Plan"
+    for w in (1, 3, 4, 5):
+        result = _fit_center(long_label, w)
+        assert len(result) == w
+    assert _fit_center(long_label, 4) == "Anth"
+
+
+def test_grid_move_clamps_and_no_wrap():
+    from claude_swap.tui.widgets import grid_move
+
+    # 3 items, 2 cols -> layout [0,1 / 2]
+    assert grid_move(0, 1, 0, 2, 3) == 1  # right
+    assert grid_move(1, 1, 0, 2, 3) == 1  # right at edge: clamp (no wrap)
+    assert grid_move(0, 0, 1, 2, 3) == 2  # down
+    assert grid_move(0, -1, 0, 2, 3) == 0  # left at edge: clamp
+    assert grid_move(2, 0, -1, 2, 3) == 0  # up
+    # short last row: moving down from col 1 lands on the only item in row 1
+    assert grid_move(1, 0, 1, 2, 3) == 2
+
+
+def _make_three_meter_accounts() -> list[AccountSnapshot]:
+    return [
+        make_account(1, active=True, email="a@example.com", entry=make_entry(pct5=78.0, pct7=34.0)),
+        make_account(2, email="b@example.com", entry=make_entry(pct5=50.0, pct7=10.0)),
+        make_account(3, email="c@example.com", entry=make_entry(pct5=20.0, pct7=5.0)),
+    ]
+
+
+def test_meters_grid_text_two_columns():
+    from claude_swap.tui.widgets import meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    out = meters_grid_text(accounts, 44, 31, now=time.time())
+    lines = out.plain.split("\n")
+    # two cards side by side on row 1: account 1 is active (double-line ╔),
+    # account 2 is not (single-line rounded ╭).
+    assert lines[0].count("╭") + lines[0].count("╔") == 2
+    assert len(lines) <= 31  # the whole grid fits the device height
+
+
+def test_meters_grid_text_rows_separated_by_blank_line():
+    from claude_swap.tui.widgets import meter_grid_dims, meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    out = meters_grid_text(accounts, 44, 31, now=time.time())
+    lines = out.plain.split("\n")
+    _ncols, _cw, bar_height = meter_grid_dims(44, 31, len(accounts))
+    card_lines = bar_height + 12
+    assert lines[card_lines] == ""  # blank separator between card rows
+    assert lines[card_lines + 1].count("╭") == 1  # lone third card on row 2
+
+
+def _accent_cols_by_line(text) -> dict[int, set[int]]:
+    """Per-line column offsets styled ACCENT, for pinpointing which card's
+    border the cursor marked."""
+    from claude_swap.tui.theme import ACCENT
+
+    accent_offsets: set[int] = set()
+    for sp in text.spans:
+        if sp.style == ACCENT:
+            accent_offsets.update(range(sp.start, sp.end))
+    result: dict[int, set[int]] = {}
+    offset = 0
+    for i, line in enumerate(text.plain.split("\n")):
+        cols = {o - offset for o in accent_offsets if offset <= o < offset + len(line)}
+        if cols:
+            result[i] = cols
+        offset += len(line) + 1
+    return result
+
+
+def test_meters_grid_text_cursor_marks_selected_card():
+    from claude_swap.tui.theme import ACCENT
+    from claude_swap.tui.widgets import meters_grid_text, _SELECT_BG
+
+    accounts = _make_three_meter_accounts()
+    now = time.time()
+
+    plain_out = meters_grid_text(accounts, 44, 31, now=now)
+    marked0 = meters_grid_text(accounts, 44, 31, cursor=0, now=now)
+    assert plain_out.plain == marked0.plain  # marking never changes layout/text
+
+    # the selection highlight fills the selected card's background...
+    assert any(_SELECT_BG in str(s.style) for s in marked0.spans)
+    assert not any(_SELECT_BG in str(s.style) for s in plain_out.spans)
+    # ...and gives its border a bold accent
+    assert any("bold" in str(s.style) and ACCENT in str(s.style) for s in marked0.spans)
+
+
+def test_meters_grid_text_empty_accounts():
+    from claude_swap.tui.widgets import meters_grid_text
+
+    out = meters_grid_text([], 44, 16, now=time.time())
+    assert out.plain == "no accounts"
+
+
+def test_meters_grid_text_falls_back_to_compact_when_cards_cannot_fit():
+    from claude_swap.tui.widgets import meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    out = meters_grid_text(accounts, 30, 12, now=time.time())
+    lines = out.plain.split("\n")
+    assert len(lines) <= 12  # fits the viewport instead of clipping
+    assert "╭" not in out.plain  # compact form, not framed cards
+    for acc, line in zip(accounts, lines):
+        assert line.lstrip().startswith(str(acc.number))
+
+
+def test_meters_grid_text_fallback_cursor_marks_selected_line():
+    from claude_swap.tui.widgets import meters_grid_text
+
+    accounts = _make_three_meter_accounts()
+    now = time.time()
+    marked0 = meters_grid_text(accounts, 30, 12, cursor=0, now=now)
+    marked1 = meters_grid_text(accounts, 30, 12, cursor=1, now=now)
+
+    cols0 = _accent_cols_by_line(marked0)
+    cols1 = _accent_cols_by_line(marked1)
+    assert 0 in cols0 and 1 not in cols0  # cursor=0 accents only line 0
+    assert 1 in cols1 and 0 not in cols1  # cursor=1 accents only line 1
+
+
+def _snap_with_fetched_at(fetched_at: float) -> AccountsSnapshot:
+    entry = dataclasses.replace(make_entry(pct5=50.0), fetched_at=fetched_at)
+    return AccountsSnapshot(
+        active_number="1",
+        accounts=(make_account(1, active=True, entry=entry),),
+        taken_at=time.time(),
+    )
+
+
+class _FakeTimer:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def _animatable_grid():
+    """A MetersGrid outside an app, with scheduling and repaint stubbed."""
+    from claude_swap.tui.widgets import MetersGrid
+
+    grid = MetersGrid()
+    grid.set_timer = lambda *a, **k: None
+    grid.refresh = lambda *a, **k: None
+    grid.intervals: list[tuple[float, object]] = []
+
+    def set_interval(period, callback, **_k):
+        timer = _FakeTimer()
+        grid.intervals.append((period, timer))
+        return timer
+
+    grid.set_interval = set_interval
+    return grid
+
+
+def test_meters_grid_animates_only_while_a_target_is_predicted():
+    grid = _animatable_grid()
+    assert grid.intervals == []  # idle: nothing scheduled, flat CPU
+
+    grid.set_predicted("2", 0.0)
+    assert grid.predicted == "2"
+    assert len(grid.intervals) == 1 and not grid.intervals[0][1].stopped
+
+    grid.set_predicted("3", 0.5)  # retarget reuses the running interval
+    assert len(grid.intervals) == 1
+
+    grid.set_predicted(None, 0.0)
+    assert grid.predicted is None
+    assert grid.intervals[0][1].stopped
+
+
+def test_predicted_card_frame_breathes_between_muted_and_accent():
+    from claude_swap.tui.theme import Palette
+    from claude_swap.tui.widgets import _interp
+
+    palette = Palette.DARK
+    grid = _animatable_grid()
+    assert grid.frame_styles(palette, now=0.0) == {}  # nothing predicted
+
+    grid.set_predicted("2", 0.0)
+    at_rest = grid.frame_styles(palette, now=0.0)
+    assert set(at_rest) == {"2"}
+    assert at_rest["2"] == palette.muted  # phase 0: starts from the resting frame
+
+    for _ in range(10):  # half a slow period (2.0s at 0.1s frames)
+        grid._advance_frame()
+    at_peak = grid.frame_styles(palette, now=0.0)["2"]
+    assert at_peak == palette.accent  # phase pi: fully lit
+    assert _interp(((0.0, palette.muted), (1.0, palette.accent)), 0.5) not in (
+        palette.muted, palette.accent
+    )  # the ramp really passes through intermediate colours
+
+    for _ in range(10):
+        grid._advance_frame()
+    assert grid.frame_styles(palette, now=0.0)["2"] == palette.muted  # back down
+
+
+def test_handoff_sweep_fades_old_active_out_and_new_active_in():
+    from claude_swap.tui.theme import Palette
+    from claude_swap.tui.widgets import _ACTIVE_GREEN, _SWEEP_S
+
+    palette = Palette.DARK
+    grid = _animatable_grid()
+    grid.start_sweep("1", "2", now=100.0)
+    assert len(grid.intervals) == 1  # the sweep alone keeps frames coming
+
+    # Weight follows the active role at once; only the colour crosses over.
+    start = grid.frame_styles(palette, now=100.0)
+    assert start["1"] == _ACTIVE_GREEN  # old active: still green, no longer bold
+    assert start["2"] == f"{palette.muted} bold"  # new active: bold, still muted
+
+    end = grid.frame_styles(palette, now=100.0 + _SWEEP_S)
+    assert end["1"] == palette.muted
+    assert end["2"] == f"{_ACTIVE_GREEN} bold"
+
+    grid._advance_frame(now=100.0 + _SWEEP_S + 0.1)  # sweep over: back to idle
+    assert grid.frame_styles(palette, now=200.0) == {}
+    assert grid.intervals[0][1].stopped
+
+
+def test_urgency_speeds_up_the_breathing():
+    grid = _animatable_grid()
+    grid.set_predicted("2", 0.0)
+    grid._advance_frame()
+    slow_step = grid._phase
+
+    grid.set_predicted("3", 1.0)  # retarget resets the phase
+    assert grid._phase == 0.0
+    grid._advance_frame()
+    assert grid._phase > slow_step * 3  # 0.6s period vs 2.0s: >3x faster
+
+
+def test_compact_fallback_does_not_animate():
+    """The compact one-line-per-account view has no frames to breathe, so a
+    prediction must not keep the 10 Hz interval running there."""
+    grid = _animatable_grid()
+    grid.set_predicted("2", 0.0)
+    assert len(grid.intervals) == 1 and not grid.intervals[0][1].stopped
+
+    grid.set_compact(True)
+    assert grid.intervals[0][1].stopped  # nothing to paint: interval off
+
+    grid.set_compact(False)
+    assert len(grid.intervals) == 2 and not grid.intervals[1][1].stopped
+
+
+def test_meters_grid_flash_extends_on_reflash():
+    # A re-flash of an already-flashing account must not be cleared early by
+    # the earlier timer: the generation guard keeps the account flashed until
+    # the LATEST timer fires.
+    from claude_swap.tui.widgets import MetersGrid
+
+    grid = MetersGrid()
+    grid.set_timer = lambda *a, **k: None  # no live scheduling in a unit test
+    grid.refresh = lambda *a, **k: None
+
+    grid._flash_updated(_snap_with_fetched_at(1000.0))  # baseline, no flash
+    assert grid._flash == set()
+
+    grid._flash_updated(_snap_with_fetched_at(1001.0))  # first change -> gen 1
+    assert "1" in grid._flash
+
+    grid._flash_updated(_snap_with_fetched_at(1002.0))  # re-flash -> gen 2
+    assert "1" in grid._flash
+
+    # The FIRST timer fires with its stale generation: must NOT clear.
+    grid._clear_flash("1", 1)
+    assert "1" in grid._flash
+
+    # The LATEST timer fires with the current generation: clears.
+    grid._clear_flash("1", 2)
+    assert "1" not in grid._flash

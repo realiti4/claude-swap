@@ -6,10 +6,11 @@ account-targeted opens a context of its own:
 
 - ``s`` / menu "Switch account" → :class:`SwitchScreen` — every account
   full-size, Enter switches, pops back.
-- ``w`` / menu "Watch accounts" / ``cswap watch`` → :class:`WatchScreen` —
-  the same full cards but read-only: a live monitor. ``s`` arms selection
-  (cursor appears on the active account), Enter switches and *stays
-  watching*, Esc disarms.
+- ``w`` / menu "Watch accounts" / ``cswap watch`` → a watch screen chosen by
+  ``ui.watch_style``: :class:`ClassicWatchScreen` (default) shows the same
+  full cards read-only, :class:`MeterWatchScreen` a vertical gradient-meter
+  grid. ``s`` arms selection (cursor appears on the active account), Enter
+  switches and *stays watching*, Esc disarms.
 - "Remove account" nests into a submenu listing the accounts.
 
 No global command palette: actions live where their context is.
@@ -22,11 +23,26 @@ from typing import TYPE_CHECKING, Callable
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap.autoswitch import (
+    AutoSwitchEngine,
+    AutoSwitchEvent,
+    PollEvent,
+    SwitchEvent,
+)
 from claude_swap.models import AccountsSnapshot
-from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
+from claude_swap.settings import load_settings
+from claude_swap.tui.modals import ConfirmModal
+from claude_swap.tui.widgets import (
+    AccountItem,
+    AccountsPanel,
+    MenuItem,
+    MetersGrid,
+    _active_index,
+)
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -215,7 +231,7 @@ class AccountListScreen(Screen):
     """Shared machinery: a live ListView of full account cards.
 
     Subclasses decide what the cursor does — :class:`SwitchScreen` is
-    selection-first, :class:`WatchScreen` is a monitor that can arm
+    selection-first, :class:`ClassicWatchScreen` is a monitor that can arm
     selection on demand.
     """
 
@@ -242,11 +258,20 @@ class AccountListScreen(Screen):
         if numbers != self._numbers:
             first_build = not self._numbers
             previous = listview.index
+            # Follow the highlighted account across reorders/removals: the row
+            # index alone would leave the cursor on whatever account now sits in
+            # that slot, so resolve the selected account's new position first.
+            selected = (
+                self._numbers[previous]
+                if previous is not None and 0 <= previous < len(self._numbers)
+                else None
+            )
             await listview.clear()
             await listview.extend(AccountItem(acc) for acc in snap.accounts)
             self._numbers = numbers
+            followed = numbers.index(selected) if selected in numbers else previous
             listview.index = (
-                self._index_after_build(snap, first_build, previous)
+                self._index_after_build(snap, first_build, followed)
                 if numbers
                 else None
             )
@@ -260,18 +285,8 @@ class AccountListScreen(Screen):
     ) -> int | None:
         """Where the cursor lands after the list is (re)built."""
         if first_build:
-            return self._active_index(snap)
+            return _active_index(snap)
         return min(previous or 0, len(snap.accounts) - 1)
-
-    def _active_index(self, snap: AccountsSnapshot) -> int:
-        return next(
-            (
-                i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
-            ),
-            0,
-        )
 
     def _flash_updated(self, snap: AccountsSnapshot, listview: ListView) -> None:
         """Briefly highlight rows whose stored measurement just advanced."""
@@ -329,12 +344,285 @@ class SwitchScreen(AccountListScreen):
         self.app.pop_screen()
 
 
-class WatchScreen(AccountListScreen):
-    """Live monitor of every account, full detail, hands-off by default.
+class MeterWatchScreen(Screen):
+    """Live monitor as a vertical gradient-meter grid, hands-off by default.
 
     ``s`` arms selection (cursor appears on the active account); Enter then
     switches and stays here — you keep watching on the new account. Esc
-    disarms selection first, then leaves the screen.
+    disarms selection first, then leaves the screen. Opt in via
+    ``ui.watch_style = meters``.
+    """
+
+    app: "CswapApp"
+
+    # The grid is self-evident, so monitor mode shows no header; the title row
+    # is reused only for the selection prompt once selection is armed.
+    _WATCH_TITLE = ""
+    _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
+
+    BINDINGS = [
+        Binding("s", "toggle_select", "Switch"),
+        Binding("enter", "select_highlighted", "Confirm", priority=True),
+        Binding("a", "toggle_auto", "Auto"),
+        Binding("L", "toggle_live", "Live", key_display="L"),
+        Binding("f", "app.refresh_full", "Refresh", show=False),
+        Binding("ctrl+v", "app.toggle_watch_style", "Layout"),
+        Binding("escape,q", "back", "Back"),
+        Binding("left,h", "nav_left", show=False),
+        Binding("right,l", "nav_right", show=False),
+        Binding("up,k", "nav_up", show=False),
+        Binding("down,j", "nav_down", show=False),
+    ]
+
+    # Headroom margin (percentage points above the threshold) at which the
+    # predicted target's breathing reaches full tempo… and where it is at rest.
+    _URGENT_MARGIN_PCT = 0.0
+    _CALM_MARGIN_PCT = 20.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._selecting = False
+        self._engine: AutoSwitchEngine | None = None
+        self._next_target: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="list-title")
+        yield MetersGrid(id="meters")
+        # The auto-switch readout shares the footer's row, at the right edge,
+        # so the meters keep every row while an engine runs. It is a sibling
+        # of the Footer, not a child: Footer recomposes on every binding
+        # change and drops anything composed into it.
+        with Horizontal(id="footer-row"):
+            yield Footer()
+            yield Static("", id="auto-readout")
+
+    def on_mount(self) -> None:
+        self._set_title(self._WATCH_TITLE)
+        self._refresh_readout()
+
+    def on_unmount(self) -> None:
+        # Leaving the screen (Esc, or a Ctrl+V layout swap) must not leave an
+        # engine running behind it. The widgets are already gone by now, so
+        # only the engine and the poller mode are reset.
+        self._halt_engine()
+
+    # -- auto-switch engine ---------------------------------------------------
+    # Mirrors AutoScreen: a dry-run engine runs the real decision loop and
+    # reports what it WOULD do, which is what the grid highlights; only a
+    # confirmed live engine ever switches.
+
+    def _start_engine(self, *, dry_run: bool) -> None:
+        # The callback names its engine, so a replaced engine finishing its
+        # last tick cannot drive the grid.
+        engine = AutoSwitchEngine(
+            self.app.switcher,
+            load_settings(self.app.switcher.backup_dir),
+            lambda event: self._emit_from_thread(engine, event),
+            dry_run=dry_run,
+        )
+        self._engine = engine
+        self.run_worker(
+            engine.run_loop,
+            thread=True,
+            group="engine",
+            exit_on_error=False,
+            name=f"meters-engine-{'dry' if dry_run else 'live'}",
+        )
+        # The engine fetches usage; the app poller only reads the store.
+        self.app.set_store_only(True)
+
+    def _halt_engine(self) -> None:
+        if self._engine is None:
+            return
+        self._engine.stop()
+        self._engine = None
+        self._next_target = None
+        # The engine pinned the poll planner to its settings; unpin so
+        # ordinary refreshes follow the settings file again.
+        self.app.switcher.clear_poll_policy_inputs()
+        self.app.set_store_only(False)
+
+    def _stop_engine(self) -> None:
+        self._halt_engine()
+        self.query_one("#meters", MetersGrid).set_predicted(None, 0.0)
+        self._refresh_title()
+
+    def _emit_from_thread(
+        self, engine: AutoSwitchEngine, event: AutoSwitchEvent
+    ) -> None:
+        """Engine ``on_event`` callback — runs on the worker thread."""
+        try:
+            self.app.call_from_thread(self._on_engine_event, engine, event)
+        except Exception:
+            # App/screen tearing down mid-tick; the event has nowhere to go.
+            pass
+
+    def _on_engine_event(
+        self, engine: AutoSwitchEngine, event: AutoSwitchEvent
+    ) -> None:
+        if not self.is_attached or engine is not self._engine:
+            return
+        if isinstance(event, PollEvent):
+            self._next_target = event.next_target
+            self.query_one("#meters", MetersGrid).set_predicted(
+                event.next_target, self._urgency(event)
+            )
+            self._refresh_title()
+        elif isinstance(event, SwitchEvent) and not event.dry_run:
+            # The landed account is active now, not "next": drop the stale
+            # prediction until the engine re-ranks from its new vantage point.
+            grid = self.query_one("#meters", MetersGrid)
+            grid.set_predicted(None, 0.0)
+            grid.start_sweep(
+                str(event.from_ref["number"]) if event.from_ref else None,
+                str(event.to_ref["number"]),
+            )
+            self._next_target = None
+            self._refresh_title()
+            self.app.request_refresh()
+
+    def _urgency(self, event: PollEvent) -> float:
+        """0 while the active account has ≥20 points of headroom margin above
+        the threshold, rising to 1 as that margin closes."""
+        active = event.active or {}
+        headroom = event.headroom.get(str(active.get("number", "")))
+        if headroom is None:
+            return 0.0
+        margin = headroom - (100.0 - event.threshold)
+        span = self._CALM_MARGIN_PCT - self._URGENT_MARGIN_PCT
+        calm = max(0.0, min(1.0, (margin - self._URGENT_MARGIN_PCT) / span))
+        return 1.0 - calm
+
+    def action_toggle_auto(self) -> None:
+        if self._engine is None:
+            self._start_engine(dry_run=True)
+            self._refresh_title()
+        else:
+            self._stop_engine()
+        self.refresh_bindings()  # the footer's "L Live" hint follows the engine
+
+    def action_toggle_live(self) -> None:
+        if self._engine is None:
+            return
+        if self._engine.dry_run:
+            self.app.push_screen(
+                ConfirmModal(
+                    "Go live? claude-swap will switch your active account "
+                    "automatically when the threshold is reached.\n\n"
+                    "(Same behavior as running `cswap auto` in a terminal.)",
+                    title="Go live",
+                    yes_label="Go live",
+                ),
+                self._on_live_confirm,
+            )
+        else:
+            self._restart_engine(dry_run=True)
+
+    def _on_live_confirm(self, confirmed: bool | None) -> None:
+        if confirmed:
+            self._restart_engine(dry_run=False)
+
+    def _restart_engine(self, *, dry_run: bool) -> None:
+        self._halt_engine()
+        self._start_engine(dry_run=dry_run)
+        self._refresh_title()
+
+    def _set_title(self, text: str) -> None:
+        """Set the title text and collapse its row when there's none, so the
+        empty header doesn't eat vertical space in monitor mode."""
+        title = self.query_one("#list-title", Static)
+        title.update(text)
+        title.display = bool(text)
+
+    def _refresh_title(self) -> None:
+        """The selection prompt while armed; otherwise nothing (row collapsed).
+        The auto-switch readout has its own place in the footer."""
+        self._set_title(self._SELECT_TITLE if self._selecting else self._WATCH_TITLE)
+        self._refresh_readout()
+
+    def _refresh_readout(self) -> None:
+        """Footer readout: ``dry-run · next → <alias>`` or ``LIVE · next → …``
+        while an engine runs; hidden otherwise."""
+        readout = self.query_one("#auto-readout", Static)
+        if self._engine is None:
+            readout.update("")
+            readout.display = False
+            return
+        mode = "dry-run" if self._engine.dry_run else "LIVE"
+        readout.update(f"{mode} · next → {self._next_target_label()}")
+        readout.set_class(not self._engine.dry_run, "live")
+        readout.display = True
+
+    def _next_target_label(self) -> str:
+        if self._next_target is None:
+            return "none"
+        snap = self.app.snapshot
+        for acc in snap.accounts if snap else ():
+            if acc.number == self._next_target:
+                return acc.alias or acc.email.split("@", 1)[0]
+        return self._next_target
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "select_highlighted" and not self._selecting:
+            return False  # hidden and inert until selection is armed
+        if action == "toggle_live" and self._engine is None:
+            return False  # live only arms on top of a running prediction
+        return True
+
+    def _set_selecting(self, on: bool) -> None:
+        grid = self.query_one("#meters", MetersGrid)
+        if on:
+            snap = self.app.snapshot
+            grid.cursor = _active_index(snap) if snap and snap.accounts else 0
+        else:
+            grid.cursor = None
+        self._selecting = on
+        self._refresh_title()
+        self.refresh_bindings()
+        grid.refresh(layout=True)
+
+    def action_toggle_select(self) -> None:
+        self._set_selecting(not self._selecting)
+
+    def action_select_highlighted(self) -> None:
+        if not self._selecting:
+            return
+        num = self.query_one("#meters", MetersGrid).selected_number()
+        if num:
+            self.app.do_switch(num)
+        self._set_selecting(False)  # stay here, keep watching
+
+    def action_back(self) -> None:
+        if self._selecting:
+            self._set_selecting(False)
+        else:
+            self.app.pop_screen()
+
+    def action_nav_left(self) -> None:
+        if self._selecting:
+            self.query_one("#meters", MetersGrid).move_cursor(-1, 0)
+
+    def action_nav_right(self) -> None:
+        if self._selecting:
+            self.query_one("#meters", MetersGrid).move_cursor(1, 0)
+
+    def action_nav_up(self) -> None:
+        if self._selecting:
+            self.query_one("#meters", MetersGrid).move_cursor(0, -1)
+
+    def action_nav_down(self) -> None:
+        if self._selecting:
+            self.query_one("#meters", MetersGrid).move_cursor(0, 1)
+
+
+class ClassicWatchScreen(AccountListScreen):
+    """Live monitor of every account as full horizontal-bar cards, hands-off
+    by default.
+
+    ``s`` arms selection (cursor appears on the active account); Enter then
+    switches and stays here — you keep watching on the new account. Esc
+    disarms selection first, then leaves the screen. This is the default
+    ``cswap watch`` layout (``ui.watch_style = classic``).
     """
 
     _WATCH_TITLE = "watching all accounts"
@@ -344,6 +632,7 @@ class WatchScreen(AccountListScreen):
         Binding("s", "toggle_select", "Switch"),
         Binding("enter", "select_highlighted", "Confirm", priority=True),
         Binding("f", "app.refresh_full", "Refresh", show=False),
+        Binding("ctrl+v", "app.toggle_watch_style", "Layout"),
         Binding("escape,q", "back", "Back"),
         Binding("down,j", "nav_down", show=False),
         Binding("up,k", "nav_up", show=False),
@@ -387,7 +676,7 @@ class WatchScreen(AccountListScreen):
         if on:
             snap = self.app.snapshot
             if snap is not None and snap.accounts:
-                listview.index = self._active_index(snap)
+                listview.index = _active_index(snap)
             listview.focus()
             title.update(self._SELECT_TITLE)
         else:
@@ -430,3 +719,14 @@ class WatchScreen(AccountListScreen):
             listview.action_cursor_up()
         else:
             listview.scroll_up(animate=False)
+
+
+def watch_screen(watch_style: str) -> Screen:
+    """The ``cswap watch`` screen for a ``ui.watch_style`` value.
+
+    ``meters`` opts into the vertical gradient-meter grid; anything else
+    (the default ``classic``) gets the horizontal-bar account list.
+    """
+    if watch_style == "meters":
+        return MeterWatchScreen()
+    return ClassicWatchScreen()
