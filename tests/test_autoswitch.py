@@ -27,6 +27,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    WarmPingEvent,
     _recovery_is_useful,
     pct_label,
 )
@@ -6894,3 +6895,189 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+def _idle(seven_day_pct: float = 0.0) -> dict:
+    """Usage shape for an account whose 5h window is not currently ticking.
+
+    Covers both real shapes ``oauth.build_usage_result`` can produce before a
+    request lands in the window following a reset: the ``five_hour`` key
+    omitted entirely, or present with ``pct`` but no ``resets_at`` — this
+    helper uses the former since ``_five_hour_active`` treats both alike.
+    """
+    return {"seven_day": {"pct": seven_day_pct}}
+
+
+
+class TestWarmOnReset:
+    """`settings.warm_on_reset`: the moment a non-active account's 5h window
+    resets, ping it once through its own isolated session profile (never
+    the active credential — see `_maybe_warm_reset`'s docstring) so its
+    clock starts now rather than whenever `strategy` gets around to it."""
+
+    def _two_account_harness(self, temp_home: Path, **settings_kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, warm_on_reset=True, threshold=90.0, **settings_kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_off_by_default_ignores_a_reset_transition(self, temp_home):
+        h = EngineHarness(temp_home, threshold=90.0)  # warm_on_reset defaults False
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})
+        h.events.clear()
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle()})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+        assert "fiveHourSeen" not in h.state()
+
+    def test_first_observation_only_seeds_the_baseline(self, temp_home):
+        h = self._two_account_harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+        assert h.state()["fiveHourSeen"] == {"1": True, "2": True}
+
+    def test_reset_transition_pings_without_touching_the_active_account(
+        self, temp_home, monkeypatch
+    ):
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.events.clear()
+        monkeypatch.setattr(
+            h.engine._session_manager, "ping_to_warm", lambda identifier: True
+        )
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1  # never touched — the ping is isolated
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        ping = next(e for e in h.events if isinstance(e, WarmPingEvent))
+        assert ping.number == "2"
+        assert ping.status == "sent"
+        assert ping.dry_run is False
+        assert h.state()["fiveHourSeen"]["2"] is False
+        # `pinging` only ever exists for the blocking call's duration —
+        # cleared again before the tick returns.
+        assert "pinging" not in h.state()
+
+    def test_ping_failure_leaves_the_reset_pending_for_next_tick(
+        self, temp_home, monkeypatch
+    ):
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.events.clear()
+        monkeypatch.setattr(
+            h.engine._session_manager, "ping_to_warm", lambda identifier: False
+        )
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        ping = next(e for e in h.events if isinstance(e, WarmPingEvent))
+        assert ping.number == "2"
+        assert ping.status == "failed"
+        # Not consumed — a later tick with the same idle usage detects the
+        # same reset again and retries the ping.
+        assert h.state()["fiveHourSeen"]["2"] is True
+
+    def test_dead_credential_is_quarantined_before_any_ping_is_attempted(
+        self, temp_home, monkeypatch
+    ):
+        """`_freshen_target`'s pre-flight (the same one every other trigger
+        uses) catches a dead/conflicting credential — the isolated profile
+        must never be bootstrapped from a token already known bad."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.events.clear()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            h.engine._session_manager,
+            "ping_to_warm",
+            lambda identifier: calls.append(identifier) or True,
+        )
+        monkeypatch.setattr(
+            h.engine, "_freshen_target", lambda number, email: "invalid_grant"
+        )
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == []  # ping_to_warm never reached
+        assert any(
+            isinstance(e, QuarantineEvent) and e.number == "2" for e in h.events
+        )
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+
+    def test_live_manual_session_is_never_interrupted(self, temp_home, monkeypatch):
+        """A live manual `cswap run` on the target already owns its token —
+        `_freshen_target` already reports this as "skip-live-session", and
+        warm-reset must never bootstrap or ping over it."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.events.clear()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            h.engine._session_manager,
+            "ping_to_warm",
+            lambda identifier: calls.append(identifier) or True,
+        )
+        monkeypatch.setattr(
+            h.engine, "_freshen_target", lambda number, email: "skip-live-session"
+        )
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == []
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+        # Retried later — the reset stays pending, not dropped.
+        assert h.state()["fiveHourSeen"]["2"] is True
+
+    def test_never_touches_a_disabled_account(self, temp_home):
+        """`switchable_account_numbers()` is where every strategy excludes
+        disabled slots — warm-reset must go through the same gate, not its
+        own copy that could drift out of sync."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.switcher.set_account_disabled("2", True)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+        # Excluded from the loop entirely — its stale baseline carries
+        # forward untouched rather than being read as a (fake) reset.
+        assert h.state()["fiveHourSeen"]["2"] is True
+
+    def test_dry_run_never_pings_or_persists(self, temp_home, monkeypatch):
+        h = self._two_account_harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        assert h.state() == {}
+        calls: list[str] = []
+        monkeypatch.setattr(
+            h.engine._session_manager,
+            "ping_to_warm",
+            lambda identifier: calls.append(identifier) or True,
+        )
+
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == []  # dry-run never calls the real (or mocked) ping
+        ping = next(e for e in h.events if isinstance(e, WarmPingEvent))
+        assert ping.dry_run is True
+        assert ping.status == "sent"
+        assert h.active_number() == 1  # never touched
+        assert h.state() == {}

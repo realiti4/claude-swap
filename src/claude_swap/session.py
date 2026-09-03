@@ -200,6 +200,11 @@ AUTH_OVERRIDE_ENV_VARS = (
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
 
+# `ping_to_warm`'s headless generation is a real API round trip (unlike the
+# local auth-status probe above), so it needs real headroom past a network
+# call plus a short Haiku completion.
+_WARM_PING_TIMEOUT = 60.0
+
 # Bootstrap holds the backup-dir lock across one token refresh (10s network
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
@@ -798,6 +803,38 @@ class SessionManager:
         # Lock released here, before any exec.
 
         return session_dir, account_num, email
+
+    def ping_to_warm(self, identifier: str) -> bool:
+        """Send one throwaway message through ``identifier``'s own isolated
+        session profile, so its 5h window starts now.
+
+        Never touches the global active credential (``~/.claude/``) or any
+        other running Claude Code session — same isolation ``run`` gives a
+        manual ``cswap run``, just a one-shot headless call instead of an
+        interactive `exec`. Returns ``True`` on success, ``False`` on any
+        failure (bootstrap, spawn, timeout, non-zero exit); callers retry
+        next cycle either way, so failures aren't classified further here —
+        credential health (a dead token, an identity conflict, a live
+        manual session already owning the slot) is the caller's job
+        *before* this is ever invoked, via the same `_freshen_target`
+        pre-flight the old switch-based touch used.
+        """
+        try:
+            session_dir, _num, _email = self.setup_session(identifier, share=False)
+        except SessionError:
+            return False
+        claude_bin = shutil.which("claude") or "claude"
+        try:
+            result = subprocess.run(
+                [claude_bin, "-p", "hi", "--model", "haiku"],
+                env=_probe_env(session_dir),
+                capture_output=True,
+                text=True,
+                timeout=_WARM_PING_TIMEOUT,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0
 
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str

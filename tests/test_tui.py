@@ -343,6 +343,32 @@ class TestFormatting:
         ).plain
         assert "last seen" not in api_key
 
+    def test_pinging_badge_tags_the_account_being_pinged(self):
+        # `warm_on_reset`'s isolated ping never touches the active
+        # credential — "active" tracks ground truth exactly as always;
+        # the account being pinged (here #2) additionally gets "priming",
+        # independent of which account is active.
+        from claude_swap.tui.widgets import account_card_text
+
+        pinging = {"number": "2", "since": 0.0}
+
+        untouched = account_card_text(
+            make_account(1, active=True), 80, pinging=pinging
+        ).plain
+        assert "● active" in untouched
+        assert "priming" not in untouched
+
+        touched = account_card_text(
+            make_account(2, active=False), 80, pinging=pinging
+        ).plain
+        assert "active" not in touched
+        assert "◐ priming" in touched
+
+        # No ping in flight: no priming tag, badge is just the real slot.
+        no_ping = account_card_text(make_account(2, active=True), 80).plain
+        assert "● active" in no_ping
+        assert "priming" not in no_ping
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text
@@ -1164,6 +1190,34 @@ class TestWatchScreen:
             assert isinstance(app.screen, DashboardScreen)
             assert not any(call[0] == "switch_to" for call in fake.calls)
 
+    async def test_warm_on_reset_indicator_shown_when_configured(self, tmp_path):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"warmOnReset": True},
+        }))
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "warm-on-reset" in title
+            assert "watching all accounts" in title
+
+    async def test_warm_on_reset_indicator_absent_by_default(self, tmp_path):
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "warm-on-reset" not in title
+
     async def test_menu_watch_entry_opens_it(self, tmp_path):
         app = make_app(self._fake(tmp_path))
         async with app.run_test(size=(100, 40)) as pilot:
@@ -1294,6 +1348,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_warm_on_reset: list[bool] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1310,6 +1365,10 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_warm_on_reset(self, enabled: bool) -> None:
+        self.settings = dataclasses.replace(self.settings, warm_on_reset=enabled)
+        self.applied_warm_on_reset.append(enabled)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1474,6 +1533,72 @@ class TestAutoScreen:
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
+
+    async def test_warm_on_reset_toggle_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._settings.warm_on_reset is False  # file default
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "warm-on-reset" not in summary.render().plain
+
+            await pilot.press("w")
+            await pilot.pause()
+            assert screen._settings.warm_on_reset is True
+            engine = fake_engine.instances[0]
+            assert engine.applied_warm_on_reset == [True]
+            assert "warm-on-reset (session)" in summary.render().plain
+            assert not (tmp_path / "settings.json").exists()  # never persisted
+
+            await pilot.press("w")  # back off — matches the file default again
+            await pilot.pause()
+            assert screen._settings.warm_on_reset is False
+            assert engine.applied_warm_on_reset == [True, False]
+            # Round-tripped back to the configured value: indistinguishable
+            # from never having touched it, same as the threshold's marker.
+            assert "warm-on-reset" not in summary.render().plain
+
+            # a dry↔live restart rebuilds the engine from the adjusted copy
+            await pilot.press("w")  # on again, then go live
+            await pilot.pause()
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert fake_engine.instances[1].settings.warm_on_reset is True
+
+    async def test_warm_on_reset_session_off_marks_deviation_from_file(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"warmOnReset": True},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._settings.warm_on_reset is True  # file default
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "warm-on-reset" in summary.render().plain
+            assert "(session)" not in summary.render().plain
+
+            await pilot.press("w")  # turn it off for this session
+            await pilot.pause()
+            assert screen._settings.warm_on_reset is False
+            assert "warm-on-reset off (session)" in summary.render().plain
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
