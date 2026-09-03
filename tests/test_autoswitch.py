@@ -6900,8 +6900,10 @@ class TestFreshenRoutesThroughGate:
 def _idle(seven_day_pct: float = 0.0) -> dict:
     """Usage shape for an account whose 5h window is not currently ticking.
 
-    ``oauth.build_usage_result`` omits the ``five_hour`` key entirely until a
-    request lands in the window following a reset — this is that shape.
+    Covers both real shapes ``oauth.build_usage_result`` can produce before a
+    request lands in the window following a reset: the ``five_hour`` key
+    omitted entirely, or present with ``pct`` but no ``resets_at`` — this
+    helper uses the former since ``_five_hour_active`` treats both alike.
     """
     return {"seven_day": {"pct": seven_day_pct}}
 
@@ -6923,10 +6925,10 @@ class TestWarmOnReset:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})
         h.events.clear()
 
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle()})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle()})
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
@@ -6936,7 +6938,7 @@ class TestWarmOnReset:
 
     def test_first_observation_only_seeds_the_baseline(self, temp_home):
         h = self._two_account_harness(temp_home)
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _usage(30)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
@@ -6944,75 +6946,111 @@ class TestWarmOnReset:
 
     def test_reset_transition_triggers_one_shot_switch(self, temp_home):
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
         h.events.clear()
 
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "warm-reset"
-        assert h.state()["warming"] == {"number": "2", "since": h.clock.now}
+        assert h.state()["warming"] == {
+            "number": "2", "since": h.clock.now, "returnTo": "1"
+        }
         assert h.state()["fiveHourSeen"]["2"] is False
 
     def test_hold_suppresses_normal_strategy_while_unconfirmed(self, temp_home):
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
-        h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})  # warm switch
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch
         assert h.active_number() == 2
         h.events.clear()
 
         h.clock.advance(60.0)
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 2
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["warming"]
         assert not any(isinstance(e, WarmResetHoldEndedEvent) for e in h.events)
-        assert h.state()["warming"] == {"number": "2", "since": 1_000_000.0}
+        assert h.state()["warming"] == {
+            "number": "2", "since": 1_000_000.0, "returnTo": "1"
+        }
 
     def test_hold_ends_once_five_hour_reappears(self, temp_home):
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
-        h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})  # warm switch
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch
         h.events.clear()
 
         h.clock.advance(30.0)
-        outcome = h.tick_with_usage({"1": _idle(3.0), "2": _usage(2.0)})
+        outcome = h.tick_with_usage({"1": _idle(3.0), "2": _usage(2.0, "2030-01-01T00:00:00Z")})
 
-        assert outcome is TickOutcome.NO_ACTION  # below-threshold once resumed
+        # Confirmed ticking -> hold ends -> auto-switch back to the account
+        # it borrowed the session from (account 1, still healthy).
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
         ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
         assert ended.status == "started"
         assert ended.number == "2"
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "warm-return"
+        assert switch.to_ref["number"] == 1
         assert "warming" not in h.state()
         assert h.state()["fiveHourSeen"]["2"] is True
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["below-threshold"]
 
     def test_hold_times_out_without_confirmation(self, temp_home):
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
-        h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})  # warm switch
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch
         h.events.clear()
 
         h.clock.advance(WARM_HOLD_MAX_S + 1.0)
         outcome = h.tick_with_usage({"1": _idle(3.0), "2": _idle(5.0)})
 
-        assert outcome is TickOutcome.NO_ACTION
+        # Timed out unconfirmed -> hold ends -> auto-switch back anyway; the
+        # account it borrowed from is idle but that means 0% used, not unhealthy.
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
         ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
         assert ended.status == "timeout"
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "warm-return"
         assert "warming" not in h.state()
+
+    def test_hold_ends_but_return_account_no_longer_healthy_stays_put(self, temp_home):
+        """The account we'd return to crossed the threshold while we were
+        away priming the target — returning to it would just trade one
+        problem for another, so stay on the (confirmed-healthy) target and
+        let normal strategy sort it out next time account 1 is current."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch onto 2
+        h.events.clear()
+
+        h.clock.advance(30.0)
+        outcome = h.tick_with_usage(
+            {"1": _usage(95, "2030-01-01T00:00:00Z"), "2": _usage(2.0, "2030-01-01T00:00:00Z")}
+        )
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
+        assert ended.status == "started"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
 
     def test_manual_switch_away_supersedes_the_hold(self, temp_home):
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
-        h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})  # warm switch onto 2
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})  # warm switch onto 2
         h.switcher.switch_to("1")  # user switches back by hand
         h.events.clear()
 
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.NO_ACTION
         ended = next(e for e in h.events if isinstance(e, WarmResetHoldEndedEvent))
@@ -7021,12 +7059,12 @@ class TestWarmOnReset:
 
     def test_cooldown_blocks_the_touch_without_losing_the_transition(self, temp_home):
         h = self._two_account_harness(temp_home, cooldown_seconds=300.0)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
         # Prime a cooldown via an unrelated (already-active) switch report.
         h.engine._mutate_state(lambda s: s.__setitem__("lastSwitchAt", h.clock.now))
         h.events.clear()
 
-        blocked = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        blocked = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
         assert blocked is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
@@ -7035,7 +7073,7 @@ class TestWarmOnReset:
 
         h.clock.advance(301.0)
         h.events.clear()
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
@@ -7047,11 +7085,11 @@ class TestWarmOnReset:
         disabled slots — warm-reset must go through the same gate, not its
         own copy that could drift out of sync."""
         h = self._two_account_harness(temp_home)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
         h.switcher.set_account_disabled("2", True)
         h.events.clear()
 
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
@@ -7063,10 +7101,10 @@ class TestWarmOnReset:
     def test_dry_run_never_persists_bookkeeping(self, temp_home):
         h = self._two_account_harness(temp_home)
         h.engine = h._make_engine(dry_run=True)
-        h.tick_with_usage({"1": _usage(20), "2": _usage(30)})  # baseline
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
         assert h.state() == {}
 
-        outcome = h.tick_with_usage({"1": _usage(20), "2": _idle(5.0)})
+        outcome = h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(5.0)})
 
         assert outcome is TickOutcome.SWITCHED
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))

@@ -104,8 +104,8 @@ NO_RESET_FALLBACK_S = 300.0
 IDLE_HOLD_MAX_S = 30 * 60.0
 
 # `warm_on_reset` hold cap: once the engine touches a freshly-reset account,
-# it waits for `five_hour` to reappear in that account's usage (proof a
-# request actually landed and the window is ticking) before handing control
+# it waits for `five_hour.resets_at` to reappear in that account's usage
+# (proof a request actually landed and the window is ticking) before handing control
 # back to `strategy`. Bounded because cswap cannot itself make Claude Code
 # send a message — an idle terminal would otherwise pin the engine off its
 # best account forever. Long enough for a live session's next turn to land
@@ -372,7 +372,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "warm-reset"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "warm-reset" | "warm-return"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -599,17 +599,22 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
 
 
 def _five_hour_active(usage_value: dict | str | None) -> bool | None:
-    """Is this account's 5h window currently ticking (has accrued usage this
-    cycle)? ``None`` when unreadable this tick — never evidence of a reset.
+    """Is this account's 5h window currently ticking (has a live reset
+    timer)? ``None`` when unreadable this tick — never evidence of a reset.
 
-    ``oauth.build_usage_result`` omits the ``five_hour`` key entirely when
-    the API reports none — which it does until a request lands in the
-    current window — so the key's mere presence is the ground truth
+    ``oauth.build_usage_result`` keeps emitting a ``five_hour`` dict
+    (``pct`` only, no ``resets_at``) for an account that has just reset and
+    has not yet had a request land in the new window — so the key's mere
+    presence is NOT proof the window is ticking. ``resets_at`` (added once
+    the API starts reporting a real countdown) is the ground truth
     ``warm_on_reset`` watches for a transition on.
     """
     if not isinstance(usage_value, dict):
         return None
-    return isinstance(usage_value.get("five_hour"), dict)
+    fh = usage_value.get("five_hour")
+    if not isinstance(fh, dict):
+        return False
+    return "resets_at" in fh
 
 
 def _binding_recovery_ts(
@@ -2325,12 +2330,12 @@ class AutoSwitchEngine:
                 return None
             if _five_hour_active(usage.get(target)) is True:
                 self._end_warm_hold(warming, "started")
-                return None
+                return self._maybe_return_from_warm(warming, headroom, usage, quarantined, now)
             since = warming.get("since")
             elapsed = now - since if isinstance(since, (int, float)) else WARM_HOLD_MAX_S
             if elapsed >= WARM_HOLD_MAX_S:
                 self._end_warm_hold(warming, "timeout")
-                return None
+                return self._maybe_return_from_warm(warming, headroom, usage, quarantined, now)
             # Suppress the caller's own below-threshold strategy branch —
             # for `consume-first` that branch would otherwise proactively
             # move again (possibly right back off the account we just
@@ -2359,7 +2364,9 @@ class AutoSwitchEngine:
         if self.dry_run:
             outcome = self._perform(target, email, "warm-reset", left)
             if outcome is TickOutcome.SWITCHED:
-                self._dry_run_warming = {"number": target, "since": now}
+                self._dry_run_warming = {
+                    "number": target, "since": now, "returnTo": current
+                }
                 self._dry_run_five_hour_seen = {
                     **self._dry_run_five_hour_seen, target: False
                 }
@@ -2379,7 +2386,7 @@ class AutoSwitchEngine:
         outcome = self._perform(target, email, "warm-reset", left)
         if outcome is TickOutcome.SWITCHED:
             def commit(s: dict) -> None:
-                s["warming"] = {"number": target, "since": now}
+                s["warming"] = {"number": target, "since": now, "returnTo": current}
                 # Only NOW is the pending transition actually consumed — see
                 # the comment above `reset_candidates.append` for why it was
                 # deliberately left out of the earlier bookkeeping write.
@@ -2410,6 +2417,44 @@ class AutoSwitchEngine:
                 status=status,
             )
         )
+
+    def _maybe_return_from_warm(
+        self,
+        warming: dict,
+        headroom: dict[str, float | None],
+        usage: dict[str, dict | str | None],
+        quarantined: set[str],
+        now: float,
+    ) -> TickOutcome | None:
+        """A warm-reset hold just ended with the touch confirmed or given
+        up on — switch back to the account it borrowed the session from
+        (``warming["returnTo"]``), so priming an idle account never leaves
+        the fleet parked there. Returns ``None`` (fall through to the
+        caller's normal-strategy branch, which is a no-op change from
+        today's behavior) when there is nothing to return to or the
+        return account is not currently a safe landing spot — the target
+        just warmed is at least known-healthy, so staying put is fine.
+        """
+        return_to = warming.get("returnTo")
+        if return_to is None:
+            return None
+        return_to = str(return_to)
+        target = str(warming.get("number", ""))
+        if (
+            return_to == target
+            or return_to not in self.switcher.switchable_account_numbers()
+            or return_to in quarantined
+        ):
+            return None
+        util = headroom.get(return_to)
+        if util is None or (100.0 - util) >= self.settings.threshold:
+            return None  # no longer healthy — let normal strategy pick instead
+        email = self.switcher.account_email(return_to)
+        left = (
+            headroom.get(target),
+            _binding_recovery_ts(usage.get(target), self._models, now),
+        )
+        return self._perform(return_to, email, "warm-return", left)
 
     # -- helpers --------------------------------------------------------------
 

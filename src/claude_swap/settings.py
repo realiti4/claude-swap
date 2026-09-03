@@ -57,13 +57,15 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
-    # When a non-active account's 5h window resets (its usage API stops
-    # reporting `five_hour` at all — Anthropic omits the key entirely until
-    # a request lands in the new window), touch it once so that window's
-    # clock starts now instead of whenever it is next needed, then resume
-    # `strategy` automatically. Off by default: it costs one proactive
-    # switch per idle account per 5h cycle, worthwhile only for a fleet kept
-    # busy enough that a live session can pick the touch up right away.
+    # When a non-active account's 5h window resets (its usage API drops
+    # `resets_at` from `five_hour` until a request lands in the new
+    # window — the `pct` field alone stays present), touch it once so that
+    # window's clock starts now instead of whenever it is next needed, then
+    # switch back to whichever account it borrowed the session from, once
+    # the touch is confirmed (or given up on). Off by default: it costs one
+    # proactive switch per idle account per 5h cycle, worthwhile only for a
+    # fleet kept busy enough that a live session can pick the touch up
+    # right away.
     warm_on_reset: bool = False
 
 
