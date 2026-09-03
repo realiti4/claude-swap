@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
 from claude_swap.oauth import credential_fingerprint
@@ -89,6 +90,78 @@ def _seed_account(
     if data["activeAccountNumber"] is None:
         data["activeAccountNumber"] = num
     switcher._write_json(switcher.sequence_file, data)
+
+
+# ---------------------------------------------------------------------------
+# Credential provenance
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialProvenance:
+    """``credentialOrigin`` records where a slot's credential came from, so the
+    rotated-backup resync can tell a consumed predecessor from an independently
+    acquired grant for the same account — the one case the ownership probe
+    cannot separate, since it answers *whose account is this* and both answer
+    "yours"."""
+
+    def test_import_marks_the_slot_independent(self, temp_home: Path):
+        """A payload with no provenance was not derived from this machine's
+        live store, so the credential it carries cannot be a predecessor of
+        anything here."""
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        dst_home = temp_home.parent / "dst-independent"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home), \
+             patch.dict(os.environ, {"HOME": str(dst_home)}):
+            dst = _linux_switcher(dst_home)
+            import_accounts(dst, str(out_file))
+            origin = (dst._get_sequence_data() or {})["accounts"]["1"][
+                "credentialOrigin"
+            ]
+            creds_text = dst._read_account_credentials("1", "alice@example.com")
+
+        assert origin["kind"] == "independent"
+        # Describes the bytes actually written, not the bytes in the payload.
+        assert origin["fingerprint"] == oauth.credential_fingerprint(creds_text)
+
+    def test_export_carries_provenance_so_import_does_not_invent_it(
+        self, temp_home: Path
+    ):
+        """Export/import moves accounts BETWEEN MACHINES, so "arrived via
+        import" is not the same claim as "acquired independently". A slot
+        captured from the live store here must stay ``derived`` there, or the
+        importing machine suppresses a heal it genuinely needs."""
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        data = src._get_sequence_data()
+        assert data is not None
+        creds_text = src._read_account_credentials("1", "alice@example.com")
+        data["accounts"]["1"]["credentialOrigin"] = {
+            "kind": "derived",
+            "fingerprint": oauth.credential_fingerprint(creds_text),
+        }
+        src._write_json(src.sequence_file, data)
+
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        envelope = json.loads(out_file.read_text())
+        assert envelope["accounts"][0]["credentialOrigin"]["kind"] == "derived"
+
+        dst_home = temp_home.parent / "dst-derived"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home), \
+             patch.dict(os.environ, {"HOME": str(dst_home)}):
+            dst = _linux_switcher(dst_home)
+            import_accounts(dst, str(out_file))
+            origin = (dst._get_sequence_data() or {})["accounts"]["1"][
+                "credentialOrigin"
+            ]
+
+        assert origin["kind"] == "derived"
 
 
 # ---------------------------------------------------------------------------
