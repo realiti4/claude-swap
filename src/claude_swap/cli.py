@@ -1089,6 +1089,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
+        "--table",
+        action="store_true",
+        help="Render 'list' as a colourized quota table (the default)",
+    )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the legacy plain-text rendering for 'list'",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help=(
@@ -1297,6 +1307,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
+    if args.table and not args.list:
+        parser.error("--table can only be used with 'list'")
+
+    if args.plain and not args.list:
+        parser.error("--plain can only be used with 'list'")
+
+    if args.table and args.plain:
+        parser.error("--table and --plain cannot be combined")
+
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
 
@@ -1304,6 +1323,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Token status is not part of the JSON v1 schema; reject rather than
         # silently ignore it (a future additive field can add it).
         parser.error("--token-status cannot be combined with --json")
+
+    if args.json and args.table:
+        parser.error("--table cannot be combined with --json")
 
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
@@ -1384,10 +1406,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
-            payload = switcher.list_accounts(
+            list_kwargs = dict(
                 show_token_status=args.token_status,
                 json_output=args.json,
+                table_output=not (args.plain or args.json),
             )
+            payload = switcher.list_accounts(**list_kwargs)
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
 
