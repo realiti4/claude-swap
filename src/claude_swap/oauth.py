@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -61,11 +62,31 @@ def credential_fingerprint(credentials: str) -> str | None:
 
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or (
+        isinstance(expires_at, float) and not math.isfinite(expires_at)
+    ):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+
+
+def refresh_token_spent(credentials: str) -> bool:
+    """Has this credential's own refresh token expired?
+
+    Unknown is not expired — no field, a non-numeric one, JSON carrying no
+    ``claudeAiOauth``, and non-JSON all answer False. The one predicate for
+    "these bytes can mint nothing", so no caller can disagree about a
+    credential.
+
+    It RAISES on JSON that is not an object (``AttributeError``) and on
+    ``None`` (``TypeError``), both out of ``extract_oauth_data``, so a caller
+    that cannot afford a raise must sit behind one that already parsed these
+    bytes.
+    """
+    return is_oauth_token_expired(
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")
+    )
 
 
 @dataclass(frozen=True)
@@ -559,6 +580,41 @@ def account_headroom(
     if not pcts:
         return None
     return 100.0 - max(pcts)
+
+
+def binding_window_label(
+    usage: dict | None, models: Sequence[str] = ()
+) -> str | None:
+    """Label of the window this account is closest to hitting, or ``None``.
+
+    The companion to :func:`account_headroom`, which returns the binding
+    window's headroom and throws away WHICH window it was. An escape needs the
+    label: a 5-hour limit and a weekly limit want different targets, and a
+    ranking that cannot tell them apart optimises the wrong axis for one of
+    them.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: w[1])[0]
+
+
+def headroom_on_window(
+    usage: dict | None, label: str, models: Sequence[str] = ()
+) -> float | None:
+    """Headroom on ONE named window, or ``None`` when it is not reported.
+
+    Deliberately NOT a floor on the others, and NOT a usability test: a high
+    number here says only that one window is clear. An account can score 50
+    on it and hold a single point overall. Callers must therefore rank with
+    it and decide usability with :func:`account_headroom` — the engine's
+    escape key tiers on that first, because ordering by this number alone
+    lands on an account that stops answering on the next request.
+    """
+    for name, pct, _ in relevant_windows(usage, models):
+        if name == label:
+            return 100.0 - pct
+    return None
 
 
 @dataclass(frozen=True)

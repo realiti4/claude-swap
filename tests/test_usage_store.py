@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -1237,6 +1238,168 @@ class TestDeadTokenQuarantine:
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         assert store.entries(IDENT)["1"].auth_dead_strikes == 2
 
+    def test_a_quarantine_says_who_it_quarantined_and_why(self, store, caplog):
+        """A permanent verdict that leaves no trace cannot be diagnosed.
+
+        One `invalid_grant` is enough to quarantine a slot (the threshold is
+        1), the account then reads "re-login needed" until a human logs in
+        again, and nothing anywhere records that it happened. Measured in a
+        live incident: four accounts across two machines were quarantined and
+        the log held not one line about any of them, so the cause took hours
+        to find and could only be reconstructed from the store's own row.
+
+        The strike is the ONE place that knows the slot, the identity and the
+        verdict at the moment it binds.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the quarantine names neither the slot nor the account: {said!r}"
+        )
+        assert "invalid_grant" in said, (
+            f"the quarantine does not say what the server answered: {said!r}"
+        )
+
+    def test_a_transient_failure_stays_quiet(self, store, caplog):
+        """The control: a 429 must not produce the quarantine line.
+
+        Without this the assertion above is satisfied by logging on every
+        failure, which buries the one verdict that needs a human.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "re-login" not in said and "quarantin" not in said, (
+            f"a transient failure produced the quarantine line: {said!r}"
+        )
+
+    def test_a_rotatable_quarantine_does_not_demand_a_re_login(self, store, caplog):
+        """A strike on a credential something REPLACES without a human -- a
+        `sha256:` refresh lineage -- condemns the generation, not the slot,
+        and the live client's own rotation lifts it. Telling a person to
+        re-login there is a wrong instruction, not a pessimistic one.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            # `sha256:` == the credential HAS a refresh token to rotate.
+            store.record({"1": FetchRecord(error="invalid_grant",
+                                           struck_fp="sha256:the-spent-one")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "rotation clears it" in said, (
+            f"a rotatable strike does not name the rotation that lifts it: {said!r}"
+        )
+        assert "only a re-login" not in said, (
+            f"a rotatable strike still presents re-login as the remedy: {said!r}"
+        )
+        # THE HEDGE IS THE REQUIREMENT, so assert it directly. The line above
+        # only rules out the SIBLING branch's wording; "re-login now to restore
+        # it" clears it while violating the very thing this test is named for.
+        assert "only if it persists" in said, (
+            f"a rotatable strike hardened its re-login into a demand: {said!r}"
+        )
+        assert caplog.records[-1].levelno == logging.WARNING, (
+            "a strike the message itself calls possibly-stale escalated to "
+            f"{caplog.records[-1].levelname}"
+        )
+        # SCOPE. Two of the three struck_fp mint sites are idle-only, where no
+        # live client rotates anything -- an unscoped promise is wrong there.
+        assert "only on the active slot" in said, (
+            f"the rotation promise lost its scope: {said!r}"
+        )
+
+    def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
+        """THE CONTROL. A row struck with no fingerprint binds
+        unconditionally, so softening the sentence there would tell a person
+        to wait for a heal that cannot arrive.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        # Both halves, or neither discriminates: the ROTATION wording also
+        # contains "re-login", so a bare `"re-login" in said` passes on both.
+        assert "only a re-login" in said, (
+            f"an unbound strike stopped naming the only thing that lifts it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"an unbound strike promises a rotation that cannot lift it: {said!r}"
+        )
+
+    def test_a_credential_with_no_refresh_token_demands_a_re_login(
+        self, store, caplog
+    ):
+        """A BOUND strike that no rotation can lift, so the binding is not the
+        question -- rotatability is. ``no_refresh_token`` strikes too
+        (PERMANENT_AUTH_ERRORS), and ``credential_fingerprint`` falls back to a
+        full-CONTENT hash for a blob with no refresh token, which is truthy.
+        Nothing rotates those bytes: only an explicit write replaces them.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="no_refresh_token",
+                                           struck_fp="sha256-full:deadbeef")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "only a re-login" in said, (
+            f"a content-hash strike was told a rotation may lift it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"a credential with no refresh token was promised a rotation: {said!r}"
+        )
+        # ARG SLOTS, not prose. Hardcoding `rec.error` renders a wrong cause
+        # forever and the sentence still reads fine; only the slot catches it.
+        slot, ident, err, remedy = caplog.records[-1].args[:4]
+        assert (slot, ident, err) == ("1", "a@x.com", "no_refresh_token"), (
+            f"the quarantine reported the wrong slot/identity/cause: "
+            f"{(slot, ident, err)!r}"
+        )
+
+    def test_lifting_a_quarantine_says_so(self, store, caplog):
+        """A transition log that speaks in ONE direction reports every
+        recovery as a permanent fault: the quarantine is a WARNING and the
+        heal was silent.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].token_dead()
+        # DROP THE SETUP'S OWN RECORDS. `caplog.records` accumulates over the
+        # whole test, not over the `with` block, so without this the strike's
+        # own QUARANTINE line satisfies the assertion below.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the heal names neither the slot nor the account: {said!r}"
+        )
+        assert "no longer matches" not in said, (
+            "the heal claims a fingerprint comparison it never made -- this "
+            "method never reads a credential, and only the collector path "
+            f"passes a fingerprint at all: {said!r}"
+        )
+        assert caplog.records[-1].args[:2] == ("1", "a@x.com"), (
+            f"the heal swapped its slot and identity args: "
+            f"{caplog.records[-1].args[:2]!r}"
+        )
+        # DIRECTION. Position, level, args and guard are each pinned; without
+        # this the line could announce the opposite and still pass them all.
+        assert "out of quarantine" in said, (
+            f"the heal announces the wrong direction: {said!r}"
+        )
+
+    def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
+        """THE CONTROL. `clear_dead_token` is called on rows with no strike as
+        a matter of course -- every re-login and every add runs it -- so a line
+        per call would bury the transitions it exists to show."""
+        # A FAILURE HISTORY WITH NO STRIKE separates the two counters: on a
+        # virgin row both are 0 and the guard could read either field.
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
+            f"a no-op clear announced itself: {[r.getMessage() for r in ours]!r}"
+        )
+
     def test_transient_error_does_not_advance_or_reset(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)  # transient
@@ -1269,6 +1432,35 @@ class TestDeadTokenQuarantine:
         # A dead token is never nominated as the alternate to poll.
         assert due_candidate(["1"], entries, clock.now) is None
 
+    def test_due_candidate_refuses_a_struck_row_whose_fingerprint_moved(
+        self, store, clock
+    ):
+        """DELIBERATE. A future reader will see that `due_candidate` asks the
+        UNBOUND question and take it for the bug this PR fixed elsewhere. It is
+        not: the bound verdict ranges over the live credential AND the slot
+        backup, neither of which the store can read, and the only caller has
+        already healed every case it could determine. What reaches this line is
+        the "could not determine" case, where refusing is what the switcher's
+        heal scan relies on to keep the row out of a fetch.
+
+        Passing a fingerprint in here would delete that guard, so this test
+        fails if anyone does.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant",
+                                       struck_fp="sha256:the-condemned-one")},
+                     IDENT)
+        clock.advance(10_000)  # past any backoff
+        entry = store.entries(IDENT)["1"]
+        # The BOUND question says healed -- and is the wrong one to ask here.
+        assert not entry.token_dead(stored_fp="sha256:a-rotated-one"), (
+            "premise: a moved fingerprint would lift the bound verdict"
+        )
+        assert due_candidate(["1"], {"1": entry}, clock.now) is None, (
+            "due_candidate stopped refusing a struck row, deleting the guard "
+            "switcher._collect_usage_entries leans on for its "
+            "could-not-determine case"
+        )
+
     def test_clear_dead_token_lifts_quarantine(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
@@ -1279,6 +1471,60 @@ class TestDeadTokenQuarantine:
         assert not entry.token_dead()
         assert entry.last_error is None
         assert entry.backoff_until is None
+
+    def test_clear_dead_token_revokes_the_claim_by_default(self, store, clock):
+        """The credential-refresh callers (login/add/import) need this: a
+        fresh credential fences out any claim still bound to the OLD
+        lineage, so a superseded fetch's `record()` can't land — see
+        `test_credential_refresh_revokes_an_old_fetch_claim`. Default
+        behavior stays unchanged; ``revoke_claim=False`` is the opt-out for
+        callers with no credential change to fence (below)."""
+        store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        store.clear_dead_token(["1"], IDENT)
+        assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_clear_dead_token_can_preserve_a_live_claim(self, store, clock):
+        """`revoke_claim=False`: a lock-free heal (no credential change, no
+        network) must not be able to void a lease it did not issue.
+
+        Measured before this guard existed: a zero-strike row holding a
+        live fetch claim (a collector's in-flight lease) had `claimId`
+        nulled by `clear_dead_token` unconditionally — reachable from the
+        TUI's lock-free 3s `fetch=set()` poll, every tick, with no strikes
+        involved at all. `record()` fences its own writes on `claimId`, so
+        that silently discarded a concurrent collector's in-flight fetch
+        outcome — the engine's own measurement, thrown away by a stale
+        read one poll cycle later.
+
+        Control in the same test: strikes/backoff/error state are still
+        cleared with the flag off — only the CLAIM is preserved, proving
+        the mutator's real job (lifting the quarantine) survives the guard.
+        """
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert claims, "premise: the reserve won a live claim"
+        before = store.entries(IDENT)["1"]
+        assert before.auth_dead_strikes == 0, "premise: no strikes"
+        assert before.claimed(clock.now), "premise: the claim is live"
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False)
+
+        after = store.entries(IDENT)["1"]
+        assert after.claimed(clock.now), (
+            f"claim_until {before.claim_until!r} -> {after.claim_until!r}: "
+            "revoke_claim=False must leave a live claim untouched"
+        )
+        assert after.claim_until == before.claim_until
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, claims
+        ) == {"1"}, "the preserved claim must still fence a real record()"
+
+        # Control: strike/backoff/error state is still cleared with the flag
+        # off — the guard narrows the write, it does not disable it.
+        store.record({"2": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["2"].token_dead()
+        store.clear_dead_token(["2"], IDENT, revoke_claim=False)
+        assert not store.entries(IDENT)["2"].token_dead()
 
 
 class TestReserve:
@@ -1632,11 +1878,25 @@ class TestStruckFingerprintHygiene:
     unconditionally, and clearing a quarantine drops the fingerprint too."""
 
     def test_legacy_strike_overwrites_stale_fingerprint(self, store):
+        """I3 rewrite: the ORIGINAL version called ``clear_dead_token``
+        between the two strikes, which itself zeroes ``struckFingerprint`` --
+        so the asserted state (``None``) already existed before the second
+        ``record()`` ran, and the assertion could not tell the overwrite
+        under test from that setup step (it passed identically with the
+        overwrite guarded out: ``if rec.struck_fp is not None:``). Reaching
+        the asserted state ONLY via the second ``record()`` -- no intervening
+        clear -- makes the overwrite the sole mechanism that can produce it.
+        """
         ident = {"1": ("a@b.c", "")}
         store.record(
             {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
             ident,
         )
+        assert store.entries(ident)["1"].struck_fingerprint == "sha256:old", (
+            "premise: a fingerprint is on the row before the legacy strike"
+        )
+        # legacy writer strikes without a fingerprint -- no clear in between,
+        # so only THIS write can change struckFingerprint.
         store.clear_dead_token(["1"], ident)
         # legacy writer strikes without a fingerprint
         store.record({"1": FetchRecord(error="invalid_grant")}, ident)
@@ -1682,3 +1942,153 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestStrikeOnlyHeal:
+    """C1/I2: ``clear_dead_token(strike_only=True)`` clears the STRIKE only
+    -- ``authDeadStrikes``/``struckFingerprint`` -- and leaves the server's
+    own throttle state (``consecutiveFailures``/``lastError``/
+    ``backoffUntil``) untouched. The five credential-refresh callers keep
+    the full clear (``strike_only`` defaults False)."""
+
+    def test_strike_only_preserves_backoff(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        row = store._read_rows()["1"]
+        backoff_before = row["backoffUntil"]
+        assert backoff_before is not None
+        store.clear_dead_token(["1"], ident, revoke_claim=False,
+                                strike_only=True)
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert entry.backoff_until == backoff_before, (
+            "strike_only must not touch the server's own throttle deadline"
+        )
+        assert entry.last_error == "invalid_grant"
+        assert entry.consecutive_failures == 1
+
+    def test_default_full_clear_still_wipes_backoff(self, store):
+        """The five credential-refresh callers (login/add/import) must keep
+        today's full-clear behaviour -- a freshly written credential has no
+        history at all, so a stale backoff must not survive it either."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(["1"], ident)  # default: strike_only=False
+        entry = store.entries(ident)["1"]
+        assert entry.backoff_until is None
+        assert entry.last_error is None
+        assert entry.consecutive_failures == 0
+
+    def test_expected_fingerprint_mismatch_is_a_no_op(self, store, caplog):
+        """The TOCTOU re-check: a row whose struckFingerprint moved since
+        the caller's lock-free read (a fresh strike, or a different
+        collector's own heal, landed in the gap) must be left untouched."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        # A concurrent writer moved the fingerprint before this heal's lock.
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=60.0,
+                               struck_fp="sha256:concurrent")},
+            ident,
+        )
+        row_before = dict(store._read_rows()["1"])
+        caplog.clear()
+        # at_level(INFO) or this asserts NOTHING: bare caplog captures nothing
+        # below WARNING, so the absence below would hold however loud the heal.
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(
+                ["1"], ident, revoke_claim=False, strike_only=True,
+                expected_fingerprints={"1": "sha256:old"},  # the STALE read
+            )
+        row_after = store._read_rows()["1"]
+        assert row_after == row_before, (
+            "a stale-read heal must not overwrite a row that changed under it"
+        )
+        # THE THIRD OUTCOME. Struck-but-REFUSED is neither of the two the heal
+        # line splits on, and a line here claims a transition that did not
+        # happen -- the exact defect class this wording change exists to remove.
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
+            "a refused heal announced a heal that did not happen: "
+            f"{[r.getMessage() for r in ours]!r}"
+        )
+
+    def test_expected_fingerprint_match_still_heals(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(
+            ["1"], ident, revoke_claim=False, strike_only=True,
+            expected_fingerprints={"1": "sha256:old"},  # matches
+        )
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+
+
+class TestHealPreservesTrustExtended:
+    """I2: the heal must not itself flip a decision-trusted entry to
+    unknown. Before the C1 fix, a struck entry's ``trust_extended`` rode on
+    ``consecutiveFailures``/``lastError``/``backoffUntil`` -- exactly the
+    fields the unconditional clear wiped -- so a stale-but-trusted entry
+    flipped to unknown purely from observing a healed fingerprint, which
+    ``autoswitch.py`` counts toward ``_unhealthy_ticks`` and a real
+    failover."""
+
+    def test_strike_only_heal_keeps_a_stale_entry_decision_trusted(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        # The strike is itself the failure state keeping this entry trusted
+        # past STALE_OK_S (consecutive_failures > 0).
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        pre = store.entries(IDENT)["1"]
+        assert pre.age_s > STALE_OK_S
+        assert pre.trust_extended, "premise: the strike itself trusts it"
+        assert pre.decision_value() == USAGE
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False,
+                                strike_only=True)
+        post = store.entries(IDENT)["1"]
+        assert post.trust_extended, (
+            "the heal flipped a decision-trusted entry to unknown -- "
+            "autoswitch.py counts this toward a failover"
+        )
+        assert post.decision_value() == USAGE
+
+    def test_full_clear_heal_does_flip_it_to_unknown(self, store, clock):
+        """Documents the CONTRASTING behaviour of the default (non-strike-
+        only) clear on the same setup, so the two tests together show the
+        fix is exactly the ``strike_only`` axis, not a side effect."""
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        store.clear_dead_token(["1"], IDENT)  # full clear
+        post = store.entries(IDENT)["1"]
+        assert not post.trust_extended
+        assert post.decision_value() is None
