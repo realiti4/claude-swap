@@ -54,6 +54,11 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.warmup import (
+    DEFAULT_INTERVAL_SECONDS as WARMUP_INTERVAL_SECONDS,
+    WarmupEngine,
+    WarmupEvent,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -491,6 +496,31 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class WarmupAutoEvent(AutoSwitchEvent):
+    """One guarded five-hour warm-up decision emitted by ``cswap auto``."""
+
+    kind: ClassVar[str] = "warmup"
+    action: str
+    number: str
+    email: str
+    detail: str
+
+    def _fields(self) -> dict:
+        return {
+            "action": self.action,
+            "account": {"number": self.number, "email": self.email},
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        suffix = " (5h warm-up sent)" if self.action == "warmed" else ""
+        return (
+            f"warm-up {self.action} Account-{self.number} ({self.email}): "
+            f"{self.detail}{suffix}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -684,6 +714,60 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        self._warmup: WarmupEngine | None = None
+        self._next_warmup_at: float | None = None
+        if settings.warmup_five_hour:
+            self._enable_warmup()
+
+    def _enable_warmup(self) -> None:
+        self._warmup = WarmupEngine(
+            self.switcher,
+            emit=self._emit_warmup,
+            dry_run=self.dry_run,
+            clock=self.clock,
+        )
+        # A newly enabled or newly started auto process checks immediately.
+        # The warmer's persistent state still suppresses duplicate requests.
+        self._next_warmup_at = self.clock()
+
+    def _emit_warmup(self, event: WarmupEvent) -> None:
+        self._emit(
+            WarmupAutoEvent(
+                action=event.kind,
+                number=event.account_number,
+                email=event.email,
+                detail=event.detail,
+            )
+        )
+
+    def _run_warmup_if_due(self) -> bool:
+        """Run one integrated pass when due; return whether that pass failed."""
+        warmer = self._warmup
+        due = self._next_warmup_at
+        now = self.clock()
+        if self._stop.is_set() or warmer is None or due is None or now < due:
+            return False
+
+        try:
+            return warmer.tick().failed > 0
+        except ClaudeSwitchError as exc:
+            self._emit(
+                ErrorEvent(message=f"five-hour warm-up: {exc}", transient=True)
+            )
+            return True
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            self._emit(
+                ErrorEvent(
+                    message=f"five-hour warm-up: {type(exc).__name__}: {exc}",
+                    transient=True,
+                )
+            )
+            return True
+        finally:
+            # Schedule from completion so a slow pass cannot make the next
+            # auto-switch tick immediately run another full account sweep.
+            if self._warmup is warmer:
+                self._next_warmup_at = self.clock() + WARMUP_INTERVAL_SECONDS
 
     # -- state file ---------------------------------------------------------
 
@@ -877,17 +961,20 @@ class AutoSwitchEngine:
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
-        """Evaluate once: poll usage, maybe switch. Never raises."""
+        """Evaluate once: maybe switch, then run a due warm-up pass. Never raises."""
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
+            outcome = TickOutcome.ERROR
+        if self._run_warmup_if_due():
             return TickOutcome.ERROR
+        return outcome
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -2270,6 +2357,8 @@ class AutoSwitchEngine:
         exits immediately (engines are single-use)."""
         self._stop.set()
         self._wake.set()
+        if self._warmup is not None:
+            self._warmup.stop()
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""
@@ -2283,15 +2372,29 @@ class AutoSwitchEngine:
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
+    def apply_warmup_enabled(self, enabled: bool) -> None:
+        """Apply the TUI's persisted warm-up toggle to this running engine."""
+        if enabled == self.settings.warmup_five_hour:
+            return
+        self.settings = replace(self.settings, warmup_five_hour=enabled)
+        if self._warmup is not None:
+            self._warmup.stop()
+        self._warmup = None
+        self._next_warmup_at = None
+        if enabled:
+            self._enable_warmup()
+        self._wake.set()
+
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
+        delay: float | None = None
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
-                delay = self._sleep_until_ts - self.clock()
-                return min(max(delay, interval), MAX_SLEEP_S)
-            if self._blocked_wait_long:
+                until_reset = self._sleep_until_ts - self.clock()
+                delay = min(max(until_reset, interval), MAX_SLEEP_S)
+            elif self._blocked_wait_long:
                 # Truly exhausted with no reset time known / no candidates.
-                return max(interval, NO_RESET_FALLBACK_S)
+                delay = max(interval, NO_RESET_FALLBACK_S)
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
             # escape isn't missed.
@@ -2299,9 +2402,21 @@ class AutoSwitchEngine:
             # Idle-hold: Claude is idle on an expired token — nothing changes
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
-            return max(interval, NO_RESET_FALLBACK_S)
-        # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+            delay = max(interval, NO_RESET_FALLBACK_S)
+        if delay is None:
+            # ±10% jitter so multiple machines don't synchronize their API hits.
+            delay = self._respect_poll_plan(
+                interval * (0.9 + 0.2 * random.random())
+            )
+        return self._respect_warmup_deadline(delay)
+
+    def _respect_warmup_deadline(self, delay: float) -> float:
+        """Do not let a slow auto cadence delay an enabled warm-up sweep."""
+        warmer = self._warmup
+        due = self._next_warmup_at
+        if warmer is None or due is None:
+            return delay
+        return min(delay, max(0.0, due - self.clock()))
 
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.

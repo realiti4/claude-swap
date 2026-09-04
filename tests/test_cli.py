@@ -1089,12 +1089,17 @@ class TestAutoCommand:
         backup.mkdir(parents=True, exist_ok=True)
         (backup / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"threshold": 80.0, "cooldownSeconds": 42.0},
+            "autoswitch": {
+                "threshold": 80.0,
+                "cooldownSeconds": 42.0,
+                "warmupFiveHour": True,
+            },
         }))
         self._run(["--once", "--threshold", "60"], temp_home)
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+        assert engine.settings.warmup_five_hour is True
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)

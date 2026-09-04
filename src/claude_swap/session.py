@@ -53,6 +53,7 @@ from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    PromptOutcomeUnknown,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
@@ -192,9 +193,15 @@ def mark_session_stale(session_dir: Path) -> bool:
 AUTH_OVERRIDE_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 )
 
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
@@ -604,6 +611,207 @@ class SessionManager:
             )
         self._exec(claude_bin, claude_args, env=dict(os.environ))
 
+    def run_prompt(
+        self,
+        identifier: str,
+        claude_args: list[str],
+        *,
+        timeout: float,
+        expected_identity: tuple[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one bounded non-interactive prompt as a stored OAuth account.
+
+        Unlike :meth:`run`, this method returns to its caller and captures the
+        child output. It is intended for small housekeeping requests such as
+        the opt-in five-hour warmer. The active account uses Claude's default
+        profile; every other account uses its existing isolated session
+        profile, so no global credential switch occurs.
+
+        Immediately before the paid prompt, the exact launch environment is
+        probed with ``claude --safe-mode auth status --json``. This catches
+        admin-managed cloud-provider settings that cannot be neutralized by
+        removing process environment overrides.
+
+        A nested ``CLAUDE_CONFIG_DIR`` is refused because active-account
+        detection would describe that profile while the child environment is
+        deliberately normalized to the real default profile. Proceeding could
+        therefore send the request on the wrong account.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+        if os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        ):
+            raise SessionError(
+                "Warm-up must run outside a Claude session: unset "
+                "CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR first."
+            )
+
+        def resolve_target() -> tuple[str, str, str]:
+            account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+            self._ensure_not_api_key(account_num, email)
+            if expected_identity is not None and (email, org_uuid) != expected_identity:
+                raise SessionError(
+                    f"Account-{account_num} changed since the usage check; "
+                    "refusing to run a warm-up request on a different identity."
+                )
+            return account_num, email, org_uuid
+
+        def prompt_env(session_dir: Path | None = None) -> dict[str, str]:
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in AUTH_OVERRIDE_ENV_VARS
+                and key
+                not in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+            }
+            if session_dir is not None:
+                env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+            return env
+
+        def run_verified(
+            env: dict[str, str], account_num: str, email: str, org_uuid: str
+        ) -> subprocess.CompletedProcess[str]:
+            self._verify_prompt_auth(
+                claude_bin, env, account_num, email, org_uuid
+            )
+            return self._run_prompt_process(
+                claude_bin, claude_args, env, timeout, account_num, email
+            )
+
+        # Serialize the active verdict through child completion. Every cswap
+        # switch takes this same lock, so the default login cannot change
+        # between selecting it and sending the request.
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            account_num, email, org_uuid = resolve_target()
+            if self.switcher._get_current_account() == (email, org_uuid):
+                return run_verified(prompt_env(), account_num, email, org_uuid)
+
+        # setup_session takes the account lock internally and must run outside
+        # the context above. Keep the slot identifier: email alone is ambiguous
+        # when personal and organization accounts share an address. The final
+        # expected-identity check below fails closed if the slot moved while
+        # its profile was prepared.
+        session_dir, _account_num, _email = self.setup_session(
+            account_num,
+            share=False,
+            share_history=False,
+            sync_sharing=False,
+            refresh_credentials=False,
+            expected_identity=(email, org_uuid),
+        )
+
+        # A switch may have landed while the profile was prepared. Revalidate
+        # the snapshot identity, choose the now-correct profile, and hold the
+        # lock until Claude exits so another cswap switch cannot interleave.
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            account_num, email, org_uuid = resolve_target()
+            selected_dir = (
+                None
+                if self.switcher._get_current_account() == (email, org_uuid)
+                else session_dir
+            )
+            if selected_dir is not None and read_session_identity(selected_dir) != (
+                email,
+                org_uuid,
+            ):
+                raise SessionError(
+                    f"Account-{account_num}'s prepared profile identity does not "
+                    "match the usage snapshot; refusing the warm-up request."
+                )
+            return run_verified(
+                prompt_env(selected_dir), account_num, email, org_uuid
+            )
+
+    @staticmethod
+    def _verify_prompt_auth(
+        claude_bin: str,
+        env: dict[str, str],
+        account_num: str,
+        email: str,
+        org_uuid: str,
+    ) -> None:
+        """Fail closed unless the exact prompt environment is the expected OAuth."""
+        try:
+            result = subprocess.run(
+                [claude_bin, "--safe-mode", "auth", "status", "--json"],
+                env=env,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=_AUTH_STATUS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SessionError(
+                f"Could not verify first-party Claude OAuth for Account-{account_num} "
+                f"({email}): auth status timed out. No warm-up was sent."
+            ) from exc
+        except OSError as exc:
+            raise SessionError(
+                f"Could not verify first-party Claude OAuth for Account-{account_num} "
+                f"({email}): {exc}. No warm-up was sent."
+            ) from exc
+
+        try:
+            status = json.loads(result.stdout) if result.returncode == 0 else None
+        except json.JSONDecodeError:
+            status = None
+        if not isinstance(status, dict):
+            raise SessionError(
+                f"Could not verify first-party Claude OAuth for Account-{account_num} "
+                f"({email}); auth status was unavailable. No warm-up was sent."
+            )
+        if (
+            status.get("loggedIn") is not True
+            or status.get("authMethod") != "claude.ai"
+            or status.get("apiProvider") != "firstParty"
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}) is not using first-party Claude "
+                "OAuth in the warm-up environment. No warm-up was sent."
+            )
+        status_org = status.get("orgId") or ""
+        if status.get("email") != email or status_org != (org_uuid or ""):
+            raise SessionError(
+                f"Account-{account_num}'s authenticated identity changed before "
+                "the warm-up request. No warm-up was sent."
+            )
+
+    @staticmethod
+    def _run_prompt_process(
+        claude_bin: str,
+        claude_args: list[str],
+        env: dict[str, str],
+        timeout: float,
+        account_num: str,
+        email: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the child without a shell; timeout leaves outcome ambiguous."""
+        argv = [claude_bin, *claude_args]
+        try:
+            return subprocess.run(
+                argv,
+                env=env,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise PromptOutcomeUnknown(
+                f"Claude warm-up timed out after {timeout:.0f}s for "
+                f"Account-{account_num} ({email}); the request may have been "
+                "accepted, so retries remain temporarily protected."
+            ) from exc
+        except OSError as exc:
+            raise SessionError(
+                f"Claude warm-up could not start for Account-{account_num} "
+                f"({email}): {exc}"
+            ) from exc
+
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
 
@@ -639,10 +847,27 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        *,
+        sync_sharing: bool = True,
+        refresh_credentials: bool = True,
+        expected_identity: tuple[str, str] | None = None,
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        Housekeeping callers can disable sharing changes and pre-bootstrap
+        refreshes, then bind every mutating step to ``expected_identity``.
+        Interactive ``cswap run`` retains the existing defaults.
+        """
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if expected_identity is not None and (email, org_uuid) != expected_identity:
+            raise SessionError(
+                f"Account-{account_num} changed before its session profile could "
+                "be prepared; refusing to touch a different identity."
+            )
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
@@ -656,7 +881,8 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            if sync_sharing:
+                self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
@@ -668,7 +894,11 @@ class SessionManager:
         # valid, and claude refreshes on its own at runtime. Setup-token
         # accounts (--add-token) have no refresh token by design — skip
         # silently instead of warning about a flow that can't happen.
-        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        pre_creds = (
+            self.switcher.read_account_credentials(account_num, email)
+            if refresh_credentials
+            else ""
+        )
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
@@ -728,6 +958,19 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            if expected_identity is not None:
+                locked_num, locked_email, locked_org = self.switcher.resolve_account(
+                    identifier
+                )
+                if (locked_email, locked_org) != expected_identity:
+                    raise SessionError(
+                        f"Account-{locked_num} changed while its session profile "
+                        "was being prepared; refusing to touch a different identity."
+                    )
+                account_num, email, org_uuid = locked_num, locked_email, locked_org
+                session_dir = session_dir_for(
+                    self.switcher.backup_dir, account_num, email
+                )
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -758,11 +1001,13 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                if sync_sharing:
+                    self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            if sync_sharing:
+                self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`

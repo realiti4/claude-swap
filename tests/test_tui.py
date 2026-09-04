@@ -1294,6 +1294,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_warmups: list[bool] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1310,6 +1311,12 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_warmup_enabled(self, enabled: bool) -> None:
+        self.settings = dataclasses.replace(
+            self.settings, warmup_five_hour=enabled
+        )
+        self.applied_warmups.append(enabled)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1367,6 +1374,63 @@ class TestAutoScreen:
             assert len(fake_engine.instances) == 2
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
+
+    async def test_five_hour_warmup_toggle_is_confirmed_and_persisted(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+
+            await pilot.press("w")
+            await pilot.pause()
+            from claude_swap.tui.modals import ConfirmModal
+
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("y")
+            await settle(pilot)
+
+            assert screen._settings.warmup_five_hour is True
+            assert fake_engine.instances[0].applied_warmups == [True]
+            raw = json.loads((tmp_path / "settings.json").read_text())
+            assert raw["autoswitch"]["warmupFiveHour"] is True
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "5h warm-up on" in summary.render().plain
+
+            await pilot.press("w")
+            await pilot.pause()
+            assert screen._settings.warmup_five_hour is False
+            assert fake_engine.instances[0].applied_warmups == [True, False]
+            raw = json.loads((tmp_path / "settings.json").read_text())
+            assert raw["autoswitch"]["warmupFiveHour"] is False
+
+    async def test_live_warmup_confirmation_warns_requests_can_start_now(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+
+            await pilot.press("w")
+            await pilot.pause()
+
+            from claude_swap.tui.modals import ConfirmModal
+
+            assert isinstance(app.screen, ConfirmModal)
+            assert "Auto is LIVE" in app.screen._message
 
     async def test_back_stops_engine_and_restores_fetching(
         self, tmp_path, fake_engine
@@ -1554,6 +1618,71 @@ class TestEventText:
         )
         text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
         assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
+
+    def test_failed_warmup_uses_warning_style(self):
+        from claude_swap.autoswitch import WarmupAutoEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        event = WarmupAutoEvent(
+            action="failed",
+            number="2",
+            email="b@x.com",
+            detail="state is unreadable",
+        )
+        text = event_text(event)
+
+        assert "warm-up failed" in text.plain
+        assert any(Palette.DARK.sev_warn in str(span.style) for span in text.spans)
+
+    def test_live_warmup_uses_muted_style(self):
+        from claude_swap.autoswitch import WarmupAutoEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        event = WarmupAutoEvent(
+            action="live",
+            number="2",
+            email="b@x.com",
+            detail="the five-hour window is already active",
+        )
+        text = event_text(event)
+
+        assert "five-hour window is already active" in text.plain
+        assert "5h warm-up sent" not in text.plain
+        assert Palette.DARK.muted in str(text.spans[-1].style)
+
+    def test_warmed_account_uses_accent_and_marks_warmup_sent(self):
+        from claude_swap.autoswitch import WarmupAutoEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        event = WarmupAutoEvent(
+            action="warmed",
+            number="2",
+            email="b@x.com",
+            detail="sent guarded warm-up prompt",
+        )
+        text = event_text(event)
+
+        assert text.plain.endswith("sent guarded warm-up prompt (5h warm-up sent)")
+        assert Palette.DARK.accent in str(text.spans[-1].style)
+
+    def test_dry_run_warmup_preview_uses_accent(self):
+        from claude_swap.autoswitch import WarmupAutoEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        event = WarmupAutoEvent(
+            action="would-warm",
+            number="2",
+            email="b@x.com",
+            detail="would send one minimal request",
+        )
+        text = event_text(event)
+
+        assert "5h warm-up sent" not in text.plain
+        assert Palette.DARK.accent in str(text.spans[-1].style)
 
 
 # ---------------------------------------------------------------------------
