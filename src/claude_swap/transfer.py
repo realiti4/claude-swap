@@ -23,7 +23,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp, normalize_alias
-from claude_swap.oauth import credential_fingerprint
+from claude_swap.oauth import credential_fingerprint, refresh_token_spent
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -492,7 +492,10 @@ def import_accounts(
                     and credential_fingerprint(entry["creds_text"])
                     == row.struck_fingerprint
                 )
-            elif switcher._slot_token_dead(existing_slot, entry["email"]):
+            elif (
+                switcher._slot_token_dead(existing_slot, entry["email"])
+                and not refresh_token_spent(entry["creds_text"])
+            ):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
@@ -500,13 +503,27 @@ def import_accounts(
                 # failed after being stored (known exception and full
                 # trade-off: INVESTIGATION-import-dead-token.md). Identity-
                 # guarded — a stale row for a different account returns an
-                # empty entry — so healthy slots still require --force. Never
-                # triggered by the live store's "no credentials" state, which
-                # isn't attributable to the backup.
+                # empty entry — so healthy slots still require --force. An
+                # empty live store alone does not trigger it either, not being
+                # attributable to the backup; on a slot with NO stored source
+                # at all a STRUCK row does, and nothing is there to overwrite.
+                # A spent bundle is refused: the clear below would lift an
+                # accurate quarantine. It falls to the skip; --force overrides.
                 outcome = "replaced"
             else:
+                # `--force` is the documented escape, but for a SPENT bundle
+                # it stores bytes that mint nothing and lifts an accurate
+                # quarantine. Say which half is stale, or the skip sends the
+                # user straight back into the defect the guard above refused.
+                expired_note = (
+                    " — its own refresh token has expired, so --force would "
+                    "store a credential that mints nothing; re-export where "
+                    "that account is still logged in"
+                    if refresh_token_spent(entry["creds_text"]) else ""
+                )
                 _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
+                    f"Skipped {entry['email']} (already exists, use "
+                    f"--force){expired_note}"
                 )
                 skipped += 1
                 # Even when skipped, the envelope's active account exists
@@ -558,7 +575,14 @@ def import_accounts(
             "uuid": entry["uuid"],
             "organizationUuid": entry["org_uuid"],
             "organizationName": entry["org_name"],
-            "added": entry["added"],
+            # WHEN THIS ROSTER GAINED THE ACCOUNT, not when the source
+            # machine did. The bundle's stamp is a fact about the export,
+            # and copying it makes the roster claim a credential this
+            # import just replaced has been in place since then -- which
+            # is what the auto-switch release reads to tell a recovery
+            # from an unchanged slot. `clear_dead_token` above lifts the
+            # usage-store quarantine for the same reason.
+            "added": get_timestamp(),
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"

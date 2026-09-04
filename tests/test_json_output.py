@@ -667,3 +667,26 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+def test_the_relogin_remedy_names_the_switch_step():
+    """`cswap add` CAPTURES THE ACTIVE CREDENTIAL, so it refuses unless the
+    quarantined slot is the active one — it compares the live credential's
+    resolved owner against the slot named. A slot is normally quarantined
+    while some OTHER account is active, which is exactly when the remedy as
+    written cannot run: the user logs in, runs `cswap add`, and is told the
+    stored credential belongs to another account.
+
+    Its sibling `USAGE_NO_CREDENTIALS` has always named the switch first.
+    This one did not, and that missing word is the whole difference between a
+    remedy and a loop."""
+    from claude_swap.switcher import SENTINEL_NOTES
+    from claude_swap.json_output import (
+        USAGE_NO_CREDENTIALS,
+        USAGE_RELOGIN_REQUIRED,
+    )
+    relogin = SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "switch" in relogin.lower(), relogin
+    # THE CONTROL: the sibling already does this, so the assertion above is
+    # not merely describing whatever text happens to be there.
+    assert "switch" in SENTINEL_NOTES[USAGE_NO_CREDENTIALS].lower()

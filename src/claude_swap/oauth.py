@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -59,13 +60,34 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
-def is_oauth_token_expired(expires_at: object) -> bool:
+def is_oauth_token_expired(expires_at: object, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or (
+        isinstance(expires_at, float) and not math.isfinite(expires_at)
+    ):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+    return now_ms + buffer_ms >= int(expires_at)
+
+
+def refresh_token_spent(credentials: str, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
+    """Has this credential's own refresh token expired?
+
+    Unknown is not expired — no field, a non-numeric one, JSON carrying no
+    ``claudeAiOauth``, and non-JSON all answer False. The one predicate for
+    "these bytes can mint nothing", so no caller can disagree about a
+    credential.
+
+    It RAISES on JSON that is not an object (``AttributeError``) and on
+    ``None`` (``TypeError``), both out of ``extract_oauth_data``, so a caller
+    that cannot afford a raise must sit behind one that already parsed these
+    bytes.
+    """
+    return is_oauth_token_expired(
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt"),
+        buffer_ms=buffer_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -561,6 +583,41 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def binding_window_label(
+    usage: dict | None, models: Sequence[str] = ()
+) -> str | None:
+    """Label of the window this account is closest to hitting, or ``None``.
+
+    The companion to :func:`account_headroom`, which returns the binding
+    window's headroom and throws away WHICH window it was. An escape needs the
+    label: a 5-hour limit and a weekly limit want different targets, and a
+    ranking that cannot tell them apart optimises the wrong axis for one of
+    them.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: w[1])[0]
+
+
+def headroom_on_window(
+    usage: dict | None, label: str, models: Sequence[str] = ()
+) -> float | None:
+    """Headroom on ONE named window, or ``None`` when it is not reported.
+
+    Deliberately NOT a floor on the others, and NOT a usability test: a high
+    number here says only that one window is clear. An account can score 50
+    on it and hold a single point overall. Callers must therefore rank with
+    it and decide usability with :func:`account_headroom` — the engine's
+    escape key tiers on that first, because ordering by this number alone
+    lands on an account that stops answering on the next request.
+    """
+    for name, pct, _ in relevant_windows(usage, models):
+        if name == label:
+            return 100.0 - pct
+    return None
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.
@@ -633,6 +690,20 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
+        # A grant already past its own expiry (not just inside the refresh
+        # buffer) cannot be revived by a POST — the server will only say
+        # invalid_grant. Skip straight to that outcome.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "request made. Reporting invalid_grant without a POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
@@ -688,6 +759,19 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _log_usage_failure(context, e, kind)
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "retry request made. Reporting invalid_grant without a "
+                "POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
