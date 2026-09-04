@@ -539,17 +539,38 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     """Epoch of an account's 7-day (weekly) window reset, or None if unknown
     or already past.
 
-    The consume-first strategy ranks by this — the weekly window is the
-    perishable quota (the 5-hour one recycles too fast to be worth planning
-    around). A stale snapshot can carry a ``resets_at`` that has since
-    elapsed; treated as a real instant it would sort the *just-rolled-over*
-    account (the least perishable quota of all) as "soonest", so past ==
-    unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
-    tolerance, not ranking input — padding here would turn a genuinely
-    imminent reset into a false reset-unknown hold.
+    The consume-first strategy ranks by this FIRST — the weekly window is the
+    perishable quota that is actually lost forever at reset, so among
+    qualifying candidates the one whose week dies soonest is drained first
+    (``_five_hour_reset_ts`` below breaks a tie on this axis, since two
+    accounts can share a weekly rollover while their 5-hour windows do not).
+    A stale snapshot can carry a ``resets_at`` that has since elapsed; treated
+    as a real instant it would sort the *just-rolled-over* account (the least
+    perishable quota of all) as "soonest", so past == unknown. Plain
+    ``ts <= now``: RESET_SLACK_S is poll-scheduling lag tolerance, not ranking
+    input — padding here would turn a genuinely imminent reset into a false
+    reset-unknown hold.
     """
     if isinstance(usage, dict):
         window = usage.get("seven_day")
+        if isinstance(window, dict):
+            ts = _parse_reset_ts(window.get("resets_at"))
+            if ts is not None and ts > now:
+                return ts
+    return None
+
+
+def _five_hour_reset_ts(usage: dict | str | None, now: float) -> float | None:
+    """Epoch of an account's 5-hour window reset, or None if unknown or
+    already past. Same past-is-unknown reasoning as ``_seven_day_reset_ts``.
+
+    Consume-first's SECOND ranking axis: it recycles too fast to plan a move
+    around on its own, but when two candidates tie on the weekly reset (the
+    common case for accounts added around the same time) it still separates
+    them meaningfully, rather than falling straight through to headroom.
+    """
+    if isinstance(usage, dict):
+        window = usage.get("five_hour")
         if isinstance(window, dict):
             ts = _parse_reset_ts(window.get("resets_at"))
             if ts is not None and ts > now:
@@ -1773,8 +1794,14 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
+        # consume-first ranks a qualifying candidate by soonest weekly reset,
+        # then soonest 5-hour reset, then most-used (see the key built below);
+        # a proactive (below-threshold) target must reset strictly sooner
+        # than where we are. That whole ranking is scoped to the "proactive"/
+        # "consume-first" triggers only — an "at-limit"/"failover" escape
+        # always ranks by headroom instead, regardless of strategy, so it
+        # lands on an account that can actually work rather than the one
+        # nearest its own limit.
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
@@ -1837,6 +1864,9 @@ class AutoSwitchEngine:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+            )
+            five_hour_ts = (
+                _five_hour_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
@@ -1901,10 +1931,26 @@ class AutoSwitchEngine:
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
                     # any healthy account qualifies and the sort picks soonest).
+                    #
+                    # A sooner reset alone is not enough — the candidate must
+                    # also have real headroom left, or the switch is a pure
+                    # loss: it lands on an account already at or below
+                    # SPENT_HEADROOM_PCT (the same "an edge is under two poll
+                    # intervals" floor the all_above tier above uses for the
+                    # identical concept), which resets soonest precisely
+                    # BECAUSE it's already nearly drained. Measured: switching
+                    # onto a peer sitting at 3 pts headroom cost a real
+                    # mid-session credential swap to salvage three points that
+                    # were gone again within the next half hour anyway, then
+                    # forced a SECOND disruptive swap back. Staying on a
+                    # healthy active account and letting a stranded peer's
+                    # sliver of quota expire unused is strictly better than
+                    # paying two switches to "save" it.
                     if trigger == "consume-first" and (
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
+                        or h <= SPENT_HEADROOM_PCT
                     ):
                         continue
                 elif active_headroom is not None:
@@ -1938,10 +1984,28 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif consume_first and trigger in ("proactive", "consume-first"):
+                # Soonest weekly reset first (unknown resets sort last), then
+                # soonest 5-hour reset breaks a weekly tie, then — the
+                # opposite of `best`'s ``-h`` below — the MORE-used account
+                # wins any remaining tie: two accounts perishing at the same
+                # moment are equally worth spending, so draining the one
+                # closer to its limit first finishes it off instead of
+                # leaving it half-drained next to a fresher peer, then
+                # sequence order.
+                #
+                # Scoped to the SAME triggers as the ``all_above`` key above,
+                # for the same reason (#305): `consume_first` is the
+                # STRATEGY setting, not the trigger, so an unscoped elif here
+                # would also catch "at-limit"/"failover" escapes and rank
+                # them by reset instead of headroom — landing the escape on
+                # whichever account is closest to ALSO being out of quota
+                # instead of the one that can actually do work.
+                key = (
+                    reset_ts if reset_ts is not None else float("inf"),
+                    five_hour_ts if five_hour_ts is not None else float("inf"),
+                    h,
+                )
             else:
                 key = (-h,)
             qualifying.append((key, num))
