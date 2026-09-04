@@ -8,8 +8,9 @@ human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
 Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
+higher of its 5h/7d utilization) crosses that account's **effective
+threshold** — its own per-account override where one is set, otherwise
+``settings.threshold`` — switch to the candidate with the most headroom — proactively, so the old account is
 still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 ``hysteresis_pct`` below the threshold so two accounts hovering at the line
@@ -36,7 +37,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.models import ORDER_UNSET_RANK
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -363,6 +365,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    #                | "failback" — a backup account handing back to a primary
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -393,6 +396,23 @@ class SwitchEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class NoSwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "no-switch"
+    # Enumerated for the same reason `SwitchEvent.trigger` above carries its
+    # own list: `reason` is what the TUI and `--json` consumers switch on, so
+    # an undocumented value is invisible to the next person extending this
+    # event.
+    #
+    #   active-account census:
+    #     "no-active-account" | "unmanaged-active-account" | "active-api-key"
+    #     | "active-idle" | "active-usage-unknown"
+    #   departure gate:
+    #     "below-threshold" | "cooldown" | "reset-unknown"
+    #   candidate census:
+    #     "no-candidates" | "no-comparison" | "no-qualifying-candidate"
+    #     | "no-viable-target" | "already-active" | "stale-usage"
+    #   strategy holds:
+    #     "already-consuming-soonest"
+    #     | "failback-hold" — a backup account is active and no primary has
+    #       recovered yet; detail "primaries still exhausted"
     reason: str
     detail: str = ""
 
@@ -591,11 +611,50 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
+class ThresholdMap(dict):
+    """Effective switch threshold per account number — total by construction.
+
+    Every account with a per-account override maps to that override; every
+    other account, including one that is not in the fleet at all, reads the
+    global ``autoswitch.threshold``. Totality lives here rather than at each
+    of the ten call sites: they subscript directly (``thresholds[num]``), and
+    a ``.get(num, default)`` convention would be one forgotten default away
+    from a ``KeyError`` mid-tick, in a code path that runs unattended.
+    """
+
+    def __init__(self, overrides: Mapping[str, float], default: float) -> None:
+        super().__init__(overrides)
+        self.default = default
+
+    def __missing__(self, key: str) -> float:
+        return self.default
+
+
+class OrderMap(dict):
+    """Chain rank per account number - total by construction.
+
+    Mirrors :class:`ThresholdMap` for the same reason: ranking subscripts it
+    directly while building sort keys, so a partial map would raise mid-tick
+    in an unattended loop. An account with no ``order`` pin reads
+    ``ORDER_UNSET_RANK``, which is ``ACCOUNT_ORDER_MAX + 1`` and therefore
+    sorts *after* every legal rank - the sentinel must not be
+    ``ACCOUNT_ORDER_MIN``, or an unpinned fleet would outrank every pin and
+    the feature would be inverted.
+
+    ``__missing__`` deliberately does not memoise: the map is rebuilt per tick
+    and a caching sentinel would make it grow with every key ever asked for.
+    """
+
+    def __missing__(self, key: str) -> int:
+        return ORDER_UNSET_RANK
+
+
 def _every_account_above_threshold(
     candidates: Sequence[str],
     headroom: dict[str, float | None],
     active_headroom: float | None,
-    threshold: float,
+    thresholds: Mapping[str, float],
+    current: str,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold — the state where "land somewhere healthy" has no answer.
@@ -606,12 +665,18 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None or (100.0 - active_headroom) < thresholds[current]:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    # Each candidate is compared against ITS OWN line, so a fleet is only
+    # "all above" when no account has room under the rule it is actually
+    # governed by. One account with a higher line still sitting under it is a
+    # real landing spot, and the all-above regime must not swallow it.
+    measured = [
+        (n, headroom.get(n)) for n in candidates if headroom.get(n) is not None
+    ]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all((100.0 - h) >= thresholds[n] for n, h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -659,7 +724,12 @@ class AutoSwitchEngine:
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        # The fleet MINIMUM, not the global: poll_policy's urgent mode fires
+        # at `new_pct >= threshold - 15`, so the lowest line in the fleet is
+        # the one that decides when collection must already be tight. Taking
+        # the minimum can only make collection earlier, never lazier — the
+        # safe direction when accounts disagree about where their line is.
+        switcher.set_poll_policy_inputs(self._min_effective_threshold(), self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -889,6 +959,93 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
 
+    def _resolve_thresholds(
+        self, settings: AutoSwitchSettings | None = None
+    ) -> ThresholdMap:
+        """The effective threshold for every account, resolved once per tick.
+
+        Resolution is ``policy(n).threshold if set else settings.threshold``.
+        The result is passed DOWN as a parameter rather than looked up where
+        it is needed: ``_rank_candidates`` is documented pure and runs twice
+        per tick under the consume-first two-phase commit, so a store read
+        inside it could decide phase 1 and phase 2 on different lines.
+
+        The ``settings`` argument exists so a tick resolves against the same
+        snapshot it gates with, even if ``apply_threshold()`` lands mid-tick.
+        """
+        effective = settings or self.settings
+        return ThresholdMap(
+            {
+                num: policy.threshold
+                for num, policy in self.switcher.account_policies().items()
+                if policy.threshold is not None
+            },
+            effective.threshold,
+        )
+
+    def _resolve_orders(self) -> OrderMap:
+        """Every pinned account's chain rank, resolved once per tick.
+
+        Threaded DOWN into ``_rank_candidates`` as a parameter for the same
+        reason thresholds are: ranking is documented pure and runs twice per
+        tick under the consume-first two-phase commit, so a store read inside
+        it could rank phase 1 and phase 2 against different pins.
+
+        Unlike thresholds there is no global default to fall back to - "no
+        pin" is its own tier - so the map carries only the accounts that set
+        one and ``OrderMap.__missing__`` supplies the sentinel for the rest.
+        """
+        return OrderMap(self.switcher.account_orders())
+
+    def _min_effective_threshold(
+        self, thresholds: ThresholdMap | None = None
+    ) -> float:
+        """The lowest effective threshold across switchable accounts.
+
+        Used only for poll cadence (``set_poll_policy_inputs``), never for a
+        switch decision — cadence is fleet-wide, so it has to be tight enough
+        for whichever account crosses its own line first. With no overrides
+        this is exactly ``settings.threshold``.
+
+        ``thresholds`` lets a tick reuse the map it already resolved, so the
+        cadence it pins and the lines it gates on come from one store read of
+        one snapshot. Callers outside a tick (construction, ``apply_threshold``)
+        omit it and resolve their own.
+        """
+        thresholds = thresholds if thresholds is not None else self._resolve_thresholds()
+        values = [
+            thresholds[num]
+            for num in self.switcher.switchable_account_numbers()
+        ]
+        return min(values) if values else self.settings.threshold
+
+    def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
+        """Re-pin poll cadence from this tick's threshold map.
+
+        ``set_poll_policy_inputs`` used to be called in exactly two places,
+        ``__init__`` and ``apply_threshold()``. Neither is on the path a
+        *persisted* policy write takes: ``cswap threshold 1 50`` runs in a
+        separate process from ``cswap auto``, so a running engine re-read the
+        new line for its DECISION every tick (``_resolve_thresholds``) while
+        its CADENCE stayed pinned to the minimum as it stood at boot.
+
+        That inverts AC-20's rationale. The minimum is chosen because
+        ``poll_policy``'s urgent mode fires at ``new_pct >= threshold - 15``,
+        so the fleet minimum can only make collection *earlier* — never
+        lazier, and no crossing is missed. A stale 90 against a live 50 goes
+        urgent at 75% instead of 35%, which is lazier in exactly the direction
+        the rationale rules out, on every tick until the process restarts.
+
+        Called before ``_collect_scheduled_usage`` so the tick that discovers
+        the change also plans on it. The pin itself is a bare attribute write
+        (``switcher.py:1800``); the only added per-tick cost is one
+        ``switchable_account_numbers()`` read, which ``_tick_inner`` already
+        performs for candidate construction.
+        """
+        self.switcher.set_poll_policy_inputs(
+            self._min_effective_threshold(thresholds), self._models
+        )
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -934,14 +1091,32 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        # One resolution per tick, threaded down as a parameter from here on.
+        # Every gate below reads `thresholds[...]`; the map is total, so an
+        # account absent from it (never sequenced, just removed) reads the
+        # global rather than raising mid-tick.
+        thresholds = self._resolve_thresholds(settings)
+        # Same discipline, one resolution per tick: `_rank_candidates` runs
+        # twice under the consume-first two-phase commit and once more per
+        # backup pass, and all of them must rank against the same pins.
+        # Deliberately NOT passed to `_refresh_poll_policy_inputs` below:
+        # cadence is threshold-driven, and a pin says where to go, never how
+        # often to look.
+        orders = self._resolve_orders()
+        # Cadence follows the same snapshot, and does so BEFORE collection is
+        # planned below — see `_refresh_poll_policy_inputs`.
+        self._refresh_poll_policy_inputs(thresholds)
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=thresholds[current]
         )
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
-                threshold=settings.threshold,
+                # The active account's own line: the number the CLI and TUI
+                # render as "the threshold" must be the one the departure
+                # gate below actually used, or the UI contradicts the engine.
+                threshold=thresholds[current],
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -977,8 +1152,29 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+            if utilization < thresholds[current]:
+                if self._failback_available(current, quarantined):
+                    # A backup ("last man standing") account is only supposed
+                    # to carry the fleet while nothing else can. It was taken
+                    # BECAUSE every primary was out, so waiting for it to
+                    # cross its own threshold before handing back is the
+                    # wrong test entirely — the reserve may sit at 20% for a
+                    # week while a primary's window rolls over on the hour.
+                    #
+                    # The predicate is deliberately store-only (backup flag,
+                    # disabled, kind, quarantine) so it is decidable HERE,
+                    # before any usage ranking: it answers "should we be
+                    # looking to leave?", never "where should we go?". The
+                    # OAuth clause is load-bearing — a fleet whose only peer
+                    # is an API-key account must keep today's quiet hold
+                    # rather than fall through to a `no-candidates` BLOCKED.
+                    #
+                    # Fall through; never switch from inside the gate. Every
+                    # landing gate, cooldown and freshness check downstream
+                    # still applies, and if none of them yields a target the
+                    # tick holds exactly as it does today.
+                    trigger = "failback"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -986,16 +1182,18 @@ class AutoSwitchEngine:
                             # display an impossible "100% < 99.9%".
                             detail=(
                                 f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(thresholds[current])}%"
                             ),
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account with
+                    # room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,7 +1244,10 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if (
+            trigger in ("proactive", "consume-first", "failback")
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1059,6 +1260,12 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        # `oauth_candidates` keeps its FULL-SET meaning on purpose: the
+        # "everything is exhausted" census below is a statement about the
+        # whole fleet, and a reserve holding quota means the fleet is not
+        # exhausted. The reserve is filtered out of the *ranking* instead —
+        # inside `_rank`, so both consume-first commit phases inherit it.
+        backups = set(self.switcher.backup_account_numbers())
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1086,7 +1293,7 @@ class AutoSwitchEngine:
                     reason="below-threshold",
                     detail=(
                         f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(thresholds[current])}%"
                     ),
                 )
             )
@@ -1148,30 +1355,53 @@ class AutoSwitchEngine:
             # values. Computed once, the bar answered from a snapshot the
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
-            recovered = self._left_account_recovered(
-                state,
-                kw["usage"],
-                kw["headroom"],
-                kw["active_headroom"],
-                kw["settings"],
-                kw["now"],
-                kw["current"],
-            )
-            no_return = self._no_return_account(
-                trigger,
-                state,
-                kw["headroom"],
-                kw["active_headroom"],
-                recovered,
-                kw["settings"],
-                kw["current"],
-            )
-            ranked = self._rank_candidates(no_return=no_return, **kw)
-            if no_return is not None and not ranked[0] and recovered:
-                unbarred = self._rank_candidates(no_return=None, **kw)
-                if unbarred[0]:
-                    return unbarred
-            return ranked
+            def _one_pass(pool):
+                pass_kw = {**kw, "oauth_candidates": pool}
+                recovered = self._left_account_recovered(
+                    state,
+                    pass_kw["usage"],
+                    pass_kw["headroom"],
+                    pass_kw["active_headroom"],
+                    pass_kw["settings"],
+                    pass_kw["now"],
+                    pass_kw["current"],
+                    thresholds=pass_kw["thresholds"],
+                )
+                no_return = self._no_return_account(
+                    trigger,
+                    state,
+                    pass_kw["headroom"],
+                    pass_kw["active_headroom"],
+                    recovered,
+                    pass_kw["settings"],
+                    pass_kw["current"],
+                    thresholds=pass_kw["thresholds"],
+                )
+                ranked = self._rank_candidates(no_return=no_return, **pass_kw)
+                if no_return is not None and not ranked[0] and recovered:
+                    unbarred = self._rank_candidates(no_return=None, **pass_kw)
+                    if unbarred[0]:
+                        return unbarred
+                return ranked
+
+            # Pass 1 over the primaries only. A reserve must lose to a WORSE
+            # primary, so this cannot be a sort key — an `order: 999` tie-break
+            # still promotes the reserve the moment it holds more headroom,
+            # which is precisely when it looks most attractive and is most
+            # wrong. Two passes make the exclusion absolute, and `all_above`
+            # (computed inside `_rank_candidates` from the pool it is given)
+            # correctly ignores the reserve's untouched quota.
+            #
+            # Pass 2 restores the reserve when the primaries yield nothing —
+            # the "last man standing" contract. It is skipped entirely when no
+            # account is marked backup, so an unconfigured fleet ranks exactly
+            # once, on exactly today's list.
+            primaries = [n for n in kw["oauth_candidates"] if n not in backups]
+            if len(primaries) != len(kw["oauth_candidates"]):
+                first = _one_pass(primaries)
+                if first[0]:
+                    return first
+            return _one_pass(kw["oauth_candidates"])
 
         decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
@@ -1184,9 +1414,11 @@ class AutoSwitchEngine:
             active_headroom=active_headroom,
             settings=settings,
             now=decided_now,
+            thresholds=thresholds,
+            orders=orders,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "failback") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1215,15 +1447,101 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=decided_now,
+                thresholds=thresholds,
+                orders=orders,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if trigger == "consume-first" and current not in backups and ordered:
+            # The active account is a non-backup too — and it is the ONE
+            # non-backup `_rank`'s pass 1 can never see, because the candidate
+            # list is built with `num != current`. On a fleet whose only other
+            # OAuth account is the reserve, pass 1 therefore ranks an empty
+            # pool, falls through to pass 2, and burns the reserve while a
+            # perfectly healthy primary is active — the exact inverse of the
+            # "only used once all the others are at their limit" contract, and
+            # a fleet that then ping-pongs back on the next `failback` tick.
+            #
+            # Scoped to `consume-first` because that is the only trigger that
+            # departs a still-usable account: under `proactive`/`at-limit`/
+            # `failover` the active primary is by definition NOT usable, which
+            # is precisely when promoting the reserve is right. `current not in
+            # backups` excludes `failback`, whose active account IS the reserve.
+            #
+            # Applied HERE rather than inside `_rank` on purpose. The reserve's
+            # provisional rank is what arms the two-phase commit's forced
+            # refetch, and that refetch is how a spent primary is discovered to
+            # have recovered (AC-29). Filtering earlier would suppress the
+            # escalation and lose a legitimate primary→primary move; filtering
+            # after phase 2 keeps the escalation and rejects only the commit.
+            #
+            # `any_known` is deliberately left as `_rank` reported it: a
+            # `backups` entry in `ordered` can only have come from the
+            # full-pool pass, so the census still sees the reserve and the
+            # empty list below lands on the quiet `already-consuming-soonest`
+            # hold rather than a `no-comparison` BLOCK.
+            ordered = [num for num in ordered if num not in backups]
+
+        def _failback_hold() -> TickOutcome:
+            """The failback tick found nowhere better; hold exactly as today.
+
+            Every one of these ticks returns `NO_ACTION` on unmodified source,
+            because the departure gate stops at `below-threshold` before any
+            ranking happens. The whole contract of this trigger is that a
+            fleet which merely *configures* a reserve never starts seeing
+            `BLOCKED` or `ERROR` where it used to see a quiet hold, and that is
+            still true: only the reason STRING changes here.
+
+            PR 1 held that string back on purpose and named PR 2 as its owner.
+            It borrowed the departure gate's `below-threshold` event verbatim,
+            which is a true statement about the active account and a useless
+            one about the tick: on a failback tick the active account IS the
+            reserve, and a reserve sitting under its own line is the normal
+            state rather than a reason. `failback-hold` says the one thing an
+            operator reading a stuck fleet needs — the primaries have not come
+            back yet.
+
+            Both hold sites call this closure, so the wording lives here once.
+            """
+            self._emit(
+                NoSwitchEvent(
+                    reason="failback-hold",
+                    detail="primaries still exhausted",
+                )
+            )
+            return TickOutcome.NO_ACTION
+
+        if not ordered and api_key_candidates and trigger not in (
+            "consume-first",
+            "failback",
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+            # Never for a failback either: the reserve is quiet by definition,
+            # so there is nothing to escape and metered credit is the most
+            # expensive thing in the fleet. The same two-pass filter applies
+            # here, so a reserve that happens to be an API-key account is the
+            # last thing reached rather than the first.
+            # Here order really is a list pre-sort. Metered API-key accounts
+            # have no measurable headroom and no weekly window, so there is no
+            # strategy key to prepend a tier to - the list itself is the
+            # ranking. `sorted` is stable, so an unpinned fleet keeps today's
+            # sequence order exactly. Each pass is sorted separately so the
+            # two-pass reserve filter still wins: a pinned API-key reserve is
+            # ordered among the reserves, never promoted past a primary.
+            def _by_rank(pool: list[str]) -> list[str]:
+                return sorted(pool, key=lambda n: orders[n])
+
+            primary_api_keys = [n for n in api_key_candidates if n not in backups]
+            ordered = _by_rank(primary_api_keys) or _by_rank(api_key_candidates)
 
         if not ordered:
+            if trigger == "failback":
+                # ABOVE `if not any_known:` deliberately. The predicate is
+                # store-only, so it fires even when no primary has readable
+                # usage this tick — and that tick returns a quiet NO_ACTION
+                # today, not `no-comparison`/BLOCKED.
+                return _failback_hold()
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1313,7 +1631,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "failback"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1368,6 +1686,15 @@ class AutoSwitchEngine:
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
+        if trigger == "failback":
+            # AFTER the loop, never in place of it: the `identity-conflict`
+            # and `invalid_grant` quarantines written above are durable
+            # findings about a credential and are correct regardless of why
+            # the engine was looking. An early return would silently drop
+            # them. Only the terminal outcome changes — and on the error leg
+            # no `ErrorEvent` is emitted, because today's tick emits none and
+            # "indistinguishable from today" is the contract.
+            return _failback_hold()
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
@@ -1381,6 +1708,33 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _failback_available(self, current: str, quarantined: set[str]) -> bool:
+        """Is the active account a reserve with a usable primary to hand back to?
+
+        Store-only by design — backup flag, disabled, kind, quarantine — so it
+        is decidable at the departure gate, before any usage is ranked. It
+        answers "should we be looking to leave?"; the ranking answers "where
+        to?", and every landing gate downstream still applies.
+
+        The OAuth clause is load-bearing rather than tidy. Without it, a fleet
+        whose only non-backup peer is an API-key account classifies as
+        `failback`, both candidate lists come back empty, and the tick reaches
+        the generic `no-candidates` exit and returns BLOCKED — where today it
+        returns a quiet NO_ACTION. `include_api_key_accounts` widens the
+        candidate list, never this predicate: metered credit is not somewhere
+        a quiet reserve should hand back to.
+        """
+        backups = set(self.switcher.backup_account_numbers())
+        if current not in backups:
+            return False
+        return any(
+            num != current
+            and num not in backups
+            and num not in quarantined
+            and self.switcher.account_kind_for(num) != "api_key"
+            for num in self.switcher.switchable_account_numbers()
+        )
+
     def _no_return_account(
         self,
         trigger: str,
@@ -1390,6 +1744,12 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        *,
+        # Optional so a caller with no per-account context (and every
+        # pre-existing test that exercises this helper directly) keeps
+        # today's exact semantics: one global line for every account. The
+        # engine's own tick always passes the resolved map explicitly.
+        thresholds: Mapping[str, float] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1466,6 +1826,8 @@ class AutoSwitchEngine:
         ranking cannot answer: is this a different account from the one we
         left, or only a different active?
         """
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
             return None
@@ -1491,10 +1853,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
                     return None               # beats us outright; not a flip
-            elif (
-                settings is not None
-                and left_headroom > 100.0 - settings.threshold
-            ):
+            elif left_headroom > 100.0 - thresholds[barred]:
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
                 # `_left_account_recovered` uses when it, too, has no active
@@ -1511,6 +1870,12 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         current: str | None = None,
+        *,
+        # Optional so a caller with no per-account context (and every
+        # pre-existing test that exercises this helper directly) keeps
+        # today's exact semantics: one global line for every account. The
+        # engine's own tick always passes the resolved map explicitly.
+        thresholds: Mapping[str, float] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -1537,7 +1902,7 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: `h > 100 - settings.threshold`, the same "would the ranking
+        to land: `h > 100 - thresholds[peer]`, the same "would the ranking
         accept this as a landing spot" test `_rank_candidates` already runs
         (`:1617`) on every candidate, reused rather than inventing a fresh
         constant; and (2), when the landing floor cannot answer, whether the
@@ -1552,7 +1917,8 @@ class AutoSwitchEngine:
         floor should land on: sweeping mutations of this same leg for the
         ordinary path showed an absolute floor is silently reintroducible
         with a green suite, so this is not free of that risk either — the
-        difference is this constant is `settings.threshold`, not a
+        difference is this constant is the peer's own effective threshold
+        (its per-account override, else `settings.threshold`), not a
         hardcoded number, so a
         user's OWN policy decides how conservative the hold is, and it moves
         when they change it (pinned directly, below). Deliberately MORE
@@ -1609,6 +1975,8 @@ class AutoSwitchEngine:
         escapes the account untouched, and the next successful switch
         overwrites the snapshot outright.
         """
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
             # Unreachable through `_no_return_account`, the only caller: it
@@ -1651,7 +2019,7 @@ class AutoSwitchEngine:
             # that proved it. Two legs, both read-only against CURRENT state
             # (no departure baseline exists to diff against):
             #
-            #   landing   `h > 100 - settings.threshold` -- would the
+            #   landing   `h > 100 - thresholds[peer]` -- would the
             #             ranking accept this peer as a landing spot right
             #             now (`_rank_candidates`, :1636)?
             #   recovery  the peer's binding reset is meaningfully sooner
@@ -1669,7 +2037,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if h is not None and h > 100.0 - thresholds[barred]:
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -1735,7 +2103,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif h > 100.0 - thresholds[barred]:
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1765,6 +2133,16 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        # See `_no_return_account`: optional, defaulting to the global line
+        # for every account, so a caller without per-account context behaves
+        # exactly as this function did before per-account thresholds existed.
+        thresholds: Mapping[str, float] | None = None,
+        # Chain ranks, same contract as `thresholds`: optional, and absent it
+        # behaves exactly as this function did before per-account order
+        # existed. `OrderMap()` (empty) maps every account to the sentinel, so
+        # every key gains an identical leading element and the sort is
+        # unchanged - identity by construction, not by luck.
+        orders: Mapping[str, int] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1773,6 +2151,8 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -1791,7 +2171,7 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, headroom, active_headroom, thresholds, current
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1823,6 +2203,13 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        # Total by construction, so the key builders below can subscript it
+        # unguarded. An absent `orders` yields the sentinel for EVERY account,
+        # which is a constant leading element and therefore no reordering.
+        rank: Mapping[str, int] = (
+            orders if orders is not None else OrderMap()
+        )
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -1843,14 +2230,23 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "failback"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                #
+                # `all_above` relaxes the gate so a fleet with nothing below
+                # the line still rotates instead of freezing. Failback must
+                # NOT borrow that: the reserve is quiet, so "everyone is over
+                # their line" is a reason to stay, not to move. Note the
+                # phase-2 refetch can flip `all_above` to True on a failback
+                # tick, so this is a live interaction, not a theoretical one.
+                if (100.0 - h) >= thresholds[num] and (
+                    not all_above or trigger == "failback"
+                ):
                     continue
-                if all_above:
+                if all_above and trigger != "failback":
                     # Checked before the strategies, because with nothing below
                     # the threshold the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
@@ -1894,7 +2290,15 @@ class AutoSwitchEngine:
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
-                                fallback.append(((0, recovery_ts, -h), num))
+                                # Tiered like `qualifying` below, and for a
+                                # reason that is easy to miss: the two lists
+                                # are SELECTED between (`qualifying or
+                                # fallback`), never merged, so a tier applied
+                                # to only one of them silently drops order on
+                                # every tick that takes the other path.
+                                fallback.append(
+                                    ((rank[num], 0, recovery_ts, -h), num)
+                                )
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1911,7 +2315,18 @@ class AutoSwitchEngine:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    #
+                    # Not for failback. That bar compares the reserve against
+                    # the primary on headroom, and the reserve almost always
+                    # wins it — it has been idle. Applying it would make the
+                    # trigger inert in the exact fleet it exists for. The
+                    # anti-flap property is supplied instead by the landing
+                    # gate above (the primary must be under its OWN line) plus
+                    # the no-return bar on the following tick.
+                    if (
+                        h - active_headroom < settings.hysteresis_pct
+                        and trigger != "failback"
+                    ):
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -1944,7 +2359,12 @@ class AutoSwitchEngine:
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
-            qualifying.append((key, num))
+            # Order is a PRIMARY selector, not a tie-break: it is prepended to
+            # the strategy key rather than appended to it. Appended, it would
+            # decide only exact ties, and neither strategy key ties in practice
+            # (headroom and reset timestamps are floats), so the feature would
+            # be inert. Within a tier the strategy still decides everything.
+            qualifying.append(((rank[num], *key), num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
@@ -2124,7 +2544,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in (
+                "proactive",
+                "consume-first",
+                "failback",
+            ) and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2281,7 +2705,11 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        # Recomputed, not passed through: a per-account override may still be
+        # lower than the new session global, and cadence follows the minimum.
+        self.switcher.set_poll_policy_inputs(
+            self._min_effective_threshold(), self._models
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
