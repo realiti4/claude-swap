@@ -951,6 +951,36 @@ class CredentialStore:
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
 
+    def _warn_if_oauth_missing_expires_at(self, credentials: str) -> None:
+        """Log (never raise) if the OAuth payload about to reach the Keychain is
+        missing ``claudeAiOauth.expiresAt``.
+
+        ``macos_keychain.set_password`` hex-round-trips ``credentials`` byte for
+        byte — it cannot itself drop a field. This is a pass-through sanity check
+        one layer up: an ``expiresAt``-less credential has been observed reaching
+        the active Keychain item while the ``.credentials.json`` file copy was
+        valid, meaning whatever upstream call built ``working``/``rollback_creds``
+        for this write occasionally supplies a stale or partial lineage. Surfacing
+        that here, at the single choke point every OAuth write passes through,
+        beats tracing every producer — and a missing ``expiresAt`` makes Claude
+        Code treat a token as already-expired (``is_oauth_token_expired`` prefers
+        expired-on-error), which reads exactly like the "session expired" reports
+        this was written to explain. Best-effort: a malformed (non-JSON) payload
+        is `CredentialWriteError`'s problem, not this check's — swallow and move
+        on rather than blocking the write over a diagnostic.
+        """
+        try:
+            data = json.loads(credentials)
+            oauth = data.get("claudeAiOauth") or {}
+            if not oauth.get("expiresAt"):
+                self._host._logger.warning(
+                    "OAuth credential about to be written to the Keychain has no "
+                    "claudeAiOauth.expiresAt — Claude Code will likely treat it as "
+                    "already expired. Writing anyway (never silently dropped)."
+                )
+        except Exception:
+            pass
+
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 
@@ -972,6 +1002,7 @@ class CredentialStore:
             CredentialWriteError: If writing credentials fails.
         """
         if self._use_keychain():
+            self._warn_if_oauth_missing_expires_at(credentials)
             try:
                 self._kc_call(
                     macos_keychain.set_password,

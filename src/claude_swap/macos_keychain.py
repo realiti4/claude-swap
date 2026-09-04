@@ -36,6 +36,7 @@ its functions are only meaningful on macOS.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -58,6 +59,60 @@ _TIMEOUT = 5.0
 # PATH must not be able to intercept secrets. ``/usr/bin/security`` is present on
 # every macOS.
 _SECURITY = "/usr/bin/security"
+
+# Fallback if ``claude`` is not on PATH at write time (e.g. a launchd/cron job
+# with a stripped PATH) — the standalone-CLI install location, matching most
+# hosts' actual layout. ``_trusted_app_paths`` tries ``PATH`` first.
+_CLAUDE_FALLBACK_PATH = os.path.expanduser("~/.local/bin/claude")
+
+
+def _trusted_app_paths() -> list[str]:
+    """Applications to grant no-prompt access to every Keychain item this module
+    writes, via ``security add-generic-password -T``.
+
+    Why this exists: ``set_password`` uses ``-U`` (update-or-create). Per
+    ``security``'s own semantics, omitting ``-T`` on a write does NOT mean "leave
+    the existing ACL alone" — it means "trust only the process performing this
+    write" (``/usr/bin/security`` itself here). That's fine for *this* module's
+    own reads (see the module docstring: creator == reader == ``security``), but
+    Claude Code reads the same "Claude Code-credentials" item **in-process** via
+    its own Security.framework call, a different, untrusted app. Every ``cswap``
+    rotation was silently re-pinning the ACL to "security only," so Claude Code's
+    next read had to fall back to a GUI "wants to use your keychain" prompt — one
+    that never gets answered in a headless/launchd daemon, surfacing as "OAuth
+    session expired and could not be refreshed" even though the credential itself
+    (and its ``expiresAt``) was fine.
+
+    Deliberately NEVER pass ``-T ""`` — that is macOS's own footgun: an *empty*
+    ``-T`` means "trust every application," not "trust none."
+
+    Trust here is anchored to the binary's **code signature** (Developer ID cert
+    + Team ID + bundle identifier), not the literal file path — that's how macOS
+    keychain ACLs evaluate a trusted-application entry. So resolving ``claude``
+    via ``PATH``/``shutil.which`` each call (rather than hardcoding today's
+    version-pinned binary under ``~/.local/share/claude/versions/<X.Y.Z>``, which
+    a self-update deletes) is both simpler AND durable: the grant is computed
+    from whatever the live, currently-signed ``claude`` binary is at write time,
+    and continues to match future Anthropic-signed builds of the same identity.
+
+    ``/usr/bin/security`` is included explicitly: specifying ``-T`` at all drops
+    the implicit "trust the calling process" default, so without listing it here
+    this module's OWN future reads (via ``get_password``) would themselves start
+    prompting.
+
+    Does NOT include the ``cswap`` Python interpreter — this module deliberately
+    never touches Keychain items except through the ``security`` CLI (that's the
+    whole point of the module docstring's "creator == reader" design), so a
+    separate grant for the venv's ``python3`` would be redundant and, being a
+    ``uv``-managed venv path, less stable than ``/usr/bin/security`` itself.
+    """
+    paths = [_SECURITY]
+    claude_path = shutil.which("claude") or (
+        _CLAUDE_FALLBACK_PATH if os.path.exists(_CLAUDE_FALLBACK_PATH) else None
+    )
+    if claude_path:
+        paths.append(claude_path)
+    return paths
 
 
 class KeychainError(Exception):
@@ -162,12 +217,18 @@ def set_password(service: str, account: str, password: str) -> None:
     Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
     argv only for payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
+
+    Every write stamps the trusted-application ACL via ``-T`` (see
+    :func:`_trusted_app_paths`) so the item stays readable by Claude Code itself,
+    not just by this module — ``-U`` otherwise resets the ACL to "creator only"
+    on every call, which silently locked Claude Code out after each rotation.
     """
     hex_value = password.encode("utf-8").hex()
+    trust_args = "".join(f"-T {_quote(p)} " for p in _trusted_app_paths())
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
     command = (
         f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
-        f"-X {hex_value}\n"
+        f"{trust_args}-X {hex_value}\n"
     )
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
@@ -182,11 +243,12 @@ def set_password(service: str, account: str, password: str) -> None:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
+            argv = [_SECURITY, "add-generic-password", "-U", "-a", account, "-s", service]
+            for trusted_path in _trusted_app_paths():
+                argv += ["-T", trusted_path]
+            argv += ["-X", hex_value]
             result = subprocess.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
