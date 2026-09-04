@@ -189,21 +189,40 @@ class TestTheFailbackReasonReachesTheTui:
 
 
 class TestNoTuiEditing:
-    """AC-42 — authoring stays CLI-only; this PR adds no input path."""
+    """AC-42 — the presentation leaves never write the store themselves.
+
+    This class was written while authoring was CLI-only, and asserted that the
+    two editing surfaces did not mention `order` at all. The policy editor has
+    since given them an input path, so the blanket ban is no longer the
+    property to hold: `modals.py` reads `policy.order` to prefill its field,
+    which is a *display* read of exactly the kind `widgets.py` has always been
+    allowed (see `test_widgets_reads_the_policy_but_never_writes_it` below,
+    whose read-yes / write-no shape this now matches).
+
+    What survives is the layering, which is the part that was ever
+    load-bearing: the modal collects and validates, the menu dispatches, and
+    the *write* belongs to the app. Neither leaf may call a store setter.
+    """
 
     EDITABLE = ("modals.py", "dashboard.py")
 
     @pytest.mark.parametrize("name", EDITABLE)
-    def test_the_editing_surfaces_never_mention_order(self, name: str):
+    def test_the_editing_surfaces_never_write_the_order(self, name: str):
         """`order` as a *policy* word, not the English word.
 
-        Matched as `set_account_order` / `account_orders` / `acc.policy.order`,
-        so an unrelated comment using "order" in prose does not fail this.
+        Matched as `set_account_order` / `account_orders`, so an unrelated
+        comment using "order" in prose does not fail this.
         """
         src = (SRC / "tui" / name).read_text(encoding="utf-8")
         assert not re.search(r"\bset_account_order\b", src)
         assert not re.search(r"\baccount_orders\b", src)
-        assert not re.search(r"policy\.order\b", src)
+
+    def test_the_menu_surface_still_reads_no_policy_field(self):
+        """`dashboard.py` gained a policy menu but no policy access: it hands
+        the account number to the app and renders badges through the shared
+        helper, so it reads no policy field of its own."""
+        src = (SRC / "tui" / "dashboard.py").read_text(encoding="utf-8")
+        assert not re.search(r"policy\.(order|threshold|backup)\b", src)
 
     @pytest.mark.parametrize("name", EDITABLE)
     def test_no_new_order_keybinding(self, name: str):
