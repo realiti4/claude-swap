@@ -573,6 +573,25 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_usage_probe(monkeypatch):
+    """Safety net: no test may spawn a real ``claude`` usage probe.
+
+    Setup-token accounts fetch usage by running one Claude Code turn
+    (``oauth.probe_usage_via_claude``); a test that reaches that path with
+    ``claude`` on PATH would spend a real turn under the developer's own
+    login. Stub the single spawn point to "could not start" (the
+    ``no-claude-binary`` outcome, which every caller tolerates). Tests of
+    the probe itself re-patch the same attribute inside the test body,
+    which wins over this fixture.
+    """
+    def _refuse(argv, env, cwd, timeout_s):
+        raise FileNotFoundError("usage probe blocked in tests")
+
+    monkeypatch.setattr("claude_swap.oauth._spawn_usage_probe", _refuse)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from claude_swap.printer import warning as print_warning
 
@@ -17,6 +22,23 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# Setup-tokens (`claude setup-token`, registered via `cswap add-token`) are
+# inference-only server-side; wider scopes trigger 403s on profile endpoints.
+# Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
+SETUP_TOKEN_SCOPES = ("user:inference",)
+
+# The usage endpoint answers 403 for inference-only tokens, and a handful of
+# such probes trip a host-wide 429 for an hour. Setup-token accounts read
+# usage the way Claude Code itself sees it instead: one non-interactive turn
+# whose stream-json output carries a ``rate_limit_event`` built from the
+# inference response headers. The cheapest model, one turn, no tools.
+USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"
+USAGE_PROBE_PROMPT = "ok"
+USAGE_PROBE_TIMEOUT_S = 90.0
+# Private cwd for the probe inside the profile, so its transcript never lands
+# in a real project's history.
+USAGE_PROBE_DIRNAME = "usage-probe"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -581,6 +603,209 @@ class UsageOutcome:
     struck_fp: str | None = None
 
 
+def is_setup_token_credential(credentials: str) -> bool:
+    """Is this an inference-only setup-token credential?
+
+    Exactly ``SETUP_TOKEN_SCOPES`` and no refresh token — the shape
+    ``add-token`` writes. A full-scope OAuth login (or anything carrying a
+    refresh token) is not, and keeps using the usage endpoint.
+    """
+    oauth = extract_oauth_data(credentials)
+    if not oauth or oauth.get("refreshToken"):
+        return False
+    return oauth.get("scopes") == list(SETUP_TOKEN_SCOPES)
+
+
+@dataclass(frozen=True)
+class UsageProbeProfile:
+    """Where a setup-token usage probe runs.
+
+    ``config_dir`` is exported as ``CLAUDE_CONFIG_DIR`` for the child; ``None``
+    leaves the variable exactly as inherited so claude resolves its default
+    store itself (on macOS the Keychain service name hashes the raw env
+    value, so setting it to the default path would miss the default entry).
+    ``scratch_root`` is where the private ``usage-probe/`` cwd is created.
+    """
+
+    config_dir: Path | None
+    scratch_root: Path
+
+
+def _usage_probe_env(config_dir: Path | None) -> dict[str, str]:
+    """Child env: auth overrides dropped (they would fake another identity),
+    ``CLAUDE_CONFIG_DIR`` pointed at the profile when one is given."""
+    from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
+
+    env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
+def _usage_probe_argv(claude_bin: str) -> list[str]:
+    # Verified against Claude Code 2.1.257/2.1.260.
+    return [
+        claude_bin, "-p", USAGE_PROBE_PROMPT,
+        "--output-format", "stream-json", "--verbose",
+        "--model", USAGE_PROBE_MODEL,
+        "--max-turns", "1",
+        "--tools", "",
+    ]
+
+
+def _spawn_usage_probe(
+    argv: list[str], env: dict[str, str], cwd: Path, timeout_s: float
+) -> subprocess.CompletedProcess:
+    """The one subprocess call of the probe (tests replace this).
+
+    ``subprocess.run`` kills the child on timeout before re-raising.
+    """
+    return subprocess.run(
+        argv, env=env, cwd=str(cwd), capture_output=True, text=True,
+        timeout=timeout_s, stdin=subprocess.DEVNULL,
+    )
+
+
+def parse_rate_limit_event(stdout: str) -> dict | None:
+    """Raw usage-API-shaped data from stream-json output, or ``None``.
+
+    Scans one JSON object per line, skipping anything that does not parse
+    (claude prints non-JSON noise on some paths), and takes the last
+    ``rate_limit_event``. ``unifiedWindows`` utilization is 0..1 and
+    ``resetsAt`` is epoch seconds; the usage endpoint's shape (which
+    :func:`build_usage_result` consumes) is percent 0..100 and an ISO 8601
+    UTC string, so both are converted here.
+    """
+    event: dict | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "rate_limit_event":
+            info = obj.get("rate_limit_info")
+            if isinstance(info, dict):
+                event = info
+    if event is None:
+        return None
+    windows = event.get("unifiedWindows")
+    if not isinstance(windows, dict):
+        return None
+    data: dict = {}
+    for key in ("five_hour", "seven_day"):
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if not isinstance(utilization, (int, float)):
+            continue
+        entry: dict = {"utilization": float(utilization) * 100.0}
+        resets_at = window.get("resetsAt")
+        if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+            entry["resets_at"] = datetime.fromtimestamp(
+                resets_at, tz=timezone.utc
+            ).isoformat()
+        else:
+            entry["resets_at"] = None
+        data[key] = entry
+    return data or None
+
+
+def _probe_result_error(stdout: str) -> str | None:
+    """The ``result`` line's error text when it reports ``is_error``."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result" and obj.get("is_error"):
+            return str(obj.get("result") or obj.get("error") or "is_error")
+    return None
+
+
+def probe_usage_via_claude(
+    account_num: str,
+    profile: UsageProbeProfile,
+    timeout_s: float = USAGE_PROBE_TIMEOUT_S,
+) -> UsageOutcome:
+    """Usage for a setup-token account from one Claude Code turn.
+
+    Runs ``claude -p`` non-interactively under the account's profile and
+    parses the ``rate_limit_event`` from its stream-json output. An
+    exhausted account still emits the event (status ``rejected``,
+    utilization 1.0) and the process exits non-zero — stdout is parsed
+    regardless of exit code, and that read costs nothing. A healthy account
+    spends one tiny Haiku turn. All network activity is the ``claude``
+    binary's own; nothing here talks to the API directly.
+
+    Error kinds: ``"no-claude-binary"`` (not on PATH or would not spawn),
+    ``"probe-timeout"`` (child killed after ``timeout_s``),
+    ``"no-rate-limit-event"`` (ran, but no usable event in the output).
+    None of them is a permanent auth verdict, so none strikes the account.
+    """
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        _logger.warning(
+            "Usage probe for account %s skipped: 'claude' not on PATH", account_num,
+        )
+        return UsageOutcome(None, error="no-claude-binary")
+
+    scratch = profile.scratch_root / USAGE_PROBE_DIRNAME
+    try:
+        scratch.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(scratch, 0o700)
+    except OSError as e:
+        _logger.warning(
+            "Usage probe for account %s skipped: cannot create %s (%r)",
+            account_num, scratch, e,
+        )
+        return UsageOutcome(None, error="no-session-profile")
+
+    _logger.info("Usage via Claude Code turn for account %s", account_num)
+    try:
+        completed = _spawn_usage_probe(
+            _usage_probe_argv(claude_bin), _usage_probe_env(profile.config_dir),
+            scratch, timeout_s,
+        )
+    except subprocess.TimeoutExpired as e:
+        _logger.warning(
+            "Usage probe for account %s timed out after %.0fs", account_num, timeout_s,
+        )
+        _logger.debug("Usage probe timeout detail for account %s: %r", account_num, e)
+        return UsageOutcome(None, error="probe-timeout")
+    except OSError as e:
+        _logger.warning("Usage probe for account %s could not start: %r", account_num, e)
+        return UsageOutcome(None, error="no-claude-binary")
+
+    stdout = completed.stdout or ""
+    data = parse_rate_limit_event(stdout)
+    if data is None:
+        result_error = _probe_result_error(stdout)
+        _logger.warning(
+            "Usage probe for account %s produced no rate_limit_event (exit %s%s)",
+            account_num, completed.returncode,
+            f"; result error: {result_error}" if result_error else "",
+        )
+        _logger.debug(
+            "Usage probe output for account %s:\nstdout=%s\nstderr=%s",
+            account_num, stdout[-4000:], (completed.stderr or "")[-4000:],
+        )
+        return UsageOutcome(None, error="no-rate-limit-event")
+    if completed.returncode != 0:
+        _logger.debug(
+            "Usage probe for account %s exited %s but carried a rate_limit_event",
+            account_num, completed.returncode,
+        )
+    return UsageOutcome(build_usage_result(data))
+
+
 def fetch_usage(access_token: str) -> dict | None:
     """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
     try:
@@ -610,6 +835,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    probe_profile_for: Callable[[str, str], UsageProbeProfile | None] | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -619,12 +845,29 @@ def try_fetch_usage_for_account(
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
+
+    Setup-token credentials (see :func:`is_setup_token_credential`) never
+    reach the usage endpoint (403, then a host-wide 429): they go through
+    :func:`probe_usage_via_claude` under the profile that
+    ``probe_profile_for(account_num, email)`` names. Without a callable, or
+    when it answers ``None`` (no profile bootstrapped yet), the outcome is
+    ``"no-session-profile"``.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return UsageOutcome(None, error="no-access-token")
+
+    if is_setup_token_credential(credentials):
+        profile = probe_profile_for(account_num, email) if probe_profile_for else None
+        if profile is None:
+            _logger.warning(
+                "Usage fetch skipped %s: setup-token account has no session "
+                "profile yet (run `cswap run %s` once)", context, account_num,
+            )
+            return UsageOutcome(None, error="no-session-profile")
+        return probe_usage_via_claude(account_num, profile)
 
     working_credentials = credentials
 
