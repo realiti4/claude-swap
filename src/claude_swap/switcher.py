@@ -970,12 +970,24 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
-    def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
+    def set_alias(
+        self, identifier: str, alias: str, *, preserve_case: bool = False
+    ) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
 
         ``identifier`` is a slot number, email, or existing alias (so a
         typo'd alias can be corrected with ``cswap alias <old> <new>`` as
-        well as by number/email). Returns ``(account_num, normalized_alias)``.
+        well as by number/email). Returns ``(account_num, stored_alias)``.
+
+        ``preserve_case`` stores the alias with the capitalization the caller
+        typed instead of the lowercased form. The alias is still validated
+        through ``normalize_alias`` (empty / purely-numeric / leading-dash are
+        rejected exactly as before) and uniqueness is still checked
+        case-insensitively — only the stored spelling differs. This is safe
+        because every lookup path lowercases both sides (see
+        ``_find_account_by_alias``), so ``SR``, ``sr`` and ``Sr`` all continue
+        to resolve to the same account. The CLI leaves this off, so
+        ``cswap alias`` behaviour is unchanged.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
@@ -987,6 +999,7 @@ class ClaudeAccountSwitcher:
             normalized = normalize_alias(alias)
         except ValueError as e:
             raise ValidationError(str(e)) from e
+        stored = alias.strip() if preserve_case else normalized
 
         self._get_sequence_data_migrated()
         account_num = self._resolve_account_identifier(identifier)
@@ -1003,10 +1016,10 @@ class ClaudeAccountSwitcher:
         if conflict is not None:
             raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
-        record["alias"] = normalized
+        record["alias"] = stored
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
-        return account_num, normalized
+        return account_num, stored
 
     def unset_alias(self, identifier: str) -> str:
         """Clear the alias for the account matching identifier.

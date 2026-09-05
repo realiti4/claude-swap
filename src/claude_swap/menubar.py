@@ -697,6 +697,7 @@ def run(switcher) -> int:
                 self._add_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
+                self._alias_item(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
@@ -704,6 +705,58 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+
+        def _active_account(self):
+            """Return the active account tuple from the snapshot, or None."""
+            for entry in self.snapshot["accounts"]:
+                if entry[2]:  # is_active
+                    return entry
+            return None
+
+        def _alias_item(self, rumps):
+            """Rename the CURRENT account. Label carries the alias so the
+            scope is obvious without opening the dialog."""
+            active = self._active_account()
+            if active is None:
+                item = rumps.MenuItem("Change alias…", callback=None)
+                return item
+            alias = active[5]
+            label = f"Change alias ({alias})…" if alias else "Set alias…"
+            return rumps.MenuItem(label, callback=self.on_change_alias)
+
+        def on_change_alias(self, _sender):
+            # A menu-bar (accessory) app isn't the active app, so a modal
+            # rumps.Window can render black/blank until we bring the app
+            # forward. Same guard as on_add_token.
+            import AppKit
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+            active = self._active_account()
+            if active is None:
+                rumps.alert(title="claude-swap", message="No active account to rename.")
+                return
+            num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at = active
+
+            win = rumps.Window(
+                title="Change alias",
+                message=(
+                    f"Alias for {email}\n\n"
+                    "Capitalization is kept as typed; switching stays "
+                    "case-insensitive."
+                ),
+                default_text=alias or "",
+                ok="Save", cancel="Cancel", dimensions=(320, 24),
+            )
+            resp = win.run()
+            if resp.clicked != 1:
+                return
+            text = resp.text.strip()
+            if not text or text == (alias or ""):
+                return
+            # preserve_case: the whole point of doing this from the menu is to
+            # keep the typed spelling, which `cswap alias` lowercases.
+            if self._guard(lambda: self.switcher.set_alias(num, text, preserve_case=True)):
+                self.refresh_async()
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
