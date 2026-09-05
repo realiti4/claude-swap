@@ -152,6 +152,27 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
+def chip_label(label: str, reset: str | None) -> str:
+    """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
+
+    THE one place that decides how a window reads — the dashboard's inactive
+    rows and the auto view's Next-best rows both draw it, so one account
+    cannot read two ways on two screens. The caller appends the pct so it can
+    colour it by severity. The countdown shows whenever it is known, not only
+    at 100%: a saturated candidate's worth IS when it comes back.
+
+    An unknown reset is a fact worth showing, not a reason to go blank: the
+    strategy needs exactly this account activated once to learn it (see
+    autoswitch.py's consume-first probe admission), so hiding the gap read as
+    "nothing to report" when it meant the opposite. ``?`` keeps the same
+    token shape a known reset has (``5h(⟳?):``) so a column of chips still
+    lines up — callers compute width from this string, never a literal.
+    """
+    if not reset:
+        return f"{label}(⟳?):"
+    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+
+
 def format_duration(seconds: float) -> str:
     """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
     s = int(seconds)

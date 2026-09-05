@@ -51,7 +51,14 @@ class TestConfigList:
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        # From the schema, not a literal: a bare count drifts every time a
+        # setting is added or removed, and its failure names no key.
+        from claude_swap.settings import SETTING_SPECS
+
+        assert out.count("(default)") == len(SETTING_SPECS), (
+            f"{len(SETTING_SPECS)} settings declared, "
+            f"{out.count('(default)')} listed as default"
+        )
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -77,8 +84,10 @@ class TestConfigList:
         payload = json.loads(out)
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
+        from claude_swap.settings import SETTING_SPECS
+
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert set(by_key) == set(SETTING_SPECS)
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
