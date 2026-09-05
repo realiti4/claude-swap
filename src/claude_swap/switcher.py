@@ -5620,16 +5620,27 @@ class ClaudeAccountSwitcher:
         decision-grade rows: skip the active/disabled/exhausted, then
         consume-first = soonest weekly reset, best = most headroom.
         """
-        from claude_swap.settings import load_settings
+        from claude_swap.settings import load_settings, parse_preferred
 
         try:
-            strategy = load_settings(self.backup_dir).strategy
+            settings = load_settings(self.backup_dir)
+            strategy = settings.strategy
+            preferred = parse_preferred(settings.preferred)
         except Exception:
             strategy = "best"
+            preferred = frozenset()
         best: tuple | None = None
         for row in accounts:
             if row["number"] == active or row.get("disabled"):
                 continue
+            # autoswitch.preferred, as the engine's ranking applies it: a
+            # starred account beats an unstarred one among those with room
+            # (user 2026-09-06: "account 3 which is starred isn't the next
+            # candidate" — the star was invisible to this advisory).
+            starred = (
+                str(row["number"]) in preferred
+                or str(row.get("email") or "").lower() in preferred
+            )
             usage = row.get("usage")
             if not isinstance(usage, dict):
                 continue
@@ -5651,6 +5662,7 @@ class ClaudeAccountSwitcher:
                 key = (reset == "", reset)  # soonest reset; missing sorts last
             else:
                 key = (max(pcts),)  # most headroom = lowest binding pct
+            key = (0 if starred else 1, *key)
             if best is None or key < best[0]:
                 best = (key, row["number"])
         return best[1] if best else None

@@ -12341,6 +12341,27 @@ class TestNextSwitchCandidate:
         rows = [self._row(1, five=100.0), self._row(2, seven=100.0)]
         assert switcher._next_switch_candidate(rows, None) is None
 
+    def test_a_preferred_account_with_room_comes_first(self, temp_home: Path):
+        """2026-09-06: the starred account (fresh, weekly reset far out) was
+        shown behind a sooner-resetting one under consume-first; the engine's
+        own ranking puts a listed account first among sound targets, so the
+        advisory must too. Matched by slot number or by email."""
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "autoswitch.strategy", "consume-first")
+        set_setting(switcher.backup_dir, "autoswitch.preferred", "loc@papaya.asia")
+        rows = [
+            {**self._row(1, five=75.0, seven=53.0), "email": "a@example.com"},
+            {**self._row(3, five=0.0, seven=0.0), "email": "loc@papaya.asia"},
+        ]
+        rows[0]["usage"]["sevenDay"]["resetsAt"] = "2026-09-08T10:59:59Z"
+        rows[1]["usage"]["sevenDay"]["resetsAt"] = "2026-09-12T10:59:59Z"
+        assert switcher._next_switch_candidate(rows, 2) == 3
+        # A starred account that is out of a limit is still no candidate.
+        rows[1]["usage"]["fiveHour"]["pct"] = 100.0
+        assert switcher._next_switch_candidate(rows, 2) == 1
+
 
 class TestNextRecovery:
     """All-limited fallback: who recovers soonest (advisory)."""

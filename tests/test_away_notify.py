@@ -29,6 +29,7 @@ class TestChannelConfig:
         save_channels(tmp_path, {"slackWebhookUrl": WEBHOOK})
         assert load_channels(tmp_path) == {"slackWebhookUrl": WEBHOOK}
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
     def test_file_is_owner_only(self, tmp_path):
         save_channels(tmp_path, {"slackWebhookUrl": WEBHOOK})
         mode = stat.S_IMODE(os.stat(notify_path(tmp_path)).st_mode)
