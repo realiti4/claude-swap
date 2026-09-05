@@ -507,8 +507,16 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        require_session: bool = False,
     ) -> NoReturn:
-        """Launch Claude Code as the given account in the current terminal."""
+        """Launch Claude Code as the given account in the current terminal.
+
+        ``require_session`` turns the same-account fast path (a plain claude
+        launch on the default login) into a refusal: a wrapper that hands a
+        terminal to one account per session needs the isolation guaranteed,
+        and a session on the default login is the one thing an account
+        switch can later pull out from under it.
+        """
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -542,6 +550,15 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
+                if require_session:
+                    raise SessionError(
+                        f"Account-{account_num} ({email}) is the active default "
+                        "login, so this launch would run plain claude on the "
+                        "default login rather than in a session profile (a "
+                        "second copy of the active credential would drift). "
+                        "Switch the default login to another account first, "
+                        "or run `claude` directly."
+                    )
                 print(
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "

@@ -27,6 +27,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
+from claude_swap.session import mark_session_stale
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -790,10 +791,14 @@ class TestFetchAccountUsageSessionProfile:
     def test_expired_session_credentials_without_live_session_falls_back(
         self, temp_home: Path
     ):
-        """No live session: the backup path (with refresh machinery) still runs."""
+        """No live session, and the backup is the FRESHER credential (a
+        re-login after the profile last ran): the backup path runs, refresh
+        machinery included, and the older profile is not adopted over it."""
         switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
         backup = _oauth_creds("sk-backup", 7200)
         session = _oauth_creds("sk-session", -60)
+        switcher._write_account_credentials("2", "test@example.com", backup)
 
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.session.read_session_credentials",
@@ -807,6 +812,52 @@ class TestFetchAccountUsageSessionProfile:
         assert args[2] == backup
         assert kwargs.get("is_active") is False
         assert kwargs.get("refresh_via") is not None  # consume gate replaces persist
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_exited_session_ahead_of_backup_is_adopted(self, temp_home: Path):
+        """No live session and the profile is the newer generation: its
+        credential becomes the backup, and the fetch runs on it through the
+        idle path (refresh allowed — nothing else rotates that family now)
+        instead of POSTing the backup's dead grant."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("refresh_via") is not None
+        assert switcher.read_account_credentials("2", "test@example.com") == session
+
+    def test_live_session_ahead_of_backup_is_not_adopted(self, temp_home: Path):
+        """A live claude owns its profile's family: read-only fetch, backup untouched."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            switcher._fetch_account_usage(self._info(backup))
+
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
 
     def test_no_session_profile_uses_backup_path(self, temp_home: Path):
         """Accounts without a session profile behave exactly as before."""
@@ -915,6 +966,92 @@ class TestFetchAccountUsageSessionProfile:
         args, kwargs = mock_fetch.call_args
         assert args[2] == session
         assert kwargs.get("is_active") is True
+
+
+class TestAdoptSessionCredential:
+    """An exited session's profile holds the slot's newest generation; the
+    backup only learns about it through adoption."""
+
+    EMAIL = "test@example.com"
+
+    def _switcher(self, backup: str) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_account_credentials("2", self.EMAIL, backup)
+        return switcher
+
+    def _seed_profile(
+        self, switcher, creds: str, email: str = EMAIL, org: str = "org-uuid"
+    ) -> Path:
+        session_dir = switcher._session_dir("2", self.EMAIL)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(creds)
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "organizationUuid": org}
+        }))
+        return session_dir
+
+    def test_quiescent_profile_ahead_is_adopted(self, temp_home: Path):
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = self._seed_profile(switcher, profile)
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is True
+        assert switcher.read_account_credentials("2", self.EMAIL) == profile
+        # The profile is the source of that generation, not a stale seed.
+        assert (session_dir / ".credentials.json").read_text() == profile
+
+    def test_live_profile_is_not_adopted(self, temp_home: Path):
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = self._seed_profile(switcher, profile)
+        records = session_dir / "sessions"
+        records.mkdir()
+        (records / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid()}))
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_stale_marked_profile_is_not_adopted(self, temp_home: Path):
+        """The backup moved under this profile while it was live; cswap has
+        already decided the profile re-bootstraps, and the marker stays."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = self._seed_profile(switcher, profile)
+        mark_session_stale(session_dir)
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_profile_behind_a_fresh_relogin_is_not_adopted(self, temp_home: Path):
+        backup = _oauth_creds("sk-backup", 7200)
+        profile = _oauth_creds("sk-session", -60)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile)
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_profile_on_the_backup_generation_is_not_adopted(self, temp_home: Path):
+        creds = _oauth_creds("sk-same", 7200)
+        switcher = self._switcher(creds)
+        self._seed_profile(switcher, creds)
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+
+    def test_profile_logged_in_as_another_account_is_not_adopted(
+        self, temp_home: Path
+    ):
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile, email="other@example.com")
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
 
 class TestLiveSessionGuardOnAnUnreadableRecord:
@@ -11669,6 +11806,36 @@ class TestUnreadableBackupIsNotAbsent:
         )
         assert after.struck_fingerprint is not None, (
             "one unreadable pass erased the persisted struck fingerprint"
+        )
+
+    # -- C-2b: the dead-token second-source check with NO strike to hold -
+
+    def test_active_slot_with_zero_strikes_and_unreadable_backup_is_not_dead(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """A transient Keychain read must not manufacture a dead verdict
+        for a row that was never struck.
+
+        The ``unreadable`` branch's own comment justifies holding a strike
+        because the row "already took AUTH_DEAD_STRIKES invalid_grants" —
+        but the code returns ``True`` unconditionally, with no check that
+        any strike actually exists. A healthy active account (zero
+        ``auth_dead_strikes``) whose backup read merely times out must not
+        be reported as "re-login needed".
+        """
+        s = self._macos_switcher(sample_sequence_data, email="b@example.com")
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        identities = {"1": ("b@example.com", "")}
+        entry = s._usage_store.entries(identities, [])["1"]
+        assert entry.auth_dead_strikes == 0, "the row must never have been struck"
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert not s._entry_token_dead(entry, "1", "b@example.com", live, True), (
+            "zero strikes plus an unreadable backup must not report dead"
         )
 
     # -- C-3: the import auto-heal's verdict -----------------------------

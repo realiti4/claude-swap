@@ -478,6 +478,130 @@ class TestCLI:
         assert exc.value.code == 0
         assert called.get("ran") is True
 
+    def _service_harness(self, monkeypatch, argv):
+        """Drive `cswap menubar <service flag>` with launch_agent stubbed out."""
+        seen = {"menubar_ran": False}
+
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+
+            def _is_running_in_container(self):
+                return False
+
+        def _fake_menubar(switcher):
+            seen["menubar_ran"] = True
+            return 0
+
+        def _record(name, payload):
+            def _call(*a, **k):
+                seen["called"] = name
+                return payload
+
+            return _call
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr("claude_swap.menubar.run", _fake_menubar, raising=False)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.install",
+            _record(
+                "install",
+                {
+                    "label": "com.cswap.menubar",
+                    "plist": "/tmp/p.plist",
+                    "program": ["/tmp/cswap", "menubar"],
+                    "stdout_log": "/tmp/o.log",
+                    "stderr_log": "/tmp/e.log",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.uninstall",
+            _record("uninstall", {"label": "com.cswap.menubar", "was_loaded": True, "removed_plist": True}),
+        )
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.status",
+            _record(
+                "status",
+                {
+                    "label": "com.cswap.menubar",
+                    "installed": True,
+                    "loaded": True,
+                    "state": "running",
+                    "pid": 4242,
+                    "plist": "/tmp/p.plist",
+                },
+            ),
+        )
+        return seen
+
+    def test_menubar_install_service_routes_to_launch_agent(self, monkeypatch, capsys):
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["called"] == "install"
+        # The service flags must not also start a foreground menu bar.
+        assert seen["menubar_ran"] is False
+        assert "installed" in capsys.readouterr().out
+
+    def test_menubar_uninstall_service_routes_to_launch_agent(self, monkeypatch, capsys):
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--uninstall-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["called"] == "uninstall"
+        assert seen["menubar_ran"] is False
+        assert "removed" in capsys.readouterr().out
+
+    def test_menubar_service_status_reports_state_and_pid(self, monkeypatch, capsys):
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--service-status"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["called"] == "status"
+        out = capsys.readouterr().out
+        assert "running" in out and "4242" in out
+
+    def test_menubar_service_flags_still_refuse_off_macos(self, monkeypatch):
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 1
+
+    def test_service_flags_are_rejected_outside_menubar(self, monkeypatch, capsys):
+        # `--full` already guards this way; without a matching check
+        # `cswap list --install-service` would be accepted and silently ignored.
+        monkeypatch.setattr(sys, "argv", ["cswap", "list", "--install-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "can only be used with 'menubar'" in capsys.readouterr().err
+
+    def test_plain_menubar_does_not_touch_the_service(self, monkeypatch):
+        seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 0
+        assert seen["menubar_ran"] is True
+        assert "called" not in seen
+
 
 class TestCLICommands:
     """Test individual CLI commands."""
@@ -582,8 +706,18 @@ class TestRunCommand:
             def __init__(self, switcher):
                 calls.append(("init", switcher))
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
-                calls.append(("run", identifier, claude_args, share, share_history))
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
+                calls.append((
+                    "run", identifier, claude_args, share, share_history,
+                    require_session,
+                ))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
@@ -594,32 +728,36 @@ class TestRunCommand:
 
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False) in calls
+        assert ("run", "user@example.com", [], True, False, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True) in calls
+        assert ("run", "2", [], True, True, False) in calls
 
     def test_no_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
+
+    def test_require_session_flag(self):
+        calls = self._dispatch(["run", "2", "--require-session"])
+        assert ("run", "2", [], True, False, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False) in calls
+        assert ("run", "2", ["--no-share"], True, False, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -659,7 +797,14 @@ class TestRunCommand:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 from claude_swap.exceptions import SessionError
 
                 raise SessionError("boom")
@@ -761,7 +906,14 @@ class TestSubcommandAliases:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 calls.append((identifier, claude_args, share))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
@@ -1351,7 +1503,14 @@ class TestRunAutoResolve:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
             def exec_default(self, claude_args):

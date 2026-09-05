@@ -145,6 +145,16 @@ def _wipe_throwaway_artifacts(target: Path) -> None:
     target.rmdir()
 
 
+def migration_flag_for(target: Path) -> Path:
+    """The interrupted-migration flag for ``target``: a SIBLING of the
+    backup root, not a child.
+
+    Spell it here only -- this flag is what turns the collision refusal
+    below into an rmtree of the destination, and a second copy drifts.
+    """
+    return target.parent / f".{target.name}.migrating"
+
+
 def migrate_legacy_backup_dir(target: Path) -> bool:
     """Move the legacy backup directory to ``target`` if needed.
 
@@ -177,7 +187,7 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
     if same_path:
         return False
 
-    flag = target.parent / f".{target.name}.migrating"
+    flag = migration_flag_for(target)
 
     if not legacy.exists():
         # Successful prior run that died before unlinking the flag.

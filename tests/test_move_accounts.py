@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from claude_swap import macos_keychain
+from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -497,6 +498,15 @@ class TestMoveUnreadableSourceIsNotAbsent:
     same file already tests for the destination side).
     """
 
+    @pytest.fixture(autouse=True)
+    def _file_mode(self, monkeypatch):
+        """Force the FILE store: these cases read the file backend, and on
+        macOS a usable Keychain takes the write instead -- no file to `chmod`,
+        and the retained generation lands where `_prev_backup_path` cannot
+        see it. Class-wide and autouse, so membership alone grants it.
+        """
+        monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
+
     def _write(self, switcher, data):
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
@@ -505,10 +515,23 @@ class TestMoveUnreadableSourceIsNotAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
+    # THE MACOS ARM MAKES THE SHAPE REACHABLE ON THE UBUNTU JOB, which is
+    # where it adds anything -- and the class fixture that forces the file
+    # store is what makes it so. `_use_keychain` keys on the SWITCHER's
+    # platform, not on the real OS, so this arm turns it True on Ubuntu too;
+    # the `[None]` arm is already file-mode there and the fixture is inert,
+    # but on this arm -- and on the whole macOS job -- the fixture is what
+    # keeps the store on file so there is an `.enc` to chmod. Windows skips
+    # this case entirely (the `skipif` above), and on macOS
+    # `Platform.detect()` already answers MACOS, so the arm duplicates
+    # `[None]` there.
+    @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_move_before_anything_changes(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, as_platform
     ):
         switcher = ClaudeAccountSwitcher()
+        if as_platform is not None:
+            switcher.platform = as_platform
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("2", "account2@example.com", "live-rt")
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")

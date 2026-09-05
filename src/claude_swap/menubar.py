@@ -857,6 +857,25 @@ def run(switcher) -> int:
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
             )
+            # Stop a rumps memory leak: rumps registers each menu item's callback
+            # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
+            # never removes them, so rebuilding the whole menu on every refresh
+            # leaks every item forever (~1GB after days on a busy machine). Purge
+            # this menu's entries before we tear it down. We walk the *native*
+            # NSMenu tree (itemArray, recursing into submenus) rather than the
+            # rumps Python dict: that dict is keyed by title and silently drops
+            # same-title items, which would leave leaked entries behind.
+            # Guard the private rumps attribute: if a future rumps release renames
+            # it, degrade to "leaks again" rather than crashing on every rebuild.
+            _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
+            if _reg is not None:
+                def _purge(nsmenu):
+                    for _it in nsmenu.itemArray():
+                        _reg.pop(_it, None)
+                        _sub = _it.submenu()
+                        if _sub is not None:
+                            _purge(_sub)
+                _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
             accounts = self.snapshot["accounts"]

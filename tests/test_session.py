@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
     SessionError,
+    SwitchError,
     ValidationError,
 )
 from claude_swap.models import Platform
@@ -1322,6 +1323,29 @@ class TestRun:
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
 
+    def test_require_session_refuses_fast_path(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        # SessionError, not _ExecCalled: nothing may launch.
+        with pytest.raises(SessionError, match="active default login"):
+            manager.run("2", [], require_session=True)
+
+    def test_require_session_is_inert_off_the_active_account(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=True)
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
     def test_preset_config_dir_disables_fast_path(
         self,
         manager,
@@ -1534,6 +1558,54 @@ class TestGuards:
         assert "live session-mode" in out
         data = seeded_switcher._get_sequence_data()
         assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
+
+    def test_switch_refuses_live_target_whose_profile_is_ahead(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Once the live session has rotated past the backup, the backup is a
+        consumed generation and activating it could only fail."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+
+    def test_switch_adopts_exited_session_credential_first(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Nothing running against the profile: its newer generation becomes
+        the backup, and that is what the switch activates."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == ROTATED_CREDS
+        )
+        assert seeded_switcher._read_credentials() == ROTATED_CREDS
+        # The profile is the source of that generation, not a stale seed.
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
 
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain

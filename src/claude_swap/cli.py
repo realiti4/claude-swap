@@ -133,6 +133,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
     )
@@ -165,6 +166,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--require-session",
+        action="store_true",
+        help=(
+            "Refuse to launch when the account is already the active default "
+            "login, instead of running plain claude on that login (which a "
+            "later switch could pull out from under the session)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -185,6 +195,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -196,6 +207,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests
         if email is not None:
@@ -1507,6 +1519,51 @@ def _history_command(argv: list[str]) -> None:
         print(f"{entry['from']} -> {entry['to']}   {entry['at']}")
 
 
+def _menubar_service(args) -> int:
+    """Handle ``menubar --install-service|--uninstall-service|--service-status``.
+
+    Split out of the dispatch chain because these three share one import and
+    one output shape, and because the menu bar branch below them is a
+    non-returning call — folding the service paths inline would leave the
+    reader tracing which branches fall through to launching the app.
+    """
+    from claude_swap import launch_agent
+
+    if args.install_service:
+        result = launch_agent.install()
+        print(f"Menu bar service installed ({result['label']}).")
+        print(f"  plist: {result['plist']}")
+        print(f"  logs:  {result['stderr_log']}")
+        print(
+            dimmed(
+                "It starts at login from now on. Re-run this after a cswap "
+                "upgrade to point launchd at the new build."
+            )
+        )
+        return 0
+
+    if args.uninstall_service:
+        result = launch_agent.uninstall()
+        if result["was_loaded"] or result["removed_plist"]:
+            print("Menu bar service removed.")
+        else:
+            print("Menu bar service was not installed.")
+        return 0
+
+    result = launch_agent.status()
+    if not result["installed"] and not result["loaded"]:
+        print("Menu bar service is not installed.")
+        print(dimmed("Install it with: cswap menubar --install-service"))
+        return 0
+    state = result["state"] or ("loaded" if result["loaded"] else "stopped")
+    pid = f" (pid {result['pid']})" if result["pid"] else ""
+    print(f"Menu bar service: {state}{pid}")
+    print(f"  plist: {result['plist']}")
+    if not result["installed"]:
+        print(dimmed("launchd still has it loaded, but the plist is gone."))
+    return 0
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1615,6 +1672,7 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1718,6 +1776,27 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
+    )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "With 'menubar': install a launchd LaunchAgent so the menu bar "
+            "starts at login and restarts on crash (macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="With 'menubar': stop the LaunchAgent and remove its plist (macOS)",
+    )
+    parser.add_argument(
+        "--service-status",
+        action="store_true",
+        help=(
+            "With 'menubar': report whether the LaunchAgent is installed "
+            "and running"
+        ),
     )
 
     # Legacy `--flag` interface. Still fully supported (bare subcommands rewrite
@@ -1877,6 +1956,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
+    if (
+        args.install_service or args.uninstall_service or args.service_status
+    ) and not args.menubar:
+        parser.error(
+            "--install-service, --uninstall-service and --service-status "
+            "can only be used with 'menubar'"
+        )
+
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
     if args.upgrade:
@@ -1977,6 +2064,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")
                 sys.exit(1)
+            if args.install_service or args.uninstall_service or args.service_status:
+                sys.exit(_menubar_service(args))
             # menubar is import-safe without the extra; a missing rumps
             # surfaces from run() as a ClaudeSwitchError with the install hint.
             from claude_swap.menubar import run as menubar_run
