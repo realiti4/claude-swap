@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import enum
 import json
+import os
 import logging
 import math
 import random
@@ -42,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy, session_resume
+from claude_swap import away_notify, cmux_control, oauth, poll_policy, session_resume
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -51,11 +52,20 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    parse_preferred,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+# Held (flock) for run_loop's lifetime — ONE engine per account store. This is
+# a mutex, unlike `.autoswitch_state.lock`, which is a short read-modify-write
+# lock around the state file and must never be repurposed as one.
+ENGINE_LOCK_FILENAME = "autoswitch_engine.lock"
 STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
@@ -148,6 +158,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # sit where quota returns first, however far out — rather than parking on
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
+# A limit stop observed this soon after a switch is the OLD token failing in a
+# session that has not reloaded credentials yet (a resume nudge, or a turn
+# that was already in flight), not evidence about the account just landed on.
+# Measured 2026-09-05: a stop 11 s after an at-limit escape was blamed on the
+# healthy new active and the engine bounced back onto the spent account —
+# five switches in 52 s. Sixty seconds covers the resume coordinator's
+# retry ladder (5 s + 15 s with 10 s watches) with room to spare.
+STALE_CREDENTIAL_GRACE_S = 60.0
 
 
 def _recovery_is_useful(
@@ -465,6 +483,34 @@ class SessionResumedEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class RemoteControlRearmedEvent(AutoSwitchEvent):
+    """`/rc` was typed into cmux-hosted sessions after a switch."""
+
+    kind: ClassVar[str] = "remote-control-rearmed"
+    count: int
+
+    def _fields(self) -> dict:
+        return {"count": self.count}
+
+    def human(self) -> str:
+        return f"re-armed remote control on {self.count} session(s)"
+
+
+@dataclass(frozen=True)
+class AwayNotifiedEvent(AutoSwitchEvent):
+    """The switch was pushed to the user's away-mode channels (item 7)."""
+
+    kind: ClassVar[str] = "away-notified"
+    channels: list[str]
+
+    def _fields(self) -> dict:
+        return {"channels": self.channels}
+
+    def human(self) -> str:
+        return f"pushed switch notice to {', '.join(self.channels)}"
+
+
+@dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
@@ -488,6 +534,25 @@ class ErrorEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
+
+
+@dataclass(frozen=True)
+class EngineRefusedEvent(AutoSwitchEvent):
+    """Another engine already holds this store's mutex; this one won't run.
+
+    Three hosts construct an engine (cswap auto, the menubar, the TUI) and
+    two polling and switching one credential store at once is never what the
+    user meant. Display surfaces keep working — only the loop is refused.
+    """
+
+    kind: ClassVar[str] = "engine-refused"
+    message: str
+
+    def _fields(self) -> dict:
+        return {"message": self.message}
+
+    def human(self) -> str:
+        return f"not starting: {self.message}"
 
 
 @dataclass(frozen=True)
@@ -548,6 +613,17 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+
+
+def _live_autoswitch_enabled(backup_root) -> bool:
+    """Fresh ``autoswitch.enabled`` read; fail-open so a broken settings
+    file can never park the engine."""
+    try:
+        from claude_swap.settings import load_settings
+
+        return load_settings(Path(backup_root)).enabled
+    except Exception:
+        return True
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -671,6 +747,9 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Accounts to land on first when a switch happens (emails and/or slot
+        # numbers, lowercased); resolved against the candidates per tick.
+        self._preferred = parse_preferred(settings.preferred)
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -703,6 +782,11 @@ class AutoSwitchEngine:
         # unrelated process. Losing the record on restart costs an un-resumed
         # session; persisting it risks messaging a stranger.
         self._stopped_sessions: dict[str, session_resume.StoppedSession] = {}
+        # Transcript-derived evidence that the ACTIVE account is spent. The
+        # usage API only says so on its next poll; a session that just stopped
+        # says so now, for the cost of a stat per live session.
+        self._limit_scanner = session_resume.LimitStopScanner()
+        self._observed_limit: session_resume.LimitStop | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -928,6 +1012,11 @@ class AutoSwitchEngine:
             else {}
         )
 
+        # Before trusting the API's picture, ask the transcripts: a session
+        # that just stopped knows the active account is spent well before the
+        # next poll would say so. Also covers `--once`, which never sleeps.
+        self._poll_limit_stops(state)
+
         current = self.switcher.current_account_number()
         if current is None:
             self._emit(
@@ -983,6 +1072,18 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
+        # Master switch, read FRESH each tick so the Settings toggle applies
+        # without an engine restart. Gated here — after the PollEvent — so
+        # usage keeps flowing to every display while switching is off.
+        if not _live_autoswitch_enabled(self.state_path.parent):
+            self._emit(
+                NoSwitchEvent(
+                    reason="disabled",
+                    detail="autoswitch.enabled is off — usage polling continues",
+                )
+            )
+            return TickOutcome.NO_ACTION
+
         if (
             self.switcher.account_kind_for(current) == "api_key"
             and not settings.include_api_key_accounts
@@ -996,6 +1097,13 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        if self._limit_evidence_applies():
+            # A session on this account hit the wall. That outranks whatever
+            # the store last measured — including a reading that is merely
+            # stale, and including no reading at all — and drops the tick into
+            # the `at-limit` escape below, which already ignores the threshold
+            # and records the stopped sessions worth waking afterwards.
+            active_headroom = 0.0
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1259,6 +1367,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                kw["now"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1403,10 +1512,14 @@ class AutoSwitchEngine:
         # The departure snapshot of the account we are leaving, taken from the
         # SAME `usage`/`headroom` the ranking just decided on — for
         # consume-first that is the phase-2 refetch, not the stale one.
-        left_snapshot = (
-            active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now),
-        )
+        left_recovery = _binding_recovery_ts(usage.get(current), self._models, decided_now)
+        stop = self._observed_limit if self._limit_evidence_applies() else None
+        if stop is not None and stop.resets_at > decided_now:
+            # The transcript knows WHICH window stopped the session and when
+            # it comes back; the usage row is the stale reading the evidence
+            # just overrode, and its binding window may not even be the one.
+            left_recovery = stop.resets_at
+        left_snapshot = (active_headroom, left_recovery)
         transient_failure = False
         systemic = ""
         for num in ordered:
@@ -1488,6 +1601,7 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        now: float | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1565,7 +1679,16 @@ class AutoSwitchEngine:
         left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if came_from is None:
+            return None
+        # The bar is an anti-flap device for the discretionary triggers; an
+        # at-limit or failover escape MUST move and may go anywhere — except
+        # back onto an account a session just proved spent (2026-09-05:
+        # at-limit bounced #1→#2→#1→#2 because that account read healthy on
+        # a stale poll and the bar did not apply to at-limit).
+        if trigger not in ("proactive", "consume-first") and not (
+            now is not None and self._left_at_limit_holds(state, now)
+        ):
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -1599,6 +1722,18 @@ class AutoSwitchEngine:
                 # to compare against.
                 return None
         return barred
+
+    @staticmethod
+    def _left_at_limit_holds(state: dict, now: float) -> bool:
+        """The account we left was PROVEN spent — a session stopped on it —
+        and its window has not reset yet. Until then no usage reading can
+        release it: the API lags a real limit by up to a poll interval (and
+        measured ~95 s on 2026-09-05), which is exactly the reading that
+        would otherwise make a spent account look like the best target."""
+        if state.get("leftTrigger") != "at-limit":
+            return False
+        until = state.get("leftRecoveryAt")
+        return isinstance(until, (int, float)) and now < until
 
     def _left_account_recovered(
         self,
@@ -1716,6 +1851,8 @@ class AutoSwitchEngine:
             # silent hold.
             return True
         barred = str(came_from)
+        if self._left_at_limit_holds(state, now):
+            return False
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
         h = headroom.get(barred)
@@ -1921,6 +2058,8 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        preferred = self._preferred_numbers(oauth_candidates)
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -2042,11 +2181,33 @@ class AutoSwitchEngine:
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
+            # autoswitch.preferred: a listed account beats an unlisted one
+            # among the candidates that qualified above. The gates decide
+            # WHETHER a move is sound; the preference only picks which sound
+            # target to take, so it can never land somewhere that re-triggers.
+            # The recovery-tier keys are left alone on purpose: when every
+            # account is spent, soonest-back is the whole point, listed or not.
+            if preferred and not (
+                all_above and trigger in ("proactive", "consume-first")
+            ):
+                key = (0 if num in preferred else 1, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _preferred_numbers(self, candidates: list[str]) -> frozenset[str]:
+        """Candidates named by ``autoswitch.preferred``, by slot number or
+        email (case-insensitive). Names matching nothing are ignored."""
+        if not self._preferred:
+            return frozenset()
+        return frozenset(
+            n
+            for n in candidates
+            if n in self._preferred
+            or self.switcher.account_email(n).lower() in self._preferred
+        )
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -2267,15 +2428,141 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
             )
         )
+        # The account this tick left is the one the evidence indicted, so the
+        # evidence has done its job. Anything still wrong with the NEW account
+        # will produce its own stop, and its own scan.
+        self._observed_limit = None
+
         # No resume nudge here on purpose. A switch is one way quota comes
         # back, not the only one, so the trigger lives in `tick` where the
         # ACTIVE account is known to have headroom — which covers a switch on
         # the following tick and the active account's own reset alike. Nudging
         # from here as well would fire before the freshly-switched account's
         # headroom has been read, on the assumption the target is healthy.
+
+        # The /rc sweep, by contrast, DOES belong on the switch itself:
+        # remote control broke the moment the credentials changed, whatever
+        # the new account's headroom says. Item 7's away-mode push runs after
+        # it (ordering rule: never announce an account sessions aren't bound
+        # to yet); today's push carries no session URLs, so the sweep's
+        # outcome informs the body without gating the send.
+        sweep = self._rearm_remote_control()
+        self._away_notify(result.get("to"), sweep)
         return TickOutcome.SWITCHED
 
+    def _rearm_remote_control(self) -> cmux_control.SweepResult | None:
+        """Re-arm `/rc` on cmux-hosted sessions; never affects the switch.
+
+        Confirms as it goes (scraping the session URLs the push body wants,
+        dismissing the input-capturing Remote Control panels the sweep
+        opened). None when disabled, absent, or failed.
+        """
+        if not self.settings.rearm_remote_control:
+            return None
+        try:
+            result = cmux_control.rearm_remote_control(
+                confirm=True,
+                active_within_s=self.settings.rearm_active_within_minutes * 60,
+            )
+        except Exception as e:  # pragma: no cover - belt for a never-raise API
+            _logger.warning("/rc sweep failed: %r", e)
+            return None
+        if result is not None and result.sent:
+            self._emit(RemoteControlRearmedEvent(count=len(result.sent)))
+        return result
+
+    def _away_notify(
+        self, to_ref: dict | None, sweep: cmux_control.SweepResult | None
+    ) -> None:
+        """Item 7's away-mode push; never affects the switch."""
+        try:
+            if not to_ref:
+                return
+            number = str(to_ref.get("number", ""))
+            email = to_ref.get("email", "") or ""
+            alias = next(
+                (a for num, a, _ in self.switcher.list_aliases() if num == number),
+                None,
+            )
+            label = alias or email.split("@", 1)[0] or f"#{number}"
+            channels = away_notify.push(
+                self.switcher.backup_dir,
+                away_notify.switch_text(
+                    label, number,
+                    len(sweep.sent) if sweep else 0,
+                    urls=sweep.urls if sweep else (),
+                    fleet=away_notify.fleet_lines(
+                        self.switcher.fleet_status_rows(number)),
+                ),
+            )
+        except Exception as e:  # pragma: no cover - belt for a never-raise API
+            _logger.warning("away-notify push failed: %s", type(e).__name__)
+            return
+        if channels:
+            self._emit(AwayNotifiedEvent(channels=channels))
+
     # -- stopped-session resume ------------------------------------------------
+
+    def _poll_limit_stops(self, state: dict | None = None) -> bool:
+        """Look for a limit stop that indicts the account in use right now.
+
+        Measured 2026-08-27: the active account read 100% at 13:27:18, a
+        session took its real 429 at 13:30:35, and the switch landed at
+        13:30:50 — the delay was the poll interval, and even those 15s were
+        tick luck. The transcript carries the same verdict immediately, and
+        `quotaLimits` names the window and its reset, so nothing has to be
+        inferred.
+
+        Two filters keep old news out, both cheap and neither needing the API:
+        a stop from BEFORE the last switch is evidence about an account
+        already left, and one whose window has since reset is history.
+        """
+        if self.settings.limit_scan_interval_seconds <= 0:
+            return False
+        try:
+            stops = self._limit_scanner.scan()
+        except Exception as e:
+            # Reading Claude Code's undocumented transcripts must cost this
+            # accelerator only — the tick still has the usage API to fall
+            # back on, which is exactly where it was before this existed.
+            _logger.warning("Could not scan for limit stops: %r", e)
+            return False
+        if not stops:
+            return False
+        if state is None:
+            state = self._read_state()
+        last_switch = state.get("lastSwitchAt")
+        floor = last_switch if isinstance(last_switch, (int, float)) else 0.0
+        now = self.clock()
+        # Not merely AFTER the last switch: a stop inside the grace is a
+        # stale-credential burn (see STALE_CREDENTIAL_GRACE_S) and says
+        # nothing about the account we are on now. The usage API remains the
+        # fallback for a new active that really is spent.
+        fresh = [
+            stop for stop in stops
+            if stop.observed_at > floor + STALE_CREDENTIAL_GRACE_S
+            and (not stop.resets_at or now < stop.resets_at)
+        ]
+        if not fresh:
+            return False
+        self._observed_limit = max(fresh, key=lambda stop: stop.observed_at)
+        return True
+
+    def _limit_evidence_applies(self) -> bool:
+        """Whether an observed stop still says the active account is spent.
+
+        Held across ticks rather than consumed on sight: the account really is
+        out of quota until its window rolls over, so a tick that could not
+        land a switch must keep treating it that way. Cleared when the switch
+        lands (`_perform`) or when the window resets.
+        """
+        stop = self._observed_limit
+        if stop is None:
+            return False
+        if stop.resets_at and self.clock() >= stop.resets_at:
+            self._observed_limit = None
+            return False
+        return True
 
     def _record_stopped_sessions(self) -> None:
         """Remember sessions stopped by a usage limit, while quota is gone.
@@ -2334,7 +2621,8 @@ class AutoSwitchEngine:
             # nudge from landing in a session already back at work.
             still = {s.session_id for s in session_resume.find_stopped_sessions()}
             resumed = session_resume.resume_sessions(
-                [s for s in pending if s.session_id in still]
+                [s for s in pending if s.session_id in still],
+                capture_dir=self.switcher.backup_dir,
             )
         except Exception as e:
             _logger.warning("Could not resume stopped sessions: %r", e)
@@ -2507,8 +2795,70 @@ class AutoSwitchEngine:
         except Exception:
             return delay
 
+    def _wait_watching_for_limits(self, delay: float) -> None:
+        """Sleep ``delay``, but cut it short when a session hits its limit.
+
+        The sleep is what makes the API a late witness: a stop landing one
+        second after a tick waits the whole interval to be noticed. Breaking
+        the wait into scan-sized chunks costs a stat per live session per
+        chunk and turns "up to one interval" into "up to one scan interval".
+
+        Deliberately paced off ``Event.wait`` alone, never ``self.clock()``:
+        the two are different time sources under an injected clock, and
+        mixing them would either spin or hang.
+        """
+        scan_every = self.settings.limit_scan_interval_seconds
+        if scan_every <= 0:
+            self._wake.wait(delay)
+            return
+        remaining = delay
+        while remaining > 0:
+            if self._wake.wait(min(remaining, scan_every)):
+                return  # a deliberate wake (settings change, stop) wins
+            remaining -= scan_every
+            if self._poll_limit_stops():
+                return  # evidence in hand: tick now rather than finish sleeping
+
+    # How long run_loop waits for the engine mutex. Nonzero because the
+    # menubar restarts its engine without joining the old thread (a settings
+    # change stops it and starts the successor immediately), so the lock is
+    # routinely still held for the first few hundred milliseconds.
+    _mutex_timeout_s = 5.0
+
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        Refuses to run at all — exit code 1, one ``engine-refused`` event —
+        when another engine already holds this store's mutex. A dry-run
+        engine never contends: it cannot switch, and the TUI's watch page
+        auto-starts one next to whatever live engine exists, so locking it
+        out would just blind that page's event feed.
+        """
+        if self.dry_run:
+            return self._run_loop_locked()
+        mutex = FileLock(self.state_path.parent / ENGINE_LOCK_FILENAME)
+        if not mutex.acquire(timeout=self._mutex_timeout_s):
+            self._emit(
+                EngineRefusedEvent(
+                    message="another auto-switch engine is already running "
+                    "for this account store (cswap auto, the menu bar, or "
+                    "the TUI) — this one will not start"
+                )
+            )
+            return 1
+        try:
+            # Best-effort breadcrumb for humans inspecting the lock file; the
+            # flock itself, not this content, is the authority.
+            mutex._lock_file.write(json.dumps({"pid": os.getpid()}))
+            mutex._lock_file.flush()
+        except Exception:  # pragma: no cover - diagnostics only
+            pass
+        try:
+            return self._run_loop_locked()
+        finally:
+            mutex.release()
+
+    def _run_loop_locked(self) -> int:
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
@@ -2534,4 +2884,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._wake.wait(delay)
+            self._wait_watching_for_limits(delay)

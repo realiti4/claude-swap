@@ -34,15 +34,20 @@ import os
 import re
 import socket
 import string
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 from claude_swap.paths import get_claude_config_home
 from claude_swap.process_detection import ClaudeSession, list_sessions
 from claude_swap.settings import load_settings
 
-_logger = logging.getLogger(__name__)
+# The shared logger, NOT a per-module one: `setup_logging` attaches the
+# rotating file handler to "claude-swap", and a "claude_swap.*" name is a
+# different tree — it propagates to root and is written nowhere.
+_logger = logging.getLogger("claude-swap")
 
 # The ``peerProtocol`` value in ~/.claude/sessions/<pid>.json this module was
 # written against. A session advertising anything else is skipped rather than
@@ -70,6 +75,22 @@ _TAIL_BYTES = 512 * 1024
 # uses 5s for the same exchange.
 _SEND_TIMEOUT_S = 5.0
 
+# Waking a session races Claude Code's in-process credential cache. Measured
+# 2026-08-27: `cswap` wrote the new account's credentials at 13:30:50.622, the
+# nudge landed 43ms later, and the turn it started was rejected at 13:30:52.792
+# with a real 429 whose quotaLimits.resetsAt was the OLD account's reset — the
+# session was still holding the previous token. The same session worked 25s
+# later with no further help. So the first nudge can burn itself, and one
+# burned nudge used to strand the session for good: the engine clears its
+# record unconditionally and `cswap use` is a short-lived process.
+#
+# These pace a bounded retry across that window. The delays are spread rather
+# than tight because detecting a burn is fast (~2s) — three back-to-back
+# nudges would all land inside the same stale window and change nothing.
+RESUME_RETRY_DELAYS_S: tuple[float, ...] = (5.0, 15.0)
+RESUME_VERIFY_S = 10.0  # how long to watch one nudge for a verdict
+RESUME_POLL_S = 1.0  # how often to re-read the tail while watching
+
 
 @dataclass(frozen=True)
 class StoppedSession:
@@ -84,6 +105,13 @@ class StoppedSession:
     # user; never parsed — the reset time comes from the usage API, which is
     # authoritative and already drives the engine's sleep.
     message: str
+    # The ``uuid`` of the limit-stop entry this session was found on. A nudge
+    # that burns on stale credentials appends a NEW limit stop, so comparing
+    # identities is what tells "burned, nudge again" from "held for review,
+    # leave it alone" — two states that look identical from the sender's side.
+    # Empty when the transcript entry carried no uuid, which disables
+    # verification for that session rather than guessing between the two.
+    stop_uuid: str = ""
 
 
 def transcript_path(session: ClaudeSession, claude_dir: Path | None = None) -> Path:
@@ -95,9 +123,19 @@ def transcript_path(session: ClaudeSession, claude_dir: Path | None = None) -> P
     project directory would be O(all transcripts) per tick, and two projects
     can share a session-id-shaped filename only if the id itself collides.
     """
+    return _transcript_for(session.cwd, session.session_id, claude_dir)
+
+
+def _transcript_for(cwd: str, session_id: str, claude_dir: Path | None) -> Path:
+    """The transcript for a cwd/session-id pair (see :func:`transcript_path`).
+
+    Split out because the retry loop re-reads a :class:`StoppedSession`'s tail,
+    and that has no ``ClaudeSession`` to hand — only the two fields the path is
+    actually derived from.
+    """
     root = (claude_dir or get_claude_config_home()) / "projects"
-    slug = "".join(c if c.isalnum() else "-" for c in session.cwd)
-    return root / slug / f"{session.session_id}.jsonl"
+    slug = "".join(c if c.isalnum() else "-" for c in cwd)
+    return root / slug / f"{session_id}.jsonl"
 
 
 def _decides_the_turn(entry: dict) -> bool:
@@ -231,8 +269,98 @@ def find_stopped_sessions(claude_dir: Path | None = None) -> list[StoppedSession
             cwd=session.cwd,
             socket_path=session.messaging_socket_path,
             message=_limit_text(entry),
+            stop_uuid=str(entry.get("uuid") or ""),
         ))
     return stopped
+
+
+@dataclass(frozen=True)
+class LimitStop:
+    """A live session's terminal limit stop, read as evidence about quota.
+
+    The account a session runs on is whichever one claude-swap has active, so
+    a session hitting its plan limit says the ACTIVE account is spent — sooner
+    and more cheaply than the usage API, which only reports it on the next
+    poll (up to a full interval late) and costs a request to ask.
+    """
+
+    session_id: str
+    stop_uuid: str
+    # ``quotaLimits.rateLimitType`` ("five_hour", "seven_day", ...) and
+    # ``quotaLimits.resetsAt`` (epoch seconds). Both empty/zero when the entry
+    # carried no ``quotaLimits`` — the stop is still real, it just says less.
+    window: str
+    resets_at: float
+    # The entry's own timestamp: when the session actually stopped, which is
+    # what decides whether the evidence predates a switch that already fixed it.
+    observed_at: float
+
+
+def _entry_epoch(entry: dict) -> float:
+    """An entry's ``timestamp`` as epoch seconds, or 0.0 if unusable."""
+    stamp = entry.get("timestamp")
+    if isinstance(stamp, str):
+        try:
+            return datetime.fromisoformat(stamp).timestamp()
+        except ValueError:
+            pass
+    return 0.0
+
+
+class LimitStopScanner:
+    """Reports terminal limit stops that are news since the last scan.
+
+    Built to run every few seconds between engine ticks, so it is careful
+    about cost: a transcript is re-read only when its file mtime moved, which
+    makes an idle machine one ``stat`` per live session. Stops already
+    reported are remembered by uuid so a stop is news exactly once — an entry
+    with no uuid is therefore never reported, since it could not be told apart
+    from the next one.
+
+    Unlike :func:`find_stopped_sessions` this does NOT require a messageable
+    socket: what a transcript says about the account's quota is true whether
+    or not that session can be nudged afterwards.
+    """
+
+    def __init__(self, claude_dir: Path | None = None) -> None:
+        self._claude_dir = claude_dir
+        self._mtimes: dict[Path, float] = {}
+        self._seen: set[str] = set()
+
+    def scan(self) -> list["LimitStop"]:
+        found: list[LimitStop] = []
+        for session in list_sessions(self._claude_dir):
+            if not session.session_id:
+                continue
+            path = transcript_path(session, self._claude_dir)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if self._mtimes.get(path) == mtime:
+                continue  # untouched since the last look — nothing new to read
+            self._mtimes[path] = mtime
+            entry = _last_turn_entry(path)
+            if not is_limit_stop(entry):
+                continue
+            stop_uuid = str(entry.get("uuid") or "")
+            if not stop_uuid or stop_uuid in self._seen:
+                continue
+            self._seen.add(stop_uuid)
+            quota = entry.get("quotaLimits")
+            quota = quota if isinstance(quota, dict) else {}
+            try:
+                resets_at = float(quota.get("resetsAt") or 0.0)
+            except (TypeError, ValueError):
+                resets_at = 0.0
+            found.append(LimitStop(
+                session_id=session.session_id,
+                stop_uuid=stop_uuid,
+                window=str(quota.get("rateLimitType") or ""),
+                resets_at=resets_at,
+                observed_at=_entry_epoch(entry),
+            ))
+        return found
 
 
 def _peer_token(pid: int, claude_dir: Path | None = None) -> str | None:
@@ -394,26 +522,241 @@ RESUME_MESSAGE = (
 )
 
 
-def resume_sessions(
-    sessions: list[StoppedSession], claude_dir: Path | None = None
-) -> list[StoppedSession]:
-    """Nudge each stopped session. Returns the ones the socket accepted.
+def _nudge_text(attempt: int) -> str:
+    """The nudge to send on one attempt — distinct per attempt.
 
-    "Accepted" means the bytes were written to the inbox, NOT that Claude
-    Code acted on them. It may still HOLD the message for the user's review
-    (see the module docstring on ``crossSessionInbound``), and holds are
-    invisible from this side — the socket write succeeds either way.
+    Claude Code discards a peer message identical to the sender's previous
+    one ("Dropped a peer message ... identical to the previous message from
+    this sender", observed 2026-08-27), which silently made every retry a
+    no-op: the bytes were written, ``send_peer_message`` reported success,
+    and the inbox threw them away. The suffix only has to differ; it stays
+    non-instructional like the base message.
     """
-    resumed = []
-    for stopped in sessions:
-        if send_peer_message(
-            stopped.socket_path,
-            RESUME_MESSAGE,
-            pid=stopped.pid,
-            claude_dir=claude_dir,
-        ):
-            resumed.append(stopped)
-    return resumed
+    if not attempt:
+        return RESUME_MESSAGE
+    return f"{RESUME_MESSAGE} (nudge {attempt + 1})"
+
+
+def _active_headroom(switcher) -> float | None:
+    """Measured headroom of the account that is live right now, or ``None``.
+
+    Store-only — no network and no keychain refresh. This runs on the path of
+    a switch the user just made by hand, so it must not add latency to it.
+
+    ``None`` means "could not measure", never "empty": an unreadable row is
+    not evidence of an exhausted account, the same rule the engine applies in
+    ``_rank_candidates``.
+    """
+    try:
+        from claude_swap import oauth
+        from claude_swap.snapshot_source import SnapshotSource
+
+        raw = load_settings(switcher.backup_dir).model or ""
+        models = tuple(m.strip() for m in raw.split(",") if m.strip())
+        for account in SnapshotSource(switcher).take(store_only=True).accounts:
+            if account.is_active:
+                return oauth.account_headroom(account.usage.last_good, models)
+    except Exception as e:
+        _logger.debug("Could not read the active account's headroom: %r", e)
+    return None
+
+
+
+def _nudge_verdict(stopped: StoppedSession, claude_dir: Path | None) -> str:
+    """What the transcript says about a nudge already delivered to ``stopped``.
+
+    Four tails, three meanings:
+
+    * the ORIGINAL limit stop, unchanged — either Claude Code has not picked
+      the message up yet, or it is HOLDING it for the user's review. Holds are
+      invisible from this side (see the module docstring on
+      ``crossSessionInbound``), so this stays ``"waiting"`` and, if it never
+      changes, the nudge is simply left alone. Retrying a held message would
+      queue duplicates in front of someone who has not looked yet.
+    * a DIFFERENT limit stop — the nudge landed, started a turn, and that turn
+      was rejected. That is the stale-credential burn, and it is worth another
+      nudge once the switched-to account has propagated.
+    * a user turn — our own nudge, sitting in the ~2s gap before the 429 it
+      earns. Calling this recovery would declare victory in exactly the window
+      the failure lives in.
+    * anything else (a real assistant turn, a retryable mid-turn 429) — work
+      is happening. Done.
+
+    A missing or unreadable transcript yields ``"done"``: nothing can be
+    verified, and a retry would be guesswork.
+    """
+    entry = _last_turn_entry(
+        _transcript_for(stopped.cwd, stopped.session_id, claude_dir)
+    )
+    if entry is None:
+        return "done"
+    if is_limit_stop(entry):
+        if str(entry.get("uuid") or "") == stopped.stop_uuid:
+            return "waiting"
+        return "burned"
+    if entry.get("type") == "user":
+        return "waiting"
+    return "done"
+
+
+def _watch_nudges(
+    sent: list[StoppedSession], claude_dir: Path | None, sleep, clock
+) -> list[StoppedSession]:
+    """Watch delivered nudges until each resolves; return the burned ones.
+
+    Only sessions carrying a stop identity are watched — without one a second
+    limit stop is indistinguishable from the first, so there is no verdict to
+    reach and no safe retry to make.
+    """
+    watching = [s for s in sent if s.stop_uuid]
+    burned: list[StoppedSession] = []
+    deadline = clock() + RESUME_VERIFY_S
+    while watching and clock() < deadline:
+        sleep(RESUME_POLL_S)
+        still: list[StoppedSession] = []
+        for stopped in watching:
+            verdict = _nudge_verdict(stopped, claude_dir)
+            if verdict == "waiting":
+                still.append(stopped)
+            elif verdict == "burned":
+                # Re-baseline on the stop we just saw, so the next round
+                # compares against it rather than the original.
+                entry = _last_turn_entry(
+                    _transcript_for(stopped.cwd, stopped.session_id, claude_dir)
+                )
+                burned.append(
+                    replace(stopped, stop_uuid=str((entry or {}).get("uuid") or ""))
+                )
+        watching = still
+    return burned
+
+
+_CAPTURE_KEEP = 40
+
+
+def capture_limit_screens(
+    sessions: list[StoppedSession], backup_dir: Path | None
+) -> None:
+    """Save what each limit-stopped session's screen shows right now.
+
+    6b groundwork: the limit dialog captures input, so the future nudge flow
+    must recognize and dismiss it before typing — but its exact on-screen
+    markers are unknown, and guessing them means typing at a live session
+    blind. These captures (``<backup_dir>/limit-screens/``) are the corpus
+    that recognizer gets written from. Read-only via cmux, best-effort,
+    never raises; sessions outside cmux simply aren't captured. Bounded:
+    only the newest ``_CAPTURE_KEEP`` files are kept.
+    """
+    if backup_dir is None:
+        return
+    try:
+        from claude_swap import cmux_control
+
+        capture_dir = Path(backup_dir) / "limit-screens"
+        for stopped in sessions:
+            got = cmux_control.capture_screen_for_pid(stopped.pid)
+            if got is None:
+                continue
+            ref, screen = got
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%S")
+            path = capture_dir / f"{stamp}-{stopped.session_id[:8]}.txt"
+            path.write_text(
+                f"# session {stopped.session_id} pid {stopped.pid} "
+                f"surface {ref}\n{screen}"
+            )
+        if capture_dir.is_dir():
+            files = sorted(capture_dir.glob("*.txt"))
+            for old in files[:-_CAPTURE_KEEP]:
+                old.unlink(missing_ok=True)
+    except Exception as e:
+        _logger.debug("limit-screen capture failed: %r", e)
+
+
+def _nudge_one(
+    stopped: StoppedSession, text: str, claude_dir: Path | None
+) -> bool:
+    """Deliver one nudge — the PTY first, the peer socket as fallback.
+
+    cmux is the PRIMARY channel (decision 2026-08-27): typing into the PTY
+    has no dedup and no hold, and the screen read-back is real delivery
+    confirmation. The socket covers what the PTY can't reach:
+
+    * ``no-surface`` — the session isn't hosted in cmux;
+    * ``captured-input`` — a dialog holds the input and wouldn't dismiss;
+      the inbox message at least queues behind it.
+
+    A typed delivery — verified or not — must NEVER also go to the socket:
+    the message was submitted as a user turn, and a socket copy on top
+    queues a duplicate. ``running`` gets nothing at all: the session is
+    mid-turn, so it isn't stopped anymore and the transcript watch will
+    reach its own verdict.
+    """
+    try:
+        from claude_swap import cmux_control
+
+        status = cmux_control.nudge_via_cmux(stopped.pid, text)
+    except Exception as e:
+        _logger.debug("cmux nudge unavailable for %s: %r", stopped.session_id, e)
+        status = "no-surface"
+    if status in ("delivered", "typed-unverified"):
+        return True
+    if status == "running":
+        return False
+    return send_peer_message(
+        stopped.socket_path, text, pid=stopped.pid, claude_dir=claude_dir
+    )
+
+
+def resume_sessions(
+    sessions: list[StoppedSession],
+    claude_dir: Path | None = None,
+    *,
+    sleep=time.sleep,
+    clock=time.monotonic,
+    capture_dir: Path | None = None,
+) -> list[StoppedSession]:
+    """Nudge each stopped session, retrying one burned on stale credentials.
+
+    Returns the sessions the socket accepted at least once. "Accepted" means
+    the bytes were written to the inbox, NOT that Claude Code acted on them —
+    it may still HOLD the message for the user's review, and holds are
+    invisible from this side.
+
+    A nudge sent moments after a switch can be rejected by the account the
+    switch moved AWAY from, because Claude Code caches its token in-process
+    (see ``RESUME_RETRY_DELAYS_S``). So each delivery is watched and, if it
+    burned, sent again after a pause — bounded, because an account that never
+    comes back must not be nudged forever.
+
+    ``sleep``/``clock`` are injected so tests can drive the retry pacing
+    without waiting on a wall clock.
+    """
+    accepted: dict[str, StoppedSession] = {}
+    pending = list(sessions)
+    # Before anything is typed at them: what do these screens show? (6b
+    # corpus — see capture_limit_screens.)
+    capture_limit_screens(pending, capture_dir)
+    for attempt in range(1 + len(RESUME_RETRY_DELAYS_S)):
+        if attempt:
+            sleep(RESUME_RETRY_DELAYS_S[attempt - 1])
+        sent = []
+        for stopped in pending:
+            if _nudge_one(stopped, _nudge_text(attempt), claude_dir):
+                accepted.setdefault(stopped.session_id, stopped)
+                sent.append(stopped)
+        pending = _watch_nudges(sent, claude_dir, sleep, clock)
+        if not pending:
+            break
+    if pending:
+        _logger.warning(
+            "%d session(s) could not be woken after %d nudges — the account "
+            "they are on may still be at its limit: %s",
+            len(pending),
+            1 + len(RESUME_RETRY_DELAYS_S),
+            ", ".join(s.session_id for s in pending),
+        )
+    return list(accepted.values())
 
 
 def resume_after_manual_switch(
@@ -446,7 +789,22 @@ def resume_after_manual_switch(
             return []
         if not load_settings(switcher.backup_dir).resume_stopped_sessions:
             return []
-        resumed = resume_sessions(find_stopped_sessions(claude_dir), claude_dir)
+        # A slot change is not evidence of quota. Rotating off the last account
+        # wraps to the first, which may be just as spent: measured 2026-08-27,
+        # a wrap onto an account at 100% weekly woke every stopped session
+        # straight into a limit four days from resetting.
+        headroom = _active_headroom(switcher)
+        if headroom is not None and headroom <= 0:
+            _logger.info(
+                "Not nudging after the switch: the account now live has no "
+                "headroom left, so a nudge would spend each session on a "
+                "limit it cannot clear."
+            )
+            return []
+        resumed = resume_sessions(
+            find_stopped_sessions(claude_dir), claude_dir,
+            capture_dir=switcher.backup_dir,
+        )
     except Exception as e:
         # Reading Claude Code's undocumented transcript/session state must
         # cost the nudge, never the switch the user actually asked for.

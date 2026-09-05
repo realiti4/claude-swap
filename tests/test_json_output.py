@@ -47,6 +47,24 @@ class TestJsonHelpers:
         assert out["spend"]["used"] == 12.5
         assert out["spend"]["resetsAt"] == resets_at
 
+    def test_usage_to_json_emits_resets_at_inferred_for_carried_reset(self):
+        # usage_store._carry_weekly_reset marks a carried-forward weekly
+        # reset with resets_at_inferred=True; the JSON projection must
+        # surface that so clients can distinguish it from a real reset.
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        usage = {
+            "seven_day": {"pct": 0.0, "resets_at": resets_at,
+                          "resets_at_inferred": True},
+        }
+        out = usage_to_json(usage)
+        assert out["sevenDay"]["resetsAtInferred"] is True
+
+    def test_usage_to_json_omits_resets_at_inferred_for_a_real_reset(self):
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        usage = {"seven_day": {"pct": 16.0, "resets_at": resets_at}}
+        out = usage_to_json(usage)
+        assert "resetsAtInferred" not in out["sevenDay"]
+
     def test_usage_to_json_projects_scoped_windows(self):
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=3, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
@@ -222,6 +240,47 @@ class TestListJson:
         assert acct1["active"] is True
         assert acct1["usageStatus"] == "ok"
         assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+
+    def test_list_payload_live_sessions_breakdown(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        from claude_swap.process_detection import ClaudeSession
+
+        def rec(pid: int, status: str | None) -> ClaudeSession:
+            return ClaudeSession(pid=pid, session_id=f"s{pid}", cwd="/",
+                                 started_at=0, kind="interactive",
+                                 entrypoint="cli", status=status)
+
+        sessions = [rec(1, "busy"), rec(2, "busy"), rec(3, "idle"),
+                    rec(4, "waiting"), rec(5, "shell"), rec(6, None)]
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=active_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({})), \
+             patch("claude_swap.process_detection.list_sessions",
+                   return_value=sessions):
+            payload = switcher.list_accounts(json_output=True)
+
+        # Parts always sum to total; a status-less record lands in unknown.
+        live = payload["liveSessions"]
+        detail = live.pop("sessions")
+        assert live == {
+            "busy": 2, "idle": 1, "waiting": 1, "shell": 1,
+            "unknown": 1, "total": 6,
+        }
+        # Additive per-session detail: busy first, all records carried.
+        assert len(detail) == 6
+        assert detail[0]["status"] == "busy" and detail[1]["status"] == "busy"
+        assert {"pid", "cwd", "status", "kind", "startedAt"} <= detail[0].keys()
 
     def test_list_payload_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,

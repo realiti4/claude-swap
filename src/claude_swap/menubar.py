@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -44,6 +44,10 @@ STRATEGY_LABELS: dict[str, str] = {
 }
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
+# Account rows are padded into columns and drawn monospaced (see align_rows).
+SPAN = ""  # cell key for text that ends a row instead of claiming a column
+COLUMN_GAP = "  "
+ROW_PCT_WIDTH = 3  # right-align percentages so "0%" and "100%" end together
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 
 
@@ -191,10 +195,18 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
     if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
+        countdown = f"{days}d {hours}h"
+    elif hours > 0:
+        countdown = f"{hours}h {minutes}m"
+    else:
+        countdown = f"{minutes}m"
+    # Countdown plus wall clock ("2h 15m · 11:19"): the remaining time says
+    # how long, the clock says when — the reader shouldn't have to add.
+    clock = oauth.reset_clock_string(
+        datetime.fromtimestamp(ts, tz=timezone.utc),
+        datetime.fromtimestamp(now, tz=timezone.utc),
+    )
+    return f"{countdown} · {clock}"
 
 
 _WEEKLY_PERIOD_S = 7 * 86400  # weekly limits reset on a fixed 7-day cadence
@@ -226,22 +238,40 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
-def usage_summary(
-    usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
-) -> str:
-    """One-line usage summary for an account row (reset countdown computed live).
+def usage_segments(
+    usage: dict | str | None,
+    now: float | None = None,
+    fetched_at: float | None = None,
+    *,
+    pct_width: int = 0,
+) -> list[tuple[str, str]]:
+    """Usage as ``(column key, text)`` cells, in display order.
+
+    The key names the column a cell belongs to, so rows that carry different
+    windows can still be lined up: ``5h``/``7d``, one column per scoped model
+    (keyed by its name), and ``$``. A sentinel string or a missing measurement
+    yields a single :data:`SPAN` cell, which claims no column and simply ends
+    the row.
 
     ``fetched_at`` is the underlying measurement's fetch time (may be older
     than ``now`` when serving last-good data) — used only to flag a weekly
     window that's meaningfully ahead of pace (issue #125), never the 5h one.
+
+    ``pct_width`` right-aligns the percentage into that many digits so each
+    window's suffix (pace marker, countdown) starts at the same offset on
+    every row; ``0`` keeps the compact form the title and the log use.
     """
     if isinstance(usage, str):
-        return usage
+        return [(SPAN, usage)]
     if usage is None:
-        return "usage unavailable"
+        return [(SPAN, "usage unavailable")]
     if now is None:
         now = time.time()
-    parts: list[str] = []
+
+    def pct(value: float) -> str:
+        return f"{value:.0f}%".rjust(pct_width + 1)
+
+    cells: list[tuple[str, str]] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -254,19 +284,19 @@ def usage_summary(
             # pct with this cycle's freshly-reset 0% display.
             pace_result = pace.compute_pace(window, fetched_at=fetched_at)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            seg = f"{label} {window['pct']:.0f}%"
+            seg = f"{label} {pct(window['pct'])}"
             if key == "seven_day" and pace_result and pace_result.ahead:
                 seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
-            parts.append(seg)
+            cells.append((label, seg))
     # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
     for window in usage.get("scoped") or []:
         window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
         pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-            seg = f"{window['name']} {window['pct']:.0f}%"
+            seg = f"{window['name']} {pct(window['pct'])}"
             if window["pct"] >= 100:
                 seg += " (!)"  # maxed model — the usual reason to switch
             elif pace_result and pace_result.ahead:
@@ -274,14 +304,21 @@ def usage_summary(
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"
-            parts.append(seg)
+            cells.append((window["name"], seg))
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-        parts.append(f"$ {spend['pct']:.0f}%")
-    return " · ".join(parts) if parts else "usage unavailable"
+        cells.append(("$", f"$ {pct(spend['pct'])}"))
+    return cells or [(SPAN, "usage unavailable")]
 
 
-def format_account_label(
+def usage_summary(
+    usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
+) -> str:
+    """One-line usage summary for the title and the log (no column padding)."""
+    return " · ".join(text for _, text in usage_segments(usage, now, fetched_at))
+
+
+def account_row_cells(
     num,
     email: str,
     usage: dict | str | None,
@@ -289,11 +326,118 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
-) -> str:
-    """Build one account row's menu label."""
+) -> list[tuple[str, str]]:
+    """One account row as alignable ``(column key, text)`` cells."""
     label = f"{alias}  ({email})" if alias else email
-    marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    if disabled:
+        label += "  (disabled)"
+    return [
+        ("#", str(num)),
+        ("acct", label),
+        *usage_segments(usage, now, fetched_at, pct_width=ROW_PCT_WIDTH),
+    ]
+
+
+def align_rows(rows: list[list[tuple[str, str]]]) -> list[str]:
+    """Pad each column to its widest cell so rows line up in a monospaced font.
+
+    Columns are the ordered union of the rows' non-:data:`SPAN` keys, so a row
+    that lacks one — an account with no per-model limit, say — leaves a gap
+    instead of shifting every later column left. A row's :data:`SPAN` cell is
+    written where its first missing column would have begun, which keeps a
+    sentinel ("no credentials") in the usage area rather than off to the right
+    past every column it doesn't have.
+    """
+    keys: list[str] = []
+    for row in rows:
+        for key, _ in row:
+            if key != SPAN and key not in keys:
+                keys.append(key)
+    widths = {
+        key: max((len(text) for row in rows for k, text in row if k == key), default=0)
+        for key in keys
+    }
+    labels: list[str] = []
+    for row in rows:
+        cells = dict(row)
+        span = cells.pop(SPAN, None)
+        parts: list[str] = []
+        for key in keys:
+            if span is not None and key not in cells:
+                break
+            parts.append(cells.get(key, "").ljust(widths[key]))
+        if span is not None:
+            parts.append(span)
+        labels.append(COLUMN_GAP.join(parts).rstrip())
+    return labels
+
+
+# The `autoswitch.model` sentinel meaning "every scoped window this account
+# reports" (see oauth.relevant_windows).
+MODEL_ALL = "all"
+
+
+def model_menu_names(usages) -> list[str]:
+    """Scoped model names present anywhere in the snapshot, first-seen order.
+
+    The "Count model limits" submenu offers exactly these. Reading them off the
+    measurements the rows already display means the menu tracks whatever models
+    the fleet actually reports, instead of carrying a hardcoded list that goes
+    stale the day a new model ships.
+    """
+    names: list[str] = []
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue  # sentinel ("no credentials") or a failed fetch
+        for window in usage.get("scoped") or ():
+            if isinstance(window, dict) and isinstance(window.get("name"), str):
+                if window["name"] not in names:
+                    names.append(window["name"])
+    return names
+
+
+def toggle_model(current: str, name: str) -> str:
+    """``autoswitch.model`` with ``name`` flipped in or out of its comma list.
+
+    Matches case-insensitively and tolerates hand-written spacing, because the
+    CLI writes this same setting as free text and ``oauth.relevant_windows``
+    compares it case-insensitively too.
+
+    ``all`` is a wildcard rather than a membership list, so there is nothing to
+    remove a name *from*: toggling a model while it is set narrows the setting
+    to just that model.
+    """
+    if current.strip().lower() == MODEL_ALL:
+        return name
+    selected = [part.strip() for part in current.split(",") if part.strip()]
+    kept = [s for s in selected if s.lower() != name.lower()]
+    if len(kept) == len(selected):
+        kept.append(name)  # was not selected — turn it on
+    return ",".join(kept)
+
+
+def _set_monospaced_title(menu_item, text: str) -> None:
+    """Draw one ``NSMenuItem``'s title in the system monospaced font.
+
+    Menus render in a proportional font, where the padding :func:`align_rows`
+    adds doesn't line anything up; an attributed title is the only per-item
+    way to change that. A pyobjc surprise here is not worth losing the menu
+    over — rumps' plain title stays, just unaligned.
+    """
+    try:
+        from AppKit import NSFont, NSFontAttributeName
+        from Foundation import NSAttributedString
+
+        font = NSFont.monospacedSystemFontOfSize_weight_(NSFont.systemFontSize(), 0.0)
+        menu_item.setAttributedTitle_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                text, {NSFontAttributeName: font}
+            )
+        )
+    except Exception:
+        logging.getLogger("claude-swap").debug(
+            "monospaced menu title unavailable", exc_info=True
+        )
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -472,7 +616,12 @@ def run(switcher) -> int:
 
     from claude_swap import session_resume
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
+    from claude_swap.settings import (
+        AutoSwitchSettings,
+        load_settings,
+        set_setting,
+        unset_setting,
+    )
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -493,6 +642,10 @@ def run(switcher) -> int:
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
+            # Set by the resume worker, drained on the main thread by
+            # on_sync_tick — rumps notifications must not be posted from a
+            # background thread.
+            self._resume_note = None
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
@@ -566,6 +719,13 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             self._detect_active_change()
             self._drain_engine_events()
+            note, self._resume_note = self._resume_note, None
+            if note:
+                rumps.notification(
+                    "claude-swap",
+                    "Resumed stopped sessions",
+                    f"{note} session(s) stopped by the usage limit were nudged.",
+                )
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -662,6 +822,20 @@ def run(switcher) -> int:
             except Exception:
                 return AutoSwitchSettings.resume_stopped_sessions
 
+        def _limit_scan_on(self) -> bool:
+            """Whether the engine scans sessions for a hit limit (for the menu)."""
+            try:
+                return load_settings(self.switcher.backup_dir).limit_scan_interval_seconds > 0
+            except Exception:
+                return AutoSwitchSettings.limit_scan_interval_seconds > 0
+
+        def _models(self) -> str:
+            """Current ``autoswitch.model`` selection (for the menu)."""
+            try:
+                return load_settings(self.switcher.backup_dir).model or ""
+            except Exception:
+                return ""
+
         def _strategy(self) -> str:
             """Current auto-switch strategy from core settings (for the menu).
 
@@ -685,13 +859,18 @@ def run(switcher) -> int:
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
-                    ),
-                    callback=self._make_switch_to(num),
+            accounts = self.snapshot["accounts"]
+            # Widths come from the whole snapshot, so every row has to be
+            # rendered together — one row can't know how wide the column is.
+            labels = align_rows([
+                account_row_cells(
+                    num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
                 )
+                for num, email, _active, display, _last_good, alias, disabled, fetched_at in accounts
+            ])
+            for (num, _email, is_active, *_rest), label in zip(accounts, labels):
+                item = rumps.MenuItem(label, callback=self._make_switch_to(num))
+                _set_monospaced_title(item._menuitem, label)
                 item.state = 1 if is_active else 0
                 account_items.append(item)
             if not account_items:
@@ -793,15 +972,12 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
+            # Causal order: master switch, then policy (strategy,
+            # threshold), then the triggers that fire switches (limit
+            # scan, model limits), then the aftermath (resume).
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
-
-            resume_item = rumps.MenuItem(
-                "Resume limit-stopped sessions", callback=self.on_toggle_resume
-            )
-            resume_item.state = 1 if self._resume_stopped() else 0
-            menu.add(resume_item)
 
             strategy = self._strategy()
             strategy_menu = rumps.MenuItem("Auto-switch strategy")
@@ -827,6 +1003,39 @@ def run(switcher) -> int:
                 ch.state = 1 if current == pct else 0
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
+
+            scan_item = rumps.MenuItem(
+                "Switch the moment a limit is hit", callback=self.on_toggle_limit_scan
+            )
+            scan_item.state = 1 if self._limit_scan_on() else 0
+            menu.add(scan_item)
+
+            # Per-model weekly limits are OFF by default: folding one in makes
+            # an account with 5h/7d headroom but a maxed model count as spent,
+            # so the engine switches away from it. Right for someone pinned to
+            # that model, surprising for everyone else — hence opt-in, and
+            # offered only for models the fleet actually reports.
+            models = self._models()
+            model_names = model_menu_names(a[3] for a in self.snapshot["accounts"])
+            if model_names:
+                selected = {m.strip().lower() for m in models.split(",") if m.strip()}
+                every = MODEL_ALL in selected
+                model_menu = rumps.MenuItem("Count model limits")
+                all_item = rumps.MenuItem("All models", callback=self.on_toggle_all_models)
+                all_item.state = 1 if every else 0
+                model_menu.add(all_item)
+                model_menu.add(None)
+                for name in model_names:
+                    ch = rumps.MenuItem(name, callback=self._make_model_toggle(name))
+                    ch.state = 1 if every or name.lower() in selected else 0
+                    model_menu.add(ch)
+                menu.add(model_menu)
+
+            resume_item = rumps.MenuItem(
+                "Resume limit-stopped sessions", callback=self.on_toggle_resume
+            )
+            resume_item.state = 1 if self._resume_stopped() else 0
+            menu.add(resume_item)
 
             return menu
 
@@ -858,14 +1067,26 @@ def run(switcher) -> int:
             turned off — and is therefore switching by hand — has no engine
             running to do it. Without this, `resumeStoppedSessions` is inert for
             exactly the person driving the switches.
+
+            Runs on a worker: a nudge burned on a stale credential is watched
+            and retried, so this call can take the better part of a minute
+            (RESUME_RETRY_DELAYS_S plus a verify window each). Measured
+            2026-08-27, doing it inline froze the menu for 42s after a switch.
             """
-            resumed = session_resume.resume_after_manual_switch(self.switcher, before)
-            if resumed:
-                rumps.notification(
-                    "claude-swap",
-                    "Resumed stopped sessions",
-                    f"{len(resumed)} session(s) stopped by the usage limit were nudged.",
+            threading.Thread(
+                target=self._resume_worker, args=(before,), daemon=True
+            ).start()
+
+        def _resume_worker(self, before):
+            try:
+                resumed = session_resume.resume_after_manual_switch(
+                    self.switcher, before
                 )
+            except Exception:
+                self.switcher._logger.debug("resume worker failed", exc_info=True)
+                return
+            if resumed:
+                self._resume_note = len(resumed)  # main thread posts it
 
         def _make_switch_to(self, num):
             def cb(_sender):
@@ -1033,6 +1254,44 @@ def run(switcher) -> int:
                 return
             self._restart_engine()  # apply immediately if running
             self.rebuild_menu()
+
+        def _set_autoswitch(self, key: str, value: str, what: str) -> None:
+            """Persist one core auto-switch setting and apply it to a live engine.
+
+            An empty value means "back to the default", which ``set_setting``
+            rejects outright (it reads as a typo from the CLI, where ``unset``
+            is the documented way to clear a key). From a menu there is no typo
+            to catch: unchecking the last model IS the request to clear it.
+            """
+            try:
+                if value:
+                    set_setting(self.switcher.backup_dir, key, value)
+                else:
+                    unset_setting(self.switcher.backup_dir, key)
+            except Exception as e:
+                rumps.alert(title="claude-swap", message=f"Couldn't set {what}: {e}")
+                return
+            self._restart_engine()  # apply immediately if running
+            self.rebuild_menu()
+
+        def on_toggle_limit_scan(self, _sender):
+            # Stored as an interval, offered as on/off: 5s versus 3s is not a
+            # choice anyone makes, and 0 is the documented way to disable it.
+            new = 0.0 if self._limit_scan_on() else AutoSwitchSettings.limit_scan_interval_seconds
+            self._set_autoswitch(
+                "autoswitch.limitScanIntervalSeconds", str(new), "limit scanning"
+            )
+
+        def on_toggle_all_models(self, _sender):
+            new = "" if self._models().strip().lower() == MODEL_ALL else MODEL_ALL
+            self._set_autoswitch("autoswitch.model", new, "model limits")
+
+        def _make_model_toggle(self, name):
+            def cb(_sender):
+                self._set_autoswitch(
+                    "autoswitch.model", toggle_model(self._models(), name), "model limits"
+                )
+            return cb
 
         def _make_strategy(self, name):
             def cb(_sender):

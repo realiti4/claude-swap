@@ -52,6 +52,8 @@ def _window_to_json(entry: dict) -> dict:
     out: dict = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
+    if entry.get("resets_at_inferred"):
+        out["resetsAtInferred"] = True
     cell = oauth.fresh_reset_strings(entry)
     if cell:
         out["countdown"], out["clock"] = cell
@@ -220,7 +222,9 @@ def account_row(
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
     alias: str = "",
+    icon: str = "",
     disabled: bool = False,
+    plan: str = "",
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -236,6 +240,13 @@ def account_row(
     }
     if alias:
         row["alias"] = alias
+    if icon:
+        row["icon"] = icon
+    # Additive: the account's Claude subscription tier ("Max 20x", "Pro"),
+    # read from the slot's backed-up oauthAccount profile. Absent when the
+    # backup carries no tier (API-key slots, very old backups).
+    if plan:
+        row["plan"] = plan
     # Additive field: present only when the slot is held out of rotation, so
     # existing consumers keying on the base schema are unaffected.
     if disabled:

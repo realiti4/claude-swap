@@ -1615,3 +1615,34 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestParseSwitchHistory:
+    """cswap history: the supported reading of the switcher log."""
+
+    def test_parses_reverses_and_trims_stamps(self):
+        from claude_swap.cli import parse_switch_history
+
+        log = (
+            "2026-06-27 02:06:11,123 - INFO - Switched from account 3 to 1\n"
+            "junk line\n"
+            "2026-06-27 03:00:00,456 - INFO - Switched from account 1 to 2\n"
+        )
+        assert parse_switch_history(log) == [
+            {"from": 1, "to": 2, "at": "2026-06-27 03:00"},
+            {"from": 3, "to": 1, "at": "2026-06-27 02:06"},
+        ]
+
+    def test_limit_keeps_most_recent(self):
+        from claude_swap.cli import parse_switch_history
+
+        log = "\n".join(
+            f"2026-06-27 0{n % 10}:00:00 - Switched from account 1 to 2"
+            for n in range(15)
+        )
+        assert len(parse_switch_history(log)) == 10
+
+    def test_empty_log(self):
+        from claude_swap.cli import parse_switch_history
+
+        assert parse_switch_history("") == []

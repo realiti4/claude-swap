@@ -1005,6 +1005,58 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         return account_num, normalized
 
+    def set_icon(self, identifier: str, icon: str) -> tuple[str, str]:
+        """Set the display icon (one emoji/glyph) for an account.
+
+        Stored in the sequence record beside ``alias`` — cswap-level, not
+        app-local, so every frontend (menubar app, TUI) renders the same
+        icon (backlog item 3's storage decision, the "emoji is the cheap
+        version" branch). Kept to a single grapheme so row layouts stay
+        aligned. Returns ``(account_num, icon)``.
+        """
+        self._refuse_session_shell()
+        icon = icon.strip()
+        # One user-perceived character: crude but dependency-free — an emoji
+        # with modifiers/ZWJ is several code points but never longer than 12,
+        # and anything with whitespace or ASCII letters is not an icon.
+        if not icon or len(icon) > 12 or any(c.isspace() for c in icon) or icon.isascii():
+            raise ValidationError(
+                f"Icon must be a single emoji/symbol, got: {icon!r}"
+            )
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        record["icon"] = icon
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return account_num, icon
+
+    def unset_icon(self, identifier: str) -> str:
+        """Clear an account's icon. Idempotent, like :meth:`unset_alias`."""
+        self._refuse_session_shell()
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        if "icon" in record:
+            del record["icon"]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        return account_num
+
     def unset_alias(self, identifier: str) -> str:
         """Clear the alias for the account matching identifier.
 
@@ -1524,6 +1576,64 @@ class ClaudeAccountSwitcher:
             self._relocate_locked(num_src, target)
             return num_src, target, False
 
+    def reorder_accounts(self, order: list[str]) -> list[tuple[str, str]]:
+        """Rearrange ALL accounts into the given top-to-bottom order.
+
+        ``order`` names every account exactly once (any ``NUM|EMAIL|ALIAS``);
+        afterwards the i-th named account occupies the i-th occupied slot.
+        The slot-number SET is untouched — sparse tables (``remove`` leaves
+        gaps) keep their gaps, only the occupants shift. This is the "drag
+        #5 to position #2 shifts 2,3,4 down" semantics a reorder gesture
+        implies, which a sequence of raw ``move`` calls (swap-on-occupied)
+        cannot express directly.
+
+        Implemented as a cycle decomposition into :meth:`swap_accounts`
+        calls, so everything a swap carries (aliases, backups, session
+        profiles, activeAccountNumber) moves correctly. Each swap is atomic
+        under the file lock; the sequence as a whole is not — an interrupt
+        leaves a consistent, partially reordered table, never a corrupt one.
+
+        Returns the final ``(slot, email)`` rows in slot order.
+        """
+        self._refuse_session_shell()
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        data = self._get_sequence_data_migrated() or {}
+        slots = sorted(data.get("accounts", {}), key=int)
+        if not slots:
+            raise ConfigError("No accounts are managed yet")
+
+        resolved = []
+        for ident in order:
+            num = self._resolve_account_identifier(ident)
+            if num is None or num not in data.get("accounts", {}):
+                raise AccountNotFoundError(f"Account not found: {ident}")
+            resolved.append(num)
+        if sorted(resolved, key=int) != slots or len(resolved) != len(slots):
+            raise ValidationError(
+                "reorder needs every account exactly once "
+                f"(have slots {', '.join(slots)})"
+            )
+
+        # loc: where each originally-named account lives right now, updated
+        # as swaps displace occupants.
+        loc = {num: num for num in slots}
+        for target, wanted in zip(slots, resolved):
+            current = loc[wanted]
+            if current == target:
+                continue
+            # Whoever sits in `target` takes `wanted`'s old slot.
+            displaced = next(n for n, s in loc.items() if s == target)
+            self.swap_accounts(current, target)
+            loc[wanted], loc[displaced] = target, current
+
+        final = self._get_sequence_data() or {}
+        return [
+            (num, acc.get("email", ""))
+            for num, acc in sorted(final.get("accounts", {}).items(), key=lambda kv: int(kv[0]))
+        ]
+
     def _relocate_locked(self, num_src: str, target: str) -> None:
         """Move one account from ``num_src`` to the empty slot ``target``.
 
@@ -1768,6 +1878,36 @@ class ClaudeAccountSwitcher:
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
         )
+
+    def fleet_status_rows(
+        self, active: str | int | None
+    ) -> list[tuple[str, str, dict | None, bool]]:
+        """``(number, label, last_good_usage, is_active)`` per enabled
+        account, slot order — the switch push's fleet summary feed
+        (``away_notify.fleet_lines``). Pure file reads: last-good usage
+        straight from the store, no fetching, no credential access.
+        Labels are alias-or-email-local-part, never the full address.
+        """
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        identities = {
+            num: (info.get("email", ""), info.get("organizationUuid", "") or "")
+            for num, info in accounts.items()
+        }
+        entries = self._usage_store.entries(identities)
+        rows: list[tuple[str, str, dict | None, bool]] = []
+        for num in sorted(accounts, key=int):
+            info = accounts[num]
+            if info.get("disabled"):
+                continue
+            email = info.get("email", "") or ""
+            label = info.get("alias") or email.split("@", 1)[0] or f"#{num}"
+            entry = entries.get(num)
+            rows.append(
+                (num, label, entry.last_good if entry else None,
+                 num == str(active))
+            )
+        return rows
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
@@ -5094,6 +5234,131 @@ class ClaudeAccountSwitcher:
                 seen[key] = snum
         return out
 
+    @staticmethod
+    def _plan_label(oauth_account: dict) -> str:
+        """Human plan label from an ``oauthAccount`` profile, '' if unknown.
+
+        Prefers the rate-limit tier (``default_claude_max_20x`` -> "Max 20x",
+        seat tiers win over org tiers when present), falling back to the
+        organization type (``claude_pro`` -> "Pro").
+        """
+        raw = (
+            oauth_account.get("userRateLimitTier")
+            or oauth_account.get("organizationRateLimitTier")
+            or oauth_account.get("organizationType")
+            or ""
+        )
+        raw = raw.removeprefix("default_").removeprefix("claude_")
+        if not raw:
+            return ""
+        words = [
+            w if w[:-1].isdigit() and w.endswith("x") else w.capitalize()
+            for w in raw.split("_")
+        ]
+        return " ".join(words)
+
+    def _account_plan(self, num: int, email: str, is_active: bool) -> str:
+        """The slot's subscription tier for display, '' when unreadable.
+
+        The active slot reads the LIVE config (its backup can lag a plan
+        change); parked slots read their backup copy.
+        """
+        import json as _json
+
+        if is_active:
+            data = self._read_json(self._get_claude_config_path()) or {}
+        else:
+            raw = self._read_account_config(str(num), email)
+            try:
+                data = _json.loads(raw) if raw else {}
+            except (ValueError, TypeError):
+                data = {}
+        oauth_account = data.get("oauthAccount")
+        if not isinstance(oauth_account, dict):
+            return ""
+        return self._plan_label(oauth_account)
+
+    def _next_switch_candidate(
+        self, accounts: list[dict], active: int | None
+    ) -> int | None:
+        """Display-grade guess at the next auto-switch target.
+
+        Advisory only — the engine's real ranking adds hysteresis, no-return
+        bars, and quarantines. This mirrors the strategy's core idea over the
+        decision-grade rows: skip the active/disabled/exhausted, then
+        consume-first = soonest weekly reset, best = most headroom.
+        """
+        from claude_swap.settings import load_settings
+
+        try:
+            strategy = load_settings(self.backup_dir).strategy
+        except Exception:
+            strategy = "best"
+        best: tuple | None = None
+        for row in accounts:
+            if row["number"] == active or row.get("disabled"):
+                continue
+            usage = row.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            pcts = [
+                w["pct"]
+                for key in ("fiveHour", "sevenDay")
+                if isinstance((w := usage.get(key)), dict)
+            ]
+            pcts += [w["pct"] for w in usage.get("scoped") or []]
+            # NO spend here: the cost figure is an estimate, never billing
+            # truth, and the real ranking (oauth.account_headroom) never
+            # consults it — folding it in hid a fully-rested account behind
+            # a maxed spend estimate (2026-08-30: account at 5h 0% / 7d 1%
+            # advisory-dead on spend 100%, indicator vanished fleet-wide).
+            if not pcts or max(pcts) >= 100:
+                continue  # dead — out of at least one limit
+            if strategy == "consume-first":
+                reset = (usage.get("sevenDay") or {}).get("resetsAt") or ""
+                key = (reset == "", reset)  # soonest reset; missing sorts last
+            else:
+                key = (max(pcts),)  # most headroom = lowest binding pct
+            if best is None or key < best[0]:
+                best = (key, row["number"])
+        return best[1] if best else None
+
+    def _next_recovery(
+        self, accounts: list[dict], active: int | None
+    ) -> dict | None:
+        """Who recovers soonest when NO account is a viable target.
+
+        Without this, "everyone is limited" and "indicator broken" look
+        identical in the app (user report 2026-08-30). An exhausted
+        account is usable again when its LAST maxed window resets, so
+        rank by max(resetsAt) over the >=100 windows. Advisory, like
+        `_next_switch_candidate`; spend is excluded for the same reason.
+        """
+        best: tuple[str, int] | None = None
+        for row in accounts:
+            if row["number"] == active or row.get("disabled"):
+                continue
+            usage = row.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            windows = [
+                w
+                for key in ("fiveHour", "sevenDay")
+                if isinstance((w := usage.get(key)), dict)
+            ] + [w for w in usage.get("scoped") or []]
+            maxed = [w for w in windows if w.get("pct", 0) >= 100]
+            if not maxed:
+                continue  # viable — _next_switch_candidate's territory
+            resets = [w.get("resetsAt") or "" for w in maxed]
+            if "" in resets:
+                continue  # a maxed window with no reset time can't be ranked
+            key = max(resets)  # ISO-8601 sorts lexicographically
+            if best is None or key < best[0]:
+                best = (key, row["number"])
+        if best is None:
+            return None
+        return {"number": best[1], "at": best[0]}
+
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -5119,7 +5384,9 @@ class ClaudeAccountSwitcher:
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
                     alias=alias,
+                    icon=seq_data.get("accounts", {}).get(str(num), {}).get("icon", ""),
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    plan=self._account_plan(num, email, is_active),
                 )
             )
         payload = {
@@ -5127,6 +5394,53 @@ class ClaudeAccountSwitcher:
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        # Additive, advisory: who the auto-switcher would likely pick next.
+        candidate = self._next_switch_candidate(accounts, active_num)
+        if candidate is not None:
+            payload["nextCandidate"] = candidate
+        else:
+            # All limited: say who recovers first, so the app can render
+            # "everyone is at a limit" distinctly from "nothing to show".
+            recovery = self._next_recovery(accounts, active_num)
+            if recovery is not None:
+                payload["nextRecovery"] = recovery
+        # Additive: live Claude Code sessions on this machine — they all
+        # ride the ACTIVE account's credential. busy = mid-turn right now.
+        try:
+            from claude_swap.process_detection import list_sessions
+
+            sessions = list_sessions()
+            known = ("busy", "idle", "waiting", "shell")
+            counts = {k: sum(1 for x in sessions if x.status == k) for k in known}
+            payload["liveSessions"] = {
+                "busy": counts["busy"],
+                # Additive breakdown (menu bar tooltip): idle/waiting/shell
+                # by status; "unknown" is the remainder (no status on the
+                # record, e.g. sdk-cli), so the parts always sum to total.
+                "idle": counts["idle"],
+                "waiting": counts["waiting"],
+                "shell": counts["shell"],
+                "unknown": len(sessions) - sum(counts.values()),
+                "total": len(sessions),
+                # Additive detail (2026-08-30, app's session list popover):
+                # busy first, newest first within a status; capped so a
+                # runaway session dir can't bloat every list call.
+                "sessions": [
+                    {
+                        "pid": s.pid,
+                        "cwd": s.cwd,
+                        "status": s.status or "unknown",
+                        "kind": s.kind,
+                        "startedAt": s.started_at,
+                    }
+                    for s in sorted(
+                        sessions,
+                        key=lambda s: (s.status != "busy", -s.started_at),
+                    )[:20]
+                ],
+            }
+        except Exception:  # pragma: no cover - display-only, never blocks list
+            pass
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -6809,6 +7123,23 @@ class ClaudeAccountSwitcher:
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
+                )
+                # Caller identity (2026-08-30 flap forensics: a 5→3 switch
+                # 15s after the auto engine's 3→5 could not be attributed —
+                # not the app, not the auto engine, no CLI invocation found).
+                # Every switch now names its author so the next anomaly
+                # self-identifies. Best-effort; never fails the switch.
+                try:
+                    import subprocess as _sp
+                    parent = _sp.run(
+                        ["ps", "-o", "comm=", "-p", str(os.getppid())],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout.strip() or "?"
+                except Exception:
+                    parent = "?"
+                self._logger.info(
+                    "Switch caller: pid=%s ppid=%s parent=%s argv=%r"
+                    % (os.getpid(), os.getppid(), parent, sys.argv)
                 )
 
             except Exception as e:

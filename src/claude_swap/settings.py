@@ -43,6 +43,7 @@ class AutoSwitchSettings:
     ping-pong while a strictly better account is always taken.
     """
 
+    enabled: bool = True
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
@@ -65,6 +66,30 @@ class AutoSwitchSettings:
     # stopping while the engine was running are eligible (see
     # session_resume.find_stopped_sessions).
     resume_stopped_sessions: bool = False
+    # How often, in seconds, to scan live sessions' transcripts for a terminal
+    # limit stop while waiting between ticks. The usage API is the slower
+    # witness — it reports an exhausted account no earlier than the next poll,
+    # so on a long interval a stopped session waits minutes for a switch the
+    # transcript already justified. A scan costs one stat per live session and
+    # no request at all, so it runs far more often than a poll ever could.
+    # 0 disables it and leaves the engine on the API alone.
+    limit_scan_interval_seconds: float = 5.0
+    # After any switch, type `/rc` into every cmux surface hosting a live
+    # Claude Code session, re-arming remote control (it binds to the account,
+    # so a switch always breaks it). OFF by default for the same reason as
+    # resume_stopped_sessions: it injects input into live sessions. No-op
+    # when cmux isn't installed.
+    rearm_remote_control: bool = False
+    # The /rc sweep only touches sessions whose tty saw input or output in
+    # the last N minutes — an abandoned session would otherwise collect one
+    # `/rc` per switch as scrollback junk. 0 sweeps every session.
+    rearm_active_within_minutes: float = 120.0
+    # Comma-separated account emails and/or slot numbers to land on first
+    # whenever a switch happens. A listed account beats an unlisted one only
+    # among the candidates that already qualify under the strategy's own
+    # gates (threshold, hysteresis, no-return); the strategy's key orders the
+    # rest. None = strategy order only (default).
+    preferred: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +136,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
+            "autoswitch", "enabled", "enabled", "bool",
+            help="Auto-switching on/off — off keeps polling usage, never switches",
+        ),
+        SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
@@ -148,6 +177,24 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Nudge sessions stopped by a usage limit once quota returns",
         ),
         SettingSpec(
+            "autoswitch", "limitScanIntervalSeconds", "limit_scan_interval_seconds",
+            "float", 0.0, 60.0,
+            help="Scan sessions for a hit limit this often, in seconds (0 disables)",
+        ),
+        SettingSpec(
+            "autoswitch", "rearmRemoteControl", "rearm_remote_control", "bool",
+            help="Re-run /rc in cmux-hosted sessions after a switch (needs cmux)",
+        ),
+        SettingSpec(
+            "autoswitch", "rearmActiveWithinMinutes", "rearm_active_within_minutes",
+            "float", 0.0, 1440.0,
+            help="Only /rc sessions active in the last N minutes (0 = all)",
+        ),
+        SettingSpec(
+            "autoswitch", "preferred", "preferred", "string",
+            help="Land on these accounts first when switching (emails and/or slot numbers, comma-separated)",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -177,6 +224,15 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_preferred(value: str | None) -> frozenset[str]:
+    """Split ``autoswitch.preferred`` into trimmed, lowercased tokens — emails
+    or slot numbers. Emails are the stable identity (slot numbers move under
+    ``cswap reorder``) and match case-insensitively."""
+    if not value:
+        return frozenset()
+    return frozenset(t.strip().lower() for t in value.split(",") if t.strip())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -272,6 +328,24 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
         section[json_key] = getattr(settings, field)
     raw["autoswitch"] = section
     atomic_write_json(path, raw)
+
+
+def spec_metadata(spec: SettingSpec) -> dict:
+    """A SettingSpec's JSON projection for ``cswap config ... --json``.
+
+    Additive schema-v1 fields. GUIs render their settings surface from this
+    instead of hand-wiring one widget per key, so a new SettingSpec shows up
+    everywhere at once. ``lo``/``hi`` appear only when the spec bounds a
+    number; ``choices`` only on choice kinds.
+    """
+    out: dict = {"kind": spec.kind, "help": spec.help, "default": spec.default}
+    if spec.lo is not None:
+        out["lo"] = spec.lo
+    if spec.hi is not None:
+        out["hi"] = spec.hi
+    if spec.choices:
+        out["choices"] = list(spec.choices)
+    return out
 
 
 def setting_spec(dotted_key: str) -> SettingSpec:

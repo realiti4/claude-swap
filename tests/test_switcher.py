@@ -12134,3 +12134,78 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestNextSwitchCandidate:
+    """Advisory next-candidate must rank on the real decision axes."""
+
+    @staticmethod
+    def _row(num, five=0.0, seven=0.0, spend=None, disabled=False):
+        usage = {"fiveHour": {"pct": five}, "sevenDay": {"pct": seven}}
+        if spend is not None:
+            usage["spend"] = {"pct": spend}
+        return {"number": num, "disabled": disabled, "usage": usage}
+
+    def test_spend_estimate_never_disqualifies(self, temp_home: Path):
+        """A maxed spend ESTIMATE must not hide a rested account.
+
+        2026-08-30: an account at 5h 0% / 7d 1% went advisory-dead on
+        spend 100% and the indicator vanished fleet-wide — the real
+        ranking (oauth.account_headroom) never consults spend.
+        """
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            self._row(1, five=0.0, seven=1.0, spend=100.0),
+            self._row(2, five=0.0, seven=100.0),
+            self._row(5, five=46.0, seven=20.0),
+        ]
+        assert switcher._next_switch_candidate(rows, 5) == 1
+
+    def test_window_at_limit_still_disqualifies(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            self._row(1, five=100.0, seven=1.0),
+            self._row(2, five=10.0, seven=20.0),
+        ]
+        assert switcher._next_switch_candidate(rows, None) == 2
+
+    def test_all_limited_yields_no_candidate(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [self._row(1, five=100.0), self._row(2, seven=100.0)]
+        assert switcher._next_switch_candidate(rows, None) is None
+
+
+class TestNextRecovery:
+    """All-limited fallback: who recovers soonest (advisory)."""
+
+    @staticmethod
+    def _row(num, windows, disabled=False):
+        return {"number": num, "disabled": disabled, "usage": windows}
+
+    def test_soonest_full_recovery_wins(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            # Recovers when its LAST maxed window resets: 7d, Sep 3.
+            self._row(1, {
+                "fiveHour": {"pct": 100.0, "resetsAt": "2026-08-30T05:00:00+00:00"},
+                "sevenDay": {"pct": 100.0, "resetsAt": "2026-09-03T00:00:00+00:00"},
+            }),
+            # Only the 5h is maxed — back at 09:00 today.
+            self._row(2, {
+                "fiveHour": {"pct": 100.0, "resetsAt": "2026-08-30T09:00:00+00:00"},
+                "sevenDay": {"pct": 40.0, "resetsAt": "2026-09-05T00:00:00+00:00"},
+            }),
+        ]
+        assert switcher._next_recovery(rows, None) == {
+            "number": 2, "at": "2026-08-30T09:00:00+00:00",
+        }
+
+    def test_viable_and_active_rows_are_skipped(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        rows = [
+            self._row(1, {"fiveHour": {"pct": 10.0}}),  # viable — not ours
+            self._row(3, {
+                "fiveHour": {"pct": 100.0, "resetsAt": "2026-08-30T09:00:00+00:00"},
+            }),
+        ]
+        assert switcher._next_recovery(rows, 3) is None

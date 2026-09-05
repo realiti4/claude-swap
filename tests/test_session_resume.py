@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import socket
@@ -507,6 +508,325 @@ def test_resume_reports_only_the_sessions_that_accepted(tmp_path: Path, short_so
     assert [s.session_id for s in resumed] == ["a"]
 
 
+# --- waking a session races Claude Code's credential cache ---------------------
+
+# Captured 2026-08-27: a nudge landed 34ms after `cswap` wrote the new
+# account's credentials, and the turn it started was rejected 2.1s later with
+# a real 429 (requestId req_011Ce..., quotaLimits.resetsAt = the OLD account's
+# reset). The same session worked 25s later with no further help. Claude Code
+# caches the OAuth token in-process, so a nudge can burn itself on the account
+# that was just switched away from — and the burn appends a NEW limit stop.
+
+OK_TURN = {"type": "assistant", "uuid": "ok-1", "message": {"role": "assistant"}}
+
+
+def _stop(uuid: str) -> dict:
+    """A terminal limit stop distinguishable from another by uuid."""
+    return {**LIMIT_STOP, "uuid": uuid}
+
+
+def _clockwork(transcript: Path, timeline: list[tuple[float, dict]]):
+    """A (sleep, clock) pair that plays `timeline` into `transcript`.
+
+    Simulated time only advances when the code under test sleeps, so the
+    retry loop's own pacing decides what it sees — no wall-clock waiting and
+    no flakiness.
+    """
+    now = [0.0]
+    pending = sorted(timeline, key=lambda item: item[0])
+
+    def _catch_up():
+        while pending and pending[0][0] <= now[0]:
+            _, entry = pending.pop(0)
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+
+    def sleep(seconds):
+        now[0] += seconds
+        _catch_up()
+
+    return sleep, (lambda: now[0])
+
+
+def _nudge_recorder(monkeypatch, transcript: Path, on_send=None):
+    """Replace the wire with a recorder; returns the list of nudged ids."""
+    sent: list[str] = []
+
+    def fake_send(socket_path, text, pid=None, claude_dir=None):
+        sent.append(socket_path)
+        if on_send is not None:
+            on_send()
+        return True
+
+    monkeypatch.setattr(session_resume, "send_peer_message", fake_send)
+    return sent
+
+
+def test_stopped_session_records_which_stop_it_saw(tmp_path: Path, monkeypatch):
+    """The retry logic needs to tell a NEW limit stop from the original one."""
+    _write_transcript(tmp_path, [{"type": "user"}, _stop("stop-1")])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    assert find_stopped_sessions(tmp_path)[0].stop_uuid == "stop-1"
+
+
+def test_a_nudge_burned_on_stale_credentials_is_retried(tmp_path: Path, monkeypatch):
+    """The exact captured failure: nudge lands, a NEW limit stop appears."""
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    sent = _nudge_recorder(monkeypatch, path)
+    # The first nudge burns at +2s; by the retry the account is live again.
+    sleep, clock = _clockwork(path, [
+        (2.0, {"type": "user"}),
+        (2.5, _stop("stop-2")),
+        (8.0, OK_TURN),
+    ])
+
+    resumed = session_resume.resume_sessions(
+        [stopped], tmp_path, sleep=sleep, clock=clock
+    )
+
+    assert len(sent) == 2, "the burned nudge should have been sent again"
+    assert [s.session_id for s in resumed] == ["sess-1"]
+
+
+def test_a_nudge_held_for_review_is_never_retried(tmp_path: Path, monkeypatch):
+    """A held message leaves the tail on the ORIGINAL stop.
+
+    Claude Code can hold a cross-session message for the user instead of
+    acting on it, and holds are invisible from this side. Retrying would
+    queue duplicates in front of a user who has not looked yet.
+    """
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    sent = _nudge_recorder(monkeypatch, path)
+    sleep, clock = _clockwork(path, [])  # nothing ever changes
+
+    session_resume.resume_sessions([stopped], tmp_path, sleep=sleep, clock=clock)
+
+    assert len(sent) == 1
+
+
+def test_our_own_nudge_landing_is_not_mistaken_for_recovery(
+    tmp_path: Path, monkeypatch
+):
+    """The nudge IS a user turn, and it appears ~2s before the 429 it earns.
+
+    Treating "tail is a user turn" as success would declare victory in the
+    gap and strand exactly the session this fix exists for.
+    """
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    sent = _nudge_recorder(monkeypatch, path)
+    sleep, clock = _clockwork(path, [(0.5, {"type": "user"}), (3.0, _stop("stop-2"))])
+
+    session_resume.resume_sessions([stopped], tmp_path, sleep=sleep, clock=clock)
+
+    assert len(sent) == 2
+
+
+def test_a_session_that_wakes_is_not_nudged_again(tmp_path: Path, monkeypatch):
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    sent = _nudge_recorder(monkeypatch, path)
+    sleep, clock = _clockwork(path, [(1.0, {"type": "user"}), (2.0, OK_TURN)])
+
+    session_resume.resume_sessions([stopped], tmp_path, sleep=sleep, clock=clock)
+
+    assert len(sent) == 1
+
+
+def test_retries_are_bounded(tmp_path: Path, monkeypatch, caplog):
+    """An account that never comes back must not be nudged forever."""
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    counter = {"n": 0}
+
+    def burn():
+        # Every nudge earns a fresh limit stop, exactly like a still-dead account.
+        counter["n"] += 1
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(_stop(f"burn-{counter['n']}")) + "\n")
+
+    sent = _nudge_recorder(monkeypatch, path, on_send=burn)
+    sleep, clock = _clockwork(path, [])
+
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        session_resume.resume_sessions([stopped], tmp_path, sleep=sleep, clock=clock)
+
+    assert len(sent) == 1 + len(session_resume.RESUME_RETRY_DELAYS_S)
+    assert any("could not be woken" in r.message for r in caplog.records)
+
+
+def test_a_session_the_socket_refused_is_not_watched(tmp_path: Path, monkeypatch):
+    """No bytes delivered means nothing to verify — and nothing to retry."""
+    path = _write_transcript(tmp_path, [_stop("stop-1")])
+    stopped = StoppedSession("sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1")
+    monkeypatch.setattr(
+        session_resume, "send_peer_message", lambda *a, **k: False
+    )
+    sleep, clock = _clockwork(path, [])
+
+    resumed = session_resume.resume_sessions(
+        [stopped], tmp_path, sleep=sleep, clock=clock
+    )
+
+    assert resumed == []
+
+
+def test_warnings_reach_the_claude_swap_log(tmp_path: Path, monkeypatch):
+    """This module's records must land on the logger the log file listens to.
+
+    `setup_logging` attaches the rotating file handler to "claude-swap".
+    A module logger named after the package ("claude_swap.session_resume")
+    is a different tree — underscore, not hyphen — so it propagates to root
+    and is written nowhere. That silently defeated the peerProtocol warning,
+    which exists precisely so a Claude Code upgrade disabling resume is
+    discoverable from the log.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    logging.getLogger("claude-swap").addHandler(handler)
+    try:
+        path = _write_transcript(tmp_path, [_stop("stop-1")])
+        stopped = StoppedSession(
+            "sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1"
+        )
+        counter = {"n": 0}
+
+        def burn():
+            counter["n"] += 1
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(_stop(f"burn-{counter['n']}")) + "\n")
+
+        _nudge_recorder(monkeypatch, path, on_send=burn)
+        sleep, clock = _clockwork(path, [])
+        session_resume.resume_sessions([stopped], tmp_path, sleep=sleep, clock=clock)
+    finally:
+        logging.getLogger("claude-swap").removeHandler(handler)
+
+    assert any("could not be woken" in r.getMessage() for r in records)
+
+
+# --- limit stops as evidence about the active account -------------------------
+
+# The usage API only reports an exhausted account on the next poll — up to a
+# full interval late. The transcript says it immediately, and carries the two
+# fields the engine needs. Captured verbatim 2026-08-27 alongside the 429 that
+# stranded session 767f1fac.
+QUOTA_LIMITS = {
+    "status": "rejected",
+    "resetsAt": 1787815200,
+    "rateLimitType": "five_hour",
+    "overageStatus": "rejected",
+}
+
+
+def _dated_stop(uuid_: str, when: str, **quota) -> dict:
+    return {
+        **LIMIT_STOP,
+        "uuid": uuid_,
+        "timestamp": when,
+        "quotaLimits": {**QUOTA_LIMITS, **quota},
+    }
+
+
+def test_a_limit_stop_is_read_as_evidence_about_the_account(
+    tmp_path: Path, monkeypatch
+):
+    _write_transcript(tmp_path, [
+        {"type": "user"},
+        _dated_stop("stop-1", "2026-08-27T06:30:35.659Z"),
+    ])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+
+    found = session_resume.LimitStopScanner(tmp_path).scan()
+
+    assert [s.stop_uuid for s in found] == ["stop-1"]
+    assert found[0].window == "five_hour"
+    assert found[0].resets_at == 1787815200
+    # 2026-08-27T06:30:35.659Z, the moment the session actually stopped.
+    assert found[0].observed_at == pytest.approx(1787812235.659, abs=0.01)
+
+
+def test_the_same_stop_is_only_reported_once(tmp_path: Path, monkeypatch):
+    """The scanner runs every few seconds; a stop is news exactly once."""
+    _write_transcript(tmp_path, [_dated_stop("stop-1", "2026-08-27T06:30:35Z")])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    scanner = session_resume.LimitStopScanner(tmp_path)
+
+    assert len(scanner.scan()) == 1
+    assert scanner.scan() == []
+
+
+def test_a_later_stop_is_still_found_after_an_unchanged_scan(
+    tmp_path: Path, monkeypatch
+):
+    """The mtime gate must skip re-reads without hiding real news."""
+    path = _write_transcript(tmp_path, [_dated_stop("stop-1", "2026-08-27T06:30:35Z")])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    scanner = session_resume.LimitStopScanner(tmp_path)
+    scanner.scan()
+    scanner.scan()
+
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_dated_stop("stop-2", "2026-08-27T07:00:00Z")) + "\n")
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 10))
+
+    assert [s.stop_uuid for s in scanner.scan()] == ["stop-2"]
+
+
+def test_a_session_that_cannot_be_messaged_is_still_evidence(
+    tmp_path: Path, monkeypatch
+):
+    """Unlike a resume candidate, evidence does not need a socket.
+
+    What the transcript says about the account's quota is true whether or not
+    that session can be nudged afterwards.
+    """
+    _write_transcript(tmp_path, [_dated_stop("stop-1", "2026-08-27T06:30:35Z")])
+    monkeypatch.setattr(
+        session_resume,
+        "list_sessions",
+        lambda d=None: [_session(tmp_path, messaging_socket_path="", peer_protocol=0)],
+    )
+
+    assert len(session_resume.LimitStopScanner(tmp_path).scan()) == 1
+    assert find_stopped_sessions(tmp_path) == []
+
+
+def test_a_working_session_is_not_evidence(tmp_path: Path, monkeypatch):
+    _write_transcript(tmp_path, [LIMIT_STOP, RETRYABLE_429])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    assert session_resume.LimitStopScanner(tmp_path).scan() == []
+
+
+def test_a_stop_without_quota_fields_still_reports_what_it_has(
+    tmp_path: Path, monkeypatch
+):
+    """Older Claude Code builds may omit quotaLimits; the stop is still real."""
+    _write_transcript(tmp_path, [{**LIMIT_STOP, "uuid": "stop-1"}])
+    monkeypatch.setattr(
+        session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+    )
+    found = session_resume.LimitStopScanner(tmp_path).scan()
+    assert found[0].resets_at == 0.0 and found[0].window == ""
+
+
 # --- manual switches -----------------------------------------------------------
 
 # The engine remembers what it witnessed across ticks; a human-driven switch
@@ -614,3 +934,203 @@ def test_a_broken_scan_never_fails_the_switch(tmp_path: Path, monkeypatch, caplo
 
     assert resumed == []
     assert "transcript shape changed" in caplog.text
+
+
+class TestManualSwitchNeedsQuota:
+    """A slot change is not evidence of quota.
+
+    Measured 2026-08-27 18:06: rotating from account 5 wrapped to account 1,
+    whose weekly window was at 100%. The slot changed, so every stopped
+    session was nudged straight into an account with nothing left and took
+    its weekly limit — a reset four days out — on the first turn.
+    """
+
+    def test_no_nudge_when_the_account_landed_on_is_spent(
+        self, tmp_path: Path, monkeypatch
+    ):
+        _resume_enabled(tmp_path)
+        _write_transcript(tmp_path, [LIMIT_STOP])
+        monkeypatch.setattr(
+            session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+        )
+        monkeypatch.setattr(session_resume, "_active_headroom", lambda _s: 0.0)
+        sent: list[str] = []
+        monkeypatch.setattr(
+            session_resume,
+            "send_peer_message",
+            lambda *a, **k: sent.append(a) or True,
+        )
+
+        assert session_resume.resume_after_manual_switch(
+            _StubSwitcher(tmp_path, "2"), "1", tmp_path
+        ) == []
+        assert sent == []
+
+    def test_unknown_headroom_still_nudges(self, tmp_path: Path, monkeypatch):
+        """An unreadable measurement is not evidence of an empty account.
+
+        Same rule the engine applies: a locked keychain or an expired token
+        must not silently disable the feature for the person it exists for.
+        """
+        _resume_enabled(tmp_path)
+        _write_transcript(tmp_path, [LIMIT_STOP])
+        monkeypatch.setattr(
+            session_resume, "list_sessions", lambda d=None: [_session(tmp_path)]
+        )
+        monkeypatch.setattr(session_resume, "_active_headroom", lambda _s: None)
+        monkeypatch.setattr(session_resume, "send_peer_message", lambda *a, **k: True)
+
+        assert session_resume.resume_after_manual_switch(
+            _StubSwitcher(tmp_path, "2"), "1", tmp_path
+        ) != []
+
+
+class TestRetriesAreDistinguishable:
+    """Claude Code drops a peer message identical to the sender's previous one.
+
+    Observed 2026-08-27: "Dropped a peer message from @claude-swap ...
+    identical to the previous message from this sender." Every retry sent the
+    same RESUME_MESSAGE constant, so attempts 2 and 3 were discarded by the
+    receiver while send_peer_message still reported success — the retry could
+    never have worked.
+    """
+
+    def test_each_attempt_sends_different_bytes(self, tmp_path: Path, monkeypatch):
+        # The stop must carry a uuid: _watch_nudges re-baselines on it after a
+        # burn, and a session without one stops being watchable (and so stops
+        # being retried) after the first round.
+        _write_transcript(tmp_path, [_stop("u2")])
+        sent: list[str] = []
+
+        def _send(_sock, message, **_kw):
+            sent.append(message)
+            return True
+
+        monkeypatch.setattr(session_resume, "send_peer_message", _send)
+        # Never satisfied, so the loop spends its full retry budget.
+        monkeypatch.setattr(
+            session_resume, "_nudge_verdict", lambda *a, **k: "burned"
+        )
+
+        stopped = StoppedSession(
+            "sess-1", 1, "/Users/x/my.project", "/s.sock", "limit", "stop-1"
+        )
+        session_resume.resume_sessions(
+            [stopped], tmp_path, sleep=lambda _s: None, clock=lambda: 0.0
+        )
+
+        assert len(sent) == 1 + len(session_resume.RESUME_RETRY_DELAYS_S)
+        assert len(set(sent)) == len(sent), f"identical payloads: {sent}"
+        assert sent[0] == session_resume.RESUME_MESSAGE
+
+
+class TestCaptureLimitScreens:
+    """capture_limit_screens — the 6b dialog-recognizer corpus builder."""
+
+    def _stopped(self, sid="sess-cap", pid=99):
+        return StoppedSession(sid, pid, "/w", "/s.sock", "limit", "u1")
+
+    def test_writes_one_capture_per_session(self, tmp_path, monkeypatch):
+        from claude_swap import cmux_control
+
+        monkeypatch.setattr(
+            cmux_control, "capture_screen_for_pid",
+            lambda pid, **kw: ("surface:3", "the dialog\n"),
+        )
+        session_resume.capture_limit_screens([self._stopped()], tmp_path)
+        files = list((tmp_path / "limit-screens").glob("*.txt"))
+        assert len(files) == 1
+        text = files[0].read_text()
+        assert "session sess-cap" in text and "surface surface:3" in text
+        assert "the dialog" in text
+
+    def test_session_outside_cmux_writes_nothing(self, tmp_path, monkeypatch):
+        from claude_swap import cmux_control
+
+        monkeypatch.setattr(
+            cmux_control, "capture_screen_for_pid", lambda pid, **kw: None
+        )
+        session_resume.capture_limit_screens([self._stopped()], tmp_path)
+        assert not (tmp_path / "limit-screens").exists()
+
+    def test_corpus_is_bounded(self, tmp_path, monkeypatch):
+        from claude_swap import cmux_control
+
+        d = tmp_path / "limit-screens"
+        d.mkdir()
+        for i in range(session_resume._CAPTURE_KEEP + 5):
+            (d / f"20260101T00000{i:02d}-old.txt").write_text("x")
+        monkeypatch.setattr(
+            cmux_control, "capture_screen_for_pid",
+            lambda pid, **kw: ("surface:1", "s"),
+        )
+        session_resume.capture_limit_screens([self._stopped()], tmp_path)
+        assert len(list(d.glob("*.txt"))) == session_resume._CAPTURE_KEEP
+
+    def test_never_raises(self, tmp_path, monkeypatch):
+        from claude_swap import cmux_control
+
+        def boom(pid, **kw):
+            raise RuntimeError("cmux exploded")
+        monkeypatch.setattr(cmux_control, "capture_screen_for_pid", boom)
+        session_resume.capture_limit_screens([self._stopped()], tmp_path)  # no raise
+
+    def test_none_backup_dir_is_a_noop(self):
+        session_resume.capture_limit_screens([self._stopped()], None)
+
+
+class TestNudgeChannelSelection:
+    """_nudge_one — cmux-primary, socket fallback, no double delivery."""
+
+    def _stopped(self):
+        return StoppedSession("sess-n", 77, "/w", "/s.sock", "limit", "u1")
+
+    def _run(self, monkeypatch, status, socket_result=True):
+        from claude_swap import cmux_control
+
+        socket_calls = []
+        monkeypatch.setattr(
+            cmux_control, "nudge_via_cmux", lambda pid, text, **kw: status
+        )
+        monkeypatch.setattr(
+            session_resume, "send_peer_message",
+            lambda *a, **kw: socket_calls.append(a) or socket_result,
+        )
+        ok = session_resume._nudge_one(self._stopped(), "text", None)
+        return ok, socket_calls
+
+    def test_delivered_skips_the_socket(self, monkeypatch):
+        ok, socket_calls = self._run(monkeypatch, "delivered")
+        assert ok and socket_calls == []
+
+    def test_typed_unverified_also_skips_the_socket(self, monkeypatch):
+        # The text WAS submitted as a user turn — a socket copy on top
+        # would queue a duplicate.
+        ok, socket_calls = self._run(monkeypatch, "typed-unverified")
+        assert ok and socket_calls == []
+
+    def test_no_surface_falls_back_to_the_socket(self, monkeypatch):
+        ok, socket_calls = self._run(monkeypatch, "no-surface")
+        assert ok and len(socket_calls) == 1
+
+    def test_captured_input_falls_back_to_the_socket(self, monkeypatch):
+        ok, socket_calls = self._run(monkeypatch, "captured-input")
+        assert ok and len(socket_calls) == 1
+
+    def test_running_gets_nothing(self, monkeypatch):
+        ok, socket_calls = self._run(monkeypatch, "running")
+        assert not ok and socket_calls == []
+
+    def test_cmux_blowup_degrades_to_the_socket(self, monkeypatch):
+        from claude_swap import cmux_control
+
+        def boom(pid, text, **kw):
+            raise RuntimeError("cmux exploded")
+        socket_calls = []
+        monkeypatch.setattr(cmux_control, "nudge_via_cmux", boom)
+        monkeypatch.setattr(
+            session_resume, "send_peer_message",
+            lambda *a, **kw: socket_calls.append(a) or True,
+        )
+        assert session_resume._nudge_one(self._stopped(), "text", None)
+        assert len(socket_calls) == 1
