@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -48,10 +49,14 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.resumeStoppedSessions",
+            "autoswitch.preferred",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        # Every key above, and nothing set: derived from the schema so adding
+        # a setting doesn't fail a test that isn't about the count.
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +83,11 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        # Derived from the schema, not restated: the property under test is
+        # "every key is listed", and a literal count merely re-asserts how
+        # many settings exist today — it fails on any legitimate addition
+        # while catching nothing a missing key wouldn't.
+        assert set(by_key) == set(SETTING_SPECS)
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -134,12 +143,14 @@ class TestConfigSetGet:
             code, out, _ = _run(argv, capsys)
             assert code == 0
             payload = json.loads(out)
-            assert payload == {
+            # Subset, not equality: the payload also carries the spec
+            # metadata (kind/help/default/...), which has its own tests.
+            assert payload | {
                 "schemaVersion": 1,
                 "key": "autoswitch.threshold",
                 "value": 80.0,
                 "isSet": True,
-            }
+            } == payload
 
 
 class TestConfigValidation:
@@ -268,3 +279,39 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestJsonCarriesSpecMetadata:
+    """`config list --json` describes each setting, not just its value.
+
+    A GUI (the native menubar app) renders its settings pane from this —
+    the SETTING_SPECS table already drives validation and the CLI, and
+    exporting it is what stops a new setting from being invisible on a
+    surface nobody hand-wired (which happened twice on 2026-08-27).
+    """
+
+    def test_every_entry_names_its_kind_help_and_default(self, temp_home, capsys):
+        _, out, _ = _run(["--json"], capsys)
+        for entry in json.loads(out)["settings"]:
+            assert entry["kind"], entry["key"]
+            assert entry["help"], entry["key"]
+            assert "default" in entry, entry["key"]
+
+    def test_bounds_appear_only_where_the_spec_has_them(self, temp_home, capsys):
+        _, out, _ = _run(["--json"], capsys)
+        by_key = {e["key"]: e for e in json.loads(out)["settings"]}
+        threshold = by_key["autoswitch.threshold"]
+        assert (threshold["lo"], threshold["hi"]) == (50.0, 99.9)
+        assert "lo" not in by_key["autoswitch.resumeStoppedSessions"]
+
+    def test_choices_appear_only_on_choice_kinds(self, temp_home, capsys):
+        _, out, _ = _run(["--json"], capsys)
+        by_key = {e["key"]: e for e in json.loads(out)["settings"]}
+        assert "consume-first" in by_key["autoswitch.strategy"]["choices"]
+        assert "choices" not in by_key["autoswitch.threshold"]
+
+    def test_get_json_carries_the_same_metadata(self, temp_home, capsys):
+        _, out, _ = _run(["get", "autoswitch.strategy", "--json"], capsys)
+        payload = json.loads(out)
+        assert payload["kind"] == "choice"
+        assert payload["default"] == "best"

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import re
 import sys
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import error_envelope
+from claude_swap.json_output import SCHEMA_VERSION, error_envelope
 from claude_swap.printer import (
     accent,
     bolded,
@@ -498,6 +500,240 @@ Examples:
         sys.exit(130)
 
 
+def _icon_command(argv: list[str]) -> None:
+    """Handle `cswap icon [NUM|EMAIL|ALIAS] [EMOJI] [--unset]`.
+
+    With no arguments, lists all icons. Stored in cswap's sequence record
+    beside the alias (backlog item 3), so every frontend renders the same
+    icon. Pre-dispatched before the main parser for the same reason as
+    `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} icon",
+        description=(
+            "Set, remove, or list a one-emoji display icon for an account. "
+            "Frontends (menubar app) show it next to the account name."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap icon 2 \U0001F409
+  cswap icon dev \U0001F525
+  cswap icon 2 --unset
+  cswap icon                          # list all icons
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL|ALIAS",
+        help="Account to decorate. Omit to list icons.",
+    )
+    parser.add_argument(
+        "emoji", nargs="?", metavar="EMOJI",
+        help="A single emoji/symbol",
+    )
+    parser.add_argument("--unset", action="store_true", help="Remove the account's icon")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.emoji:
+        parser.error("--unset does not take an EMOJI argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL|ALIAS is required with --unset")
+    if args.account is not None and not args.unset and not args.emoji:
+        parser.error("EMOJI is required (or pass --unset to remove the icon)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            data = switcher._get_sequence_data_migrated() or {}
+            rows = [
+                (num, acc.get("icon"), acc.get("email", ""))
+                for num, acc in sorted(
+                    (data.get("accounts") or {}).items(), key=lambda kv: int(kv[0])
+                )
+                if acc.get("icon")
+            ]
+            if not rows:
+                print(dimmed("No icons set. Try: cswap icon 2 \U0001F409"))
+                return
+            for num, icon, email in rows:
+                print(f"  {num}: {icon}  {email}")
+            return
+        if args.unset:
+            num = switcher.unset_icon(args.account)
+            print(f"{accent('Removed')} icon from Account {num}")
+            return
+        num, icon = switcher.set_icon(args.account, args.emoji)
+        print(f"{accent('Set')} Account {num} icon to {icon}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _reorder_command(argv: list[str]) -> None:
+    """Handle `cswap reorder NUM|EMAIL|ALIAS... [--json]`.
+
+    Rearranges ALL accounts into the given order (shift semantics — what a
+    drag gesture means), unlike `move`, which swaps when the target slot is
+    occupied. Pre-dispatched before the main parser for the same reason as
+    `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} reorder",
+        description=(
+            "Rearrange all accounts into the given top-to-bottom order. "
+            "Every account must be named exactly once; slot-number gaps "
+            "stay where they are, only the occupants shift. Aliases, "
+            "backups, and session history move with their account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap reorder 3 1 2       account from slot 3 goes first, then 1, then 2
+  cswap reorder dev me@x.io work
+        """,
+    )
+    parser.add_argument(
+        "order", nargs="+", metavar="NUM|EMAIL|ALIAS",
+        help="Every account, in the desired order",
+    )
+    parser.add_argument("--json", action="store_true", help="Machine-readable result")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        rows = switcher.reorder_accounts(args.order)
+        if args.json:
+            print(json.dumps({
+                "schemaVersion": 1,
+                "accounts": [{"number": int(num), "email": email} for num, email in rows],
+            }))
+            return
+        print(f"{accent('Reordered')}:")
+        for num, email in rows:
+            print(f"  {num}: {email}")
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: 950, 12.3k, 4.5M, 1.2B."""
+    for div, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suffix}"
+    return str(n)
+
+
+def _usage_command(argv: list[str]) -> None:
+    """Handle `cswap usage [--days N] [--json]`.
+
+    Estimated per-account token spend from local transcripts joined against
+    the switch log (backlog item 4). The dollar figure is an API-list-price
+    estimate, never billing truth — the report says so itself.
+    """
+    import time
+    from pathlib import Path
+
+    from claude_swap import usage_report
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} usage",
+        description=(
+            "Estimate token spend per account from the transcripts on this "
+            "machine (~/.claude/projects), attributed by the switch "
+            "timeline. Prices are public API list prices — an estimate, "
+            "not a bill."
+        ),
+    )
+    parser.add_argument(
+        "--days", type=int, default=7, metavar="N",
+        help="Window to scan (default 7; attribution is bounded by log retention)",
+    )
+    parser.add_argument("--json", action="store_true", help="Machine-readable report")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.days < 1:
+        parser.error("--days must be at least 1")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        backup_dir = switcher.backup_dir
+        data = switcher._get_sequence_data_migrated() or {}
+        labels = {}
+        for num, acc in (data.get("accounts") or {}).items():
+            entry = {"email": acc.get("email", "")}
+            if acc.get("alias"):
+                entry["alias"] = acc["alias"]
+            labels[int(num)] = entry
+
+        timeline = usage_report.parse_switch_timeline(
+            usage_report.read_switch_logs(backup_dir)
+        )
+        since = time.time() - args.days * 86400
+        projects = Path.home() / ".claude" / "projects"
+        messages = usage_report.scan_transcripts(projects, since)
+        report = usage_report.build_report(
+            messages, timeline, days=args.days, labels=labels
+        )
+        if args.json:
+            print(json.dumps(report))
+            return
+
+        print(
+            f"{accent('Estimated spend')}, last {args.days}d at API list prices "
+            f"({report['priceTable']['source']} {report['priceTable']['date']}):"
+        )
+        rows = list(report["accounts"])
+        extra = report.get("unattributed")
+        if extra:
+            rows.append({"number": None, "email": "(before switch log)", **extra})
+        for row in rows:
+            name = row.get("alias") or row.get("email", "?")
+            num = row["number"] if row["number"] is not None else "-"
+            toks = (
+                f"in {_fmt_tokens(row['input'])} · out {_fmt_tokens(row['output'])}"
+                f" · cacheR {_fmt_tokens(row['cacheRead'])}"
+                f" · cacheW {_fmt_tokens(row['cacheWrite'])}"
+            )
+            top = row["models"][0]["model"] if row["models"] else ""
+            print(f"  {num}: {name}")
+            print(f"     ${row['estimatedUSD']:.2f}   {row['messages']} msgs   {toks}")
+            if top:
+                print(f"     mostly {top}")
+        print(f"  {accent('total')}: ${report['estimatedTotalUSD']:.2f}")
+        if report.get("unpricedTokens"):
+            print(dimmed(
+                f"  unpriced tokens: {_fmt_tokens(report['unpricedTokens'])} "
+                f"({', '.join(report['unpricedModels'])})"
+            ))
+        print(dimmed(
+            "  Estimate only — subscription plans don't bill per token."
+        ))
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
 def _alias_command(argv: list[str]) -> None:
     """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
 
@@ -571,6 +807,36 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _watch_supervisor_eof() -> None:
+    """Exit the engine when a supervising parent's stdin pipe closes.
+
+    Arms ONLY under an explicit supervisor contract — the parent sets
+    CSWAP_SUPERVISED=1 (CswapBar's EngineSupervisor does) — because "stdin
+    is not a TTY" is true in far too many innocent places: pytest workers
+    (an in-process `_auto_command` test would os._exit the whole xdist
+    worker — observed), cron pipes, `cswap auto | tee`.
+    """
+    import threading
+
+    if os.environ.get("CSWAP_SUPERVISED") != "1":
+        return
+    try:
+        if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
+            return
+    except (ValueError, OSError):
+        return
+
+    def watch() -> None:
+        try:
+            while sys.stdin.buffer.read(4096):
+                pass
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True, name="supervisor-eof").start()
 
 
 def _auto_command(argv: list[str]) -> None:
@@ -722,6 +988,14 @@ Defaults live in settings.json in the backup root; flags override them.
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        # Supervised mode (stdin is the supervisor's pipe, not a TTY): exit
+        # the moment that pipe hits EOF — the supervisor died. Without this
+        # a killed app leaves an orphaned engine holding the flock, and the
+        # replacement app is refused by a corpse (observed 2026-08-28:
+        # pkill'd CswapBar left `cswap auto` re-parented to launchd).
+        # os._exit is safe here: the flock releases on process exit and the
+        # engine keeps no buffered state that outlives a tick.
+        _watch_supervisor_eof()
         if not args.json:
             print(
                 dimmed(
@@ -761,6 +1035,7 @@ def _config_command(argv: list[str]) -> None:
         set_setting,
         setting_spec,
         settings_path,
+        spec_metadata,
         unset_setting,
     )
 
@@ -841,7 +1116,12 @@ Examples:
                     "schemaVersion": 1,
                     "path": str(settings_path(root)),
                     "settings": [
-                        {"key": spec.dotted, "value": value, "isSet": is_set}
+                        {
+                            "key": spec.dotted,
+                            "value": value,
+                            "isSet": is_set,
+                            **spec_metadata(spec),
+                        }
                         for spec, value, is_set in rows
                     ],
                 }
@@ -863,6 +1143,7 @@ Examples:
                     "key": spec.dotted,
                     "value": value,
                     "isSet": is_set,
+                    **spec_metadata(spec),
                 }
                 print(json.dumps(payload, indent=2))
             else:
@@ -913,6 +1194,329 @@ def _use_native_tls() -> None:
         truststore.inject_into_ssl()
     except Exception:
         pass
+
+
+def _notify_command(argv: list[str]) -> None:
+    """Handle `cswap notify [show|slack|telegram|test|off]` (backlog item 7).
+
+    Secrets are taken from stdin ("-", or interactively without echo), never
+    required on the command line — a webhook URL in argv lands in shell
+    history, the exact leak the 0600 notify.json exists to avoid.
+    """
+    import getpass
+
+    from claude_swap import away_notify
+
+    parser = argparse.ArgumentParser(
+        prog="cswap notify",
+        description=(
+            "Configure away-mode push channels. After every account switch — "
+            "engine tick or manual — cswap pushes the new account's alias to "
+            "each configured channel, so a phone knows which account to open "
+            "the Claude app with. Secrets live in notify.json (mode 0600) "
+            "beside the credential backups, never in settings.json, and are "
+            "only ever shown masked."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap notify                      # show configured channels (masked)
+  cswap notify slack -              # paste the webhook URL on stdin
+  cswap notify telegram - CHAT_ID   # paste the bot token on stdin
+  cswap notify test                 # push a test message through every channel
+  cswap notify push TEXT…           # push arbitrary text (or pipe it: push -)
+  cswap notify off slack            # remove one channel
+  cswap notify off                  # remove all channels
+        """,
+    )
+    parser.add_argument(
+        "action", nargs="?", default="show",
+        choices=["show", "slack", "telegram", "test", "push", "off"],
+    )
+    parser.add_argument("values", nargs="*", metavar="VALUE")
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Machine-readable MASKED status (show only) — never emits secrets",
+    )
+    args = parser.parse_args(argv)
+
+    def read_secret(prompt: str) -> str:
+        if sys.stdin.isatty():
+            return getpass.getpass(prompt).strip()
+        return sys.stdin.readline().strip()
+
+    backup_dir = paths.get_backup_root()
+    config = away_notify.load_channels(backup_dir)
+
+    if args.action == "show":
+        if args.json:
+            # Masked ONLY — this feeds the CswapBar settings pane, and a
+            # raw secret here would sit in the app's process output.
+            print(json.dumps({
+                "schemaVersion": 1,
+                "slackWebhookUrl": (
+                    away_notify.masked(config["slackWebhookUrl"])
+                    if config.get("slackWebhookUrl") else None
+                ),
+                "telegramBotToken": (
+                    away_notify.masked(config["telegramBotToken"])
+                    if config.get("telegramBotToken") else None
+                ),
+                "telegramChatId": config.get("telegramChatId"),
+            }))
+            return
+        if not config:
+            print("No away-mode channels configured.")
+            print("  cswap notify slack -              # add a Slack webhook")
+            print("  cswap notify telegram - CHAT_ID   # add a Telegram bot")
+            return
+        if config.get("slackWebhookUrl"):
+            print(f"slack     {away_notify.masked(config['slackWebhookUrl'])}")
+        if config.get("telegramBotToken"):
+            chat = config.get("telegramChatId", "")
+            print(
+                f"telegram  token {away_notify.masked(config['telegramBotToken'])}"
+                f"  chat {chat}"
+            )
+        return
+
+    if args.action == "slack":
+        value = args.values[0] if args.values else "-"
+        url = read_secret("Slack webhook URL: ") if value == "-" else value
+        if not url.startswith("https://"):
+            print(error("Webhook URL must start with https://"))
+            sys.exit(1)
+        config["slackWebhookUrl"] = url
+        away_notify.save_channels(backup_dir, config)
+        print(f"Slack channel saved ({away_notify.masked(url)}). Try: cswap notify test")
+        return
+
+    if args.action == "telegram":
+        if not args.values or (len(args.values) == 1 and args.values[0] != "-"):
+            parser.error("usage: cswap notify telegram TOKEN|- CHAT_ID")
+        if args.values[0] == "-":
+            if len(args.values) < 2:
+                parser.error("usage: cswap notify telegram - CHAT_ID")
+            token = read_secret("Telegram bot token: ")
+            chat_id = args.values[1]
+        else:
+            token, chat_id = args.values[0], args.values[1]
+        if not token:
+            print(error("Empty bot token"))
+            sys.exit(1)
+        config["telegramBotToken"] = token
+        config["telegramChatId"] = chat_id
+        away_notify.save_channels(backup_dir, config)
+        print("Telegram channel saved. Try: cswap notify test")
+        return
+
+    if args.action == "test":
+        if not config:
+            print(error("No channels configured — run cswap notify slack - first"))
+            sys.exit(1)
+        delivered = away_notify.push(
+            backup_dir, "cswap test push — away-mode notifications reach you"
+        )
+        if delivered:
+            print(f"Delivered to: {', '.join(delivered)}")
+        else:
+            print(error("No channel accepted the push (see log for status)"))
+            sys.exit(1)
+        return
+
+    if args.action == "push":
+        # Generic push for other frontends (the menu bar app's "all
+        # sessions done" / "all accounts exhausted" triggers): the text is
+        # not a secret, but "-" keeps the stdin path uniform with the
+        # channel setup commands.
+        text = " ".join(args.values).strip()
+        if not text or text == "-":
+            text = sys.stdin.read().strip()
+        if not text:
+            print(error("Nothing to push — pass text or pipe it on stdin"))
+            sys.exit(1)
+        if not config:
+            print(error("No channels configured — run cswap notify slack - first"))
+            sys.exit(1)
+        delivered = away_notify.push(backup_dir, text)
+        if delivered:
+            print(f"Delivered to: {', '.join(delivered)}")
+        else:
+            print(error("No channel accepted the push (see log for status)"))
+            sys.exit(1)
+        return
+
+    if args.action == "off":
+        target = args.values[0] if args.values else None
+        if target == "slack":
+            config.pop("slackWebhookUrl", None)
+        elif target == "telegram":
+            config.pop("telegramBotToken", None)
+            config.pop("telegramChatId", None)
+        elif target is None:
+            config = {}
+        else:
+            parser.error("usage: cswap notify off [slack|telegram]")
+        away_notify.save_channels(backup_dir, config)
+        print("Removed." if not config else f"Removed {target}.")
+
+
+def _rearm_remote_control(
+    switcher: ClaudeAccountSwitcher, payload: dict | None
+):
+    """Re-run /rc in cmux-hosted sessions after a manual switch.
+
+    Same reasoning as `_resume_stopped_sessions` below: the engine sweeps on
+    its own switches, but a human-driven `cswap use` needs its own call or
+    `autoswitch.rearmRemoteControl` is inert for exactly the switches a user
+    performs while watching. Runs BEFORE the resume nudge so a session woken
+    by the nudge comes back with remote control already re-armed — and the
+    confirm pass has dismissed the input-capturing Remote Control panels the
+    sweep opened, which would otherwise eat that nudge. Returns the
+    SweepResult (or None) for the away-mode push body.
+    """
+    from claude_swap import cmux_control
+    from claude_swap.settings import load_settings
+
+    try:
+        settings = load_settings(switcher.backup_dir)
+        if not settings.rearm_remote_control:
+            return None
+        result = cmux_control.rearm_remote_control(
+            confirm=True,
+            active_within_s=settings.rearm_active_within_minutes * 60,
+        )
+    except Exception:
+        # Same contract as the engine's sweep: /rc convenience must never
+        # break (or fail) the switch that triggered it.
+        logging.getLogger("claude-swap").debug("/rc sweep failed", exc_info=True)
+        return None
+    if result is None or not result.sent:
+        return result
+    if payload is not None:
+        payload["remoteControlRearmed"] = len(result.sent)
+    else:
+        print(f"Re-armed remote control on {len(result.sent)} session(s)")
+    return result
+
+
+def _away_notify_switch(
+    switcher: ClaudeAccountSwitcher, payload: dict | None, sweep
+) -> None:
+    """Item 7's away-mode push, for human-driven switches.
+
+    The engine pushes on its own switches; without this, a manual `cswap use`
+    would leave the phone showing the wrong account — the same inertness the
+    /rc helper above exists to prevent. Never breaks the switch.
+    """
+    from claude_swap import away_notify
+
+    try:
+        number = switcher.current_account_number()
+        if number is None:
+            return
+        alias = next(
+            (a for num, a, _ in switcher.list_aliases() if num == number), None
+        )
+        email = switcher.account_email(number)
+        label = alias or email.split("@", 1)[0] or f"#{number}"
+        channels = away_notify.push(
+            switcher.backup_dir,
+            away_notify.switch_text(
+                label, number,
+                len(sweep.sent) if sweep else 0,
+                urls=sweep.urls if sweep else (),
+                fleet=away_notify.fleet_lines(
+                    switcher.fleet_status_rows(number)),
+            ),
+        )
+    except Exception:
+        logging.getLogger("claude-swap").debug("away-notify failed", exc_info=True)
+        return
+    if not channels:
+        return
+    if payload is not None:
+        payload["awayNotified"] = channels
+    else:
+        print(f"Pushed switch notice to {', '.join(channels)}")
+
+
+def _resume_stopped_sessions(
+    switcher: ClaudeAccountSwitcher, before: str | None, payload: dict | None
+) -> None:
+    """Wake sessions the usage limit stopped, now that this switch has landed.
+
+    The auto-switch engine does this from its own tick, but only while it is
+    running — the menu bar's engine can be turned off, and a one-shot `cswap
+    use` never had one. Without this, `autoswitch.resumeStoppedSessions` is
+    silently inert for every human-driven switch.
+
+    Imported lazily: this reads Claude Code's session directory and transcripts,
+    which no other subcommand needs and every subcommand would otherwise pay
+    for at import time.
+    """
+    from claude_swap import session_resume
+
+    sweep = _rearm_remote_control(switcher, payload)
+    _away_notify_switch(switcher, payload, sweep)
+    resumed = session_resume.resume_after_manual_switch(switcher, before)
+    if not resumed:
+        return
+    if payload is not None:
+        payload["resumedSessions"] = [s.session_id for s in resumed]
+    else:
+        print(f"Resumed {len(resumed)} session(s) stopped by the usage limit")
+
+
+_SWITCH_LINE_RE = re.compile(r"Switched from account (\d+) to (\d+)")
+
+
+def parse_switch_history(log_text: str, limit: int = 10) -> list[dict]:
+    """Recent account switches from the switcher log, newest first.
+
+    Each entry: ``{"from": int, "to": int, "at": "YYYY-MM-DD HH:MM"}``.
+    The log is the ONLY record of past switches; this parser is the
+    supported reading of it — frontends consume ``cswap history --json``
+    instead of scraping the file themselves.
+    """
+    out: list[dict] = []
+    for line in log_text.splitlines():
+        m = _SWITCH_LINE_RE.search(line)
+        if not m:
+            continue
+        stamp = line.split(" - ", 1)[0].strip()[:16]
+        out.append({"from": int(m.group(1)), "to": int(m.group(2)), "at": stamp})
+    return list(reversed(out[-limit:]))
+
+
+def _history_command(argv: list[str]) -> None:
+    """``cswap history [--json] [--limit N]`` — recent account switches."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} history",
+        description="Show recent account switches (from the switcher log)",
+    )
+    parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    parser.add_argument("--limit", type=int, default=10, help="Max entries (default 10)")
+    args = parser.parse_args(argv)
+
+    log_file = paths.get_backup_root() / "claude-swap.log"
+    try:
+        text = log_file.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    switches = parse_switch_history(text, limit=max(1, args.limit))
+    if args.json:
+        print(json.dumps({
+            "schemaVersion": SCHEMA_VERSION,
+            "switches": switches,
+            "logPath": str(log_file),
+        }))
+        return
+    if not switches:
+        print("No switches logged yet")
+        return
+    for entry in switches:
+        print(f"{entry['from']} -> {entry['to']}   {entry['at']}")
 
 
 def _menubar_service(args) -> int:
@@ -998,8 +1602,23 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "icon":
+        _icon_command(argv[1:])
+        return
+    if argv and argv[0] == "notify":
+        _notify_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
+        return
+    if argv and argv[0] == "reorder":
+        _reorder_command(argv[1:])
+        return
+    if argv and argv[0] == "usage":
+        _usage_command(argv[1:])
+        return
+    if argv and argv[0] == "history":
+        _history_command(argv[1:])
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
@@ -1040,7 +1659,10 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s icon <a> <emoji>            set a one-emoji icon for an account
+  %(prog)s notify [slack -|test|off]  away-mode push channels (phone)
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
+  %(prog)s usage [--days N]           estimated per-account token spend
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
@@ -1401,19 +2023,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             else:
                 models = parse_model_names(load_settings(switcher.backup_dir).model)
                 model_source = "autoswitch.model" if models else None
+            before = switcher.current_account_number()
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
             )
+            _resume_stopped_sessions(switcher, before, payload)
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
+            before = switcher.current_account_number()
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+            _resume_stopped_sessions(switcher, before, payload)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

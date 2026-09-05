@@ -67,6 +67,22 @@ def test_notification_identity_is_noop_off_macos(tmp_path: Path):
 
 # --- settings ------------------------------------------------------------------
 
+def test_strategy_labels_cover_exactly_the_accepted_strategies():
+    """The menu must offer every strategy the settings schema accepts.
+
+    The menu bar had no strategy control at all while `cswap config set
+    autoswitch.strategy` did — a menu-bar user could be running consume-first
+    with nothing on screen saying so. Keying the labels off the schema's own
+    choices means a strategy added there can't silently go missing from the
+    menu (nor can the menu offer one `set_setting` would reject).
+    """
+    from claude_swap.settings import SETTING_SPECS
+
+    accepted = set(SETTING_SPECS["autoswitch.strategy"].choices)
+    assert set(menubar.STRATEGY_LABELS) == accepted
+    assert all(menubar.STRATEGY_LABELS.values()), "every strategy needs a label"
+
+
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
@@ -160,7 +176,7 @@ def test_usage_summary_scoped_multiple_and_countdown():
             {"name": "Opus", "pct": 55.0},
         ],
     }
-    assert menubar.usage_summary(usage, _NOW) == "Fable 4% (2h 0m) · Opus 55%"
+    assert menubar.usage_summary(usage, _NOW) == f"Fable 4% (2h 0m · {_clk(2 * 3600)}) · Opus 55%"
 
 
 def test_usage_summary_string_sentinel_passthrough():
@@ -175,7 +191,7 @@ def test_usage_summary_seven_day_ahead_of_pace_marker():
     # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
     usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert out == "7d 50% (ahead) (6d 0h)"
+    assert out == f"7d 50% (ahead) (6d 0h · {_clk(6 * 86400)})"
 
 
 def test_usage_summary_five_hour_never_shows_pace_marker():
@@ -187,7 +203,7 @@ def test_usage_summary_five_hour_never_shows_pace_marker():
 def test_usage_summary_scoped_ahead_of_pace_marker():
     usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": _iso(6 * 86400)}]}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert out == "Fable 50% (ahead) (6d 0h)"
+    assert out == f"Fable 50% (ahead) (6d 0h · {_clk(6 * 86400)})"
 
 
 def test_usage_summary_maxed_scoped_marker_wins_over_pace():
@@ -223,19 +239,97 @@ def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
     assert "Fable 0%" in out
 
 
-def test_format_account_label():
-    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+def test_usage_segments_keys_and_text():
+    assert menubar.usage_segments(_USAGE) == [
+        ("5h", "5h 42%"),
+        ("7d", "7d 18%"),
+        ("$", "$ 30%"),
+    ]
 
 
-def test_format_account_label_with_alias():
-    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
-    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+def test_usage_segments_pct_width_right_aligns_percentages():
+    segs = dict(menubar.usage_segments(_USAGE, pct_width=3))
+    assert segs["5h"] == "5h  42%"
+    assert segs["$"] == "$  30%"
 
 
-def test_format_account_label_disabled_marker():
-    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+def test_usage_segments_scoped_model_gets_its_own_key():
+    usage = dict(_USAGE)
+    usage["scoped"] = [{"name": "Fable", "pct": 4.0}]
+    assert ("Fable", "Fable 4%") in menubar.usage_segments(usage)
+
+
+def test_usage_segments_sentinel_is_a_span_cell():
+    assert menubar.usage_segments("no credentials") == [(menubar.SPAN, "no credentials")]
+    assert menubar.usage_segments(None) == [(menubar.SPAN, "usage unavailable")]
+
+
+def test_usage_summary_still_joins_segments():
+    assert menubar.usage_summary(_USAGE) == " · ".join(
+        text for _, text in menubar.usage_segments(_USAGE)
+    )
+
+
+# --- account row cells / alignment ---------------------------------------------
+
+def test_account_row_cells():
+    cells = menubar.account_row_cells(2, "loc@papaya.asia", _USAGE)
+    assert cells[:2] == [("#", "2"), ("acct", "loc@papaya.asia")]
+    assert [k for k, _ in cells[2:]] == ["5h", "7d", "$"]
+
+
+def test_account_row_cells_alias_and_disabled_marker():
+    assert menubar.account_row_cells(2, "loc@papaya.asia", _USAGE, alias="dev")[1] == (
+        "acct",
+        "dev  (loc@papaya.asia)",
+    )
+    assert menubar.account_row_cells(2, "loc@papaya.asia", _USAGE, disabled=True)[1] == (
+        "acct",
+        "loc@papaya.asia  (disabled)",
+    )
+
+
+def test_align_rows_pads_columns_to_widest_cell():
+    rows = [
+        [("#", "1"), ("acct", "bloodynightcrawler@gmail.com"), ("5h", "5h   0%")],
+        [("#", "2"), ("acct", "loc@x.io"), ("5h", "5h  86%")],
+    ]
+    out = menubar.align_rows(rows)
+    assert [line.index("5h") for line in out] == [len(out[0]) - 7] * 2
+    assert out[0].index("5h") == out[1].index("5h")
+
+
+def test_align_rows_blanks_a_missing_middle_column():
+    rows = [
+        [("#", "1"), ("acct", "a@x.io"), ("5h", "5h 0%"), ("Fable", "Fable 95%")],
+        [("#", "2"), ("acct", "b@x.io"), ("5h", "5h 0%"), ("$", "$ 100%")],
+    ]
+    out = menubar.align_rows(rows)
+    # "$" sits in its own column after the (blank) Fable column, so the two
+    # rows' trailing cells do NOT collide at the same offset.
+    assert out[1].index("$ 100%") == out[0].index("Fable 95%") + len("Fable 95%") + 2
+
+
+def test_align_rows_span_cell_ends_the_row():
+    rows = [
+        [("#", "1"), ("acct", "bloodynightcrawler@gmail.com"), ("5h", "5h 0%")],
+        [("#", "2"), ("acct", "b@x.io"), (menubar.SPAN, "no credentials")],
+    ]
+    out = menubar.align_rows(rows)
+    assert out[1].endswith("no credentials")
+    assert out[0].index("5h 0%") == out[1].index("no credentials")
+
+
+def test_align_rows_has_no_trailing_padding():
+    rows = [
+        [("#", "1"), ("acct", "a@x.io"), ("5h", "5h 0%"), ("$", "$ 5%")],
+        [("#", "2"), ("acct", "b@x.io"), ("5h", "5h 0%")],
+    ]
+    assert all(line == line.rstrip() for line in menubar.align_rows(rows))
+
+
+def test_align_rows_empty():
+    assert menubar.align_rows([]) == []
 
 
 # --- usage logging -------------------------------------------------------------
@@ -381,10 +475,20 @@ def _iso(delta_s):  # ISO-8601 for _NOW + delta_s, UTC
     return _dt.datetime.fromtimestamp(_NOW + delta_s, _dt.timezone.utc).isoformat()
 
 
+
+def _clk(offset_s: float, now: float = _NOW) -> str:
+    """The wall-clock suffix _live_countdown appends, for exact-string asserts."""
+    from datetime import datetime, timezone
+    from claude_swap import oauth
+    return oauth.reset_clock_string(
+        datetime.fromtimestamp(now + offset_s, tz=timezone.utc),
+        datetime.fromtimestamp(now, tz=timezone.utc),
+    )
+
 def test_live_countdown_formats_from_resets_at():
-    assert menubar._live_countdown({"resets_at": _iso(9 * 3600 + 5 * 60)}, _NOW) == "9h 5m"
-    assert menubar._live_countdown({"resets_at": _iso(86400 + 19 * 3600)}, _NOW) == "1d 19h"
-    assert menubar._live_countdown({"resets_at": _iso(34 * 60)}, _NOW) == "34m"
+    assert menubar._live_countdown({"resets_at": _iso(9 * 3600 + 5 * 60)}, _NOW) == f"9h 5m · {_clk(9 * 3600 + 5 * 60)}"
+    assert menubar._live_countdown({"resets_at": _iso(86400 + 19 * 3600)}, _NOW) == f"1d 19h · {_clk(86400 + 19 * 3600)}"
+    assert menubar._live_countdown({"resets_at": _iso(34 * 60)}, _NOW) == f"34m · {_clk(34 * 60)}"
 
 
 def test_live_countdown_none_when_passed_or_missing():
@@ -399,7 +503,7 @@ def test_usage_summary_live_countdown_from_resets_at():
         "seven_day": {"pct": 18.0, "resets_at": _iso(86400 + 19 * 3600)},
         "spend": {"pct": 30.0},
     }
-    assert menubar.usage_summary(usage, _NOW) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
+    assert menubar.usage_summary(usage, _NOW) == f"5h 42% (2h 33m · {_clk(2 * 3600 + 33 * 60)}) · 7d 18% (1d 19h · {_clk(86400 + 19 * 3600)}) · $ 30%"
 
 
 def test_usage_summary_omits_countdown_when_passed_or_missing():
@@ -527,13 +631,13 @@ def test_usage_summary_reflects_passed_weekly_reset():
         "five_hour": {"pct": 10.0},
         "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
     }
-    assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d 0% (6d 0h)"
+    assert menubar.usage_summary(usage, _NOW) == f"5h 10% · 7d 0% (6d 0h · {_clk(6 * 86400)})"
 
 
 def test_usage_summary_scoped_reflects_passed_weekly_reset():
     usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}]}
     # rolled to 0% → the over-limit "(!)" marker is gone too
-    assert menubar.usage_summary(usage, _NOW) == "Fable 0% (6d 0h)"
+    assert menubar.usage_summary(usage, _NOW) == f"Fable 0% (6d 0h · {_clk(6 * 86400)})"
 
 
 def test_format_title_reflects_passed_weekly_reset():
@@ -556,3 +660,71 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+def _scoped(*names: str) -> dict:
+    """A usage dict carrying only the named scoped model windows."""
+    return {"scoped": [{"name": n, "pct": 10.0} for n in names]}
+
+
+class TestModelMenuNames:
+    """Scoped model names offered by the "Count model limits" submenu.
+
+    Sourced from the snapshot the rows already render, so the menu can never
+    offer a model the fleet does not report — and never hardcodes a list that
+    goes stale when Anthropic ships a new model.
+    """
+
+    def test_collects_scoped_names_across_accounts(self):
+        usages = [_scoped("Fable"), _scoped("Opus")]
+        assert menubar.model_menu_names(usages) == ["Fable", "Opus"]
+
+    def test_dedups_keeping_first_seen_order(self):
+        usages = [_scoped("Opus", "Fable"), _scoped("Fable", "Opus")]
+        assert menubar.model_menu_names(usages) == ["Opus", "Fable"]
+
+    def test_skips_sentinels_and_missing_measurements(self):
+        usages = ["no credentials", None, _scoped("Fable")]
+        assert menubar.model_menu_names(usages) == ["Fable"]
+
+    def test_skips_entries_without_a_usable_name(self):
+        usages = [{"scoped": [{"pct": 10.0}, {"name": 7}, {"name": "Fable"}]}]
+        assert menubar.model_menu_names(usages) == ["Fable"]
+
+    def test_account_with_no_scoped_windows_contributes_nothing(self):
+        assert menubar.model_menu_names([{"five_hour": {"pct": 5.0}}]) == []
+
+    def test_empty_snapshot_offers_nothing(self):
+        assert menubar.model_menu_names([]) == []
+
+
+class TestToggleModel:
+    """Add/remove one model in the comma list ``autoswitch.model`` stores.
+
+    The setting is free text the CLI also writes, so this has to survive
+    whatever spacing and casing a hand-edited value carries.
+    """
+
+    def test_adds_to_an_empty_setting(self):
+        assert menubar.toggle_model("", "Fable") == "Fable"
+
+    def test_appends_to_an_existing_selection(self):
+        assert menubar.toggle_model("Fable", "Opus") == "Fable,Opus"
+
+    def test_removing_the_only_selection_clears_the_setting(self):
+        assert menubar.toggle_model("Fable", "Fable") == ""
+
+    def test_removes_one_of_several(self):
+        assert menubar.toggle_model("Fable,Opus", "Fable") == "Opus"
+
+    def test_matches_case_insensitively_like_the_engine_does(self):
+        assert menubar.toggle_model("fable", "Fable") == ""
+
+    def test_tolerates_hand_written_spacing(self):
+        assert menubar.toggle_model("Fable, Opus", "Opus") == "Fable"
+
+    def test_toggling_a_model_out_of_all_selects_only_that_model(self):
+        # "all" is a wildcard, not a membership list — there is nothing to
+        # remove Fable *from*. Narrowing to the clicked model is the only
+        # reading that leaves the user somewhere they asked to be.
+        assert menubar.toggle_model("all", "Fable") == "Fable"

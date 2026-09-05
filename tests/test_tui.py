@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -1710,3 +1711,55 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestManualSwitchResume:
+    """A switch driven from the TUI wakes sessions the usage limit stopped.
+
+    Third of the three manual surfaces (CLI, menu bar, TUI). This one calls the
+    switcher through ``partial`` inside a worker, so the nudge hangs off the
+    action result rather than the call site — and it runs on the worker thread,
+    because nudging is socket I/O the UI must not block on.
+    """
+
+    def _app(self, tmp_path: Path):
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        app.call_from_thread = Mock()
+        return app
+
+    def _resume(self, app, payload: dict | None, ok: bool = True):
+        with patch(
+            "claude_swap.session_resume.resume_after_manual_switch"
+        ) as resume:
+            resume.return_value = []
+            app._resume_stopped_sessions(
+                tui_data.ActionResult(ok=ok, output="", payload=payload)
+            )
+        return resume
+
+    def test_a_landed_switch_resumes_stopped_sessions(self, tmp_path: Path):
+        """The slot it came FROM is in the payload, so no before/after probe."""
+        app = self._app(tmp_path)
+        resume = self._resume(
+            app, {"switched": True, "from": {"number": "1"}, "to": {"number": "2"}}
+        )
+        resume.assert_called_once_with(app.switcher, "1")
+
+    def test_a_refused_switch_resumes_nothing(self, tmp_path: Path):
+        """Switching onto the already-active account frees no quota."""
+        app = self._app(tmp_path)
+        resume = self._resume(app, {"switched": False, "reason": "already-active"})
+        resume.assert_not_called()
+
+    def test_a_non_switch_action_resumes_nothing(self, tmp_path: Path):
+        """`_action_blocking` is shared by every TUI action — disabling an
+        account or adding one must not wake anybody."""
+        app = self._app(tmp_path)
+        resume = self._resume(app, None)
+        resume.assert_not_called()
+
+    def test_a_failed_switch_resumes_nothing(self, tmp_path: Path):
+        """A switch that raised left the old account live."""
+        app = self._app(tmp_path)
+        resume = self._resume(app, {"switched": True, "from": {"number": "1"}}, ok=False)
+        resume.assert_not_called()

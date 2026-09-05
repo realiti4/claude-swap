@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, poll_policy
+from claude_swap import autoswitch, oauth, poll_policy, session_resume
 from claude_swap.autoswitch import (
+    ENGINE_LOCK_FILENAME,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
@@ -24,6 +27,7 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SessionResumedEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -2804,6 +2808,24 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "consume-first"
         assert sw.to_ref == {"number": 2, "email": "b@example.com"}
 
+    def test_carried_reset_on_a_zero_pct_account_still_ranks_soonest(self, temp_home):
+        # usage_store._carry_weekly_reset pins a carried-forward resets_at
+        # onto a 0%-utilization weekly window (Anthropic omits resets_at for
+        # some tokens while utilization is 0). Once carried it is an
+        # ordinary resets_at value by the time it reaches the ranking, so
+        # this only pins that consume-first picks the SOONEST reset even
+        # when that account reports 0% usage — not "reset unknown -> last".
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),   # active resets later
+            "2": _usage7(0, 0, _R_SOON),      # 0% but carried reset is soonest
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
@@ -2862,6 +2884,63 @@ class TestConsumeFirstStrategy:
             "its weekly window resets sooner — it re-triggers next tick"
         )
         assert h.active_number() == 1
+
+    def test_burns_the_active_account_past_the_threshold(self, temp_home):
+        """consume-first does not stop consuming at ``threshold``.
+
+        The threshold is the `best` strategy's "start looking" line. Under
+        consume-first the point is to spend perishable weekly quota, so the
+        last few percent of the active account are exactly what must be
+        burned rather than stranded — on a Max-x20 week that band is real
+        money, and it evaporates at the weekly reset either way.
+
+        The active account here is over the threshold but NOT at its limit,
+        and no candidate resets sooner. `best` would move (proactive, ranked
+        on headroom); consume-first must stay and finish the window.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 95, _R_SOON),    # active: over threshold, resets FIRST
+            "2": _usage7(10, 10, _R_LATEST),  # healthy, but resets last
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "consume-first abandoned an account at 95% whose weekly window "
+            "resets soonest — the last 5% is perishable and was stranded"
+        )
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_at_limit_escape_survives_the_threshold_being_ignored(self, temp_home):
+        """Burning past the threshold must not cost the at-limit escape.
+
+        `at-limit` keys on ``active_headroom <= 0``, not on the threshold, so
+        ignoring the threshold for the proactive trigger leaves the escape
+        intact. Active is exhausted with NO sooner-resetting peer: the
+        strictly-sooner filter that governs a below-threshold consume-first
+        tick would strand us here, so this pins that at-limit takes any
+        healthy account instead.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 100, _R_SOON),   # active: spent, resets FIRST
+            "2": _usage7(10, 10, _R_LATEST),  # only escape, resets LAST
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "active account is at 100% with no sooner-resetting peer — the "
+            "at-limit escape must still move to a healthy account"
+        )
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
 
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s
@@ -3181,6 +3260,246 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestResumeStoppedSessions:
+    """Nudging Claude Code sessions that stopped on a usage limit.
+
+    The engine half only: transcript detection and the wire format are
+    covered in test_session_resume.py.
+    """
+
+    def test_one_exhausted_account_is_enough_to_record_a_stopped_session(
+        self, temp_home, monkeypatch
+    ):
+        """The COMMON case, and the one that shipped broken.
+
+        A session dies when the account it is on hits a limit — whether or
+        not any peer still has quota. Recording only from the all-exhausted
+        path missed exactly the everyday shape auto-switch exists for:
+        measured on a real machine, account 3 hit its 5h limit at 100% while
+        account 2 sat at 0%, so the engine took the ordinary `at-limit`
+        escape, nothing was ever recorded, and the stopped session was never
+        nudged.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+
+        # Active is spent; the PEER IS HEALTHY, so this is `at-limit`, not
+        # all-exhausted. The session stops here and must be recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(0),
+        }) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", "premise: the ordinary escape, not exhaustion"
+
+        # Next tick reads the new account's headroom and nudges.
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})
+        assert [s.session_id for s in calls[0]] == ["s-1"], (
+            "one account hitting its limit stopped a session and cswap "
+            "switched, but the session was never nudged"
+        )
+
+    def test_the_active_accounts_own_reset_resumes_without_a_switch(
+        self, temp_home, monkeypatch
+    ):
+        """Quota can return WITHOUT a switch, and the nudge must still fire.
+
+        Every account exhausted, sessions stop — then the account we are
+        already on resets first. There is no better account to move to, so no
+        switch happens and `_perform` is never reached. Hanging the nudge on a
+        switch alone strands exactly the sessions this feature exists for:
+        the user waits out a weekly reset and their sessions stay dead.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+
+        # Everything spent: sessions stop and are recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
+        assert calls == []
+
+        # The ACTIVE account's own window rolls over. Nothing to switch to
+        # (account 2 is still spent) — but we can work again.
+        outcome = h.tick_with_usage({"1": _usage(0), "2": _usage(100)})
+        assert outcome is not TickOutcome.SWITCHED, (
+            "premise: the active account recovering is not a switch"
+        )
+        assert [s.session_id for s in calls[0]] == ["s-1"], (
+            "the active account's window reset and quota is back, but the "
+            "stopped session was never nudged"
+        )
+
+    def test_resume_of_stopped_sessions_is_opt_in(self, temp_home, monkeypatch):
+        """Default-off, and it must not even LOOK at Claude Code's session
+        state until the user opts in — the scan reads undocumented files."""
+        h = EngineHarness(temp_home)  # resume_stopped_sessions defaults False
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        called = []
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions",
+            lambda *a, **k: called.append(1) or [],
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})
+        assert called == [], "scanned for stopped sessions while opted out"
+
+    def test_stopped_sessions_are_nudged_after_the_switch_lands(
+        self, temp_home, monkeypatch
+    ):
+        """The end-to-end shape: record while exhausted, nudge once quota is
+        back. Ordering is the point — a nudge sent before the switch would
+        resume the session onto the same spent account and stop it again.
+
+        On this path the nudge lands on the tick AFTER the switch, because the
+        trigger is "the active account has headroom" rather than "a switch
+        happened": the switching tick decides on the OLD active account's
+        (exhausted) numbers, and the new one's headroom is not read until the
+        next tick. Deliberate — the alternative is nudging on the assumption
+        that the account just switched to is healthy, and a target that turns
+        out to be spent would stop the session again immediately.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession(
+            session_id="s-1", pid=999, cwd="/w", socket_path="/w.sock", message="limit",
+        )
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        resumed_with: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: resumed_with.append(sessions) or sessions,
+        )
+
+        # Everything spent: the session stops, and is recorded.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
+        assert resumed_with == [], "nudged while there was still no quota"
+
+        # Account 2's window resets: the switch lands.
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(0),
+        }) is TickOutcome.SWITCHED
+        assert resumed_with == [], "nudged before the new account was verified"
+
+        # Next tick reads account 2's real headroom — now the nudge fires.
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})
+        assert [s.session_id for s in resumed_with[0]] == ["s-1"]
+        ev = next(e for e in h.events if isinstance(e, SessionResumedEvent))
+        assert ev.session_id == "s-1"
+        assert ev.cwd == "/w"
+
+    def test_a_session_is_nudged_only_once(self, temp_home, monkeypatch):
+        """The record is cleared on use. A later switch (a normal rotation
+        hours on) must not re-nudge a session that already resumed."""
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: [stopped]
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})   # record
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # switch
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # verify + nudge
+        assert len(calls) == 1
+        h.clock.advance(3600.0)
+        h.tick_with_usage({"2": _usage(100), "1": _usage(0)})     # ordinary switch
+        assert len(calls) == 1, "re-nudged a session that had already resumed"
+
+    def test_a_session_someone_else_already_woke_is_not_nudged_again(
+        self, temp_home, monkeypatch
+    ):
+        """The record says a session stopped; it does not say it is STILL
+        stopped.
+
+        Manual switches (`cswap use`, the menu bar, the TUI) nudge from a scan
+        of their own, and they can reach a session this engine also has
+        recorded — the user switches by hand while the engine is between
+        ticks. Nudging the record unconditionally then delivers a second
+        message to a session that is already working again.
+
+        A fresh scan is the arbiter: once a nudge lands, Claude Code appends a
+        user turn, so the transcript no longer ends in a limit and the session
+        drops out of `find_stopped_sessions`. Same guard covers a user who
+        pressed enter themselves.
+        """
+        h = EngineHarness(temp_home, resume_stopped_sessions=True, cooldown_seconds=0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        stopped = session_resume.StoppedSession("s-1", 999, "/w", "/w.sock", "limit")
+        scan = [stopped]
+        monkeypatch.setattr(
+            session_resume, "find_stopped_sessions", lambda *a, **k: list(scan)
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            session_resume, "resume_sessions",
+            lambda sessions, *a, **k: calls.append(sessions) or sessions,
+        )
+        h.tick_with_usage({"1": _usage(100), "2": _usage(100)})   # record
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # switch
+        # Between the switch and the verify tick, a manual switch nudged it
+        # and it went back to work: it no longer reads as stopped.
+        scan.clear()
+        h.tick_with_usage({"1": _usage(100), "2": _usage(0)})     # verify tick
+
+        assert [s.session_id for c in calls for s in c] == [], (
+            "nudged a session that had already been woken by a manual switch"
+        )
+
+    def test_a_scan_failure_never_breaks_the_tick(self, temp_home, monkeypatch):
+        """The scan reads undocumented Claude Code state. A shape change there
+        must cost the resume feature, not the loop that keeps the user
+        working."""
+        h = EngineHarness(temp_home, resume_stopped_sessions=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        def boom(*a, **k):
+            raise RuntimeError("session record shape changed")
+
+        monkeypatch.setattr(session_resume, "find_stopped_sessions", boom)
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100),
+        }) is TickOutcome.BLOCKED
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
@@ -5071,9 +5390,18 @@ class TestHorizonAxisDoesNotFlap:
         outcomes = []
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
-                # unchanged since departure on BOTH axes
-                "1": _usage7(0.0, 0.0, self._days_out(h, 500)),
-                "2": _usage7(90.0, 0.0, self._days_out(h, 100)),
+                # Account 1 still holds the full 100.0 points it departed at —
+                # the headroom axis is unchanged, which is the lockout under
+                # test. The RESET axis is what makes it a candidate again:
+                # consume-first ranks on soonest weekly reset, so 1 resetting
+                # before the active account is this strategy's own reason to
+                # return. (Driving the return by burning the active account
+                # past the threshold no longer works, and shouldn't: under
+                # consume-first the threshold is not a trigger, so a
+                # threshold-crossing vehicle would be testing a path this
+                # strategy never takes.)
+                "1": _usage7(0.0, 0.0, self._days_out(h, 50)),
+                "2": _usage7(10.0, 0.0, self._days_out(h, 100)),
             }))
             h.clock.advance(301.0)
 
@@ -6894,3 +7222,473 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# --- a hit limit is faster evidence than the usage API -------------------------
+
+class _StubScanner:
+    """Stands in for LimitStopScanner; the transcript reading is tested in
+    test_session_resume.py, so these tests are about what the engine DOES with
+    a stop, not how it finds one."""
+
+    def __init__(self, stops=()):
+        self.stops = list(stops)
+        self.calls = 0
+
+    def scan(self):
+        self.calls += 1
+        found, self.stops = self.stops, []
+        return found
+
+
+def _limit_stop(observed_at: float, resets_at: float, uuid_: str = "stop-1"):
+    return session_resume.LimitStop(
+        session_id="sess-1",
+        stop_uuid=uuid_,
+        window="five_hour",
+        resets_at=resets_at,
+        observed_at=observed_at,
+    )
+
+
+class TestLimitStopEvidence:
+    """The engine treats an observed limit stop as zero headroom.
+
+    Measured 2026-08-27: the active account read 100% at 13:27:18, a session
+    took its real 429 at 13:30:35, and the switch landed at 13:30:50. The
+    delay was the poll interval; the transcript knew immediately.
+    """
+
+    def _armed(self, harness, stops):
+        harness.engine._limit_scanner = _StubScanner(stops)
+        return harness.engine._limit_scanner
+
+    def test_without_evidence_a_healthy_account_is_left_alone(self, harness):
+        """The control: 50% is nowhere near the 90% threshold."""
+        self._armed(harness, [])
+        outcome = harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_a_hit_limit_switches_even_far_below_the_threshold(self, harness):
+        """What the API says is stale by construction here — the session
+        stopped, so the account is spent whatever the last reading was."""
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now + 3600)])
+
+        outcome = harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_the_switch_is_recorded_as_an_at_limit_escape(self, harness):
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now + 3600)])
+        harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+        switch = [e for e in harness.events if e.kind == "switch"]
+        assert switch and switch[0].trigger == "at-limit"
+
+    def test_evidence_is_cleared_once_the_switch_lands(self, harness):
+        """The indicted account is no longer the active one; anything wrong
+        with the new one will produce its own stop."""
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now + 3600)])
+        harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+        assert harness.engine._observed_limit is None
+
+    def test_evidence_survives_a_tick_that_could_not_switch(self, harness):
+        """Held, not consumed: the account really is spent until it resets, so
+        a tick with nowhere to go must not forget on the next one."""
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now + 3600)])
+        harness.tick_with_usage({"1": _usage(50.0), "2": _usage(100.0)})
+        assert harness.engine._observed_limit is not None
+
+    def test_a_stop_from_before_the_last_switch_is_ignored(self, harness):
+        """Evidence about an account the engine has already left."""
+        now = harness.clock.now
+        state = harness.switcher.backup_dir / "autoswitch_state.json"
+        state.write_text(json.dumps({"lastSwitchAt": now - 1000}))
+        self._armed(harness, [_limit_stop(now - 2000, now + 3600)])
+
+        outcome = harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_a_stop_after_the_last_switch_still_counts(self, harness):
+        """The other side of that filter, so it cannot pass by rejecting all."""
+        now = harness.clock.now
+        state = harness.switcher.backup_dir / "autoswitch_state.json"
+        state.write_text(json.dumps({"lastSwitchAt": now - 1000}))
+        self._armed(harness, [_limit_stop(now - 500, now + 3600)])
+
+        assert harness.tick_with_usage(
+            {"1": _usage(50.0), "2": _usage(0.0)}
+        ) is TickOutcome.SWITCHED
+
+    def test_a_stop_whose_window_already_reset_is_ignored(self, harness):
+        """Past its reset the account has quota again; the stop is history."""
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now - 1)])
+
+        outcome = harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_scanning_can_be_turned_off(self, temp_home: Path):
+        h = EngineHarness(temp_home, limit_scan_interval_seconds=0.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        scanner = _StubScanner([_limit_stop(now - 5, now + 3600)])
+        h.engine._limit_scanner = scanner
+
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+
+        assert scanner.calls == 0, "a disabled scan must not read transcripts"
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_a_broken_scan_never_fails_the_tick(self, harness, caplog):
+        class _Exploding:
+            def scan(self):
+                raise OSError("transcripts unreadable")
+
+        harness.engine._limit_scanner = _Exploding()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = harness.tick_with_usage({"1": _usage(50.0), "2": _usage(0.0)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert any("limit stops" in r.getMessage() for r in caplog.records)
+
+
+class TestStaleCredentialBurns:
+    """A stop right after a switch is the OLD token failing, not the new account.
+
+    Measured 2026-09-05 22:56–22:58 (+07): a session stopped on #2, the engine
+    escaped to #1 at :55, and eleven seconds later a session that had been
+    nudged (or simply fired) on credentials it had not yet reloaded wrote a
+    fresh stop entry. The scanner reported it, the engine blamed the ACTIVE
+    account — the healthy #1 — and switched straight back onto the spent #2.
+    Five switches in 52 seconds, every resume nudge landing on the dead
+    account. Two rules end it: a stop observed within
+    STALE_CREDENTIAL_GRACE_S of the last switch is not evidence against the
+    new active, and an account left at-limit stays barred until its window
+    resets, whatever the (lagging) usage API reads for it in between.
+    """
+
+    def _armed(self, harness, stops):
+        harness.engine._limit_scanner = _StubScanner(stops)
+
+    def _escape_from_one(self, harness):
+        """The first, legitimate at-limit escape: #1 stopped, best peer is #2."""
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 5, now + 3600, "stop-1")])
+        outcome = harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(20.0)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        return now + 3600
+
+    def test_a_stop_within_the_grace_after_a_switch_is_not_new_evidence(self, harness):
+        self._escape_from_one(harness)
+        harness.clock.advance(10)
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 1, now + 3600, "stop-burn")])
+        outcome = harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(20.0)}
+        )
+        assert outcome is not TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_a_stop_past_the_grace_is_evidence_again(self, harness):
+        self._escape_from_one(harness)
+        harness.clock.advance(autoswitch.STALE_CREDENTIAL_GRACE_S + 30)
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 1, now + 3600, "stop-2")])
+        outcome = harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(20.0)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_the_account_left_at_limit_is_not_the_next_target(self, harness):
+        """#1 reads 90 points of headroom — the API has not caught up — and
+        would win 'best' outright. It was proven spent 90 s ago; go to #3."""
+        self._escape_from_one(harness)
+        harness.clock.advance(autoswitch.STALE_CREDENTIAL_GRACE_S + 30)
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 1, now + 3600, "stop-2")])
+        harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(20.0)}
+        )
+        assert harness.active_number() == 3
+
+    def test_the_departure_records_the_stops_own_reset(self, harness):
+        resets_at = self._escape_from_one(harness)
+        assert harness.state()["leftTrigger"] == "at-limit"
+        assert harness.state()["leftRecoveryAt"] == pytest.approx(resets_at)
+
+    def test_the_bar_lifts_when_the_left_window_resets(self, harness):
+        resets_at = self._escape_from_one(harness)
+        harness.clock.now = resets_at + 1
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 1, now + 3600, "stop-2")])
+        harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(20.0)}
+        )
+        assert harness.active_number() == 1
+
+    def test_with_only_the_barred_account_left_the_engine_holds(self, harness):
+        """#3 is spent too: staying on the stopped #2 beats bouncing back onto
+        the #1 that stopped a session ninety seconds ago."""
+        self._escape_from_one(harness)
+        harness.clock.advance(autoswitch.STALE_CREDENTIAL_GRACE_S + 30)
+        now = harness.clock.now
+        self._armed(harness, [_limit_stop(now - 1, now + 3600, "stop-2")])
+        outcome = harness.tick_with_usage(
+            {"1": _usage(10.0), "2": _usage(0.0), "3": _usage(100.0)}
+        )
+        assert outcome is not TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+
+class TestLoopWatchesForLimits:
+    def test_the_sleep_is_cut_short_by_a_limit_stop(self, harness):
+        """A stop landing just after a tick must not wait out the interval."""
+        harness.engine.settings = replace(
+            harness.settings, limit_scan_interval_seconds=0.01
+        )
+        now = harness.clock.now
+        harness.engine._limit_scanner = _StubScanner([_limit_stop(now - 5, now + 3600)])
+
+        started = time.monotonic()
+        harness.engine._wait_watching_for_limits(30.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, "should return on the evidence, not sleep 30s"
+        assert harness.engine._observed_limit is not None
+
+    def test_a_quiet_sleep_runs_its_course(self, harness):
+        harness.engine.settings = replace(
+            harness.settings, limit_scan_interval_seconds=0.01
+        )
+        harness.engine._limit_scanner = _StubScanner([])
+
+        started = time.monotonic()
+        harness.engine._wait_watching_for_limits(0.1)
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 0.09
+
+    def test_a_deliberate_wake_still_wins(self, harness):
+        harness.engine.settings = replace(
+            harness.settings, limit_scan_interval_seconds=0.01
+        )
+        harness.engine._limit_scanner = _StubScanner([])
+        harness.engine._wake.set()
+
+        started = time.monotonic()
+        harness.engine._wait_watching_for_limits(30.0)
+
+        assert time.monotonic() - started < 1.0
+
+
+class TestEngineMutex:
+    """One engine per account store, enforced by a held flock.
+
+    Three hosts construct an engine (cswap auto, the menubar, cswap
+    tui/watch) and nothing stopped two from polling and switching the same
+    credential store at once — the state the machine was measured in on
+    2026-08-27. The mutex is a NEW lock file held for run_loop's lifetime;
+    `.autoswitch_state.lock` is a read-modify-write lock around the state
+    file and must never be repurposed for this.
+    """
+
+    def _hold(self, harness):
+        from claude_swap.locking import FileLock
+
+        other = FileLock(harness.switcher.backup_dir / ENGINE_LOCK_FILENAME)
+        assert other.acquire(timeout=0)
+        return other
+
+    def test_a_second_engine_refuses_to_run(self, harness):
+        other = self._hold(harness)
+        try:
+            harness.engine._mutex_timeout_s = 0.0  # no restart to wait out
+            assert harness.engine.run_loop() == 1
+        finally:
+            other.release()
+        assert "engine-refused" in [e.kind for e in harness.events]
+
+    def test_the_loop_holds_the_lock_and_releases_on_exit(self, harness):
+        harness.engine.stop()  # first iteration exits immediately
+        assert harness.engine.run_loop() == 0
+        other = self._hold(harness)  # released ⇒ acquirable again
+        other.release()
+
+    def test_the_lock_file_names_its_holder(self, harness):
+        harness.engine.stop()
+        harness.engine.run_loop()
+        info = json.loads(
+            (harness.switcher.backup_dir / ENGINE_LOCK_FILENAME).read_text()
+        )
+        assert info["pid"] == os.getpid()
+
+    def test_a_brief_restart_overlap_is_waited_out(self, harness):
+        """The menubar stops its engine without joining the thread, so a
+        settings change can start the new engine while the old still holds
+        the lock. The acquire must ride that out instead of dying."""
+        other = self._hold(harness)
+        harness.engine._mutex_timeout_s = 5.0
+        harness.engine.stop()
+        threading.Timer(0.3, other.release).start()
+        started = time.monotonic()
+        assert harness.engine.run_loop() == 0
+        assert time.monotonic() - started < 4.0
+
+    def test_a_dry_run_engine_ignores_the_mutex(self, harness):
+        """`cswap watch` auto-starts a dry-run engine next to whatever live
+        engine is running; a dry-run never switches, so locking it out would
+        just blind the watch page's event feed."""
+        other = self._hold(harness)
+        try:
+            harness.engine.dry_run = True
+            harness.engine._mutex_timeout_s = 0.0
+            harness.engine.stop()
+            assert harness.engine.run_loop() == 0
+        finally:
+            other.release()
+        assert "engine-refused" not in [e.kind for e in harness.events]
+
+
+class TestSupervisorEofWatchdog:
+    """_watch_supervisor_eof — a supervised engine dies with its supervisor.
+
+    A killed app must not leave an orphaned `cswap auto` holding the engine
+    flock (observed 2026-08-28: pkill'd CswapBar left its child re-parented
+    to launchd, and the replacement app was refused by the corpse).
+    """
+
+    def test_child_exits_when_the_stdin_pipe_closes(self):
+        import subprocess
+        import sys as _sys
+
+        code = (
+            "from claude_swap.cli import _watch_supervisor_eof\n"
+            "import time\n"
+            "_watch_supervisor_eof()\n"
+            "time.sleep(30)\n"
+        )
+        import os as _os
+
+        child = subprocess.Popen(
+            [_sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            cwd=str(Path(__file__).resolve().parent.parent / "src"),
+            env={**_os.environ, "CSWAP_SUPERVISED": "1"},
+        )
+        child.stdin.close()  # the "supervisor" dies
+        assert child.wait(timeout=10) == 0  # long before the 30s sleep
+
+    def test_never_arms_without_the_supervisor_contract(self, monkeypatch):
+        # No CSWAP_SUPERVISED=1 means no watchdog, whatever stdin looks
+        # like — a pytest worker's non-TTY stdin must never arm an
+        # os._exit trap inside the test process itself.
+        import threading
+
+        from claude_swap import cli
+
+        monkeypatch.delenv("CSWAP_SUPERVISED", raising=False)
+        before = {t.name for t in threading.enumerate()}
+        cli._watch_supervisor_eof()
+        after = {t.name for t in threading.enumerate()}
+        assert "supervisor-eof" not in (after - before)
+
+    def test_interactive_tty_is_left_alone(self, monkeypatch):
+        import threading
+
+        from claude_swap import cli
+
+        class FakeTTY:
+            closed = False
+            def isatty(self):
+                return True
+
+        monkeypatch.setenv("CSWAP_SUPERVISED", "1")
+        monkeypatch.setattr(cli.sys, "stdin", FakeTTY())
+        before = {t.name for t in threading.enumerate()}
+        cli._watch_supervisor_eof()
+        after = {t.name for t in threading.enumerate()}
+        assert "supervisor-eof" not in (after - before)
+class TestPreferredAccounts:
+    """``autoswitch.preferred`` orders qualifying targets, never the gates."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_preferred_beats_more_headroom_when_it_qualifies(self, temp_home):
+        h = self._harness(temp_home, preferred="C@Example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(95),   # over the threshold: must move
+            "2": _usage(10),   # most headroom
+            "3": _usage(40),   # preferred, qualifies -> wins
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_preferred_by_slot_number(self, temp_home):
+        h = self._harness(temp_home, preferred="3")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_preferred_must_still_clear_the_gates(self, temp_home):
+        """A preferred account over the threshold is not landed on."""
+        h = self._harness(temp_home, preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(92),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_unknown_preferred_names_are_ignored(self, temp_home):
+        h = self._harness(temp_home, preferred="nobody@example.com,9")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_preferred_orders_consume_first_targets_too(self, temp_home):
+        """Among sooner-resetting accounts, the preferred one wins even when
+        another resets sooner still; the strictly-sooner gate is untouched."""
+        h = self._harness(temp_home, strategy="consume-first", preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST),   # active resets last
+            "2": _usage7(10, 10, _R_SOON),     # soonest
+            "3": _usage7(10, 10, _R_LATER),    # preferred, still sooner than active
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "consume-first"
+
+    def test_preferred_does_not_override_all_spent_recovery_order(self, temp_home):
+        """Everything at/over the threshold: soonest-back still wins."""
+        h = self._harness(temp_home, preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(99, _iso_at(h.clock.now + 3600 * 2)),
+            "2": _usage(97, _iso_at(h.clock.now + 300)),     # soonest back
+            "3": _usage(95, _iso_at(h.clock.now + 3600)),    # preferred, later back
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2

@@ -33,6 +33,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap.locking import FileLock
@@ -61,6 +62,8 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+
+WEEK_S = 7 * 24 * 3600
 
 
 def _live_claim(
@@ -479,6 +482,32 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
+
+
+def _carry_weekly_reset(new, previous, now: float) -> None:
+    """Anthropic's weekly window resets at a fixed per-account slot, but the
+    usage endpoint omits ``resets_at`` for some tokens while utilization is
+    0. A window measured before pins the slot: step the last reset forward
+    by whole weeks to the first instant after ``now``. Mutates ``new`` in
+    place; no-op unless both sides qualify. seven_day only — the 5-hour
+    window is rolling from first use, nothing to infer."""
+    if not isinstance(new, dict) or not isinstance(previous, dict):
+        return
+    d7 = new.get("seven_day")
+    if not isinstance(d7, dict) or d7.get("resets_at"):
+        return
+    prev_d7 = previous.get("seven_day")
+    if not isinstance(prev_d7, dict):
+        return
+    ts = parse_reset_ts(prev_d7.get("resets_at"))
+    if ts is None:
+        return
+    while ts <= now:
+        ts += WEEK_S
+    resets_at = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    d7["resets_at"] = resets_at
+    d7["resets_at_inferred"] = True
+    d7["countdown"], d7["clock"] = oauth.format_reset(resets_at)
 
 
 def _rate_limited_trust_ok(
@@ -1070,6 +1099,7 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
+                _carry_weekly_reset(rec.usage, row.get("lastGood"), now)
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction

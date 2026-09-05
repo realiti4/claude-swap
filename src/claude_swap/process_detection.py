@@ -29,7 +29,16 @@ class ClaudeSession:
     started_at: int  # epoch milliseconds
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
-    status: str | None = None  # "busy", "idle", "waiting"
+    status: str | None = None  # "busy", "idle", "waiting", "shell"
+    # Unix socket Claude Code listens on for cross-session messages, when the
+    # record carries one (older versions and non-messaging sessions do not).
+    # Absent/empty means "cannot be messaged" — never guess the path from the
+    # pid, since a stale socket file outlives the process that bound it.
+    messaging_socket_path: str = ""
+    # Wire-format version of that socket. 0 when the record carries none,
+    # which is how pre-messaging Claude Code versions read; see
+    # session_resume.PEER_PROTOCOL for what consumes it.
+    peer_protocol: int = 0
 
 
 @dataclass
@@ -123,6 +132,17 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                messaging_socket_path=(
+                    data.get("messagingSocketPath")
+                    if isinstance(data.get("messagingSocketPath"), str)
+                    else ""
+                ),
+                peer_protocol=(
+                    data["peerProtocol"]
+                    if isinstance(data.get("peerProtocol"), int)
+                    and not isinstance(data.get("peerProtocol"), bool)
+                    else 0
+                ),
             ))
         except (
             json.JSONDecodeError,   # malformed JSON

@@ -1713,6 +1713,43 @@ class TestDisableEnableDispatch:
         assert excinfo.value.code == 2
 
 
+class TestManualSwitchResume:
+    """A human-driven switch wakes sessions the usage limit stopped.
+
+    The engine nudges from its own tick, but only while it is running — the
+    menu bar's copy can be switched off, and `cswap use` never had one. These
+    cover the CLI half of closing that gap; the two menu-bar call sites are
+    inside `MenuBarApp`, which is defined inside `run_menubar` and needs
+    `rumps`, so it has no unit tests by construction.
+    """
+
+    def _run(self, argv, slots):
+        """Run `argv` against a switcher whose live slot follows `slots`."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch(
+                 "claude_swap.session_resume.resume_after_manual_switch"
+             ) as resume, \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.current_account_number.side_effect = slots
+            cli.main()
+            return switcher_cls.return_value, resume
+
+    def test_use_resumes_stopped_sessions_after_landing(self):
+        """`cswap use 2` from slot 1 nudges, and reports where it came from."""
+        switcher, resume = self._run(
+            ["claude-swap", "--switch-to", "2"], ["1", "2"]
+        )
+        resume.assert_called_once_with(switcher, "1")
+
+    def test_bare_switch_resumes_stopped_sessions_after_landing(self):
+        """`cswap switch` rotates through switch(), not switch_to() — the
+        nudge has to hang off both or half the manual paths stay silent."""
+        switcher, resume = self._run(["claude-swap", "switch"], ["1", "2"])
+        resume.assert_called_once_with(switcher, "1")
+
+
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     """Import must allocate nothing; the fixture must allocate inside basetemp.
 
@@ -1737,3 +1774,34 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestParseSwitchHistory:
+    """cswap history: the supported reading of the switcher log."""
+
+    def test_parses_reverses_and_trims_stamps(self):
+        from claude_swap.cli import parse_switch_history
+
+        log = (
+            "2026-06-27 02:06:11,123 - INFO - Switched from account 3 to 1\n"
+            "junk line\n"
+            "2026-06-27 03:00:00,456 - INFO - Switched from account 1 to 2\n"
+        )
+        assert parse_switch_history(log) == [
+            {"from": 1, "to": 2, "at": "2026-06-27 03:00"},
+            {"from": 3, "to": 1, "at": "2026-06-27 02:06"},
+        ]
+
+    def test_limit_keeps_most_recent(self):
+        from claude_swap.cli import parse_switch_history
+
+        log = "\n".join(
+            f"2026-06-27 0{n % 10}:00:00 - Switched from account 1 to 2"
+            for n in range(15)
+        )
+        assert len(parse_switch_history(log)) == 10
+
+    def test_empty_log(self):
+        from claude_swap.cli import parse_switch_history
+
+        assert parse_switch_history("") == []
