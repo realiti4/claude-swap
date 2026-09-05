@@ -1100,6 +1100,20 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def test_strategy_dynamic_is_accepted(self, temp_home):
+        self._run(["--once", "--strategy", "dynamic"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.strategy == "dynamic"
+
+    def test_strategy_bogus_is_still_rejected(self, temp_home):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(
+                 sys, "argv",
+                 ["claude-swap", "auto", "--strategy", "bogus"],
+             ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2  # argparse usage error
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
 
@@ -1126,6 +1140,193 @@ class TestAutoCommand:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+    def test_ctrl_c_stops_the_engine_the_way_the_banner_promises(
+        self, temp_home
+    ):
+        """The banner says "Ctrl-C to stop"; only SIGTERM was wired.
+
+        `KeyboardInterrupt` is a `BaseException`, so neither `except
+        ClaudeSwitchError` nor `except Exception` in `tick()` catches it. It
+        propagates out of `_perform` between `switch_to` and the state write:
+        the account IS switched, `lastSwitchAt` is not recorded, and the LIVE
+        lock is still held. The next engine sees no cooldown and can switch
+        again immediately — the same half-written state the RLock fix closed,
+        through a door nobody wired shut.
+
+        Asserts the HANDLER is installed rather than simulating delivery:
+        installing it is the fix, and `stop()`'s own behaviour under a signal
+        is covered on the engine side.
+        """
+        import signal as signal_mod
+
+        installed = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        stopped = []
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                stopped.append(True)
+
+            def run_loop(self):
+                return 0
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        assert signal_mod.SIGINT in installed, (
+            f"handlers installed for {sorted(s.name for s in installed)} — the "
+            "banner tells the user Ctrl-C stops it and nothing handles SIGINT"
+        )
+        installed[signal_mod.SIGINT]()
+        assert stopped == [True], "the SIGINT handler does not stop the engine"
+
+    def test_a_second_ctrl_c_aborts_rather_than_doing_nothing(
+        self, temp_home
+    ):
+        """One Ctrl-C asks; a second must be able to insist.
+
+        `stop()` is idempotent — the second call hits `if self._live_lock is
+        None: return` and does nothing. So with a tick wedged in a network
+        call the operator had no way out short of SIGKILL from another
+        terminal, while the banner still says "Ctrl-C to stop". The handler
+        restores the default, which is the standard escalation: the second
+        signal raises KeyboardInterrupt.
+        """
+        import signal as signal_mod
+
+        installed = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+            # Delivered INSIDE the patch, so the handler's own re-install is
+            # recorded here instead of touching the test process's signals.
+            installed[signal_mod.SIGINT]()
+
+        assert installed[signal_mod.SIGINT] is signal_mod.default_int_handler, (
+            "after the first Ctrl-C the handler is still the engine's stop(), "
+            "which is a no-op the second time — a wedged tick cannot be "
+            "interrupted at all"
+        )
+
+    def test_the_banner_says_dry_run_for_a_demoted_engine(
+        self, temp_home, capsys
+    ):
+        """THE ENGINE, NOT THE REQUEST.
+
+        A second `cswap auto` loses the LIVE lock and demotes itself in
+        `__init__`, so `engine.dry_run` is True while `args.dry_run` is False.
+        Every other banner case drives a stub whose `dry_run` AGREES with the
+        flag, so both readings print the same line and none of them can say
+        which one it came from -- reverting this to `args.dry_run` left the
+        whole suite green.
+        """
+        class _Engine:
+            dry_run = True          # demoted; no --dry-run was asked for
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "Auto-switch running" in out, "premise: the banner never printed"
+        assert "(dry-run)" in out, (
+            "the banner read the REQUEST, so a demoted engine announces "
+            f"switching over a process that will switch nothing: {out!r}"
+        )
+
+    def test_once_is_interruptible_too(self, temp_home):
+        """`--once` exits before the handlers are installed, so it has none.
+
+        The half-written state the loop's handlers close is not a property of
+        the loop: `--once` takes the same `_perform` path, holds the same LIVE
+        lock, and a Ctrl-C between `switch_to` and the state write leaves the
+        account switched with no `lastSwitchAt`. Cron runs it, and a cron
+        wrapper's timeout kills with SIGTERM.
+
+        Asserts the handlers are in place WHEN THE TICK RUNS, not merely by
+        the end of the call: installing them after the tick would satisfy a
+        weaker assert and close nothing.
+        """
+        import signal as signal_mod
+
+        installed = {}
+        at_tick = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def tick(self):
+                at_tick.update(installed)
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        missing = {signal_mod.SIGINT, signal_mod.SIGTERM} - set(at_tick)
+        assert not missing, (
+            f"`--once` ran its tick with {sorted(s.name for s in missing)} "
+            "unhandled — a signal there leaves the account switched and "
+            "lastSwitchAt unwritten"
+        )
+
+    def test_auto_flag_is_refused_where_it_does_nothing(self, capsys):
+        """`--auto` is read only by the tui branch.
+
+        Everywhere else it parsed cleanly and was dropped, so `cswap watch
+        --auto` opened the watch page in silence — a flag that means "start
+        switching accounts" is the wrong one to ignore quietly.
+        """
+        with patch.object(sys, "argv", ["claude-swap", "watch", "--auto"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--auto can only be used with 'tui'" in capsys.readouterr().err
 
     def test_auto_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
@@ -1192,6 +1393,52 @@ class TestUnclaimedCommand:
             cli._unclaimed_command(["--purge", entry_id])
         assert switcher.list_unclaimed_credentials() == {}
         assert not switcher._store._stash_entry_path(entry_id).exists()
+
+    def test_a_purge_and_a_sweep_only_touch_their_own_rows(
+        self, temp_home,
+    ):
+        """Consumer: `cswap unclaimed --purge` (cli.py) beside the sweep.
+        Purging X and sweeping-away Y are two independent removals of the
+        same store — neither one's target is the other's, and a third row
+        with no drop verdict must be left standing by both."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        import time
+
+        def _creds(refresh, refresh_expires_at=None, access_expires_at=None):
+            payload = {"accessToken": "sk-a", "refreshToken": refresh}
+            if refresh_expires_at is not None:
+                payload["refreshTokenExpiresAt"] = refresh_expires_at
+            if access_expires_at is not None:
+                payload["expiresAt"] = access_expires_at
+            return json.dumps({"claudeAiOauth": payload})
+
+        def now_ms(days):
+            return int((time.time() + days * 86400) * 1000)
+
+        purge_target = switcher._store._write_unclaimed_credential(
+            _creds("x-rt", now_ms(20)), {"reason": "foreign"},
+        )
+        sweep_target = switcher._store._write_unclaimed_credential(
+            _creds("y-rt", now_ms(-1), access_expires_at=now_ms(-1)),
+            {"reason": "foreign"},
+        )
+        untouched = switcher._store._write_unclaimed_credential(
+            _creds("z-rt", now_ms(20)), {"reason": "foreign"},
+        )
+
+        with patch.object(os, "geteuid", return_value=1000, create=True):
+            cli._unclaimed_command(["--purge", purge_target])
+        switcher._sweep_unclaimed_stash()
+
+        remaining = switcher.list_unclaimed_credentials()
+        assert purge_target not in remaining
+        assert sweep_target not in remaining
+        assert untouched in remaining, (
+            "a row neither the purge nor the sweep targeted must survive both"
+        )
 
     def test_purging_an_unknown_id_fails_loudly(self, temp_home):
         self._stashed(temp_home)
@@ -1597,6 +1844,41 @@ class TestRunAutoResolve:
         assert ("exec_default", []) in calls
         assert "No account mapped" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("mapping", [None, "ghost@co.com"])
+    def test_require_session_refuses_the_default_login_fallback(
+        self, tmp_path, monkeypatch, capsys, mapping
+    ):
+        """`exec_default` runs plain claude on the default login with no
+        session profile and no auth-override scrubbing -- the one outcome
+        `--require-session` exists to refuse. Both fallbacks reach it: an
+        unmapped directory, and a mapping whose account is gone.
+
+        A script passing the flag cannot see either coming, so falling
+        through returned exit 0 having launched exactly what was forbidden.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        if mapping is not None:
+            from claude_swap.mappings import MappingStore
+
+            MappingStore(backup).set(repo, mapping, "")
+        calls = []
+        monkeypatch.chdir(repo)
+        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=self._fake_switcher(
+                       backup, {"accounts": {}, "sequence": []})), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "run", "--require-session"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert calls == [], calls
+        assert "--require-session" in capsys.readouterr().err
+
     def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
         from claude_swap.mappings import MappingStore
 
@@ -1711,6 +1993,41 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestTuiAutoFlag:
+    """`cswap tui --auto` opens the TUI on the auto view with the engine
+    LIVE — the flag itself is the go-live consent."""
+
+    def test_tui_auto_passes_start_auto(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui", "--auto"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "auto"
+
+    def test_tui_without_auto_stays_dashboard(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "dashboard"
 
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):

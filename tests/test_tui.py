@@ -19,12 +19,16 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
-from claude_swap.usage_store import UsageEntry
+from claude_swap.usage_store import STALE_OK_S, UsageEntry
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +308,7 @@ class TestFormatting:
         # active account, not that the user must re-login.
         assert (
             tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
-            == "token expired — refresh deferred this pass; retries automatically"
+            == "token expired — auto-refreshing on the next pass (≤1m); no action needed"
         )
         from claude_swap.switcher import SENTINEL_NOTES
 
@@ -325,7 +329,7 @@ class TestFormatting:
             age_s=720.0,
         )
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "token expired — refresh deferred this pass; retries automatically" in card
+        assert "token expired — auto-refreshing on the next pass (≤1m); no action needed" in card
         assert "last seen 53% used" in card
 
         no_history = account_card_text(
@@ -662,6 +666,198 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    def test_window_reads_the_same_as_the_auto_views_chip(self):
+        """One account must not read two ways on two screens.
+
+        The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
+        rendered `5h(⟳2h28m):100%` for the same window in the same second.
+        Both now come from data.chip_label, so a change to one surface
+        cannot silently diverge from the other.
+        """
+        from claude_swap.tui import data
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        # +1s so the truncating duration format cannot land on 2h27m when the
+        # render happens a hair after _iso_in computed the deadline.
+        last_good = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(3600 * 2 + 1680 + 1)}
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        chip = data.chip_label("5h", data.reset_text(last_good["five_hour"], now))
+        assert chip == "5h(⟳2h28m):"
+        assert f"{chip}100%" in mini_account_text(acc, now).plain
+
+    @pytest.mark.parametrize(
+        "age_s, expect_dim",
+        [(5.0, False), (STALE_OK_S + 100, True)],
+        ids=["fresh", "stale"],
+    )
+    def test_a_spend_only_account_shows_spend_not_usage_unknown(
+        self, age_s, expect_dim
+    ):
+        """PROBE: the same defect `TestUnswitchableRowsAreListed` fixed on the
+        auto view, on the dashboard's mini line.
+
+        An extra-usage (pay-as-you-go) account has neither a 5h nor a 7d
+        window — only `spend` — so this loop found nothing and fell through to
+        "usage unknown", while `usage_rows` IN THIS FILE rendered `$$ 51%
+        $10.29 / $50.00` for the same `last_good` in the same second. One
+        account must not read two ways on two screens.
+
+        Also covers staleness: every other pct in this file dims once the
+        measurement is older than `STALE_OK_S` (`account_card_text` dims the
+        very same `$$` row on the card for this same account), so the mini
+        line's spend pct must too — an undimmed reading asserts a freshness
+        the code never checked.
+
+        Display only: spend is a budget, not rate-limit headroom, and nothing
+        here feeds a ranking.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(
+            pct5=None, pct7=None, age_s=age_s,
+            spend={"used": 10.29, "limit": 20.0, "pct": 51.45, "currency": "USD"},
+        )
+        text = mini_account_text(make_account(1, entry=entry), now)
+        out = text.plain
+        assert "usage unknown" not in out, (
+            f"a spend-only account still reads as unknown: {out!r}"
+        )
+        assert "51%" in out, out
+        assert "$10.29" in out and "$20.00" in out, out
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == "51%")
+        assert ("dim" in str(pct_span.style)) == expect_dim, (
+            f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
+        )
+
+    def test_CONTROL_no_windows_and_no_spend_still_says_unknown(self):
+        """CONTROL for the probe: "usage unknown" is still the right answer
+        with genuinely nothing to show. Deleting the phrase would pass the row
+        above and lose the real signal."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(pct5=None, pct7=None)
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "usage unknown" in out, (
+            f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "age_s,expect_dim",
+        [(5.0, False), (STALE_OK_S + 100, True)],
+        ids=["fresh", "stale"],
+    )
+    def test_scoped_only_account_below_the_cap_is_shown_not_usage_unknown(
+        self, age_s, expect_dim
+    ):
+        """PROBE: the mini line's maxed-scoped loop only fires at/over 100%,
+        so an account whose only window is a per-model (e.g. Fable) limit
+        below its cap fell all the way through to "usage unknown" — while
+        `account_card_text` renders the same `Fable 99%` row from the same
+        `usage_rows` one screen over. Same rendering gap `c209903` closed for
+        spend, left open for scoped.
+
+        Staleness rides the same axis as the spend row above: this branch is
+        the OTHER place a pct is emitted, and an undimmed reading asserts a
+        freshness the code never checked.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(
+            pct5=None, pct7=None, age_s=age_s, scoped=[("Fable", 99.0)]
+        )
+        text = mini_account_text(make_account(1, entry=entry), now)
+        out = text.plain
+        assert "usage unknown" not in out, (
+            f"a scoped-only account below its cap still reads as unknown: {out!r}"
+        )
+        assert "Fable" in out and "99%" in out, out
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == "99%")
+        assert ("dim" in str(pct_span.style)) == expect_dim, (
+            f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
+        )
+
+    def test_spend_shows_alongside_a_healthy_window_not_hidden_behind_it(self):
+        """PROBE: the spend row only rendered inside `if not parts:`, so a
+        95%-spent budget vanished behind ANY healthy 5h/7d window — the mini
+        line said "5h:10%" and nothing else, while the card shows both rows
+        for the same account. Spend is a separate axis from a rate-limit
+        window (never enters the ranking), so hiding it behind one is not a
+        real precedence, just an accident of the fallback's shape.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(
+            pct5=10.0, pct7=None,
+            spend={"used": 19.0, "limit": 20.0, "pct": 95.0, "currency": "USD"},
+        )
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "10%" in out, out
+        assert "95%" in out, (
+            f"a 95%-spent budget vanished behind a healthy window: {out!r}"
+        )
+        assert "10% \u00b7 $$" in out, (
+            f"the window and the spend row ran together: {out!r}"
+        )
+
+    def test_countdown_shows_below_100_too(self):
+        """A window's worth IS when it comes back, which is exactly what you
+        compare while picking an account — so it is not hidden until 100%."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 42.0, "resets_at": _iso_in(3600 + 1)}}
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+
+    def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
+        """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
+        5h/7d window already rendered (`parts` nonzero) a scoped window below
+        its cap never reaches the dashboard row at all — it is not the
+        `usage unknown` fallback catching it either, since 5h/7d already
+        produced output. An account sitting at 91% on a per-model window
+        reads as if that window does not exist."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 91.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "91%" in out, (
+            f"a scoped window below 100 vanished from the dashboard row: {out!r}"
+        )
+
+    def test_scoped_window_at_100_keeps_its_marker_and_shows_pct(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "100%" in out and "(!)" in out, out
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -784,7 +980,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # the same helper the auto view uses. Assert the parts that carry
+            # the meaning (which window, what pct), not the spacing between
+            # them, so the two surfaces can keep sharing one format.
+            assert "5h(" in mini_part and ":92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
@@ -804,6 +1004,8 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                # No "pin-menu": the cloud pin row appears only when the
+                # optional extra is installed, which it is not in CI.
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -1294,6 +1496,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1311,6 +1514,10 @@ class _FakeEngine:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
 
+    def apply_strategy(self, strategy: str) -> None:
+        self.settings = dataclasses.replace(self.settings, strategy=strategy)
+        self.applied_strategies.append(strategy)
+
     def wake(self) -> None:
         self.wakes += 1
 
@@ -1324,12 +1531,91 @@ def fake_engine(monkeypatch):
     return _FakeEngine
 
 
+class _ContendedFakeEngine:
+    """Stands in for AutoSwitchEngine, but ALWAYS starts demoted regardless
+    of the requested ``dry_run`` -- simulating a second engine that lost the
+    LIVE lock to a holder already running. ``promote()`` then simulates
+    ``_retry_live_promotion`` succeeding once the holder exits: flips
+    ``dry_run``/``demoted_from_live`` and emits the same event kind
+    (``config-warning``) the real method does, with NO further human action
+    -- exactly what I1 is about.
+    """
+
+    instances: list["_ContendedFakeEngine"] = []
+
+    def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+        self.settings = settings
+        self.on_event = on_event
+        self.dry_run = True                 # always demoted on construction
+        self.demoted_from_live = True
+        self.stopped = False
+        self._stop = threading.Event()
+        self._promote_requested = threading.Event()
+        _ContendedFakeEngine.instances.append(self)
+
+    def run_loop(self) -> int:
+        # `on_event` -- like the real engine's -- must run from THIS worker
+        # thread: `_emit_from_thread` reaches it via Textual's
+        # `call_from_thread`, which raises RuntimeError (silently swallowed)
+        # when called from the app's own thread. `promote()` merely flags
+        # the request from the test's thread; the actual emit happens here,
+        # matching where the real `_retry_live_promotion` runs.
+        self.on_event(NoSwitchEvent(reason="cooldown"))
+        while not self._stop.is_set():
+            if self._promote_requested.wait(0.05):
+                self._promote_requested.clear()
+                self.dry_run = False
+                self.demoted_from_live = False
+                self.on_event(
+                    ConfigWarningEvent(
+                        message="the LIVE holder released the lock — this "
+                                "engine is now LIVE"
+                    )
+                )
+        return 0
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._stop.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        pass
+
+    def apply_strategy(self, strategy: str) -> None:
+        pass
+
+    def wake(self) -> None:
+        pass
+
+    def promote(self) -> None:
+        self._promote_requested.set()
+
+    def wait_promoted(self, timeout: float = 1.0) -> bool:
+        """Block until `run_loop`'s worker thread has flipped `dry_run`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.dry_run:
+                return True
+            time.sleep(0.01)
+        return not self.dry_run
+
+
+@pytest.fixture
+def contended_fake_engine(monkeypatch):
+    _ContendedFakeEngine.instances = []
+    monkeypatch.setattr(
+        "claude_swap.tui.autoview.AutoSwitchEngine", _ContendedFakeEngine
+    )
+    return _ContendedFakeEngine
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
         await settle(pilot)
         await pilot.press("g")
         await pilot.pause()
+
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1349,6 +1635,42 @@ class TestAutoScreen:
             from textual.widgets import RichLog
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
+
+    async def test_a_promoted_engine_updates_the_badge(
+        self, tmp_path, contended_fake_engine
+    ):
+        """The engine PROMOTES itself mid-run, with no human action.
+
+        Nothing else re-reads `dry_run` after mount, so without the refresh in
+        `_on_engine_event` the badge keeps reading DRY-RUN over an engine that
+        is now switching accounts -- worse than the stuck-dry-run it fixes,
+        because the display then contradicts what is happening. Deleting that
+        one call left the suite green: `contended_fake_engine` was built for
+        exactly this and no case used it.
+        """
+        from textual.widgets import Static
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            engine = contended_fake_engine.instances[0]
+            badge = app.screen.query_one("#mode-badge", Static)
+            assert badge.has_class("dry"), (
+                "premise: the screen did not open demoted, so a later LIVE "
+                "badge would prove nothing"
+            )
+
+            engine.promote()
+            assert engine.wait_promoted(), "premise: the engine never promoted"
+            await settle(pilot)
+
+            assert badge.has_class("live"), (
+                "the badge still reads DRY-RUN over an engine that is now "
+                "LIVE and switching accounts"
+            )
 
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1424,6 +1746,41 @@ class TestAutoScreen:
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
 
+    async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._settings.strategy == "consume-first"  # the default
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "consume-first" in summary.render().plain
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "dynamic"
+            engine = fake_engine.instances[0]
+            assert engine.applied_strategies == ["dynamic"]
+            assert engine.wakes == 1  # a forced tick shows the new strategy
+            assert "dynamic (session)" in summary.render().plain
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "best"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "consume-first"  # wraps around
+            # the override lives in memory only — nothing was persisted
+            assert not (tmp_path / "settings.json").exists()
+            await pilot.press("escape")
+            await settle(pilot)
+            # the session strategy does not outlive the screen: a fresh open
+            # reverts to the file value, same precedent as the threshold.
+            await self._open(pilot)
+            assert app.screen._settings.strategy == "consume-first"
+
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
     ):
@@ -1476,6 +1833,11 @@ class TestAutoScreen:
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "best"},
+        }))
         fake = FakeSwitcher(
             [
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
@@ -1504,7 +1866,8 @@ class TestAutoScreen:
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1, "autoswitch": {"model": "Fable"},
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "best"},
         }))
         fake = FakeSwitcher(
             [
@@ -1531,6 +1894,152 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_drop_the_model_gate_when_every_row_is_model_only(
+        self, tmp_path, fake_engine
+    ):
+        """Both candidates' ONLY over-bar window is the pinned model, exactly
+        the shape ``_rank_candidates`` (autoswitch.py) retries on 5h/7d alone
+        for — but that retry is `dynamic`-only (autoswitch.py:2400): `best`/
+        `consume-first` never rank on 5h/7d alone, so under those strategies
+        the panel must NOT drop the model gate either, even here. `strategy`
+        must be `dynamic` for the panel to take this path at all — ranking on
+        the model-gated axis here would name #2 (95% Fable) the worse account
+        when its real 5h is #3's better one: the two are on OPPOSITE sides of
+        `-Fable, +5h` vs `+Fable, -5h`."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            # #2's real 5h (20%) beats #3's (60%): once the model gate drops
+            # (neither #2 nor #3 has a 5h/7d window over the bar on its own),
+            # #2 must rank first — ranking on the model-gated axis instead
+            # would put #3 first (90% Fable < 95% Fable).
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+
+    async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
+        self, tmp_path, fake_engine
+    ):
+        """The regression this gate exists to stop: same fleet as the test
+        above (both candidates blocked ONLY by the pinned model), but
+        `strategy: "best"` — the engine's own retry never drops the model
+        set for `best`/`consume-first` (autoswitch.py:2400), so the panel
+        must not either. Ranking stays on the model-gated axis: #3 (90%
+        Fable) ranks first, the OPPOSITE order from the `dynamic` test
+        above."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "best", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+
+    async def test_candidates_drain_soonest_seven_day_reset_first(
+        self, tmp_path, fake_engine
+    ):
+        """Under the default (consume-first) strategy, 'Next best' lists
+        switchable accounts in the order the engine would actually switch to
+        them: soonest 7-day reset first, so quota is spent before it resets
+        and goes to waste. The active's 5-hour window stays a gate, never a
+        key -- it plays no part in this order."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 90},
+        }))
+
+        def _entry(pct7: float, reset7_s: float, pct5: float | None = None) -> UsageEntry:
+            if pct5 is None:
+                pct5 = pct7 - 10.0  # seeded below 7d: immaterial to the order
+            last_good = {
+                "five_hour": {"pct": pct5, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": pct7, "resets_at": _iso_in(reset7_s)},
+            }
+            return UsageEntry(last_good=last_good, fetched_at=time.time() - 5.0, age_s=5.0)
+
+        fake = FakeSwitcher(
+            [
+                make_account(  # active: 5h 38% resets 55m, 7d 53% resets 1d18h
+                    4, active=True,
+                    entry=UsageEntry(
+                        last_good={
+                            "five_hour": {"pct": 38.0, "resets_at": _iso_in(3300)},
+                            "seven_day": {"pct": 53.0, "resets_at": _iso_in(151200)},
+                        },
+                        fetched_at=time.time() - 5.0, age_s=5.0,
+                    ),
+                ),
+                make_account(6, entry=_entry(37.0, 532800, pct5=0.0)),
+                make_account(3, entry=_entry(44.0, 201600)),
+                make_account(2, entry=_entry(62.0, 309600)),
+                make_account(5, entry=_entry(42.0, 108000)),
+                make_account(1, entry=_entry(62.0, 414000)),  # cloud/OAuth slot
+                make_account(
+                    7, kind="api_key",
+                    entry=make_entry(
+                        pct5=None, pct7=None,
+                        spend={"used": 1.0, "limit": 100.0, "pct": 1.0, "currency": "USD"},
+                    ),
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            positions = [
+                plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
+            ]
+            assert positions == sorted(positions), plain
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
@@ -1542,6 +2051,27 @@ class TestEventText:
         from claude_swap.tui.autoview import event_text
 
         assert event.human() in event_text(event).plain
+
+    def test_a_deliberate_wait_is_not_painted_as_an_exhausted_fleet(self):
+        """`_EVENT_ROLES` keys on the KIND, and one kind carries two states.
+
+        `sev_crit` is the fifth surface saying "exhausted" about a hold whose
+        own gate proves every candidate was READ and one still holds quota.
+
+        This case builds the event directly, so it cannot witness that gate;
+        `test_a_readable_peer_with_room_does_not_excuse_an_unread_one` is the
+        one that does.
+        """
+        from claude_swap.autoswitch import AllExhaustedEvent
+        from claude_swap.tui.autoview import event_text
+
+        wait = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=True)
+        real = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=False)
+        styles = lambda e: {str(s.style) for s in event_text(e).spans}
+        assert styles(wait) != styles(real), (
+            "a deliberate hold is painted exactly like an exhausted fleet: "
+            f"{styles(wait)}"
+        )
 
     def test_event_text_uses_light_accent_for_switch(self):
         from claude_swap.tui.autoview import event_text
@@ -1599,7 +2129,7 @@ class TestBareInvocation:
 
         launched = {}
 
-        def fake_run(switcher):
+        def fake_run(switcher, start="dashboard"):
             launched["switcher"] = switcher
             return 0
 
@@ -1710,3 +2240,448 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestTheAutoFlagIsTheOnlyRouteToLive:
+    """`cswap tui --auto` is the one thing that starts a LIVE engine.
+
+    A bare `cswap tui` lands on the dashboard, and reaching the auto view
+    from the menu watches without switching — opening a view must never
+    begin switching accounts. That the menu route starts dry-run is asserted
+    by `TestAutoScreen::test_opens_in_dry_run_and_store_only`, which drives
+    the real keypress; these two cover the flag's own halves.
+
+    A persisted `autoStartLive` setting used to override this, so one
+    confirmed "Go live" made every later launch switch accounts unasked, on
+    every machine sharing settings.json. The setting is gone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_bare_launch_lands_on_the_dashboard_with_no_engine(
+        self, tmp_path, fake_engine
+    ):
+        from claude_swap.tui.dashboard import DashboardScreen
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)  # default start="dashboard", no --auto
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            assert fake_engine.instances == [], (
+                "a bare launch constructed the auto-switch engine"
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_auto_flag_opens_the_view_and_starts_live(
+        self, tmp_path, fake_engine
+    ):
+        """Both halves in one: `--auto` must SHOW the auto view (not merely
+        construct-and-never-push it) and the engine it starts must be LIVE.
+        Splitting these let a mutation that dropped the `push_screen` call
+        survive — the constructed-engine assertion passed on its own."""
+        from claude_swap.tui.app import CswapApp
+        from claude_swap.tui.autoview import AutoScreen
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = CswapApp(fake, start="auto")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances, "no engine was constructed"
+            assert fake_engine.instances[-1].dry_run is False, (
+                "--auto did not start a LIVE engine"
+            )
+
+class TestUnswitchableRowsAreListed:
+    """A slot you cannot switch to must still appear, with the reason.
+
+    It used to be filtered out of "Next best" entirely. On a machine that
+    had imported the account roster but not the credentials — which is the
+    normal state right after a sync, since credentials deliberately do not
+    travel — the auto view showed two accounts while the engine's own log
+    line listed five. An absent row reads as "not configured"; a row that
+    says why reads as "here is what to do".
+    """
+
+    def _snap(self, *accounts):
+        from claude_swap.models import AccountsSnapshot
+        return AccountsSnapshot(
+            accounts=list(accounts), active_number=None, taken_at=0.0
+        )
+
+    def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
+              sentinel=None):
+        from unittest.mock import MagicMock
+        a = MagicMock()
+        a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        a.usage.last_good = last_good
+        a.usage.sentinel = sentinel
+        return a
+
+    def _render(self, snap, active, *, settings=None):
+        from unittest.mock import MagicMock, patch
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.settings import AutoSwitchSettings
+
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = settings or AutoSwitchSettings()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            return str(v._candidates_text(snap, active_number=active))
+
+    def test_a_credential_less_slot_is_shown_with_what_to_do(self):
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="1")
+        assert "new@x.com" in out, "the slot must not be hidden"
+        # Naming the state is not enough — "no credentials" leaves the user
+        # to guess, and the obvious guess (/login right where you are) writes
+        # the login to whatever slot is active instead of this one.
+        assert "switch here" in out
+        assert "log in" in out
+
+    def test_an_api_key_slot_says_api_key_not_re_login(self):
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "console-api@token.local",
+                       switchable=False, kind="api_key"),
+        ), active="1")
+        assert "console-api@token.local" in out
+        assert "API key" in out
+        # There is no login to restore for an API key slot.
+        assert "cswap add" not in out
+
+    def test_an_api_key_slot_says_api_key_even_behind_a_locked_keychain(self):
+        """CONTROL for the probe below: consulting the sentinel must not let it
+        overrule `kind`.
+
+        `dashboard.py`'s pin-menu comment records the measured divergence — an
+        API-key slot behind a locked macOS keychain derives
+        USAGE_KEYCHAIN_UNAVAILABLE — and `kind` is the fact the CLI and set_pin
+        refuse on. "try again" is wrong advice for a slot that has no login to
+        come back to, however many times you retry.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "console-api@token.local", switchable=False,
+                       kind="api_key", sentinel=USAGE_KEYCHAIN_UNAVAILABLE),
+        ), active="1")
+        assert "API key" in out, (
+            f"the sentinel overruled `kind` — the divergence dashboard.py's "
+            f"pin menu documents: {out!r}"
+        )
+        assert "keychain" not in out, out
+
+    def test_an_unreadable_slot_says_keychain_not_no_stored_login(self):
+        """PROBE for the two rows above: a slot whose backup EXISTS but could
+        not be read right now (locked keychain, no GUI session) is unswitchable
+        for a different reason, and its own sentinel already says which.
+
+        This arm never consulted it, so the row printed the `no stored login —
+        switch here, then log in (`cswap add` …)` advice, and taking it burns a
+        working stored grant by overwriting it with whatever is live. The same
+        dead end `switcher.py`'s `_static_usage_sentinel` comment says was
+        removed from three other sites; this arm was a fourth.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "locked@x.com", switchable=False,
+                       sentinel=USAGE_KEYCHAIN_UNAVAILABLE),
+        ), active="1")
+        assert "locked@x.com" in out
+        assert "keychain unavailable" in out, (
+            f"the real sentinel was shadowed by the hardcoded pair: {out!r}"
+        )
+        assert "cswap add" not in out, (
+            f"advice that overwrites a good stored credential: {out!r}"
+        )
+
+    def test_a_spend_only_account_shows_its_spend_not_usage_unknown(self):
+        """An extra-usage (pay-as-you-go) account has no 5h/7d window, so the
+        binding-window helper answers None and the row read "usage unknown"
+        while the watch screen showed `$$ 51%  $10.29 / $20.00` for the same
+        account from the same `last_good`. One account cannot read two ways.
+
+        `relevant_windows` excludes `spend` deliberately — it is a separate
+        axis from a rate-limit window and must not enter the ranking — so this
+        is a RENDERING gap, not a missing window. The row stays sorted last.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, last_good={
+                "spend": {"pct": 51.45, "used": 10.29, "limit": 20.0},
+            }),
+        ), active="1")
+        assert "usage unknown" not in out, (
+            f"a spend-only account still reads as unknown: {out!r}"
+        )
+        assert "$10.29" in out and "$20.00" in out, out
+        assert "51%" in out, out
+
+    def test_spend_does_not_enter_the_ranking(self):
+        """Showing spend must not make it a sort key. Spend is a budget, not
+        rate-limit headroom, and `relevant_windows` excludes it from every
+        decision — a spend-only account ranks last whatever its percentage,
+        or the display would quietly change which account the engine picks.
+
+        Measured by the row ORDER: a 1%-spent account still sorts behind a
+        95%-used oauth account, which it would overtake on any spend-aware key.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "busy@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 95.0},
+            }),
+            self._acct("6", "cheap@x.com", switchable=True, last_good={
+                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+            }),
+        ), active="1")
+        assert out.index("busy@x.com") < out.index("cheap@x.com"), (
+            f"spend entered the ranking — a barely-spent account outranked a "
+            f"95%-used one: {out!r}"
+        )
+
+    def test_CONTROL_an_account_with_no_usage_at_all_still_says_unknown(self):
+        """The control: "usage unknown" is still the right answer when there
+        is genuinely nothing to show. A fix that removes the phrase outright
+        would pass the row above and lose the real signal."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("7", "silent@x.com", switchable=True),
+        ), active="1")
+        assert "usage unknown" in out, (
+            f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
+
+    def test_unswitchable_rows_sort_last(self):
+        out = self._render(self._snap(
+            self._acct("4", "empty@x.com", switchable=False),
+            self._acct("1", "a@x.com", switchable=True),
+        ), active="9")
+        assert out.index("a@x.com") < out.index("empty@x.com")
+
+    def test_the_first_chip_starts_at_the_same_column_across_rows(self):
+        """Each row's content must start where the widest email in this
+        block ends, not where its own email ends — otherwise a long email
+        pushes its row's content far right while short ones sit left, and
+        the columns never line up. This must hold at BOTH sites that pad
+        the email: the switchable rows (chips) and the unswitchable row
+        (a sentinel note instead), which are two separate append sites in
+        the panel and can drift out of alignment independently.
+        """
+        import re
+
+        out = self._render(self._snap(
+            self._acct("2", "brief@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("3", "a-much-longer-address@example.com",
+                       switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="9")
+        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
+        assert len(rows) == 3, rows
+        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
+        assert columns[0] == columns[1] == columns[2], (
+            f"content does not share a column: {columns} in {rows!r}"
+        )
+
+    def test_later_chips_align_by_window_name_not_position(self):
+        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
+        nine characters wider than `5h:0%`, so a row whose 5h window carries
+        a live countdown pushes its 7d and Fable chips right of a row whose
+        5h window does not — a positional pad over `chip_label` cannot fix
+        this because the two rows' window LISTS can differ in length and
+        membership; the column has to be keyed by window NAME. Same emails-
+        length rows to isolate this from the already-covered email pad.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=8)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
+        assert len(lines) == 2, lines
+        seven_d = [line.index("7d") for line in lines]
+        fable = [line.index("Fable") for line in lines]
+        assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
+        assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
+
+    def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
+        """`classify_candidate_block`'s two blocked outcomes must both reach
+        the panel, not just `model` — the decision log already appends
+        `(<window> full)` for `full` (`_describe`), and the chip colour
+        alone does not say which window blocked: it is driven by the fixed
+        WARN/CRIT constants in `theme.py`, not by `settings.threshold`, so
+        at an off-default threshold the colour and the block classification
+        can disagree."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            # Model-only block: 5h/7d have room, only the pinned model's
+            # scoped window is over the bar.
+            self._acct("2", "model-only@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            # Full block: 5h itself is over the bar, no model choice escapes it.
+            self._acct("3", "c@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 10.0}],
+            }),
+        ), active="1", settings=settings)
+        assert "Fable-only" in out, out
+        assert "  5h full" in out, out
+
+    def test_the_panel_chips_include_the_window_its_label_names(self):
+        """A row's chips and its label must read the SAME window set — a
+        `model`-blocked row used to name the scoped window in its label
+        while the chips, built from a literal 5h/7d pair, never printed it
+        at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
+        threshold 90, model Fable — the label already read `Fable-only`;
+        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "d@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 28.0}, "seven_day": {"pct": 70.0},
+                "scoped": [{"name": "Fable", "pct": 91.0}],
+            }),
+        ), active="1", settings=settings)
+        assert "Fable-only" in out, out
+        assert "Fable:91%" in out, out
+
+    def test_panel_top_matches_the_engines_pick_under_consume_first(
+        self, temp_home
+    ):
+        """The engine's own model-window fallback (`_rank_candidates`,
+        autoswitch.py) only drops the model set under `strategy ==
+        "dynamic"` (`autoswitch.py:2400`) — `best`/`consume-first` never
+        rank on 5h/7d alone. The panel's `rank_models` fallback must be
+        gated the same way, or under `consume-first` it names a top row
+        the engine is forbidden to pick.
+
+        Four accounts, `model="Fable"`, `threshold=90`, `strategy=
+        "consume-first"`: every candidate is blocked on the model-gated
+        axis (account 2 on its own 5h window, 3 and 4 only on Fable), so
+        an ungated panel drops `models` and ranks 3/4 on 5h/7d alone,
+        naming account 3 top. The real engine, ticked on the identical
+        fleet, switches to account 2 — the panel must agree.
+        """
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="consume-first",
+        )
+        for num, email in (
+            (1, "a@x.invalid"), (2, "b@x.invalid"),
+            (3, "c@x.invalid"), (4, "d@x.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a@x.invalid", 1)
+
+        def w(five_h, seven_d, fable, hours_out):
+            d = {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+            }
+            if fable is not None:
+                d["scoped"] = [{"name": "Fable", "pct": fable}]
+            return d
+
+        fleet = {
+            "1": w(0, 91, 99, 10),
+            "2": w(91, 5, None, 5),
+            "3": w(20, 50, 100, 20),
+            "4": w(5, 88, 95, 40),
+        }
+        out = h.tick_with_usage(fleet)
+        assert out is TickOutcome.SWITCHED, f"expected a switch, got {out}"
+        engine_pick = str(h.active_number())
+
+        settings = AutoSwitchSettings(
+            model="Fable", threshold=90.0, strategy="consume-first",
+        )
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=fleet["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=fleet["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
+            self._acct("4", "d@x.invalid", switchable=True, last_good=fleet["4"]),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid", "4": "d@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
+
+
+@pytest.mark.asyncio
+class TestNeedsLoginIsReported:
+    """Landing on a credential-less slot logs the machine OUT.
+
+    `switch_to` reports that with `needsLogin`, and the notification path read
+    only `switched` — so the one switch that leaves the user unable to work
+    announced itself exactly like a working one.
+    """
+
+    class _EmptySlotSwitcher(FakeSwitcher):
+        def switch_to(
+            self, identifier: str, json_output: bool = False, force: bool = False
+        ) -> dict:
+            payload = super().switch_to(identifier, json_output, force)
+            payload["needsLogin"] = True
+            payload["reason"] = "switched-needs-login"
+            payload["message"] = (
+                f"Switched to Account-{identifier} "
+                f"(user{identifier}@example.com) — no stored login; run /login"
+            )
+            return payload
+
+    async def test_the_switch_notification_says_a_login_is_needed(self, tmp_path):
+        fake = self._EmptySlotSwitcher(
+            [make_account("1", active=True), make_account("2")], tmp_path
+        )
+        app = make_app(fake)
+        seen: list[tuple[str, dict]] = []
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.notify = lambda msg, **kw: seen.append((str(msg), kw))
+            app.do_switch("2")
+            await settle(pilot)
+
+        assert seen, "the switch produced no notification at all"
+        body = " ".join(m for m, _ in seen)
+        assert "/login" in body, (
+            f"a switch that logged the machine out reported a plain success: "
+            f"{seen!r}"
+        )

@@ -438,6 +438,40 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+def switch_notification(payload: dict | None = None) -> tuple[str, str]:
+    """``(title, body)`` for the notification a completed switch posts.
+
+    A ``needsLogin`` landing is a switch onto a slot with no stored login, so
+    the machine is now logged out: the propagation note below would tell the
+    user to wait for an account that never arrives.
+    """
+    if (payload or {}).get("needsLogin"):
+        return (
+            "Logged out",
+            (payload or {}).get("message")
+            or "That slot has no stored login — run /login in Claude Code.",
+        )
+    return (
+        "Account switched",
+        "Switch takes effect within ~30s — restart Claude Code to apply "
+        "immediately.",
+    )
+
+
+def exhausted_notification(event) -> tuple[str, str]:
+    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
+
+    One kind carries two states. A deliberate wait is entered BECAUSE every
+    candidate was READ and one still holds quota, so "All accounts exhausted"
+    is the one thing it is not -- and the notification is a surface
+    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
+    does not count.
+    """
+    if getattr(event, "deliberate_wait", False):
+        return "Waiting for a reset", event.human()
+    return "All accounts exhausted", event.human()
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -632,7 +666,7 @@ def run(switcher) -> int:
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification("claude-swap", *exhausted_notification(ev))
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
@@ -811,17 +845,16 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap", message=str(e))
                 return False
 
-        def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+        def _notify_switched(self, payload: dict | None = None):
+            rumps.notification("claude-swap", *switch_notification(payload))
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
+                payload: dict = {}
+                if self._guard(lambda: payload.update(
+                    self.switcher.switch_to(str(num), json_output=True) or {}
+                )):
+                    self._notify_switched(payload)
                     self.refresh_async()
             return cb
 
