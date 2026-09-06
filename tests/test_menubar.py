@@ -927,3 +927,110 @@ def test_attributed_row_count_and_no_crash_on_sentinel_and_disabled():
         )
         assert len(titles) == 3
         assert "re-login needed" in titles[1].string()
+
+
+@needs_appkit
+class TestActiveRowEmphasis:
+    """NSMenuItem.state centres its checkmark vertically over the whole item,
+    and a grid row is two lines tall once countdowns are shown — so the mark
+    floated in the gap between the name and its countdowns, aligned with
+    neither."""
+
+    @staticmethod
+    def _row():
+        rows = [
+            menubar.TableRow(
+                cells=("8", "a@b.c", "95%", "10%"),
+                values=(None, None, 95.0, 10.0),
+                severities=(None, None, "warning", None),
+                resets=("", "", "1h", "2d"),
+            ),
+        ]
+        columns = (
+            menubar.TableColumn("num", "", False),
+            menubar.TableColumn("name", "", False),
+            menubar.TableColumn("window", "5h", True),
+            menubar.TableColumn("window", "7d", True),
+        )
+        titles, _ = menubar.build_attributed_rows(
+            AppKit, rows, columns, ("", "", "5h", "7d"), with_resets=True
+        )
+        return titles[0]
+
+    def _at(self, attributed, index):
+        font = attributed.attribute_atIndex_effectiveRange_(
+            AppKit.NSFontAttributeName, index, None
+        )[0]
+        colour = attributed.attribute_atIndex_effectiveRange_(
+            AppKit.NSForegroundColorAttributeName, index, None
+        )[0]
+        bold = bool(
+            AppKit.NSFontManager.sharedFontManager().traitsOfFont_(font)
+            & AppKit.NSBoldFontMask
+        ) if font is not None else False
+        return bold, colour
+
+    def test_the_whole_first_line_is_emphasised(self):
+        """Stopping at the name left too little of the row to find at a
+        glance, which is the one job the mark has."""
+        row = self._row()
+        text = row.string()
+        first_pct = text.find("\t", text.find("\t") + 1) + 1
+
+        out = menubar._emphasise_active(AppKit, row)
+
+        assert self._at(out, 0)[0] is True
+        assert self._at(out, first_pct)[0] is True
+
+    def test_a_warning_percentage_keeps_its_own_colour(self):
+        """Weight may run across the numbers; colour may not. The tints are
+        the reading the operator most needs to see."""
+        row = self._row()
+        text = row.string()
+        first_pct = text.find("\t", text.find("\t") + 1) + 1
+
+        out = menubar._emphasise_active(AppKit, row)
+
+        assert self._at(out, first_pct)[1] == AppKit.NSColor.systemOrangeColor()
+
+    def test_the_countdown_line_stays_quiet(self):
+        row = self._row()
+        second_line = row.string().find("\n") + 1
+
+        out = menubar._emphasise_active(AppKit, row)
+
+        assert self._at(out, second_line)[0] is False
+
+    def test_the_original_is_not_mutated(self):
+        """rebuild_menu reuses the aligned titles; emphasising in place would
+        leave every later row wearing this one's weight."""
+        row = self._row()
+        menubar._emphasise_active(AppKit, row)
+        assert self._at(row, 0)[0] is False
+
+
+@needs_appkit
+def test_the_resets_line_carries_no_repeated_caption():
+    """It read "resets in" once per account, saying the same thing each time
+    and separated from its own values by whichever columns were empty."""
+    rows = [
+        menubar.TableRow(
+            cells=("1", "a@b.c", "5%", "10%"),
+            values=(None, None, 5.0, 10.0),
+            severities=(None,) * 4,
+            resets=("", "", "1h", "2d"),
+        ),
+    ]
+    columns = (
+        menubar.TableColumn("num", "", False),
+        menubar.TableColumn("name", "", False),
+        menubar.TableColumn("window", "5h", True),
+        menubar.TableColumn("window", "7d", True),
+    )
+    titles, _ = menubar.build_attributed_rows(
+        AppKit, rows, columns, ("", "", "5h", "7d"), with_resets=True
+    )
+    second_line = titles[0].string().split("\n")[1]
+
+    assert "resets" not in second_line
+    assert "1h" in second_line and "2d" in second_line

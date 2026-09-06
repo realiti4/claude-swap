@@ -307,7 +307,6 @@ def format_account_label(
 
 MAXED_MARKER = "!"   # window at/over its limit — the usual reason to switch
 AHEAD_MARKER = "\u2191"   # weekly window running ahead of an even burn-down pace
-RESETS_CAPTION = "resets in"  # leads the dimmed second line of a detailed row
 SPEND_HEADER = "$"
 
 # Utilization thresholds behind the severity tint. Only the constrained end is
@@ -620,6 +619,41 @@ def _bar_attachment(AppKit, image):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attachment)
 
 
+def _emphasise_active(AppKit, attributed):
+    """Mark the active account inside the row rather than beside it.
+
+    ``NSMenuItem.state`` draws its checkmark centred vertically over the whole
+    item. That is right for a one-line item and wrong for a grid row, which is
+    two lines tall once reset countdowns are shown: the mark floats in the gap
+    between the name and the countdowns, aligned with neither.
+
+    Weight, across the first line only. Not colour — an accent-coloured row
+    reads as a link, and it would compete with the warning and critical tints
+    the percentages carry, which are the readings that matter. Weight runs
+    safely across those numbers because it does not disturb their colour. The
+    countdown line stays quiet; bolding it would make the active row shout
+    twice without helping anyone find it.
+
+    Works on a copy: ``rebuild_menu`` reuses the aligned titles, and
+    emphasising in place would leave every later row wearing this one's weight.
+    """
+    out = AppKit.NSMutableAttributedString.alloc().initWithAttributedString_(attributed)
+    text = out.string()
+    newline = text.find("\n")
+    head = len(text) if newline < 0 else newline
+    if head <= 0:
+        return out
+    existing = out.attribute_atIndex_effectiveRange_(
+        AppKit.NSFontAttributeName, 0, None
+    )[0]
+    if existing is not None:
+        bold = AppKit.NSFontManager.sharedFontManager().convertFont_toHaveTrait_(
+            existing, AppKit.NSBoldFontMask
+        )
+        out.addAttribute_value_range_(AppKit.NSFontAttributeName, bold, (0, head))
+    return out
+
+
 def build_attributed_rows(
     AppKit,
     rows: list[TableRow],
@@ -705,8 +739,6 @@ def build_attributed_rows(
             if with_resets:
                 widest = max(widest, width(row.resets[index], small_font))
         widths.append(widest)
-    if with_resets and len(widths) > 1:
-        widths[1] = max(widths[1], width(RESETS_CAPTION, small_font))
 
     # Give every window column the same width — an even rhythm reads far better
     # than columns that each hug their own widest value, and it keeps a "0%"
@@ -792,8 +824,12 @@ def build_attributed_rows(
                 AppKit.NSColor.secondaryLabelColor(),
                 (start, len(row.cells[3])))
         if with_resets and any(row.resets):
+            # No caption. It read "resets in" once per account — as many
+            # times as there are accounts, saying the same thing each time,
+            # and separated from its own values by whichever window columns
+            # were empty. The countdown sits directly under the percentage it
+            # belongs to, and the header above already names the window.
             resets = list(row.resets)
-            resets[1] = RESETS_CAPTION
             attributed.appendAttributedString_(
                 AppKit.NSAttributedString.alloc().initWithString_attributes_(
                     "\n", {AppKit.NSParagraphStyleAttributeName: paragraph}))
@@ -1231,8 +1267,13 @@ def run(switcher) -> int:
                 # The plain label above stays the item's rumps key (unique per
                 # account); the attributed title only changes what's drawn.
                 if aligned is not None:
-                    item._menuitem.setAttributedTitle_(aligned[index])
-                item.state = 1 if is_active else 0
+                    title = aligned[index]
+                    if is_active:
+                        title = _emphasise_active(AppKit, title)
+                    item._menuitem.setAttributedTitle_(title)
+                    # NOT item.state on a grid row — see _emphasise_active.
+                else:
+                    item.state = 1 if is_active else 0
                 account_items.append(item)
             if not accounts:
                 account_items = [rumps.MenuItem("No managed accounts", callback=None)]
