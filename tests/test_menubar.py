@@ -18,7 +18,7 @@ import pytest
 
 from claude_swap import menubar
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.switcher import USAGE_API_KEY
+from claude_swap.switcher import SENTINEL_NOTES, USAGE_API_KEY
 
 
 # --- notification identity -----------------------------------------------------
@@ -461,6 +461,34 @@ class _FakeAcct:
 class _FakeSnap:
     def __init__(self, accounts):
         self.accounts = accounts
+
+
+class TestShortSentinelNote:
+    """A menu is as wide as its widest item, and the full notes carry a remedy.
+    Measured on a pool of eight accounts: one expired row renders 614pt while
+    every aligned account row is 314pt, so it nearly doubles the menu."""
+
+    def test_the_remedy_is_cut_and_the_state_kept(self):
+        assert menubar.short_sentinel_note("re-login needed") == "re-login needed"
+        assert menubar.short_sentinel_note("token expired") == "token expired"
+
+    def test_it_is_derived_not_a_second_table(self):
+        """Every short form must be a prefix of its full note — a hand-kept
+        second copy of these strings would drift."""
+        for key, note in SENTINEL_NOTES.items():
+            assert note.startswith(menubar.short_sentinel_note(key))
+
+    def test_a_note_without_a_remedy_passes_through_whole(self):
+        assert menubar.short_sentinel_note("api key") == SENTINEL_NOTES["api key"]
+
+    def test_no_sentinel_can_set_the_menu_width(self):
+        """The property that matters. The longest email in a real pool is 19
+        characters, so a note under 45 cannot be the widest item."""
+        for key in SENTINEL_NOTES:
+            assert len(menubar.short_sentinel_note(key)) <= 45, key
+
+    def test_an_unknown_sentinel_survives(self):
+        assert menubar.short_sentinel_note("something new") == "something new"
 
 
 def test_account_display_usage_sentinel_note_last_good_or_none():

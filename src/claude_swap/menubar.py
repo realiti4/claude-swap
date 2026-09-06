@@ -905,15 +905,35 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
     return out[-limit:][::-1]
 
 
+def short_sentinel_note(sentinel: str) -> str:
+    """The state, without the instruction that follows it.
+
+    A menu is as wide as its widest item, and the full notes carry a remedy as
+    well as a state: "re-login needed — refresh token dead; log in with Claude
+    Code, then run: cswap add" is 82 characters. Measured on a pool of eight
+    accounts, that one row renders 614pt wide while every aligned account row
+    is 314pt — so a single expired account nearly doubles the menu and leaves
+    the usage columns marooned against the far edge. Cutting the remedy takes
+    it to 201pt, narrower than the table, so it stops setting the width.
+
+    Derived from ``SENTINEL_NOTES`` rather than kept as a second table: two
+    hand-maintained copies of one string drift. A note with no dash ("API key
+    (no quota)") is already short and passes through whole. ``cswap list``
+    keeps the full note, where one long line costs nothing and the remedy is
+    what the reader came for.
+    """
+    note = SENTINEL_NOTES.get(sentinel, sentinel)
+    return note.split(" \u2014 ", 1)[0]
+
+
 def _account_display_usage(entry) -> dict | str | None:
     """Menu-display usage for a ``UsageEntry``.
 
-    A human-readable note for a sentinel state (token expired / API key /
-    keychain unavailable), otherwise the last-good measurement dict, otherwise
-    ``None``.
+    A short note for a sentinel state (token expired / API key / keychain
+    unavailable), otherwise the last-good measurement dict, otherwise ``None``.
     """
     if entry.sentinel:
-        return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        return short_sentinel_note(entry.sentinel)
     return entry.last_good
 
 
