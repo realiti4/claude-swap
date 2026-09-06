@@ -19,6 +19,7 @@ accidentally swap their default keychain by running pytest.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -123,6 +124,63 @@ class TestBackupCredentialsSecurity:
                 call("claude-swap", "account-None-bob@example.com"),
                 call("claude-swap", "account-None-bob@example.com.prev"),
             ])
+
+
+class TestActiveCredentialWritesRequestTrustedApps:
+    """Issue #279: the ACTIVE credential — the item Claude Code itself reads
+    via its in-process Security.framework call, as opposed to the
+    ``claude-swap``-service backup items above, which only this wrapper ever
+    reads — must be written with ``trusted_apps`` so its ACL isn't left
+    trusting only ``/usr/bin/security``. Mocked: the shape of the call, not
+    the real ACL (that's ``TestKeychainAclPreservedOnWrite``, Layer 2).
+    """
+
+    def test_oauth_write_passes_resolved_trusted_apps(
+        self, macos_switcher: ClaudeAccountSwitcher
+    ):
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
+            mock_kc.resolve_trusted_claude_apps.return_value = ["/opt/claude"]
+            macos_switcher._store._write_oauth_credentials(
+                '{"claudeAiOauth": {"accessToken": "x"}}'
+            )
+
+            mock_kc.set_password.assert_called_once_with(
+                "Claude Code-credentials",
+                mock_kc.keychain_account_name.return_value,
+                '{"claudeAiOauth": {"accessToken": "x"}}',
+                trusted_apps=["/opt/claude"],
+            )
+
+    def test_managed_key_write_passes_resolved_trusted_apps(
+        self, macos_switcher: ClaudeAccountSwitcher
+    ):
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
+            mock_kc.resolve_trusted_claude_apps.return_value = ["/opt/claude"]
+            macos_switcher._store._write_managed_credentials(
+                "sk-ant-api03-" + "x" * 40
+            )
+
+            mock_kc.set_password.assert_called_once_with(
+                "Claude Code",
+                mock_kc.keychain_account_name.return_value,
+                "sk-ant-api03-" + "x" * 40,
+                trusted_apps=["/opt/claude"],
+            )
+
+    def test_backup_writes_do_not_pass_trusted_apps(
+        self, macos_switcher: ClaudeAccountSwitcher
+    ):
+        """The per-account ``claude-swap``-service backup is read only by this
+        wrapper's own ``security`` calls, never by Claude Code — widening its
+        ACL would be a no-op that just grows the ACL for nothing."""
+        with patch("claude_swap.credentials.macos_keychain") as mock_kc:
+            mock_kc.get_password.return_value = None
+            macos_switcher._write_account_credentials(
+                "2", "alice@example.com", "secret-token"
+            )
+            mock_kc.set_password.assert_called_once_with(
+                "claude-swap", "account-2-alice@example.com", "secret-token"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +346,189 @@ def test_wrapper_roundtrip_real_keychain(tmp_keychain: str):
     assert macos_keychain.get_password("claude-swap-test", "acct-1") == "round-trip-token"
     macos_keychain.delete_password("claude-swap-test", "acct-1")
     assert macos_keychain.get_password("claude-swap-test", "acct-1") is None
+
+
+@pytest.fixture
+def tmp_keychain_path(tmp_path: Path):
+    """Create a temporary keychain at an explicit absolute path, never touching
+    the default keychain or the search list.
+
+    Unlike :func:`tmp_keychain` (which swaps the *default* keychain — needed
+    for tests that exercise code with no ``keychain=`` targeting of its own),
+    every test below passes ``keychain=`` explicitly to
+    ``macos_keychain.*``, so there's no need to touch the user's default or
+    search list at all: create it under ``tmp_path`` (an absolute path with a
+    directory component — a *bare* filename would land in
+    ``~/Library/Keychains/`` instead, which is exactly the mistake this
+    fixture exists to avoid), unlock it, disable auto-lock, and unconditionally
+    delete it on teardown so no file survives even if a test fails midway.
+    """
+    keychain = str(tmp_path / "test.keychain")
+    password = "test-keychain-password"
+    subprocess.run(
+        ["security", "create-keychain", "-p", password, keychain], check=True
+    )
+    try:
+        subprocess.run(
+            ["security", "unlock-keychain", "-p", password, keychain], check=True
+        )
+        # Same SecurityAgent-hang defense as `tmp_keychain`: no auto-lock timeout.
+        subprocess.run(
+            ["security", "set-keychain-settings", keychain], check=True
+        )
+        yield keychain
+    finally:
+        subprocess.run(["security", "delete-keychain", keychain], check=False)
+
+
+def _trusted_app_paths(keychain: str, service: str, account: str) -> list[str]:
+    """Parse ``security dump-keychain -a``'s ACL section for one item's
+    trusted-application list — the entry whose authorizations include
+    ``decrypt`` (the read/write authorization ``set_password``'s ``-T``
+    targets), e.g.::
+
+        access: 5 entries
+            entry 0:
+                authorizations (6): decrypt derive export_clear export_wrapped mac sign
+                ...
+                applications (2):
+                    0: /usr/bin/security (OK)
+                        requirement: identifier "com.apple.security" and anchor apple
+                    1: /usr/bin/true (OK)
+                        requirement: identifier "com.apple.true" and anchor apple
+
+    Returns just the paths, e.g. ``["/usr/bin/security", "/usr/bin/true"]``.
+    """
+    result = subprocess.run(
+        ["security", "dump-keychain", "-a", keychain],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"dump-keychain failed: {result.stderr}"
+    # `dump-keychain -a` prints one record per item, each starting with a
+    # fresh "keychain: " header; split on that to isolate our item's record.
+    records = result.stdout.split("\nkeychain: ")
+    record = next(
+        (
+            r for r in records
+            if f'"svce"<blob>="{service}"' in r and f'"acct"<blob>="{account}"' in r
+        ),
+        None,
+    )
+    assert record is not None, f"no dump-keychain record for {service}/{account}"
+    lines = record.splitlines()
+    decrypt_idx = next(
+        i for i, line in enumerate(lines)
+        if "authorizations" in line and "decrypt" in line
+    )
+    app_line = re.compile(r"^\s+\d+:\s+(\S+)\s+\(")
+    apps: list[str] = []
+    for line in lines[decrypt_idx + 1:]:
+        m = app_line.match(line)
+        if m:
+            apps.append(m.group(1))
+            continue
+        stripped = line.strip()
+        if stripped.startswith(("requirement:", "applications", "description:",
+                                 "don't-require-password")):
+            continue
+        break  # reached the next ACL entry / end of the access section
+    return apps
+
+
+@pytest.mark.no_keychain_fake
+@mac_ci_only
+class TestKeychainAclPreservedOnWrite:
+    """Issue #279: a Keychain item ``security add-generic-password`` writes
+    without ``-T`` gets an ACL trusting only ``/usr/bin/security`` — a
+    headless in-process Security.framework reader (e.g. Claude Code) then
+    needs a GUI prompt to read it back, surfacing as "OAuth session expired"
+    with perfectly valid credentials underneath.
+
+    Empirically (see ``set_password``'s docstring): the fix cannot be "pass
+    ``-U -T <app>`` on the existing item" — that routes through
+    ``SecKeychainItemSetAccess``, which needs interactive authorization and
+    can itself raise a SecurityAgent GUI prompt, even against an
+    already-unlocked keychain. So a widen-in-place repro is not attempted
+    here; these tests instead prove the ACL each write actually produces.
+    """
+
+    def test_write_without_trusted_apps_leaves_only_security_trusted(
+        self, tmp_keychain_path: str
+    ):
+        """The bug itself: the pre-#279 call shape (no ``trusted_apps``)."""
+        macos_keychain.set_password(
+            "acl-test-default", "acct", "v1", keychain=tmp_keychain_path
+        )
+        assert _trusted_app_paths(tmp_keychain_path, "acl-test-default", "acct") == [
+            "/usr/bin/security"
+        ]
+
+    def test_write_with_trusted_apps_widens_the_acl_on_create(
+        self, tmp_keychain_path: str
+    ):
+        """A brand-new item: ``-T`` is honored directly, no prompt, no delete."""
+        macos_keychain.set_password(
+            "acl-test-create", "acct", "v1",
+            keychain=tmp_keychain_path, trusted_apps=["/usr/bin/true"],
+        )
+        apps = _trusted_app_paths(tmp_keychain_path, "acl-test-create", "acct")
+        assert set(apps) == {"/usr/bin/security", "/usr/bin/true"}
+        assert (
+            macos_keychain.get_password(
+                "acl-test-create", "acct", keychain=tmp_keychain_path
+            )
+            == "v1"
+        )
+
+    def test_write_with_trusted_apps_widens_an_existing_narrow_item(
+        self, tmp_keychain_path: str
+    ):
+        """An item that already exists with the narrow (pre-fix) ACL: the fix
+        must widen it via delete-then-recreate, not raise, and not hang."""
+        # Seed a narrow item — exactly what test_write_without_trusted_apps_*
+        # proves this call shape produces.
+        macos_keychain.set_password(
+            "acl-test-update", "acct", "v1", keychain=tmp_keychain_path
+        )
+        assert _trusted_app_paths(tmp_keychain_path, "acl-test-update", "acct") == [
+            "/usr/bin/security"
+        ], "premise: the item starts narrow"
+
+        macos_keychain.set_password(
+            "acl-test-update", "acct", "v2",
+            keychain=tmp_keychain_path, trusted_apps=["/usr/bin/true"],
+        )
+
+        assert (
+            macos_keychain.get_password(
+                "acl-test-update", "acct", keychain=tmp_keychain_path
+            )
+            == "v2"
+        ), "the value must survive the delete+recreate, not just the ACL"
+        apps = _trusted_app_paths(tmp_keychain_path, "acl-test-update", "acct")
+        assert set(apps) == {"/usr/bin/security", "/usr/bin/true"}
+
+    def test_write_with_trusted_apps_is_idempotent_when_already_widened(
+        self, tmp_keychain_path: str
+    ):
+        """A second write with the *same* trusted_apps (the steady-state case
+        once #279 ships) must not error or regress the ACL."""
+        macos_keychain.set_password(
+            "acl-test-idempotent", "acct", "v1",
+            keychain=tmp_keychain_path, trusted_apps=["/usr/bin/true"],
+        )
+        macos_keychain.set_password(
+            "acl-test-idempotent", "acct", "v2",
+            keychain=tmp_keychain_path, trusted_apps=["/usr/bin/true"],
+        )
+        assert (
+            macos_keychain.get_password(
+                "acl-test-idempotent", "acct", keychain=tmp_keychain_path
+            )
+            == "v2"
+        )
+        apps = _trusted_app_paths(tmp_keychain_path, "acl-test-idempotent", "acct")
+        assert set(apps) == {"/usr/bin/security", "/usr/bin/true"}
 
 
 class TestOurOwnFileModeIsNotAKeychainFailure:

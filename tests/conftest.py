@@ -434,23 +434,54 @@ sys.addaudithook(_real_store_audit_hook)
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real
-    macOS Keychain so unit tests never shell out to ``security`` or ``keyring``."""
+    macOS Keychain so unit tests never shell out to ``security`` or ``keyring``.
+
+    Several existing tests seed/inspect ``.data`` directly with a bare
+    ``(service, account)`` key (e.g. ``block_real_keychain.data[(svc, acct)] =
+    ...``), so that key shape is load-bearing and must not change. ``keychain``
+    and ``trusted_apps`` (added for #279's ACL fix) are accepted for signature
+    parity with the real wrapper but not folded into the key or otherwise
+    enforced — this fake has no real multi-keychain or ACL concept, and no
+    fake-backed test needs one (the real-Keychain integration tests that
+    exercise ``keychain=``/``trusted_apps=`` for real opt out of this fake via
+    ``no_keychain_fake``).
+    """
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
+        # Last `trusted_apps` a `set_password` call requested, per (service,
+        # account) — recorded only so a test can assert *what was requested*
+        # without needing the real Keychain.
+        self.trusted_apps: dict[tuple[str, str], list[str] | None] = {}
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
-    def get_password(self, service: str, account: str) -> str | None:
+    def get_password(
+        self, service: str, account: str, *, keychain: str | None = None
+    ) -> str | None:
         return self.data.get((service, account))
 
-    def item_exists(self, service: str, account: str) -> bool:
+    def item_exists(
+        self, service: str, account: str, *, keychain: str | None = None
+    ) -> bool:
         return (service, account) in self.data
 
-    def set_password(self, service: str, account: str, password: str) -> None:
+    def set_password(
+        self,
+        service: str,
+        account: str,
+        password: str,
+        *,
+        keychain: str | None = None,
+        trusted_apps: list[str] | None = None,
+    ) -> None:
         self.data[(service, account)] = password
+        self.trusted_apps[(service, account)] = trusted_apps
 
-    def delete_password(self, service: str, account: str) -> None:
+    def delete_password(
+        self, service: str, account: str, *, keychain: str | None = None
+    ) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
+        self.trusted_apps.pop((service, account), None)
 
 
 def _make_fake_keyring() -> types.ModuleType:

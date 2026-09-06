@@ -138,6 +138,232 @@ def test_set_get_roundtrip_hex_is_decodable():
 
 
 # ---------------------------------------------------------------------------
+# get_password / item_exists / delete_password / set_password — ``keychain``
+# targeting (issue #279's testability seam: a positional keychain argument,
+# opt-in, default None = unchanged prior behavior)
+# ---------------------------------------------------------------------------
+
+
+def test_get_password_keychain_none_matches_prior_argv_exactly():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout="v\n")
+        macos_keychain.get_password("svc", "acct")
+        args = run.call_args.args[0]
+        assert args == [
+            "/usr/bin/security", "find-generic-password",
+            "-a", "acct", "-w", "-s", "svc",
+        ]
+
+
+def test_get_password_keychain_given_appends_trailing_positional():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout="v\n")
+        macos_keychain.get_password("svc", "acct", keychain="/tmp/x.keychain")
+        args = run.call_args.args[0]
+        assert args[-1] == "/tmp/x.keychain"
+        assert args[:-1] == [
+            "/usr/bin/security", "find-generic-password",
+            "-a", "acct", "-w", "-s", "svc",
+        ]
+
+
+def test_item_exists_keychain_given_appends_trailing_positional():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.item_exists("svc", "acct", keychain="/tmp/x.keychain")
+        args = run.call_args.args[0]
+        assert args[-1] == "/tmp/x.keychain"
+
+
+def test_delete_password_keychain_given_appends_trailing_positional():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.delete_password("svc", "acct", keychain="/tmp/x.keychain")
+        args = run.call_args.args[0]
+        assert args[-1] == "/tmp/x.keychain"
+
+
+def test_set_password_keychain_given_appends_trailing_positional_in_stdin():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", "secret", keychain="/tmp/x.keychain"
+        )
+        stdin = run.call_args.kwargs["input"]
+        assert stdin.rstrip("\n").endswith('"/tmp/x.keychain"')
+
+
+# ---------------------------------------------------------------------------
+# set_password — ``trusted_apps`` (issue #279: a freshly-created item's ACL
+# by default trusts only /usr/bin/security, which a headless in-process
+# Security.framework reader — e.g. Claude Code — can't read without a GUI
+# prompt). See tests/test_macos_keychain_contract.py's
+# TestKeychainAclPreservedOnWrite for the real-Keychain ACL-widening proof;
+# these mock subprocess to check the argv/stdin shape and the
+# delete-then-recreate call ordering.
+# ---------------------------------------------------------------------------
+
+
+def test_set_password_no_trusted_apps_is_byte_for_byte_unchanged():
+    # The exact stdin string set_password produced before #279, verbatim.
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "secret")
+        stdin = run.call_args.kwargs["input"]
+        hex_value = "secret".encode().hex()
+        assert stdin == f'add-generic-password -U -a "acct" -s "svc" -X {hex_value}\n'
+
+
+def test_set_password_empty_trusted_apps_list_is_also_a_no_op():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "secret", trusted_apps=[])
+        stdin = run.call_args.kwargs["input"]
+        assert "-T" not in stdin
+
+
+def test_set_password_trusted_apps_adds_dash_T_per_app_and_always_security():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run, \
+         patch("claude_swap.macos_keychain.item_exists", return_value=False):
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", "secret", trusted_apps=["/opt/claude"]
+        )
+        stdin = run.call_args.kwargs["input"]
+        assert '-T "/usr/bin/security"' in stdin  # the tool itself, always
+        assert '-T "/opt/claude"' in stdin
+
+
+def test_set_password_trusted_apps_dedupes_when_security_already_listed():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run, \
+         patch("claude_swap.macos_keychain.item_exists", return_value=False):
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", "secret",
+            trusted_apps=["/usr/bin/security", "/opt/claude"],
+        )
+        stdin = run.call_args.kwargs["input"]
+        assert stdin.count("-T ") == 2  # security once, claude once — no triple
+
+
+def test_set_password_trusted_apps_on_new_item_does_not_delete_first():
+    """A brand-new item: ``-T`` is honored directly by ``-U`` — no need to
+    (and must not) delete first, matching the empirical finding that a
+    delete+recreate is only required to widen an EXISTING item's ACL."""
+    with patch("claude_swap.macos_keychain.subprocess.run") as run, \
+         patch("claude_swap.macos_keychain.item_exists", return_value=False) as exists, \
+         patch("claude_swap.macos_keychain.delete_password") as delete:
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", "secret", trusted_apps=["/opt/claude"]
+        )
+        exists.assert_called_once_with("svc", "acct", keychain=None)
+        delete.assert_not_called()
+        run.assert_called_once()  # a single add-generic-password, nothing else
+
+
+def test_set_password_trusted_apps_on_existing_item_deletes_then_recreates():
+    """An item that already exists: widening its ACL via ``-U -T`` in place is
+    NOT safe (see set_password's docstring — SecKeychainItemSetAccess can
+    raise a SecurityAgent prompt), so the fix must delete first."""
+    calls = []
+
+    def fake_delete(service, account, *, keychain=None):
+        calls.append(("delete", service, account, keychain))
+
+    with patch("claude_swap.macos_keychain.subprocess.run") as run, \
+         patch("claude_swap.macos_keychain.item_exists", return_value=True), \
+         patch("claude_swap.macos_keychain.delete_password", side_effect=fake_delete):
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", "secret",
+            keychain="/tmp/x.keychain", trusted_apps=["/opt/claude"],
+        )
+        assert calls == [("delete", "svc", "acct", "/tmp/x.keychain")]
+        # The delete must happen BEFORE the add-generic-password call.
+        run.assert_called_once()
+
+
+def test_set_password_trusted_apps_large_payload_falls_back_to_argv_with_dash_T():
+    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT
+    with patch("claude_swap.macos_keychain.subprocess.run") as run, \
+         patch("claude_swap.macos_keychain.item_exists", return_value=False):
+        run.return_value = _completed(0)
+        macos_keychain.set_password(
+            "svc", "acct", big,
+            keychain="/tmp/x.keychain", trusted_apps=["/opt/claude"],
+        )
+        args = run.call_args.args[0]
+        assert "input" not in run.call_args.kwargs  # argv path, not stdin
+        assert args.count("-T") == 2  # security + claude, unquoted argv
+        assert "/usr/bin/security" in args and "/opt/claude" in args
+        assert args[-1] == "/tmp/x.keychain"
+
+
+# ---------------------------------------------------------------------------
+# resolve_trusted_claude_apps
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_trusted_claude_apps_no_claude_on_path_returns_empty(monkeypatch):
+    monkeypatch.setattr(macos_keychain.shutil, "which", lambda name: None)
+    assert macos_keychain.resolve_trusted_claude_apps() == []
+
+
+def test_resolve_trusted_claude_apps_real_binary_returns_just_that_path(
+    monkeypatch, tmp_path
+):
+    binary = tmp_path / "claude"
+    binary.write_bytes(b"\x7fELF-not-really-but-not-a-shebang-either")
+    monkeypatch.setattr(
+        macos_keychain.shutil, "which",
+        lambda name: str(binary) if name == "claude" else None,
+    )
+    apps = macos_keychain.resolve_trusted_claude_apps()
+    assert apps == [str(binary.resolve())]
+
+
+def test_resolve_trusted_claude_apps_shebang_script_adds_the_interpreter(
+    monkeypatch, tmp_path
+):
+    node = tmp_path / "node"
+    node.write_bytes(b"\x7fELF-fake-node-binary")
+    shim = tmp_path / "claude"
+    shim.write_text(f"#!{node}\nrequire('./cli.js')\n")
+
+    def fake_which(name):
+        if name == "claude":
+            return str(shim)
+        if name == "node":
+            return str(node)
+        return None
+
+    monkeypatch.setattr(macos_keychain.shutil, "which", fake_which)
+    apps = macos_keychain.resolve_trusted_claude_apps()
+    assert apps == [str(shim.resolve()), str(node.resolve())]
+
+
+def test_resolve_trusted_claude_apps_env_shebang_resolves_the_named_interpreter(
+    monkeypatch, tmp_path
+):
+    node = tmp_path / "node"
+    node.write_bytes(b"\x7fELF-fake-node-binary")
+    shim = tmp_path / "claude"
+    shim.write_text("#!/usr/bin/env node\nrequire('./cli.js')\n")
+
+    def fake_which(name):
+        if name == "claude":
+            return str(shim)
+        if name == "node":
+            return str(node)
+        return None
+
+    monkeypatch.setattr(macos_keychain.shutil, "which", fake_which)
+    apps = macos_keychain.resolve_trusted_claude_apps()
+    assert apps == [str(shim.resolve()), str(node.resolve())]
+
+
+# ---------------------------------------------------------------------------
 # delete_password
 # ---------------------------------------------------------------------------
 

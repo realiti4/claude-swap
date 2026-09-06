@@ -336,7 +336,7 @@ class CredentialStore:
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
 
-    def _kc_call(self, fn, *args):
+    def _kc_call(self, fn, *args, **kwargs):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
 
         A success (including ``get_password`` returning ``None`` for a missing
@@ -351,7 +351,7 @@ class CredentialStore:
         "absent" and "failed", so a timeout would be misread as a usable Keychain.
         """
         try:
-            result = fn(*args)
+            result = fn(*args, **kwargs)
         except macos_keychain.KEYCHAIN_ERRORS:
             # A Keychain op FAILED. Recorded separately from the capability
             # cache because that cache is a routing decision others overwrite —
@@ -837,6 +837,7 @@ class CredentialStore:
                     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
                     api_key,
+                    trusted_apps=macos_keychain.resolve_trusted_claude_apps(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall back to config below.
@@ -978,6 +979,7 @@ class CredentialStore:
                     CLAUDE_CODE_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
                     credentials,
+                    trusted_apps=macos_keychain.resolve_trusted_claude_apps(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
