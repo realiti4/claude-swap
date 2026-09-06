@@ -35,7 +35,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -3209,7 +3209,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 
     def test_the_null_snapshot_answers_differently_by_recorded_trigger(self):
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3258,7 +3258,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         existed has no such key. Must fall back to the old two-null
         inference (failover) rather than crash or silently misclassify."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3294,7 +3294,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         more permissive failover landing floor, regardless of whether some
         future change makes the failover branch unconditional."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -4628,7 +4628,7 @@ class TestHorizonAxisDoesNotFlap:
         combinations, every one identical. The ranking is the only place the
         bar's effect is observable in isolation.
         """
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         args = dict(
             trigger="proactive",
@@ -6993,17 +6993,19 @@ class TestPerWindowThresholds:
             {"1": _usage7(*usage), "2": _usage7(0, 0)}
         ) is expected
 
-    @pytest.mark.parametrize("override", [0.0, -5.0])
-    def test_a_non_positive_window_key_falls_back_to_the_base_line(self, override):
-        """A hand-edited settings.json can carry a value the `cswap config
-        set` bounds refuse. FAILURE DIRECTION: back to the line the window
-        had before per-window keys existed. Zero would make `pct / line`
-        infinite and fire on an idle account; dropping the window would stop
-        watching it at all. `or` — the obvious spelling — takes the first of
-        those for 0 and the second for a negative."""
-        s = AutoSwitchSettings(threshold=90.0, threshold_five_hour=override)
-        assert autoswitch_window_threshold("5h", s) == 90.0
-        assert autoswitch_pressure(_usage7(45.0, 0), (), s) == pytest.approx(0.5)
+    @pytest.mark.parametrize("written", ["-3", "0", "10"])
+    def test_the_clamp_already_makes_a_too_low_window_key_impossible(
+        self, tmp_path, written
+    ):
+        """There is no guard for a zero or negative override because
+        load_settings cannot produce one: _clamped holds every float to its
+        spec range and this spec's floor is 50.0. Measured rather than
+        assumed, because the guard that used to sit in window_threshold was
+        justified by the opposite claim."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"autoswitch": {"thresholdFiveHour": float(written)}})
+        )
+        assert load_settings(tmp_path).threshold_five_hour == 50.0
 
     def test_the_below_threshold_line_quotes_the_window_it_measured(
         self, temp_home

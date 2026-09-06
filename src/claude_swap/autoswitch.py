@@ -597,19 +597,21 @@ def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
     Every window that is not the 5h one is weekly — the 7d window and each
     per-model scoped window, which reset on the same cadence.
 
-    An override that is not a usable line (``None``, or a non-positive value a
-    hand-edited settings.json can carry past the clamp) falls back to
-    ``threshold``. That is the only safe direction: 0 would make ``pct / line``
-    infinite and fire on an idle account, and dropping the window would stop
-    watching it altogether. Falling back means the window is still watched at
-    exactly the line it had before per-window keys existed.
+    ``None`` means "not set" and falls back to ``threshold``, so a config that
+    never mentions these keys is watched at exactly the line it had before they
+    existed.
+
+    No guard against a zero or negative override: ``load_settings`` cannot
+    produce one. ``_clamped`` holds every float to its spec range, and this
+    spec's floor is 50.0 — measured, a hand-edited ``-3`` comes back as 50.0,
+    as does 0. A branch for a state no caller can reach is a seam with no
+    caller, and one carrying a justification that is not true is worse than
+    none.
     """
     override = (
         settings.threshold_five_hour if label == "5h" else settings.threshold_weekly
     )
-    if override is None or override <= 0:
-        return settings.threshold
-    return override
+    return settings.threshold if override is None else override
 
 
 def binding_window(
