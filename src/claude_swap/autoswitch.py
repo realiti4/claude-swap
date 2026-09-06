@@ -591,27 +591,107 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
+def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
+    """The switch line for one window.
+
+    Every window that is not the 5h one is weekly — the 7d window and each
+    per-model scoped window, which reset on the same cadence.
+
+    An override that is not a usable line (``None``, or a non-positive value a
+    hand-edited settings.json can carry past the clamp) falls back to
+    ``threshold``. That is the only safe direction: 0 would make ``pct / line``
+    infinite and fire on an idle account, and dropping the window would stop
+    watching it altogether. Falling back means the window is still watched at
+    exactly the line it had before per-window keys existed.
+    """
+    override = (
+        settings.threshold_five_hour if label == "5h" else settings.threshold_weekly
+    )
+    if override is None or override <= 0:
+        return settings.threshold
+    return override
+
+
+def binding_window(
+    usage: dict | str | None,
+    models: tuple[str, ...],
+    settings: AutoSwitchSettings,
+) -> tuple[float, float] | None:
+    """``(pct, line)`` of the window closest to its OWN switch line.
+
+    A RATIO decides, not the raw percentage, and that is the part that is easy
+    to get wrong: comparing ``max(pct)`` against the binding window's line
+    looks equivalent and is not. With 5h at 89.5 (line 90) and 7d at 94 (line
+    95) no window has crossed anything, yet ``max(pct) = 94`` clears the 5h
+    line of 90 and would fire. Dividing each window by its own line collapses
+    to the old comparison exactly when the lines are equal.
+
+    ``None`` when no window is readable. The line is returned alongside the pct
+    so a log line can quote the comparison the engine actually made.
+    """
+    best: tuple[float, float] | None = None
+    for label, pct, _resets_at in oauth.relevant_windows(
+        usage if isinstance(usage, dict) else None, models
+    ):
+        line = window_threshold(label, settings)
+        if line > 0 and (best is None or pct / line > best[0] / best[1]):
+            best = (pct, line)
+    return best
+
+
+def pressure(
+    usage: dict | str | None,
+    models: tuple[str, ...],
+    settings: AutoSwitchSettings,
+) -> float | None:
+    """How close this account is to the first line it will cross, as a ratio.
+
+    ``>= 1.0`` means some window has reached its own threshold. ``None`` when
+    no window is readable — never 0.0, which would read as "plenty of room".
+    """
+    window = binding_window(usage, models, settings)
+    return None if window is None else window[0] / window[1]
+
+
+def _landable(
+    usage: dict | str | None,
+    models: tuple[str, ...],
+    settings: AutoSwitchSettings,
+) -> bool:
+    """Would the ranking accept this account as a place to land right now —
+    every window strictly below its own line? ``False`` when unreadable, which
+    is what the headroom spelling of this test (``h is not None and
+    h > 100 - threshold``) also did."""
+    ratio = pressure(usage, models, settings)
+    return ratio is not None and ratio < 1.0
+
+
 def _every_account_above_threshold(
     candidates: Sequence[str],
-    headroom: dict[str, float | None],
-    active_headroom: float | None,
-    threshold: float,
+    pressures: dict[str, float | None],
+    active_pressure: float | None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    their own switch lines — the state where "land somewhere healthy" has no
+    answer.
 
-    Requires the active account's own headroom to be known: without it we do
-    not know we are in this state, and guessing here would relax the landing
-    rule on an ordinary tick. An unmeasured candidate does not block the
-    verdict (it may be healthy, but it cannot be *chosen* either — the caller
-    skips ``None`` headroom) as long as at least one candidate was measured.
+    Reads the same ratio as the trigger and the landing gate, so the three
+    cannot disagree about what "above the threshold" means. A ``None`` pressure
+    is exactly a ``None`` headroom (both mean "no readable window"), so this is
+    the same census it always was.
+
+    Requires the active account's own reading to be known: without it we do not
+    know we are in this state, and guessing here would relax the landing rule
+    on an ordinary tick. An unmeasured candidate does not block the verdict (it
+    may be healthy, but it cannot be *chosen* either — the caller skips
+    ``None``) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_pressure is None or active_pressure < 1.0:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [p for p in map(pressures.get, candidates) if p is not None]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(p >= 1.0 for p in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -976,8 +1056,18 @@ class AutoSwitchEngine:
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # Each window against its OWN line, closest one decides. The
+            # message quotes that window's pct and that window's line, so it
+            # cannot print an arithmetically false comparison once the lines
+            # differ ("94% < 90%" would otherwise read as a below-threshold
+            # hold on a number that is above the base threshold). The fallback
+            # is unreachable while `threshold` is positive (a readable headroom
+            # means a readable window) and is exactly the pre-existing
+            # comparison if it ever is not.
+            active_pct, active_line = binding_window(
+                usage.get(current), self._models, settings
+            ) or (100.0 - active_headroom, settings.threshold)
+            if active_pct < active_line:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -985,8 +1075,8 @@ class AutoSwitchEngine:
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
                             detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(active_pct)}% < "
+                                f"{pct_label(active_line)}%"
                             ),
                         )
                     )
@@ -1085,8 +1175,7 @@ class AutoSwitchEngine:
                 NoSwitchEvent(
                     reason="below-threshold",
                     detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(active_pct)}% < {pct_label(active_line)}%"
                     ),
                 )
             )
@@ -1669,7 +1758,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if _landable(usage.get(barred), self._models, settings):
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -1735,7 +1824,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif _landable(usage.get(barred), self._models, settings):
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1791,7 +1880,12 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            {
+                n: pressure(usage.get(n), self._models, settings)
+                for n in oauth_candidates
+            },
+            pressure(usage.get(current), self._models, settings),
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1848,7 +1942,9 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if not _landable(usage.get(num), self._models, settings) and (
+                    not all_above
+                ):
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
