@@ -76,6 +76,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -102,7 +103,9 @@ KEYRING_SERVICE = "claude-code"
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
-SETUP_TOKEN_SCOPES = ("user:inference",)
+# Defined in oauth (the usage path detects setup-tokens by it); re-exported
+# here for add-token and the test suite.
+SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -192,6 +195,21 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    # Setup-token accounts read usage from a one-turn Claude Code session
+    # under the account's profile (the usage endpoint 403s inference-only
+    # tokens); these are that probe's failure kinds.
+    "no-session-profile": (
+        "setup-token usage needs a session profile — run `cswap run <num>` once"
+    ),
+    "no-claude-binary": (
+        "setup-token usage runs a Claude Code turn — `claude` is not on PATH"
+    ),
+    "probe-timeout": (
+        "the Claude Code usage turn timed out — retries next pass"
+    ),
+    "no-rate-limit-event": (
+        "the Claude Code usage turn reported no rate-limit data — retries next pass"
     ),
 }
 
@@ -2681,6 +2699,33 @@ class ClaudeAccountSwitcher:
 
         return session_dir_for(self.backup_dir, account_num, email)
 
+    # -- setup-token usage probe profiles -----------------------------------
+    # Setup-token accounts read usage from one Claude Code turn (see
+    # oauth.probe_usage_via_claude); these name the profile it runs under.
+    # Full-scope credentials never consult them.
+
+    def _usage_probe_profile_default(
+        self, account_num: str, email: str
+    ) -> oauth.UsageProbeProfile:
+        """The active/default login: claude's own store, env left as is."""
+        return oauth.UsageProbeProfile(
+            config_dir=None, scratch_root=get_claude_config_home(),
+        )
+
+    def _usage_probe_profile_session(
+        self, account_num: str, email: str
+    ) -> oauth.UsageProbeProfile | None:
+        """An inactive slot: its `cswap run` session profile, or ``None``
+        when none has been bootstrapped yet (bootstrapping takes the backup
+        lock and probes `claude auth status`, too heavy for a collect pass;
+        the caller reports ``no-session-profile`` with the remedy)."""
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.is_dir():
+            return None
+        return oauth.UsageProbeProfile(
+            config_dir=session_dir, scratch_root=session_dir,
+        )
+
     def _token_status_lines(
         self, account_info: tuple[int, str, str, str, bool, str, str]
     ) -> list[str]:
@@ -4137,6 +4182,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                probe_profile_for=self._usage_probe_profile_default,
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4620,6 +4666,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            probe_profile_for=self._usage_probe_profile_default,
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -4869,6 +4916,7 @@ class ClaudeAccountSwitcher:
                 if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     outcome = oauth.try_fetch_usage_for_account(
                         str(num), email, session_creds, is_active=True,
+                        probe_profile_for=self._usage_probe_profile_session,
                     )
                     return FetchRecord(
                         usage=outcome.usage,
@@ -4886,6 +4934,7 @@ class ClaudeAccountSwitcher:
             refresh_via=(
                 None if has_live_session else self.consume_backup_grant
             ),
+            probe_profile_for=self._usage_probe_profile_session,
         )
         return FetchRecord(
             usage=outcome.usage,

@@ -354,6 +354,21 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+**Usage for setup-token accounts.** A setup-token carries only the `user:inference`
+scope, so the usage endpoint every other account is read from answers 403 for it,
+and a few such probes get the endpoint rate-limited for an hour for every account
+on the host. cswap therefore never queries the endpoint for these accounts. It reads
+their usage the way Claude Code itself sees it: one isolated, non-interactive Claude
+Code turn (`claude -p`, Haiku, one turn, no tools) under the account's `cswap run`
+session profile, parsing the rate-limit event Claude Code emits from the response
+headers. An exhausted account still emits that event and the read costs nothing; a
+healthy account spends one tiny Haiku turn per poll. The probe runs in a private
+`usage-probe/` directory inside the profile, so nothing lands in a real project's
+history. `claude` must be on PATH, and a slot's session profile must exist (run
+`cswap run <num>` once); until then the account shows `usage unavailable
+(no-session-profile)`. The active/default login is probed in Claude Code's own
+config directory instead.
+
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
