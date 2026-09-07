@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -45,6 +46,185 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+#: Per-account switch-away threshold bounds, in binding-window utilization
+#: percent. Mirrors ``SETTING_SPECS["autoswitch.threshold"]``, written as
+#: literals rather than imported: ``models`` is a leaf and must not import
+#: ``settings`` (AGENTS.md §Architecture). The two are asserted equal in
+#: ``tests/test_account_policy_values.py`` so they cannot drift apart.
+ACCOUNT_THRESHOLD_MIN = 50.0
+ACCOUNT_THRESHOLD_MAX = 99.9
+
+
+def normalize_account_threshold(value: object) -> float:
+    """Validate a per-account switch-away threshold; raise ValueError if invalid.
+
+    Strict, in the manner of ``settings.parse_setting_value`` and unlike the
+    forgiving clamp applied when *reading* a record: a user who types 150 learns
+    about it at set time rather than by watching the account never switch away.
+    This is the single write-boundary validator for the value — the CLI verb,
+    the store setter, and any future UI all route through it.
+
+    Accepts ``int``, ``float``, and numeric ``str`` (the CLI hands over argv
+    strings). Rejects ``bool`` explicitly: ``True`` is an ``int`` in Python and
+    would otherwise normalize to 1.0, failing the range test for the wrong
+    reason.
+
+    Args:
+        value: The proposed threshold.
+
+    Returns:
+        The threshold as a ``float`` in ``[ACCOUNT_THRESHOLD_MIN,
+        ACCOUNT_THRESHOLD_MAX]``.
+
+    Raises:
+        ValueError: If the value is not numeric, is NaN or infinite, or falls
+            outside the valid range. The message always names the range.
+    """
+    range_text = (
+        f"must be between {ACCOUNT_THRESHOLD_MIN:g} and {ACCOUNT_THRESHOLD_MAX:g}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            pct = float(value.strip())
+        except ValueError:
+            raise ValueError(f"threshold {range_text}, got {value!r}") from None
+    else:
+        pct = float(value)
+    # NaN fails every comparison and infinity passes the lower bound, so both
+    # are rejected by name rather than left to the range test to catch by luck.
+    if math.isnan(pct) or math.isinf(pct):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if not ACCOUNT_THRESHOLD_MIN <= pct <= ACCOUNT_THRESHOLD_MAX:
+        raise ValueError(f"threshold {range_text}, got {pct:g}")
+    return pct
+
+
+#: Per-account chain-order bounds. ``order`` is an **ordinal** that indexes the
+#: switch chain, not a measurement of it, so unlike ``threshold`` it is an
+#: ``int``. The lower bound is 1 rather than 0 so that 0 stays available as a
+#: future "always first" sentinel; the upper bound exists so the rejection
+#: message can name a range, and three digits is wide enough that no real fleet
+#: reaches it while still catching a 99999 typo.
+ACCOUNT_ORDER_MIN = 1
+ACCOUNT_ORDER_MAX = 999
+
+#: The rank an *unpinned* account sorts at. Strictly greater than every legal
+#: pin, because the order tier is the leading element of an ascending sort key:
+#: if this were not greater, an account with no pin could outrank one with a
+#: pin and the feature would be unsound. Defined here — once — because both the
+#: ranking map in ``autoswitch`` and the CLI listing refer to it.
+ORDER_UNSET_RANK = ACCOUNT_ORDER_MAX + 1
+
+
+def normalize_account_order(value: object) -> int:
+    """Validate a per-account chain order; raise ValueError if invalid.
+
+    The single write-boundary validator for the value, in the manner of
+    :func:`normalize_account_threshold`: strict here, forgiving when *reading* a
+    record, so a user who types 0 learns at set time rather than by watching the
+    account never come up.
+
+    Accepts ``int``, integral ``float``, and integral numeric ``str`` — ``2``,
+    ``2.0`` and ``"2"`` all yield the ``int`` ``2``. The CLI hands over argv
+    strings, and a JSON round-trip can widen a whole number to a float, so both
+    are legitimate spellings of the same ordinal. Fractional values are refused:
+    there is no position 1.5 in a chain.
+
+    Rejects ``bool`` explicitly. ``True`` is an ``int`` in Python and would
+    otherwise normalize to 1 — a *legal* order — and be stored silently, which
+    is a worse failure than an error message.
+
+    Args:
+        value: The proposed order.
+
+    Returns:
+        The order as an ``int`` in ``[ACCOUNT_ORDER_MIN, ACCOUNT_ORDER_MAX]``.
+
+    Raises:
+        ValueError: If the value is not numeric, is NaN or infinite, is
+            fractional, or falls outside the valid range. The message always
+            names the range.
+    """
+    range_text = (
+        f"must be a whole number between {ACCOUNT_ORDER_MIN} and {ACCOUNT_ORDER_MAX}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"order {range_text}, got {value!r}")
+    if isinstance(value, int):
+        rank = value
+    else:
+        if isinstance(value, str):
+            try:
+                number = float(value.strip())
+            except ValueError:
+                raise ValueError(f"order {range_text}, got {value!r}") from None
+        else:
+            number = value
+        # NaN fails every comparison, so the range test below would pass it by
+        # luck rather than by design; int(inf) raises OverflowError rather than
+        # ValueError. Both are rejected by name before either can happen.
+        if math.isnan(number) or math.isinf(number):
+            raise ValueError(f"order {range_text}, got {value!r}")
+        rank = int(number)
+        if rank != number:
+            raise ValueError(f"order {range_text}, got {value!r}")
+    if not ACCOUNT_ORDER_MIN <= rank <= ACCOUNT_ORDER_MAX:
+        raise ValueError(f"order {range_text}, got {rank}")
+    return rank
+
+
+@dataclass(frozen=True)
+class AccountPolicy:
+    """Per-account auto-switch overrides, stored in the sequence record.
+
+    Both knobs are unset by default, so a fleet with no policy set behaves
+    exactly as it did before this existed — the default-identity property
+    the acceptance criteria assert throughout.
+
+    ``threshold``
+        This account's own switch-away cap, in binding-window utilization
+        percent. ``None`` inherits ``autoswitch.threshold``. Reserving headroom
+        on one shared account no longer means taxing the whole fleet with a
+        global cap set to the strictest member's.
+
+    ``backup``
+        "Last man standing": held out of candidate selection while any
+        non-backup account can still be landed on, and offered only when none
+        can. Orthogonal to ``disabled``, which removes an account from
+        auto-rotation entirely; ``disabled`` is applied first and wins.
+
+    ``order``
+        This account's position in the switch chain. Pinned accounts are
+        preferred over unpinned ones, and lower pins over higher, before the
+        ranking strategy is consulted at all — the pin is a primary selector,
+        not a tie-break. ``None`` leaves the account unpinned, sorting by
+        strategy alone behind every pinned account. Equal pins are a group, not
+        an error: they tie on the leading key element and fall through to the
+        strategy, which is the intended load-balancing semantics.
+
+        **A pin costs throughput.** Unpinned, an account whose 7-day window
+        rolls over is demoted to the back of the queue automatically, so the
+        fleet spends whatever resets soonest. A pin overrides that demotion
+        permanently - that is what pinning means - so an account pinned as a
+        soft "prefer this one" will be chosen even when spending a peer first
+        would have banked more total quota. Pin for a hard requirement (a
+        billing account, an org that must carry the work), not for a
+        preference.
+
+    Frozen because ``AccountSnapshot`` is frozen — a mutable member would
+    silently break that guarantee for the whole row.
+
+    ``order`` is appended rather than inserted so that the positional
+    construction sites written against the two-field version stay correct.
+    """
+
+    threshold: float | None = None
+    backup: bool = False
+    order: int | None = None
 
 
 class Platform(Enum):
@@ -140,6 +320,9 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    #: Per-account auto-switch overrides. Appended last and defaulted, so every
+    #: pre-existing construction site keeps working and yields the default.
+    policy: AccountPolicy = AccountPolicy()
 
     @property
     def display_tag(self) -> str:
