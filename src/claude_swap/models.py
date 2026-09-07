@@ -140,11 +140,27 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Which CLI this account belongs to ("claude" | "codex"). Defaulted so every
+    # existing construction site — and every test that builds a snapshot
+    # positionally — keeps working untouched; only multi-provider consumers
+    # (the TUI grouping, the auto loop) ever read it.
+    provider: str = "claude"
 
     @property
     def display_tag(self) -> str:
         """Org tag for display: the org name, or 'personal'."""
         return self.org_name if self.org_name else "personal"
+
+    @property
+    def key(self) -> str:
+        """Identity that stays unique once more than one provider is listed.
+
+        Slot numbers are per-provider, so "1" names a Claude account *and* a
+        Codex one. Any surface that shows both — the dashboard, the menu bar —
+        must address rows by this instead of by ``number``, or a keystroke aimed
+        at one provider lands on the other.
+        """
+        return f"{self.provider}:{self.number}"
 
 
 @dataclass(frozen=True)
@@ -159,6 +175,7 @@ class AccountsSnapshot:
     active_number: str | None
     accounts: tuple[AccountSnapshot, ...]
     taken_at: float
+    provider: str = "claude"
 
 
 @dataclass

@@ -24,7 +24,9 @@ from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
+from claude_swap.providers.aggregate import MultiSnapshotSource
+from claude_swap.providers.registry import available_providers
+from claude_swap.tui.data import ActionResult, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
@@ -61,7 +63,12 @@ class CswapApp(App):
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
         self._detected = detected  # terminal background sensed pre-driver, or None
-        self.source = SnapshotSource(switcher)
+        # Multi-provider from the start: with only Claude accounts present the
+        # registry returns exactly one provider, so a Claude-only install
+        # behaves and renders precisely as it did before.
+        self.providers = available_providers(switcher)
+        self.source = MultiSnapshotSource(self.providers)
+        self.owners: dict[str, object] = {}
         self._store_only = False
         self._full_next = False
         self._normal_refreshing = False
@@ -152,11 +159,15 @@ class CswapApp(App):
     def _refresh_blocking(
         self, generation: int, lane: str, full: bool, store_only: bool
     ) -> None:
-        snap = self.source.take(full=full, store_only=store_only)
-        self.call_from_thread(self._apply_snapshot, generation, lane, snap)
+        snap, owners = self.source.take(full=full, store_only=store_only)
+        self.call_from_thread(self._apply_snapshot, generation, lane, snap, owners)
 
     def _apply_snapshot(
-        self, generation: int, lane: str, snap: AccountsSnapshot
+        self,
+        generation: int,
+        lane: str,
+        snap: AccountsSnapshot,
+        owners: dict[str, object] | None = None,
     ) -> None:
         if lane == "normal":
             self._normal_refreshing = False
@@ -164,6 +175,8 @@ class CswapApp(App):
         else:
             self._store_refreshing = False
         self._last_refresh_error = ""
+        if owners is not None:
+            self.owners = owners
         if generation >= self._applied_generation:
             self._applied_generation = generation
             self.snapshot = snap
@@ -173,11 +186,14 @@ class CswapApp(App):
             # SnapshotSource has already rejected per-account regressions, so
             # merge its canonical usage rows without restoring stale metadata.
             current = self.snapshot
-            incoming = {acc.number: acc for acc in snap.accounts}
+            # Keyed by `key`, not `number`: slot numbers repeat across
+            # providers, and matching on them would graft one provider's
+            # usage onto the other's row.
+            incoming = {acc.key: acc for acc in snap.accounts}
             accounts = tuple(
                 replace(acc, usage=other.usage)
                 if (
-                    (other := incoming.get(acc.number)) is not None
+                    (other := incoming.get(acc.key)) is not None
                     and account_identity(acc) == account_identity(other)
                 )
                 else acc
@@ -281,12 +297,47 @@ class CswapApp(App):
         elif result.first_line:
             self.notify(result.first_line)
 
+    # -- provider dispatch -----------------------------------------------------
+
+    def _resolve_row(self, key: str):
+        """``(provider, slot number)`` for a row key like ``"codex:2"``.
+
+        A bare number is read as Claude, so any call site that predates
+        multi-provider keeps working. Falls back to the Claude switcher when the
+        key names a provider that has since gone away — better a no-op on the
+        default provider than a traceback in the event loop.
+        """
+        if ":" in key:
+            provider_id, number = key.split(":", 1)
+        else:
+            provider_id, number = "claude", key
+        provider = self.owners.get(f"{provider_id}:{number}")
+        if provider is None:
+            provider = next(
+                (p for p in self.providers if getattr(p, "provider_id", "") == provider_id),
+                self.switcher,
+            )
+        return provider, number
+
+    def _row_for(self, key: str):
+        """The snapshot row for a key, or None."""
+        snap = self.snapshot
+        want = key if ":" in key else f"claude:{key}"
+        return next((a for a in (snap.accounts if snap else ()) if a.key == want), None)
+
     # -- account operations ----------------------------------------------------
 
-    def do_switch(self, number: str) -> None:
+    def do_switch(self, key: str) -> None:
+        provider, number = self._resolve_row(key)
+        label = f"Switch to account {number}"
+        if getattr(provider, "provider_id", "claude") != "claude":
+            label = f"Switch to {provider.provider_id} account {number}"
+            # Only the Claude switcher speaks json_output; other providers
+            # return their own result object, which _start_action renders.
+            self._start_action(label, partial(provider.switch_to, number))
+            return
         self._start_action(
-            f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
+            label, partial(provider.switch_to, number, json_output=True)
         )
 
     def action_switch_best(self) -> None:
@@ -295,38 +346,40 @@ class CswapApp(App):
             partial(self.switcher.switch, strategy="best", json_output=True),
         )
 
-    def do_toggle_disabled(self, number: str) -> None:
+    def do_toggle_disabled(self, key: str) -> None:
         """Hold the account out of auto-rotation, or return it — reads its
         current state from the live snapshot to pick the direction."""
-        snap = self.snapshot
-        acc = next(
-            (a for a in (snap.accounts if snap else ()) if a.number == number), None
-        )
+        acc = self._row_for(key)
         if acc is None:
             return
+        provider, number = self._resolve_row(key)
         target = not acc.disabled
         verb = "Disable" if target else "Enable"
         self._start_action(
             f"{verb} account {number}",
-            partial(self.switcher.set_account_disabled, number, target),
+            partial(provider.set_account_disabled, number, target),
         )
 
-    def confirm_remove(self, number: str, email: str) -> None:
+    def confirm_remove(self, key: str, email: str) -> None:
+        provider, number = self._resolve_row(key)
+        pid = getattr(provider, "provider_id", "claude")
+        what = "account" if pid == "claude" else f"{pid} account"
         self.push_screen(
             ConfirmModal(
-                f"Remove account {number} ({email})?\n\n"
+                f"Remove {what} {number} ({email})?\n\n"
                 "Its stored credentials and config backup are deleted.",
                 title="Remove account",
                 yes_label="Remove",
             ),
-            partial(self._on_remove_confirm, number),
+            partial(self._on_remove_confirm, key),
         )
 
-    def _on_remove_confirm(self, number: str, confirmed: bool | None) -> None:
+    def _on_remove_confirm(self, key: str, confirmed: bool | None) -> None:
         if confirmed:
+            provider, number = self._resolve_row(key)
             self._start_action(
                 f"Remove account {number}",
-                partial(self.switcher.remove_account, number, assume_yes=True),
+                partial(provider.remove_account, number, assume_yes=True),
             )
 
     def action_add_current(self) -> None:

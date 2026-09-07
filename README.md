@@ -2,6 +2,8 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+Also switches **Codex (ChatGPT)** accounts — see [Codex accounts](#codex-chatgpt-accounts).
+
 ## Installation
 
 ### Using uv (recommended)
@@ -177,6 +179,81 @@ cswap add
 ```
 
 This will update the stored credentials without creating a duplicate.
+
+### Codex (ChatGPT) accounts
+
+cswap also switches [Codex](https://github.com/openai/codex) accounts, under a
+`codex` namespace. Bare `cswap list` / `cswap switch` keep meaning Claude, so
+nothing you already type changes.
+
+```bash
+cswap codex list                     # accounts + 5h/weekly usage
+cswap codex list --token-status      # token expiry (never prints the token)
+cswap codex list --json              # machine-readable
+cswap codex status                   # the account codex is running as
+cswap codex switch                   # rotate to the next account
+cswap codex switch 2                 # or by number / email / alias
+cswap codex switch --strategy best   # jump to the most quota left
+cswap codex add                      # store the account you are logged in as
+cswap codex login                    # run `codex login`, then store it
+cswap codex alias 2 work
+cswap codex disable 2                # hold it out of auto-rotation
+cswap codex swap 1 2                 # exchange slot numbers
+cswap codex move 3 1                 # assign a slot (swaps if taken)
+cswap codex export ~/codex.json      # back up (contains live tokens)
+cswap codex import ~/codex.json
+cswap codex purge                    # drop cswap's copies; your login stays
+```
+
+Every command mirrors its Claude counterpart — `cswap codex status` prints the
+same block as `cswap status`, and `--json` returns the same envelope, so a
+script that reads one reads the other.
+
+**Coming from `codex-auth`?** Your accounts are imported automatically the first
+time you run any `cswap codex` command. `~/.codex/accounts/` is left completely
+untouched, so you can keep using that tool or go back to it. Re-run the import
+by hand with `cswap codex import-codex-auth`.
+
+> [!IMPORTANT]
+> Switching rewrites `~/.codex/auth.json`. A codex session that is **already
+> running** keeps its old account until you restart it — cswap warns you and
+> names the running PIDs. This applies to automatic switching too: it only
+> affects the next session you start. For seamless switching without a restart,
+> see the [`codext`](https://github.com/Loongphy/codext) fork of the Codex CLI.
+
+Codex accounts appear in the dashboard and the macOS menu bar alongside your
+Claude ones (tagged `⟨codex⟩`), and `cswap auto` rotates both providers in one
+process. Two extra settings tune the Codex side:
+
+```bash
+cswap config set autoswitch.codexThreshold 85   # 0 = use autoswitch.threshold
+cswap config set autoswitch.codexEnabled false  # leave Codex out of `cswap auto`
+```
+
+`autoswitch.includeApiKeyAccounts` applies to Claude only: a Codex API-key login
+reports no usage, so there is nothing for a threshold to compare.
+
+<details>
+<summary>Where Codex data is stored</summary>
+
+Accounts live in cswap's own store, a sibling of the Claude one — not in
+`~/.codex/accounts/`:
+
+| What | Where |
+|---|---|
+| Slot registry (no secrets) | `<cswap data dir>/codex/sequence.json` |
+| Credentials, macOS | Keychain, service `claude-swap-codex` |
+| Credentials, Linux/Windows | `<cswap data dir>/codex/credentials/`, mode 0600 |
+| Usage cache | `<cswap data dir>/codex/cache/` |
+
+Credentials are keyed by account identity rather than slot number, so `swap` and
+`move` only rewrite the registry and never move a secret.
+
+`cswap codex export` writes real OAuth tokens — an export you cannot log in with
+is not a backup. The file is created private (0600) and says so in a `warning`
+field. Treat it like a password.
+
+</details>
 
 ### Other commands
 

@@ -45,6 +45,14 @@ class AutoSwitchSettings:
 
     threshold: float = 90.0
     interval_seconds: float = 60.0
+    # Codex rides in the same `cswap auto` process as its own small engine.
+    # Enabled by default, but a no-op unless the user has Codex accounts —
+    # a Claude-only install never notices it exists.
+    codex_enabled: bool = True
+    # 0 means "use `threshold`". A separate knob because Claude's 5h/7d
+    # rhythm and a ChatGPT plan's limits are not the same shape, so one
+    # number need not suit both.
+    codex_threshold: float = 0.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
@@ -109,6 +117,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
             help="Poll interval for the cswap auto loop, in seconds",
+        ),
+        SettingSpec(
+            "autoswitch", "codexEnabled", "codex_enabled", "bool",
+            help="Also auto-switch Codex accounts in the cswap auto loop",
+        ),
+        SettingSpec(
+            "autoswitch", "codexThreshold", "codex_threshold", "float", 0.0, 99.9,
+            help="Codex-only switch threshold (0 = use autoswitch.threshold)",
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,

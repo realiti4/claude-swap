@@ -17,6 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
+from claude_swap.providers.aggregate import provider_label
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -160,6 +161,20 @@ def usage_rows(
     return rows
 
 
+
+def provider_badge(acc: AccountSnapshot, palette: Palette) -> Text | None:
+    """A short provider tag, or None for Claude.
+
+    Claude rows stay exactly as they were: a Claude-only install must not gain a
+    badge on every line to say the only thing it could possibly say. The badge
+    appears precisely when two providers are on screen and confusing one for the
+    other would be possible.
+    """
+    if acc.provider == "claude":
+        return None
+    return Text(f" ⟨{provider_label(acc.provider)}⟩", style=palette.muted)
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -179,6 +194,9 @@ def account_card_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    badge = provider_badge(acc, palette)
+    if badge is not None:
+        text.append_text(badge)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -258,6 +276,9 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    badge = provider_badge(acc, palette)
+    if badge is not None:
+        text.append_text(badge)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")
@@ -385,10 +406,16 @@ class AccountItem(ListItem):
         super().__init__(AccountCard(acc))
         self.number = acc.number
         self.email = acc.email
+        # Slot numbers repeat across providers, so anything that dispatches on a
+        # selected row must use these two, never ``number`` alone.
+        self.provider = acc.provider
+        self.key_id = acc.key
 
     def set_account(self, acc: AccountSnapshot) -> None:
         self.number = acc.number
         self.email = acc.email
+        self.provider = acc.provider
+        self.key_id = acc.key
         self.query_one(AccountCard).set_account(acc)
 
 
