@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
+from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -221,6 +222,7 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
+    policy: AccountPolicy = AccountPolicy(),
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -240,6 +242,13 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Same convention for the per-account policy: a slot on the global default
+    # emits neither key, so a fleet that never sets a policy produces rows
+    # byte-identical to those from before this feature existed.
+    if policy.threshold is not None:
+        row["threshold"] = policy.threshold
+    if policy.backup:
+        row["backup"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

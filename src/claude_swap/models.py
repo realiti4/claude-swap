@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -45,6 +46,89 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+#: Per-account switch-away threshold bounds, in binding-window utilization
+#: percent. Mirrors ``SETTING_SPECS["autoswitch.threshold"]``, written as
+#: literals rather than imported: ``models`` is a leaf and must not import
+#: ``settings`` (AGENTS.md §Architecture). The two are asserted equal in
+#: ``tests/test_account_policy_values.py`` so they cannot drift apart.
+ACCOUNT_THRESHOLD_MIN = 50.0
+ACCOUNT_THRESHOLD_MAX = 99.9
+
+
+def normalize_account_threshold(value: object) -> float:
+    """Validate a per-account switch-away threshold; raise ValueError if invalid.
+
+    Strict, in the manner of ``settings.parse_setting_value`` and unlike the
+    forgiving clamp applied when *reading* a record: a user who types 150 learns
+    about it at set time rather than by watching the account never switch away.
+    This is the single write-boundary validator for the value — the CLI verb,
+    the store setter, and any future UI all route through it.
+
+    Accepts ``int``, ``float``, and numeric ``str`` (the CLI hands over argv
+    strings). Rejects ``bool`` explicitly: ``True`` is an ``int`` in Python and
+    would otherwise normalize to 1.0, failing the range test for the wrong
+    reason.
+
+    Args:
+        value: The proposed threshold.
+
+    Returns:
+        The threshold as a ``float`` in ``[ACCOUNT_THRESHOLD_MIN,
+        ACCOUNT_THRESHOLD_MAX]``.
+
+    Raises:
+        ValueError: If the value is not numeric, is NaN or infinite, or falls
+            outside the valid range. The message always names the range.
+    """
+    range_text = (
+        f"must be between {ACCOUNT_THRESHOLD_MIN:g} and {ACCOUNT_THRESHOLD_MAX:g}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            pct = float(value.strip())
+        except ValueError:
+            raise ValueError(f"threshold {range_text}, got {value!r}") from None
+    else:
+        pct = float(value)
+    # NaN fails every comparison and infinity passes the lower bound, so both
+    # are rejected by name rather than left to the range test to catch by luck.
+    if math.isnan(pct) or math.isinf(pct):
+        raise ValueError(f"threshold {range_text}, got {value!r}")
+    if not ACCOUNT_THRESHOLD_MIN <= pct <= ACCOUNT_THRESHOLD_MAX:
+        raise ValueError(f"threshold {range_text}, got {pct:g}")
+    return pct
+
+
+@dataclass(frozen=True)
+class AccountPolicy:
+    """Per-account auto-switch overrides, stored in the sequence record.
+
+    Both knobs are unset by default, so a fleet with no policy set behaves
+    exactly as it did before this existed — the default-identity property
+    the acceptance criteria assert throughout.
+
+    ``threshold``
+        This account's own switch-away cap, in binding-window utilization
+        percent. ``None`` inherits ``autoswitch.threshold``. Reserving headroom
+        on one shared account no longer means taxing the whole fleet with a
+        global cap set to the strictest member's.
+
+    ``backup``
+        "Last man standing": held out of candidate selection while any
+        non-backup account can still be landed on, and offered only when none
+        can. Orthogonal to ``disabled``, which removes an account from
+        auto-rotation entirely; ``disabled`` is applied first and wins.
+
+    Frozen because ``AccountSnapshot`` is frozen — a mutable member would
+    silently break that guarantee for the whole row.
+    """
+
+    threshold: float | None = None
+    backup: bool = False
 
 
 class Platform(Enum):
@@ -140,6 +224,9 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    #: Per-account auto-switch overrides. Appended last and defaulted, so every
+    #: pre-existing construction site keeps working and yields the default.
+    policy: AccountPolicy = AccountPolicy()
 
     @property
     def display_tag(self) -> str:

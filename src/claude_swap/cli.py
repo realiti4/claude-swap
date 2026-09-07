@@ -10,6 +10,7 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
 from claude_swap.printer import (
     accent,
     bolded,
@@ -58,6 +59,8 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
+    "backup": "--backup-account",
+    "unbackup": "--unbackup-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -573,6 +576,115 @@ Examples:
         sys.exit(130)
 
 
+def _threshold_command(argv: list[str]) -> None:
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+
+    With no arguments, prints the global `autoswitch.threshold` and every
+    per-account override. Otherwise sets (or, with --unset, removes) one
+    account's own switch-away threshold. Pre-dispatched before the main parser
+    for the same reason as `alias`: the main parser's required
+    mutually-exclusive group cannot hold a positional subcommand.
+
+    The value is validated inside `set_account_threshold`, before any file is
+    touched, so a rejected value leaves `sequence.json` byte-identical.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap threshold",
+        description=(
+            "Set, remove, or list a per-account switch-away threshold. The "
+            "per-account value replaces autoswitch.threshold for that account "
+            "only, so one shared account can reserve headroom without capping "
+            "the whole fleet."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap threshold 2 85
+  cswap threshold user@example.com 99.9
+  cswap threshold 2 --unset           # back to the global default
+  cswap threshold                     # list the global default and overrides
+
+Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "threshold",
+        nargs="?",
+        metavar="PCT",
+        help=(
+            f"Percent used at which to switch away "
+            f"({ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g})."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's override"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.threshold:
+        parser.error("--unset does not take a PCT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.threshold is None:
+        parser.error("PCT is required (or pass --unset to remove the override)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            _print_threshold_table(switcher)
+            return
+
+        switcher.set_account_threshold(
+            args.account, None if args.unset else args.threshold
+        )
+    except ValueError as e:
+        # normalize_account_threshold's message; it always names the range.
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
+    """Print the global switch-away threshold and every per-account override.
+
+    The global line is printed unconditionally: an operator reading a list of
+    overrides needs to know what the accounts *without* one are using.
+    """
+    from claude_swap.settings import load_settings
+
+    default = load_settings(switcher.backup_dir).threshold
+    print(bolded("Switch-away thresholds:"))
+    print(f"  {dimmed('global default')}  {default:g}%")
+
+    rows = sorted(
+        (
+            (num, policy.threshold)
+            for num, policy in switcher.account_policies().items()
+            if policy.threshold is not None
+        ),
+        key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
+    )
+    if not rows:
+        print(dimmed("  No per-account overrides set"))
+        return
+    for num, value in rows:
+        print(f"  Account-{num}  {value:g}%")
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -998,6 +1110,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "threshold":
+        _threshold_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1032,6 +1147,11 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s backup <num|email>         hold an account back as a last resort
+  %(prog)s unbackup <num|email>       return a backup account to rotation
+  %(prog)s threshold <num|email> <pct>  set one account's switch-away point
+  %(prog)s threshold <num|email> --unset  clear it (use the global default)
+  %(prog)s threshold                  list the global default and overrides
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1205,6 +1325,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--backup-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--unbackup-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--list",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1287,6 +1417,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
+        or args.backup_account is not None
+        or args.unbackup_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1383,6 +1515,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
+        elif args.backup_account is not None:
+            switcher.set_account_backup(args.backup_account, True)
+        elif args.unbackup_account is not None:
+            switcher.set_account_backup(args.unbackup_account, False)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
