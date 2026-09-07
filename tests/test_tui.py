@@ -21,7 +21,7 @@ import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.models import AccountPolicy, AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
@@ -81,6 +81,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    policy: AccountPolicy = AccountPolicy(),
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -93,6 +94,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        policy=policy,
     )
 
 
@@ -174,6 +176,40 @@ class FakeSwitcher:
         ]
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
+
+    def set_account_threshold(
+        self, identifier: str, threshold: float | None
+    ) -> None:
+        self.calls.append(("set_threshold", str(identifier), threshold))
+        self._replace_policy(identifier, threshold=threshold)
+        if threshold is None:
+            print(f"Cleared threshold for Account-{identifier}")
+        else:
+            print(f"Set Account-{identifier} threshold to {threshold:g}%")
+
+    def set_account_backup(self, identifier: str, backup: bool) -> None:
+        self.calls.append(("set_backup", str(identifier), backup))
+        self._replace_policy(identifier, backup=backup)
+        verb = "marked as backup" if backup else "cleared as backup"
+        print(f"Account-{identifier} {verb}")
+
+    def set_account_order(self, identifier: str, order: int | None) -> None:
+        self.calls.append(("set_order", str(identifier), order))
+        self._replace_policy(identifier, order=order)
+        if order is None:
+            print(f"Cleared chain order for Account-{identifier}")
+        else:
+            print(f"Set Account-{identifier} chain order to {order}")
+
+    def _replace_policy(self, identifier: str, **fields) -> None:
+        """Apply one policy field to the fake's own account, like the real
+        setters apply it to the record — so a follow-up snapshot reflects it."""
+        self._accounts = [
+            dataclasses.replace(a, policy=dataclasses.replace(a.policy, **fields))
+            if a.number == str(identifier)
+            else a
+            for a in self._accounts
+        ]
 
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
@@ -804,6 +840,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "policy-menu",
                 "remove-menu",
                 "theme-menu",
                 "quit",

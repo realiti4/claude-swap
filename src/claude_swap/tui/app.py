@@ -18,14 +18,21 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountPolicy, AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
-from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
+from claude_swap.tui.modals import (
+    AddTokenModal,
+    ConfirmModal,
+    OutputModal,
+    PolicyForm,
+    PolicyModal,
+    TokenForm,
+)
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
@@ -309,6 +316,75 @@ class CswapApp(App):
         self._start_action(
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
+        )
+
+    def do_edit_policy(self, number: str) -> None:
+        """Open the per-account policy editor for one account.
+
+        The account is resolved from the live snapshot and the policy it holds
+        right now is handed to the modal *and* bound into the callback, so the
+        write is diffed against what the user was actually shown rather than
+        against a snapshot that may have refreshed while the modal was open.
+        """
+        snap = self.snapshot
+        acc = next(
+            (a for a in (snap.accounts if snap else ()) if a.number == number), None
+        )
+        if acc is None:
+            return
+        name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+        self.push_screen(
+            PolicyModal(f"{acc.number}  {name}", acc.policy),
+            partial(self._on_policy_form, number, acc.policy),
+        )
+
+    def _on_policy_form(
+        self, number: str, before: AccountPolicy, form: PolicyForm | None
+    ) -> None:
+        if form is None:
+            return
+        self._write_policy(number, before, form)
+
+    def _write_policy(
+        self, number: str, before: AccountPolicy, form: PolicyForm
+    ) -> None:
+        """Write only the fields the edit actually changed.
+
+        Each of the three store setters already short-circuits an unchanged
+        value, but a submit that changed nothing must not reach them at all --
+        three no-op setters still refresh the record's timestamp. All the
+        writes for one submit run inside a single ``_start_action`` so the
+        single-flight guard covers the edit end to end. It is serial, not
+        transactional: if the second setter raises, the first has persisted and
+        the failure output names what landed.
+        """
+        writes = []
+        if form.threshold != before.threshold:
+            writes.append(
+                partial(self.switcher.set_account_threshold, number, form.threshold)
+            )
+        if form.backup != before.backup:
+            writes.append(
+                partial(self.switcher.set_account_backup, number, form.backup)
+            )
+        if form.order != before.order:
+            writes.append(
+                partial(self.switcher.set_account_order, number, form.order)
+            )
+        if not writes:
+            self.notify("Policy unchanged", title="Policy")
+            return
+
+        def apply_all() -> None:
+            for write in writes:
+                write()
+
+        self._start_action(
+            f"Policy for account {number}",
+            apply_all,
+            # More than one write produces more than one confirmation line, and
+            # a toast can carry only the first.
+            show_output=len(writes) > 1,
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
