@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
+``autoswitch``, ``ui`` and ``usage`` sections; others can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -67,7 +67,28 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class UsageSettings:
+    """How usage is collected (``usage`` section).
+
+    ``header_fallback`` permits the unified-header probe that rescues a usage
+    fetch the endpoint answered 429 (issue #220). Enabled by default, because
+    the endpoint rate-limits per account on that account's own inference
+    activity and without the probe the busiest accounts never report at all.
+    Switchable because it costs about 10 tokens of that account's own
+    subscription quota per rescued fetch: real inference, spent by a metadata
+    command. Off means a 429'd fetch reports unavailable, as before the
+    fallback existed.
+    """
+
+    header_fallback: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "usage": UsageSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -79,7 +100,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "ui", "usage")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -138,6 +159,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "usage", "headerFallback", "header_fallback", "bool",
+            help="Rescue a 429'd usage fetch from response headers (~10 tokens)",
         ),
     )
 }
@@ -246,6 +271,28 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_usage_settings(backup_root: Path) -> UsageSettings:
+    """Load the usage section; missing/corrupt file or a non-bool → default.
+
+    A non-bool is not coerced: ``bool("false")`` is True, so a hand-edited
+    string would silently mean the opposite of what it says.
+    """
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("usage")
+    default = UsageSettings()
+    if not isinstance(section, dict) or "headerFallback" not in section:
+        return default
+    value = section["headerFallback"]
+    if not isinstance(value, bool):
+        _logger.warning(
+            "settings.json: usage.headerFallback must be true or false, got %r; "
+            "using %r",
+            value, default.header_fallback,
+        )
+        return default
+    return UsageSettings(header_fallback=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +459,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "usage": load_usage_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

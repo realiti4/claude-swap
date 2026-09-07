@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap import poll_policy
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -32,6 +33,7 @@ from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
+    last_seen_note,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
@@ -1782,7 +1784,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -1852,7 +1854,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2183,7 +2185,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -7681,7 +7683,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **kwargs):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})
@@ -8805,6 +8807,195 @@ class TestDisableEnableAccount:
         assert "disabled" not in rows[1]
 
 
+class TestARescuedFetchIsPlannedAtThePost429Floor:
+    """The 429 a header probe rescued is stamped on the row AFTER the plan for
+    that same fetch is computed, so the first rescue used to be planned as if
+    no 429 had happened -- and an active account burning inside the escalation
+    band is exactly the shape that earns the 60s urgent cadence. The endpoint
+    budget it just exhausted is unchanged by the rescue, so the floor has to
+    apply in the same pass, not from the second rescue onward.
+    """
+
+    ACTIVE_INFO = {"1": (1, "a@b.c", "", "", True, "", "")}
+
+    def _plan(self, temp_home: Path, record: FetchRecord):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        now = switcher._usage_store.clock()
+        pre = {
+            "1": UsageEntry(
+                last_good={"five_hour": {"pct": 80.0}},
+                fetched_at=now - 100,
+                age_s=100.0,
+                poll_interval_s=poll_policy.MIN_INTERVAL_S,
+            )
+        }
+        plans = switcher._plans_after_fetch(
+            {"1": record}, pre, self.ACTIVE_INFO
+        )
+        return plans["1"]
+
+    def _burning_record(self, **kwargs) -> FetchRecord:
+        return FetchRecord(usage={"five_hour": {"pct": 90.0}}, **kwargs)
+
+    def test_the_first_rescue_is_not_given_the_urgent_cadence(self, temp_home: Path):
+        _next_poll, interval = self._plan(
+            temp_home, self._burning_record(rescued_from="http-429")
+        )
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
+        assert interval > poll_policy.URGENT_INTERVAL_S
+
+    def test_an_unrescued_fetch_keeps_the_urgent_cadence(self, temp_home: Path):
+        """The floor is armed by the 429, not by burning: an account moving
+        inside the band with no 429 behind it still polls urgently."""
+        _next_poll, interval = self._plan(temp_home, self._burning_record())
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+
+class TestHeaderFallbackIsConfigurable:
+    """``usage.headerFallback`` (default on) decides whether a 429'd usage
+    fetch may spend about 10 tokens of the account's own subscription quota on
+    the unified-header probe. The switcher owns the setting, because every
+    surface -- list, status, the TUI, the menu bar, auto -- fetches through it.
+    """
+
+    def test_the_default_is_enabled(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        assert switcher._header_fallback_enabled() is True
+
+    def test_the_setting_is_honored(self, temp_home: Path):
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+        assert switcher._header_fallback_enabled() is False
+
+    def test_a_real_fetch_carries_the_setting(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        from claude_swap.settings import set_setting
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+
+        usage = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage)) as mock_fetch:
+            switcher.status()
+
+        capsys.readouterr()
+        assert mock_fetch.call_args.kwargs.get("header_fallback") is False
+
+
+class TestEveryFetchSiteCarriesTheFallbackSetting:
+    """The setting is worthless if one fetch path forgets it: the probe would
+    keep spending quota on whichever accounts route through that path. A
+    ``--list`` pass covers both shapes at once, the ACTIVE slot's own fetch and
+    an inactive slot's backup-credential fetch."""
+
+    def test_a_list_pass_passes_it_on_every_call(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        from claude_swap.settings import set_setting
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        set_setting(switcher.backup_dir, "usage.headerFallback", "false")
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       {"five_hour": {"pct": 5.0}})) as mock_fetch:
+            switcher.list_accounts()
+
+        assert mock_fetch.call_count >= 2
+        assert all(
+            call.kwargs.get("header_fallback") is False
+            for call in mock_fetch.call_args_list
+        ), mock_fetch.call_args_list
+
+    def test_the_setting_is_read_once_per_pass_not_once_per_account(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Fetches run in a thread pool, so an uncached read is N concurrent
+        parses of the same file. The sibling poll-policy read caches on mtime
+        for exactly this reason."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        from claude_swap import settings as settings_mod
+        real = settings_mod.load_usage_settings
+        calls: list[int] = []
+
+        def counting(backup_root):
+            calls.append(1)
+            return real(backup_root)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=backup_creds), \
+             patch("claude_swap.switcher.load_usage_settings", counting), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(
+                       {"five_hour": {"pct": 5.0}})):
+            switcher.list_accounts()
+            switcher.list_accounts()
+
+        assert len(calls) == 1, f"read the settings file {len(calls)} times"
+
+
+class TestAPartialMeasurementStaysVisible:
+    """A partial measurement withholds the HEADROOM, not the numbers: the whole
+    reason to keep it is that a number beats "usage unavailable". The
+    "last seen" note (shared word-for-word by the CLI and the TUI) reads the
+    windows directly for that reason, and says which measurements were
+    incomplete so nobody mistakes a surviving window for the whole account.
+    """
+
+    def _entry(self, usage: dict) -> UsageEntry:
+        return UsageEntry(last_good=usage, fetched_at=time.time())
+
+    def test_a_partial_row_still_reports_its_number(self):
+        note = last_seen_note(self._entry({
+            "five_hour": {"pct": 40.0}, "partial": True, "source": "headers",
+        }))
+        assert note is not None
+        assert "40% used" in note
+        assert "(partial)" in note
+
+    def test_a_complete_row_reads_exactly_as_before(self):
+        note = last_seen_note(self._entry({
+            "five_hour": {"pct": 53.0}, "seven_day": {"pct": 12.0},
+        }))
+        assert note is not None
+        assert note.startswith("last seen 53% used · ")
+        assert "partial" not in note
+
+    def test_no_windows_at_all_still_has_no_note(self):
+        assert last_seen_note(self._entry({"spend": {"pct": 10.0}})) is None
 class TestDegradedReadProvenance:
     """M1 (stale-credential robustness): a credential read that fell back
     after a Keychain failure carries ``degraded=True`` — the bytes may be a
