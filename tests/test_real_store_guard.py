@@ -50,17 +50,6 @@ def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
     assert target.read_text(encoding="utf-8") == "ok"
 
 
-def _remove_our_marker(marker: Path) -> None:
-    """Remove OUR probe marker. No window: `conftest`'s hook exempts exactly
-    this basename for `os.remove`, so the guard stays armed for every other
-    path and every other thread while this runs. Blanking the specs around
-    the unlink instead disarmed the hook process-wide for the width of the
-    call, which is a worse trade than the litter it was fixing.
-    """
-    assert marker.name == conftest._GUARD_PROBE_MARKER, marker
-    marker.unlink(missing_ok=True)
-
-
 def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
     """CONTROL B (main thread) and CONTROL C (a thread that outlives its
     own test's isolation, the case that actually matters) both attempt a
@@ -76,13 +65,15 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
     """
     from claude_swap.exceptions import ClaudeSwitchError  # noqa: F401  (sanity import only)
 
-    marker_name = ".cswap-test-real-store-guard-probe-DELETE-ME"
+    # `conftest`'s hook exempts exactly this basename for `os.remove`, so the
+    # unlinks below leave the guard armed for every other path and thread.
+    marker_name = conftest._GUARD_PROBE_MARKER
 
     monkeypatch.undo()  # expose the REAL, unpatched HOME from here on
 
     real_backup_root = paths.get_backup_root()
     real_marker = real_backup_root / marker_name
-    _remove_our_marker(real_marker)  # a prior failed run may have left one
+    real_marker.unlink(missing_ok=True)  # a prior failed run may have left one
 
     # -- CONTROL B: main thread --------------------------------------
     outcome_main: dict = {}
@@ -102,7 +93,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the write was reported as refused but the file exists anyway"
         )
     finally:
-        _remove_our_marker(real_marker)  # never leave real-store litter
+        real_marker.unlink(missing_ok=True)  # never leave real-store litter
 
     # -- CONTROL C: a thread that outlives its own test's teardown ---
     # (the case the incident actually was: a thread started while isolation
@@ -136,7 +127,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the thread's write was reported as refused but the file exists anyway"
         )
     finally:
-        _remove_our_marker(real_marker)
+        real_marker.unlink(missing_ok=True)
 
 
 def test_rmtree_of_a_protected_root_is_refused_before_any_child_is_removed(
