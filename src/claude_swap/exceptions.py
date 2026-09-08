@@ -43,6 +43,18 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
+class PromptOutcomeUnknown(SessionError):
+    """A non-interactive Claude prompt may have reached the service."""
+
+    pass
+
+
+class WarmupError(ClaudeSwitchError):
+    """Error while checking or warming five-hour usage windows."""
+
+    pass
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 
