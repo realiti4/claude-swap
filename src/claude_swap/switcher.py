@@ -6421,6 +6421,40 @@ class ClaudeAccountSwitcher:
             self._logger.debug(f"Profile resolution raised: {e!r}")
         return result
 
+    @staticmethod
+    def _slot_supersedes_live(backup: str | None, live: str) -> bool:
+        """Whether the slot's stored credential is a NEWER LOGIN than live.
+
+        ``refreshTokenExpiresAt`` is stamped when a login is issued and stays
+        constant across the refresh-token rotations inside that family, so a
+        strictly greater value on the slot means the slot holds a login issued
+        later than the live copy — an out-of-band re-login registered with
+        ``cswap add`` while a stale credential was still sitting in the live
+        file.
+
+        Re-syncing live over that (the own-rotated path, which is right when
+        live is the newer side) reverts the slot to the older family. Nothing
+        recovers it: the older family is still alive, so no poll ever 401s, and
+        the slot quietly expires on the old deadline while the user believes
+        they re-logged in. See #302.
+
+        False whenever the comparison cannot be made — an absent or
+        non-numeric stamp on either side leaves the pre-existing behaviour
+        exactly as it was, since this guard may only ever *skip* a write.
+        """
+        if not backup:
+            return False
+        slot_oauth = oauth.extract_oauth_data(backup)
+        live_oauth = oauth.extract_oauth_data(live)
+        if not isinstance(slot_oauth, dict) or not isinstance(live_oauth, dict):
+            return False
+        slot_exp = slot_oauth.get("refreshTokenExpiresAt")
+        live_exp = live_oauth.get("refreshTokenExpiresAt")
+        for value in (slot_exp, live_exp):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+        return slot_exp > live_exp
+
     def _classify_outgoing_credential(
         self,
         current_account: str,
@@ -6441,6 +6475,12 @@ class ClaudeAccountSwitcher:
           resolved the live token to this slot's identity; back up normally
           (the live→backup re-sync that keeps slots alive across Claude
           Code's routine refresh-token rotations).
+        - ``"own-superseded"`` — resolved to this slot's identity, but the
+          slot's stored backup is a NEWER login than the live credential
+          (``refreshTokenExpiresAt`` strictly greater). Backing live up would
+          revert an out-of-band re-login to the older family, which never
+          401s and so is never recovered (#302). Config backed up; the
+          credential write is skipped.
         - ``"foreign"``        — uuid-positively resolved to *another* managed
           slot (``foreign_slot``) holding a different lineage; backing it up
           here would destroy this slot's only refresh token (issue #117's
@@ -6516,6 +6556,8 @@ class ClaudeAccountSwitcher:
         if r_uuid and own_uuid and r_uuid == own_uuid and (
             not r_org or not own_org or r_org == own_org
         ):
+            if self._slot_supersedes_live(backup, original_creds):
+                return ("own-superseded", None)
             return ("own-rotated", None)
         slot = self._find_account_slot(data, r_email, r_org) if r_email else None
         if slot is not None and r_uuid:
@@ -6540,6 +6582,8 @@ class ClaudeAccountSwitcher:
                     slot = num
                     break
         if slot == current_account:
+            if self._slot_supersedes_live(backup, original_creds):
+                return ("own-superseded", None)
             return ("own-rotated", None)
         if slot is None:
             # A positive "alien" needs a structurally complete identity —
@@ -7127,6 +7171,24 @@ class ClaudeAccountSwitcher:
                         f"Backed up account {current_account} (lineage "
                         "differs from the stored backup and ownership could "
                         "not be verified — pre-fix backup)"
+                    )
+                elif kind == "own-superseded":
+                    # The slot holds a NEWER login than the live copy: an
+                    # out-of-band re-login was registered while a stale
+                    # credential still sat in the live file. Writing live over
+                    # it would revert that login to the older family, and
+                    # because the older family is still alive nothing ever
+                    # 401s to trigger recovery — the slot would just expire on
+                    # the old deadline (#302). Config backup only; the live
+                    # bytes are this account's own superseded family, so there
+                    # is nothing worth preserving.
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    self._logger.info(
+                        f"Backed up account {current_account} (config only; "
+                        "the stored credential is a newer login than the live "
+                        "one and was kept)"
                     )
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
