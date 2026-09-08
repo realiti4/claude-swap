@@ -103,11 +103,24 @@ def window_pct(last_good: dict | None, key: str) -> float | None:
     return float(pct) if isinstance(pct, (int, float)) else None
 
 
-def reset_text(window: dict | None, now: float) -> str | None:
+REFETCHING = "refetching"
+
+
+def reset_text(
+    window: dict | None, now: float, fetched_at: float | None = None
+) -> str | None:
     """Live countdown to one window's reset ("resets 2h 13m"), if known.
 
     Computed from ``resets_at`` at render time — the countdown the API sent
     was correct at *fetch* time and drifts as the measurement ages.
+
+    ``fetched_at``, when given, catches the window between the reset firing
+    and the next refetch landing: once ``resets_at`` has passed, the pct
+    beside this text is only fresh if it was MEASURED after the reset too.
+    ``fetched_at < resets_at <= now`` proves it wasn't, so that state reads
+    "refetching" instead of asserting "resets now" beside a pct that
+    provably predates it (#325). Without ``fetched_at`` nothing can be
+    proven either way, so the elapsed reading is unchanged.
     """
     if not isinstance(window, dict):
         return None
@@ -120,6 +133,8 @@ def reset_text(window: dict | None, now: float) -> str | None:
         return None
     remaining = ts - now
     if remaining <= 0:
+        if fetched_at is not None and fetched_at < ts:
+            return REFETCHING
         return "resets now"
     return f"resets {format_duration(remaining)}"
 
@@ -152,6 +167,35 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
+def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
+    """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
+
+    THE one place that decides how a window reads — the dashboard's inactive
+    rows and the auto view's Next-best rows both draw it, so one account
+    cannot read two ways on two screens. The caller appends the pct so it can
+    colour it by severity. The countdown shows whenever it is known, not only
+    at 100%: a saturated candidate's worth IS when it comes back.
+
+    An unknown reset is a fact worth showing, not a reason to go blank: the
+    strategy needs exactly this account activated once to learn it (see
+    autoswitch.py's consume-first probe admission), so hiding the gap read as
+    "nothing to report" when it meant the opposite. ``?`` keeps the same
+    token shape a known reset has (``5h(⟳?):``) so a column of chips still
+    lines up — callers compute width from this string, never a literal.
+
+    The one exception: a 5h window with no reported reset AND no usage
+    (``pct == 0``, not merely falsy — ``None`` from a caller that never
+    passes it must not match) has nothing withheld, the whole window is
+    what's left, so it reads its own full duration instead of ``⟳?``. A 5h
+    window WITH usage but no reported reset is live and its reset really
+    was withheld, and any other window (7d, a scoped model) always keeps
+    the plain unknown-reset marker; #325 is what resolves those.
+    """
+    if not reset:
+        return "5h(⟳5h00m):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
+    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+
+
 def format_duration(seconds: float) -> str:
     """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
     s = int(seconds)
@@ -180,6 +224,7 @@ def clock_stamp() -> str:
 
 __all__ = [
     "ActionResult",
+    "REFETCHING",
     "SnapshotSource",
     "format_age",
     "format_duration",

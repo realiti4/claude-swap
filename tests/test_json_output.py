@@ -211,11 +211,20 @@ class TestListJson:
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, capsys,
     ):
+        # Reset instant must stay FUTURE — #325 nulls a reading whose own
+        # reset has already elapsed, and a hardcoded calendar date only
+        # stays future until the wall clock catches up to it.
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (
+            (datetime.now(timezone.utc) + timedelta(hours=1))
+            .isoformat().replace("+00:00", "Z")
+        )
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
         usage = {
-            "five_hour": {"pct": 10.0, "resets_at": "2026-01-01T00:00:00Z",
+            "five_hour": {"pct": 10.0, "resets_at": resets_at,
                           "countdown": "1h", "clock": "01:00"},
         }
 
@@ -236,7 +245,7 @@ class TestListJson:
         acct1 = next(a for a in payload["accounts"] if a["number"] == 1)
         assert acct1["active"] is True
         assert acct1["usageStatus"] == "ok"
-        assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+        assert acct1["usage"]["fiveHour"]["resetsAt"] == resets_at
 
     def test_list_payload_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
@@ -390,9 +399,18 @@ class TestStatusJson:
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, capsys,
     ):
+        # Reset instant must stay FUTURE — #325 nulls a reading whose own
+        # reset has already elapsed, and a hardcoded calendar date only
+        # stays future until the wall clock catches up to it.
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (
+            (datetime.now(timezone.utc) + timedelta(hours=1))
+            .isoformat().replace("+00:00", "Z")
+        )
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
-        usage = {"five_hour": {"pct": 25.0, "resets_at": "2026-01-01T00:00:00Z",
+        usage = {"five_hour": {"pct": 25.0, "resets_at": resets_at,
                                "countdown": "1h", "clock": "01:00"}}
 
         switcher = ClaudeAccountSwitcher()
@@ -409,7 +427,7 @@ class TestStatusJson:
         assert active["number"] == 1
         assert active["managed"] is True
         assert active["usageStatus"] == "ok"
-        assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+        assert active["usage"]["fiveHour"]["resetsAt"] == resets_at
         assert payload["totalManagedAccounts"] == 2
 
     def test_status_managed_includes_display_grade_last_good(
@@ -752,3 +770,26 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+def test_the_relogin_remedy_names_the_switch_step():
+    """`cswap add` CAPTURES THE ACTIVE CREDENTIAL, so it refuses unless the
+    quarantined slot is the active one — it compares the live credential's
+    resolved owner against the slot named. A slot is normally quarantined
+    while some OTHER account is active, which is exactly when the remedy as
+    written cannot run: the user logs in, runs `cswap add`, and is told the
+    stored credential belongs to another account.
+
+    Its sibling `USAGE_NO_CREDENTIALS` has always named the switch first.
+    This one did not, and that missing word is the whole difference between a
+    remedy and a loop."""
+    from claude_swap.switcher import SENTINEL_NOTES
+    from claude_swap.json_output import (
+        USAGE_NO_CREDENTIALS,
+        USAGE_RELOGIN_REQUIRED,
+    )
+    relogin = SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "switch" in relogin.lower(), relogin
+    # THE CONTROL: the sibling already does this, so the assertion above is
+    # not merely describing whatever text happens to be there.
+    assert "switch" in SENTINEL_NOTES[USAGE_NO_CREDENTIALS].lower()

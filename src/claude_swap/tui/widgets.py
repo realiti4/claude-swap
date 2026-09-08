@@ -89,15 +89,22 @@ def usage_bar(
     return text
 
 
-def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
+def _reset_parts(
+    window: dict, now: float, fetched_at: float | None = None
+) -> tuple[str, str]:
     """Countdown suffix and its clock-extended variant for one window.
 
     ``("resets 2h 13m", "resets 2h 13m · 20:39")`` — the second form is what
     a row shows when it has the width for it. Equal when no clock is known.
+
+    An unknown reset used to return ``(None, None)`` and this row's suffix
+    then went blank — the same "nothing to report" reading that hid it in
+    the chips, on the account's OWN detail card this time. Named instead, so
+    the reset column never disappears merely because it is unmeasured.
     """
-    reset = data.reset_text(window, now)
+    reset = data.reset_text(window, now, fetched_at)
     if not reset:
-        return None, None
+        return "reset unknown", "reset unknown"
     clock = data.reset_clock(window, now)
     return reset, f"{reset} · {clock}" if clock else reset
 
@@ -129,14 +136,23 @@ def usage_rows(
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
-        reset, reset_full = _reset_parts(spend, now)
-        suffix = f"{reset}  {amounts}" if reset else amounts
-        suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
+        # A monthly budget the server never reported a reset for has no
+        # usage-window reset to name at all -- unlike 5h/7d/scoped, this
+        # is not a gap in a real countdown, so it reads its own truth
+        # (the amounts alone) instead of borrowing "reset unknown".
+        suffix = suffix_full = amounts
+        if spend.get("resets_at"):
+            reset, reset_full = _reset_parts(spend, now, fetched_at)
+            suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
+        rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
-            reset, reset_full = _reset_parts(window, now)
+            reset, reset_full = _reset_parts(window, now, fetched_at)
+            # A lapsed 5h window (no reported reset, no usage) has nothing
+            # withheld -- "reset unknown" would assert a gap that isn't one.
+            if key == "five_hour" and not window.get("resets_at") and window["pct"] == 0:
+                reset = reset_full = "resets 5h"
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
                 marker = _pace_suffix(window, fetched_at)
@@ -146,7 +162,7 @@ def usage_rows(
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
-        suffix, suffix_full = _reset_parts(window, now)
+        suffix, suffix_full = _reset_parts(window, now, fetched_at)
         suffix, suffix_full = suffix or "", suffix_full or ""
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
@@ -240,6 +256,19 @@ def account_card_text(
     return text
 
 
+SPEND_LABEL = "$$"
+
+
+def spend_row(rows: list[tuple]) -> tuple | None:
+    """The pay-as-you-go spend row out of :func:`usage_rows`, or ``None``.
+
+    Both compact surfaces render spend, so the label lives here rather than
+    as a literal in each of them — the same reason `data.chip_label`
+    exists for a window.
+    """
+    return next((r for r in rows if r[0] == SPEND_LABEL), None)
+
+
 def mini_account_text(
     acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
 ) -> Text:
@@ -280,28 +309,58 @@ def mini_account_text(
         if parts:
             text.append(" · ", style=palette.track)
         color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
+        # Same chip the auto view's Next-best rows draw, from the same
+        # helper — one account must not read two ways on two screens.
+        text.append(
+            data.chip_label(
+                label, data.reset_text(window, now, fetched_at),
+                pct,
+            ),
+            style=palette.muted,
+        )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                text.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
+        if key == "seven_day":
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
         parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
-    ]
-    for name in maxed:
+    for window in (last_good.get("scoped") or [] if isinstance(last_good, dict) else []):
+        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
+        color = palette.severity(pct)
+        # Same chip helper the 5h/7d loop above uses — a scoped window reads
+        # the same way whether it is the account's only window or sits
+        # beside 5h/7d.
+        text.append(
+            data.chip_label(window["name"], data.reset_text(window, now, fetched_at)),
+            style=palette.muted,
+        )
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        if pct >= 100:
+            text.append(" (!)", style=palette.sev_crit)
+        parts += 1
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    rows = usage_rows(last_good, now, fetched_at)
+    spend = spend_row(rows)
+    if spend is not None:
+        if parts:
+            text.append(" · ", style=palette.track)
+        _label, pct, suffix, _full = spend
+        color = palette.severity(pct)
+        text.append("$$ ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        text.append(f" · {suffix}", style=palette.muted)
         parts += 1
     if not parts:
+        # Nothing above rendered — every source `usage_rows` draws from
+        # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
+        # above, so `rows` is provably empty here too.
         text.append("usage unknown", style=palette.muted)
     return text
 
