@@ -784,6 +784,91 @@ class TestIsSessionValid:
         assert seen_argv["argv"][0] == resolved
 
 
+class TestPingToWarm:
+    """`SessionManager.ping_to_warm`: `warm_on_reset`'s isolated priming
+    touch — one throwaway headless message through the account's own
+    session profile, never the active credential."""
+
+    def _mock_setup_session(self, manager, monkeypatch, session_dir):
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+            ),
+        )
+
+    def test_ok(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        assert manager.ping_to_warm(ACCOUNT_NUM) is True
+
+    def test_setup_session_failure_never_spawns(self, manager, monkeypatch):
+        def boom(identifier, share=False, share_history=False):
+            raise SessionError("profile could not be bootstrapped")
+
+        monkeypatch.setattr(manager, "setup_session", boom)
+        spawned = []
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: spawned.append(a) or SimpleNamespace(returncode=0),
+        )
+        assert manager.ping_to_warm(ACCOUNT_NUM) is False
+        assert spawned == []
+
+    def test_nonzero_exit_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="oops"),
+        )
+        assert manager.ping_to_warm(ACCOUNT_NUM) is False
+
+    def test_timeout_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+
+        def raise_timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=60)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        assert manager.ping_to_warm(ACCOUNT_NUM) is False
+
+    def test_missing_binary_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+
+        def raise_oserror(*a, **k):
+            raise OSError("claude not found")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_oserror)
+        assert manager.ping_to_warm(ACCOUNT_NUM) is False
+
+    def test_uses_the_isolated_profile_and_a_cheap_headless_call(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """The ping must run in the account's own `CLAUDE_CONFIG_DIR`
+        (never the global default) with Haiku and a throwaway message —
+        the whole point is never touching the active credential and never
+        spending more than a fraction of a cent."""
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        seen: dict = {}
+
+        def capture_run(argv, env=None, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = env
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", capture_run)
+        assert manager.ping_to_warm(ACCOUNT_NUM) is True
+        assert seen["argv"][1:] == ["-p", "hi", "--model", "haiku"]
+        assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # sharing
 # ---------------------------------------------------------------------------

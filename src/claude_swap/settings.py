@@ -57,6 +57,18 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # When a non-active account's 5h window resets (its usage API drops
+    # `resets_at` from `five_hour` until a request lands in the new
+    # window — the `pct` field alone stays present), send it one throwaway
+    # Haiku message through its own isolated session profile (the same
+    # isolation `cswap run` uses) so that window's clock starts now instead
+    # of whenever it is next needed. Never touches the active credential,
+    # so it can never redirect another live Claude Code session onto a
+    # different account mid-conversation and break its prompt cache (cache
+    # is scoped per Anthropic org; a redirected session would reprocess its
+    # whole history at full price on its next message). Off by default;
+    # the ping itself costs a fraction of a cent (Haiku, ~2 tokens in).
+    warm_on_reset: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "warmOnReset", "warm_on_reset", "bool",
+            help="Touch an account once when its 5h window resets, then resume strategy",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +447,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("warm_on_reset", "warm_on_reset"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

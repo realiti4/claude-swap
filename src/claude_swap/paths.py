@@ -108,6 +108,14 @@ def get_backup_root() -> Path:
     return get_legacy_backup_root()
 
 
+# The auto-switch engine's cooldown/quarantine/warm-on-reset bookkeeping file,
+# under the backup root. Lives here (rather than in ``autoswitch.py``, its
+# only writer) so a *reader* elsewhere in the package — e.g. ``switcher.py``'s
+# display-only warm-on-reset lookup — can name it without importing
+# ``autoswitch``, which itself imports ``switcher`` and would cycle.
+AUTOSWITCH_STATE_FILENAME = "autoswitch_state.json"
+
+
 # Names that any prior cswap run may have created in the backup root without
 # user data being present (logger output, update-check + usage cache). The
 # migration treats a target containing only these as effectively empty, since
