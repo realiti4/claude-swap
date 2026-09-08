@@ -6894,3 +6894,123 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestOneRemedyPerKindAcrossEverySurface:
+    """`ERROR_NOTES`'s own comment claims every surface renders through it.
+
+    THE THREE COVER DIFFERENT SURFACES; none is redundant. `autoswitch` binds
+    the remedies as `_SYSTEMIC_MESSAGES`, not as `ERROR_NOTES`, so it carries
+    no such attribute and is ABSENT from the enumeration below -- the identity
+    check structurally cannot see that surface. Only
+    `test_the_tick_renders_the_same_text_as_every_other_surface` can, and it is
+    the sole catcher of `autoswitch` holding its own partly-stale literal
+    again, which is the regression the shared dict exists to prevent.
+
+    What that method actually catches is TEXT, measured both ways: re-binding
+    `_SYSTEMIC_MESSAGES` as a byte-identical literal leaves the file green, and
+    the same literal with one string shortened fails that method alone. So it
+    is dormant while the derivation holds and is the only witness the moment
+    the text drifts -- not a guard on the binding, and not a premise either.
+    """
+
+    def test_every_module_that_exports_the_dict_exports_THE_dict(self):
+        """IDENTITY, not equality, and it is the one this file cannot get
+        from `_SYSTEMIC_MESSAGES`.
+
+        That comparison is derived FROM `oauth.ERROR_NOTES`, so it holds
+        however many copies of the dict exist. What splits the surfaces is a
+        second literal: `switcher` re-exports the dict by import, and
+        `tui/widgets` reads it FROM `switcher` while `session` reads it from
+        `oauth`. A merge that lands a literal below that import shadows it,
+        and the TUI then prints the bare kind where `cswap run` prints the
+        remedy -- with every test here still green, because each side is
+        internally consistent.
+        """
+        import importlib
+        from pathlib import Path
+
+        import claude_swap
+        from claude_swap import oauth
+
+        # ASKED OF THE MODULE OBJECT, not of its source. A literal pair named
+        # half the modules; an AST scan for `Assign`/`ImportFrom` then named
+        # half the BINDING SHAPES -- `ERROR_NOTES: dict = {...}` walked
+        # straight through it, and so did a binding under `try`/`if`, a
+        # `globals()[...]`, and a tuple target. "Does this module expose the
+        # name" is a runtime question and `hasattr` answers it for every shape
+        # there is, including ones nobody has written yet.
+        # FROM THE FILESYSTEM, not `pkgutil.walk_packages`, which recurses
+        # only through packages that carry an `__init__.py`. A subpackage
+        # added as a PEP 420 namespace is skipped in silence, and this test
+        # gets quietly weaker with nothing to show for it.
+        root = Path(claude_swap.__file__).parent
+        names = {
+            "claude_swap." + ".".join(p.relative_to(root).with_suffix("").parts)
+            for p in root.rglob("*.py")
+        }
+        bound = [
+            mod
+            for mod in (
+                importlib.import_module(n.removesuffix(".__init__"))
+                for n in sorted(names)
+            )
+            if hasattr(mod, "ERROR_NOTES")
+        ]
+
+        # THE DENOMINATOR NAMES THE DEFINITION, not a count. A count asserts
+        # an architecture: refactor the re-exports to read `oauth.ERROR_NOTES`
+        # through the module and a `>= 3` fires RED on a tree that is strictly
+        # healthier. Finding `oauth` is what proves the walk reached the right
+        # package, and it cannot go stale while the dict lives there.
+        assert oauth in bound, (
+            f"the walk did not find the module that DEFINES ERROR_NOTES "
+            f"({[m.__name__ for m in bound]}) -- it is measuring the wrong "
+            "tree, and every identity check below is vacuous"
+        )
+        # NO FLOOR ON THE POPULATION. An earlier cut required one module
+        # besides the definer, to stop the loop iterating over nothing. It was
+        # wrong in both directions: a tree where every surface reads
+        # `oauth.ERROR_NOTES` through the module holds no re-exports at all
+        # and is strictly healthier, and that assert was its ONLY failure --
+        # while a one-line convenience re-export in `__init__.py`, which no
+        # surface reads, satisfies it with zero real surfaces participating.
+        # Finding the definer is what proves the walk reached the right tree;
+        # an empty loop below means there is nothing to compare, not a fault.
+        for mod in bound:
+            assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
+                f"{mod.__name__} exports its own copy of ERROR_NOTES, so a "
+                "remedy edited in oauth.py reaches some surfaces and not "
+                "others"
+            )
+
+    def test_the_tick_renders_the_same_text_as_every_other_surface(self):
+        from claude_swap.autoswitch import _SYSTEMIC_MESSAGES
+        from claude_swap.oauth import ERROR_NOTES
+
+        shared = sorted(set(_SYSTEMIC_MESSAGES) & set(ERROR_NOTES))
+        assert shared, "the two dicts share no kind — this compares nothing"
+        drifted = {k: (ERROR_NOTES[k], _SYSTEMIC_MESSAGES[k])
+                   for k in shared if ERROR_NOTES[k] != _SYSTEMIC_MESSAGES[k]}
+        assert not drifted, (
+            "the same failure kind reads differently depending on which "
+            f"surface reports it: {sorted(drifted)}"
+        )
+
+    def test_the_two_enumerations_of_a_systemic_kind_agree(self):
+        """The text can no longer drift; the SET still can, silently.
+
+        What remains free is WHICH kinds each side knows: `oauth._DETERMINISTIC_REFRESH_ERRORS`
+        decides that a refresh failure is systemic, `_SYSTEMIC_KINDS` decides
+        what the tick then says about it, and they are two independent
+        literals. Measured: adding a fifth kind to one leaves the suite green
+        and the tick reports "(network?)" for a failure it has a remedy for.
+        """
+        from claude_swap.autoswitch import _SYSTEMIC_KINDS
+        from claude_swap.oauth import _DETERMINISTIC_REFRESH_ERRORS
+
+        assert set(_SYSTEMIC_KINDS) == set(_DETERMINISTIC_REFRESH_ERRORS), (
+            "a kind is systemic on one side and not the other: "
+            f"only oauth={sorted(set(_DETERMINISTIC_REFRESH_ERRORS) - set(_SYSTEMIC_KINDS))} "
+            f"only autoswitch={sorted(set(_SYSTEMIC_KINDS) - set(_DETERMINISTIC_REFRESH_ERRORS))}"
+        )

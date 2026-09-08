@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
+
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
@@ -70,16 +71,17 @@ _logger = logging.getLogger("claude-swap")
 # the one that is per-SLOT rather than global, which costs nothing here: this
 # message is only ever emitted when NO candidate freshened, so naming the real
 # cause of the only slot that had one beats "(network?)".
-_SYSTEMIC_MESSAGES = {
-    "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
-                        "run cswap from a normal shell",
-    "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
-                      "account",
-    "stash-unreadable": "a stashed successor is unreadable — unlock the "
-                        "keychain or fix the file, then retry; "
-                        "`cswap unclaimed` inspects it",
-    "consume-busy": "another cswap surface holds the slot — retries next pass",
-}
+# DERIVED, not a second copy. `oauth.ERROR_NOTES` says every surface renders a
+# kind's remedy through it, and a parallel dict here had already drifted from
+# it in two of the four kinds they share. Insertion order IS the precedence
+# order, so the tuple stays keyed on this sequence.
+_SYSTEMIC_KINDS = (
+    "store-unmirrored",
+    "invalid_client",
+    "stash-unreadable",
+    "consume-busy",
+)
+_SYSTEMIC_MESSAGES = {k: oauth.ERROR_NOTES[k] for k in _SYSTEMIC_KINDS}
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
