@@ -132,7 +132,7 @@ def usage_rows(
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
+        rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
@@ -240,6 +240,19 @@ def account_card_text(
     return text
 
 
+SPEND_LABEL = "$$"
+
+
+def spend_row(rows: list[tuple]) -> tuple | None:
+    """The pay-as-you-go spend row out of :func:`usage_rows`, or ``None``.
+
+    Both compact surfaces render spend, so the label lives here rather than
+    as a literal in each of them — the same reason `data.chip_label`
+    exists for a window.
+    """
+    return next((r for r in rows if r[0] == SPEND_LABEL), None)
+
+
 def mini_account_text(
     acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
 ) -> Text:
@@ -280,28 +293,54 @@ def mini_account_text(
         if parts:
             text.append(" · ", style=palette.track)
         color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
+        # Same chip the auto view's Next-best rows draw, from the same
+        # helper — one account must not read two ways on two screens.
+        text.append(
+            data.chip_label(label, data.reset_text(window, now)), style=palette.muted
+        )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                text.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
+        if key == "seven_day":
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
         parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
-    ]
-    for name in maxed:
+    for window in (last_good.get("scoped") or [] if isinstance(last_good, dict) else []):
+        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
+        color = palette.severity(pct)
+        # Same chip helper the 5h/7d loop above uses — a scoped window reads
+        # the same way whether it is the account's only window or sits
+        # beside 5h/7d.
+        text.append(
+            data.chip_label(window["name"], data.reset_text(window, now)),
+            style=palette.muted,
+        )
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        if pct >= 100:
+            text.append(" (!)", style=palette.sev_crit)
+        parts += 1
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    rows = usage_rows(last_good, now, fetched_at)
+    spend = spend_row(rows)
+    if spend is not None:
+        if parts:
+            text.append(" · ", style=palette.track)
+        _label, pct, suffix, _full = spend
+        color = palette.severity(pct)
+        text.append("$$ ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        text.append(f" · {suffix}", style=palette.muted)
         parts += 1
     if not parts:
+        # Nothing above rendered — every source `usage_rows` draws from
+        # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
+        # above, so `rows` is provably empty here too.
         text.append("usage unknown", style=palette.muted)
     return text
 
