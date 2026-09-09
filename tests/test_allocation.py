@@ -156,4 +156,36 @@ run_allocated(NS(switcher=switcher, run=run), [])
         assert all(p.poll() is None for p in processes)
     finally:
         for p in processes:
-            p.communicate("\n", timeout=10)
+            try:
+                p.communicate("\n", timeout=10)
+            except Exception:
+                p.kill()
+                p.wait(timeout=5)
+
+
+@pytest.mark.parametrize("content", [
+    '{"abc": [], "99999999999999999999": [], "12": "junk"}',
+    '{broken', '[]', '{"1": ["email", "org", 123]}',
+])
+def test_malformed_reservations_are_discarded(manager, content):
+    (manager.switcher.backup_dir / "allocation.json").write_text(content)
+    allocation.run_allocated(manager, [])
+    assert manager.run.call_args.args[0] == "4"
+
+
+def test_cleanup_preserves_original_error(manager, monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        monkeypatch.setattr(allocation, "_load_reservations", Mock(side_effect=OSError("unreadable")))
+        raise SessionError("original bootstrap failure")
+    manager.run.side_effect = fail
+    with pytest.raises(SessionError, match="original bootstrap failure"):
+        allocation.run_allocated(manager, [])
+    assert "Could not release allocation reservation" in capsys.readouterr().err
+
+
+def test_reused_pid_reservation_is_discarded(manager, monkeypatch):
+    records = manager.switcher.backup_dir / "allocation.json"
+    records.write_text(json.dumps({str(os.getpid()): ["a4@test.invalid", "org4", "old-start"]}))
+    monkeypatch.setattr(allocation, "pid_matches_record", lambda pid, stamp: stamp != "old-start")
+    allocation.run_allocated(manager, [])
+    assert manager.run.call_args.args[0] == "4"

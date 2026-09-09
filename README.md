@@ -143,7 +143,8 @@ queue tasks, verify model entitlements, or add quota. Do not switch the model
 inside an allocated session if you want its Fable quota decision to remain
 applicable. Session counts cover local registered sessions and allocated
 launches, not other machines. Ended allocations are pruned on the next launch;
-after abrupt exits, PID reuse can conservatively overcount an old allocation.
+process-start identity checks discard records belonging to a reused PID when
+that identity is available.
 Avoid manually activating an allocated account as the default login while it
 is running. Use normal `run NUM -- --model fable` on Windows.
 
