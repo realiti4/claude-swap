@@ -347,6 +347,41 @@ class TestMoveAccount:
         assert switcher._read_account_credentials("2", "account2@example.com") == ""
         assert switcher._read_account_config("2", "account2@example.com") == ""
 
+    def test_bare_renumber_still_finds_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A renumber that only rewrites ``sequence.json`` (no ``move``) leaves
+        the backup keyed under the OLD slot number. The read for the roster's
+        NEW number must still find it, converge a copy under the new number,
+        and never delete the old one."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials("2", "account2@example.com", "creds-two")
+
+        data = switcher._get_sequence_data()
+        data["accounts"]["5"] = data["accounts"].pop("2")
+        switcher._write_json(switcher.sequence_file, data)
+
+        assert (
+            switcher._read_account_credentials("5", "account2@example.com")
+            == "creds-two"
+        )
+        # Converged: a DIRECT read (no fallback) now finds slot 5's own
+        # copy, on whichever backend this platform actually writes to...
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "5", "account2@example.com"
+            )
+            == "creds-two"
+        )
+        # ...and the old slot's item was never touched.
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "2", "account2@example.com"
+            )
+            == "creds-two"
+        )
+
     def test_move_relocates_session_profile(
         self, temp_home: Path, sample_sequence_data: dict
     ):

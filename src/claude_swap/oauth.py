@@ -35,9 +35,9 @@ def extract_oauth_data(credentials: str) -> dict | None:
     """Extract the Claude AI OAuth payload from a credentials JSON string."""
     try:
         data = json.loads(credentials)
-    except json.JSONDecodeError:
+        oauth = data.get("claudeAiOauth")
+    except (json.JSONDecodeError, AttributeError):
         return None
-    oauth = data.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
 
 

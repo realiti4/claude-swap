@@ -23,12 +23,14 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import (
+    ConfigError,
     CredentialError,
     CredentialReadError,
     CredentialWriteError,
@@ -277,17 +279,45 @@ def approved_form(api_key: str) -> str:
     return api_key.strip()[-20:]
 
 
+def _credential_generation(credentials: str) -> float:
+    """Sort key for picking the NEWEST of several same-slot copies.
+
+    Never-delete means multiple same-email backups can legitimately coexist
+    on disk; "newest wins" is decided the same way ``switcher.py``'s session-
+    vs-backup drift check decides it: by ``expiresAt`` (every refresh and
+    every login issues a token that expires later than the last). Anything
+    that doesn't parse sorts as the oldest rather than raising.
+    """
+    try:
+        data = oauth.extract_oauth_data(credentials) or {}
+        return float(data.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class _StoreHost(Protocol):
     """The live configuration view ``CredentialStore`` reads from its owner.
 
-    Data only — the store reads these attributes at call time so post-construction
-    overrides (e.g. tests setting ``switcher.platform``) are honored. The store
-    must not reach for any *method* here.
+    Mostly data — the store reads these attributes at call time so post-construction
+    overrides (e.g. tests setting ``switcher.platform``) are honored. The one
+    method, ``_get_sequence_data``, reuses the roster read the owner already
+    performs rather than duplicating it as a second data attribute.
     """
 
     platform: Platform
     credentials_dir: Path
     _logger: logging.Logger
+
+    def _get_sequence_data(self) -> dict | None: ...
+
+
+#: Backs ``CredentialStore._in_attribution_read``. One store is shared by the
+#: TUI's worker threads (``switcher.py``'s ``self._store = CredentialStore(self)``,
+#: ``tui/app.py``'s ``run_worker(thread=True)`` groups), and
+#: ``_build_accounts_info`` reaches this seam UNLOCKED — so a plain instance
+#: attribute one thread clears is a mark another thread is still relying on,
+#: and can be left stuck True by whichever thread's own restore runs last.
+_ATTRIBUTION_READ = threading.local()
 
 
 class CredentialStore:
@@ -296,6 +326,19 @@ class CredentialStore:
     One store per switcher: the capability cache is per-process, learned from real
     ``security`` calls, and a fresh process re-evaluates from scratch.
     """
+
+    @property
+    def _in_attribution_read(self) -> bool:
+        """True while THIS THREAD is inside a write-path verification read.
+
+        Thread-local rather than an instance attribute — see
+        ``_ATTRIBUTION_READ`` above for why an instance flag is unsafe here.
+        """
+        return getattr(_ATTRIBUTION_READ, "active", False)
+
+    @_in_attribution_read.setter
+    def _in_attribution_read(self, value: bool) -> None:
+        _ATTRIBUTION_READ.active = bool(value)
 
     def __init__(self, host: _StoreHost):
         self._host = host
@@ -335,6 +378,16 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # (account_num, email, probe_reassigned_slots) -> the `accounts`
+        # snapshot under which the renumber-fallback sweep in
+        # `_read_account_credentials` last found nothing. The roster is
+        # exactly what the sweep depends on (see that method's docstring);
+        # unchanged roster means an unchanged candidate set and an unchanged
+        # verdict, so a hit skips the sweep's per-slot backend reads
+        # entirely. Keyed on the flag too: it changes the candidate set, so
+        # a negative found under one value says nothing about the other.
+        # See `_read_account_credentials`.
+        self._sweep_negative_cache: dict[tuple[str, str, bool], dict] = {}
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -1160,6 +1213,187 @@ class CredentialStore:
         self._write_backup_enc(account_num, email, credentials)
 
     def _read_account_credentials(
+        self,
+        account_num: str,
+        email: str,
+        failed: list | None = None,
+        *,
+        probe_reassigned_slots: bool = True,
+    ) -> str:
+        """Read account credentials from backup, following a bare renumber.
+
+        A renumber that only rewrites ``sequence.json`` (no ``move_account``)
+        leaves the backup keyed under the OLD slot number: same email, wrong
+        number. When the roster confirms ``account_num`` *is* this email's
+        current slot and the direct read comes back genuinely absent (not
+        merely unreadable — see ``_read_account_credentials_ex``), retry the
+        same email under every OTHER slot number up to a bound — exact
+        lookups only, never a wildcard scan (neither backend supports one).
+        Never-delete means several hits can legitimately exist; the NEWEST
+        generation (by ``expiresAt`` — see ``_credential_generation``) is the
+        one mirrored under ``account_num`` — the source slot is never
+        touched — so the next read is direct.
+
+        Guarding on "is account_num this email's current slot" matters: a
+        slot number the roster has since FREED (``move_account`` relocates
+        the backup file itself, so the old number should read empty, not
+        borrow its new home's copy) must not trigger this fallback. A
+        candidate the roster still lists under the SAME email is a sibling
+        with its own backup (two slots can legitimately share one email —
+        same login, different org) and is never borrowed from either.
+
+        ``probe_reassigned_slots`` (default ``True``) governs a candidate the
+        roster lists under a DIFFERENT email: the dotfiles roster is edited
+        and synced as one wholesale write, so a slot a renumber freed can be
+        reused for an unrelated new account in the SAME edit, and items are
+        keyed (num, email) — that reuse doesn't erase this email's own claim
+        on the number. But the two are indistinguishable from a file leaked
+        by an earlier crash at a slot some OTHER account has always owned, so
+        a pre-mutation snapshot read (``_read_backup_or_abort``, which cannot
+        tell "orphaned by a renumber" from "foreign leftover" either, and
+        would otherwise adopt it as this account's own committed material)
+        passes ``False`` to keep that class of candidate out of reach, the
+        same way it always was before this fallback existed.
+        """
+        value = self._read_account_credentials_direct(account_num, email, failed)
+        if value or failed:
+            return value
+        try:
+            sequence_data = self._host._get_sequence_data()
+        except ConfigError:
+            # A torn/unreadable roster (`_get_sequence_data` is
+            # `_read_json(strict=True)`) means no fallback is available —
+            # never an exception out of a read. `session.py`'s `_bootstrap`
+            # and the collect pass call through here with no handler for
+            # one; this fallback must not be able to raise where the plain
+            # direct read above never could.
+            return ""
+        try:
+            accounts = {
+                num: account.get("email", "")
+                for num, account in (sequence_data or {}).get("accounts", {}).items()
+            }
+        except AttributeError:
+            # `_read_json` only validates the TOP-LEVEL payload is a dict, so
+            # a malformed "accounts" shape (a list, or an entry that isn't
+            # itself a dict) raises AttributeError from `.items()`/`.get()`
+            # here, not ConfigError — same fail-open rule as above. This is
+            # scoped to the SHAPE, not the lookup above: a renamed or removed
+            # `_get_sequence_data`, or a host double lacking it, must raise
+            # loudly rather than being mistaken for a malformed roster.
+            return ""
+        if accounts.get(account_num) != email:
+            return ""
+        if not account_num.isdigit():
+            # `accounts.get(account_num) == email` above only proves
+            # `account_num` is a roster KEY, not that it's numeric — a read
+            # must not raise here any more than the comprehension below,
+            # which guards the same `int()` with the same check.
+            return ""
+        cache_key = (account_num, email, probe_reassigned_slots)
+        if self._sweep_negative_cache.get(cache_key) == accounts:
+            # ponytail: the sweep already ran once against this exact roster
+            # and found nothing; the roster is unchanged so the candidate
+            # set and every candidate read would come back the same. Skips
+            # the per-slot backend reads (a `security` spawn each, on
+            # macOS) that would otherwise repeat on every read of a slot
+            # that is simply unbacked. Ceiling: a backup written to another
+            # slot WITHOUT a roster edit (bypassing sequence.json) between
+            # reads stays invisible until the roster changes; upgrade to a
+            # real generation counter if that ever needs closing.
+            return ""
+        # The stale number itself is gone from `accounts` (that IS the
+        # renumber), so the candidates are a bounded integer sweep, not
+        # `accounts`' own keys.
+        #
+        # The current-roster HEURISTIC alone is not a guarantee: the
+        # dotfiles roster is edited and synced as one wholesale file write,
+        # so N removals can land as a single renumber, and `+ len(accounts)`
+        # covers that only while N does not exceed the number of accounts
+        # that SURVIVE the edit. A wholesale write dropping MORE accounts
+        # than remain — e.g. 6 of 8 — can still leave a leftover past this
+        # ceiling. `highestAccountNumber` (stamped on every `sequence.json`
+        # write, see `switcher._with_sequence_high_water`) is the real
+        # defense: a number persisted from BEFORE the edit, not a shape
+        # read off the roster the edit already changed, and it needs no
+        # enumeration — sound on the Keychain backend the same as the file
+        # one. The heuristic below is only the floor for a roster that has
+        # never carried the field (a fresh install, or one written before
+        # this defense existed).
+        heuristic_bound = (
+            max([int(account_num)] + [int(n) for n in accounts if n.isdigit()])
+            + len(accounts)
+        )
+        try:
+            ever_used = int((sequence_data or {}).get("highestAccountNumber", 0))
+        except (TypeError, ValueError):
+            ever_used = 0
+        bound = max(heuristic_bound, ever_used)
+        candidates: list[tuple[str, str]] = []
+        for n in range(1, bound + 1):
+            other_num = str(n)
+            if other_num == account_num:
+                continue
+            other_email = accounts.get(other_num)
+            if other_email == email:
+                continue  # sibling with its own backup, not ours to borrow
+            if other_email is not None and not probe_reassigned_slots:
+                continue  # occupied by a different identity; see docstring
+            sub_failed: list = []
+            candidate = self._read_account_credentials_direct(other_num, email, sub_failed)
+            if sub_failed:
+                # The sibling slot is unreadable too (e.g. a locked Keychain
+                # would refuse every slot alike) — stop rather than probing
+                # the rest, and surface it exactly as an unreadable primary
+                # read would.
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            if candidate:
+                candidates.append((other_num, candidate))
+        if not candidates:
+            self._sweep_negative_cache[cache_key] = accounts
+            return ""
+        # Never-delete means every one of these candidates can be a
+        # legitimate, still-live copy — the newest GENERATION wins, not the
+        # first one found by ascending slot number (see `_credential_
+        # generation`).
+        other_num, value = max(candidates, key=lambda c: _credential_generation(c[1]))
+        # Re-read the slot being mirrored into, right before writing it: the
+        # sweep above can run up to `bound` unrelated reads (a locked
+        # Keychain costs 10-50ms each) with no lock held, so a concurrent
+        # writer (e.g. `cswap add`) may have filled `account_num` while it
+        # ran. Never clobber something that landed with an equally-or-more
+        # current generation than what the sweep found.
+        #
+        # C1: a `failed` list is required here — without one, a transient
+        # read denial (a locked Keychain) comes back indistinguishable from
+        # "nothing there" and this write proceeds anyway, clobbering the
+        # fresh material this re-read exists to protect.
+        current_failed: list = []
+        current = self._read_account_credentials_direct(account_num, email, current_failed)
+        if current_failed:
+            return value
+        if current and _credential_generation(current) >= _credential_generation(value):
+            return current
+        if self._in_attribution_read:
+            # This read was taken to verify a slot's lineage, not to serve a
+            # caller — the converge write below would re-enter the write
+            # path that asked for the read. See `_in_attribution_read`.
+            return value
+        try:
+            # Routed through `_write_account_credentials` (not the raw
+            # backend calls) so this write retains the generation it
+            # displaces, same as every other writer in this file.
+            self._write_account_credentials(account_num, email, value)
+        except Exception as e:
+            self._host._logger.warning(
+                f"Found account {account_num}'s backup relocated under "
+                f"{other_num}, but could not mirror it back: {e}"
+            )
+        return value
+
+    def _read_account_credentials_direct(
         self, account_num: str, email: str, failed: list | None = None
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
@@ -1237,7 +1471,11 @@ class CredentialStore:
         return ""
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self,
+        account_num: str,
+        email: str,
+        *,
+        probe_reassigned_slots: bool = True,
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
@@ -1252,9 +1490,13 @@ class CredentialStore:
         into an unnecessary re-add/re-login. The ``.enc`` is the ONLY backend
         on Linux/WSL/Windows, so its own read failure must reach this verdict
         there too, not only on macOS.
+
+        ``probe_reassigned_slots`` — see ``_read_account_credentials``.
         """
         failed: list = []
-        value = self._read_account_credentials(account_num, email, failed)
+        value = self._read_account_credentials(
+            account_num, email, failed, probe_reassigned_slots=probe_reassigned_slots
+        )
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:
@@ -1303,8 +1545,14 @@ class CredentialStore:
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
-    ) -> None:
+    ) -> bool:
         """Write account credentials to backup (pure I/O — no session invalidation).
+
+        Returns whether the write RETAINED a previous generation, i.e. whether
+        it displaced a value that differed from the one going in. The rollback
+        purge keys on that answer, so the type is load-bearing: the switcher
+        wrapper and `_retain_previous_backup` were both updated and this one
+        was missed, which `uv run pytest` cannot see.
 
         macOS writes the Keychain when usable, then reconciles the ``.enc`` away
         (see ``_reconcile_enc_after_keychain_write``). When the Keychain is unusable
@@ -1320,7 +1568,7 @@ class CredentialStore:
         giving a misclassified overwrite a best-effort chance of recovery without
         a /login.
         """
-        self._retain_previous_backup(account_num, email, credentials)
+        retained = self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:
                 self._kc_write_backup(account_num, email, credentials)
@@ -1332,7 +1580,7 @@ class CredentialStore:
                 )
             else:
                 self._reconcile_enc_after_keychain_write(account_num, email, credentials)
-                return
+                return retained
 
         # File mode: write the .enc atomically, then (macOS) best-effort drop the
         # stale Keychain copy so a recovered Keychain can't shadow the fresh file.
@@ -1343,6 +1591,7 @@ class CredentialStore:
             raise
         if self._host.platform == Platform.MACOS:
             self._delete_backup_keychain_quiet(account_num, email)
+        return retained
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup (both backends on macOS).
@@ -1408,10 +1657,15 @@ class CredentialStore:
         # docstring says "conflates absent with unreadable" — so an
         # unreadable-but-present view (a locked Keychain, a permission
         # glitch on the .enc) would pass verification and resurface later.
-        # `_ex` distinguishes the two; either a served value OR an
-        # unreadable verdict aborts the commit.
-        value, unreadable = self._read_account_credentials_ex(account_num, email)
-        if value or unreadable:
+        # DIRECT, never the renumber-fallback wrapper: this asks "is THIS
+        # slot's own item gone", and the fallback answers a different
+        # question ("can this account's login be found somewhere") — on a
+        # same-email swap it would find a stale sibling item, MIRROR IT BACK
+        # under the slot just cleared, and then this verify would see that
+        # write and raise "Could not clear" against the clear it just undid.
+        failed: list = []
+        value = self._read_account_credentials_direct(account_num, email, failed)
+        if value or failed:
             raise CredentialError(
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit"
@@ -1459,8 +1713,14 @@ class CredentialStore:
 
     def _retain_previous_backup(
         self, account_num: str, email: str, new_credentials: str
-    ) -> None:
+    ) -> bool:
         """Retain the slot's current backup as ``.prev`` before it is replaced.
+
+        Returns whether a ``.prev`` was actually written. That is the ONE
+        authoritative answer to "did this write displace anything", and the
+        rollback purge needs it: inferring it from a second read of the same
+        value lets the two reads disagree, and a disagreement there strands a
+        recovery generation holding another account's credential.
 
         C1: when the current generation can't be read (a locked Keychain, an
         unreadable ``.enc``), the caller's overwrite proceeds regardless — the
@@ -1468,12 +1728,25 @@ class CredentialStore:
         succeeding. No ``.prev`` is written in that case (see the WITHDRAWN
         comment below for why a checkpoint of the incoming bytes was tried
         and reverted).
+
+        Reads with ``_read_account_credentials_direct``, never the renumber-
+        fallback wrapper (``_read_account_credentials`` / ``_ex``): this asks
+        "what is in THIS slot's own key right now", the same DIRECT question
+        ``delete_account_credentials_strict``'s final belt asks. The fallback
+        answers a different question ("can this account's login be found
+        somewhere") and, on a converge write into a genuinely empty slot,
+        would re-enter the very sweep that is calling this write —
+        `_write_account_credentials` -> here -> the fallback reader -> the
+        sweep -> `_write_account_credentials` again — an unbounded mutual
+        recursion that only stops at Python's recursion limit.
         """
+        failed: list = []
         try:
-            current, unreadable = self._read_account_credentials_ex(account_num, email)
+            current = self._read_account_credentials_direct(account_num, email, failed)
         except Exception as e:  # pragma: no cover - _read swallows its own errors
             self._host._logger.warning(f"Could not read backup for retention: {e}")
-            return
+            return False
+        unreadable = bool(failed)
         if unreadable:
             # WITHDRAWN (round 10): rounds 8 and 9 tried to salvage this path by
             # checkpointing the INCOMING bytes as `.prev`. Both attempts shipped
@@ -1504,9 +1777,9 @@ class CredentialStore:
                 "could not be read (not absent) — no .prev recovery copy "
                 "will exist for this write"
             )
-            return
+            return False
         if not current or current == new_credentials:
-            return
+            return False
         try:
             if self._use_keychain():
                 self._kc_call(
@@ -1524,6 +1797,8 @@ class CredentialStore:
                 f"Failed to retain previous credential generation for "
                 f"account {account_num}: {e}"
             )
+            return False
+        return True
 
     def _read_previous_backup(self, account_num: str, email: str) -> str:
         """Read the retained previous generation. ``""`` when absent/corrupt.
