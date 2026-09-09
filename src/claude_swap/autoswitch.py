@@ -1293,28 +1293,27 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             fallback_num = self._resolve_fallback_account_number()
-            if fallback_num is not None and fallback_num in candidates:
+            if (
+                # The active account must be unable to carry on either:
+                # at-limit means it is out of quota, failover that its
+                # credential is dead. Under "proactive" it is merely NEAR the
+                # threshold and still holds headroom the fallback does not —
+                # reaching the fallback branch at all means every candidate
+                # reads as 0%, so switching would spend the escape hatch to
+                # buy strictly less quota than staying put.
+                trigger in ("at-limit", "failover")
+                and fallback_num in candidates
+                and self._fallback_is_eligible(fallback_num)
+            ):
                 # Everything OAuth is at 0% headroom and no better option
                 # exists — a configured fallback beats sitting BLOCKED until
                 # the earliest reset. Reuses the freshen+switch loop below as
-                # its sole candidate rather than a bespoke switch path.
+                # its sole candidate rather than a bespoke switch path, and
+                # the loop's own exits restore this block if it cannot land.
                 ordered = [fallback_num]
                 trigger = "fallback"
             else:
-                self._blocked_wait_long = True
-                earliest = self._earliest_recovery(usage)
-                if earliest is not None:
-                    self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-                self._emit(
-                    AllExhaustedEvent(
-                        earliest_reset_at=(
-                            earliest.isoformat().replace("+00:00", "Z")
-                            if earliest
-                            else None
-                        )
-                    )
-                )
-                return TickOutcome.BLOCKED
+                return self._block_all_exhausted(usage)
 
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
@@ -1392,7 +1391,15 @@ class AutoSwitchEngine:
                     transient=True,
                 )
             )
+            if trigger == "fallback":
+                # The fleet is still all-exhausted; only the escape hatch
+                # failed. The ErrorEvent above says why, but the tick's
+                # OUTCOME must stay what it would have been without a
+                # fallback configured — see `_block_all_exhausted`.
+                return self._block_all_exhausted(usage)
             return TickOutcome.ERROR
+        if trigger == "fallback":
+            return self._block_all_exhausted(usage)
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -2238,6 +2245,52 @@ class AutoSwitchEngine:
                 )
             )
 
+    def _block_all_exhausted(
+        self, usage: dict[str, dict | str | None]
+    ) -> TickOutcome:
+        """Park on the bounded, reset-aware slow cadence and say so.
+
+        Shared by the plain all-exhausted branch and by the fallback paths
+        that end up back in the same state, so a configured-but-unreachable
+        fallback cannot quietly cost the caller what the block provides: the
+        ``AllExhaustedEvent`` the menubar and TUI key on, ``earliestResetAt``
+        for ``--json`` consumers, and the BLOCKED ``--once`` exit code.
+        """
+        self._blocked_wait_long = True
+        earliest = self._earliest_recovery(usage)
+        if earliest is not None:
+            self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+        self._emit(
+            AllExhaustedEvent(
+                earliest_reset_at=(
+                    earliest.isoformat().replace("+00:00", "Z")
+                    if earliest
+                    else None
+                )
+            )
+        )
+        return TickOutcome.BLOCKED
+
+    def _fallback_is_eligible(self, num: str | None) -> bool:
+        """Whether a resolved ``fallbackAccount`` slot can actually be used.
+
+        One definition for both the decision point and the typo guard, so
+        the warning cannot claim a fallback the engine would refuse.
+
+        API-key slots are excluded unless the user opted into them. The
+        exhausted branch is only reachable with that opt-out OFF (with it on,
+        API-key candidates are already taken as the last resort further up),
+        and switching onto a metered slot from here is a one-way door: the
+        next tick's ``active-api-key`` early return holds, so rotation never
+        resumes even once the OAuth accounts reset.
+        """
+        if num is None:
+            return False
+        return num in self.switcher.switchable_account_numbers() and (
+            self.settings.include_api_key_accounts
+            or self.switcher.account_kind_for(num) != "api_key"
+        )
+
     def _resolve_fallback_account_number(self) -> str | None:
         """Resolve ``autoswitch.fallbackAccount`` to an account number, or
         ``None`` if unset, unmatched, or ambiguous (an ambiguous email is
@@ -2257,13 +2310,16 @@ class AutoSwitchEngine:
         candidate list would otherwise look like a safety net while being
         inert.
 
-        Resolution alone is not the bar. ``_resolve_account_identifier``
-        returns a bare digit string unexamined, so ``--fallback-account 4``
-        with three accounts resolves to ``"4"`` and matches nothing — exactly
-        the typo most worth catching. So the check is membership in the same
-        ``switchable_account_numbers()`` the candidate list is built from,
-        which also covers a real slot held out of rotation (no usable backup,
-        or ``cswap disable``).
+        Resolution alone is not the bar, so this asks ``_fallback_is_eligible``
+        the same question the decision point asks. ``_resolve_account_identifier``
+        returns a bare digit unexamined, so ``--fallback-account 4`` with three
+        accounts resolves to ``"4"`` — the typo most worth catching, and one
+        that resolving alone reports as fine.
+
+        The wording stays one sentence covering every ineligible case rather
+        than naming which one applies: telling them apart needs a second
+        lookup that can migrate the account store, and a warning is not worth
+        a write.
         """
         self._fallback_check_done = True
         identifier = self.settings.fallback_account
@@ -2278,21 +2334,17 @@ class AutoSwitchEngine:
                 )
             )
             return
-        if resolved is not None and resolved in (
-            self.switcher.switchable_account_numbers()
-        ):
+        if self._fallback_is_eligible(resolved):
             return
-        detail = (
-            f"account {resolved} is not in automatic rotation (no usable "
-            "backup, or disabled)"
-            if resolved is not None
-            else "matches no known account (typo?)"
-        )
         self._emit(
             ConfigWarningEvent(
                 message=(
-                    f"autoswitch.fallbackAccount: '{identifier}' {detail} — "
-                    "the exhausted-fallback safety net is inert"
+                    f"autoswitch.fallbackAccount: '{identifier}' is not an "
+                    "account available for automatic rotation (unknown "
+                    "identifier, or a slot that is disabled, has no usable "
+                    "backup, or is an API-key account while "
+                    "autoswitch.includeApiKeyAccounts is off) — the "
+                    "exhausted-fallback safety net is inert"
                 )
             )
         )

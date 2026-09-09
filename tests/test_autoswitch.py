@@ -696,11 +696,125 @@ class TestFallbackAccount:
         warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
         assert len(warnings) == 1
         assert "'9'" in warnings[0].message
+        assert "not an account available for automatic rotation" in (
+            warnings[0].message
+        )
 
     def test_matching_fallback_never_warns(self, temp_home):
         h = self._seed(temp_home, fallback_account="2")
         h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_resolves_fallback_by_alias(self, temp_home):
+        # The third identifier form the flag's metavar and the README example
+        # both advertise; number and email are covered above.
+        h = self._seed(temp_home)
+        h.switcher.set_alias("2", "enterprise")
+        h.settings = replace(h.settings, fallback_account="enterprise")
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_ambiguous_fallback_email_warns_and_blocks(self, temp_home):
+        # Two slots share an email, so `_resolve_account_identifier` raises
+        # ConfigError. Both the guard AND the hot path must absorb it: without
+        # the swallow in `_resolve_fallback_account_number` this tick raises
+        # straight out of the `cswap auto` loop.
+        h = EngineHarness(temp_home, fallback_account="dup@example.com")
+        h.seed(1, "a@example.com")
+        h.seed(2, "dup@example.com")
+        h.seed(3, "dup@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "ambiguous" in warnings[0].message
+        assert h.active_number() == 1
+
+    def test_api_key_fallback_refused_while_opt_out_is_on(self, temp_home):
+        # Switching onto a metered slot here is a one-way door: the next
+        # tick's `active-api-key` early return holds forever, so rotation
+        # would never resume once the OAuth accounts reset.
+        h = self._seed(temp_home, fallback_account="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": "api key", "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "includeApiKeyAccounts" in warnings[0].message
+
+    def test_fallback_not_used_while_the_active_still_has_headroom(self, temp_home):
+        # Past the threshold but not yet at the limit, so the active still
+        # holds quota that the (0%-headroom) fallback does not. Burning the
+        # remainder beats spending the escape hatch to buy strictly less.
+        h = self._seed(temp_home, fallback_account="2")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_unfreshenable_fallback_keeps_the_exhausted_block(self, temp_home):
+        # A fallback the freshen loop cannot land on must not cost the caller
+        # what the plain block provides: the AllExhaustedEvent consumers key
+        # on, the reset-aware sleep, and the BLOCKED `--once` exit code.
+        h = self._seed(temp_home, fallback_account="2")
+        h.seed(2, "b@example.com", expires_at=1)  # long expired
+        recovers_at = h.clock() + 3_600.0
+        reset_at = _iso_at(recovers_at)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(100, reset_at),
+                "2": _usage(100, reset_at),
+                "3": _usage(100, reset_at),
+            })
+        # BLOCKED, not ERROR: the fleet is all-exhausted exactly as it would
+        # be with no fallback configured, and TickOutcome doubles as the
+        # `--once` exit code.
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, ErrorEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is True
+        assert h.engine._sleep_until_ts == pytest.approx(
+            recovers_at + poll_policy.RESET_SLACK_S
+        )
+
+    def test_unfreshenable_fallback_quarantined_keeps_the_block(self, temp_home):
+        # The other loop exit: a dead refresh token quarantines the fallback
+        # and drains `ordered`, reaching the `no-viable-target` tail.
+        h = self._seed(temp_home, fallback_account="2")
+        h.seed(2, "b@example.com", expires_at=1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(100), "2": _usage(100), "3": _usage(100),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, QuarantineEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is True
 
 
 class TestIdleHold:
