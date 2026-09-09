@@ -22,7 +22,8 @@ def account(number, pct=20, **overrides):
 
 @pytest.fixture
 def manager(tmp_path, monkeypatch):
-    monkeypatch.setattr(allocation.sys, "platform", "darwin")
+    if os.name != "posix":
+        pytest.skip("automatic allocation is POSIX-only")
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(allocation, "scan_live_sessions", lambda path: ([], 0))
     switcher = NS(backup_dir=tmp_path, set_poll_policy_inputs=Mock(),
@@ -117,6 +118,12 @@ def test_nested_profile_refused(manager, monkeypatch):
     with pytest.raises(SessionError, match="regular macOS/Linux terminal"):
         allocation.run_allocated(manager, [])
     manager.switcher.accounts_snapshot.assert_not_called()
+
+
+def test_windows_refused_before_snapshot(monkeypatch):
+    monkeypatch.setattr(allocation.sys, "platform", "win32")
+    with pytest.raises(SessionError, match="regular macOS/Linux terminal"):
+        allocation.run_allocated(None, [])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="allocation uses POSIX exec")
