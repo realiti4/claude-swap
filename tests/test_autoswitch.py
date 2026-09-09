@@ -606,6 +606,103 @@ class TestDecisionTable:
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
 
+class TestFallbackAccount:
+    """`autoswitch.fallbackAccount` forces a designated account once every
+    OAuth candidate is truly exhausted, instead of sitting BLOCKED until the
+    earliest reset."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switches_to_fallback_when_all_exhausted(self, temp_home):
+        h = self._seed(temp_home, fallback_account="2")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "fallback"
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_resolves_fallback_by_email(self, temp_home):
+        h = self._seed(temp_home, fallback_account="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_no_fallback_configured_still_blocks(self, temp_home):
+        # Unchanged default behavior: no fallback_account means AllExhaustedEvent.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_fallback_not_used_while_a_candidate_still_has_headroom(self, temp_home):
+        # Not truly exhausted (account 2 has room) — the normal hysteresis
+        # gate applies, the fallback is irrelevant, and it must not preempt
+        # the ordinary proactive switch.
+        h = self._seed(temp_home, fallback_account="3")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_fallback_already_active_stays_blocked(self, temp_home):
+        # Fallback resolves to the account already active — nothing to
+        # switch to, so this degrades to the ordinary all-exhausted block.
+        h = self._seed(temp_home, fallback_account="1")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_unresolvable_fallback_warns_once_and_blocks(self, temp_home):
+        h = self._seed(temp_home, fallback_account="nonexistent@example.com")
+        usage = {"1": _usage(100), "2": _usage(100), "3": _usage(100)}
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "nonexistent@example.com" in warnings[0].message
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_unknown_account_number_warns(self, temp_home):
+        # `_resolve_account_identifier` returns a bare digit unexamined, so a
+        # mistyped number resolves to itself and would otherwise stay silently
+        # inert — the typo the guard most needs to catch.
+        h = self._seed(temp_home, fallback_account="9")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "'9'" in warnings[0].message
+
+    def test_matching_fallback_never_warns(self, temp_home):
+        h = self._seed(temp_home, fallback_account="2")
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
 

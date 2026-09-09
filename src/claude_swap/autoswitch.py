@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -362,7 +362,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "fallback"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -684,6 +684,10 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # One-shot typo guard for ``autoswitch.fallbackAccount``. Unlike the
+        # model check this needs no usage data (it's a static identifier
+        # lookup), so it resolves on the very first tick.
+        self._fallback_check_done = not settings.fallback_account
 
     # -- state file ---------------------------------------------------------
 
@@ -959,6 +963,8 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+        if not self._fallback_check_done:
+            self._check_fallback_account()
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1286,20 +1292,29 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-            self._emit(
-                AllExhaustedEvent(
-                    earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
+            fallback_num = self._resolve_fallback_account_number()
+            if fallback_num is not None and fallback_num in candidates:
+                # Everything OAuth is at 0% headroom and no better option
+                # exists — a configured fallback beats sitting BLOCKED until
+                # the earliest reset. Reuses the freshen+switch loop below as
+                # its sole candidate rather than a bespoke switch path.
+                ordered = [fallback_num]
+                trigger = "fallback"
+            else:
+                self._blocked_wait_long = True
+                earliest = self._earliest_recovery(usage)
+                if earliest is not None:
+                    self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+                self._emit(
+                    AllExhaustedEvent(
+                        earliest_reset_at=(
+                            earliest.isoformat().replace("+00:00", "Z")
+                            if earliest
+                            else None
+                        )
                     )
                 )
-            )
-            return TickOutcome.BLOCKED
+                return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
@@ -2222,6 +2237,65 @@ class AutoSwitchEngine:
                     )
                 )
             )
+
+    def _resolve_fallback_account_number(self) -> str | None:
+        """Resolve ``autoswitch.fallbackAccount`` to an account number, or
+        ``None`` if unset, unmatched, or ambiguous (an ambiguous email is
+        already reported by ``_check_fallback_account``; here it just means
+        "no usable fallback")."""
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(identifier)
+        except ConfigError:
+            return None
+
+    def _check_fallback_account(self) -> None:
+        """One-shot ``autoswitch.fallbackAccount`` typo guard, mirroring
+        ``_check_model_names``: a configured identifier that never reaches the
+        candidate list would otherwise look like a safety net while being
+        inert.
+
+        Resolution alone is not the bar. ``_resolve_account_identifier``
+        returns a bare digit string unexamined, so ``--fallback-account 4``
+        with three accounts resolves to ``"4"`` and matches nothing — exactly
+        the typo most worth catching. So the check is membership in the same
+        ``switchable_account_numbers()`` the candidate list is built from,
+        which also covers a real slot held out of rotation (no usable backup,
+        or ``cswap disable``).
+        """
+        self._fallback_check_done = True
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return
+        try:
+            resolved = self.switcher._resolve_account_identifier(identifier)
+        except ConfigError as e:
+            self._emit(
+                ConfigWarningEvent(
+                    message=f"autoswitch.fallbackAccount: {e}",
+                )
+            )
+            return
+        if resolved is not None and resolved in (
+            self.switcher.switchable_account_numbers()
+        ):
+            return
+        detail = (
+            f"account {resolved} is not in automatic rotation (no usable "
+            "backup, or disabled)"
+            if resolved is not None
+            else "matches no known account (typo?)"
+        )
+        self._emit(
+            ConfigWarningEvent(
+                message=(
+                    f"autoswitch.fallbackAccount: '{identifier}' {detail} — "
+                    "the exhausted-fallback safety net is inert"
+                )
+            )
+        )
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]

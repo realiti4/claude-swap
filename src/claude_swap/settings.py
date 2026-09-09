@@ -57,6 +57,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # NUM|EMAIL|alias to force onto once every OAuth candidate is truly
+    # exhausted (0% headroom on every relevant window), rather than sitting
+    # blocked until the earliest reset. None = no fallback (default: block).
+    fallback_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "fallbackAccount", "fallback_account", "string",
+            help="NUM|EMAIL|alias to force onto once every account is truly exhausted",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +439,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("fallback_account", "fallback_account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
