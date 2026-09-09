@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from claude_swap.mappings import MappingStore, normalize_path
 
 
@@ -183,3 +185,30 @@ def test_normalize_path_applies_normcase(monkeypatch, tmp_path: Path):
 
     assert calls, "normalize_path did not call os.path.normcase"
     assert key == key.lower(), "normcase result was not applied to the key"
+
+
+def test_a_ctrl_c_during_the_replace_leaves_no_temp_file(tmp_path: Path, monkeypatch):
+    """The temp file must not survive an interrupt the handler does not name.
+
+    It caught only ``OSError``, so a Ctrl-C anywhere in the write left a
+    ``.mappings-*.tmp`` behind with nothing to ever collect it.
+    """
+    from claude_swap import mappings as m
+
+    backup = tmp_path / "backup"
+    repo = tmp_path / "work" / "app"
+    repo.mkdir(parents=True)
+    store = MappingStore(backup)
+    store.set(repo, "work@co.com", "org-1")
+
+    def interrupted(*_a, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(m, "replace_with_retry", interrupted)
+    # `raises` is the guard: a `try/except: pass` here passes when the
+    # interrupt never fires, which certifies nothing.
+    with pytest.raises(KeyboardInterrupt):
+        store.set(repo, "other@co.com", "org-2")
+
+    strays = list(backup.glob(".mappings-*.tmp"))
+    assert strays == [], f"left behind {[s.name for s in strays]}"

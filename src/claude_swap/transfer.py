@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -100,8 +100,9 @@ def _atomic_write_file(path: Path, content: str) -> None:
     """Write text atomically with 0600 perms, never exposing plaintext content
     at a world-readable mode.
 
-    Uses ``tempfile.mkstemp`` (0600 from creation, per the process umask being
-    irrelevant to it) rather than ``Path.write_text`` + a follow-up ``chmod``:
+    Creates the temp with ``O_CREAT|O_EXCL`` at 0600 (the mode argument is
+    honoured because the name is fresh) rather than ``Path.write_text`` + a
+    follow-up ``chmod``:
     the export payload carries live OAuth refresh tokens, and a write-then-
     chmod sequence leaves the temp file at the umask-derived default mode
     (typically world-readable) for the window between creation and the chmod
@@ -111,21 +112,40 @@ def _atomic_write_file(path: Path, content: str) -> None:
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    # NAME FIRST, THEN THE FILE. `mkstemp` mints the name INSIDE the syscall,
+    # so a signal between the create and the return strands a file no handler
+    # can name. The random suffix keeps what mkstemp gave in exchange: a pid
+    # alone is recycled, and `O_EXCL` on a recycled name can only fail -- or
+    # unlink a predecessor's file on the way out.
+    tmp_path = str(
+        path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    )
+    fd = -1
     try:
-        os.write(fd, content.encode("utf-8"))
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+            # the name, so the cleanup below must not unlink their file.
+            tmp_path = None
+            raise
+        write_all(fd, content.encode("utf-8"))
+        if sys.platform != "win32":
+            # On the fd: past `replace_with_retry` a chmod can only fail,
+            # and the `except` below would report a landed write as failed.
+            os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(path))
-        if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
+        tmp_path = None  # consumed by the publish; the name is not ours
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
 
