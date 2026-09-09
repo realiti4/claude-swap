@@ -54,7 +54,11 @@ class ClaudeCodeLockTimeout(LockError):
 
     Raised when ``~/.claude.lock`` / ``~/.claude.json.lock`` stays held past
     our bounded wait — usually Claude Code mid-token-refresh. Nothing has been
-    mutated when this raises; the operation is safe to retry.
+    mutated when this raises.
+
+    RETRY IS USUALLY, NOT ALWAYS, THE ANSWER. The same type is raised at once
+    for a lock path that is a SYMLINK, which no wait can clear -- the message
+    says which, and a retrying caller should surface it rather than swallow it.
     """
 
     pass

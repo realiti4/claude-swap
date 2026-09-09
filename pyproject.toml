@@ -51,7 +51,12 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `pytest>=9.0`, NOT 8: `faulthandler_exit_on_timeout` below landed in
+# 9.0.0. On 8.x it is an unknown ini key -- a `PytestConfigWarning` in a
+# wall of output, no abort, and the hang the option exists to end. CI is
+# safe either way (`uv sync --locked`); an editable install inside the
+# declared range was not.
+dev = ["pytest>=9.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -64,7 +69,36 @@ pythonpath = ["src"]
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
-addopts = "-n auto --dist loadgroup"
+# `--max-worker-restart=0` IS PART OF THE BACKSTOP BELOW, not a tuning
+# knob. With the faulthandler set to exit on timeout, a wedged test kills
+# its worker -- and under `loadgroup` xdist then wedges in the
+# worker-replacement path instead of reporting the item. Measured on a
+# 41-test repo with one hanging case and a 3s budget:
+#   --dist loadgroup                      rc=124, 0 crash lines (HUNG)
+#   --dist load                           rc=1 in 5.4s, names the test
+#   --dist loadgroup --max-worker-restart=0  rc=1 in 4.2s, names the test
+# `--dist load` is not available here: conftest pins the real-keychain
+# group with `xdist_group`, which only `loadgroup` honours.
+# `minversion` AND `--strict-config` ask the INSTALLED pytest, which is
+# what the failure story is about -- an editable install inside the
+# declared range, where `faulthandler_exit_on_timeout` below is an unknown
+# ini key and the backstop is inert. A hand-maintained list of
+# version-gated options cannot: 9.1 registers nine keys 8.4 does not, and
+# a realistic typo of a real one (`max_warnigns`) passed such a guard
+# while `--strict-config` gave rc=4 and ran nothing.
+minversion = "9.0"
+addopts = "-n auto --dist loadgroup --max-worker-restart=0 --strict-config"
+# A HANG BECOMES AN ABORT WITH STACKS, with no new dependency: pytest ships
+# both of these, and `exit_on_timeout` is what turns the dump into a failure
+# instead of a note in a job that keeps running. GitHub's default JOB budget
+# is 360 minutes -- a step has no documented default and simply runs until
+# that budget cancels it -- so a job without `timeout-minutes` pays six hours
+# for a spinning worker and prints no test name.
+# PER TEST, not per suite -- pytest arms it in a `pytest_runtest_protocol`
+# hookwrapper, so 600s is compared against the slowest SINGLE case (~10s
+# here), not against the run. Collection is not covered at all.
+faulthandler_timeout = 600
+faulthandler_exit_on_timeout = true
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
