@@ -151,6 +151,9 @@ Examples:
             "shared items)"
         ),
     )
+    parser.add_argument("--auto", action="store_true", help="Allocate an isolated Fable account (macOS/Linux).")
+    parser.add_argument("--model", choices=["fable"], help="Model to allocate; requires --auto.")
+    parser.add_argument("--threshold", type=int, default=90, help="Maximum usage for --auto (1-100, default 90).")
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
@@ -179,6 +182,14 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    if args.auto:
+        if args.account or args.model != "fable" or not 1 <= args.threshold <= 100:
+            parser.error("--auto requires --model fable, no account, and --threshold 1-100")
+        if any(arg == "--model" or arg.startswith("--model=") or arg.startswith("--fallback-model") for arg in tail):
+            parser.error("--auto controls the model; remove model/fallback overrides after --")
+    elif args.model or "--threshold" in head or any(arg.startswith("--threshold=") for arg in head):
+        parser.error("--model and --threshold require --auto; pass manual Claude flags after --")
+
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -186,6 +197,12 @@ Examples:
         from claude_swap.session import SessionManager
 
         manager = SessionManager(switcher)
+
+        if args.auto:
+            from claude_swap.allocation import run_allocated
+
+            run_allocated(manager, tail, args.threshold, not args.no_share, args.share_history)
+            return
 
         if args.account is not None:
             manager.run(

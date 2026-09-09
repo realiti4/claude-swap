@@ -11,10 +11,3 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
-
-# ftask: per-slug runtime files (env + sim artifacts) — never committed
-.ftask/*/.env
-.ftask/*/sim_artifacts/
-.ftask/*/qa/
-.ftask/*/STATE.json
-.ftask/*/STATE.json.tmp

@@ -116,6 +116,37 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Automatically allocate Fable sessions (macOS/Linux)
+
+```bash
+cswap run --auto --model fable
+cswap run --auto --model fable --threshold 95
+cswap run --auto --model fable -- --resume
+```
+
+Each launch selects an isolated account below the usage threshold (90% by
+default) in **all three** windows: 5h, 7d, and Fable. Accounts with unknown
+windows, disabled accounts, API-key accounts, and the current default login
+are excluded. Among eligible accounts, fewer live sessions wins, then more
+remaining quota. Pending launches count too, so two concurrent launches can
+spread across two accounts before Claude finishes registering either session.
+
+Run from a normal terminal without `CLAUDE_CONFIG_DIR`. This mode launches
+Fable explicitly; model/fallback overrides after `--` are rejected. Existing
+manual `run` and directory mappings are unchanged. If no account qualifies,
+it reports why (including known quota reset timestamps) instead of launching
+the default login. The default account remains reserved; this can leave just
+one eligible isolated account even when two accounts have Fable quota.
+
+Allocation happens **only at startup**: it does not migrate running sessions,
+queue tasks, verify model entitlements, or add quota. Do not switch the model
+inside an allocated session if you want its Fable quota decision to remain
+applicable. Session counts cover local registered sessions and allocated
+launches, not other machines. Ended allocations are pruned on the next launch;
+after abrupt exits, PID reuse can conservatively overcount an old allocation.
+Avoid manually activating an allocated account as the default login while it
+is running. Use normal `run NUM -- --model fable` on Windows.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
