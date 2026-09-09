@@ -183,6 +183,37 @@ class EngineHarness:
             return {}
         return json.loads(path.read_text())
 
+    def switch_state(self) -> dict:
+        """This engine's per-config-dir slice of the switch history.
+
+        `state()` stays the raw file (quarantine, schemaVersion, every
+        scope); assertions about what a switch RECORDED belong here, where
+        the engine itself reads and writes them.
+        """
+        return self.engine._switch_state(self.state())
+
+    def seed_switch_history(self, **keys) -> None:
+        """Write switch-history keys into this engine's own scope slice.
+
+        The top-level spelling (`_mutate_state(lambda s: s.update(...))`)
+        still works through `_switch_state`'s pre-upgrade fallback — but only
+        until a real switch creates the slice, after which top-level keys are
+        invisible to the engine. Tests that seed after a switch, or mix
+        seeding with real switches, must use this instead.
+        """
+        self.mutate_switch_history(lambda history: history.update(keys))
+
+    def mutate_switch_history(self, fn) -> None:
+        """Apply ``fn`` to this engine's scope slice (creating it if absent)."""
+        def apply(state: dict) -> None:
+            fn(
+                state.setdefault("perConfigDir", {}).setdefault(
+                    self.engine._scope_key, {}
+                )
+            )
+
+        self.engine._mutate_state(apply)
+
 
 @pytest.fixture
 def harness(temp_home: Path) -> EngineHarness:
@@ -324,7 +355,7 @@ class TestDecisionTable:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "proactive"
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
-        assert harness.state()["lastSwitchTo"] == "3"
+        assert harness.switch_state()["lastSwitchTo"] == "3"
 
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)
@@ -455,9 +486,7 @@ class TestDecisionTable:
         assert exhausted.earliest_reset_at == reset
 
     def test_cooldown_suppresses_proactive(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock() - 10)
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(10),
         })
@@ -467,9 +496,7 @@ class TestDecisionTable:
         ]
 
     def test_at_limit_bypasses_cooldown(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock() - 10)
         outcome = harness.tick_with_usage({
             "1": _usage(100), "2": _usage(10), "3": _usage(50),
         })
@@ -479,9 +506,7 @@ class TestDecisionTable:
         assert harness.active_number() == 2
 
     def test_cooldown_expires(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock())
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock())
         harness.clock.advance(400)  # past the 300s default cooldown
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(50),
@@ -3335,7 +3360,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
             "2": _usage7(10, 10, _R_SOON),
         })
         assert out is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftTrigger") == "consume-first", (
             f"expected leftTrigger='consume-first', got {state.get('leftTrigger')!r}"
         )
@@ -3352,7 +3377,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
             out = h.tick_with_usage({"1": None, "2": _usage(4)})
             h.clock.advance(60.0)
         assert out is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftTrigger") == "failover", (
             f"expected leftTrigger='failover', got {state.get('leftTrigger')!r}"
         )
@@ -4157,9 +4182,7 @@ class TestHorizonAxisDoesNotFlap:
         it also emits AllExhaustedEvent — a false claim that reaches the user
         as a macOS notification and a critical TUI row while a peer sits at 0%.
         """
-        harness.engine._mutate_state(
-            lambda st: st.__setitem__("lastSwitchFrom", "2")
-        )
+        harness.seed_switch_history(lastSwitchFrom="2")
         outcome = harness.tick_with_usage({
             "1": _usage(100),      # active, exhausted -> at-limit
             "2": _usage(0),        # the account we left, now at full quota
@@ -4575,12 +4598,12 @@ class TestHorizonAxisDoesNotFlap:
             "3": _usage(92, back["3"]),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state["lastSwitchFrom"] == 1 and state["lastSwitchTo"] == "2", (
             f"premise: production writes an int `from` and a str `to` — got "
             f"{state.get('lastSwitchFrom')!r} / {state.get('lastSwitchTo')!r}"
         )
-        h.engine._mutate_state(
+        h.mutate_switch_history(
             lambda st: st.pop("lastSwitchTo", None) if landed is None
             else st.__setitem__("lastSwitchTo", landed)
         )
@@ -4837,7 +4860,7 @@ class TestHorizonAxisDoesNotFlap:
             "3": _usage(99, self._days_out(h, 300)),
         }) is TickOutcome.SWITCHED
         h.clock.advance(301.0)
-        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.mutate_switch_history(lambda st: st.pop("lastSwitchFrom", None))
 
         assert h.tick_with_usage({
             "1": _usage(96.5, self._days_out(h, 10)),
@@ -4890,7 +4913,7 @@ class TestHorizonAxisDoesNotFlap:
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         h.clock.advance(301.0)
-        assert h.engine._read_state().get("lastSwitchFrom") is not None, (
+        assert h.switch_state().get("lastSwitchFrom") is not None, (
             "premise: the move recorded what it left"
         )
 
@@ -4912,7 +4935,7 @@ class TestHorizonAxisDoesNotFlap:
         # ahead of the active by the same margins.
         h.make_live("b@example.com", 2)
         h.clock.advance(301.0)
-        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.mutate_switch_history(lambda st: st.pop("lastSwitchFrom", None))
         assert h.tick_with_usage(second) is TickOutcome.SWITCHED
         assert h.active_number() == 1, (
             "premise: unbarred, the account we left returns soonest and IS the "
@@ -5063,7 +5086,7 @@ class TestHorizonAxisDoesNotFlap:
             "2": _usage7(0.0, 0.0, self._days_out(h, 100)),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        assert h.engine._read_state().get("leftHeadroom") == 100.0, (
+        assert h.switch_state().get("leftHeadroom") == 100.0, (
             "premise: consume-first recorded a full-quota departure"
         )
         h.clock.advance(301.0)
@@ -5348,7 +5371,7 @@ class TestHorizonAxisDoesNotFlap:
             "1": _usage(96),                            # 4 pts, NO reset known
             "2": _usage(92, self._days_out(h, 400)),
         }) is TickOutcome.SWITCHED
-        assert h.engine._read_state().get("leftRecoveryAt") is None, (
+        assert h.switch_state().get("leftRecoveryAt") is None, (
             "premise: the departure reset was unknown and stored as null"
         )
         h.clock.advance(3612.0)
@@ -5492,7 +5515,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert "leftHeadroom" in state, (
             "premise: _perform writes the keys unconditionally even on failover"
         )
@@ -5599,7 +5622,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5668,7 +5691,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5726,7 +5749,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5939,7 +5962,7 @@ class TestHorizonAxisDoesNotFlap:
                 "2": _usage(10),
             })
         assert outcome is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftRecoveryAt") == ranking_now + 100.0, (
             f"leftRecoveryAt={state.get('leftRecoveryAt')!r} -- a SECOND, "
             "independent clock() read after the ranking already decided "
@@ -5981,9 +6004,9 @@ class TestHorizonAxisDoesNotFlap:
 
         # Strip to the pre-upgrade shape: barred is named, no departure
         # evidence recorded at all -- absence releases, by design.
-        h.engine._mutate_state(lambda st: st.pop("leftHeadroom", None))
-        h.engine._mutate_state(lambda st: st.pop("leftRecoveryAt", None))
-        assert "leftHeadroom" not in h.engine._read_state()
+        h.mutate_switch_history(lambda st: st.pop("leftHeadroom", None))
+        h.mutate_switch_history(lambda st: st.pop("leftRecoveryAt", None))
+        assert "leftHeadroom" not in h.switch_state()
 
         h.clock.advance(301.0)
         outcome = h.tick_with_usage({
@@ -6025,7 +6048,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert "leftHeadroom" in state, (
             "premise: _perform writes the keys unconditionally even on failover"
         )
@@ -6893,4 +6916,359 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
+
+
+class TestSwitchHistoryIsPerConfigDir:
+    """The switch history describes ONE live config, not the machine.
+
+    Engines under different ``CLAUDE_CONFIG_DIR``s operate different live
+    logins: one terminal's switch must not cool another down, bar another's
+    candidates, or overwrite the departure snapshot another's release
+    predicate diffs against. Quarantine is a fact about an ACCOUNT — dead is
+    dead in every terminal — and stays shared. This class pins the move of
+    all six ``SWITCH_HISTORY_KEYS`` from top level into ``perConfigDir``
+    slices keyed by the engine's ``scope_key``, and the pre-upgrade fallback
+    that retires top-level records on the first post-upgrade switch.
+    """
+
+    OTHER = "/somewhere/else/.claude"
+
+    def _tick(self, h: EngineHarness, engine: AutoSwitchEngine, usage: dict):
+        entries = {
+            num: _entry_for(value, h.clock.now) for num, value in usage.items()
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            return engine.tick()
+
+    def test_cooldown_gates_only_the_config_dir_that_switched(self, harness):
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+        # Same config dir (a loop and a cron --once on one profile): the
+        # second engine reads the first's lastSwitchAt and backs off.
+        same_scope = harness._make_engine()
+        assert self._tick(harness, same_scope, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "cooldown"
+
+        # Different config dir: a different live login — no backoff owed.
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_the_bar_does_not_leak_into_another_config_dir(self, temp_home):
+        """INSIDE the recovery horizon, where the bar bites — the same
+        all-spent fleet ``test_the_bar_reaches_the_ranking_through_tick``
+        uses to pin that the OWN engine lands on 3 (its bar refuses the
+        soonest-returning account 1). Past the horizon the bar release and
+        the ranking gate collapse into one inequality and the bar is inert,
+        so a leak there is invisible; here, a foreign engine that saw the
+        own scope's ``lastSwitchFrom=1`` would land on 3 exactly like the
+        owner. Landing on 1 is therefore the observable that the bar did
+        NOT leak."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        days = lambda d: _iso_at(h.clock.now + d * 86400.0)
+        secs = lambda s: _iso_at(h.clock.now + s)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, days(500)),
+            "2": _usage(10, days(400)),
+            "3": _usage(50, days(300)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.switch_state().get("lastSwitchFrom") == 1, (
+            "premise: the own scope's bar names account 1"
+        )
+        h.clock.advance(301.0)
+
+        other = h._make_engine(scope_key=self.OTHER)
+        assert self._tick(h, other, {
+            "1": _usage(99, secs(1800)),   # the owner's barred account; back first
+            "2": _usage(99, secs(7200)),   # active, spent, back in 2h
+            "3": _usage(99, secs(3600)),   # where a leaked bar would land us
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            "the foreign engine avoided account 1 — the no-return bar leaked "
+            "across config dirs"
+        )
+
+    def test_a_foreign_switch_does_not_clobber_the_departure_snapshot(
+        self, harness
+    ):
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        own = dict(harness.switch_state())
+        assert own.get("leftHeadroom") == 5.0, (
+            "premise: the departure snapshot recorded 1's headroom"
+        )
+        harness.clock.advance(301.0)
+
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        assert harness.switch_state() == own, (
+            "a switch in another config dir rewrote this engine's departure "
+            "snapshot — the release predicate now diffs against a baseline "
+            "belonging to a different live config's move"
+        )
+        foreign = harness.state()["perConfigDir"][self.OTHER]
+        assert foreign["lastSwitchTo"] == "2"
+
+    # The six literal key names, spelled out rather than imported: the
+    # production constant is what the retirement loop iterates, so using it
+    # as the oracle here would let the assertion shrink in lockstep with a
+    # shrunk tuple.
+    _HISTORY_KEYS = (
+        "lastSwitchAt",
+        "lastSwitchTo",
+        "lastSwitchFrom",
+        "leftHeadroom",
+        "leftRecoveryAt",
+        "leftTrigger",
+    )
+
+    def test_a_pre_upgrade_record_is_honoured_then_retired(self, harness):
+        # A full record written before perConfigDir existed: all six keys at
+        # top level, with distinguishable sentinel values.
+        harness.engine._mutate_state(
+            lambda s: s.update(
+                lastSwitchAt=harness.clock() - 10,
+                lastSwitchTo="1",
+                lastSwitchFrom="2",
+                leftHeadroom=42.0,
+                leftRecoveryAt=None,
+                leftTrigger="proactive",
+            )
+        )
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.NO_ACTION, (
+            "a pre-upgrade cooldown record must keep its old meaning until "
+            "a switch retires it"
+        )
+        # Pre-migration, the legacy record binds EVERY scope through the
+        # fallback — the faithful reading of the old shared-cluster
+        # semantics, not only the default profile's.
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.NO_ACTION
+
+        harness.clock.advance(400.0)
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        for key in self._HISTORY_KEYS:
+            assert key not in raw, (
+                f"{key} survived at top level — the first post-upgrade "
+                "switch must retire the pre-upgrade record it replaces"
+            )
+        # The retiring engine IS the default profile here, so its own slice
+        # replaces the record — exactly what an old-format switch's
+        # overwrite did — rather than the record migrating anywhere.
+        slice_ = harness.switch_state()
+        assert slice_["lastSwitchTo"] == "3"
+        assert slice_["lastSwitchFrom"] == 1
+        assert slice_["leftTrigger"] == "proactive"
+        assert slice_["leftHeadroom"] == 5.0
+        assert list(raw["perConfigDir"]) == [harness.engine._scope_key]
+
+    def test_a_foreign_scope_switch_moves_legacy_into_the_default_slice(
+        self, harness
+    ):
+        """The legacy record carries no owner; pre-upgrade autoswitch ran the
+        default profile in the overwhelmingly common case. So when some OTHER
+        config dir's engine performs the retiring switch, the record must
+        move into the default profile's slice — not vanish, which would
+        silently drop the default engine's own cooldown and anti-flap bar for
+        one upgrade cycle. Retirement must also fire even though a slice for
+        a third scope already exists (it is not gated on perConfigDir being
+        absent)."""
+        harness.engine._mutate_state(
+            lambda s: s.update(
+                lastSwitchAt=123.0,
+                lastSwitchTo="9",
+                lastSwitchFrom="8",
+                leftHeadroom=42.0,
+                leftRecoveryAt=None,
+                leftTrigger="failover",
+            )
+        )
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("perConfigDir", {}).update(
+                {"/third/scope": {"lastSwitchAt": 1.0}}
+            )
+        )
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        for key in self._HISTORY_KEYS:
+            assert key not in raw
+        assert raw["perConfigDir"][harness.engine._scope_key] == {
+            "lastSwitchAt": 123.0,
+            "lastSwitchTo": "9",
+            "lastSwitchFrom": "8",
+            "leftHeadroom": 42.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+        assert raw["perConfigDir"]["/third/scope"] == {"lastSwitchAt": 1.0}
+        assert raw["perConfigDir"][self.OTHER]["lastSwitchTo"] == "3"
+
+    def test_legacy_never_overwrites_an_existing_default_slice(self, harness):
+        """A slice a post-upgrade engine already wrote is the newer
+        authority; a top-level record next to it can only come from a
+        still-running pre-upgrade writer, and must be dropped, not moved."""
+        harness.seed_switch_history(lastSwitchAt=555.0)  # the default's own
+        harness.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=123.0, leftHeadroom=42.0)
+        )
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        default_slice = raw["perConfigDir"][harness.engine._scope_key]
+        assert default_slice["lastSwitchAt"] == 555.0
+        assert "leftHeadroom" not in default_slice
+        assert "lastSwitchAt" not in raw and "leftHeadroom" not in raw
+
+    def test_quarantine_stays_shared_across_config_dirs(self, harness):
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "the foreign engine landed on quarantined account 3 — a dead "
+            "refresh token is dead in every config dir, quarantine must not "
+            "be sliced per scope"
+        )
+
+    def test_a_switch_under_an_arbitrary_config_dir_stays_in_it(
+        self, harness, monkeypatch
+    ):
+        """An engine run under a manually-exported ``CLAUDE_CONFIG_DIR`` (a
+        plain profile dir, NOT one of cswap's own ``sessions/`` dirs, which
+        ``_refuse_session_shell`` blocks by design) switches that profile's
+        live login and leaves the default profile's untouched."""
+        profile = harness.temp_home / "work-profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"},
+        }))
+        default_live = (harness.temp_home / ".claude.json").read_text()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+        engine = harness._make_engine()
+        assert self._tick(harness, engine, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        landed = json.loads((profile / ".claude.json").read_text())
+        assert landed["oauthAccount"]["emailAddress"] == "c@example.com", (
+            "the switch must land in the exported profile dir"
+        )
+        assert (harness.temp_home / ".claude.json").read_text() == default_live, (
+            "a switch under CLAUDE_CONFIG_DIR rewrote the DEFAULT profile's "
+            "live config"
+        )
+
+    def test_scope_key_follows_claude_config_dir(self, harness, monkeypatch):
+        from claude_swap.mappings import normalize_path
+
+        profile = str(harness.temp_home / "profile-a")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", profile)
+        assert harness._make_engine()._scope_key == normalize_path(profile)
+
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        assert harness._make_engine()._scope_key == normalize_path(
+            harness.temp_home / ".claude"
+        ), "without CLAUDE_CONFIG_DIR the scope is the default profile"
+
+    def test_equivalent_config_dir_spellings_share_one_slice(
+        self, harness, monkeypatch
+    ):
+        """A cron exporting a trailing-slash (or symlinked) spelling of the
+        profile a shell loop spells canonically must land in the SAME
+        slice, or the two double-switch the same live login — the exact bug
+        class this change fixes. Pinned behaviorally: the second spelling's
+        engine backs off on the first's cooldown."""
+        profile = harness.temp_home / "profile-a"
+        profile.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        canonical = harness._make_engine()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile) + "/")
+        slashed = harness._make_engine()
+        link = harness.temp_home / "profile-link"
+        link.symlink_to(profile)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(link))
+        linked = harness._make_engine()
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        assert canonical._scope_key == slashed._scope_key == linked._scope_key
+
+        # The spelling only ever feeds the scope key (fixed at
+        # construction); the live login these ticks read is the harness's
+        # default profile.
+        assert self._tick(harness, canonical, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert self._tick(harness, slashed, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.NO_ACTION, (
+            "the trailing-slash spelling resolved to a different slice — no "
+            "cooldown honoured between two engines on one profile"
+        )
+
+    def test_a_corrupt_perconfigdir_falls_back_and_is_rebuilt(self, harness):
+        harness.engine._mutate_state(lambda s: s.update(perConfigDir="oops"))
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED  # reader falls back cleanly, no crash
+        raw = harness.state()
+        assert (
+            raw["perConfigDir"][harness.engine._scope_key]["lastSwitchTo"]
+            == "3"
+        )
+
+    def test_a_corrupt_slice_is_replaced_and_siblings_survive(self, harness):
+        harness.engine._mutate_state(
+            lambda s: s.update(perConfigDir={
+                harness.engine._scope_key: "oops",
+                "/sibling": {"lastSwitchAt": 1.0},
+            })
+        )
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        raw = harness.state()
+        assert (
+            raw["perConfigDir"][harness.engine._scope_key]["lastSwitchTo"]
+            == "3"
+        )
+        assert raw["perConfigDir"]["/sibling"] == {"lastSwitchAt": 1.0}
 

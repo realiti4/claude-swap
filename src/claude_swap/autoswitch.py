@@ -24,7 +24,15 @@ consecutive ticks, the engine fails over to any healthy candidate.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
-read-modify-write under a dedicated file lock.
+read-modify-write under a dedicated file lock. Quarantine is a fact about an
+*account* and stays top-level, shared by every engine. The switch history
+(cooldown timestamp, no-return bar, departure snapshot) is a fact about one
+*live config* — engines running under different ``CLAUDE_CONFIG_DIR``s
+operate different live logins, so each config dir gets its own slice under
+``perConfigDir`` (see :meth:`AutoSwitchEngine._switch_state`); otherwise a
+switch in one terminal would start a cooldown and erect no-return bars in
+every other, and any switch anywhere would overwrite the one departure
+snapshot the anti-flap release diffs against.
 """
 
 from __future__ import annotations
@@ -46,6 +54,8 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.mappings import normalize_path
+from claude_swap.paths import get_claude_config_home, get_default_claude_config_home
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -56,7 +66,29 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+# Still 1 after the perConfigDir move: nothing validates the version on read,
+# and every switch-history key was already optional-with-absence-handled, so a
+# pre-upgrade reader of the new shape lands in its existing release paths
+# rather than misparsing — the same treatment the late-added `leftHeadroom`/
+# `leftTrigger` fields got.
 STATE_SCHEMA_VERSION = 1
+
+# The switch-history cluster `_perform` writes as one unit: when/where the
+# last switch landed, and the departure snapshot the no-return release diffs
+# against. Facts about ONE live config, so they live per config dir under
+# `perConfigDir` (keyed by the engine's `scope_key`), never top-level — see
+# the module docstring. Every successful switch overwrites all six, which is
+# also the whole migration story: a pre-upgrade record's top-level keys are
+# honoured by `_switch_state`'s fallback until the first post-upgrade switch
+# retires them.
+SWITCH_HISTORY_KEYS = (
+    "lastSwitchAt",
+    "lastSwitchTo",
+    "lastSwitchFrom",
+    "leftHeadroom",
+    "leftRecoveryAt",
+    "leftTrigger",
+)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -647,9 +679,16 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        scope_key: str | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Which live config this engine operates — the key for its slice of
+        # the shared state file's switch history (see module docstring).
+        # Derived from the process's CLAUDE_CONFIG_DIR resolution by default;
+        # injectable so tests can run differently-scoped engines in one
+        # process, same as `state_path`.
+        self._scope_key = scope_key or normalize_path(get_claude_config_home())
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -696,6 +735,35 @@ class AutoSwitchEngine:
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return raw if isinstance(raw, dict) else {}
+
+    def _switch_state(self, state: dict) -> dict:
+        """This engine's slice of the switch history (`SWITCH_HISTORY_KEYS`).
+
+        Every reader of those keys (`_in_cooldown`, `_no_return_account`,
+        `_left_account_recovered`) receives this view, never the raw state:
+        the history describes one live config's last switch, and this engine
+        must not gate on — or release against — a switch some other config
+        dir's engine made.
+
+        Falls back to the full state when no slice exists for this scope, so
+        a pre-upgrade record's top-level keys keep exactly their old meaning
+        until the first post-upgrade switch retires them — replaced by the
+        retiring engine's own slice when the record was its config's, moved
+        into the default profile's slice otherwise (`_perform`). After that,
+        the fallback reads a state with none of the six keys present — the
+        same "absence of evidence releases" shape every reader already
+        handles for records written before a key existed. One skew window is
+        accepted: a still-running pre-upgrade binary writes top-level keys
+        that this engine ignores once its own slice exists, so old and new
+        binaries on one profile owe each other no cooldown until both are
+        upgraded.
+        """
+        scopes = state.get("perConfigDir")
+        if isinstance(scopes, dict):
+            slice_ = scopes.get(self._scope_key)
+            if isinstance(slice_, dict):
+                return slice_
+        return state
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -904,6 +972,10 @@ class AutoSwitchEngine:
             if isinstance(state.get("quarantine"), dict)
             else {}
         )
+        # Quarantine above is per-account and read from the shared state;
+        # everything below that reads switch history reads this engine's own
+        # per-config-dir slice instead.
+        switch_state = self._switch_state(state)
 
         current = self.switcher.current_account_number()
         if current is None:
@@ -1046,7 +1118,9 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(
+            switch_state
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1149,7 +1223,7 @@ class AutoSwitchEngine:
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
             recovered = self._left_account_recovered(
-                state,
+                switch_state,
                 kw["usage"],
                 kw["headroom"],
                 kw["active_headroom"],
@@ -1159,7 +1233,7 @@ class AutoSwitchEngine:
             )
             no_return = self._no_return_account(
                 trigger,
-                state,
+                switch_state,
                 kw["headroom"],
                 kw["active_headroom"],
                 recovered,
@@ -2119,12 +2193,17 @@ class AutoSwitchEngine:
         # Hold the state lock across the whole recheck -> switch -> record
         # sequence so two concurrent engines (loop + cron --once) make one
         # serialized decision: the loser re-reads the winner's lastSwitchAt
-        # and backs off instead of double-switching. No deadlock cycle: the
-        # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # and backs off instead of double-switching. Both read their own
+        # config dir's slice, so the dance serializes engines operating the
+        # SAME live config; engines under different CLAUDE_CONFIG_DIRs are
+        # switching different live logins and owe each other no backoff. No
+        # deadlock cycle: the switch path (cswap FileLock + Claude Code
+        # locks) never takes the state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(
+                self._switch_state(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2139,17 +2218,49 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
 
             state["schemaVersion"] = STATE_SCHEMA_VERSION
-            state["lastSwitchAt"] = self.clock()
-            state["lastSwitchTo"] = number
+            scopes = state.get("perConfigDir")
+            if not isinstance(scopes, dict):
+                scopes = {}
+                state["perConfigDir"] = scopes
+            # Retiring any pre-upgrade top-level copies here IS the
+            # migration — `_switch_state`'s fallback honoured them until this
+            # moment. A switch has always overwritten the entire history
+            # cluster, so when the record was this engine's config's, the
+            # slice write below replaces it exactly as an old-format switch
+            # would have. The record carries no owner, but pre-upgrade
+            # autoswitch ran the DEFAULT profile in the overwhelmingly common
+            # case — so when a non-default engine retires it, the cluster
+            # moves into the default profile's slice (never onto an existing
+            # slice: one a post-upgrade engine already wrote is the newer
+            # authority) instead of vanishing. Wrong only by keeping a
+            # cooldown/bar that wasn't the default profile's — the
+            # over-conservative direction this history's readers already
+            # prefer (see `_no_return_account` on absent keys).
+            legacy = {
+                key: state.pop(key) for key in SWITCH_HISTORY_KEYS if key in state
+            }
+            default_key = normalize_path(get_default_claude_config_home())
+            if (
+                legacy
+                and self._scope_key != default_key
+                and not isinstance(scopes.get(default_key), dict)
+            ):
+                scopes[default_key] = legacy
+            history = scopes.get(self._scope_key)
+            if not isinstance(history, dict):
+                history = {}
+                scopes[self._scope_key] = history
+            history["lastSwitchAt"] = self.clock()
+            history["lastSwitchTo"] = number
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
             # state alone cannot supply one. `inf` is stored as null: it is not
             # portable JSON, and every other reader of this file would have to
             # learn about it.
-            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            history["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+            history["leftHeadroom"], recovery = left
+            history["leftRecoveryAt"] = None if recovery == float("inf") else recovery
             # A `consume-first` phase-2 refetch can write the SAME (None,
             # None) shape a `failover` departure writes, whenever the
             # refetched active row has a `pct` but is otherwise unmeasurable
@@ -2158,7 +2269,7 @@ class AutoSwitchEngine:
             # needs only `resets_at`. Inferring the trigger from the two
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
-            state["leftTrigger"] = trigger
+            history["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
         self._emit(
