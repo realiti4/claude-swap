@@ -192,7 +192,7 @@ class TestSkipifArgumentsAreEvaluatedEverywhere:
         import ast
         import pathlib
 
-        src = pathlib.Path(__file__).read_text()
+        src = pathlib.Path(__file__).read_text(encoding="utf-8")
         # Names that do not exist on Windows. A call to one of these inside a
         # skipif condition must be short-circuited by a platform test to its
         # LEFT, in the same expression — a separate decorator cannot do it.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -19,6 +20,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -547,7 +549,7 @@ class TestAddAccountRefresh:
         # Track what was written to credential storage
         stored = {}
 
-        def mock_write_creds(num, email, creds):
+        def mock_write_creds(num, email, creds, attributed=None):
             stored["creds"] = creds
 
         def mock_read_creds(num, email):
@@ -1998,7 +2000,91 @@ class TestActiveAccountRefresh:
             "primary": True, "legacy": True, "config": False,
         }
         write_live.assert_called_once_with(self._REFRESHED)
-        write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, attributed=True
+        )
+
+    def test_a_condemned_lineage_is_never_posted_by_this_recovery_branch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """This is the SECOND POST call site (the consume gate is the
+        first) — the bytes gate lives once, inside
+        ``oauth.try_refresh_oauth_credentials`` itself, so this site
+        inherits it for free rather than needing its own duplicate check.
+        The verdict must also reach the store AS ``foreign-lineage``, not
+        the generic ``refresh-failed`` this site's own error-collapse used
+        to fall back to (2026-09-08 breadth review, F3) — same subject as
+        the consume-gate path, same identity."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._EXPIRED),
+            )
+        ] = False
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error == "foreign-lineage"  # not the generic "refresh-failed"
+
+    def test_an_unreadable_sequence_file_at_this_recovery_post_never_defers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        `condemned` callback: `_lineage_key` reads `sequence.json` with
+        `strict=True` and raises `ConfigError` on a torn/unreadable file.
+        Before the fix that escaped to this call's own blanket `except
+        Exception`, which answers `_defer(force_refresh)` — an unreadable
+        store deferring a live refresh on no evidence at all (the softest
+        form of R1's violation: bounded to one pass, no strike, no
+        `/login`, but still a refusal `_condemned`'s own wrapping was meant
+        to end). Wrapped the same way, the POST must proceed instead."""
+        switcher = self._switcher(sample_sequence_data)
+        fault_fired = []
+        real_lineage_key = switcher._lineage_key
+
+        def raise_once(*a, **kw):
+            if not fault_fired:
+                fault_fired.append(True)
+                raise ConfigError(
+                    "sequence.json exists but could not be read"
+                )
+            return real_lineage_key(*a, **kw)
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_lineage_key", side_effect=raise_once), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # not deferred
+        assert result.error is None
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2320,6 +2406,124 @@ class TestActiveAccountRefresh:
         write_backup.assert_not_called()          # backup already holds it
         assert mock_fetch.call_args[0][2] == successor
 
+    def test_a_restore_for_a_slot_the_roster_does_not_name_active_leaves_the_live_store_alone(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """MEASURED: the resolver named slot 1 while the roster named 5, and
+        this restore put slot 1's grant into the live store -- the machine
+        changed login with no switch recorded. The backup restore is fine;
+        the live store belongs to the slot the roster names.
+
+        The pass DEFERS rather than reporting: it is leaving the live store
+        on a credential it just judged unusable, which is what the sentinel
+        means. See `test_a_skipped_live_write_is_reported_as_a_deferral...`
+        for why a usage number here is the wrong answer."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()
+        write_live.assert_not_called()             # not this slot's store
+        write_backup.assert_not_called()
+        mock_fetch.assert_not_called()             # nothing to report on
+
+    def test_a_skipped_live_write_is_reported_as_a_deferral_not_as_health(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A refusal to write the live store is a DEFERRAL, and the record
+        has to say so.
+
+        The refusal leaves the live store holding bytes this pass judged
+        unusable -- exactly the state `if not live_ok` exists to catch ("Live
+        still holds the dead token -- don't serve usage for a credential CC
+        can't currently use"). `live_ok` is only ever cleared by an
+        exception, so a deliberate skip walks past that guard and the ACTIVE
+        account reports a healthy usage number: `cswap list` shows
+        percentages, and autoswitch reads a usage dict instead of
+        `USAGE_TOKEN_EXPIRED`, so it neither idle-holds nor fails over while
+        Claude Code cannot use the credential in front of it.
+        """
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        write_live.assert_not_called()             # premise: the write was skipped
+        assert result.sentinel == USAGE_TOKEN_EXPIRED, (
+            "the live store was left on an unusable credential and the pass "
+            f"reported usage anyway: {result}"
+        )
+        assert result.usage is None
+
+    def test_a_refresh_of_the_live_lineage_lands_in_the_live_store_whatever_the_roster_says(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """THE CONTROL: a grant refreshed FROM the live credential goes back
+        where it came from, or the live store keeps a consumed grant."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+        valid_but_revoked = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-revoked", "refreshToken": "rt-orig",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        def mock_fetch(account_num, email, credentials, is_active):
+            if credentials == valid_but_revoked:
+                return oauth.UsageOutcome(None, error="http-401")
+            return oauth.UsageOutcome({"five_hour": {"pct": 5}})
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=valid_but_revoked
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=valid_but_revoked,
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=mock_fetch):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", valid_but_revoked
+            )
+
+        assert result.sentinel is None
+        write_live.assert_called_once_with(self._REFRESHED)
+
     def test_identity_check_compares_organization_too(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -2585,7 +2789,7 @@ class TestActiveAccountRefresh:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         # Live store still holds the consumed token → report expired, not usage.
         assert result.sentinel == USAGE_TOKEN_EXPIRED
@@ -2653,8 +2857,8 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()   # nothing consumed — pure resync
         mock_probe.assert_called_once()
         assert write_backup.call_args_list == [
-            call("1", "test@example.com", self._REFRESHED),
-            call("1", "test@example.com", self._REFRESHED),
+            call("1", "test@example.com", self._REFRESHED, attributed=True),
+            call("1", "test@example.com", self._REFRESHED, attributed=True),
         ]
 
     def test_fresh_fetch_same_lineage_skips_the_resync(
@@ -2741,6 +2945,38 @@ class TestActiveAccountRefresh:
         ]
         assert len(warnings) == 1
 
+    def test_an_unreadable_sequence_file_at_the_served_credential_check_never_raises(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        foreign-lineage check: it sits OUTSIDE the locked `try` further
+        down in this method, and `_lineage_key` reads `sequence.json` with
+        `strict=True`, raising `ConfigError` on a torn/unreadable file.
+        Uncaught here it would escape `_fetch_active_usage` entirely and
+        (via `_fetch_account_usage`'s `executor.map`) kill the whole
+        collect pass — the exact defect the consume-gate's own
+        `_condemned` was wrapped for. Wrapped the same way, an unreadable
+        store must not even raise, let alone refuse to serve usage."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts["seed"] = True  # non-empty: reaches the check
+        fault_fired = []
+
+        def raise_fault(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        with patch.object(switcher, "_lineage_key", side_effect=raise_fault), \
+             patch.object(switcher, "_resync_rotated_backup"), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # absence of evidence -> served, not refused
+        assert result.usage == {"five_hour": {"pct": 7}}
+
     def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -2762,7 +2998,7 @@ class TestActiveAccountRefresh:
         # Next pass re-probes; a matching answer licenses the resync.
         mock_probe2.assert_called_once()
         write_backup2.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
     def test_fresh_probe_unverifiable_not_cached(
@@ -2857,7 +3093,7 @@ class TestActiveAccountRefresh:
 
         assert first.usage == {"five_hour": {"pct": 3}}
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         assert switcher.account_identity("1")["uuid"] == "uuid-resolved"
 
@@ -3009,7 +3245,7 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_called_once()
         assert mock_refresh.call_args[0][0] == live_b   # B, never A
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         write_live.assert_called_once_with(self._REFRESHED)
         assert mock_fetch.call_args[0][2] == self._REFRESHED
@@ -3310,7 +3546,7 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()          # adopted, not consumed
         write_live.assert_not_called()            # live already correct
         write_backup.assert_called_once_with(     # lineage continuity restored
-            "1", "test@example.com", self._CC_ROTATED
+            "1", "test@example.com", self._CC_ROTATED, attributed=True
         )
 
     def test_adopting_a_known_foreign_credential_defers(
@@ -3419,7 +3655,7 @@ class TestPerformSwitchPostDisplay:
             # double and reads the real (empty) store instead.
             return creds_store.get((str(num), email), ""), False
 
-        def write_creds(num, email, creds):
+        def write_creds(num, email, creds, attributed=None):
             creds_store[(str(num), email)] = creds
 
         def read_cfg(num, email):
@@ -4934,6 +5170,105 @@ class TestAddAccountSlot:
         out = capsys.readouterr().out
         assert "Moved from slot 1" in out
 
+    def _pin_spy(self, monkeypatch, pinned):
+        """Patch the pin seam and return the list `clear_pin` appends to."""
+        from claude_swap import pin as _pin
+
+        cleared: list[int] = []
+        monkeypatch.setattr(_pin, "_pinned_email_now", lambda _s: pinned)
+        monkeypatch.setattr(
+            _pin, "clear_pin", lambda _s: (cleared.append(1), (True, "cleared"))[1]
+        )
+        return cleared
+
+    def test_displacing_the_pinned_account_clears_the_pin(
+        self, temp_home, monkeypatch
+    ):
+        """`--slot N` destroys the occupant, and the pin can be naming it.
+
+        `remove_account` clears the pin because removal is the moment cswap
+        knows its subject ceased to exist. `add_account --slot N` reaches the
+        same `_delete_account_files` through a different door and said nothing,
+        so displacing the pinned account left `settings.json` pointing at a
+        slot with no account: no proxy starts, the TUI still draws the Cloud
+        row, and nothing says why.
+        """
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="pinned@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=1)
+
+        occupant = switcher._get_sequence_data()["accounts"]["1"]
+        pinned = (occupant["email"], occupant.get("organizationUuid", "") or "")
+        cleared = self._pin_spy(monkeypatch, pinned)
+
+        switcher = self._make_switcher(temp_home, email="newcomer@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [1], (
+            "the pinned account was displaced and the pin still names it"
+        )
+
+    def test_displacing_a_DIFFERENT_account_leaves_the_pin_alone(
+        self, temp_home, monkeypatch
+    ):
+        """THE CONTROL. Clearing unconditionally passes the case above and
+        unpins a live account every time any other slot is overwritten."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="bystander@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=1)
+
+        cleared = self._pin_spy(monkeypatch, ("pinned@example.com", "org-P"))
+
+        switcher = self._make_switcher(temp_home, email="newcomer@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [], (
+            "displacing an unrelated account cleared the pin"
+        )
+
+    def test_displacing_the_pinned_account_from_a_token_clears_the_pin(
+        self, temp_home, monkeypatch
+    ):
+        """`add_account_from_token --slot N` carries the same door."""
+        switcher = self._make_switcher(temp_home, email="unused@example.com")
+        with patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account_from_token("tok", "pinned@example.com", slot=1)
+
+        occupant = switcher._get_sequence_data()["accounts"]["1"]
+        pinned = (occupant["email"], occupant.get("organizationUuid", "") or "")
+        cleared = self._pin_spy(monkeypatch, pinned)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account_from_token("tok2", "newcomer@example.com", slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [1], (
+            "the pinned account was displaced and the pin still names it"
+        )
+
     def test_migrate_with_occupied_target_cancel_preserves_old_slot(self, temp_home, capsys):
         """If migration target is occupied and user cancels, old slot must survive."""
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
@@ -5103,7 +5438,7 @@ class TestAddAccountFromToken:
         switcher = self._make_switcher(temp_home)
         stored_creds = None
 
-        def capture_creds(num, email, creds):
+        def capture_creds(num, email, creds, attributed=None):
             nonlocal stored_creds
             stored_creds = creds
 
@@ -5167,7 +5502,7 @@ class TestAddAccountFromToken:
 
         stored_creds = None
 
-        def capture_creds(num, email, creds):
+        def capture_creds(num, email, creds, attributed=None):
             nonlocal stored_creds
             stored_creds = creds
 
@@ -5461,6 +5796,144 @@ class TestSwitchSkipsBrokenSlots:
         assert s._account_is_switchable("3") is False
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
+
+    def test_a_switch_refreshes_the_policy_cache_and_never_leaves_it_absent(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE POLICY BELONGS TO THE ACCOUNT, THE CACHE IS MACHINE-WIDE.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `<config home>/policy-limits.json`; `/remote-control` resolves
+        `Ms('allow_remote_control')` -> `Hcd()` -> that file. The fetch carries
+        whatever account is ACTIVE, the file is machine-wide, and nothing
+        rewrote it when the account changed — so one account's restrictions
+        gated every session on the machine, including accounts with no such
+        restriction.
+
+        AND DELETING IT IS NOT THE FIX, which the first cut of this got wrong.
+        Read out of the binary:
+
+            function Ms(e){ let t=Hcd()
+              if(!t){ if(aK_.has(e)){ if(fK()) return !1 } return !0 } ... }
+
+        With NO document, a gate in that set returns FALSE. Absent means
+        DENIED, not "unknown, allow" — so dropping the file would refuse
+        Remote Control to every session started after a switch until some poll
+        landed, turning a stale-answer bug into a guaranteed outage.
+
+        So: ask the server with the account that is now active, and write down
+        what it says. A fetch that fails leaves the old file in place, which is
+        no worse than today and never worse than absent.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert policy.exists(), (
+            "the cache was left ABSENT, and absent is DENIED — every session "
+            "started after this switch would be refused Remote Control")
+        assert json.loads(policy.read_text()) == fresh, (
+            "the previous account's answer survived the switch, so its "
+            "restrictions keep gating sessions under an account they no "
+            "longer describe")
+
+    def test_the_activation_path_refreshes_the_policy_cache_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE OTHER SWITCH PATH, which had no witness and lost the refresh.
+
+        `_perform_switch` has two exits. The ordinary rotation falls out of the
+        lock block; the direct-activation branch -- `force_activate`, a fresh
+        machine with no live login, post-import, or a live login cswap does not
+        manage -- returns from INSIDE it. A refresh placed after the lock is
+        reached by the first and not the second, and every existing policy test
+        drives `s.switch()` with a roster-matching live login, so all of them
+        take the first.
+
+        That gap is not a corner: activation is what runs right after
+        `cswap --import` on a new machine, which is precisely when
+        `policy-limits.json` is absent -- and absent is DENIED, so Remote
+        Control is refused until something else happens to write it.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
+
+        # NO `~/.claude.json` oauthAccount: that is what makes `switch()` take
+        # the fresh-machine path and `_perform_switch` take the activation
+        # branch. Credentials still exist, so the fetch has a token to carry.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == fresh, (
+            "the activation path returned without refreshing the policy "
+            "cache, so the previous account's restrictions keep gating every "
+            "session on the machine")
+
+    def test_a_failed_policy_fetch_leaves_the_old_answer_rather_than_none(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL. Absent is denied, so a refresh that cannot reach the
+        server must not clear the file — the old answer may be wrong for this
+        account, but no answer is wrong for every account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        policy.write_text(json.dumps(stale))
+
+        def _boom(**_kw):
+            raise OSError("no network")
+
+        monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _boom)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == stale, (
+            "a failed fetch cleared the cache; absent is DENIED, so that is "
+            "strictly worse than the answer it replaced")
 
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
@@ -6178,7 +6651,7 @@ class TestMacosKeychainFallback:
         assert s._use_keychain() is False          # pinned, stays file mode
 
     def test_write_fallback_clears_pending_read_reprobe(self, temp_home: Path, monkeypatch):
-        # The owner's edge: already in file mode from a read timeout with a
+        # The edge case: already in file mode from a read timeout with a
         # re-probe still pending, then a write leaves a stale item behind. The
         # write must clear that pending re-probe (pin) so it never resurrects.
         s = self._macos_switcher()
@@ -6472,9 +6945,35 @@ class TestMacosKeychainFallback:
         self, temp_home: Path, block_real_keychain
     ):
         s = self._macos_switcher()
-        s._kc_write_backup("1", "a@example.com", "STALE-KC")
-        s._write_backup_enc("1", "a@example.com", "FRESH-FILE")
+        # Raw backend seeding (not through the write-time attribution
+        # guard): the point of this test is which BACKEND wins on read when
+        # the two disagree, not the guard's own business logic.
+        s._store._kc_write_backup("1", "a@example.com", "STALE-KC")
+        s._store._write_backup_enc("1", "a@example.com", "FRESH-FILE")
         assert s._read_account_credentials("1", "a@example.com") == "FRESH-FILE"
+
+    def test_kc_write_backup_and_write_backup_enc_route_through_the_guard(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """The switcher's backend-only forwarders (used by the macOS-
+        keyring-to-security migration and by tests to seed a backend
+        directly) must not let a caller bypass the attribution guard —
+        each was, until PR 210 round 5, a straight pass-through to the
+        store's raw backend writer."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "gen-1")
+        with pytest.raises(CredentialWriteError, match="cross-identity"):
+            s._kc_write_backup("1", "a@example.com", "gen-2-unattested")
+        assert s._read_account_credentials("1", "a@example.com") == "gen-1"
+
+        s._write_backup_enc("2", "b@example.com", "gen-1")
+        with pytest.raises(CredentialWriteError, match="cross-identity"):
+            s._write_backup_enc("2", "b@example.com", "gen-2-unattested")
+        assert s._read_account_credentials("2", "b@example.com") == "gen-1"
+
+        # attributed=True still gets through, same as the store's own guard.
+        s._kc_write_backup("1", "a@example.com", "gen-2", attributed=True)
+        assert s._read_account_credentials("1", "a@example.com") == "gen-2"
 
     def test_backup_keychain_write_deletes_enc(
         self, temp_home: Path, block_real_keychain
@@ -6483,7 +6982,9 @@ class TestMacosKeychainFallback:
         s._write_backup_enc("1", "a@example.com", "OLD-FILE")
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+            s._write_account_credentials(
+                "1", "a@example.com", "NEW-KC", attributed=True
+            )
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
 
@@ -6504,7 +7005,9 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(Path, "unlink", flaky_unlink)
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+            s._write_account_credentials(
+                "1", "a@example.com", "NEW-KC", attributed=True
+            )
         monkeypatch.setattr(Path, "unlink", orig_unlink)
 
         # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
@@ -6520,7 +7023,9 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "FILE-CREDS")
+            s._write_account_credentials(
+                "1", "a@example.com", "FILE-CREDS", attributed=True
+            )
         assert s._read_account_credentials("1", "a@example.com") == "FILE-CREDS"
         # Stale keychain copy cleared (best-effort) so it can't resurface.
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
@@ -6541,8 +7046,9 @@ class TestMacosKeychainFallback:
         self, temp_home: Path, block_real_keychain
     ):
         s = self._macos_switcher()
-        s._kc_write_backup("1", "a@example.com", "KC")
-        s._write_backup_enc("1", "a@example.com", "FILE")
+        # Raw backend seeding — see test_backup_read_enc_wins_over_stale_keychain.
+        s._store._kc_write_backup("1", "a@example.com", "KC")
+        s._store._write_backup_enc("1", "a@example.com", "FILE")
         s._delete_account_credentials("1", "a@example.com")
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
@@ -6557,7 +7063,9 @@ class TestMacosKeychainFallback:
         baseline against which the unreadable-path probe below is judged."""
         s = self._macos_switcher()
         s._kc_write_backup("1", "a@example.com", "gen-1")
-        s._write_account_credentials("1", "a@example.com", "gen-2")
+        s._write_account_credentials(
+            "1", "a@example.com", "gen-2", attributed=True
+        )
         assert (SECURITY_SERVICE, "account-1-a@example.com.prev") in block_real_keychain.data
         assert s._store._read_previous_backup("1", "a@example.com") == "gen-1"
 
@@ -6587,6 +7095,209 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+class TestPersistBackupCredentials:
+    """``persist_backup_credentials`` is a public entry point for an
+    external caller that already refreshed a slot's own grant (the
+    cswap-pin compat path used against a cswap predating
+    ``consume_backup_grant``) and is persisting the rotated successor back
+    to that same slot — not a foreign lineage. Every genuine Claude Code
+    refresh rotates the refresh token, so the routine call always differs
+    from the stored fingerprint; an unattested write here would refuse the
+    very rotation this method exists to persist."""
+
+    def test_persists_a_rotation_without_attribution_error(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_account_credentials("2", "test@example.com", "gen-1")
+
+        switcher.persist_backup_credentials("2", "test@example.com", "gen-2")
+
+        assert switcher._read_account_credentials("2", "test@example.com") == (
+            "gen-2"
+        )
+
+
+def _grant_setup_token_creds(token: str) -> str:
+    """No ``refreshToken``: falls to the ``sha256-full:`` fingerprint arm."""
+    return json.dumps({"claudeAiOauth": {"accessToken": token}})
+
+
+class TestNoPeerSlotMayShareARefreshGrant:
+    """Queue row #474: two slots holding the same refresh grant race to
+    each POST it once -- one wins, the other's lineage dies and forces a
+    re-login inside its own grant's lifetime. The fix removes the
+    precondition instead of locking the race: refuse the WRITE that would
+    let a second slot come to hold the bytes a populated peer already
+    holds, scoped to the ``sha256:`` arm (never ``sha256-full:``, the
+    supported shared-setup-token config) and skipped whenever the caller
+    passes ``attributed=True`` (a verified move/rotation legitimately
+    holds the same bytes in two slots for an instant)."""
+
+    def test_refuses_an_unattested_write_that_would_duplicate_a_peers_grant(
+        self, temp_home: Path, sample_sequence_data, caplog,
+    ):
+        """RED: an unattributed write into the EMPTY slot 2 that happens to
+        carry slot 1's exact refresh grant is exactly the shape that
+        creates the double-spend precondition."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(CredentialWriteError, match="Account-1"):
+                switcher._write_account_credentials(
+                    "2", "account2@example.com", shared,
+                )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == ""
+        assert any(
+            "Account-1 already holds this exact refresh grant" in r.message
+            and "cswap add --slot 2" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("writer", ["_write_backup_enc", "_kc_write_backup"])
+    def test_refuses_via_the_other_two_chokepoints_directly(
+        self, temp_home: Path, sample_sequence_data, writer: str,
+    ):
+        """The guard is called from all THREE chokepoints, not just
+        ``_write_account_credentials`` -- ``_write_backup_enc`` (the
+        macOS-keyring-to-security migration's direct writer) and
+        ``_kc_write_backup`` (its Keychain-only forwarder) must each refuse
+        before ever reaching the backend, so this needs no real Keychain to
+        run off macOS."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with pytest.raises(CredentialWriteError, match="Account-1"):
+            getattr(switcher, writer)("2", "account2@example.com", shared)
+
+    def test_refuses_when_a_peers_read_reports_failed_uid_independent(
+        self, temp_home: Path, sample_sequence_data, monkeypatch,
+    ):
+        """RED for the unreadable-peer hole: an EACCES-shaped peer read
+        (``failed`` set, no bytes) must refuse like a mismatch, not
+        silently permit like an absent slot -- the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state, extended to a PEER slot here (an unreadable Keychain on
+        ssh/launchd is exactly where a silent permit would matter).
+        Asserts the ``failed`` semantics directly rather than chmod'ing a
+        real file, so this also covers the arm on a root-run gate, where a
+        POSIX permission check is inert."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        switcher._write_account_credentials(
+            "1", "account1@example.com", _oauth_creds("account-1", 7200),
+            attributed=True,
+        )
+
+        def unreadable(account_num, email, failed=None):
+            if failed is not None:
+                failed.append(True)
+            return ""
+
+        monkeypatch.setattr(
+            switcher._store, "_read_account_credentials_direct", unreadable,
+        )
+
+        with pytest.raises(CredentialWriteError, match="unreadable"):
+            switcher._write_account_credentials(
+                "2", "account2@example.com", _oauth_creds("account-2", 7200),
+            )
+
+    def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A pasted setup-token with no ``refreshToken`` hashes on
+        ``sha256-full:``, and two slots holding the identical one on
+        purpose is a supported shape (``add_account_from_token`` itself
+        always writes attributed=True, so it never reaches this guard on
+        either arm; what this arm actually exempts is the two UNattributed
+        writers that could otherwise re-refuse an already-duplicated
+        setup-token account afterwards: the public
+        ``write_account_credentials`` seam and a switch's own-family
+        resync) -- must never refuse."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_setup_token_creds("sk-ant-setup-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_attributed_true_still_permits_a_verified_move(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A caller that independently verified the write (a slot swap or
+        relocate) may pass ``attributed=True`` even while a peer still
+        holds the same bytes for the instant between the two halves."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared, attributed=True,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_CONTROL_an_unattested_write_with_no_peer_match_still_succeeds(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """Positive control: without a peer holding a matching fingerprint,
+        the routine unattributed write (a first population, or a same-slot
+        re-write) must still go through -- otherwise the RED test above
+        would pass just as well for a guard that refuses every write."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+
+        creds = _oauth_creds("account-2", 7200)
+        switcher._write_account_credentials("2", "account2@example.com", creds)
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == creds
 
 
 class TestFormatUsageLines:
@@ -7111,8 +7822,9 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A response missing email/organization that matches no slot is
-        indistinguishable from schema drift → unresolved (pre-fix backup),
-        never alien (preserve-and-skip)."""
+        indistinguishable from schema drift → unresolved, never alien
+        (preserve-and-skip stays unavailable to a partial response) — but
+        unresolved is itself preserve-and-skip now, never a slot write."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7132,9 +7844,11 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == mystery
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
     def test_foreign_attribution_survives_missing_email(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7169,12 +7883,11 @@ class TestProvenanceGuard:
     def test_unresolvable_mismatch_backs_up_pre_fix(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """The fail-open core: offline / endpoint failure means the identity
-        oracle is silent, and the switch behaves exactly pre-fix — the
-        divergent bytes are backed into the outgoing slot (most such
-        divergences are the account's own rotation; skipping would leave the
-        slot holding a consumed token), with no safety copy and no
-        user-facing warning."""
+        """Offline / endpoint failure means the identity oracle is silent.
+        No longer fail-open: an unresolvable divergence is preserved as
+        unclaimed and never backed into the outgoing slot (2026-09-07
+        incident: a foreign refresh token consumed under the wrong slot
+        forced a re-login)."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7191,11 +7904,155 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Pre-fix backup happened; the switch completed quietly.
-        assert creds_store[("1", "test@example.com")] == mystery
+        # Outgoing slot's backup is untouched; the mystery bytes are stashed.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert _read_safety_copy(switcher, entry_id) == mystery
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+        # The switch itself proceeded, onto the target's stored backup.
+        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+
+    def test_unresolved_stash_is_not_adoptable_back_into_its_slot(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An unresolved-arm stash must NOT be adoptable back into its slot.
+
+        `unresolved` means ownership could not be verified — the oracle was
+        offline or failing, not that it confirmed the bytes are this slot's
+        own next generation. Setting `consumedFp` from the slot's own stored
+        backup made the row match `_adopt_stashed_successor`'s gate BY
+        CONSTRUCTION the instant it was written (the gate is only
+        `configSlot == account_num AND consumedFp == the slot's current
+        stored backup`), so the next `consume_backup_grant` on that slot
+        would silently adopt genuinely foreign bytes into it — the wmac
+        cross-wire incident one step later. The CAS proves the slot has not
+        moved since the stash; it never proves ownership, and for
+        `unresolved` ownership is unknown by definition."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        mystery = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshToken": "rt-x",
+        }})
+        live_state = {"creds": mystery}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        adopted = switcher._adopt_stashed_successor(
+            "1", "test@example.com", creds_store[("1", "test@example.com")],
+        )
+        assert adopted is None, (
+            "an unresolved stash was adoptable back into its own slot; "
+            "ownership was never verified, so a later grant-consume could "
+            "adopt genuinely foreign bytes into this slot"
+        )
+
+    def test_unresolvable_mismatch_with_wrong_active_slot_never_poisons_it(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The wmac shape (2026-09-07): the roster's active slot is 2, but
+        the un-spliced identity file names slot 1's email. Two independent
+        guards must both hold: the roster's active slot (2) is not
+        overridden by the unverified identity-file claim (never attributed
+        to slot 1), and even if it were, an unresolved divergence is never
+        backed into whichever slot is named."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        # The live bytes are actually account 2's (the roster's real active
+        # slot) — not slot 1's, whichever slot classification lands on.
+        live_bytes = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-2", "refreshToken": "rt-live-2",
+        }})
+        live_state = {"creds": live_bytes}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == a2_backup
+        # No orphan key either: the arm no longer writes a slot at all, so
+        # there is nothing under the identity file's claimed email for
+        # slot 2 to have landed on.
+        assert ("2", "test@example.com") not in creds_store
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id, entry) = next(iter(entries.items()))
+        assert _read_safety_copy(switcher, entry_id) == live_bytes
+        # The attribution guard: the outgoing slot named is the roster's
+        # real active slot (2), never the identity file's unverified claim
+        # (1) — an unverified identity override cannot mask which account
+        # the switch left, so a re-login gets pointed at the right slot.
+        assert entry["configSlot"] == "2", (
+            f"outgoing slot misattributed to {entry['configSlot']!r} instead "
+            "of the roster's real active slot 2"
+        )
+        assert any(
+            "could not be verified" in w and "Account-2" in w
+            for w in op["warnings"]
+        )
+
+    def test_own_rotation_with_wrong_active_slot_lands_in_the_right_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same wmac shape as the test above, but the live bytes are
+        genuinely slot 2's OWN rotation (same refresh-token lineage as its
+        stored backup) — the [C] finding's "right-slot-but-wrong-email"
+        case. `current_account` correctly stays 2 (the override above is
+        rejected), but `current_email` must not be left as slot 1's:
+        `_classify_outgoing_credential` reads the backup keyed on
+        ``(current_account, current_email)``, and slot 2's backup is stored
+        under slot 2's OWN email, not slot 1's. The wrong email makes the
+        own-family fast path unreachable and the classifier falls through to
+        "unresolved", stashing the freshly rotated token as unclaimed
+        instead of landing it in slot 2 — the same re-login-forcing outcome
+        this PR exists to prevent, reached one branch over."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-orig", "refreshToken": "rt-2",
+        }})
+        creds_store[("2", "account2@example.com")] = a2_backup
+        # Same refresh-token lineage as the stored backup — a routine
+        # access-token rotation, not a foreign credential.
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2",
+        }})
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == rotated, (
+            "slot 2's own rotation was not recognised as its own lineage — "
+            "current_email leaked slot 1's identity into the classifier"
+        )
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
-        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7240,7 +8097,8 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A raising profile call must be indistinguishable from None: the
-        switch completes with the pre-fix backup."""
+        switch completes, and the divergent bytes are stashed rather than
+        backed into the outgoing slot."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7261,16 +8119,18 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == mystery
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
     def test_safety_copy_failure_aborts_before_live_overwrite(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """Preservation is the safety boundary for positively-foreign bytes:
-        no safety copy, no switch. (Never reachable from endpoint failure —
-        the unresolved path writes no safety copy.)"""
+        """Preservation is the safety boundary for positively-foreign bytes
+        (and, since the unresolved arm now stashes too, for those as well):
+        no safety copy, no switch."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7367,7 +8227,8 @@ class TestProvenanceGuard:
     ):
         """A pre-lock resolution only binds to the bytes it resolved: when
         the live store moved in between, the stale answer is discarded and
-        the switch falls back to the pre-fix backup of the current bytes."""
+        the switch falls back to unresolved — stashed, never backed into
+        the outgoing slot."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7392,10 +8253,12 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Stale resolution rejected → unresolved → pre-fix backup, no copy.
-        assert creds_store[("1", "test@example.com")] == moved
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        # Stale resolution rejected → unresolved → stashed, slot untouched.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
 
 class TestSelfSwitchProvenance:
@@ -7707,7 +8570,7 @@ class TestStashAndRetentionStore:
         switcher = self._switcher(temp_home)
         store = switcher._store
         store._write_account_credentials("1", "a@b.c", "gen-1")
-        store._write_account_credentials("1", "a@b.c", "gen-2")
+        store._write_account_credentials("1", "a@b.c", "gen-2", attributed=True)
         assert store._read_account_credentials("1", "a@b.c") == "gen-2"
         assert store._read_previous_backup("1", "a@b.c") == "gen-1"
         # Same-value rewrite doesn't clobber the retained generation.
@@ -7718,7 +8581,7 @@ class TestStashAndRetentionStore:
         switcher = self._switcher(temp_home)
         store = switcher._store
         store._write_account_credentials("1", "a@b.c", "gen-1")
-        store._write_account_credentials("1", "a@b.c", "gen-2")
+        store._write_account_credentials("1", "a@b.c", "gen-2", attributed=True)
         store._delete_account_credentials("1", "a@b.c")
         assert store._read_previous_backup("1", "a@b.c") == ""
 
@@ -7882,7 +8745,77 @@ class TestActiveRefreshProvenance:
 
         assert result.usage == {"five_hour": {"pct": 10}}
         write_live.assert_called_once_with(refreshed)
-        write_backup.assert_called_once_with("1", "test@example.com", refreshed)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", refreshed, attributed=True
+        )
+
+
+class TestDanglingActiveAccountRaisesNamedError:
+    """[I2/m] `current_account` can stay `str(activeAccountNumber)` — a slot
+    the roster no longer carries (edited by hand, or a stale value a prior
+    bug left behind) — when the live identity resolves to a REAL slot whose
+    stored backup does not (yet) match the live bytes, so the override at
+    `_perform_switch_locked`'s top declines to trust it. `data["accounts"]
+    [current_account]["email"]` then raises a raw `KeyError` that escapes
+    the switch, telling the caller nothing -- this file's own convention two
+    hundred lines up (`AccountNotFoundError(f"Account-{account_num} does
+    not exist")`, e.g. `_remove_account`) names the containment instead.
+    `int(current_account)` right below it is the same failure mode for a
+    non-numeric `activeAccountNumber`.
+    """
+
+    def test_dangling_current_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        sample_sequence_data["activeAccountNumber"] = 99  # not in "accounts"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
+
+    def test_non_numeric_active_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The `int(current_account)` conversion right below the dict lookup
+        has the same containment gap: `activeAccountNumber` is arbitrary,
+        hand-editable JSON, so a non-numeric slot key that IS still present
+        in "accounts" clears the dict lookup and then raises a raw
+        `ValueError` instead."""
+        sample_sequence_data["activeAccountNumber"] = "abc"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        sample_sequence_data["accounts"]["abc"] = {
+            "email": "other@example.com", "uuid": "uuid-abc",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
 
 
 class TestDirectActivationPreservation:
@@ -7967,6 +8900,40 @@ class TestDirectActivationPreservation:
         assert any("--force" in w for w in op["warnings"])
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
+
+    def test_a_forced_switch_under_a_pin_reaches_no_network_in_the_locks(
+        self, temp_home, monkeypatch
+    ):
+        """`force_activate` substitutes an empty provenance for the pre-lock
+        prefetch, so it is the one path where nothing warms the resolver's
+        memo before the locks close. The identity read inside them then asks
+        the server -- three locks held, including the config lock the usage
+        path refuses to hold across a POST for this exact reason.
+
+        Any call the probe sees here is necessarily the under-lock one.
+        """
+        from claude_swap import pin as _pin
+
+        switcher, _ = self._setup(temp_home, live_identity_email="pinned@example.com")
+        switcher._write_json(switcher.sequence_file, {
+            **switcher._get_sequence_data(), "activeAccountNumber": 1})
+        pin_identity = ("pinned@example.com", "")
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: pin_identity)
+        assert switcher._live_credential_is("1", "one@example.com") is False, (
+            "premise: the live credential must not be the recorded slot's, "
+            "or nothing asks the server at all"
+        )
+        asked = []
+        monkeypatch.setattr(
+            oauth, "fetch_oauth_profile",
+            lambda tok: asked.append(tok) or None,
+        )
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False, force_activate=True)
+        assert asked == [], (
+            "the switch asked the profile endpoint while holding cswap's "
+            f"lock, Claude Code's credential lock and its config lock: {asked}"
+        )
 
     def test_orphaned_live_login_without_config_identity_is_stashed(
         self, temp_home
@@ -9603,7 +10570,7 @@ class TestConsumeGate:
         def mock_refresh(credentials, **kw):
             # while the POST is in flight, another writer replaces the backup
             s._store._write_account_credentials(
-                "1", "test@example.com", racer
+                "1", "test@example.com", racer, attributed=True
             )
             return oauth.RefreshOutcome(self._NEW, None)
 
@@ -9648,6 +10615,80 @@ class TestConsumeGate:
             s.consume_backup_grant("1", "test@example.com", self._OLD)
 
         assert posted["creds"] == profile_newer
+
+    def test_a_lineage_already_condemned_as_foreign_is_never_posted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The bytes gate this chokepoint was missing (2026-09-08 audit): a
+        lineage the oracle already condemned as another account's must
+        never be POSTed here — the elsewhere-checked
+        ``_probe_verdicts.get(_lineage_key(...)) is False`` verdict
+        attaches to THIS slot's re-read bytes too, not only to the `live`
+        adopt branch `_fetch_active_usage` already refuses on. Refusing
+        must not strike the account: a confirmed-foreign lineage is not
+        evidence this slot's OWN grant is dead.
+
+        ``try_refresh_oauth_credentials`` itself runs (not mocked away): the
+        guard lives INSIDE it (the one chokepoint every POST call site
+        shares), so mocking the function wholesale would hide whether the
+        guard fired. ``urlopen`` is mocked instead — the network is the
+        thing that must never see these bytes."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._probe_verdicts[
+            s._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._OLD),
+            )
+        ] = False
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen"
+        ) as mock_urlopen:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error == "foreign-lineage"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_an_unreadable_sequence_file_at_consume_time_never_raises_through_the_pass(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review): the `condemned` check
+        sits OUTSIDE any handler in `_consume_backup_grant_locked` (between
+        the pre-consume window's own `except` and the next `try`), and
+        OUTSIDE `try_refresh_oauth_credentials`'s own POST `try`. Its
+        `_lineage_key` -> `account_identity` -> `_get_sequence_data()` reads
+        `sequence.json` with `strict=True`, which raises `ConfigError` on a
+        torn/unreadable file — and `consume_backup_grant` is try/**finally**,
+        no except, so an uncaught raise here would kill the whole collect
+        pass for every account. R1: unreadable is absence of evidence, never
+        a refusal, and never a raise — the POST must proceed."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        fault_fired = []
+
+        def raises(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(s, "_lineage_key", side_effect=raises), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.error is None      # absence of evidence -> proceeded, not refused
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
@@ -10087,7 +11128,7 @@ class TestInactiveRefreshRoutesThroughGate:
 
         def mock_gate(num, email, snapshot):
             gate["args"] = (num, email)
-            s._store._write_account_credentials(num, email, fresh)
+            s._store._write_account_credentials(num, email, fresh, attributed=True)
             return oauth.RefreshOutcome(fresh, None)
 
         monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
@@ -10148,7 +11189,9 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials(
+            "2", "b@example.com", fresh, attributed=True
+        )
         info = [(2, "b@example.com", "", "", False, fresh, "")]
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
@@ -10605,7 +11648,9 @@ class TestGateUltraReviewFixes:
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         def refresh_then_lose_the_race(credentials, **kw):
-            s._store._write_account_credentials("1", "test@example.com", racer)
+            s._store._write_account_credentials(
+                "1", "test@example.com", racer, attributed=True
+            )
             return oauth.RefreshOutcome(self._NEW, None)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
@@ -12486,3 +13531,1111 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestTheLiveCredentialIsReadThroughTheStore:
+    """Both readers went to the plaintext file and nowhere else.
+
+    On macOS the active credential may live in the Keychain with NO
+    `~/.claude/.credentials.json` at all -- measured across this fleet's two
+    Macs, one has the file and the other does not. There `read_text` raises,
+    both readers answer "unaskable", and three things downstream go quiet in
+    opposite directions because they split the tri-state differently:
+    `pin.py`'s `... is True` never fires, `switcher.py`'s `... is False` never
+    fires, and the policy refresh returns before it asks.
+
+    The class already owns a keychain-aware reader that reports `degraded` for
+    the declined case these docstrings argue about. Use it.
+    """
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_a_keychain_only_live_store_is_still_compared(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = self._switcher(temp_home)
+        blob = json.dumps({"claudeAiOauth": {"refreshToken": "rt-1",
+                                             "accessToken": "at-1"}})
+        assert not get_credentials_path().exists(), (
+            "premise: the plaintext file exists, so this proves nothing"
+        )
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(blob, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: blob)
+
+        assert s._live_credential_is("1", "a@example.com") is True, (
+            "a keychain-only live store read as unaskable, so the un-splice "
+            "discriminator is off on exactly the machine it was written for"
+        )
+
+    def test_an_unreadable_store_still_answers_None(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL FOR THE FILE PATH. `None` has to survive: it is what
+        stops a keychain that declines this process from reading as a
+        different account.
+
+        It is NOT a control for the store guard beside it — measured, it stays
+        green with that guard deleted, because it leaves through the
+        missing-file `except` below. Its third field matches production too:
+        the only arm returning `value=None` is
+        `ActiveCredentials(None, keychain_failed, keychain_failed)`, so a
+        `degraded` of False beside a True would be a state nothing returns.
+        """
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(None, True, True))
+        assert s._live_credential_is("1", "a@example.com") is None
+
+    def test_a_degraded_store_read_is_not_a_mismatch(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`degraded` carries the declined keychain, not `keychain_unavailable`.
+
+        `_read_active_credentials` returns `(text, False, keychain_failed)` on
+        the arm where the plaintext file COVERED a failed Keychain read -- so
+        `keychain_unavailable` is hard-coded False exactly when there IS a
+        value to compare, and those bytes are a stale generation, because
+        Claude Code rotates keychain-only on macOS and the file lags.
+        Comparing them answers `False`: a mismatch, about the account that is
+        in fact logged in.
+        """
+        s = self._switcher(temp_home)
+        stale = json.dumps({"claudeAiOauth": {"refreshToken": "rt-previous"}})
+        current = json.dumps({"claudeAiOauth": {"refreshToken": "rt-current"}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(stale, False, True))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: current)
+
+        assert s._live_credential_is("1", "a@example.com") is None, (
+            "a degraded read was compared and called a mismatch -- the guard "
+            "reads keychain_unavailable, which is False on that very arm"
+        )
+
+    def test_the_policy_refresh_hands_the_seam_its_switcher(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CALL SITE, which `..._asks_the_store_too` cannot see.
+
+        That case calls `fetch_policy_limits(switcher=s)` itself, so it stays
+        green when the argument is dropped here -- and every stub in this file
+        takes `**kwargs`, so a no-arg call is accepted everywhere. Dropping it
+        is the revert the comment at that line used to invite, and it silently
+        restores the keychain-only outage the seam was widened to fix.
+        """
+        from claude_swap import pin as pin_mod
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(pin_mod, "is_available", lambda: False)
+        seen: list[object] = []
+
+        def _spy(*a, **kw):
+            # RECORD HERE, ASSERT AFTER. `_refresh_policy_cache` wraps this
+            # call in `except Exception` by design, so an assert raised inside
+            # the spy is SWALLOWED -- the run then fails on whichever later
+            # assert happens to notice, naming the wrong cause.
+            seen.append({"args": a, "kwargs": kw})
+            return None
+
+        real_fetch = switcher_mod.fetch_policy_limits
+        monkeypatch.setattr(switcher_mod, "fetch_policy_limits", _spy)
+        s._refresh_policy_cache()
+        assert seen, "premise: the refresh never called the seam at all"
+        # BOUND TO THE SIGNATURE, not read off `kwargs`. Collapsing to `{}`
+        # whenever a positional was passed made the budget assertion below
+        # report clean about a call it had not looked at: `timeout_s` handed
+        # over positionally is not in an empty dict either.
+        import inspect
+
+        got = inspect.signature(real_fetch).bind_partial(
+            *seen[0]["args"], **seen[0]["kwargs"]
+        ).arguments
+        assert got.get("switcher") is s, (
+            "the refresh called the seam without its switcher, so on a "
+            f"keychain-only host the fetch has no token to ask with: {seen}"
+        )
+        # THE BUDGET TOO. Adding `timeout_s=...` at the call site left the
+        # suite byte-identical: the seam's own case pins its DEFAULT, and every
+        # stub here takes `**kwargs`, so nothing read what the call site
+        # passes. That budget bounds the switch tail the auto engine drives
+        # right before a lockout.
+        assert "timeout_s" not in got, (
+            f"the call site overrode the seam's own budget: {got['timeout_s']}"
+        )
+
+    def test_the_policy_fetch_asks_the_store_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        blob = json.dumps({"claudeAiOauth": {"accessToken": "at-policy"}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(blob, False))
+        seen: list[str] = []
+        monkeypatch.setattr(switcher_mod.oauth, "fetch_policy_limits",
+                            lambda tok, timeout_s=None: seen.append(tok) or {})
+
+        switcher_mod.fetch_policy_limits(switcher=s)
+        assert seen == ["at-policy"], (
+            "the policy fetch found no token, so the refresh returns before it "
+            f"asks on a machine with no plaintext file: {seen}"
+        )
+
+    def test_a_rotated_pair_of_the_same_lineage_is_still_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Claude Code's refresh rotates BOTH tokens. Before this, the
+        rotated pair matched neither stored token, `_live_credential_is`
+        answered False, and `_live_login_identity` fell back to the config
+        identity: the pin's splice, slot 1. Every reader then believed the
+        login had moved to the pinned account, the resync refused to save
+        the rotation into its slot, the collector POSTed the slot's stale
+        refresh token and the endpoint answered invalid_grant for a lineage
+        that was alive in the live store. The refresh-token lifetime is the
+        stamp a rotation keeps."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000000000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is True
+
+    def test_a_fresh_login_has_a_new_lineage_stamp_and_is_not_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL: the case the fallback exists for. A login AS the
+        pinned account writes the same config the splice wrote, and only the
+        credential tells them apart: new tokens AND a new lifetime."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-new", "accessToken": "at-new",
+            "refreshTokenExpiresAt": 1791111111111}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is False
+
+    def test_a_rotation_re_stamps_within_a_second_and_is_still_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Claude Code writes the stamp back on every refresh as now plus the
+        server's refresh_token_expires_in, so it moves by under a second per
+        rotation. Measured against three slots' previous generations: 105,
+        377 and 819 ms. Equality read each as a different login; the resolver
+        flipped to the pin, the resync was refused, and the slot's stale
+        grant struck invalid_grant on the code that carried the equality."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790294523113}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790294522294}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is True
+
+    def test_a_login_a_minute_later_is_a_different_lineage(
+        self, temp_home: Path, monkeypatch
+    ):
+        """CONTROL for the tolerance: a stamp a minute apart is a second
+        login, not jitter, and must still fall through to the config."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000060000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is False
+
+    def test_the_resolver_keeps_the_recorded_slot_across_a_rotation(
+        self, temp_home: Path, monkeypatch
+    ):
+        """End to end through `_live_login_identity`: config names the pin,
+        the roster records slot 2, the live pair has rotated. The answer is
+        slot 2, not the pin."""
+        from claude_swap import pin as _pin
+        s = self._switcher(temp_home)
+        pinned = ("pin@example.com", "org-pin")
+        monkeypatch.setattr(s, "_get_current_account", lambda: pinned)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda sw: pinned)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {
+                "1": {"email": "pin@example.com", "organizationUuid": "org-pin"},
+                "2": {"email": "b@example.com", "organizationUuid": "org-b"},
+            }})
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000000000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_login_identity() == ("b@example.com", "org-b")
+        assert s.current_account_number() == "2"
+
+
+class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
+    """Two shapes, one invariant: a witness gap must never fall back to the
+    raw config identity, which under a splice is the pin's forged value.
+
+    - The record is silent (cleared, or unreadable) but the wiring is
+      still present: falls through to the same recorded-slot /
+      local-credential resolver a genuine splice uses.
+    - No recorded active slot, or a recorded slot with no stored email:
+      neither witness can attribute the login, so this asks the oracle and
+      answers ``None`` when it too cannot say -- never the pin.
+
+    `pinned_identity` itself never raises (`pin.py`'s `_pinned_email_now`
+    degrades every read failure to ``None``, and `pinned_identity` wraps it
+    in its own ``except Exception: return None``), so there is no case
+    where `_live_login_identity`'s ``except Exception`` around the call is
+    reachable; that arm keeps its original `return identity` untested, the
+    same as any other unreachable defensive branch.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_record_cleared_but_wiring_still_present_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`cswap_pin.proxy.apply_pin`'s clear path writes `save_pin(...,
+        None, None)` (the record gone) BEFORE it un-splices
+        `~/.claude.json` -- and that un-splice can fail and never run. A
+        fresh switcher has no recorded active slot yet, so this reaches
+        the same "no recorded active slot" exit a genuine splice would;
+        the guard is that the answer is never the just-cleared pin's
+        forged value, not which exit gets there."""
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+        monkeypatch.setattr(_pin, "_wiring_present", lambda _s: True)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle",
+            lambda **kw: ("other@example.com", "org-other", "u-other"))
+        assert s._live_login_identity() == ("other@example.com", "org-other"), (
+            "the record was silent but the wiring was still present, and "
+            "the answer was the raw config identity, which is the "
+            "just-cleared pin's forged value"
+        )
+
+    def test_a_repeated_witness_gap_logs_once_per_reason(
+        self, temp_home: Path, monkeypatch, caplog
+    ):
+        """The gap is a persistent state, not an event: a scheduled caller
+        (`_tick_inner`, the sleep shortener, a per-slot token check) asks on
+        every poll for as long as it stays there, and must not re-log it
+        every time. TWO different reasons, not one: a dedupe keyed on
+        nothing ("log once, ever, no matter why") would pass a same-reason
+        repeat too, and only a second, DIFFERENT reason tells them apart."""
+        import logging as _logging
+
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+        no_recorded_slot = {"accounts": {}}
+        no_stored_email = {"activeAccountNumber": 2, "accounts": {"2": {}}}
+        with caplog.at_level(_logging.WARNING):
+            monkeypatch.setattr(s, "_get_sequence_data", lambda: no_recorded_slot)
+            s._live_login_identity()
+            s._live_login_identity()               # repeat: no new line
+            monkeypatch.setattr(s, "_get_sequence_data", lambda: no_stored_email)
+            s._live_login_identity()                # different reason: a new line
+        warnings = [r.message for r in caplog.records
+                    if r.levelno == _logging.WARNING and "unattributed" in r.message]
+        assert len(warnings) == 2, (
+            f"expected one line per distinct reason (no recorded slot, "
+            f"no stored email), got {len(warnings)}: {warnings}"
+        )
+        assert warnings[0] != warnings[1], warnings
+
+    def test_CONTROL_no_pin_and_no_wiring_still_answers_the_config(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The overwhelmingly common case: nothing was ever pinned. Both
+        witnesses agree, and the honest config identity ships unchanged --
+        with no detour through the oracle, which the deleted-feature version
+        of this test could not tell from a correct one."""
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("plain@example.com", ""))
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+        monkeypatch.setattr(_pin, "_wiring_present", lambda _s: False)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle",
+            lambda **kw: pytest.fail("no pin and no wiring asked the oracle"))
+        assert s._live_login_identity() == ("plain@example.com", "")
+
+    @pytest.mark.parametrize("sequence_data, why", [
+        ({"accounts": {}}, "no recorded active slot"),
+        ({"activeAccountNumber": 2,
+          "accounts": {"2": {"organizationUuid": "org-b"}}},
+         "the recorded slot carried no email"),
+    ])
+    def test_no_attributable_slot_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch, sequence_data, why
+    ):
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: sequence_data)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+        assert s._live_login_identity() is None, (
+            f"{why} and the answer was the raw config identity, which "
+            "under a splice is the pin's"
+        )
+
+
+class TestALeftoverWiringWithADeadPortAndAForgedConfigIsStillASplice:
+    """A rejected fix for the R11 "leftover wiring, no serving pin" refusal
+    proposed `_config_names_the_pin`'s `pinned is None` branch fall back to
+    ``_wiring_present(self) and _wired_port_is_serving(self)`` instead of
+    ``_wiring_present(self)`` alone. That reopens R11's own
+    never-answer-the-forged-pin guarantee on a state none of R11's existing
+    fixtures reach: those write the wiring marker only via the sidecar
+    ledger with no ``CSWAP_PIN_PORT`` in the config's own ``env`` block, so
+    ``_wired_ports()`` is empty for them and the carve-out never fires.
+
+    Here the marker and the port are REAL, written into the config file
+    itself (what `apply_pin`'s wiring actually looks like), the port is
+    confirmed dead by binding then closing it, and ``oauthAccount`` already
+    holds what a splice caught mid-teardown would leave behind: the pin's
+    own forged identity, with the record cleared first (`clear_pin`'s own
+    ordering) and no recorded active slot yet. The two invariants must hold
+    on this state exactly as they do on the sidecar-only ones: the config
+    still names the pin, and the live login identity is never the forged
+    pair.
+    """
+
+    PIN_EMAIL = "pinned@example.com"
+    PIN_ORG = "org-pin"
+
+    def _dead_port(self) -> int:
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()  # nothing listens on it from here on: confirmed dead
+        return port
+
+    def _switcher_with_leftover_wiring(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()  # activeAccountNumber: None -- no recorded slot
+        port = self._dead_port()
+        config = {
+            "oauthAccount": {
+                "emailAddress": self.PIN_EMAIL,
+                "organizationUuid": self.PIN_ORG,
+                "accountUuid": "acct-pin",
+            },
+            "env": {
+                "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                "CSWAP_PIN_PORT": port,
+            },
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }
+        (temp_home / ".claude.json").write_text(json.dumps(config))
+        # No settings.json `remoteControl` section: the pin record is silent,
+        # exactly as `clear_pin`'s clear-record-before-unsplice ordering
+        # leaves it when the unsplice itself fails or never runs.
+        return s
+
+    def test_config_names_the_pin_true_on_a_dead_wired_port_with_a_forged_config(
+        self, temp_home: Path
+    ):
+        s = self._switcher_with_leftover_wiring(temp_home)
+        assert s._config_names_the_pin(self.PIN_EMAIL, self.PIN_ORG) is True
+
+    def test_live_login_identity_never_answers_the_forged_pin_on_a_dead_wired_port(
+        self, temp_home: Path
+    ):
+        s = self._switcher_with_leftover_wiring(temp_home)
+        assert s._live_login_identity(ask_server=False) is None, (
+            "a dead wired port, a silent record and no recorded active slot "
+            "answered the pin's own forged config identity literally, which "
+            "is exactly the leak R11 exists to close"
+        )
+
+
+class TestConfigNamesThePinNeverAsksWiringWhenTheRecordAnswers:
+    """`_config_names_the_pin`'s `pinned is None` branch is load-bearing:
+    `_wiring_present` must never run while the record already names an
+    account (a wired-but-mismatched host would then answer True from
+    `_wiring_present` alone, independent of whether `pinned` actually
+    matches -- exactly the forged-identity leak this predicate exists to
+    close), and a raising `_wiring_present` must never surface past
+    `_live_login_identity`'s own guarantee never to answer the raw config
+    identity under a splice.
+
+    The second half is not the invariant it looks like: see the test's own
+    assertion and docstring below for what it actually measures.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def test_wiring_present_is_not_asked_when_the_record_already_answers(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import pin as _pin
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+
+        def _boom(_s):
+            raise AssertionError("_wiring_present was asked with pinned known")
+
+        monkeypatch.setattr(_pin, "_wiring_present", _boom)
+        assert s._config_names_the_pin(*self.PIN) is True
+        assert s._config_names_the_pin("other@example.com", "org-x") is False
+
+    def test_a_raising_wiring_present_on_a_silent_record_still_leaks_the_raw_config(
+        self, temp_home: Path, monkeypatch
+    ):
+        """NOT a passing guarantee -- a recorded finding. `pinned is None`
+        plus a raising `_wiring_present` (the config/backup dir is present
+        but unreadable, say) is caught by `_config_names_the_pin`'s own
+        `except Exception: return False`, so `_live_login_identity` reads
+        "not spliced" and takes its `if not spliced: return identity`
+        exit -- the SAME raw, possibly-forged config identity the
+        `except Exception: return identity` arm two lines above would also
+        have answered. Measured directly (a throwaway script, HOME
+        isolated) on 835d30c2: `_live_login_identity()` returned the wired
+        config's identity unchanged. Reported to the lead rather than
+        patched here: closing it needs `_config_names_the_pin` to tell
+        "definitely not spliced" apart from "could not tell", which is a
+        third return value, not a few lines.
+        """
+        from claude_swap import pin as _pin
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+
+        def _boom(_s):
+            raise RuntimeError("ledger unreadable")
+
+        monkeypatch.setattr(_pin, "_wiring_present", _boom)
+        assert s._live_login_identity() == self.PIN, (
+            "if this ever answers None or something else, the finding "
+            "below is stale -- update the docstring rather than deleting "
+            "the test"
+        )
+
+
+class TestForgetLiveLoginWarningsResetsTheDedupe:
+    """`_forget_live_login_warnings` exists so the NEXT gap logs again --
+    without it the dedupe key set on the first gap would stay set forever,
+    and a mutant whose body is bare `return` (never discarding) would pass
+    every other test in this file, since none of them cross a
+    gap -> clean resolution -> gap boundary in one process."""
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_a_clean_resolution_between_two_gaps_lets_the_second_log(
+        self, temp_home: Path, monkeypatch, caplog
+    ):
+        import logging as _logging
+
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        no_recorded_slot = {"accounts": {}}
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: no_recorded_slot)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+
+        with caplog.at_level(_logging.WARNING):
+            monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+            s._live_login_identity()                       # gap 1: logs
+
+            monkeypatch.setattr(
+                s, "_get_current_account", lambda: ("plain@example.com", ""))
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+            monkeypatch.setattr(_pin, "_wiring_present", lambda _s: False)
+            s._live_login_identity()                       # clean: forgets
+
+            monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+            s._live_login_identity()                       # gap 2: logs again
+
+        warnings = [r.message for r in caplog.records
+                    if r.levelno == _logging.WARNING and "unattributed" in r.message]
+        assert len(warnings) == 2, (
+            f"the dedupe was not reset by the clean resolution in between: "
+            f"{warnings}"
+        )
+
+
+class TestUnattributedLiveLoginSurvivesADoubleWithNoProvenanceWarned:
+    """`_unattributed_live_login` read `self._provenance_warned` bare --
+    unlike its sibling `_forget_live_login_warnings`, which already uses
+    `getattr(self, "_provenance_warned", None)` for exactly this reason: many
+    tests reach these resolvers through a bare `ClaudeAccountSwitcher.__new__`
+    double that skips `__init__` and so never sets the attribute."""
+
+    def test_no_provenance_warned_attribute_does_not_raise(self):
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._login_identity_from_the_oracle = lambda **kw: (
+            "o@example.com", "org-o", "u-o")
+        assert s._unattributed_live_login(
+            ask_server=False, reason="no recorded active slot"
+        ) == ("o@example.com", "org-o")
+
+
+class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
+    """Routing "not pinned but wiring present" through the oracle-or-None
+    fallback (`_unattributed_live_login`) left `current_identity=None`
+    whenever the oracle could not answer (offline, an expired token, a
+    timeout -- failures are never memoized). `None` sends the switch down
+    the no-backup direct-activation path, which SKIPS the back-up-current
+    step, so the outgoing slot's stored backup goes stale (its rotation
+    unrecorded) rather than updated.
+
+    The fix reuses the mechanism this PR already built for a genuine splice:
+    the recorded slot plus a local byte/lineage compare, oracle only as a
+    tie-breaker, and the recorded slot standing when the oracle cannot say.
+    No pin, no `_wiring_present` stub -- the REAL sidecar receipt on disk,
+    the same file `pin.py` itself reads and writes."""
+
+    def _witness_gap_switch_harness(self, temp_home: Path, monkeypatch):
+        """A real, on-disk witness gap: settings.json absent (never
+        written), the sidecar wiring receipt present (the exact file
+        `pin.py`'s own writer/reader use -- no `_wiring_present` stub),
+        slot 2 recorded active with a stored backup slot 2's live
+        credential has rotated PAST (both tokens differ, no shared
+        lineage stamp -- `_live_credential_is` answers False), slot 3 the
+        switch target, and the oracle stubbed unreachable."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        sequence = {
+            "activeAccountNumber": 2,
+            "accounts": {
+                "2": {"email": "slot2@example.com", "organizationUuid": "",
+                      "uuid": "uuid-2"},
+                "3": {"email": "slot3@example.com", "organizationUuid": "",
+                      "uuid": "uuid-3"},
+            },
+        }
+        switcher._write_json(switcher.sequence_file, sequence)
+
+        config_path = _sw.get_global_config_path()
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+        assert _pin._wiring_present(switcher) is True, "test premise"
+
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2-old", "refreshToken": "rt-slot2-old",
+            "refreshTokenExpiresAt": 1000}})
+        slot2_live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2-live", "refreshToken": "rt-slot2-live",
+            "refreshTokenExpiresAt": 999999999999}})
+        slot3_stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot3", "refreshToken": "rt-slot3"}})
+        creds_store = {
+            ("2", "slot2@example.com"): slot2_backup,
+            ("3", "slot3@example.com"): slot3_stored,
+        }
+        configs_store = {
+            ("2", "slot2@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "slot2@example.com", "accountUuid": "uuid-2"}}),
+            ("3", "slot3@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "slot3@example.com", "accountUuid": "uuid-3"}}),
+        }
+        live_state = {"creds": slot2_live}
+
+        def read_creds(num, email):
+            return creds_store.get((str(num), email), "")
+
+        def read_creds_ex(num, email):
+            return creds_store.get((str(num), email), ""), False
+
+        def write_creds(num, email, creds, attributed=None):
+            creds_store[(str(num), email)] = creds
+
+        def read_cfg(num, email):
+            return configs_store.get((str(num), email), "")
+
+        def write_cfg(num, email, cfg):
+            configs_store[(str(num), email)] = cfg
+
+        def read_live():
+            return live_state.get("creds", "")
+
+        def write_live(creds):
+            live_state["creds"] = creds
+
+        monkeypatch.setattr(switcher, "_read_account_credentials", read_creds)
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex", read_creds_ex)
+        monkeypatch.setattr(switcher, "_write_account_credentials", write_creds)
+        monkeypatch.setattr(switcher, "_read_account_config", read_cfg)
+        monkeypatch.setattr(switcher, "_write_account_config", write_cfg)
+        monkeypatch.setattr(switcher, "_read_credentials", read_live)
+        monkeypatch.setattr(switcher, "_write_credentials", write_live)
+        monkeypatch.setattr(
+            switcher, "_read_active_credentials",
+            lambda: ActiveCredentials(read_live(), False))
+        monkeypatch.setattr(switcher, "_read_capture_credentials", read_live)
+        # THE ORACLE CANNOT SAY: offline, a timeout, an expired access token
+        # -- whatever the cause, it answers nothing, and a failed lookup is
+        # never memoized (`_login_identity_from_the_oracle`), so this is
+        # asked again on every attempt within the budget this test allows.
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: None)
+        return switcher, creds_store, live_state["creds"]
+
+    def test_the_outgoing_slot_is_still_backed_up_when_the_oracle_cannot_say(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        switcher, creds_store, slot2_live = self._witness_gap_switch_harness(
+            temp_home, monkeypatch
+        )
+        slot2_backup_before = creds_store[("2", "slot2@example.com")]
+        with patch.object(switcher, "list_accounts"):
+            result = switcher._perform_switch("3", emit_output=False)
+
+        # No longer fail-open: an unverifiable divergence is stashed, never
+        # backed into the outgoing slot -- the direct-activation path was
+        # correctly NOT taken (this is the ordinary rotation path, proven
+        # by `from` below), but the divergent live bytes are unclaimed
+        # rather than written over slot 2's own backup.
+        assert creds_store[("2", "slot2@example.com")] == slot2_backup_before, (
+            "the unresolved live bytes were backed into the outgoing slot "
+            "instead of being stashed"
+        )
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
+            f"the switch could not attribute who it left: {result['from']!r}"
+        )
+
+    def test_force_activate_still_attributes_from(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`force_activate` skips `_prefetch_live_identity` entirely
+        (`provenance = {"live": None, "resolved": None}`) and always takes
+        the direct-activation branch, which correctly skips the
+        backup-current step -- but `current_identity` is resolved UNDER
+        THE LOCK regardless of `force_activate` or `provenance`, so
+        `from_ref` must still name slot 2, not go unattributed."""
+        switcher, creds_store, _slot2_live = self._witness_gap_switch_harness(
+            temp_home, monkeypatch
+        )
+        slot2_backup_before = creds_store[("2", "slot2@example.com")]
+        with patch.object(switcher, "list_accounts"):
+            result = switcher._perform_switch(
+                "3", emit_output=False, force_activate=True
+            )
+        assert creds_store[("2", "slot2@example.com")] == slot2_backup_before, (
+            "force_activate did not skip the backup-current step"
+        )
+        assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
+            f"force_activate left `from` unattributed: {result['from']!r}"
+        )
+
+    def _wired_slot2(self, monkeypatch) -> ClaudeAccountSwitcher:
+        """Real wiring marker, `activeAccountNumber` 2, and slot 2's live
+        credential byte-identical to its own stored backup (no lineage
+        divergence)."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "slot2@example.com",
+                               "organizationUuid": "", "uuid": "uuid-2"}},
+        })
+        config_path = _sw.get_global_config_path()
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+
+        matching = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2", "refreshToken": "rt-slot2"}})
+        monkeypatch.setattr(switcher, "_read_account_credentials",
+                             lambda num, email: matching)
+        monkeypatch.setattr(switcher, "_read_active_credentials",
+                             lambda: ActiveCredentials(matching, False))
+        monkeypatch.setattr(switcher, "_read_capture_credentials",
+                             lambda: matching)
+        return switcher
+
+    def test_a_byte_match_with_the_recorded_slot_asks_nobody(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`current_account_number` calls `_live_login_identity()` at its
+        DEFAULT `ask_server=True` -- but when the live bytes are already
+        the recorded slot's (no lineage divergence), the local compare
+        answers before the oracle is ever asked, egress or none."""
+        from claude_swap import switcher as _sw
+
+        switcher = self._wired_slot2(monkeypatch)
+        asked = []
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or None))
+
+        assert switcher.current_account_number() == "2"
+        assert asked == [], (
+            f"the local byte match still asked the oracle: {asked}")
+
+    def test_live_identity_matches_holds_on_a_witness_gap(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`_live_identity_matches` (the TOCTOU re-check the locked refresh
+        and the rotated-backup resync both gate on) must still answer True
+        for the recorded slot's own identity on a witness gap -- otherwise
+        both callers silently stop running for as long as the gap lasts."""
+        switcher = self._wired_slot2(monkeypatch)
+        assert switcher._live_identity_matches("slot2@example.com", "") is True
+
+
+class TestTheResolverAsksTheServerOnlyOutsideTheLocks:
+    """The resolver may reach the network; its under-lock callers may not.
+
+    Three places state the rule: `fetch_oauth_profile`'s own docstring
+    ("Must not be called while any credential/config lock is held"),
+    `_resync_rotated_backup` ("probed here, before any lock"), and the line
+    directly above `_perform_switch_locked`'s `with` ("Everything under here
+    is local I/O -- no network while locks are held").
+
+    Both under-lock callers ask `_live_login_identity`, so the fetch it
+    gained lands inside Claude Code's credential lock -- and under
+    `force_activate`, which skips the pre-lock prefetch entirely, that is the
+    only place it can be asked from. A failure is never memoized, so an
+    unreachable server pays the full 5s timeout there on every pass.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _drifted(self, monkeypatch, asked):
+        """The one state that reaches the oracle: the config names the pin
+        and the live credential is not the recorded slot's."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._get_current_account = lambda: self.PIN
+        s._get_sequence_data = lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "login@example.com",
+                               "organizationUuid": "org-login"}}}
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-live", "refreshToken": "rt-live"}})
+        s._read_active_credentials = lambda: ActiveCredentials(live, False)
+        s.read_account_credentials = lambda num, email: json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-slot2",
+                               "refreshToken": "rt-slot2"}})
+        s._read_capture_credentials = lambda: live
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or {"email": "other@example.com", "uuid": "u-o",
+                                  "organizationUuid": "org-other"}))
+        return s
+
+    def test_CONTROL_the_unlocked_resolver_does_ask(self, monkeypatch):
+        """The probe can see a call. Without this the two below are
+        arithmetic: a resolver that never asks anyone passes them too."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        assert s._live_login_identity() == ("other@example.com", "org-other")
+        assert asked == ["at-live"], asked
+
+    def test_the_under_lock_re_check_asks_nobody(self, monkeypatch):
+        """`_live_identity_matches` runs inside `FileLock`, `FileLock` and
+        `claude_credentials_lock`. With a cold memo it must fall back to the
+        recorded slot, which is what it answered before the fetch existed."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        matched = s._live_identity_matches("login@example.com", "org-login")
+        assert asked == [], (
+            "the under-lock identity re-check reached the profile endpoint "
+            f"while Claude Code's credential lock is held: {asked}")
+        assert matched is True
+
+    def test_a_warm_memo_still_answers_under_the_lock(self, monkeypatch):
+        """CONTROL for the fix's reach: refusing the NETWORK is not refusing
+        the answer. A verdict already resolved outside the locks is a dict
+        lookup, so the check keeps the precision the fetch bought it."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        s._live_login_identity()                      # pre-lock, memoizes
+        assert asked == ["at-live"], asked
+        assert s._live_identity_matches("other@example.com", "org-other")
+        assert not s._live_identity_matches("login@example.com", "org-login")
+        assert asked == ["at-live"], "asked again with the memo warm"
+
+    def test_the_witness_gap_fallback_asks_nobody_under_the_lock(
+        self, monkeypatch
+    ):
+        """The `no recorded active slot` exit reaches the oracle through the
+        same seam and must honour the same rule: `_live_identity_matches`
+        (``ask_server=False``) must not touch the network for it either.
+        Without this a mutant dropping ``ask_server=ask_server`` in
+        `_unattributed_live_login`'s oracle call (a bare
+        `self._login_identity_from_the_oracle()`) survives every other test
+        here, because none of them stub the oracle with `lambda **kw` in a
+        way that can see the keyword go missing."""
+        import logging
+
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        asked = []
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-witness-gap")
+        s._provenance_warned = set()
+        s._get_current_account = lambda: self.PIN
+        s._get_sequence_data = lambda: {"accounts": {}}   # no activeAccountNumber
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-live", "refreshToken": "rt-live"}})
+        s._read_capture_credentials = lambda: live
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or {"email": "other@example.com", "uuid": "u-o",
+                                  "organizationUuid": "org-other"}))
+        matched = s._live_identity_matches("other@example.com", "org-other")
+        assert asked == [], (
+            "the witness-gap fallback reached the profile endpoint while "
+            f"Claude Code's credential lock is held: {asked}")
+        assert matched is False, matched
+
+
+class TestThePolicyFetchIsBudgeted:
+    """A switch must not spend ten seconds asking about policy.
+
+    The one call sits in `_perform_switch`, which wraps the locked body and
+    runs after it returns -- policy is network I/O and the body holds Claude
+    Code's own locks. So this budget no longer narrows a
+    credentials-vs-roster window; that window closed when the call moved out.
+    What it still bounds is the tail of `cswap switch` itself, on the path the
+    autoswitch engine drives right before a lockout, where `urlopen`'s 10s
+    default is the whole delay a user waits through for a cache refresh that
+    fails open anyway.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE WAS MEASURED. A reviewer reverted the
+    budget with `fetch_policy_limits.__defaults__ = (10.0,)` and the suite came
+    back byte-identical -- 2389 passed, 4 skipped. Both policy tests replace
+    this seam with a no-arg lambda, so by construction neither can observe a
+    timeout. The constant was a comment with no witness.
+    """
+
+    @staticmethod
+    def _creds(tmp_path):
+        p = tmp_path / ".credentials.json"
+        p.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt"}}))
+        return p
+
+    def test_the_seam_hands_oauth_the_budget_and_not_the_default(
+            self, tmp_path, monkeypatch):
+        from claude_swap import switcher as sw
+
+        seen = {}
+
+        def _spy(token, timeout_s):
+            seen["token"], seen["timeout"] = token, timeout_s
+            return {"restrictions": {}}
+
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits", _spy)
+
+        assert sw.fetch_policy_limits() == {"restrictions": {}}
+        assert seen["token"] == "sk-live"
+        # THE COMPARISON IS THE POINT, not the literal: this fails if someone
+        # "simplifies" the constant back to the fetch's own default.
+        assert seen["timeout"] == sw._POLICY_FETCH_BUDGET_S
+        assert seen["timeout"] < 10.0, (
+            "the switch transaction must be tighter than urlopen's default")
+
+    def test_an_explicit_budget_still_wins(self, tmp_path, monkeypatch):
+        """The seam keeps its parameter, so a caller that knows better can say
+        so -- and the suite's own no-arg stubs keep working because the budget
+        is a DEFAULT, not something the call site passes."""
+        from claude_swap import switcher as sw
+
+        seen = {}
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda token, timeout_s: seen.setdefault("t", timeout_s))
+        sw.fetch_policy_limits(timeout_s=0.25)
+        assert seen["t"] == 0.25
+
+    def test_CONTROL_no_credential_means_no_fetch_at_all(
+            self, tmp_path, monkeypatch):
+        """Without this, the two above pass on a seam that calls oauth
+        unconditionally."""
+        from claude_swap import switcher as sw
+
+        called = []
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: tmp_path / "absent.json")
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda *a, **k: called.append(1))
+        assert sw.fetch_policy_limits() is None
+        assert not called
+
+        # AND THE OTHER WAY THE TOKEN IS MISSING. The line above covers the
+        # absent FILE, which the `except` handles; a file that parses and
+        # carries no accessToken is the `if not token` branch, and deleting
+        # that guard left the suite byte-identical. The cost is one pointless
+        # `Bearer None` request inside the switch transaction.
+        empty = tmp_path / "tokenless.json"
+        empty.write_text(json.dumps({"claudeAiOauth": {}}))
+        monkeypatch.setattr(sw, "get_credentials_path", lambda: empty)
+        assert sw.fetch_policy_limits() is None
+        assert not called
+
+
+
+class TestTheDaemonOwnsThePolicyCacheWhenAPinIsSet:
+    """`policy-limits.json` is machine-wide and ABSENT MEANS DENIED, so which
+    process writes it decides whether Remote Control works at all.
+
+    cswap-pin's daemon already maintains it -- `sweep_policy_once`, on its
+    sweep beat, asked as the PIN, skipping the write when the document already
+    agrees. Refreshing it from the switch too is not a second opinion:
+
+      - BEHIND THE WIRING it is the same answer. The proxy swaps the bearer on
+        this exact route; traced live against the deployed daemon:
+        `GET /api/claude_code/policy_limits pinned=True swapped=True`, from a
+        `Python-urllib` client, which is this fetch and not Claude Code's.
+      - OUTSIDE IT the bearer is NOT swapped, so the answer is the ACTIVE
+        account's restrictions -- written into the file every pinned session
+        reads. That is the outage the daemon's version records having measured:
+        an enterprise denial reaching sessions pinned to an account the server
+        had not restricted, and `/remote-control` refused for hours.
+
+    So the switch pays a network round trip inside its own transaction for an
+    answer that is at best identical and at worst a machine-wide denial.
+    """
+
+    def _switcher(self):
+        import logging
+
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-policy-owner")
+        return s
+
+    def _run(self, monkeypatch, *, available, pinned):
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or {"restrictions": {}})
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: available)
+        monkeypatch.setattr("claude_swap.pin.pinned_email", lambda _s: pinned)
+        monkeypatch.setattr(sw, "get_claude_config_home",
+                            lambda: (_ for _ in ()).throw(
+                                AssertionError("a skipped refresh must not "
+                                               "even resolve the cache path")))
+        self._switcher()._refresh_policy_cache()
+        return calls
+
+    def test_a_pinned_host_leaves_the_file_to_the_daemon(self, monkeypatch):
+        calls = self._run(monkeypatch, available=True,
+                          pinned="pinned@example.com")
+        assert calls == [], (
+            "the switch re-fetched a document the daemon already maintains -- "
+            "identical behind the wiring, and the ACTIVE account's "
+            "restrictions written machine-wide outside it")
+
+    def test_CONTROL_no_pin_set_still_refreshes(self, monkeypatch):
+        """Nothing else writes this file on an unpinned host, and Claude Code's
+        own poll is hourly and per-process -- a session started right after a
+        switch would read the previous account's answer."""
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        monkeypatch.setattr("claude_swap.pin.pinned_email", lambda _s: None)
+        self._switcher()._refresh_policy_cache()
+        assert calls == [1]
+
+    def test_CONTROL_no_pin_package_still_refreshes(self, monkeypatch):
+        """The optional extra is absent, so there is no daemon to hand it to."""
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: False)
+        monkeypatch.setattr("claude_swap.pin.pinned_email",
+                            lambda _s: (_ for _ in ()).throw(
+                                AssertionError("asked the pin a question after "
+                                               "the availability guard said no")))
+        self._switcher()._refresh_policy_cache()
+        assert calls == [1]

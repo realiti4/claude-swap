@@ -95,12 +95,25 @@ class TestFileLock:
         lock.release()  # Should not raise
 
 
-def _hold_lock_process(lock_path: str, duration: float, ready_event, done_event):
-    """Helper function to hold a lock in a subprocess."""
+def _hold_lock_process(lock_path: str, duration: float, ready_event, done_event,
+                       release_event=None):
+    """Helper function to hold a lock in a subprocess.
+
+    ``release_event``, when given, replaces the fixed ``duration`` sleep: the
+    child holds until the parent says it is done looking. A caller that only
+    needs the lock held WHILE it makes one assertion was otherwise paying the
+    whole sleep as dead wall clock (2.0s held against a 0.5s acquire attempt),
+    and the parent never waited on `done_event` anyway. Kept as an option, not
+    a replacement, because the exit-then-acquire test genuinely needs the
+    child to finish on its own.
+    """
     lock = FileLock(Path(lock_path))
     if lock.acquire(timeout=5.0):
         ready_event.set()  # Signal that lock is held
-        time.sleep(duration)
+        if release_event is not None:
+            release_event.wait(timeout=10.0)
+        else:
+            time.sleep(duration)
         lock.release()
     done_event.set()
 
@@ -114,11 +127,12 @@ class TestFileLockConcurrency:
 
         ready_event = multiprocessing.Event()
         done_event = multiprocessing.Event()
+        release_event = multiprocessing.Event()
 
-        # Start process that holds the lock
+        # Start process that holds the lock until we have looked.
         p = multiprocessing.Process(
             target=_hold_lock_process,
-            args=(str(lock_path), 2.0, ready_event, done_event),
+            args=(str(lock_path), 0.0, ready_event, done_event, release_event),
         )
         p.start()
 
@@ -131,7 +145,9 @@ class TestFileLockConcurrency:
 
         assert result is False
 
-        # Clean up
+        # Clean up. The child held for a fixed 2.0s before, of which every
+        # second past the 0.5s acquire attempt was dead wall clock.
+        release_event.set()
         p.join(timeout=5.0)
         if p.is_alive():
             p.terminate()

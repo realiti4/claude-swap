@@ -145,7 +145,7 @@ BACKOFF_MAX_SHIFT = 32
 # window, never hours.
 #
 # Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
-# the server is not reliably ready. Measured over this machine's whole log
+# the server is not reliably ready. Measured over one machine's whole log
 # (re-measured 2026-08-03, round 8 — the round-7 "21 of 36"/"2 of 38" figures
 # do reproduce under the method below, on the OTHER of its two valid
 # readings; round 8 switched readings, see the METHOD paragraph below for

@@ -81,12 +81,16 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    # THE ORG AXIS. Without it no snapshot could express two slots sharing one
+    # address across organizations -- the entire subject of
+    # `pin.account_is_pinned` -- so nothing rendered that pair.
+    org_uuid: str = "",
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
         email=email or f"user{number}@example.com",
         org_name="",
-        org_uuid="",
+        org_uuid=org_uuid,
         is_active=active,
         kind=kind,
         switchable=switchable,
@@ -787,7 +791,19 @@ class TestDashboard:
             assert "5h 92%" in mini_part
             assert "7d" not in mini_part
 
-    async def test_menu_is_default_navigation_and_nests(self, tmp_path):
+    async def test_menu_is_default_navigation_and_nests(self, tmp_path, monkeypatch):
+        # SAY WHICH WORLD THIS IS, rather than inherit it. The list below used
+        # to carry the comment "no pin-menu: the extra is not installed in
+        # CI" — an assertion whose expected value was decided by what happened
+        # to be on sys.path. Adding `claude-swap[pin]` to the dev group (so
+        # the peer contract could be tested at all) flipped it, and the
+        # navigation behaviour this test is actually about did not change one
+        # bit. Pinned to the no-pin shape: the pin row's own behaviour is
+        # covered in test_tui_pin.py, and one extra row would only pad the
+        # indices the presses below depend on.
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "is_available", lambda: False)
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
@@ -804,6 +820,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                # No "pin-menu": pinned False above, not left to sys.path.
                 "remove-menu",
                 "theme-menu",
                 "quit",

@@ -24,11 +24,54 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # -n 8, NOT the pyproject default of `auto`. A runner has 4 vCPUs and
+      # this suite is mostly WAITING (file locks, spawned interpreters,
+      # Textual pilots), so one worker per core leaves cores idle. Measured on
+      # 4 CPUs, same 1995 passed: auto(=4) 16.9s, -n 6 14.1s, -n 8 14.5s,
+      # -n 10 14.7s. xdist has no multiplier spelling, so the literal lives
+      # here, where the runner's shape is known.
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -n 8
 
+  # SHARDED, because a single Windows job pays ~26s of checkout, `uv sync`,
+  # worker boot and teardown before the first test runs. Each shard pays that
+  # floor once and they split the ~51s of test execution.
+  #
+  # Exhaustive by construction: three shards name their files and `rest`
+  # `--ignore`s exactly those, so a NEW test file lands in `rest`
+  # automatically. tests/test_ci_shards.py fails if that stops being true.
   test-windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # BALANCED ON WINDOWS COST, which does NOT rank these files the
+          # way Linux does. Per-file cost by subtraction, all Windows:
+          # autoswitch ~18.3s, pin+cli ~17.9s, everything else ~12.9s,
+          # switcher ~8.6s, tui group ~3.6s.
+          #
+          # The two heavyweights must not share a job: `pin` and `cli` spawn
+          # 20 interpreters between them, the one thing Windows is reliably
+          # slower at. A Linux-derived split had put both in one shard while
+          # giving `switcher` its own, which is exactly backwards.
+          #
+          # FOUR SHARDS, NOT FIVE. Splitting pin from cli was tried and
+          # REVERTED: 48s -> 80s wall clock. More concurrent Windows jobs
+          # contend for the same GitHub cache, and the SLOWEST shard got 76%
+          # slower on the same commit and lockfile. Expect +/-8s of runner
+          # noise, so measure twice before moving a file between shards.
+          - name: autoswitch
+            paths: tests/test_autoswitch.py
+          - name: pin-cli
+            paths: tests/test_pin.py tests/test_cli.py
+          - name: switcher
+            paths: tests/test_switcher.py
+          - name: rest
+            paths: >-
+              --ignore=tests/test_autoswitch.py --ignore=tests/test_pin.py
+              --ignore=tests/test_cli.py --ignore=tests/test_switcher.py
+    name: test-windows (${{ matrix.name }})
 
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +87,20 @@ jobs:
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
-        run: uv run pytest
+        #
+        # `-o testpaths=` is a NO-OP for every shard as written, measured on
+        # the pinned pytest: each named shard and the `rest` shard collect the
+        # same count with the flag and without on every shard, and
+        # the control that the flag is honoured at all is `-o testpaths=docs`
+        # collecting nothing. Positional paths already beat `testpaths`, and
+        # `rest`'s `--ignore` list narrows it rather than replacing it. Kept
+        # because it is what would matter if a shard ever ignored the
+        # testpaths root itself; a first reading of it, and a second, each
+        # claimed a different reason that measurement did not support.
+        #
+        # -n 4, not the 8 the unsharded job used: each worker re-imports the
+        # test modules and booting 8 cost 16.7s on Windows against 4's 8.8s.
+        run: uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}
 
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the

@@ -1761,7 +1761,9 @@ class TestImportClearsDeadTokenQuarantine:
             "organizationName": "",
         }})
         s._store._write_active_credentials_file(live)
-        s._write_account_credentials("2", "bob@example.com", newer_backup)
+        s._write_account_credentials(
+            "2", "bob@example.com", newer_backup, attributed=True
+        )
         s._usage_store.record(
             {"2": FetchRecord(
                 error="invalid_grant",

@@ -20,6 +20,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     LockError,
     SessionError,
     SwitchError,
@@ -77,6 +78,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -180,6 +182,13 @@ _DEMOTING_STASH_REASONS = (
 )
 
 ERROR_NOTES = {
+    "tls-cert": (
+        "the certificate chain was not trusted, most often a TLS-terminating "
+        "proxy whose CA is missing here, sometimes an expired duplicate root "
+        "shadowing a valid one; fix it in the OS store on macOS/Windows, or "
+        "via SSL_CERT_FILE on Linux (REQUESTS_CA_BUNDLE and "
+        "NODE_EXTRA_CA_CERTS are not read on this path)"
+    ),
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
         "normal shell"
@@ -193,6 +202,10 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "foreign-lineage": (
+        "this slot's stored grant is confirmed another account's — a switch "
+        "restores the slot's own backup"
     ),
 }
 
@@ -301,7 +314,56 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+#: How long a switch may spend asking the policy question.
+#:
+#: The one caller is `_perform_switch`, AFTER its body has released the locks,
+#: so this no longer narrows a credentials-vs-roster window -- that window
+#: closed when the call moved out. What it bounds is the tail of `cswap switch`
+#: itself, on the path the autoswitch engine drives right before a lockout.
+#: NOT A WALL-CLOCK BOUND: urlopen applies this per blocking socket operation,
+#: so connect, handshake and each read get it separately. The fetch's own
+#: default is 10s.
+_POLICY_FETCH_BUDGET_S = 2.0
 
+
+def fetch_policy_limits(
+    timeout_s: float = _POLICY_FETCH_BUDGET_S, switcher: "object | None" = None
+) -> "dict | None":
+    """The active credential's org-policy document, or None if unaskable.
+
+    A module-level seam so the switch path has ONE thing to stub, and so the
+    credential read lives beside the call that needs it rather than inside a
+    method that also writes files.
+
+    THROUGH THE STORE WHEN THERE IS ONE. `get_credentials_path().read_text`
+    alone sees the plaintext file and nothing else, and on macOS the active
+    credential may live in the Keychain with no such file at all -- measured,
+    one of this fleet's two Macs has it and the other does not. There this
+    returned None on every call and the policy refresh went quiet for good.
+    The plaintext read stays as the fallback for callers with no switcher.
+    """
+    raw = None
+    if switcher is not None:
+        try:
+            live = switcher._read_active_credentials()
+            if live.value:
+                raw = json.loads(live.value)
+        except Exception:  # noqa: BLE001 — fall through to the file
+            raw = None
+    try:
+        if raw is None:
+            raw = json.loads(get_credentials_path().read_text(encoding="utf-8"))
+        token = (raw.get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:  # noqa: BLE001 — no credential, nothing to ask with
+        return None
+    if not token:
+        return None
+    return oauth.fetch_policy_limits(token, timeout_s=timeout_s)
+
+
+#: How far apart two `refreshTokenExpiresAt` values may sit and still be one
+#: login. See `_live_credential_is`.
+_LINEAGE_STAMP_JITTER_MS = 5_000
 
 
 class ClaudeAccountSwitcher:
@@ -496,6 +558,91 @@ class ClaudeAccountSwitcher:
             return None
         return data
 
+    def _refresh_policy_cache(self) -> None:
+        """Re-ask the org-policy question as the account that is now active.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `<config home>/policy-limits.json`, and every org-policy gate reads it
+        -- `/remote-control` among them. The fetch carries whatever account was
+        ACTIVE, the file is machine-wide, and nothing rewrote it when the
+        account changed, so one account's restrictions gated every session on
+        the machine, including accounts the server places no restriction on.
+
+        DELETING IT IS NOT THE FIX, and the first cut of this did exactly that.
+        **Absent means DENIED for the gates in that set** -- observed: with the
+        file removed, `/remote-control` refuses. So dropping it would turn a
+        stale-answer bug into a guaranteed outage for every session started
+        after a switch.
+
+        A FAILED FETCH LEAVES THE OLD ANSWER. It may be wrong for this account;
+        absent is wrong for every account. Never raises, for the same reason:
+        a switch must not fail over a cache file, and the worst case of doing
+        nothing is the state we already had.
+        """
+        # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
+        # runs on its sweep beat, asks as the PIN -- the account every pinned
+        # session's requests go out as -- and skips the write when the document
+        # already agrees. Fetching here reaches the same answer anyway, because
+        # the proxy swaps the bearer on this exact route (traced live:
+        # `GET /api/claude_code/policy_limits pinned=True swapped=True`). What
+        # it can do is HARM: a cswap started outside the wiring is not swapped,
+        # so it writes the ACTIVE account's restrictions into a machine-wide
+        # file, which is the measured outage the daemon's version exists to
+        # prevent.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.is_available() and _pin.pinned_email(self):
+                return
+        except Exception:  # noqa: BLE001 — a switch must not fail on this
+            pass
+        # `switcher` is passed because the seam cannot reach a keychain-aware
+        # read without it: where the live credential is Keychain-only the
+        # plaintext fallback finds nothing and the refresh returns before it
+        # asks. The budget stays the seam's own `_POLICY_FETCH_BUDGET_S`.
+        try:
+            doc = fetch_policy_limits(switcher=self)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            self._logger.debug("policy refresh failed, keeping the old answer:"
+                               " %r", exc)
+            return
+        if not isinstance(doc, dict):
+            return
+        path = get_claude_config_home() / "policy-limits.json"
+        # THROUGH A SYMLINK, NEVER OVER IT -- the rule `_write_json` states
+        # above. `os.replace` swaps a directory entry and does not follow
+        # links, so a dotfiles-managed cache would be detached from its target.
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
+        # THE PID IS IN THE NAME, like every other writer in this store. A
+        # fixed temp name is shared by every process writing this file, so two
+        # concurrent switches interleave their write and replace and the
+        # survivor can be one document's bytes under the other's rename --
+        # which an atomic rename cannot protect against, because the tearing
+        # happened before it.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            # CARRY THE MODE OVER, do not mint one. This is Claude Code's file,
+            # not ours; `os.replace` publishes the TEMP file's mode, so a fresh
+            # temp under an 022 umask silently widened a 0600 document to 0644.
+            # Preserving what is there invents no policy for another program's
+            # file, and a file that does not exist yet has no mode to keep.
+            try:
+                os.chmod(tmp, path.stat().st_mode & 0o777)
+            except OSError:
+                # First creation: nothing to carry over. The umask-derived mode
+                # is a mint as well, just a looser one (0644 under 022), so
+                # pick the tighter default rather than inherit an accident.
+                os.chmod(tmp, 0o600)
+            tmp.replace(path)          # atomic: no reader sees half a document
+        except OSError as exc:
+            self._logger.debug("could not write the policy cache: %r", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
     ) -> Path:
@@ -557,8 +704,32 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON file with validation.
+
+        THROUGH A SYMLINK, NEVER OVER IT. The publish below is a rename, and a
+        rename swaps a directory ENTRY without following links — so on a
+        dotfiles-managed `.claude.json` this replaced the link with a regular
+        file, left the real target carrying whatever it had, and sent Claude
+        Code's later writes to an orphan. The next deploy restores the link
+        and everything the write meant to remove comes back with it.
+
+        `settings.atomic_write_json` already resolves for exactly this reason
+        and cites #192/#193, which fixed the same bug in `session.py`'s
+        writer. `_clear_pin_record` uses that one while the pin's config half
+        came through here, so the two halves of a single `pin --clear`
+        disagreed about what "published" means.
+
+        THE TEMP FILE STAYS BESIDE THE TARGET, not beside the link: they can
+        be on different filesystems, and a cross-device rename is not atomic
+        (`shutil.move` falls back to copy+unlink, which a reader can catch
+        half-written). `realpath` resolves every component, not just the last,
+        which is stricter than this needs and costs nothing -- what matters is
+        only that the temp file and the rename land in the resolved directory.
+        """
         content = json.dumps(data, indent=2)
+
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
@@ -640,21 +811,31 @@ class ClaudeAccountSwitcher:
         ``add_account`` then cleared the dead-token strike — re-creating on the
         common path exactly the stale-consume this PR exists to prevent.
 
-        I-1 (round 9): returns the value THIS read produced so the caller
-        captures those exact bytes instead of reading again. The check-read
-        and a separate use-read are two independent Keychain reads — a
-        Keychain that answers the first and fails the second passes the
-        guard and then captures the possibly-stale plaintext fallback
-        anyway, which is precisely the outcome this guard exists to prevent.
+        Returns the value THIS read produced, so the caller captures those
+        exact bytes rather than reading again. A check-read and a separate
+        use-read are two independent Keychain reads, and one that answers the
+        first and fails the second passes the guard and then captures the
+        possibly-stale plaintext fallback anyway.
         """
         active = self._read_active_credentials()
-        if active.degraded:
+        # A MANAGED API KEY IS NOT OURS TO REFUSE. It has no generation to
+        # supersede, and its real door is `--add-token`, which
+        # `_reject_live_api_key_capture` names a few lines on. Raising here
+        # reaches the user with a remedy for a different cause AND hides the
+        # one that would work: on a session with no GUI the Keychain does not
+        # become readable inside this process, so the correct message is
+        # never printed at all.
+        if active.degraded and not looks_like_api_key(active.value or ""):
+            # SAYS WHAT IS KNOWN IN EVERY ARM. Two of the reachable ones have
+            # nothing readable at all, so "whatever is readable here" was
+            # vacuous there; what holds throughout is that a capture taken
+            # from a degraded read is either empty or already superseded.
             raise CredentialReadError(
-                "The macOS Keychain is unreadable right now (locked or no GUI "
-                "session), so the only readable credential is a plaintext "
-                "fallback that may be a superseded generation — capturing it "
-                "would file a spent refresh token against this slot. Retry "
-                "from a GUI terminal."
+                "The OAuth Keychain read failed, so a capture now would "
+                "either store nothing or store a superseded generation "
+                "against this slot. A locked Keychain or a session with no "
+                "GUI is the usual cause, and retrying from a GUI terminal is "
+                "what clears that one."
             )
         return active.value
 
@@ -769,14 +950,121 @@ class ClaudeAccountSwitcher:
     def _backup_enc_path(self, account_num: str, email: str) -> Path:
         return self._store._backup_enc_path(account_num, email)
 
-    def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
+    def _write_backup_enc(
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
+    ) -> None:
+        """Backend-only write (no session invalidation, no dispatch): used
+        to seed a slot's ``.enc`` directly and by the macOS-keyring-to-
+        security migration, which must not fall through to a different
+        backend. Routes through the same attribution guard as
+        ``_write_account_credentials`` so a caller here cannot bypass it —
+        pass ``attributed=True`` only with the same independent proof that
+        method requires.
+        """
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
+        self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._write_backup_enc(account_num, email, credentials)
 
     def _kc_read_backup(self, account_num: str, email: str) -> str:
         return self._store._kc_read_backup(account_num, email)
 
-    def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
+    def _kc_write_backup(
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
+    ) -> None:
+        """Backend-only write (no session invalidation, no dispatch): see
+        ``_write_backup_enc``, same guard and same reason it exists."""
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
+        self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._kc_write_backup(account_num, email, credentials)
+
+    def _refuse_if_peer_shares_grant(
+        self, account_num: str, email: str, credentials: str, attributed: bool,
+    ) -> None:
+        """Refuse a write that would leave two slots holding the same
+        single-use refresh grant -- the precondition for the fan-out
+        double-spend (queue row #474): two slots each POST the same grant,
+        one wins, the other's lineage dies and forces a re-login inside its
+        own grant's window. Closes the write-time path that CREATES a new
+        duplicate; it does not by itself retire the consume gate's lock (an
+        attributed=True write -- the same login added under a second org,
+        for one -- can still leave a peer holding matching bytes, since
+        ``attributed`` attests IDENTITY, never NON-DUPLICATION).
+
+        Scoped to the ``sha256:`` fingerprint arm only. ``sha256-full:`` is
+        a raw setup-token with no ``refreshToken``, and one pasted into two
+        slots on purpose is a SUPPORTED shape, not this defect --
+        ``add_account_from_token`` itself always writes ``attributed=True``
+        and never reaches this arm either way; what it exempts is the two
+        unattributed writers below that could otherwise re-refuse an
+        already-duplicated setup-token account.
+
+        Skipped whenever ``attributed`` is True: every ``attributed=True``
+        call site already independently verified this write's identity, and
+        several of them (a slot swap, a relocate) legitimately hold the same
+        bytes in two slots for the instant between the two halves of a move.
+        By the same token every write on the consume gate's fan-out
+        (``_consume_backup_grant_locked``, ``_fetch_active_usage``) is
+        always attributed=True, so this guard costs it nothing -- the only
+        payers are the rare unattributed writes (a switch's own-family
+        resync, the pin's session-bootstrap seam), each an O(other slots)
+        read, never a network call.
+
+        Reads each peer with ``_read_account_credentials_direct`` -- this
+        slot's own key, never a merge partner's renumber-fallback sweep for
+        the same email under a different slot (see
+        ``_check_attribution``'s docstring) -- and refuses on a peer whose
+        backup could not be read at all, the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state: unreadable is "cannot verify", which refuses like a
+        mismatch, never "empty", which would permit like an absent slot.
+        """
+        # ponytail: refuses the write that would CREATE a new duplicate, not
+        # a backfill scan for one already on disk before this guard existed
+        # -- the fleet's own zero-collision reading is what makes that
+        # ceiling acceptable today.
+        if attributed:
+            return
+        fp = oauth.credential_fingerprint(credentials)
+        if not fp or not fp.startswith("sha256:"):
+            return
+        data = self._get_sequence_data() or {}
+        for num in data.get("sequence", []):
+            peer_num = str(num)
+            if peer_num == str(account_num):
+                continue
+            peer_email = data.get("accounts", {}).get(peer_num, {}).get(
+                "email", "unknown"
+            )
+            failed: list = []
+            peer_creds = self._store._read_account_credentials_direct(
+                peer_num, peer_email, failed
+            )
+            if bool(failed) and not peer_creds:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s's "
+                    "own backup could not be read to verify it does not "
+                    "already hold this grant. Retry once it is readable.",
+                    account_num, email, peer_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num}'s backup is unreadable, so it "
+                    "cannot be ruled out as already holding this grant"
+                )
+            if peer_creds and oauth.credential_fingerprint(peer_creds) == fp:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s "
+                    "already holds this exact refresh grant, and writing it "
+                    "here too would let both slots race to spend it once. "
+                    "Log in fresh for one of them: cswap add --slot %s",
+                    account_num, email, peer_num, account_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num} already holds this refresh grant"
+                )
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
         self._store._delete_backup_keychain_quiet(account_num, email)
@@ -811,9 +1099,18 @@ class ClaudeAccountSwitcher:
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
-        self, account_num: str, email: str, credentials: str
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
     ) -> None:
         """Write account credentials to backup, then invalidate the slot's session.
+
+        ``attributed`` is passed straight through to the store's own
+        attribution guard (``CredentialStore._write_account_credentials``):
+        pass it only when THIS call site has independently established that
+        ``credentials`` belongs to ``(account_num, email)`` (a uuid-verified
+        identity resolution, or a structural move/rotation of that same
+        account's own record) — never as a blanket default. See the store
+        method's docstring for what the guard refuses without it.
 
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
@@ -844,7 +1141,10 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
-        self._store._write_account_credentials(account_num, email, credentials)
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
+        self._store._write_account_credentials(
+            account_num, email, credentials, attributed=attributed
+        )
         try:
             self._post_backup_write(account_num, email)
         except OSError:
@@ -932,6 +1232,99 @@ class ClaudeAccountSwitcher:
         if not self._read_account_config(str(account_num), email):
             return False
         return True
+
+    def _config_naming_slot(
+        self, config: str, account_num: str, email: str
+    ) -> str:
+        """`config` with its `oauthAccount` set to the slot's own identity.
+
+        The inverse of the pin splice, for the moment a live config is
+        archived as a slot's backup. Returns the input unchanged on any
+        doubt — a backup that is merely stale beats one this could not parse.
+        """
+        try:
+            data = json.loads(config)
+            if not isinstance(data, dict) or "oauthAccount" not in data:
+                return config
+            # THE ROSTER FIRST, and this order is the whole correctness of
+            # the repair. Asking the slot's STORED config who it belongs to
+            # trusts a file that may already carry the pin: measured on a real
+            # backup, the lookup returned the pin, decided it already matched,
+            # and changed nothing. The roster is the index of which slot is
+            # whose; the stored config is only a fallback for a slot the
+            # roster has not caught up with.
+            row = (self._get_sequence_data() or {}).get(
+                "accounts", {}).get(str(account_num)) or {}
+            slot_email = row.get("email")
+            here = data["oauthAccount"]
+            # ALREADY OURS — LEAVE EVERY FIELD ALONE. Anything built from the
+            # roster is still a PARTIAL identity — it carries the uuid, the org
+            # and a name, while a real one also carries
+            # `organizationName`, `organizationRole` and `displayName`, and
+            # Claude Code identifies an account by the uuid. Comparing the
+            # whole dict to the synthesis can never be equal, so without this
+            # the rewrite fired on EVERY switch, pin or no pin, and the loss
+            # outlives the pin: nothing rewrites a backup afterwards.
+            slot_org = row.get("organizationUuid", "") or ""
+            if isinstance(here, dict) and slot_email and \
+                    here.get("emailAddress") == slot_email and \
+                    (here.get("organizationUuid") or "") == slot_org:
+                return config
+            own = None
+            if slot_email:
+                # It names someone else. The stored backup is the only place a
+                # FULL identity for this slot exists; the roster is the
+                # fallback when there is none.
+                stored = self._read_account_config(account_num, email)
+                if stored:
+                    # ITS OWN GUARD. This parse sits inside the function-wide
+                    # try, so a torn backup raised and the bare except handed
+                    # the config back UNCHANGED — under a pin, archiving the
+                    # pin. A bad backup must cost the full identity, not the
+                    # repair.
+                    try:
+                        _parsed = json.loads(stored)
+                    except (ValueError, TypeError):
+                        _parsed = None
+                    kept = (_parsed.get("oauthAccount")
+                            if isinstance(_parsed, dict) else None)
+                    # THE COMPOSITE. A backup that names the right address in
+                    # the wrong org is another slot's, or the pin's.
+                    if isinstance(kept, dict) and \
+                            kept.get("emailAddress") == slot_email and \
+                            (kept.get("organizationUuid") or "") == slot_org:
+                        own = kept
+                if own is None:
+                    # THE UUID IS IN THE ROSTER ROW, so do not synthesise an
+                    # identity without it. Claude Code identifies an account by
+                    # `accountUuid` and compares a stored bridge pointer
+                    # against it; a backup written with only the two keys hands
+                    # a later switch a config CC cannot compare, and nothing
+                    # rewrites a backup afterwards. `pin.identity_for_config`
+                    # already reads `row["uuid"]` for exactly this reason.
+                    own = {"emailAddress": slot_email,
+                           "organizationUuid": slot_org}
+                    if row.get("uuid"):
+                        own["accountUuid"] = row["uuid"]
+                    if row.get("organizationName"):
+                        own["organizationName"] = row["organizationName"]
+            else:
+                stored = self._read_account_config(account_num, email)
+                if stored:
+                    try:
+                        _parsed = json.loads(stored)
+                    except (ValueError, TypeError):
+                        _parsed = None
+                    own = (_parsed.get("oauthAccount")
+                           if isinstance(_parsed, dict) else None)
+            if not isinstance(own, dict) or not own:
+                return config
+            if here == own:
+                return config
+            data["oauthAccount"] = own
+            return json.dumps(data)
+        except Exception:  # noqa: BLE001 — never block a switch
+            return config
 
     def _write_account_config(
         self, account_num: str, email: str, config: str
@@ -1172,8 +1565,15 @@ class ClaudeAccountSwitcher:
             # separate old-key cleanup runs) or a stale file leaked by an
             # earlier crash. The old keys are cleared only after the commit
             # below, so the records never point at missing material.
+            # attributed=True: `creds_a`/`creds_b` were each just read from
+            # their OWN account's current slot (`num_a, email_a` /
+            # `num_b, email_b`) a few lines up under this same lock — a
+            # renumber of an account's own material, never another
+            # account's bytes.
             if creds_a:
-                self._write_account_credentials(num_b, email_a, creds_a)
+                self._write_account_credentials(
+                    num_b, email_a, creds_a, attributed=True
+                )
             else:
                 self._delete_account_credentials_strict(num_b, email_a)
             if config_a:
@@ -1181,7 +1581,9 @@ class ClaudeAccountSwitcher:
             else:
                 self._delete_config_backup(num_b, email_a)
             if creds_b:
-                self._write_account_credentials(num_a, email_b, creds_b)
+                self._write_account_credentials(
+                    num_a, email_b, creds_b, attributed=True
+                )
             else:
                 self._delete_account_credentials_strict(num_a, email_b)
             if config_b:
@@ -1398,7 +1800,13 @@ class ClaudeAccountSwitcher:
             try:
                 if original:
                     if kind == "creds":
-                        self._write_account_credentials(num, email, original)
+                        # attributed=True: `original` is exactly this same
+                        # (num, email) key's own pre-swap snapshot, read
+                        # earlier under this same lock — a restore, not a
+                        # cross-account write.
+                        self._write_account_credentials(
+                            num, email, original, attributed=True
+                        )
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:
@@ -1586,7 +1994,12 @@ class ClaudeAccountSwitcher:
             # earlier crash. The old key is cleared only after the commit
             # below, so the records never point at missing material.
             if creds:
-                self._write_account_credentials(target, email, creds)
+                # attributed=True: `creds` is `num_src`'s own material, read
+                # a few lines up under this same lock, moving to its new
+                # (empty, just-checked) slot number — not another account's.
+                self._write_account_credentials(
+                    target, email, creds, attributed=True
+                )
             else:
                 self._delete_account_credentials_strict(target, email)
             if config:
@@ -1933,12 +2346,11 @@ class ClaudeAccountSwitcher:
         the no-backup direct-activation path). Use :meth:`has_live_login` to
         tell the two ``None`` cases apart.
         """
-        identity = self._get_current_account()
+        identity = self._live_login_identity()
         if identity is None:
             return None
         data = self._get_sequence_data() or {}
-        email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        return self._find_account_slot(data, *identity)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -1956,9 +2368,19 @@ class ClaudeAccountSwitcher:
         For inactive accounts only — never routes to the active store. Mirrors
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
+
+        attributed=True: this is the cswap-pin compat path for a pin running
+        against a cswap that predates ``consume_backup_grant`` — the caller
+        already POSTed the refresh for THIS slot's own grant and is
+        persisting the successor it got back, the same shape as
+        ``_fetch_active_usage``'s attributed resync. Every genuine rotation
+        changes the refresh token (and so the fingerprint), so leaving this
+        unattested would refuse the routine call this method exists for.
         """
         with FileLock(self.lock_file):
-            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_credentials(
+                account_num, email, credentials, attributed=True,
+            )
 
     def account_identity(self, account_num: str) -> dict:
         """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""
@@ -2209,8 +2631,14 @@ class ClaudeAccountSwitcher:
                             # backup rt is already consumed. Resync so the
                             # slot's stored credential is the live lineage,
                             # then consume THAT.
+                            #
+                            # attributed=True: `profile` came from THIS
+                            # slot's own session directory and just passed
+                            # `session_identity_drifted`'s check against
+                            # `email`/`org_uuid` above — a verified identity,
+                            # not a bare claim.
                             self._write_account_credentials(
-                                account_num, email, profile
+                                account_num, email, profile, attributed=True
                             )
                             refresh_input = profile
                             input_oauth = prof_oauth
@@ -2272,7 +2700,27 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        def _condemned(fp: str) -> bool:
+            # This runs OUTSIDE any handler here (between the pre-consume
+            # window's own `except` above and the next `try` below), and
+            # `_lineage_key` -> `account_identity` -> `_get_sequence_data()`
+            # reads `sequence.json` with `strict=True` — a torn/unreadable
+            # file at this exact instant raises `ConfigError` straight
+            # through `try_refresh_oauth_credentials` (whose own `condemned`
+            # call is likewise unguarded) and `consume_backup_grant`
+            # (try/finally, no except), killing the whole collect pass. R1:
+            # unreadable is absence of evidence, never a refusal — caught
+            # here and reported as "no evidence" rather than left to raise.
+            try:
+                return self._probe_verdicts.get(
+                    self._lineage_key(account_num, email, fp)
+                ) is False
+            except Exception:
+                return False
+
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input, condemned=_condemned,
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -2349,8 +2797,15 @@ class ClaudeAccountSwitcher:
                         )
                         outcome_creds = store_now
                     else:
+                        # attributed=True: the CAS just above proved
+                        # `store_now`'s fingerprint still equals
+                        # `consumed_fp` — the exact lineage this refresh
+                        # grant was requested against — so the rotated
+                        # result belongs to this slot even though its
+                        # fingerprint necessarily differs after rotation.
                         self._write_account_credentials(
-                            account_num, email, result.credentials
+                            account_num, email, result.credentials,
+                            attributed=True,
                         )
             except LockError:
                 # The grant IS consumed — the successor must survive even
@@ -2584,7 +3039,14 @@ class ClaudeAccountSwitcher:
             # cannot raise past its own store write. Open-coding the split
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
-            self._write_account_credentials(account_num, email, creds)
+            #
+            # attributed=True: this row's `consumedFp` (checked above)
+            # matches the slot's CURRENT stored fingerprint — a CAS proving
+            # `creds` is this slot's own pending successor, not another
+            # account's stash entry.
+            self._write_account_credentials(
+                account_num, email, creds, attributed=True
+            )
             # Housekeeping, and non-fatal for the same reason: the slot is
             # advanced, so a raise would report a failed refresh for a
             # credential the store holds. A stale row is retried next pass or
@@ -2858,7 +3320,13 @@ class ClaudeAccountSwitcher:
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
                 return False
-            self._store._write_account_credentials(account_num, email, profile)
+            # attributed=True: `profile` came from THIS slot's own session
+            # directory (`_session_dir(account_num, email)`), never another
+            # slot's — a rotation of this account's own lineage, not a
+            # cross-slot write.
+            self._store._write_account_credentials(
+                account_num, email, profile, attributed=True
+            )
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
@@ -2983,6 +3451,233 @@ class ClaudeAccountSwitcher:
             oauth_account.get("accountUuid", "") or "",
         )
 
+    def _unattributed_live_login(
+        self, *, ask_server: bool, reason: str
+    ) -> "tuple[str, str] | None":
+        """Last resort when a witness `_live_login_identity` needs is missing.
+
+        Never the raw config identity: under a splice that value is the
+        pin's, and a witness gap has not established it is anything else.
+        Asks the oracle, the one independent read left; answers ``None``
+        when it too cannot say, matching `current_account_number`'s
+        "no guessed slot" guarantee.
+
+        Logged once per reason per process — the witness gap is a
+        persistent state, not an event, and every scheduled caller
+        (`_tick_inner`, the sleep shortener, a per-slot token check) would
+        otherwise re-log it every poll for as long as it stays there.
+        """
+        key = (reason, "", "live-login-unattributed")
+        warned = getattr(self, "_provenance_warned", None)
+        if warned is not None and key not in warned:
+            warned.add(key)
+            self._logger.warning(
+                "live login identity unattributed (%s); asking the oracle",
+                reason,
+            )
+        resolved = self._login_identity_from_the_oracle(ask_server=ask_server)
+        return (resolved[0], resolved[1]) if resolved is not None else None
+
+    def _forget_live_login_warnings(self) -> None:
+        """Clear the witness-gap dedupe keys on a clean resolution.
+
+        The gap is a persistent state; a discard's absence is a no-op, so
+        calling this on every attributed exit costs nothing and lets the
+        NEXT gap log again instead of staying silent forever once one has
+        fired (the same shape as `_fetch_active_usage` and
+        `_resync_rotated_backup`'s own discard on their clean exits).
+
+        ``getattr``, not `self._provenance_warned` directly: this runs on
+        `_live_login_identity`'s ordinary, most-taken exit, which many
+        tests reach through a bare `ClaudeAccountSwitcher.__new__` double
+        that skips `__init__` (and so never sets the attribute) because
+        the scenario under test has nothing to do with this dedupe.
+        """
+        warned = getattr(self, "_provenance_warned", None)
+        if warned is None:
+            return
+        for reason in ("no recorded active slot", "recorded slot has no email"):
+            warned.discard((reason, "", "live-login-unattributed"))
+
+    def _live_login_identity(
+        self, *, ask_server: bool = True
+    ) -> "tuple[str, str] | None":
+        """(email, org) of the LIVE LOGIN, which is not always what the file says.
+
+        `~/.claude.json`'s oauthAccount carries two facts now. Claude Code
+        reads it as the owner of any bridge it creates, and `_perform_switch`
+        writes the PINNED account there so a live Remote Control session
+        survives a rotation. cswap reads the same field to answer "who is
+        logged in", and after a rotation that answer is the pin.
+
+        TEN sites re-derived that answer from `_get_current_account()` plus
+        `_find_account_slot()`. Fixing them one at a time is how the second
+        was found after the first was fixed, so they ask this instead.
+
+        `_get_current_account` KEEPS its literal meaning — what the config
+        holds — because `_live_identity_matches` is a TOCTOU re-check that
+        must compare against the literal live value, and a caller re-reading
+        the config under a lock is asking a different question from a caller
+        asking who is logged in.
+
+        When the config names the pin, the roster is the other witness: the
+        switch updates `activeAccountNumber` in the SAME transaction that
+        writes the config, so it cannot lag. Anything else is returned
+        unchanged, so an UNMANAGED login still resolves to nothing — which is
+        the guarantee `current_account_number`'s docstring exists to keep.
+
+        `ask_server=False` for a caller inside the locks: the memo when it is
+        warm, the recorded slot when it is not. See the resolver it forwards to.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        email, org_uuid = identity
+        try:
+            # THE RECORD IS NOT THE ONLY WITNESS THAT A PIN IS WIRED. A torn
+            # or absent record reads identically to "nothing pinned" here;
+            # `apply_pin(None, ...)`'s clear ordering is a second way to
+            # reach the same state (it removes the record before it
+            # un-splices the config, and that un-splice can fail and never
+            # run). Either way, the wiring outliving the record means
+            # `identity` may still be a pin's forged value even though the
+            # record reads nothing pinned. `_config_names_the_pin` covers
+            # both witnesses and is shared with `add_account`, which must
+            # never disagree with this resolver over what counts as spliced.
+            spliced = self._config_names_the_pin(email, org_uuid)
+        except Exception:  # noqa: BLE001 — an optional extra cannot break this
+            return identity
+        # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
+        # genuine `claude /login` into a SAME-EMAIL sibling — a personal
+        # account at the address of an org one, which this codebase states is
+        # legitimate. That login rewrites `oauthAccount` without moving
+        # `activeAccountNumber`, so an email-only test read it as a splice and
+        # handed back the roster's slot: the refresh path then wrote the
+        # personal credential over the org account's stored backup.
+        # SPLICED, PINNED IDENTITY UNKNOWN falls through to the recorded-slot
+        # / local-credential resolution below rather than the oracle-or-None
+        # helper: that answers from local bytes with no network, and `None`
+        # here would send `_perform_switch_locked` down the no-backup
+        # direct-activation path, leaving the outgoing slot's stored backup
+        # stale (its rotation unrecorded) instead of updated.
+        if not spliced:
+            self._forget_live_login_warnings()
+            return identity
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None:
+            return self._unattributed_live_login(
+                ask_server=ask_server, reason="no recorded active slot"
+            )
+        slot = (data.get("accounts") or {}).get(str(recorded))
+        if not isinstance(slot, dict) or not slot.get("email"):
+            return self._unattributed_live_login(
+                ask_server=ask_server, reason="recorded slot has no email"
+            )
+        # A SPLICE MOVES THE CONFIG AND NOTHING ELSE. Logging in AS the pinned
+        # account writes the same value into `oauthAccount` -- and that login
+        # is the documented repair for a dead pin credential -- so the two
+        # states are identical in the config and have to be told apart
+        # somewhere else. The credential is where they differ: after a splice
+        # the roster's active account is still the one authenticated, after a
+        # login it is not. Without this, the repair path reaches `add_account`
+        # naming the ACTIVE slot, stores the pin's fresh credential there, and
+        # leaves the pin's own slot holding the dead one -- and
+        # `_repin_if_pin_slot_refreshed` then sees the wrong slot and skips.
+        self._forget_live_login_warnings()
+        if self._live_credential_is(str(recorded), slot["email"]) is False:
+            # Not the recorded slot's credential, and not thereby the pin's:
+            # a newer generation of the same account and a login as any other
+            # account look identical from here. The server says whose it is.
+            # When it cannot, the recorded slot stands: resolving to the pin
+            # sends the usage path to restore the pin's grant over a login it
+            # never attributed, which is a switch nobody asked for.
+            resolved = self._login_identity_from_the_oracle(
+                ask_server=ask_server
+            )
+            if resolved is not None:
+                return (resolved[0], resolved[1])
+        return (slot["email"], slot.get("organizationUuid", "") or "")
+
+    def _live_credential_is(self, num: str, email: str) -> "bool | None":
+        """Whether the credential in the live store is this slot's stored one.
+
+        THREE ANSWERS, and the third is the point. ``False`` means both stores
+        were read and neither token matched — positive evidence of a different
+        credential. ``None`` means one of them could not be read, which is an
+        ordinary state and not a mismatch: a Mac keychain that declines this
+        process reads as absent while the daemon above it reads the same slot
+        fine. Folding those two together would switch the un-splice off on
+        exactly the machines it was written for.
+
+        Compared on EITHER token, so rotating one of them does not read as a
+        different account. Measured against a seven-slot roster: the live pair
+        matched the roster's active slot on both tokens, and no other slot on
+        either.
+
+        NEVER RAISES: it runs on the path that answers "who is logged in".
+        """
+        def _oauth(blob):
+            if isinstance(blob, str):
+                blob = json.loads(blob)
+            return ((blob or {}).get("claudeAiOauth") or {})
+
+        # THE STORE FIRST, the plaintext file second. On macOS the live
+        # credential may be in the Keychain with no file at all, and the file
+        # read then raises -- so this answered None on every call, and the
+        # tri-state's two consumers went quiet in OPPOSITE directions
+        # (`is True` never fires, `is False` never fires).
+        #
+        # `degraded`, NOT `keychain_unavailable`. The latter is hard-coded
+        # False on the one arm that matters here -- a failed Keychain read
+        # COVERED by the plaintext file -- so it is absent exactly when there
+        # is a value to compare, and those bytes are a stale generation
+        # because Claude Code rotates keychain-only. Comparing them answers
+        # `False`, a mismatch, about the account that IS logged in. `degraded`
+        # is set on every arm the other flag is, so nothing is lost by it.
+        #
+        # The file stays as the fallback because not every caller holds a
+        # fully built switcher: the seam is reached from `pin.py` with an
+        # instance that has a config reader and no credential store.
+        raw = None
+        try:
+            active = self._read_active_credentials()
+            if active.degraded:
+                return None
+            raw = active.value or None
+        except Exception:  # noqa: BLE001 — no store here; try the file
+            raw = None
+        try:
+            if raw is None:
+                raw = get_credentials_path().read_text(encoding="utf-8")
+            live = _oauth(json.loads(raw))
+        except Exception:  # noqa: BLE001 — unreadable is not a mismatch
+            return None
+        try:
+            mine = _oauth(self.read_account_credentials(num, email))
+        except Exception:  # noqa: BLE001 — unreadable is not a mismatch
+            return None
+        if not live or not mine:
+            return None
+        for key in ("refreshToken", "accessToken"):
+            if live.get(key) and live.get(key) == mine.get(key):
+                return True
+        # A refresh rotates BOTH tokens; the lineage stamp survives it, to
+        # within a second: Claude Code writes it back as now + the server's
+        # refresh_token_expires_in, so it jitters by the seconds the server
+        # truncated and the milliseconds the client added. Measured on one
+        # host, three slots' backups against their previous generation: 105,
+        # 377 and 819 ms apart; equality read all three as a different login
+        # and flipped the resolver. A fresh login is minutes to weeks away.
+        try:
+            live_at = float(live.get("refreshTokenExpiresAt") or 0)
+            mine_at = float(mine.get("refreshTokenExpiresAt") or 0)
+        except (TypeError, ValueError):
+            return False
+        if live_at and mine_at and abs(live_at - mine_at) <= _LINEAGE_STAMP_JITTER_MS:
+            return True
+        return False
+
     def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
         """Whether the live config identity is (email, org_uuid) right now.
 
@@ -2992,8 +3687,19 @@ class ClaudeAccountSwitcher:
         and a mismatch means the live store is no longer the caller's account
         — nothing there is its to adopt, consume, or overwrite. Compares the
         organization too: two managed slots may share an email across orgs.
+
+        Asks `_live_login_identity`, not the config field directly. The splice
+        writes the pin there and it STAYS, so a literal read answers False for
+        the account that is logged in on every pass, not for a race window —
+        which silently disabled the rotated-backup resync and deferred the
+        usage fetch to USAGE_TOKEN_EXPIRED. It still detects a switch or a
+        /login landing in the gap, because both move the roster inside the
+        same critical section.
+
+        NO NETWORK: every caller holds Claude Code's credential lock, so the
+        resolver is asked memo-only.
         """
-        identity = self._get_current_account()
+        identity = self._live_login_identity(ask_server=False)
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(
@@ -3123,6 +3829,23 @@ class ClaudeAccountSwitcher:
         now = self._get_current_identity_triple()
         if now == verified:
             return
+        # A PIN GIVES THIS FIELD A SECOND WRITER. The switch splices the pinned
+        # identity in and the daemon's carry writes the account now signed in,
+        # so it swings between the two with nobody logging in -- and a guard
+        # that refuses on any difference refuses on the swing, advising a re-run
+        # that has the same odds because nothing is in flight.
+        #
+        # ASKED THROUGH THE SEAM, and False whenever it cannot tell: this answer
+        # only ever SUPPRESSES a refusal, and a refusal writes nothing. A
+        # machine without the extra keeps the strict guard, which is the right
+        # default when there is no second writer to explain the move.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.identity_move_is_not_a_login(self, verified, now):
+                return
+        except Exception:  # noqa: BLE001 — an optional extra cannot add a refusal
+            pass
         raise ConfigError(
             f"The active account changed while {verified[0]} was being "
             f"verified (now {(now[0] if now else '') or 'unknown'}). Nothing "
@@ -3479,6 +4202,108 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def _repin_if_pin_slot_refreshed(self, account_num: str) -> None:
+        """Re-apply the pin when an add refreshed the PINNED slot's credential.
+
+        Logging in again and re-adding the account is how a dead pin credential
+        gets replaced, but the daemon serving now has already published that it
+        cannot mint and nothing re-asks it. Without this the active account
+        comes back and the pin does not, until someone re-pins by hand.
+
+        Only ``is False``. ``None`` is "cannot tell", and recycling a healthy
+        daemon restarts it under live sessions for nothing.
+
+        Never raises and never returns a failure: the account IS added by the
+        time this runs, so an unrepaired pin must not report the add as failed.
+        """
+        try:
+            from claude_swap import pin as _pin
+
+            if not _pin.is_available():
+                return
+            if _pin.pinned_slot(self) != str(account_num):
+                return
+            if _pin.pin_is_applying(self) is not False:
+                return
+            if _pin.repin_current(self):
+                print(f"{accent('Re-applied')} the cloud pin.")
+            else:
+                # NOT `--heal`: it declines a daemon that IS serving, which is
+                # exactly this state. Naming the slot is the command that works.
+                warning(
+                    "The cloud pin is set but the daemon serving now cannot "
+                    f"mint it. Run `cswap pin {account_num}` to re-apply it."
+                )
+        except Exception:  # noqa: BLE001 — the add already succeeded
+            self._logger.debug("post-add re-pin skipped", exc_info=True)
+
+    def _config_names_the_pin(self, email: str, org_uuid: str) -> bool:
+        """Whether ``.claude.json``'s identity is a pin splice right now.
+
+        Two witnesses, not one: the record itself, or -- when it is silent --
+        the wiring outliving it (a witness gap resolves the same way a
+        genuine splice does). Shared with `_live_login_identity`, which
+        calls this instead of duplicating it: `add_account`'s own splice
+        guards must never disagree with the resolver over what counts as
+        spliced, or a witness gap sends one down the honest oracle-or-refuse
+        path while the other still reads the raw config and finds a
+        mismatch it blames on the pin.
+        """
+        try:
+            from claude_swap import pin as _pin
+            pinned = _pin.pinned_identity(self)
+            if pinned is None:
+                return _pin._wiring_present(self)
+            return (email, org_uuid or "") == pinned
+        except Exception:  # noqa: BLE001 -- an optional extra cannot decide this
+            return False
+
+    def _login_identity_from_the_oracle(
+        self, *, ask_server: bool = True
+    ) -> "tuple[str, str, str] | None":
+        """``(email, org_uuid, account_uuid)`` of the account that owns the
+        live credential, from the server, or ``None`` when it cannot be read
+        or resolved. Asked when the config names the pin, which is the one
+        state where the config cannot answer for a /login.
+
+        ``ask_server=False`` answers from the memo and never from the network:
+        `fetch_oauth_profile` may not be called while a credential or config
+        lock is held, and both under-lock callers reach here through
+        `_live_login_identity`. A cold memo then falls back to the recorded
+        slot, which is what those callers read before this fetch existed.
+        """
+        try:
+            creds = self._read_capture_credentials()
+            token = oauth.extract_access_token(creds) if creds else None
+        except Exception:  # noqa: BLE001 -- unreadable resolves nothing
+            return None
+        if not token:
+            return None
+        # One answer per credential: the resolver asks on every call and the
+        # same bytes always have the same owner. A failure is not remembered.
+        answers = self.__dict__.setdefault("_oracle_answers", {})
+        key = oauth.credential_fingerprint(creds)
+        if key in answers:
+            return answers[key]
+        if not ask_server:
+            return None
+        try:
+            resolved = oauth.fetch_oauth_profile(token)
+        except Exception:  # noqa: BLE001 -- unreachable resolves nothing
+            return None
+        if not resolved or not resolved.get("uuid") or not resolved.get("email"):
+            return None
+        answer = (
+            resolved["email"],
+            resolved.get("organizationUuid") or "",
+            resolved["uuid"],
+        )
+        if key:
+            if len(answers) > 32:
+                answers.clear()
+            answers[key] = answer
+        return answer
+
     def add_account(
         self,
         slot: int | None = None,
@@ -3512,6 +4337,66 @@ class ClaudeAccountSwitcher:
         if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
+        # THE CONFIG MAY NAME THE PIN RATHER THAN THE LOGIN, and every name
+        # below is taken from it. Under a splice the row would be written as the
+        # pin's, `_find_account_slot` would then match nothing, and the live
+        # login would be left unmanaged.
+        #
+        # ASKED BESIDE THE TRIPLE, NEVER INSTEAD OF IT. The triple is what
+        # `_reject_identity_drift_since_verify` compares against, and its own
+        # comment forbids rebuilding it out of unpacked names — an un-spliced
+        # email and org beside a literal uuid describe no real account. So the
+        # read stays literal and single, and the pin question is a separate
+        # refusal over it.
+        #
+        # AND HERE, NOT AT THE UUID. Placed at the `oauthAccount` read further
+        # down it guarded only the create path, while the refresh-in-place path
+        # above returns long before reaching it — carrying the same forged
+        # names into `_write_account_credentials`.
+        #
+        # REFUSING WHEN NOBODY CAN NAME THE LOGIN: the roster records the email
+        # and the org, but on this machine `accountUuid` is only in the config
+        # the pin overwrote. The server is asked for it first, below; a row
+        # nobody can find is worse than a command that stops and says why.
+        spliced = False
+        # THE CONFIG CANNOT NAME A /login WHILE IT NAMES THE PIN. The splice
+        # writes the pinned account there and the daemon's carry keeps it
+        # there, so after a bare /login the file still says the pin and the
+        # roster still says the slot the last switch chose; every name below
+        # would then be the pin's, and the live credential another account's.
+        # The server knows whose the credential is, and the profile the token
+        # resolves to carries the email, the org and the uuid the roster keys
+        # on -- the same uuid `_reject_foreign_credential_capture` checks the
+        # token against below. Measured 2026-09-02 on both Macs: a /login as
+        # slot 2 under the pin, `cswap add` refused as "does not belong to
+        # <pin>", and the login reached its slot only through a failover.
+        if self._config_names_the_pin(current_email, current_org_uuid):
+            self._refuse_degraded_capture()
+            resolved = self._login_identity_from_the_oracle()
+            if resolved is None:
+                raise ConfigError(
+                    "The cloud pin is rewriting this machine's account "
+                    "identity, and the server could not say whose the live "
+                    "credential is, so the account you are adding cannot be "
+                    "read correctly. Run `cswap pin --clear`, add the "
+                    "account, then re-pin."
+                )
+            if resolved != identity:
+                identity = resolved
+                current_email, current_org_uuid, current_account_uuid = identity
+                spliced = True
+        # Resolved above, the triple IS the live login; the guard below then
+        # compares it with itself and stays quiet, as it must.
+        live_login = (current_email, current_org_uuid) if spliced \
+            else self._live_login_identity()
+        if live_login is not None and live_login != (current_email, current_org_uuid):
+            self._refuse_degraded_capture()
+            raise ConfigError(
+                "The cloud pin is rewriting this machine's account identity, "
+                "so the account you are adding cannot be read correctly "
+                "(its accountUuid is not recoverable while the pin is set). "
+                "Run `cswap pin --clear`, add the account, then re-pin."
+            )
 
         # When no slot specified and account already exists, refresh credentials in place
         if slot is None and self._account_exists(current_email, current_org_uuid):
@@ -3557,10 +4442,25 @@ class ClaudeAccountSwitcher:
             # describes no real account -- so the guard would compare it against
             # a fresh read, never match, and refuse every time instead of only
             # on a race.
-            self._reject_identity_drift_since_verify(identity)
+            if not spliced:
+                self._reject_identity_drift_since_verify(identity)
 
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
+            # attributed=True: `current_creds` already passed
+            # `_reject_foreign_credential_capture` (an oracle-verified uuid
+            # check) above, and `account_num` was found FROM that same
+            # verified identity — not an external claim.
+            self._write_account_credentials(
+                account_num, current_email, current_creds, attributed=True
+            )
+            # UN-SPLICE IT, like the archive in `_perform_switch`. This
+            # is the same kind of write — a live config kept as a slot's
+            # backup — and under a pin the raw blob names the pin, which
+            # outlives it because nothing rewrites a backup afterwards.
+            self._write_account_config(
+                account_num, current_email,
+                self._config_naming_slot(
+                    current_config, account_num, current_email),
+            )
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
             )
@@ -3578,6 +4478,7 @@ class ClaudeAccountSwitcher:
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
             )
+            self._repin_if_pin_slot_refreshed(account_num)
             return
 
         # Determine slot number and collect confirmation decisions
@@ -3678,8 +4579,13 @@ class ClaudeAccountSwitcher:
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
+        if spliced:
+            # Under a splice those three name the pin; the login is the triple.
+            account_uuid, organization_uuid = current_account_uuid, current_org_uuid
+            organization_name = ""
 
-        self._reject_identity_drift_since_verify(identity)
+        if not spliced:
+            self._reject_identity_drift_since_verify(identity)
 
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
@@ -3691,6 +4597,12 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            # `--slot N` reaches `_delete_account_files` through a different
+            # door than `remove_account`, and the pin can be naming what it
+            # destroys. A migration is NOT this: the account survives at
+            # another slot, and the pin is matched on the identity, not the
+            # number, so it stays valid.
+            self._clear_pin_if_removed(d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -3702,7 +4614,18 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, data)
 
         # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
+        #
+        # attributed=True: `current_creds` already passed
+        # `_reject_foreign_credential_capture` (an oracle-verified uuid
+        # check) above — the same attestation as the refresh-in-place path.
+        self._write_account_credentials(
+            account_num, current_email, current_creds, attributed=True
+        )
+        # NO UN-SPLICE HERE, AND IT NEEDS NONE. This slot's roster row is
+        # written just below, so `_config_naming_slot` would find nothing
+        # to name it with. What protects this line is the refusal beside
+        # the identity capture above: a config the pin has rewritten
+        # cannot reach it.
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (current_email, organization_uuid)}
@@ -3732,6 +4655,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        self._repin_if_pin_slot_refreshed(account_num)
 
     def add_account_from_token(
         self,
@@ -3823,7 +4747,13 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(account_num, email, credentials)
+            # attributed=True: a raw token carries no identity to verify
+            # against (no oracle call is made for it); `account_num` was
+            # found FROM this same `email`, and this is the refresh-in-place
+            # branch for that exact account.
+            self._write_account_credentials(
+                account_num, email, credentials, attributed=True
+            )
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
@@ -3840,6 +4770,7 @@ class ClaudeAccountSwitcher:
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
+            self._repin_if_pin_slot_refreshed(account_num)
             return
 
         displace_slot = None
@@ -3897,6 +4828,12 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            # `--slot N` reaches `_delete_account_files` through a different
+            # door than `remove_account`, and the pin can be naming what it
+            # destroys. A migration is NOT this: the account survives at
+            # another slot, and the pin is matched on the identity, not the
+            # number, so it stays valid.
+            self._clear_pin_if_removed(d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -3907,7 +4844,13 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
-        self._write_account_credentials(account_num, email, credentials)
+        # attributed=True: `account_num` is either auto-assigned (a fresh
+        # slot) or the exact slot the caller named via ``--slot`` (displaced/
+        # migrated above, with an explicit overwrite confirmation when
+        # occupied); a raw token has no identity to verify against.
+        self._write_account_credentials(
+            account_num, email, credentials, attributed=True
+        )
         self._write_account_config(account_num, email, config)
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
         # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
@@ -3940,6 +4883,56 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        self._repin_if_pin_slot_refreshed(account_num)
+
+    def _clear_pin_if_removed(self, email: str, org_uuid: str) -> None:
+        """Clear the cloud pin when the account it names is the one going away.
+
+        A pin that outlives its account is silent: `ensure_proxy` resolves the
+        slot, finds nothing and starts no proxy, while `settings.json` still
+        says pinned and the TUI still draws the Cloud row. Removal is the one
+        moment cswap knows the pin's subject just ceased to exist.
+
+        MATCHED ON THE COMPOSITE. Two slots may share one address across
+        organizations, and `remove_account` already holds the org when it
+        calls this -- so address-only was not a safe direction, it was a
+        discarded fact that unpinned a live account whenever its same-email
+        sibling was removed.
+
+        NOT GATED ON THE PACKAGE. `_pinned_email_now` reads cswap's OWN
+        settings.json and `clear_pin` works with `cswap_pin` absent, so an
+        availability check turned this off on exactly the machine where a
+        leftover record has nothing else to remove it.
+        """
+        try:
+            from claude_swap import pin as _pin
+
+            pinned = _pin._pinned_email_now(self)
+            if not pinned:
+                return
+            if (pinned[0] or "") != email or (pinned[1] or "") != (org_uuid or ""):
+                # THE COLLISION SPEAKS, the rest stays quiet. Two slots sharing
+                # one address across organizations is the whole reason this
+                # matches on the composite, and it is also the one case where
+                # the silence reads as "the clear did not run": the user
+                # removed the account they can see and the pin still names that
+                # address. A different address needs no word.
+                if (pinned[0] or "") == email:
+                    warning(
+                        f"Cloud pin: still on {email}, which is a different "
+                        f"organization from the slot just removed — that pin "
+                        f"is live, not a leftover"
+                    )
+                return
+            ok, msg = _pin.clear_pin(self)
+            warning(f"Cloud pin: {msg}")
+        except Exception as exc:  # noqa: BLE001 — removal already succeeded
+            # The account IS gone; failing here would report a removal that
+            # happened as an error. Say what was left behind instead.
+            warning(
+                f"the cloud pin still names {email}, which was just removed "
+                f"({exc}); run `cswap pin --clear`"
+            )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -4028,6 +5021,10 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        # AFTER the roster write, not before: the pin's own clear re-reads the
+        # roster, and clearing first would have it resolve a slot that is still
+        # there.
+        self._clear_pin_if_removed(email, account_info.get("organizationUuid", ""))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
@@ -4038,7 +5035,12 @@ class ClaudeAccountSwitcher:
         other slot reads its backup copy.
         """
         data = self._get_sequence_data_migrated() or {}
-        current_identity = self._get_current_account()
+        # THE LIVE LOGIN, not what the file literally says: this drives
+        # `is_active`, which is the `(active)` marker in `cswap list` and
+        # the `active` flag in `list --json`. Reading the config alone
+        # tells the user the PIN is their active account while another
+        # slot serves every request.
+        current_identity = self._live_login_identity()
 
         # Find active account number by (email, organizationUuid) composite key
         active_num = None
@@ -4068,6 +5070,29 @@ class ClaudeAccountSwitcher:
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _recovery_may_write_live(
+        self, account_num: str, refresh_input: str, live: str
+    ) -> bool:
+        """The live store is the roster's active slot's. A grant refreshed
+        from the live credential goes back where it came from; another
+        slot's backup may not, or the machine changes login with no switch
+        recorded and the roster still naming the old slot."""
+        if refresh_input == live:
+            return True
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None or str(recorded) == str(account_num):
+            return True
+        key = (account_num, "", "not-the-active-slot")
+        if key not in self._provenance_warned:
+            self._provenance_warned.add(key)
+            self._logger.warning(
+                "Account-%s's credential was refreshed for its backup only: "
+                "the roster's active slot is %s, and the live store is that "
+                "slot's to keep.", account_num, recorded,
+            )
+        return False
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
@@ -4158,12 +5183,28 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
-                    if self._probe_verdicts and self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(creds) or "",
-                        )
-                    ) is False:
+
+                    def _confirmed_foreign() -> bool:
+                        # Same shape as `_consume_backup_grant_locked`'s
+                        # `_condemned`: this runs outside the locked `try`
+                        # below, and `_lineage_key` reads `sequence.json`
+                        # with `strict=True`, raising `ConfigError` on a
+                        # torn/unreadable file. R1: unreadable is absence of
+                        # evidence, never a refusal — caught here instead of
+                        # escaping uncaught through `_fetch_active_usage`
+                        # (whose caller, `_fetch_account_usage`, promises
+                        # never to raise) and killing the whole collect pass.
+                        try:
+                            return self._probe_verdicts.get(
+                                self._lineage_key(
+                                    account_num, email,
+                                    oauth.credential_fingerprint(creds) or "",
+                                )
+                            ) is False
+                        except Exception:
+                            return False
+
+                    if self._probe_verdicts and _confirmed_foreign():
                         # The probe just proved the served credential is
                         # another account's: its quota is not this slot's,
                         # and recording it would poison history and switch
@@ -4354,8 +5395,12 @@ class ClaudeAccountSwitcher:
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
                         try:
+                            # attributed=True: the condition just above IS
+                            # the guard's own rule (an oracle-verified
+                            # `live_verdict`, or a fingerprint match against
+                            # the slot's own backup).
                             self._write_account_credentials(
-                                account_num, email, live
+                                account_num, email, live, attributed=True
                             )
                         except Exception:
                             self._logger.warning(
@@ -4477,8 +5522,26 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
+                        def _condemned(fp: str) -> bool:
+                            # Same shape as `_consume_backup_grant_locked`'s
+                            # `_condemned`: `_lineage_key` reads
+                            # `sequence.json` with `strict=True` and raises
+                            # `ConfigError` on a torn/unreadable file. R1:
+                            # unreadable is absence of evidence, never a
+                            # refusal — caught here instead of escaping to
+                            # this call's own blanket `except Exception`
+                            # (below), which would otherwise defer a live
+                            # refresh for one pass on no evidence at all.
+                            try:
+                                return self._probe_verdicts.get(
+                                    self._lineage_key(account_num, email, fp)
+                                ) is False
+                            except Exception:
+                                return False
+
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0,
+                            condemned=_condemned,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -4540,7 +5603,17 @@ class ClaudeAccountSwitcher:
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
-                            return FetchRecord(error="refresh-failed")
+                            # "foreign-lineage" keeps its own identity here
+                            # too (mirrors try_fetch_usage_for_account's own
+                            # retry-branch treatment) — collapsing it to the
+                            # generic "refresh-failed" hides the one signal
+                            # this round exists to produce. No strike either
+                            # way: struck_fp is only set in the branch above.
+                            return FetchRecord(
+                                error=result.error
+                                if result.error == "foreign-lineage"
+                                else "refresh-failed"
+                            )
                         working = result.credentials
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
@@ -4563,8 +5636,12 @@ class ClaudeAccountSwitcher:
                     backup_ok = live_ok = True
                     if restore_source is None:
                         try:
+                            # attributed=True: `working` is either our own
+                            # POST's result (self-attributed, see above) or
+                            # `restore_source`'s exact bytes for this same
+                            # slot — never another account's.
                             self._write_account_credentials(
-                                account_num, email, working
+                                account_num, email, working, attributed=True
                             )
                         except Exception:
                             backup_ok = False
@@ -4580,7 +5657,14 @@ class ClaudeAccountSwitcher:
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
                         with claude_config_lock():
-                            self._write_credentials(working)  # active store — CC reads this
+                            # A REFUSAL IS A DEFERRAL: it leaves the live
+                            # store on bytes this pass judged unusable, which
+                            # is the state the guard below reports.
+                            live_ok = self._recovery_may_write_live(
+                                account_num, refresh_input, live
+                            )
+                            if live_ok:
+                                self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(
@@ -4751,7 +5835,12 @@ class ClaudeAccountSwitcher:
                     == oauth.credential_fingerprint(creds)
                 ):
                     return
-                self._write_account_credentials(account_num, email, live)
+                # attributed=True: the oracle above (`_resolved_matches_slot_identity`)
+                # already positively verified this lineage belongs to
+                # `account_num`'s identity, re-checked under this lock.
+                self._write_account_credentials(
+                    account_num, email, live, attributed=True
+                )
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",
@@ -5630,7 +6719,8 @@ class ClaudeAccountSwitcher:
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
-        identity = self._get_current_account()
+        # THE LIVE LOGIN — this payload reports who is active.
+        identity = self._live_login_identity()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, current_org_uuid = identity
@@ -5693,7 +6783,9 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
-        identity = self._get_current_account()
+        # THE LIVE LOGIN — this prints who is active, and the identity file
+        # names the PIN after a rotation. See `_live_login_identity`.
+        identity = self._live_login_identity()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
@@ -5849,7 +6941,10 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        identity = self._get_current_account()
+        # THE LIVE LOGIN. This decides which slot is being switched AWAY
+        # from; the identity file names the PIN after a rotation, so reading
+        # it directly would treat the pinned slot as the outgoing one.
+        identity = self._live_login_identity()
 
         # Ensure org fields are migrated before checking composite key
         self._get_sequence_data_migrated()
@@ -6266,7 +7361,7 @@ class ClaudeAccountSwitcher:
         # reconcile it.
         provenance: dict | None = None
         if not force and data:
-            identity = self._get_current_account()
+            identity = self._live_login_identity()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
                 if cur_slot == target_account:
@@ -6396,7 +7491,9 @@ class ClaudeAccountSwitcher:
         result["live"] = live
         if not live:
             return result
-        identity = self._get_current_account()
+        # THE LIVE LOGIN: the slot read below is the one whose stored
+        # credential should match what is live.
+        identity = self._live_login_identity()
         if identity is None:
             return result
         data = self._get_sequence_data() or {}
@@ -6573,6 +7670,7 @@ class ClaudeAccountSwitcher:
         reason: str,
         current_account: str,
         resolved: dict | None,
+        consumed_fp: str | None = None,
     ) -> str:
         """Preserve an unowned live credential before it is overwritten.
 
@@ -6580,6 +7678,25 @@ class ClaudeAccountSwitcher:
         live store (the bytes may be the only live copy of some account's
         refresh token). The logged evidence doubles as the instrumentation for
         identifying what wrote the credential (#117's writer is unidentified).
+
+        ``consumed_fp``, when given, is the fingerprint of the SLOT'S OWN
+        stored backup at stash time — the generation this stash supersedes.
+        It lets `_adopt_stashed_successor` install the stash back into that
+        slot once its own backup grant is next consumed, the way an ordinary
+        `own-rotated` resync would have.
+
+        No call site passes it today, including the "unresolved" arm: a CAS
+        match on `configSlot`+`consumedFp` only proves the slot has not moved
+        since the stash, never that the bytes belong to it, and `unresolved`
+        means ownership was never verified in the first place. Passing it
+        there made an unresolved stash adoptable by construction the instant
+        it was written — the exact incident this stash exists to prevent,
+        one step later. An unresolved stash must never be made adoptable; it
+        is left stranded until a manual `cswap add` confirms it. A future
+        caller must independently re-verify ownership at ADOPTION time
+        (inside `_adopt_stashed_successor`, under the slot's lock, against a
+        fresh oracle call or a fresh CAS against the ACTIVE store) before
+        this parameter is used for anything.
         """
         creds_mtime: str | None = None
         try:
@@ -6603,6 +7720,7 @@ class ClaudeAccountSwitcher:
             {
                 "reason": reason,
                 "configSlot": current_account,
+                "consumedFp": consumed_fp,
                 "fingerprint": oauth.credential_fingerprint(original_creds),
                 "liveOauthAccount": live_oauth_account,
                 "resolvedIdentity": resolved,
@@ -6682,6 +7800,37 @@ class ClaudeAccountSwitcher:
         )
 
     def _perform_switch(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+        provenance: dict | None = None,
+    ) -> dict:
+        """Switch, then re-ask the org-policy question. See the body below.
+
+        THE REFRESH IS NETWORK I/O AND THE BODY HOLDS THREE LOCKS -- two of
+        them Claude Code's own, which it blocks on during a credential
+        refresh -- so it cannot live inside. It cannot live at the end of the
+        body either: that body has TWO exits, and the direct-activation branch
+        (`force_activate`, a fresh machine, post-import, an unmanaged live
+        login) returns from inside the lock scope. A tail call reaches the
+        ordinary rotation only, and no test could see the difference because
+        every policy test drives a roster-matching live login.
+
+        Deliberately NOT `try`/`finally`: a switch that raised has rolled back,
+        and refreshing then writes a policy answer for an account the machine
+        is no longer on.
+        """
+        result = self._perform_switch_locked(
+            target_account,
+            emit_output=emit_output,
+            force_activate=force_activate,
+            provenance=provenance,
+        )
+        self._refresh_policy_cache()
+        return result
+
+    def _perform_switch_locked(
         self,
         target_account: str,
         emit_output: bool = True,
@@ -6785,12 +7934,34 @@ class ClaudeAccountSwitcher:
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
-            current_identity = self._get_current_account()
+            # The outgoing credential lives in `.credentials.json`, which
+            # the pin never touches, so it belongs to the roster's active
+            # account — not to whoever the identity file names.
+            #
+            # Memo-only, per the no-network rule above: the prefetch resolved
+            # this outside the locks, and `force_activate` skips that prefetch.
+            current_identity = self._live_login_identity(ask_server=False)
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                candidate_slot = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+                # AN IDENTITY FILE CLAIM IS NOT A VERIFICATION. An incident
+                # on 2026-09-07 traced a re-login-forcing credential wipe to
+                # exactly this line: the config's oauthAccount named slot 1
+                # while the roster's real active slot (6) still held the
+                # live credential, and this override took slot 1's word for
+                # it uncontested. Only trust the override when either the
+                # pre-lock oracle actually resolved the live bytes' owner
+                # (`provenance["resolved"]`), or the candidate slot's own
+                # stored backup already matches the live bytes (byte or
+                # refresh-token lineage) — an unmanaged/unresolved candidate
+                # is left as `None` unchanged, which already routes to the
+                # direct-activation path's own stash.
+                if candidate_slot is None or provenance.get("resolved") is not None or (
+                    self._live_matches_slot_backup(candidate_slot, current_email)
+                ):
+                    current_account = candidate_slot
 
             config_path = self._get_claude_config_path()
 
@@ -6828,6 +7999,27 @@ class ClaudeAccountSwitcher:
                 target_oauth = target_config_data.get("oauthAccount")
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
+                # THE IDENTITY FILE NAMES THE PIN WHILE ONE IS SET, and that
+                # is what keeps Remote Control alive across this switch.
+                # Claude Code takes a live bridge's OWNER from this field at
+                # creation and compares it on every rotation against what
+                # `/api/oauth/validate` answers — which the pin swaps — so an
+                # owner frozen as whichever account happened to be active
+                # tears the bridge down.
+                #
+                # Inference is NOT affected: it authenticates from
+                # `.credentials.json`, which still follows the switch. This
+                # field is identity, not authority. Anything that needs the
+                # ACTIVE account reads `activeAccountNumber` from
+                # sequence.json, which no pin touches.
+                #
+                # ASK THE SEAM, DO NOT COMPUTE IT: resolving the pinned slot
+                # and reading its stored identity is pin policy, and doing it
+                # here also meant reaching a PRIVATE of pin.py.
+                from claude_swap import pin as _pin
+
+                pin_oauth = _pin.identity_for_config(self)
+                identity_oauth = pin_oauth or target_oauth
 
                 # Snapshot live state so a mid-operation failure can be
                 # undone, config identity or not: a wiped or half-written
@@ -6931,7 +8123,7 @@ class ClaudeAccountSwitcher:
                         # falsy form sent it down the salvage branch and told
                         # the user it "could not be parsed", which is the same
                         # ""-vs-None conflation this branch exists to separate.
-                        existing_config["oauthAccount"] = target_oauth
+                        existing_config["oauthAccount"] = identity_oauth
                         self._write_json(config_path, existing_config)
                     else:
                         if config_path.exists():
@@ -6939,6 +8131,16 @@ class ClaudeAccountSwitcher:
                                 config_path, emit_output, warnings_out
                             )
                             del salvage
+                        # THE OTHER WRITE, and it bypassed the pin. This
+                        # branch writes the target's WHOLE stored config —
+                        # `oauthAccount` included — so splicing the pin into
+                        # the sibling branch alone left the identity naming
+                        # the account being switched to whenever the live
+                        # config was absent or unreadable. The two branches
+                        # are alternatives of one call and both carry it.
+                        if pin_oauth:
+                            target_config_data = dict(target_config_data)
+                            target_config_data["oauthAccount"] = identity_oauth
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
@@ -6966,6 +8168,13 @@ class ClaudeAccountSwitcher:
                             )
                     raise
 
+                # AFTER the rollback block, so a carry can never undo a
+                # switch that succeeded. Claude Code refuses to reattach a
+                # session whose persisted bridge owner no longer matches the
+                # config just written; the package's daemon carries those
+                # pointers on noticing the move, but only while it is running.
+                _pin.carry_live_pointers()
+
                 if force_activate and current_identity is not None:
                     self._logger.info(
                         f"Activated account {target_account} "
@@ -6989,8 +8198,26 @@ class ClaudeAccountSwitcher:
                 )
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
-            current_email, _ = current_identity
-            from_ref = account_ref(int(current_account), current_email)
+            # NOT `current_identity[0]`: when the override above was
+            # rejected, that email is the identity file's unverified claim
+            # (e.g. slot 1's), while `current_account` correctly stayed the
+            # roster's real active slot (e.g. 6) -- pairing the two would
+            # feed `_classify_outgoing_credential` a (slot, email) pair
+            # assembled from two different sources, so its backup lookup
+            # for the REAL slot misses (keyed on the wrong email) and a
+            # genuine own-rotation falls through to "unresolved" and is
+            # stashed as unclaimed instead of landing in its slot. The
+            # account's own stored email is right either way: when the
+            # override WAS accepted, `current_account` is the slot
+            # `_find_account_slot` matched on this exact email, so the two
+            # already agree.
+            try:
+                current_email = data["accounts"][current_account]["email"]
+                from_ref = account_ref(int(current_account), current_email)
+            except (KeyError, ValueError, TypeError):
+                raise AccountNotFoundError(
+                    f"Account-{current_account} does not exist"
+                ) from None
 
             # Create transaction for rollback capability
             try:
@@ -7020,6 +8247,23 @@ class ClaudeAccountSwitcher:
                 original_email=current_email,
                 config_path=config_path,
             )
+
+            # UN-SPLICE BEFORE IT IS ARCHIVED. The backup writes below store
+            # this blob as the OUTGOING slot's config, and under a pin its
+            # `oauthAccount` is the pin's — stored that way it outlives the
+            # pin. Done here rather than in `_write_account_config`, which
+            # also moves configs between slots during a renumber.
+            #
+            # AFTER THE TRANSACTION, DELIBERATELY. `rollback` restores
+            # `original_config` to the LIVE `~/.claude.json`, so un-splicing
+            # above it would hand the error path a config naming the outgoing
+            # slot — dropping the pin and killing the bridge on a failed
+            # switch. Strings are immutable: the transaction keeps the live
+            # bytes and the archive writes below take the un-spliced value.
+            if current_account and current_email:
+                original_config = self._config_naming_slot(
+                    original_config, current_account, current_email
+                )
 
             try:
                 # Step 1: Backup current account. Position in ~/.claude.json
@@ -7109,25 +8353,41 @@ class ClaudeAccountSwitcher:
                         warnings_out.append(msg)
                 elif kind == "unresolved":
                     # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
+                    # failure, malformed response, non-OAuth blob). No longer
+                    # fail-open: an incident on 2026-09-07 traced a wrong
+                    # active slot resolving to slot 1 while the live bytes
+                    # were slot 6's; the old pre-fix backup here wrote slot
+                    # 6's refresh token into slot 1's backup, and the pin
+                    # later consumed slot 6's grant under slot 1, forcing a
+                    # re-login. Same as the sibling foreign/alien arms:
+                    # never into a slot, always preserved.
+                    #
+                    # `unresolved` means ownership could not be verified (the
+                    # oracle was offline or failing) — never confirmed. No
+                    # `consumed_fp`: setting it here made the row match
+                    # `_adopt_stashed_successor`'s gate by construction the
+                    # instant it was written (nothing else need happen to the
+                    # slot in between), so a later grant-consume would
+                    # silently adopt these unverified bytes — the wmac
+                    # cross-wire incident one step later. Left stranded until
+                    # a manual `cswap add` confirms it.
+                    self._stash_live_credential(
+                        original_creds, "unresolved", current_account,
+                        provenance.get("resolved"),
                     )
-                    self._write_account_config(
-                        current_account, current_email, original_config
+                    msg = (
+                        "The live credential diverges from Account-"
+                        f"{current_account}'s stored backup and its "
+                        "ownership could not be verified (offline or "
+                        "endpoint failure). It was preserved and not "
+                        f"written into Account-{current_account}. If "
+                        f"Account-{current_account} later cannot "
+                        "authenticate, log in as it and run: cswap add"
                     )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup. (Rare since
@@ -7142,8 +8402,20 @@ class ClaudeAccountSwitcher:
                         "credentials unchanged)"
                     )
                 else:  # own-family / own-rotated
+                    # attributed only for "own-rotated": that kind is
+                    # established by `_classify_outgoing_credential`'s
+                    # uuid-verified oracle match, so its fingerprint
+                    # legitimately differs from the stored backup and needs
+                    # the attestation. "own-family" is a stored-backup
+                    # fingerprint match already, which the store's own
+                    # attribution guard re-derives independently below — left
+                    # unattributed on purpose, as a second, redundant check
+                    # against exactly the incident this guard exists for (an
+                    # unverified switch-time claim once let a mismatched
+                    # `kind` reach this branch).
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email, original_creds,
+                        attributed=(kind == "own-rotated"),
                     )
                     self._write_account_config(
                         current_account, current_email, original_config
@@ -7194,15 +8466,25 @@ class ClaudeAccountSwitcher:
                 # assignment` with no salvage copy, losing the user's torn
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
+                # The ordinary rotation path, and it splices on the same
+                # contract as the direct-activation branch above: the pin's
+                # identity when one resolves, unchanged when it does not.
+                from claude_swap import pin as _pin
+
+                pin_oauth_ord = _pin.identity_for_config(self)
+                identity_section = pin_oauth_ord or oauth_section
                 current_config_data = self._read_json(config_path)
                 if current_config_data is not None:
-                    current_config_data["oauthAccount"] = oauth_section
+                    current_config_data["oauthAccount"] = identity_section
                     self._write_json(config_path, current_config_data)
                 else:
                     if config_path.exists():
                         self._salvage_unreadable(
                             config_path, emit_output, warnings_out
                         )
+                    if pin_oauth_ord:
+                        target_config_data = dict(target_config_data)
+                        target_config_data["oauthAccount"] = identity_section
                     self._write_json(config_path, target_config_data)
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
@@ -7235,9 +8517,13 @@ class ClaudeAccountSwitcher:
                 raise
 
         # Lock released. Safe to do network I/O and let persist callbacks
-        # re-acquire the lock from inside list_accounts(). All of this is display
-        # only — suppressed in JSON mode (the nested list_accounts() would
-        # otherwise leak human output onto the JSON stdout).
+        # re-acquire the lock from inside list_accounts(). All of this is
+        # display only — suppressed in JSON mode (the nested list_accounts()
+        # would otherwise leak human output onto the JSON stdout).
+        #
+        # The policy refresh is network I/O and does NOT belong here: this is
+        # one of two exits, and the other returns from inside the lock scope
+        # above. `_perform_switch` wraps this function and covers both.
         if emit_output:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             try:
@@ -7352,6 +8638,74 @@ class ClaudeAccountSwitcher:
             return
 
         removed_items = []
+
+        # TEAR THE PIN DOWN FIRST — both halves, before the rmtree.
+        #
+        # THE WIRING, because purge deletes backup_dir while `.claude.json`'s
+        # env block is not in there and Claude Code applies it at boot. Left
+        # behind it points every hand-launched `claude` at a port nothing
+        # serves, with nothing left that knows how to remove it.
+        #
+        # AND THE DAEMON, which unwiring does not touch: the proxy is a
+        # SEPARATE PROCESS holding OAuth bearers, and the rmtree takes the
+        # cert dir and `proxy.json` with it, leaving nothing on the machine
+        # that names its port. `clear_pin` does both and already tolerates a
+        # missing or broken package, which is why it needs no guard here.
+        #
+        # RE-READ AROUND IT, DO NOT TRUST A RETURN: neither bool separates
+        # "nothing to remove" from "the lock was contended", so only reading
+        # the configs tells ABSENT from FAILED. A survivor warns and the purge
+        # continues, and the message names the file and the keys because after
+        # this the user is the only one who can remove it.
+        from claude_swap import pin as _pin
+
+        # CAPTURED BEFORE THE CLEAR, because the receipt is one of the things
+        # the clear removes and it is the only record of WHICH env keys were
+        # cswap's. `wired_config_paths` afterwards returned empty for two
+        # opposite reasons — the wiring went, or the RECEIPT went and left the
+        # wiring behind — and on a sidecar-era wiring with an unwritable
+        # config dir it is always the second: `clear_pin` clears the writable
+        # sidecar, the config then reads as unwired, and this printed
+        # "Removed: Cloud pin wiring" with NO warning while HTTPS_PROXY and
+        # CSWAP_PIN_PORT still named a dead port. Measured, not reasoned.
+        before = _pin.wired_env_keys(self)
+        # GUARDED LIKE EVERY OTHER STEP IN THIS FUNCTION. `clear_pin` is not
+        # documented never-raising and several of its steps are not guarded —
+        # `_pinned_email_now`, `clear_wiring` (whose `_write_json` catches only
+        # OSError and ConfigError), and `_ledger_path`, which calls
+        # `get_backup_root()`. This is the FIRST destructive step and it runs
+        # after the user has already confirmed, so a raise here leaves the
+        # credentials, the session profiles and `backup_dir` in place and exits
+        # with a traceback — the one partial failure in `purge` that does not
+        # `warning()` and continue.
+        try:
+            _pin.clear_pin(self)
+        except Exception as exc:  # noqa: BLE001 — purge continues, always
+            warning(
+                f"Could not clear the cloud pin ({type(exc).__name__}: {exc}). "
+                "Continuing the purge; the wiring check below still reports "
+                "what survived."
+            )
+        # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
+        # `get_global_config_path()` after asking a check that reads BOTH
+        # configs, so when the survivor was the other one the user was sent to
+        # a file that was already clean — while the wiring that strands them
+        # sat in a file they were never told about. By this point the record,
+        # cert dir and daemon state are gone, so hand editing is the only cure
+        # and naming the wrong file is the whole failure.
+        survivors = _pin.env_keys_survive(before)
+        if before and not survivors:
+            removed_items.append("Cloud pin wiring in .claude.json")
+        for path, names in survivors.items():
+            # NAMES THE KEYS, not the marker. The advice used to say to delete
+            # `"_cswapPinWiredKeys"`, which a sidecar-era config never carried
+            # — and the sidecar that lists the real keys is about to be
+            # rmtree'd, so after this nothing can reconstruct them.
+            warning(
+                f"Could not remove the cloud pin wiring; edit {path} by hand "
+                f"and delete these entries from its \"env\" block: "
+                + ", ".join(names)
+            )
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.

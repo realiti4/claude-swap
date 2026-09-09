@@ -201,8 +201,11 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
+    # Identify the live active account (live vault has fresher tokens than
+    # backup). THE LOGIN, NOT THE IDENTITY FILE: under a pin that file names
+    # the pinned account, so this marked the wrong slot active and exported
+    # the serving account's live credential into the pinned account's record.
+    current_identity = switcher._live_login_identity()
 
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
@@ -226,6 +229,11 @@ def export_accounts(
             if not config_path.exists():
                 raise ConfigError("Claude config file not found")
             config_text = config_path.read_text(encoding="utf-8")
+            # UN-SPLICE IT. `_slim_config` keeps `oauthAccount` and drops the
+            # rest, so under a pin the export records the PIN as this slot's
+            # identity — and `import` writes that as the destination machine's
+            # backup for the slot, on a machine that may have no pin at all.
+            config_text = switcher._config_naming_slot(config_text, num, email)
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
@@ -534,8 +542,12 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
+        # attributed=True: `target_num` is either a fresh/empty slot, or
+        # `entry["email"]`'s OWN existing slot (matched by identity above),
+        # overwritten only under explicit `--force` or the identity-guarded
+        # dead-token auto-heal — never a different account's slot.
         switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
+            target_num, entry["email"], entry["creds_text"], attributed=True
         )
         switcher._write_account_config(
             target_num, entry["email"], entry["config_text"]
@@ -635,7 +647,9 @@ def import_accounts(
     # live login, a plain switch would back the (possibly stale) live
     # credentials up over it (issue #79) — point at the explicit activation
     # path instead.
-    identity = switcher._get_current_account()
+    # THE LIVE LOGIN: seeds activeAccountNumber, so the pin's
+    # identity here would record the wrong slot as active.
+    identity = switcher._live_login_identity()
     if identity is not None and final is not None:
         live_slot = switcher._find_account_slot(final, identity[0], identity[1])
         if live_slot is not None and live_slot in written_slots:

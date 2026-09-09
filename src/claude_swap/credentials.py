@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
@@ -1164,6 +1164,17 @@ class CredentialStore:
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
+        Forwards to ``_read_account_credentials_direct``: this name is the
+        one a caller that wants "this slot's own key, and nothing found
+        under any other slot" reaches for.
+        """
+        return self._read_account_credentials_direct(account_num, email, failed)
+
+    def _read_account_credentials_direct(
+        self, account_num: str, email: str, failed: list | None = None
+    ) -> str:
+        """Read account credentials from backup. ``""`` when missing.
+
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
         Linux/WSL/Windows read the ``.enc`` only.
@@ -1301,8 +1312,79 @@ class CredentialStore:
         # the single-thread case was never actually safe either.
         return "", bool(failed)
 
+    def _check_attribution(
+        self, account_num: str, email: str, credentials: str, attributed: bool,
+    ) -> None:
+        """Raise unless a populated slot's stored lineage is preserved or
+        attested. Shared by ``_write_account_credentials`` and by any other
+        guarded entry point that reaches a backend writer directly (the
+        macOS-keyring-to-security migration's Keychain-only write) — see
+        ``_write_account_credentials``'s docstring for what the guard means.
+
+        Reads with ``_read_account_credentials_direct`` — this slot's own
+        key, never a merge partner's renumber-fallback sweep for the same
+        email under a DIFFERENT slot number, which would make a genuinely
+        empty destination slot look populated by a same-email leftover
+        parked elsewhere. The unreadable-vs-absent distinction is kept via
+        this read's own ``failed`` list: the plain read returns ``""`` for
+        an UNREADABLE populated slot (a locked/denied Keychain, an EIO'd
+        ``.enc``) exactly as it does for a genuinely absent one, and
+        treating those alike disables the guard on any host where a
+        process can't read its own Keychain (ssh/launchd on macOS, per
+        CONTEXT.md) — precisely where the incident this guard exists for
+        lives. Unreadable is "cannot verify", which refuses like a
+        mismatch, not "empty", which would permit like an absent slot.
+
+        Marks ``self._in_attribution_read`` around the read. Nothing on this
+        branch alone defines or reads that attribute, so the mark is inert
+        here — it exists for a merge partner whose own read (reached
+        transitively through this one) would otherwise write back into the
+        slot this guard's caller is already writing, re-entering this write
+        path from inside the read that verifies it.
+        """
+        prev_in_attribution_read = getattr(self, "_in_attribution_read", False)
+        self._in_attribution_read = True
+        try:
+            failed: list = []
+            existing = self._read_account_credentials_direct(
+                account_num, email, failed
+            )
+            unreadable = bool(failed) and not existing
+        finally:
+            self._in_attribution_read = prev_in_attribution_read
+        if unreadable and not attributed:
+            self._host._logger.error(
+                "Refusing to write Account-%s-%s's backup: the existing "
+                "backup could not be read to verify it, and nothing "
+                "attributed this write to this slot. Retry once it is "
+                "readable, or run: cswap add --slot %s",
+                account_num, email, account_num,
+            )
+            raise CredentialWriteError(
+                f"Refusing write into Account-{account_num} ({email}): its "
+                "stored backup is unreadable, so its lineage cannot be "
+                "verified and no attribution was given"
+            )
+        if existing and not attributed and (
+            oauth.credential_fingerprint(existing)
+            != oauth.credential_fingerprint(credentials)
+        ):
+            self._host._logger.error(
+                "Refusing to write Account-%s-%s's backup: the new credential "
+                "does not match what is already stored there, and nothing "
+                "attributed it to this slot. If this account's login "
+                "changed, run: cswap add --slot %s",
+                account_num, email, account_num,
+            )
+            raise CredentialWriteError(
+                f"Refusing cross-identity write into Account-{account_num} "
+                f"({email}): the stored backup's lineage does not match the "
+                "new credential and no attribution was given"
+            )
+
     def _write_account_credentials(
-        self, account_num: str, email: str, credentials: str
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
     ) -> None:
         """Write account credentials to backup (pure I/O — no session invalidation).
 
@@ -1315,11 +1397,29 @@ class CredentialStore:
         Raises on a file-write failure **before** returning, so the switcher wrapper
         runs ``_post_backup_write`` exactly once and only after a successful write.
 
+        THE ATTRIBUTION GUARD, the single chokepoint every backup writer routes
+        through (directly, or via the switcher's ``_write_account_credentials``
+        wrapper). A write that would REPLACE a *populated* slot's stored backup
+        with a different OAuth lineage is refused unless the caller passes
+        ``attributed=True`` — an explicit attestation that it independently
+        confirmed the new bytes belong to *this* ``(account_num, email)`` slot
+        (a uuid-verified identity resolution, or a structural move/rotation of
+        that same account's own record). Absence of evidence is not a match:
+        an empty slot has nothing stored to contradict, so a first-ever write
+        (add, add-token, import, migrate) is never refused by this alone — but
+        a POPULATED slot with no attestation and a differing lineage is,
+        fail-closed, because writing the wrong identity into a slot is worse
+        than writing nothing (the incident this guard exists for: an
+        unverified switch-time claim once wrote one account's live bytes
+        under another account's key, and the pin later consumed the wrong
+        slot's grant and forced a re-login inside its 30-day window).
+
         Before overwriting, the current generation is retained as a ``.prev`` file
         (one generation, best-effort): a refresh token exists in exactly one place,
         giving a misclassified overwrite a best-effort chance of recovery without
         a /login.
         """
+        self._check_attribution(account_num, email, credentials, attributed)
         self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:

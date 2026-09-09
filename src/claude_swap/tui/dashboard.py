@@ -25,6 +25,8 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap import pin
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
@@ -67,8 +69,116 @@ class DashboardScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+        # Rebuild on the poll the app already runs, rather than adding a timer
+        # of our own: the pin row has to appear when the extra is installed
+        # mid-session, and the label names the pinned account, which changes
+        # from the CLI too.
+        self.watch(self.app, "snapshot", lambda _s: self.refresh_root_menu())
+        # A USER WHO OPENED THIS HAS ALREADY ASKED FOR THE PIN TO WORK. When the
+        # daemon has published that it cannot mint, the badge said so and then
+        # asked them to go run the repair by hand — with `--heal`, the obvious
+        # candidate, declining this exact state by design. The product knew the
+        # pin was broken, knew the fix, and waited to be asked.
+        #
+        # ONLY `is False`. `None` is "cannot tell" and a healthy pin must never
+        # be recycled on open: that restarts the daemon under live sessions for
+        # nothing, which is how a repair becomes the outage it was meant to
+        # prevent.
+        #
+        # Off the event loop, like every other pin action here: `apply_pin`
+        # spawns a daemon and can take the config lock, and doing that inline
+        # froze the dashboard for 9.31s the last time something skipped
+        # `_start_action`.
+        self._repair_pin_if_stranded()
+
+    def _repair_pin_if_stranded(self) -> None:
+        try:
+            if not pin.is_available() or not pin.pinned_email(self.app.switcher):
+                return
+            if pin.pin_is_applying(self.app.switcher) is not False:
+                return
+        except Exception:  # noqa: BLE001 — a badge-level question, never fatal
+            return
+        # THROUGH `_run_pin_op`, like every other pin action in this class.
+        # `repin_current` returns False and never raises, and handed straight
+        # to `_start_action` that False vanished: `run_action` builds
+        # `ActionResult(True, ...)` for any fn that does not raise and this one
+        # prints nothing, so `_action_done` found an empty first line and
+        # notified nothing. The repair ran on mount, failed, held `app.busy`
+        # for its duration, and the ⚠ cloud UNPINNED badge stayed lit with no
+        # explanation. `_run_pin_op` already prints on success and raises
+        # `ClaudeSwitchError` on failure so the modal opens — a second
+        # reporting path was the wrong way to say the same thing.
+        self.app._start_action(
+            "Repairing the cloud pin",
+            partial(self._run_pin_op, partial(self._repin, self.app.switcher)),
+        )
+
+    @staticmethod
+    def _repin(switcher) -> tuple[bool, str]:
+        from claude_swap import pin as _pin
+
+        if _pin.repin_current(switcher):
+            return True, "Cloud pin repaired"
+        return False, (
+            "Could not repair the cloud pin. The daemon serving now cannot "
+            "mint the pinned token; `cswap pin --heal`, or "
+            "`cswap pin <account>` to re-apply it."
+        )
 
     # -- menu plumbing --------------------------------------------------------
+
+    async def refresh_root_menu(self) -> None:
+        """Rebuild the root menu in place, if that is where the user is.
+
+        The pin row appears only when the extra is installed, and installing
+        it is something a user does WHILE the TUI is open. Building the menu
+        once at mount meant the row could not appear until a restart — and a
+        feature that needs a restart to become visible reads as broken.
+
+        Only when the root is on top: rebuilding under an open submenu would
+        yank the rows out from under the cursor.
+
+        THE ROOT MENU NEEDS THE SAME PROTECTION, and for a subtler reason.
+        `_render_menu` ends with `menu.index = 0`, which is correct for what
+        upstream calls it for — opening a menu, or popping back to one. This
+        is the only caller that re-renders a menu the user is already reading,
+        so the reset became a side effect of the poll: the cursor jumped home
+        every POLL_INTERVAL_S (3s) and nobody slower than one cycle could
+        finish choosing.
+
+        Fixed here rather than in `_render_menu`, whose `index = 0` the
+        open/pop paths want.
+
+        Two parts, because the entries changing and not changing need
+        different handling:
+
+          - Unchanged (the overwhelmingly common case — whether the extra is
+            installed changes ~never during a session): skip the rebuild
+            entirely. No rebuild, no reset, and no work.
+          - Changed: restore by ACTION ID, not by index. Installing the extra
+            inserts a row above `remove-menu`, so a remembered integer points
+            at a different action than the one the user had selected.
+        """
+        if len(self._menu_stack) != 1:
+            return
+        entries = self._root_entries()
+        if entries == self._menu_stack[0][1]:
+            return
+        menu = self.query_one("#menu", ListView)
+        items = list(menu.query(MenuItem))
+        selected = (
+            items[menu.index].action_id
+            if menu.index is not None and 0 <= menu.index < len(items)
+            else None
+        )
+        self._menu_stack[0] = ("menu", entries)
+        await self._render_menu()
+        if selected is not None:
+            for i, (_label, action_id) in enumerate(entries):
+                if action_id == selected:
+                    menu.index = i
+                    break
 
     def _root_entries(self) -> MenuEntries:
         # No "Refresh" entry: every view auto-refreshes, so a menu item would
@@ -79,6 +189,49 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            # Only when the extra is installed — OR when a wiring it left
+            # behind is still in .claude.json. A user who never asked for the
+            # pin should not see a row for it; one who installs it while the
+            # TUI is open sees the row appear (see refresh_root_menu).
+            #
+            # The second half is what makes the pin removable from here at
+            # all: uninstalling the extra is exactly when `--clear` is needed,
+            # and the CLI is deliberately able to do it without the package.
+            # Gating the row on is_available() alone left a TUI-first user
+            # with a wired config and no visible way out.
+            *(
+                # The row answers "is a pin set, and where does it point"
+                # without being opened — the whole question a user has when
+                # glancing at the menu. "RC/artifacts" names the scope, which
+                # is wider than Remote Control alone (artifacts, triggers and
+                # marketplace sync all follow the pin).
+                [(
+                    "Cloud account (RC/artifacts)… "
+                    # THE RECORD, which is what the badge reads. Asking the
+                    # package here made the row say `none` beside a lit badge
+                    # on every machine without the extra.
+                    f"{pin.pinned_email_recorded(self.app.switcher) or 'none'}",
+                    "pin-menu",
+                )]
+                if (
+                    pin.is_available()
+                    or pin._wiring_present(self.app.switcher)
+                    # AND THE RECORD, which is the state every unwire LEAVES.
+                    # Only `clear_pin` removes settings.json -> remoteControl;
+                    # `heal`, `wire_launch_env` and `--ensure` all remove the
+                    # wiring and keep it, deliberately — the wiring is what
+                    # strands a launch and the record is not. So "record, no
+                    # wiring" is not a corner case, it is where every one of
+                    # those paths lands, and this gate hid the row there while
+                    # the record still named an account that re-pins live the
+                    # moment anything reinstalls the package. The leaf gate in
+                    # `_pin_entries` already asks all three and says why: a
+                    # gate must ask what the ACTION asks, or it hides work
+                    # that exists. This was the sibling that did not.
+                    or pin._pinned_email_now(self.app.switcher) is not None
+                )
+                else []
+            ),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -126,6 +279,126 @@ class DashboardScreen(Screen):
             (f"{'●' if name == current else ' '} {name}", f"theme:{name}")
             for name in ("dark", "light", "auto")
         ]
+        entries.append(_BACK)
+        return entries
+
+    def _run_pin_op(self, op) -> None:
+        """Adapt a ``(ok, message)`` operation to what _start_action expects.
+
+        `run_action` captures stdout and `_action_done` toasts its first line
+        or, on a failed ActionResult, opens the modal. So a failure PRINTS and
+        raises — the raise is what routes it to the modal rather than to a
+        toast the user may miss — and a success just prints.
+
+        ClaudeSwitchError specifically: run_action catches only that and
+        EOFError. A RuntimeError escaped to on_worker_state_changed and became
+        a `notify(severity="error")` — MODALS [] — so the modal this
+        raise exists to open never opened and the message wore a doubled
+        prefix.
+        """
+        ok, msg = op()
+        if not ok:
+            # RAISE ONLY. run_action prints "Error: {e}" for a ClaudeSwitchError,
+            # so printing first put the same sentence in the modal twice.
+            raise ClaudeSwitchError(msg)
+        print(msg)
+
+    def _apply_pin(self, acc, impl) -> tuple[bool, str]:
+        """Pin to ``acc`` and add the note only this side can produce.
+
+        Runs on a worker thread (see the dispatch): pin.set_pin takes locks and
+        can spawn a daemon, and the CLI is a fresh process while this one has a
+        UI to keep responsive.
+        """
+        # Pass the slot we ALREADY have. set_pin re-deriving it from the
+        # email made a duplicate address (cswap's own personal+org pattern)
+        # raise inside the API-key refusal, skipping it entirely.
+        ok, msg = pin.set_pin(
+            self.app.switcher, acc.email, acc.org_uuid, num=acc.number
+        )
+        if ok:
+            # An RC session that is already open keeps its old owner (the
+            # server fixed it at creation); reconnecting inside it is what
+            # moves it. Say so only when there is one.
+            try:
+                if impl.live_remote_control_sessions():
+                    msg += (
+                        "  Reconnect open Remote Control sessions to move them "
+                        "(/rc → Disconnect → /rc)."
+                    )
+            except Exception:  # noqa: BLE001 — a note must not fail the action
+                pass
+        return ok, msg
+
+    def _pin_entries(self) -> MenuEntries:
+        """One row per account (→ pin the claude.ai surface to it), plus clear."""
+        try:
+            pin._impl()  # resolved only to prove the package is usable
+        except Exception as exc:  # noqa: BLE001
+            # The package is gone or broken, but the row was offered because a
+            # WIRING it left behind is still in .claude.json. Removing that is
+            # the one pin operation this repo can do on its own (see
+            # pin.clear_wiring), and it is exactly what a user reaches for at
+            # this moment — so offer it rather than dead-ending on the reason.
+            #
+            # Scrubbed: the text comes from an optional package and lands in a
+            # MENU LABEL (see pin._safe).
+            rows: MenuEntries = [(pin._safe(exc), "")]
+            # THE RECORD COUNTS HERE TOO, same gate one screen down.
+            # `clear_pin` removes it without the package — that is the whole
+            # reason it reads `_pinned_email_now` rather than asking the
+            # extra — so gating the row on a surviving WIRING dead-ends the
+            # user on the error string with removable state on disk.
+            if (
+                pin._wiring_present(self.app.switcher)
+                or pin._pinned_email_now(self.app.switcher) is not None
+            ):
+                rows.append(("Remove the leftover pin wiring", "pin:clear"))
+            rows.append(_BACK)
+            return rows
+        # THE COMPOSITE, like every other badge site. Two managed slots may
+        # share one address across organizations, and an email-only test lights
+        # BOTH rows.
+        pinned_identity = pin.pinned_identity(self.app.switcher)
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            state = "  ○ cloud" if pin.account_is_pinned(
+                pinned_identity, acc.email, acc.org_uuid) else ""
+            # An API-key account can never be pinned: sk-ant-api… is not OAuth
+            # JSON, so every pinned request fails open. The CLI refuses it; the
+            # menu says so instead of offering a row that reports success and
+            # pins nothing. No action id — an informational row (see _dispatch).
+            # `acc.kind` — the SAME fact the CLI refuses on
+            # (switcher._account_kind). The sentinel is derived and diverges:
+            # it reads USAGE_NO_CREDENTIALS for an unreadable backup blob and
+            # USAGE_KEYCHAIN_UNAVAILABLE for an API-key slot behind a locked
+            # macOS keychain, so filtering on it offered the row and the pin
+            # went through — the state the CLI refusal exists to prevent.
+            if getattr(acc, "kind", None) == "api_key":
+                entries.append((f"{acc.number}  {name}  · api key, cannot pin", ""))
+                continue
+            entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
+        # Only offer the clear when there is something to clear — an inert row
+        # reads as "a pin exists" to anyone scanning the menu. The SAME
+        # question the root gate asks: a partial clear_pin drops the record
+        # and gets locked out of the wiring, and gating on the record alone
+        # then hid the row while the root menu still showed the Cloud line and
+        # the message said "re-run once it frees up".
+        #
+        # AND THE RECORD IS READ THE WAY `clear_pin` READS IT.
+        # `pinned_identity` and `clear_pin` both decide from
+        # `_pinned_email_now`, which reads cswap's OWN settings.json and can
+        # still clear a record with the extra absent. The gate keeps the
+        # explicit `_pinned_email_now` call so it reads as the same question
+        # the ACTION asks; a gate that asks less hides work that exists.
+        if (
+            pinned_identity
+            or pin._pinned_email_now(self.app.switcher) is not None
+            or pin._wiring_present(self.app.switcher)
+        ):
+            entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -192,6 +465,77 @@ class DashboardScreen(Screen):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
             await self._pop_menu()
+        elif action_id == "pin-menu":
+            await self._push_menu("cloud account", self._pin_entries())
+        elif action_id.startswith("pin:"):
+            target = action_id.split(":", 1)[1]
+            # CLEAR does not need the package, and must not: uninstalling the
+            # extra is precisely when a leftover wiring has to come out, and
+            # clear_pin is written to work without it (see pin.clear_wiring).
+            # Resolving _impl() for every pin: action made the TUI refuse the
+            # one operation still available to it.
+            impl = None
+            if target != "clear":
+                try:
+                    impl = pin._impl()
+                except Exception as exc:  # noqa: BLE001
+                    # Names the real reason, which _impl already distinguishes:
+                    # "install the extra" for a missing package, the underlying
+                    # error for one that is present and broken.
+                    app.notify(pin._safe(exc))
+                    await self._pop_menu()
+                    return
+            snap = app.snapshot
+            # THE VERDICT COMES FROM pin.py, not from a second copy here: one
+            # decision implemented twice is how this branch and the CLI drift
+            # apart. Implemented once, both sides render the result.
+            #
+            # THROUGH _start_action, like every sibling action in this file.
+            # clear_wiring takes a 9s lock; run inline it freezes the dashboard
+            # for that long with no toast and no keystrokes while Claude Code
+            # holds .claude.json.lock — routine during a credential refresh.
+            if target == "clear":
+                app._start_action(
+                    "clear cloud pin",
+                    partial(self._run_pin_op, partial(pin.clear_pin, app.switcher)),
+                )
+            else:
+                acc = next(
+                    (a for a in (snap.accounts if snap else ()) if a.number == target),
+                    None,
+                )
+                if acc is not None:
+                    app._start_action(
+                        f"pin cloud → {acc.email}",
+                        partial(self._run_pin_op, partial(self._apply_pin, acc, impl)),
+                    )
+                else:
+                    # The row outlived its account: an open submenu is not
+                    # rebuilt while the snapshot updates (refresh_root_menu
+                    # returns early below depth 1), so `cswap remove` mid-menu
+                    # leaves a row that resolves to nothing. Silently popping
+                    # reads as "pinned" — say what happened instead.
+                    app.notify(
+                        f"Account {target} is no longer in the list, so "
+                        "nothing was pinned"
+                    )
+            await self._pop_menu()
+        elif not action_id:
+            # AN INFORMATIONAL ROW, and it says so by carrying no id at all
+            # (see `_pin_entries`, which shows the reason the pin is
+            # unusable). `actions[action_id]()` raised KeyError out of
+            # on_list_view_selected and killed the dashboard — the same class
+            # of failure as a raising apply_pin, one menu level up. Selecting
+            # a row that says nothing should do nothing.
+            #
+            # THE FIRST FIX WAS `elif action_id in actions`, which silences
+            # every unknown id rather than the one that is meant to be inert:
+            # rename a key in `_root_entries` and the row goes permanently
+            # dead with no exception, no notify and nothing in any log. That
+            # is a special case repaired by widening shared infrastructure,
+            # and the KeyError it removed is the only thing that would have
+            # surfaced the typo.
+            pass
         else:
             actions[action_id]()
 
@@ -239,11 +583,22 @@ class AccountListScreen(Screen):
             return
         listview = self.query_one("#accounts", ListView)
         numbers = [acc.number for acc in snap.accounts]
+        # ONCE PER SNAPSHOT, not once per card per repaint. `AccountCard.render`
+        # used to ask `pin.pinned_email` itself, which is per-widget and off the
+        # poll — see that class for the measurement. This is the only place that
+        # knows a new snapshot has arrived, so it is where the question belongs.
+        pinned_identity = pin.pinned_identity(self.app.switcher)
+
+        def _pinned(acc) -> bool:
+            return pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)
+
         if numbers != self._numbers:
             first_build = not self._numbers
             previous = listview.index
             await listview.clear()
-            await listview.extend(AccountItem(acc) for acc in snap.accounts)
+            await listview.extend(
+                AccountItem(acc, cloud_pinned=_pinned(acc)) for acc in snap.accounts
+            )
             self._numbers = numbers
             listview.index = (
                 self._index_after_build(snap, first_build, previous)
@@ -252,7 +607,7 @@ class AccountListScreen(Screen):
             )
         else:
             for item, acc in zip(listview.query(AccountItem), snap.accounts):
-                item.set_account(acc)
+                item.set_account(acc, cloud_pinned=_pinned(acc))
         self._flash_updated(snap, listview)
 
     def _index_after_build(

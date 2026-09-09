@@ -82,6 +82,24 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
+def _nap(want: float, start: float, timeout: float) -> None:
+    """Sleep at most what is LEFT of the budget, never a full jitter draw.
+
+    The deadline is checked at the top of the loop, so a sleep longer than the
+    remainder runs to completion first and the raise lands late: measured, a
+    0.01s budget took 0.302s and a 0.1s budget 0.258s. Clamping to the
+    remainder rather than to `timeout` is what makes that true on the SECOND
+    retry too -- `min(want, timeout)` is a no-op once most of the budget is
+    already spent.
+
+    Never negative: an expired budget sleeps zero and the caller's next
+    deadline check raises, which is the same instant either way.
+    """
+    left = timeout - (time.monotonic() - start)
+    if left > 0:
+        time.sleep(min(want, left))
+
+
 @contextmanager
 def proper_lockfile(
     lock_dir: Path,
@@ -124,9 +142,9 @@ def proper_lockfile(
             try:
                 os.rmdir(lock_dir)
             except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+                _nap(0.05, start, timeout)  # can't remove it either; don't spin hot
             continue
-        time.sleep(0.25 + random.random() * 0.25)
+        _nap(0.25 + random.random() * 0.25, start, timeout)
 
     stop_touching = threading.Event()
 
