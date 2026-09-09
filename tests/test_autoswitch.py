@@ -549,6 +549,21 @@ class TestDecisionTable:
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
 
+    def test_reserved_account_still_used_as_at_limit_escape(self, harness):
+        """`cswap reserve` holds an account out of PROACTIVE optimization, not
+        out of a genuine emergency. Active is hard at its limit; #2 is
+        healthy but reserved, #3 is itself at its limit. The only real
+        escape is #2 — reserved or not, at-limit must still take it rather
+        than report BLOCKED with real quota sitting unused."""
+        harness.switcher.set_account_reserved("2", True)
+        outcome = harness.tick_with_usage({
+            "1": _usage(100), "2": _usage(10), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert harness.active_number() == 2
+
     def test_failover_ignores_hysteresis_bar(self, harness):
         # Active usage unreadable (auth likely dead); the only candidate with
         # room sits above the hysteresis bar — failover takes it anyway.
@@ -3133,6 +3148,24 @@ class TestConsumeFirstStrategy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_reserved_account_never_proactively_drained(self, temp_home):
+        """Real incident: `cswap reserve` (a shared account another person
+        also uses) had the soonest weekly reset of the fleet, so
+        consume-first proactively switched onto it — overriding a manual
+        switch away made minutes earlier to protect it — and drove it to
+        99%% used. #2 resets soonest and is healthy; reserving it must stop
+        consume-first from ever picking it, leaving the active account (or
+        a non-reserved peer) in place instead."""
+        h = self._harness(temp_home)
+        h.switcher.set_account_reserved("2", True)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),      # soonest reset, healthy — but reserved
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
     def test_best_strategy_unaffected_below_threshold(self, temp_home):
         # Regression: default (best) still holds below threshold even when a

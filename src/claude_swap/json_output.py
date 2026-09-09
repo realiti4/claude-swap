@@ -221,6 +221,7 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
+    reserved: bool = False,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -236,10 +237,13 @@ def account_row(
     }
     if alias:
         row["alias"] = alias
-    # Additive field: present only when the slot is held out of rotation, so
-    # existing consumers keying on the base schema are unaffected.
+    # Additive fields: present only when the slot is held out of rotation
+    # (fully, or as a last-resort-only reserve), so existing consumers keying
+    # on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    if reserved:
+        row["reserved"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

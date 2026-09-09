@@ -1913,6 +1913,78 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("  It is back in the rotation."))
 
+    @staticmethod
+    def _reserved_from_data(data: dict, account_num: str) -> bool:
+        """Whether a slot is flagged last-resort-only in already-loaded data."""
+        record = data.get("accounts", {}).get(str(account_num))
+        return bool(record and record.get("reserved"))
+
+    def is_account_reserved(self, account_num: str) -> bool:
+        """Whether a slot is held to last-resort status."""
+        data = self._get_sequence_data() or {}
+        return self._reserved_from_data(data, str(account_num))
+
+    def reserved_account_numbers(self) -> list[str]:
+        """Managed slots held to last-resort use only, in sequence order."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._reserved_from_data(data, str(num))
+        ]
+
+    def set_account_reserved(self, identifier: str, reserved: bool) -> None:
+        """Hold an account to LAST-RESORT status (``reserved=True``) or return
+        it to full rotation.
+
+        Unlike ``set_account_disabled``, a reserved slot stays a normal
+        switch target for an ``at-limit``/``failover`` escape -- the active
+        account is already dead or blocked and something must be picked. It
+        is never chosen by ``proactive`` or ``consume-first``, which
+        optimize rather than escape, so it is never drained just because its
+        own window happens to reset soonest. Reserve a shared or otherwise
+        protected account with this instead of ``cswap disable`` when it
+        should stay a genuine last resort rather than dropping out of
+        rotation entirely.
+
+        Raises:
+            ConfigError: no accounts are managed yet, or the email is
+                ambiguous.
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        account_num, email, _ = self.resolve_account(identifier)
+
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        verb = "reserved" if reserved else "unreserved"
+        if bool(record.get("reserved")) == reserved:
+            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+            return
+
+        if reserved:
+            record["reserved"] = True
+        else:
+            record.pop("reserved", None)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
+
+        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+
+        if reserved:
+            print(dimmed(
+                "  Held out of proactive/consume-first rotation -- still a "
+                "valid at-limit/failover escape when nothing else is viable."
+            ))
+        else:
+            print(dimmed("  Back in full rotation."))
+
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
@@ -5452,6 +5524,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    reserved=self._reserved_from_data(seq_data, str(num)),
                 )
             )
         payload = {
@@ -5516,6 +5589,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            if self._reserved_from_data(seq_data, str(num)):
+                markers += f" {muted('(reserved)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")

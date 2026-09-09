@@ -1089,6 +1089,11 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+        # Reserved accounts (`cswap reserve`) stay switchable and are counted
+        # as fleet capacity above, but never a `proactive`/`consume-first`
+        # target -- see the scoping in `_rank_candidates`. Computed once per
+        # tick rather than per candidate.
+        reserved = frozenset(self.switcher.reserved_account_numbers())
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1199,6 +1204,7 @@ class AutoSwitchEngine:
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
+            reserved=reserved,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1230,6 +1236,7 @@ class AutoSwitchEngine:
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
+                reserved=reserved,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1780,6 +1787,7 @@ class AutoSwitchEngine:
         consume_first: bool,
         oauth_candidates: list[str],
         no_return: str | None,
+        reserved: frozenset[str] = frozenset(),
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
         current: str,
@@ -1862,6 +1870,22 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            if num in reserved and trigger not in ("at-limit", "failover"):
+                # `cswap reserve` -- a genuine last resort, not a candidate
+                # `proactive`/`consume-first` may optimize onto just because
+                # its own window happens to reset soonest. Real incident: a
+                # shared account got proactively drained to 99% by
+                # consume-first, overriding a human's own protective manual
+                # switch away from it minutes earlier -- the ranking had no
+                # way to know that account was off-limits for anything but a
+                # true emergency. `at-limit`/`failover` are that emergency
+                # (the active account is already dead or blocked) and still
+                # see it; `all_above`'s own recovery/fallback logic above is
+                # untouched by this -- it can still count a reserved
+                # account's headroom toward "does the fleet have quota" via
+                # `best_candidate_headroom`, it just never lands there
+                # outside a real escape.
+                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )

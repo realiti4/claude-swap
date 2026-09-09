@@ -58,6 +58,8 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
+    "reserve": "--reserve-account",
+    "unreserve": "--unreserve-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -1032,6 +1034,8 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s reserve <num|email>        last resort only -- never proactive/consume-first
+  %(prog)s unreserve <num|email>      return a reserved account to full rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1205,6 +1209,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--reserve-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--unreserve-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--list",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1287,6 +1301,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
+        or args.reserve_account is not None
+        or args.unreserve_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1383,6 +1399,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
+        elif args.reserve_account is not None:
+            switcher.set_account_reserved(args.reserve_account, True)
+        elif args.unreserve_account is not None:
+            switcher.set_account_reserved(args.unreserve_account, False)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
