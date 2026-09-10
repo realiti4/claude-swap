@@ -1396,25 +1396,12 @@ class AutoSwitchEngine:
                 # failed. The ErrorEvent above says why, but the tick's
                 # OUTCOME must stay what it would have been without a
                 # fallback configured — see `_block_all_exhausted`.
-                #
-                # The nap is a different question from the outcome. A bare
-                # `transient` is network trouble and `consume-busy` says it
-                # "retries next pass" — both clear on their own, so sleeping
-                # out the quota window would strand the user at 0% over a
-                # blip. The rest need a human (unset an env var, unlock the
-                # keychain, chase a rejected client_id) and will still be
-                # true after a nap.
-                return self._block_all_exhausted(
-                    usage, slow=systemic not in ("", "consume-busy")
-                )
+                return self._block_all_exhausted(usage)
             return TickOutcome.ERROR
         if trigger == "fallback":
             # Nothing systemic and nothing transient, so the loop drained on
-            # a quarantine or `skip-live-session`. Never nap here: a live
-            # session ends when the user's `cswap run` exits, and a
-            # quarantine drops the slot out of `candidates`, so the NEXT
-            # tick takes the plain branch above and naps there anyway.
-            return self._block_all_exhausted(usage, slow=False)
+            # a quarantine or `skip-live-session`.
+            return self._block_all_exhausted(usage)
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -2261,9 +2248,9 @@ class AutoSwitchEngine:
             )
 
     def _block_all_exhausted(
-        self, usage: dict[str, dict | str | None], *, slow: bool = True
+        self, usage: dict[str, dict | str | None]
     ) -> TickOutcome:
-        """Report the all-exhausted block, optionally parking on its cadence.
+        """Park on the bounded, reset-aware slow cadence and say so.
 
         Shared by the plain all-exhausted branch and by the fallback paths
         that end up back in the same state, so a configured-but-unreachable
@@ -2271,19 +2258,22 @@ class AutoSwitchEngine:
         ``AllExhaustedEvent`` the menubar and TUI key on, ``earliestResetAt``
         for ``--json`` consumers, and the BLOCKED ``--once`` exit code.
 
-        ``slow`` is the reset-aware nap, and it is a claim that NOTHING can
-        change until a quota window resets. That holds for the plain branch,
-        which never tries to move. It is false while a fallback is configured
-        and merely unreached: the hatch becoming reachable is a change that
-        does not wait for a reset, so napping up to ``MAX_SLEEP_S`` would
-        defer the escape by 10x over a blip that clears next tick. Callers
-        pass ``slow=False`` for the self-clearing causes.
+        The nap applies even when the cause is self-clearing (a network blip,
+        a live session holding the slot), which does mean the escape hatch
+        can land up to ``MAX_SLEEP_S`` late. That is deliberate. Retrying
+        those at the normal interval saves at most one wake-up in the cases
+        that resolve — a quarantined fallback leaves ``candidates`` and naps
+        on the very next tick to the same reset target — while
+        ``skip-live-session`` never leaves ``candidates`` at all, so a user
+        running ``cswap run`` on their designated seat would spin the tick
+        loop at 10x for the lifetime of that session. Ten minutes late is a
+        rounding error against the hour of idling the fallback exists to
+        avoid; an unattended laptop waking all night is not.
         """
+        self._blocked_wait_long = True
         earliest = self._earliest_recovery(usage)
-        if slow:
-            self._blocked_wait_long = True
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+        if earliest is not None:
+            self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
         self._emit(
             AllExhaustedEvent(
                 earliest_reset_at=(

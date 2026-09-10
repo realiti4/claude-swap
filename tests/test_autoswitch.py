@@ -845,33 +845,10 @@ class TestFallbackAccount:
         assert h.active_number() == 1
         assert any(isinstance(e, ErrorEvent) for e in h.events)
         assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        # ...but NOT the hour-long nap. "transient" is network trouble that
-        # clears next tick, and the escape hatch is still pending, so the
-        # engine must come back on the normal cadence rather than sleep out
-        # the quota window it is trying to escape.
-        assert h.engine._blocked_wait_long is False
-        assert h.engine._sleep_until_ts is None
-
-    def test_a_systemic_cause_needing_a_human_still_naps(self, temp_home):
-        # The other half of that rule: `invalid_client` is not self-clearing
-        # (it needs someone to chase a rejected client_id) and will still be
-        # true in a minute, so retrying at the normal interval would buy
-        # nothing. This one keeps the reset-aware sleep.
-        h = self._seed(temp_home, fallback_account="2")
-        h.seed(2, "b@example.com", expires_at=1)
-        recovers_at = h.clock() + 3_600.0
-        reset_at = _iso_at(recovers_at)
-        with patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_client"),
-        ):
-            outcome = h.tick_with_usage({
-                "1": _usage(100, reset_at),
-                "2": _usage(100, reset_at),
-                "3": _usage(100, reset_at),
-            })
-        assert outcome is TickOutcome.BLOCKED
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        # ...including the reset-aware sleep. Retrying at the normal interval
+        # would land the hatch sooner in this one case, but the same tail is
+        # reached by causes that never leave `candidates` — see
+        # `test_a_live_session_on_the_fallback_does_not_spin_the_tick_loop`.
         assert h.engine._blocked_wait_long is True
         assert h.engine._sleep_until_ts == pytest.approx(
             recovers_at + poll_policy.RESET_SLACK_S
@@ -893,15 +870,18 @@ class TestFallbackAccount:
         assert h.active_number() == 1
         assert any(isinstance(e, QuarantineEvent) for e in h.events)
         assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert h.engine._blocked_wait_long is False
+        assert h.engine._blocked_wait_long is True
 
-    def test_a_quarantined_fallback_naps_on_the_very_next_tick(self, temp_home):
-        # Why the tail above can safely skip the nap: quarantine drops the
-        # slot out of `candidates`, so the next tick never reaches the
-        # fallback branch at all and parks on the plain block instead. The
-        # fast tick is spent once, not on a loop.
+    def test_a_live_session_on_the_fallback_does_not_spin_the_tick_loop(
+        self, temp_home
+    ):
+        # `skip-live-session` reaches the same tail as a quarantine but does
+        # NOT quarantine, and `candidates` filters only on the quarantine
+        # set — so the slot is still there next tick, and the one after. A
+        # per-cause "retry fast, it clears itself" rule therefore never
+        # terminates here: running `cswap run` on the designated seat would
+        # wake the loop every interval for the life of that session.
         h = self._seed(temp_home, fallback_account="2")
-        h.seed(2, "b@example.com", expires_at=1)
         recovers_at = h.clock() + 3_600.0
         reset_at = _iso_at(recovers_at)
         exhausted = {
@@ -909,17 +889,16 @@ class TestFallbackAccount:
             "2": _usage(100, reset_at),
             "3": _usage(100, reset_at),
         }
-        with patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        with patch.object(
+            h.switcher, "live_session_pids_for", return_value=[4242]
         ):
-            h.tick_with_usage(exhausted)
-        assert h.engine._blocked_wait_long is False
-        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
-        assert h.engine._blocked_wait_long is True
-        assert h.engine._sleep_until_ts == pytest.approx(
-            recovers_at + poll_policy.RESET_SLACK_S
-        )
+            for _ in range(3):
+                assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+                assert h.engine._blocked_wait_long is True
+                assert h.engine._sleep_until_ts == pytest.approx(
+                    recovers_at + poll_policy.RESET_SLACK_S
+                )
+        assert h.active_number() == 1
 
 
 class TestIdleHold:

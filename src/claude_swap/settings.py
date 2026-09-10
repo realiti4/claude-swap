@@ -143,7 +143,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "fallbackAccount", "fallback_account", "string",
-            help="NUM|EMAIL|ALIAS to force onto once the active and every OAuth candidate are spent",
+            help="NUM|EMAIL|ALIAS to force onto once every OAuth account is spent",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
