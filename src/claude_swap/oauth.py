@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -92,13 +93,34 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
-def is_oauth_token_expired(expires_at: object) -> bool:
+def is_oauth_token_expired(expires_at: object, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or (
+        isinstance(expires_at, float) and not math.isfinite(expires_at)
+    ):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+    return now_ms + buffer_ms >= int(expires_at)
+
+
+def refresh_token_spent(credentials: str, *, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
+    """Has this credential's own refresh token expired?
+
+    Unknown is not expired — no field, a non-numeric one, JSON carrying no
+    ``claudeAiOauth``, and non-JSON all answer False. The one predicate for
+    "these bytes can mint nothing", so no caller can disagree about a
+    credential.
+
+    It RAISES on JSON that is not an object (``AttributeError``) and on
+    ``None`` (``TypeError``), both out of ``extract_oauth_data``, so a caller
+    that cannot afford a raise must sit behind one that already parsed these
+    bytes.
+    """
+    return is_oauth_token_expired(
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt"),
+        buffer_ms=buffer_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -143,13 +165,17 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0, slot: str | None = None
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``slot`` is logging only (an account number, when the caller has one) —
+    this used to log nothing on success and only at DEBUG on failure, so no
+    refresh POST was ever dateable from the log at all.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -194,6 +220,7 @@ def try_refresh_oauth_credentials(
             oauth["scopes"] = resp_data["scope"].split()
 
         data["claudeAiOauth"] = oauth
+        _logger.info("Refresh POST for account %s: ok", slot)
         return RefreshOutcome(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
@@ -221,10 +248,13 @@ def try_refresh_oauth_credentials(
             # (client_id rotated/blocked), no evidence about any slot, so it
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
+                _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
                 return RefreshOutcome(None, err)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
 
 
@@ -257,9 +287,11 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
+def refresh_oauth_credentials(
+    credentials: str, slot: str | None = None
+) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
-    return try_refresh_oauth_credentials(credentials).credentials
+    return try_refresh_oauth_credentials(credentials, slot=slot).credentials
 
 
 def fetch_oauth_profile(access_token: str) -> dict | None:
@@ -323,6 +355,38 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
     }
 
+
+def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool | None:
+    """Is this access token still accepted by the API, right now?
+
+    Same endpoint as ``fetch_oauth_profile``, but that oracle deliberately
+    collapses every failure to ``None`` ("unresolvable, proceed as before") —
+    exactly wrong for a caller who needs to tell "this credential is dead"
+    (401: the server itself rejected it) from "no answer either way"
+    (timeout, connection error, 5xx). Returns ``True`` (live), ``False``
+    (dead — a 401), or ``None`` (transport failure — no verdict). Must not be
+    called while any credential/config lock is held (network under locks is
+    forbidden).
+    """
+    url = "https://api.anthropic.com/api/oauth/profile"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        _logger.debug("OAuth profile liveness probe failed: %r", e)
+        return None
+    except Exception as e:
+        _logger.debug("OAuth profile liveness probe failed: %r", e)
+        return None
 
 
 def build_token_status(credentials: str) -> str | None:
@@ -594,6 +658,41 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def binding_window_label(
+    usage: dict | None, models: Sequence[str] = ()
+) -> str | None:
+    """Label of the window this account is closest to hitting, or ``None``.
+
+    The companion to :func:`account_headroom`, which returns the binding
+    window's headroom and throws away WHICH window it was. An escape needs the
+    label: a 5-hour limit and a weekly limit want different targets, and a
+    ranking that cannot tell them apart optimises the wrong axis for one of
+    them.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: w[1])[0]
+
+
+def headroom_on_window(
+    usage: dict | None, label: str, models: Sequence[str] = ()
+) -> float | None:
+    """Headroom on ONE named window, or ``None`` when it is not reported.
+
+    Deliberately NOT a floor on the others, and NOT a usability test: a high
+    number here says only that one window is clear. An account can score 50
+    on it and hold a single point overall. Callers must therefore rank with
+    it and decide usability with :func:`account_headroom` — the engine's
+    escape key tiers on that first, because ordering by this number alone
+    lands on an account that stops answering on the next request.
+    """
+    for name, pct, _ in relevant_windows(usage, models):
+        if name == label:
+            return 100.0 - pct
+    return None
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.
@@ -633,6 +732,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "identity-unreadable", "lineage-condemned", "live-store-unreadable",
+    "live-store-current",
 )
 
 
@@ -666,10 +767,26 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
+        # A grant already past its own expiry (not just inside the refresh
+        # buffer) cannot be revived by a POST — the server will only say
+        # invalid_grant. Skip straight to that outcome.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "request made. Reporting invalid_grant without a POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if refresh.credentials:
             working_credentials = refresh.credentials
             if refresh_via is None:
@@ -721,10 +838,25 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            _log_usage_failure(context, e, kind)
+            _logger.info(
+                "Account %s: refresh-token grant already past its own "
+                "expiry — decided locally from the stored expiry, no "
+                "retry request made. Reporting invalid_grant without a "
+                "POST.",
+                account_num,
+            )
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")

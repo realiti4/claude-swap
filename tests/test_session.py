@@ -1804,9 +1804,13 @@ class TestGuards:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         # Unexpired, so the read-only request is made; an expired copy under
-        # a live session is not requested at all.
+        # a live session is not requested at all. `attributed=True`: this is
+        # the same slot's own credential being rotated, matching every other
+        # ROTATED_CREDS setup call in this file (see `_write_account_credentials`'s
+        # own docstring on this branch: the kwarg is a merge seam for
+        # feat/pin-package-seam's write-time attribution guard).
         seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True
         )
         make_live(session_dir)
         seen: dict[str, bool] = {}

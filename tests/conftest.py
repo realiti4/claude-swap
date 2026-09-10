@@ -573,6 +573,32 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_switch_target_probe(request, monkeypatch):
+    """Safety net: no test may make a live switch-target liveness probe.
+
+    ``_probe_target_credential`` (the switch-time guard against activating a
+    credential the API has already revoked) calls
+    ``oauth.probe_oauth_profile_live`` on every switch target that will be
+    written live — which is most seeded test accounts, in dozens of
+    unrelated switch tests that don't mock it. Stub it to ``None`` (its
+    documented "transport failure — no verdict" answer, which the guard
+    already treats as "proceed as before") so the suite stays hermetic; a
+    test exercising the guard itself patches this explicitly.
+    ``@pytest.mark.no_probe_oauth_profile_live_fake`` opts out for
+    ``TestProbeOauthProfileLive``, which mocks ``urlopen`` beneath it — the
+    same escape hatch ``no_oauth_profile_fake`` gives its sibling stub above.
+    """
+    if request.node.get_closest_marker("no_probe_oauth_profile_live_fake"):
+        yield
+        return
+    monkeypatch.setattr(
+        "claude_swap.oauth.probe_oauth_profile_live",
+        lambda token, timeout_s=5.0: None,
+    )
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
