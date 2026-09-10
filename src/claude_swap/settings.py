@@ -47,7 +47,15 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom) or "consume-first" (soonest weekly reset first,
+    # then soonest 5h, then most-used). Default consume-first: Claude's
+    # 5h/7d quota is use-it-or-lose-it, and "best" actively works against
+    # that -- it parks on whichever account has the MOST headroom, which is
+    # exactly the quota with the longest runway, and lets whatever's about
+    # to reset evaporate unused. consume-first is the economically correct
+    # default for anyone rotating multiple accounts; "best" stays available
+    # for someone who genuinely wants pure headroom-maximizing instead.
+    strategy: str = "consume-first"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),

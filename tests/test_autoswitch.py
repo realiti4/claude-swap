@@ -186,7 +186,12 @@ class EngineHarness:
 
 @pytest.fixture
 def harness(temp_home: Path) -> EngineHarness:
-    h = EngineHarness(temp_home)
+    # Explicit strategy="best": this fixture backs TestDecisionTable, which
+    # specifically exercises "best" (most-headroom) semantics. The library
+    # default became "consume-first" (2026-09-10) -- pin it here rather than
+    # let this whole class silently start running consume-first assertions
+    # under a "best"-named test class.
+    h = EngineHarness(temp_home, strategy="best")
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
     h.seed(3, "c@example.com")
@@ -383,7 +388,7 @@ class TestDecisionTable:
         # Cooldown disabled so only the gate itself prevents flapping: after
         # 99→89 the roles reverse, and the old account (99%) can never beat
         # the new active (89%) — the move is one-way.
-        h = EngineHarness(temp_home, cooldown_seconds=0.0)
+        h = EngineHarness(temp_home, strategy="best", cooldown_seconds=0.0)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -1816,7 +1821,7 @@ class TestFreshening:
         mock_refresh.assert_not_called()
 
     def test_invalid_grant_quarantines_and_tries_next(self, temp_home):
-        h = EngineHarness(temp_home)
+        h = EngineHarness(temp_home, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=1)  # long expired
         h.seed(3, "c@example.com")
@@ -2291,7 +2296,7 @@ class TestPctLabel:
         assert "switch at 99.9%" in poll.human()
 
     def test_below_threshold_detail_shows_fractional_threshold(self, temp_home):
-        h = EngineHarness(temp_home, threshold=99.9)
+        h = EngineHarness(temp_home, strategy="best", threshold=99.9)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -2306,7 +2311,7 @@ class TestPctLabel:
     ):
         # utilization 99.85 with threshold 99.9: .0f on the left side used
         # to render the logically impossible "100% < 99.9%".
-        h = EngineHarness(temp_home, threshold=99.9)
+        h = EngineHarness(temp_home, strategy="best", threshold=99.9)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -2571,6 +2576,7 @@ class TestModelAwareSwitch:
     """`autoswitch.model` folds a per-model weekly limit into the decision."""
 
     def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        kw.setdefault("strategy", "best")
         h = EngineHarness(temp_home, **kw)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
@@ -3168,9 +3174,11 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 1
 
     def test_best_strategy_unaffected_below_threshold(self, temp_home):
-        # Regression: default (best) still holds below threshold even when a
-        # peer resets sooner — consume-first behavior must be opt-in.
-        h = EngineHarness(temp_home)  # strategy defaults to "best"
+        # Regression: "best" still holds below threshold even when a peer
+        # resets sooner. Explicit now that the library default is
+        # consume-first (2026-09-10) -- this test is specifically pinning
+        # "best"'s own behavior, not the default.
+        h = EngineHarness(temp_home, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -5024,7 +5032,7 @@ class TestHorizonAxisDoesNotFlap:
         `EngineHarness` over it inherits the first run's roster, so the control
         comes from popping `lastSwitchFrom`, not from a fresh box.
         """
-        h = EngineHarness(temp_home)
+        h = EngineHarness(temp_home, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
@@ -6256,7 +6264,7 @@ class TestHorizonAxisDoesNotFlap:
         Asserts the DESTINATION: the tick switches either way, so an outcome
         assertion would pass with the release gone.
         """
-        h = EngineHarness(temp_home)
+        h = EngineHarness(temp_home, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")

@@ -82,11 +82,14 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
-    def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
+    def test_unsupported_strategy_falls_back_to_default(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
-        assert load_settings(tmp_path).strategy == "best"
+        # Falls back to whatever AutoSwitchSettings.strategy defaults to
+        # (consume-first as of 2026-09-10) -- not a hardcoded "best", or this
+        # test silently stops matching the fallback behavior it's pinning.
+        assert load_settings(tmp_path).strategy == AutoSwitchSettings().strategy
 
     def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
