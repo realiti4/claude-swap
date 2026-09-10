@@ -57,10 +57,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
-    # NUM|EMAIL|ALIAS to force onto once the active account and every OAuth
-    # candidate are exhausted (0% headroom on every relevant window), rather
-    # than sitting blocked until the earliest reset. None = no fallback
-    # (default: block).
+    # NUM|EMAIL|ALIAS to force onto once the active account can no longer
+    # carry on — out of quota, or its credential dead — and every OAuth
+    # candidate is at or over the limit on whichever window binds first,
+    # rather than sitting blocked until the earliest reset. Never an API-key
+    # account. None = no fallback (default: block).
     fallback_account: str | None = None
 
 
@@ -142,7 +143,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "fallbackAccount", "fallback_account", "string",
-            help="NUM|EMAIL|ALIAS to force onto once every account is exhausted",
+            help="NUM|EMAIL|ALIAS to force onto once the active and every OAuth candidate are spent",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

@@ -677,9 +677,11 @@ Defaults live in settings.json in the backup root; flags override them.
         "--fallback-account",
         metavar="NUM|EMAIL|ALIAS",
         help=(
-            "Force onto this account once the active account and every OAuth "
-            "candidate are exhausted (0%% headroom on every relevant window), "
-            "instead of sitting blocked until the earliest reset"
+            "Force onto this account once the active account can no longer "
+            "carry on — out of quota, or its credential dead — and every "
+            "OAuth candidate is at or over the limit on whichever window "
+            "binds first (5h, 7d, or a --model weekly window), instead of "
+            "sitting blocked until the earliest reset"
         ),
     )
     parser.add_argument(

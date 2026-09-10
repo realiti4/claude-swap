@@ -1396,10 +1396,25 @@ class AutoSwitchEngine:
                 # failed. The ErrorEvent above says why, but the tick's
                 # OUTCOME must stay what it would have been without a
                 # fallback configured — see `_block_all_exhausted`.
-                return self._block_all_exhausted(usage)
+                #
+                # The nap is a different question from the outcome. A bare
+                # `transient` is network trouble and `consume-busy` says it
+                # "retries next pass" — both clear on their own, so sleeping
+                # out the quota window would strand the user at 0% over a
+                # blip. The rest need a human (unset an env var, unlock the
+                # keychain, chase a rejected client_id) and will still be
+                # true after a nap.
+                return self._block_all_exhausted(
+                    usage, slow=systemic not in ("", "consume-busy")
+                )
             return TickOutcome.ERROR
         if trigger == "fallback":
-            return self._block_all_exhausted(usage)
+            # Nothing systemic and nothing transient, so the loop drained on
+            # a quarantine or `skip-live-session`. Never nap here: a live
+            # session ends when the user's `cswap run` exits, and a
+            # quarantine drops the slot out of `candidates`, so the NEXT
+            # tick takes the plain branch above and naps there anyway.
+            return self._block_all_exhausted(usage, slow=False)
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -2246,20 +2261,29 @@ class AutoSwitchEngine:
             )
 
     def _block_all_exhausted(
-        self, usage: dict[str, dict | str | None]
+        self, usage: dict[str, dict | str | None], *, slow: bool = True
     ) -> TickOutcome:
-        """Park on the bounded, reset-aware slow cadence and say so.
+        """Report the all-exhausted block, optionally parking on its cadence.
 
         Shared by the plain all-exhausted branch and by the fallback paths
         that end up back in the same state, so a configured-but-unreachable
         fallback cannot quietly cost the caller what the block provides: the
         ``AllExhaustedEvent`` the menubar and TUI key on, ``earliestResetAt``
         for ``--json`` consumers, and the BLOCKED ``--once`` exit code.
+
+        ``slow`` is the reset-aware nap, and it is a claim that NOTHING can
+        change until a quota window resets. That holds for the plain branch,
+        which never tries to move. It is false while a fallback is configured
+        and merely unreached: the hatch becoming reachable is a change that
+        does not wait for a reset, so napping up to ``MAX_SLEEP_S`` would
+        defer the escape by 10x over a blip that clears next tick. Callers
+        pass ``slow=False`` for the self-clearing causes.
         """
-        self._blocked_wait_long = True
         earliest = self._earliest_recovery(usage)
-        if earliest is not None:
-            self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+        if slow:
+            self._blocked_wait_long = True
+            if earliest is not None:
+                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
         self._emit(
             AllExhaustedEvent(
                 earliest_reset_at=(
@@ -2277,18 +2301,27 @@ class AutoSwitchEngine:
         One definition for both the decision point and the typo guard, so
         the warning cannot claim a fallback the engine would refuse.
 
-        API-key slots are excluded unless the user opted into them. The
-        exhausted branch is only reachable with that opt-out OFF (with it on,
-        API-key candidates are already taken as the last resort further up),
-        and switching onto a metered slot from here is a one-way door: the
-        next tick's ``active-api-key`` early return holds, so rotation never
-        resumes even once the OAuth accounts reset.
+        An API-key slot is never eligible, in EITHER setting of
+        ``includeApiKeyAccounts``, because neither setting can honour the
+        designation:
+
+        * with the opt-in off, switching onto a metered slot from here is a
+          one-way door — the next tick's ``active-api-key`` early return
+          holds, so rotation never resumes even once the OAuth accounts
+          reset;
+        * with it on, the last-resort leg above already takes
+          ``api_key_candidates`` before this branch is reached, and it takes
+          them in rotation order — so the engine can land on a DIFFERENT
+          metered account than the one named here, and the bill follows.
+
+        Refusing both ways means the warning tells the truth in both, rather
+        than implying a control over billing that does not exist.
         """
         if num is None:
             return False
-        return num in self.switcher.switchable_account_numbers() and (
-            self.settings.include_api_key_accounts
-            or self.switcher.account_kind_for(num) != "api_key"
+        return (
+            num in self.switcher.switchable_account_numbers()
+            and self.switcher.account_kind_for(num) != "api_key"
         )
 
     def _resolve_fallback_account_number(self) -> str | None:
@@ -2316,10 +2349,10 @@ class AutoSwitchEngine:
         accounts resolves to ``"4"`` — the typo most worth catching, and one
         that resolving alone reports as fine.
 
-        The wording stays one sentence covering every ineligible case rather
-        than naming which one applies: telling them apart needs a second
-        lookup that can migrate the account store, and a warning is not worth
-        a write.
+        The wording stays one sentence listing every ineligible case rather
+        than naming which one applies, because the remedy does not vary: the
+        setting names something that cannot be the fallback, so it has to be
+        corrected or dropped either way.
         """
         self._fallback_check_done = True
         identifier = self.settings.fallback_account
@@ -2339,12 +2372,10 @@ class AutoSwitchEngine:
         self._emit(
             ConfigWarningEvent(
                 message=(
-                    f"autoswitch.fallbackAccount: '{identifier}' is not an "
-                    "account available for automatic rotation (unknown "
-                    "identifier, or a slot that is disabled, has no usable "
-                    "backup, or is an API-key account while "
-                    "autoswitch.includeApiKeyAccounts is off) — the "
-                    "exhausted-fallback safety net is inert"
+                    f"autoswitch.fallbackAccount: '{identifier}' cannot serve "
+                    "as the fallback (unknown identifier, or a slot that is "
+                    "disabled, has no usable backup, or is an API-key "
+                    "account) — the exhausted-fallback safety net is inert"
                 )
             )
         )
