@@ -96,7 +96,15 @@ class MenuBarSettings:
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
-    auto_switch_enabled: bool = False
+    # Default ON: the menu bar app is the primary way people run cswap
+    # day-to-day, and its whole purpose is watching accounts and switching
+    # before a rate limit hits. Defaulting this off meant a fresh install (or
+    # any environment with no settings.json yet) silently did nothing but
+    # display usage -- polling looked alive, nothing ever switched, and nobody
+    # noticed until an account had already frozen at 100%. Explicitly opting
+    # OUT is one click on "Auto-Switch" in the menu, same as opting in used to
+    # be -- this only changes what a fresh install starts with.
+    auto_switch_enabled: bool = True
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
