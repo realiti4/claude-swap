@@ -1408,10 +1408,15 @@ class AutoSwitchEngine:
                 )
             )
             if trigger == "fallback":
-                # The fleet is still all-exhausted; only the escape hatch
-                # failed. The ErrorEvent above says why, but the tick's
-                # OUTCOME must stay what it would have been without a
-                # fallback configured — see `_block_all_exhausted`.
+                # Nowhere left to go: every other candidate is spent and the
+                # escape hatch failed too. The ErrorEvent above says why, but
+                # the tick's OUTCOME is the block — see `_block_all_exhausted`.
+                # Since the fallback may have been excused from the exhaustion
+                # test rather than proven spent, this can now report the block
+                # on a headroom nobody read. That is the same bounded-nap trade
+                # the helper's docstring already takes for a self-clearing
+                # cause, and the fast retry that would shorten it is what
+                # 770d2a6 removed.
                 return self._block_all_exhausted(usage)
             return TickOutcome.ERROR
         if trigger == "fallback":

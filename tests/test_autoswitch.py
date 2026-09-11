@@ -846,6 +846,35 @@ class TestFallbackAccount:
         no_switch = next(e for e in h.events if isinstance(e, NoSwitchEvent))
         assert no_switch.reason == "no-qualifying-candidate"
 
+    def test_an_excused_fallback_that_cannot_land_still_takes_the_block(
+        self, temp_home
+    ):
+        # One of the tails the exemption newly exposes, where the block is
+        # reported on a headroom nobody read: the fallback is excused from the
+        # exhaustion test, tried, and the freshen fails. Consumers still get
+        # the AllExhaustedEvent and the bounded nap rather than a fast retry —
+        # the trade 770d2a6 settled. Without this the shape is unpinned.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)  # long expired
+        h.make_live("a@example.com", 1)
+        recovers_at = h.clock() + 3_600.0
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome = h.tick_with_usage(
+                {"1": _usage(100, _iso_at(recovers_at)), "2": None}
+            )
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, ErrorEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is True
+        assert h.engine._sleep_until_ts == pytest.approx(
+            recovers_at + poll_policy.RESET_SLACK_S
+        )
+
     def test_a_quarantined_fallback_is_not_reached(self, temp_home):
         # Eligibility is not the only bar — `fallback_num in candidates`
         # excludes quarantined slots, and it must, or the engine would keep
