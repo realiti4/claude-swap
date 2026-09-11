@@ -557,20 +557,33 @@ def relevant_windows(
         window = usage.get(key)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             windows.append((label, float(window["pct"]), window.get("resets_at")))
-    if models:
-        wanted = {m.lower() for m in models}
-        match_all = "all" in wanted
-        scoped = usage.get("scoped")
-        if isinstance(scoped, list):
-            for s in scoped:
-                if (
-                    isinstance(s, dict)
-                    and isinstance(s.get("pct"), (int, float))
-                    and isinstance(s.get("name"), str)
-                    and (match_all or s["name"].lower() in wanted)
-                ):
-                    windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+    windows.extend(scoped_windows(usage, models))
     return windows
+
+
+def scoped_windows(
+    usage: dict | None, models: Sequence[str] = ()
+) -> list[tuple[str, float, str | None]]:
+    """The per-model weekly ``scoped`` windows that ``models`` names, as
+    ``(display_name, pct, resets_at)``. Names match case-insensitively and
+    the sentinel ``all`` matches every scoped window the account reports.
+    Empty when ``models`` is empty or the account reports none of them.
+    """
+    if not models or not isinstance(usage, dict):
+        return []
+    wanted = {m.lower() for m in models}
+    match_all = "all" in wanted
+    scoped = usage.get("scoped")
+    if not isinstance(scoped, list):
+        return []
+    return [
+        (s["name"], float(s["pct"]), s.get("resets_at"))
+        for s in scoped
+        if isinstance(s, dict)
+        and isinstance(s.get("pct"), (int, float))
+        and isinstance(s.get("name"), str)
+        and (match_all or s["name"].lower() in wanted)
+    ]
 
 
 def account_headroom(
@@ -589,6 +602,20 @@ def account_headroom(
     auto-skipped).
     """
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
+    if not pcts:
+        return None
+    return 100.0 - max(pcts)
+
+
+def model_headroom(
+    usage: dict | None, models: Sequence[str] = ()
+) -> float | None:
+    """Remaining percentage on the tightest of the named per-model weekly
+    windows alone. The 5h/7d windows do not take part. ``None`` when the
+    account reports none of the named windows, which callers must read as
+    "unknown", never as a full or an empty quota.
+    """
+    pcts = [pct for _, pct, _ in scoped_windows(usage, models)]
     if not pcts:
         return None
     return 100.0 - max(pcts)
