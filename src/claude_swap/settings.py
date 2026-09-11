@@ -57,6 +57,12 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Comma-separated account emails and/or slot numbers to land on first
+    # whenever a switch happens. A listed account beats an unlisted one only
+    # among the candidates that already qualify under the strategy's own
+    # gates (threshold, hysteresis, no-return); the strategy's key orders the
+    # rest. None = strategy order only (default).
+    preferred: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "preferred", "preferred", "string",
+            help="Land on these accounts first when switching (emails and/or slot numbers, comma-separated)",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -165,6 +175,15 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_preferred(value: str | None) -> frozenset[str]:
+    """Split ``autoswitch.preferred`` into trimmed, lowercased tokens — emails
+    or slot numbers. Emails are the stable identity (slot numbers move under
+    ``cswap reorder``) and match case-insensitively."""
+    if not value:
+        return frozenset()
+    return frozenset(t.strip().lower() for t in value.split(",") if t.strip())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
