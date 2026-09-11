@@ -183,6 +183,8 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    if acc.expires_at:
+        text.append(f"   expires {acc.expires_at}", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -260,6 +262,8 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    if acc.expires_at:
+        text.append(f"  expires {acc.expires_at}", style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel

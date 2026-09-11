@@ -183,6 +183,19 @@ class TestJsonHelpers:
         )
         assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
+    def test_account_row_plan_expiry_is_additive_and_distinct(self):
+        """``planExpiresAt`` (user-recorded cancellation date) never aliases
+        ``loginExpiresAt`` (the login's refresh-token expiry)."""
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@x.com", "", "", True, None,
+            login_expires_at="2026-10-08T01:06:36Z", plan_expires_at="2026-09-16",
+        )
+        assert row["planExpiresAt"] == "2026-09-16"
+        assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
+        assert "planExpiresAt" not in account_row(1, "a@x.com", "", "", True, None)
+
     def test_account_row_omits_login_expiry_when_unknown(self):
         from claude_swap.json_output import account_row
 
