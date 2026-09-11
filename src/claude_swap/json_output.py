@@ -52,6 +52,8 @@ def _window_to_json(entry: dict) -> dict:
     out: dict = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
+    if entry.get("resets_at_inferred"):
+        out["resetsAtInferred"] = True
     cell = oauth.fresh_reset_strings(entry)
     if cell:
         out["countdown"], out["clock"] = cell
