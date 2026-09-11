@@ -262,6 +262,8 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    if acc.expires_at:
+        text.append(f"  expires {acc.expires_at}", style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel

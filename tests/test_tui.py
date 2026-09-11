@@ -606,6 +606,17 @@ class TestUsageRows:
         assert "expires 2026-09-16" in with_date.splitlines()[0]
         assert "expires" not in without
 
+    def test_mini_line_shows_recorded_expiration(self):
+        # Same fact as the full card, on the minimized line for an inactive
+        # account — absent when nothing is recorded.
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        with_date = mini_account_text(make_account(1, expires_at="2026-09-16"), now).plain
+        without = mini_account_text(make_account(1), now).plain
+        assert "expires 2026-09-16" in with_date
+        assert "expires" not in without
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its

@@ -9314,6 +9314,27 @@ class TestExpiringStrategy:
         assert payload["switched"] is True
         assert payload["strategy"] == "expiring"
         assert any(w.startswith("Skipped: Account-2 resets at") for w in payload["warnings"])
+        # Structured counterpart of the same "Skipped: ..." warning text, so a
+        # script can find the skipped account without parsing a sentence.
+        assert payload["pendingExpiring"] == [
+            {"accountNumber": 2, "resetsAt": usage["2"]["seven_day"]["resets_at"],
+             "reason": "saturated"}
+        ]
+
+    def test_switch_omits_pending_expiring_when_nothing_skipped(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(0), "2": self._usage(0)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert payload["switched"] is True
+        assert "pendingExpiring" not in payload
 
     def test_switch_none_stay_and_exhausted_reasons(self, temp_home, capsys):
         s = self._setup(temp_home)

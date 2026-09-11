@@ -5948,13 +5948,20 @@ class ClaudeAccountSwitcher:
         self.add_account()
 
     def _switch_result_from_op(
-        self, op: dict, strategy: str, extra_warnings: list[str] | None = None
+        self,
+        op: dict,
+        strategy: str,
+        extra_warnings: list[str] | None = None,
+        pending_expiring: list[dict] | None = None,
     ) -> dict:
         """Build a switch result from a ``_perform_switch`` return value.
 
         ``switched`` is derived from whether the live identity actually changed
         (``from != to``) — covering recorded/live drift in plain rotation, not just
-        ``switch_to`` onto the already-active account.
+        ``switch_to`` onto the already-active account. ``pending_expiring`` is
+        additive (see ``_switch_noop``) — only the ``expiring`` strategy ever
+        passes it, when it skipped a soonest-expiring-but-unusable account in
+        favor of the one it landed on.
         """
         from_ref = op["from"]
         to_ref = op["to"]
@@ -5965,7 +5972,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -5975,6 +5982,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if pending_expiring:
+            result["pendingExpiring"] = pending_expiring
+        return result
 
     def _switch_noop(
         self,
@@ -5985,17 +5995,23 @@ class ClaudeAccountSwitcher:
         from_ref: dict | None = None,
         to_ref: dict | None = None,
         warnings: list[str] | None = None,
+        pending_expiring: list[dict] | None = None,
     ) -> dict:
         """Build a no-op switch result (``switched: false``).
 
         For a no-op the user neither left nor arrived anywhere — ``from`` and
         ``to`` are both the current account. Callers pass ``to_ref`` (where they
         stayed); ``from_ref`` defaults to it so every ``switched: false`` payload
-        reports ``from == to``.
+        reports ``from == to``. ``pending_expiring`` is additive: a list of
+        ``{"accountNumber", "resetsAt", "reason"}`` rows for every account with a
+        recorded expiration the ``expiring`` strategy could not use this pass
+        (``reason`` is ``"saturated"`` or ``"unreadable"``) — the structured
+        counterpart of the same accounts named in ``message``/``warnings``, so a
+        script does not have to parse either to find them.
         """
         if from_ref is None:
             from_ref = to_ref
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": False,
             "from": from_ref,
@@ -6005,6 +6021,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": warnings or [],
         }
+        if pending_expiring:
+            result["pendingExpiring"] = pending_expiring
+        return result
 
     def switch(
         self,
@@ -6275,18 +6294,30 @@ class ClaudeAccountSwitcher:
             )
             threshold_label = f"{threshold:g}%"
 
+            # One source of truth for the human "Skipped: ..." sentence and the
+            # machine-readable `pendingExpiring` JSON field, so they can never
+            # disagree about which accounts were skipped or why.
+            pending_expiring: list[dict] = [
+                {"accountNumber": int(num), "resetsAt": resets_at, "reason": "saturated"}
+                for num, resets_at in pending.items()
+            ] + [
+                {"accountNumber": int(num), "resetsAt": None, "reason": "unreadable"}
+                for num in unreadable
+            ]
+
             def _pending_suffix() -> str:
-                parts = []
-                for num, resets_at in pending.items():
-                    when = (
-                        oauth.format_reset(resets_at)[1] if resets_at
-                        else "an unknown time"
-                    )
-                    parts.append(f"Account-{num} resets at {when}")
-                for num in unreadable:
-                    parts.append(f"Account-{num} usage unavailable")
-                if not parts:
+                if not pending_expiring:
                     return ""
+                parts = []
+                for row in pending_expiring:
+                    if row["reason"] == "unreadable":
+                        parts.append(f"Account-{row['accountNumber']} usage unavailable")
+                    else:
+                        when = (
+                            oauth.format_reset(row["resetsAt"])[1] if row["resetsAt"]
+                            else "an unknown time"
+                        )
+                        parts.append(f"Account-{row['accountNumber']} resets at {when}")
                 return " Skipped: " + "; ".join(parts) + "."
 
             if target is not None:
@@ -6298,7 +6329,9 @@ class ClaudeAccountSwitcher:
                         print(dimmed(skipped))
                 op = self._perform_switch(target, emit_output=not json_output)
                 return (
-                    self._switch_result_from_op(op, strategy_label, warnings)
+                    self._switch_result_from_op(
+                        op, strategy_label, warnings, pending_expiring
+                    )
                     if json_output else None
                 )
             if note == "none":
@@ -6321,6 +6354,7 @@ class ClaudeAccountSwitcher:
                     return self._switch_noop(
                         strategy=strategy_label, reason="already-expiring-best",
                         to_ref=current_ref, warnings=warnings, message=message,
+                        pending_expiring=pending_expiring,
                     )
                 print(f"{accent(head)} (Account-{current_num})." + dimmed(_pending_suffix()))
                 return None
@@ -6345,6 +6379,7 @@ class ClaudeAccountSwitcher:
                     return self._switch_noop(
                         strategy=strategy_label, reason=reason,
                         to_ref=current_ref, warnings=warnings, message=message,
+                        pending_expiring=pending_expiring,
                     )
                 warning(message)
                 return None
