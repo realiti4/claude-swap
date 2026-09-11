@@ -698,6 +698,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # ``autoswitch.modelMode = prefer`` with no model configured changes
+        # nothing. Warn once, so the user hears it.
+        self._model_mode_check_done = False
 
     # -- state file ---------------------------------------------------------
 
@@ -972,6 +975,18 @@ class AutoSwitchEngine:
             )
         )
 
+        if not self._model_mode_check_done:
+            self._model_mode_check_done = True
+            if settings.model_mode == "prefer" and not self._models:
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            "autoswitch.modelMode is prefer but autoswitch.model "
+                            "is not set — no model window is watched; set "
+                            "autoswitch.model (e.g. Fable) or unset modelMode"
+                        )
+                    )
+                )
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 

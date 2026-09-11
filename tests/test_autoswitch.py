@@ -7066,6 +7066,25 @@ class TestModelPreferMode:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_prefer_without_a_model_warns_once(self, temp_home):
+        h = EngineHarness(temp_home, model_mode="prefer")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {"1": _prefer_usage(5, 10), "2": _prefer_usage(5, 10)}
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "autoswitch.modelMode is prefer" in warnings[0].message
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_prefer_with_a_model_never_warns_about_the_mode(self, temp_home):
+        h = self._seed(temp_home)
+        h.tick_with_usage({"1": _prefer_usage(5, 10), "2": _prefer_usage(5, 10)})
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
     def test_returns_when_the_left_account_gets_its_model_back(self, temp_home):
         h = self._seed(temp_home)
         outcome = h.tick_with_usage({
