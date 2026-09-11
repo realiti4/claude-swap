@@ -140,6 +140,7 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    expires_at: str | None = None  # recorded subscription-expiration date (YYYY-MM-DD), if any
 
     @property
     def display_tag(self) -> str:

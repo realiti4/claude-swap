@@ -573,6 +573,78 @@ Examples:
         sys.exit(130)
 
 
+def _expires_command(argv: list[str]) -> None:
+    """Handle `cswap expires [NUM|EMAIL] [YYYY-MM-DD] [--clear]`.
+
+    Records (or, with --clear, removes) the date an account's underlying
+    subscription is canceled/expires — a fact cswap cannot observe on its own
+    (the usage API reports only 5h/7d rate-limit windows, never billing
+    state). Feeds `cswap switch --strategy expiring` and the expiration line
+    in `cswap list`. With no arguments, lists every recorded expiration.
+    Pre-dispatched before the main parser for the same reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap expires",
+        description=(
+            "Record, clear, or list when an account's subscription is "
+            "canceled/expires, so `cswap switch --strategy expiring` can "
+            "drain the soonest-expiring account first."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap expires 2 2026-09-16
+  cswap expires user@example.com 2026-09-16
+  cswap expires 2 --clear
+  cswap expires                       # list all recorded expirations
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set an expiration on. Omit to list all recorded expirations.",
+    )
+    parser.add_argument(
+        "date",
+        nargs="?",
+        metavar="YYYY-MM-DD",
+        help="Date the account's subscription is canceled/expires.",
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the account's recorded expiration")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.clear and args.date:
+        parser.error("--clear does not take a YYYY-MM-DD argument")
+    if args.clear and args.account is None:
+        parser.error("NUM|EMAIL is required with --clear")
+    if args.account is not None and not args.clear and not args.date:
+        parser.error("YYYY-MM-DD is required (or pass --clear to remove the expiration)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_expirations()
+            if not rows:
+                print(dimmed("No expirations recorded"))
+                return
+            print(bolded("Expirations:"))
+            for num, expires, email in rows:
+                print(f"  {num}: {expires} {muted(f'({email})')}")
+            return
+
+        switcher.set_account_expires(args.account, None if args.clear else args.date)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1011,6 +1083,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "expires":
+        _expires_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1053,6 +1128,9 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s expires <num|email> <date> record when an account's sub is canceled
+  %(prog)s expires <num|email> --clear remove a recorded expiration
+  %(prog)s expires                    list all recorded expirations
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
@@ -1072,6 +1150,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
         epilog="""Flags combine with subcommands:
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch --strategy expiring       # drain the soonest-expiring account
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
@@ -1111,12 +1190,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     parser.add_argument(
         "--strategy",
-        choices=["best", "next-available"],
-        metavar="{best,next-available}",
+        choices=["best", "next-available", "expiring"],
+        metavar="{best,next-available,expiring}",
         help=(
-            "With bare 'switch': pick the target by remaining 5h/7d quota. "
-            "'best' jumps to the account with the most headroom; "
-            "'next-available' rotates to the next account, skipping any at their limit"
+            "With bare 'switch': pick the target by remaining 5h/7d quota, or "
+            "by recorded subscription expiration. 'best' jumps to the account "
+            "with the most headroom; 'next-available' rotates to the next "
+            "account, skipping any at their limit; 'expiring' jumps to the "
+            "soonest-expiring account (see 'cswap expires') among those with "
+            "headroom right now"
         ),
     )
     parser.add_argument(
@@ -1325,8 +1407,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Meaningless on a direct-target switch or plain rotation — nothing
         # usage-aware reads it there, so reject loudly rather than ignore.
         parser.error(
-            "--model can only be used with 'switch --strategy best' or "
-            "'switch --strategy next-available'"
+            "--model can only be used with 'switch --strategy best', "
+            "'switch --strategy next-available', or 'switch --strategy expiring'"
         )
 
     if args.slot is not None and not (args.add_account or args.add_token is not None):

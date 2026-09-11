@@ -12,6 +12,7 @@ import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -1765,6 +1766,11 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    expires_at=(
+                        exp.isoformat()
+                        if (exp := self._expires_from_data(seq_data, n)) is not None
+                        else None
+                    ),
                 )
             )
         return AccountsSnapshot(
@@ -1913,6 +1919,161 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    # -- subscription-expiration tracking -----------------------------------
+    #
+    # The Anthropic usage API (``oauth.fetch_usage``) reports only the 5h/7d
+    # rate-limit windows — never a Max subscription's own cancellation or
+    # non-renewal date. cswap has no way to observe that date itself, so it
+    # must be told (``cswap expires``) and stores it alongside ``disabled`` in
+    # the same per-slot sequence-data record. ``expiring-first`` (below) and
+    # ``cswap list`` are the two consumers.
+
+    @staticmethod
+    def _expires_from_data(data: dict, account_num: str) -> date | None:
+        """Recorded subscription-expiration date for a slot, or ``None``."""
+        record = data.get("accounts", {}).get(str(account_num))
+        raw = record.get("expiresAt") if record else None
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def account_expires_at(self, account_num: str) -> str | None:
+        """Public wrapper: the slot's recorded expiration date (ISO), or ``None``."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num))
+        raw = record.get("expiresAt") if record else None
+        return raw if isinstance(raw, str) and raw else None
+
+    def set_account_expires(self, identifier: str, expires: str | None) -> None:
+        """Record (or clear, with ``expires=None``) when an account's
+        underlying subscription is canceled/expires.
+
+        This is plain bookkeeping cswap cannot derive on its own — see the
+        module note above. Feeds the ``expiring`` switch strategy and the
+        expiration line in ``cswap list``.
+
+        Raises:
+            ConfigError: no accounts managed yet, ``expires`` isn't a valid
+                ``YYYY-MM-DD`` date, or the identifier is ambiguous.
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        if expires is not None:
+            try:
+                date.fromisoformat(expires)
+            except ValueError:
+                raise ConfigError(
+                    f"Invalid date '{expires}', expected YYYY-MM-DD"
+                ) from None
+
+        account_num, email, _ = self.resolve_account(identifier)
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        if expires:
+            record["expiresAt"] = expires
+        else:
+            record.pop("expiresAt", None)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if expires:
+            print(f"{accent('Recorded')} Account-{account_num} ({email}) expires {expires}.")
+        else:
+            print(f"{accent('Cleared')} Account-{account_num} ({email}) expiration.")
+
+    def list_expirations(self) -> list[tuple[str, str, str]]:
+        """Every recorded expiration as ``(account_num, expires_iso, email)``,
+        soonest-expiring first."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = [
+            (num, acc["expiresAt"], acc.get("email", ""))
+            for num, acc in accounts.items()
+            if acc.get("expiresAt")
+        ]
+        return sorted(rows, key=lambda r: r[1])
+
+    def _select_expiring_switchable(
+        self,
+        current_num: str | None,
+        models: tuple[str, ...] = (),
+        usage: dict | None = None,
+    ) -> tuple[str | None, str, dict[str, str | None]]:
+        """Decide the ``expiring`` strategy target.
+
+        Ranks every switchable account that has a recorded expiration date by
+        how soon it expires, then picks the soonest-expiring one that still
+        has real headroom right now (``oauth.account_headroom`` — the
+        *binding* window, 5h or 7d, whichever is more exhausted). An account
+        that is next to expire but currently saturated (e.g. its 7d window is
+        at 95% and only resets tomorrow) is not a usable target: switching
+        there would just idle. It is skipped in favour of the next-soonest
+        expiring account that has room, and reported back in ``pending`` (its
+        binding window's reset time) so the caller can say "come back to X
+        after Y" instead of silently ignoring it.
+
+        Returns ``(target, note, pending)``:
+
+        - ``(num, "", pending)`` — switch to ``num``
+        - ``(None, "stay", pending)`` — the soonest-expiring account with
+          headroom is already the current one
+        - ``(None, "none", {})`` — no switchable account has a recorded
+          expiration
+        - ``(None, "exhausted", pending)`` — every expiring account is
+          currently saturated; ``pending`` carries their reset times
+        """
+        data = self._get_sequence_data() or {}
+        switchable = {
+            str(n) for n in data.get("sequence", [])
+            if self._account_is_switchable(str(n))
+            and not self._disabled_from_data(data, str(n))
+        }
+        expiring = sorted(
+            (
+                (num, exp)
+                for num in switchable
+                if (exp := self._expires_from_data(data, num)) is not None
+            ),
+            key=lambda pair: pair[1],
+        )
+        if not expiring:
+            return None, "none", {}
+
+        if usage is None:
+            usage = self._usage_by_account()
+
+        pending: dict[str, str | None] = {}
+        for num, _expires in expiring:
+            headroom = oauth.account_headroom(usage.get(num), models)
+            if headroom is None or headroom <= 0:
+                pending[num] = self._binding_reset_at(usage.get(num), models)
+                continue
+            if num == str(current_num):
+                return None, "stay", pending
+            return num, "", pending
+
+        return None, "exhausted", pending
+
+    @staticmethod
+    def _binding_reset_at(
+        usage: dict | str | None, models: tuple[str, ...] = ()
+    ) -> str | None:
+        """``resets_at`` of the window currently gating this account (the one
+        ``oauth.account_headroom`` maxed over), or ``None`` when unknown."""
+        windows = list(oauth.relevant_windows(usage, models))
+        if not windows:
+            return None
+        _label, _pct, resets_at = max(windows, key=lambda w: w[1])
+        return resets_at
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -5492,6 +5653,11 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    plan_expires_at=(
+                        exp.isoformat()
+                        if (exp := self._expires_from_data(seq_data, str(num))) is not None
+                        else None
+                    ),
                 )
             )
         payload = {
@@ -5557,6 +5723,10 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            expires = self._expires_from_data(seq_data, str(num))
+            if expires is not None:
+                days = (expires - date.today()).days
+                print(f"     {muted(f'expires {expires.isoformat()} ({days:+d}d)')}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 
@@ -5817,8 +5987,12 @@ class ClaudeAccountSwitcher:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
                   switchable account with the most remaining 5h/7d quota instead
                   of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
-                  (the default) performs a plain rotation.
+                  next account, skipping any currently at its 5h/7d limit;
+                  ``"expiring"`` jumps to the switchable account with a recorded
+                  subscription-expiration date (``cswap expires``) soonest,
+                  among those that currently have real headroom — see
+                  ``_select_expiring_switchable``. ``None`` (the default)
+                  performs a plain rotation.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
                   names, or the ``all`` sentinel — see
@@ -5835,7 +6009,9 @@ class ClaudeAccountSwitcher:
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
         """
-        strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
+        strategy_label = (
+            strategy if strategy in ("best", "next-available", "expiring") else "rotation"
+        )
         warnings: list[str] = []
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
@@ -6052,6 +6228,74 @@ class ClaudeAccountSwitcher:
                 )
                 return None
             # note == "none": fall through; rotation reports the lack of targets.
+
+        # Usage-aware "drain the soonest-expiring account with headroom".
+        # Unlike "best" this ranks by a fact cswap cannot observe on its own
+        # (see set_account_expires) rather than by measured usage; usage only
+        # gates *which* expiring account is actionable right now.
+        if strategy == "expiring":
+            expiring_usage = self._usage_by_account()
+            self._warn_inert_models(expiring_usage, models, json_output, warnings)
+            target, note, pending = self._select_expiring_switchable(
+                current_num, models, expiring_usage
+            )
+
+            def _pending_suffix() -> str:
+                if not pending:
+                    return ""
+                parts = []
+                for num, resets_at in pending.items():
+                    when = oauth.format_reset(resets_at)[1] if resets_at else "an unknown time"
+                    parts.append(f"Account-{num} at {when}")
+                return " Next opportunity: " + "; ".join(parts) + "."
+
+            if target is not None:
+                op = self._perform_switch(target, emit_output=not json_output)
+                return (
+                    self._switch_result_from_op(op, strategy_label, warnings)
+                    if json_output else None
+                )
+            if note == "none":
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="no-expirations-recorded",
+                        to_ref=current_ref, warnings=warnings,
+                        message=(
+                            "No switchable account has a recorded expiration date — "
+                            "staying put. Record one with: cswap expires <num|email> "
+                            "<YYYY-MM-DD>."
+                        ),
+                    )
+                print(dimmed(
+                    "No switchable account has a recorded expiration date — staying "
+                    "put. Record one with: cswap expires <num|email> <YYYY-MM-DD>."
+                ))
+                return None
+            if note == "stay":
+                message = (
+                    f"Already on the soonest-expiring account with headroom "
+                    f"(Account-{current_num})." + _pending_suffix()
+                )
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="already-expiring-best",
+                        to_ref=current_ref, warnings=warnings, message=message,
+                    )
+                print(f"{accent('Already on the soonest-expiring account with headroom')} "
+                      f"(Account-{current_num})." + dimmed(_pending_suffix()))
+                return None
+            if note == "exhausted":
+                message = (
+                    "Every account with a recorded expiration is at its usage "
+                    "limit right now — staying put." + _pending_suffix()
+                )
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="expiring-exhausted",
+                        to_ref=current_ref, warnings=warnings, message=message,
+                    )
+                warning(message)
+                return None
 
         # Find current index and get next, skipping broken candidates.
         # The active slot is never checked here — _perform_switch captures
