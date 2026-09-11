@@ -1230,7 +1230,21 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
-            if not any_known:
+            fallback_num = self._resolve_fallback_account_number()
+            fallback_ready = (
+                # The active account must be unable to carry on either:
+                # at-limit means it is out of quota, failover that its
+                # credential is dead. Resolved up front so an unreadable
+                # OTHER candidate can never hide this escape hatch behind
+                # "no candidate has readable usage" below — the fallback
+                # account's OWN unreadability doesn't disqualify it either,
+                # since the freshen step a few lines down is about to try it
+                # for real, not go on a cached, possibly-stale reading.
+                trigger in ("at-limit", "failover")
+                and fallback_num in candidates
+                and self._fallback_is_eligible(fallback_num)
+            )
+            if not any_known and not fallback_ready:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -1271,12 +1285,25 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             # "All exhausted" (and its bounded reset-aware sleep) only when it's
-            # literally true: every candidate's usage is known and at its
-            # limit. A candidate that merely failed the proactive hysteresis
-            # gate, or one whose usage is unreadable this tick, can become
-            # viable at any moment — and the active account can hit 100% and
-            # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
+            # literally true: every OTHER candidate's usage is known and at
+            # its limit. A candidate that merely failed the proactive
+            # hysteresis gate, or one whose usage is unreadable this tick,
+            # can become viable at any moment — and the active account can
+            # hit 100% and need the at-limit escape — so those keep the
+            # normal cadence. The one exception is the fallback destination
+            # when it is ready to be tried: it is excused from this "known
+            # and zero" requirement, because the freshen step below judges it
+            # live rather than by whether its cached usage happened to read
+            # as zero. The exemption is gated on `fallback_ready` so it can
+            # never shorten the OTHER path out of here — without the gate, a
+            # merely-proactive tick whose only unreadable peer is the
+            # fallback would drop to `_block_all_exhausted`'s long nap on a
+            # reading it never actually took.
+            candidate_headrooms = [
+                headroom.get(n)
+                for n in oauth_candidates
+                if not (fallback_ready and n == fallback_num)
+            ]
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
@@ -1292,24 +1319,13 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            fallback_num = self._resolve_fallback_account_number()
-            if (
-                # The active account must be unable to carry on either:
-                # at-limit means it is out of quota, failover that its
-                # credential is dead. Under "proactive" it is merely NEAR the
-                # threshold and still holds headroom the fallback does not —
-                # reaching the fallback branch at all means every candidate
-                # reads as 0%, so switching would spend the escape hatch to
-                # buy strictly less quota than staying put.
-                trigger in ("at-limit", "failover")
-                and fallback_num in candidates
-                and self._fallback_is_eligible(fallback_num)
-            ):
-                # Everything OAuth is at 0% headroom and no better option
-                # exists — a configured fallback beats sitting BLOCKED until
-                # the earliest reset. Reuses the freshen+switch loop below as
-                # its sole candidate rather than a bespoke switch path, and
-                # the loop's own exits restore this block if it cannot land.
+            if fallback_ready:
+                # Everything else OAuth is at 0% headroom (or is the fallback
+                # itself) and no better option exists — a configured fallback
+                # beats sitting BLOCKED until the earliest reset. Reuses the
+                # freshen+switch loop below as its sole candidate rather than
+                # a bespoke switch path, and the loop's own exits restore
+                # this block if it cannot land.
                 ordered = [fallback_num]
                 trigger = "fallback"
             else:

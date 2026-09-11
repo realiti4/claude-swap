@@ -792,6 +792,60 @@ class TestFallbackAccount:
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "fallback"
 
+    def test_fallback_fires_when_its_own_usage_is_unreadable(self, temp_home):
+        # Two-account fleet, the fallback IS the only other candidate, and
+        # its usage reads as unknown (e.g. a dead refresh token that hasn't
+        # hit quarantine yet). Previously this tripped the "no candidate has
+        # readable usage" / "no-qualifying-candidate" blocks before the
+        # fallback branch was ever reached, stranding a 100%-used active
+        # account even with a working fallback configured.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": None})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "fallback"
+
+    def test_unreadable_fallback_still_blocks_below_the_limit(self, temp_home):
+        # Same two-account shape, but the active account is merely past the
+        # threshold (proactive), not at-limit — the fallback must not
+        # preempt normal headroom just because the only peer is unreadable.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": None})
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_an_unreadable_fallback_does_not_shorten_the_proactive_hold(
+        self, temp_home
+    ):
+        # Excusing the fallback from the "known and <=0" exhaustion test must
+        # not leak into the path that does NOT use it. Here the active account
+        # is merely proactive, peer 2 is readable and spent, and peer 3 — the
+        # fallback — is unreadable. Peer 3 may well have full headroom, so
+        # this is "no qualifying candidate" on the normal cadence, never the
+        # all-exhausted nap towards the earliest reset.
+        h = EngineHarness(temp_home, fallback_account="3")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage(
+            {"1": _usage(95), "2": _usage(100), "3": None}
+        )
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert not h.engine._blocked_wait_long
+        no_switch = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert no_switch.reason == "no-qualifying-candidate"
+
     def test_a_quarantined_fallback_is_not_reached(self, temp_home):
         # Eligibility is not the only bar — `fallback_num in candidates`
         # excludes quarantined slots, and it must, or the engine would keep
