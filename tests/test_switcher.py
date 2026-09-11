@@ -8990,6 +8990,445 @@ class TestDisableEnableAccount:
         assert "disabled" not in rows[1]
 
 
+class TestExpiringStrategy:
+    """``cswap expires`` bookkeeping and ``switch --strategy expiring``.
+
+    The recorded date is the only signal cswap cannot measure; usage only
+    gates which expiring account is actionable, at the autoswitch threshold."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num), email,
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}}),
+        )
+        s._write_account_config(
+            str(num), email,
+            json.dumps({"oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email, "uuid": f"uuid-{num}",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}
+        }))
+
+    @staticmethod
+    def _day(offset: int) -> str:
+        from datetime import date, timedelta
+        return (date.today() + timedelta(days=offset)).isoformat()
+
+    @staticmethod
+    def _usage(seven_day: float, five_hour: float = 0.0, scoped=None) -> dict:
+        u = {
+            "five_hour": {"pct": five_hour, "resets_at": "2030-01-01T05:00:00+00:00"},
+            "seven_day": {"pct": seven_day, "resets_at": "2030-01-02T07:00:00+00:00"},
+        }
+        if scoped is not None:
+            u["scoped"] = scoped
+        return u
+
+    # -- bookkeeping -------------------------------------------------------
+
+    def test_set_and_clear_round_trip(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_expires("2", self._day(5))
+        assert s._get_sequence_data()["accounts"]["2"]["expiresAt"] == self._day(5)
+        assert "Recorded Account-2" in capsys.readouterr().out
+
+        s.set_account_expires("b@example.com", None)
+        assert "expiresAt" not in s._get_sequence_data()["accounts"]["2"]
+        assert "Cleared Account-2" in capsys.readouterr().out
+
+    def test_set_by_alias_and_normalizes_compact_iso(self, temp_home):
+        """Python's date parser accepts ``20260916``; the stored form must be
+        the dashed one so the listing's string sort stays a date sort."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s.set_alias("1", "dev")
+
+        s.set_account_expires("dev", "20300916")
+
+        assert s._get_sequence_data()["accounts"]["1"]["expiresAt"] == "2030-09-16"
+
+    def test_invalid_date_raises_and_writes_nothing(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        with pytest.raises(ConfigError, match="Invalid date"):
+            s.set_account_expires("1", "2030-9-16")
+        with pytest.raises(ConfigError, match="Invalid date"):
+            s.set_account_expires("1", "tomorrow")
+        assert "expiresAt" not in s._get_sequence_data()["accounts"]["1"]
+
+    def test_unknown_account_raises(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        with pytest.raises(AccountNotFoundError):
+            s.set_account_expires("99", self._day(1))
+
+    def test_ambiguous_email_raises(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "same@example.com")
+        self._seed(s, 2, "same@example.com")
+
+        with pytest.raises(ConfigError):
+            s.set_account_expires("same@example.com", self._day(1))
+
+    def test_past_date_is_recorded_but_warned(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        s.set_account_expires("1", self._day(-1))
+
+        out = capsys.readouterr().out
+        assert s._get_sequence_data()["accounts"]["1"]["expiresAt"] == self._day(-1)
+        assert "already passed" in out
+
+    def test_disabled_account_accepts_a_date_with_a_hint(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+
+        s.set_account_expires("2", self._day(3))
+
+        assert "cswap enable 2" in capsys.readouterr().out
+        assert s.list_expirations() == [("2", self._day(3), "b@example.com")]
+
+    def test_list_sorts_soonest_first_ties_in_sequence_order(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("4", self._day(2))
+        s.set_account_expires("3", self._day(9))
+        s.set_account_expires("1", self._day(9))
+
+        assert s.list_expirations() == [
+            ("4", self._day(2), "d@x"),
+            ("1", self._day(9), "a@x"),
+            ("3", self._day(9), "c@x"),
+        ]
+
+    def test_list_ignores_unparseable_hand_edit(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["expiresAt"] = "soon"
+        s._write_json(s.sequence_file, data)
+
+        assert s.list_expirations() == []
+        assert s._expires_from_data(data, "1") is None
+
+    # -- selection ---------------------------------------------------------
+
+    def test_none_when_no_future_expirations(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(-1))  # lapsed
+
+        assert s._select_expiring_switchable("1", usage={}) == (None, "none", {}, [])
+
+    def test_picks_soonest_with_room_skipping_saturated(self, temp_home):
+        """Soonest-expiring (2) is at 95% weekly → skipped and reported with
+        its reset; the next-soonest with room (3) is the target."""
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(5))
+        usage = {"1": self._usage(10), "2": self._usage(95), "3": self._usage(40)}
+
+        target, note, pending, unreadable = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == ("3", "")
+        assert pending == {"2": "2030-01-02T07:00:00+00:00"}
+        assert unreadable == []
+
+    def test_threshold_is_the_gate_not_100_percent(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        usage = {"1": self._usage(0), "2": self._usage(95)}
+
+        with_default = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+        raw = s._select_expiring_switchable("1", usage=usage, threshold=100.0)
+
+        assert with_default[:2] == (None, "exhausted")
+        assert raw[:2] == ("2", "")
+
+    def test_five_hour_window_binds_too(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        usage = {"1": self._usage(0), "2": self._usage(seven_day=10, five_hour=100)}
+
+        target, note, pending, _ = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == (None, "exhausted")
+        assert pending == {"2": "2030-01-01T05:00:00+00:00"}
+
+    def test_equal_dates_resolve_to_earliest_slot(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x"), (5, "e@x")):
+            self._seed(s, n, e)
+        for n in ("5", "3", "4"):
+            s.set_account_expires(n, self._day(4))
+        usage = {n: self._usage(0) for n in ("1", "2", "3", "4", "5")}
+
+        for _ in range(5):
+            target, _, _, _ = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+            assert target == "3"
+
+    def test_disabled_and_lapsed_are_not_candidates(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(-3))   # lapsed
+        s.set_account_expires("3", self._day(1))    # disabled below
+        s.set_account_expires("4", self._day(8))
+        s.set_account_disabled("3", True)
+        usage = {n: self._usage(0) for n in ("1", "2", "3", "4")}
+
+        target, note, _, _ = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+
+        assert (target, note) == ("4", "")
+
+    def test_current_soonest_but_saturated_moves_to_next(self, temp_home):
+        """The user's own case: current expires first but has no room now; a
+        later-expiring account with room wins, and current is reported."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(6))
+        usage = {"1": self._usage(96), "2": self._usage(30)}
+
+        target, note, pending, _ = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == ("2", "")
+        assert list(pending) == ["1"]
+
+    def test_current_soonest_with_room_stays(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(6))
+        usage = {"1": self._usage(50), "2": self._usage(0)}
+
+        assert s._select_expiring_switchable("1", usage=usage, threshold=90.0) == (
+            None, "stay", {}, []
+        )
+
+    def test_unreadable_usage_is_skipped_but_not_called_exhausted(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(2))
+        usage = {"1": self._usage(0), "2": USAGE_TOKEN_EXPIRED, "3": None}
+
+        target, note, pending, unreadable = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == (None, "exhausted")
+        assert pending == {}
+        assert unreadable == ["2", "3"]
+
+    def test_model_window_binds_when_named(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        scoped = [{"name": "Fable", "pct": 100.0, "resets_at": "2030-01-03T09:00:00+00:00"}]
+        usage = {"1": self._usage(0), "2": self._usage(10, scoped=scoped)}
+
+        plain = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+        pinned = s._select_expiring_switchable(
+            "1", models=("Fable",), usage=usage, threshold=90.0
+        )
+
+        assert plain[:2] == ("2", "")
+        assert pinned[:2] == (None, "exhausted")
+        assert pinned[2] == {"2": "2030-01-03T09:00:00+00:00"}
+
+    # -- switch() integration ----------------------------------------------
+
+    def test_switch_lands_on_target_and_names_skipped(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(5))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(95), "3": self._usage(20)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+        assert payload["switched"] is True
+        assert payload["strategy"] == "expiring"
+        assert any(w.startswith("Skipped: Account-2 resets at") for w in payload["warnings"])
+
+    def test_switch_none_stay_and_exhausted_reasons(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+
+        with patch.object(s, "_usage_by_account", return_value={}), \
+             patch.object(s, "list_accounts") as mock_list:
+            none = s.switch(strategy="expiring", json_output=True)
+        assert none["switched"] is False
+        assert none["reason"] == "no-expirations-recorded"
+
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(3))
+        usage = {"1": self._usage(10), "2": self._usage(0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            stay = s.switch(strategy="expiring", json_output=True)
+        assert stay["reason"] == "already-expiring-best"
+        assert stay["from"] == stay["to"]
+
+        usage = {"1": self._usage(99), "2": self._usage(91)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            exhausted = s.switch(strategy="expiring", json_output=True)
+        assert exhausted["reason"] == "expiring-exhausted"
+        assert "90%" in exhausted["message"]
+        assert "Account-1 resets at" in exhausted["message"]
+        assert "Account-2 resets at" in exhausted["message"]
+
+        usage = {"1": USAGE_TOKEN_EXPIRED, "2": None}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            unreadable = s.switch(strategy="expiring", json_output=True)
+        assert unreadable["reason"] == "usage-unavailable"
+        assert "usage unavailable" in unreadable["message"]
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_switch_honours_configured_threshold(self, temp_home, capsys):
+        from claude_swap.settings import AutoSwitchSettings
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(85)}
+
+        with patch("claude_swap.switcher.load_settings",
+                   return_value=AutoSwitchSettings(threshold=80.0)), \
+             patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert payload["switched"] is False
+        assert "80%" in payload["message"]
+
+    def test_switch_human_output_exhausted_warns(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(100)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="expiring")
+
+        captured = capsys.readouterr()
+        assert "at or above the 90% threshold" in captured.out + captured.err
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    # -- display -----------------------------------------------------------
+
+    def test_list_shows_expiration_line_and_json_field(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(4))
+        capsys.readouterr()
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            s.list_accounts()
+            payload = s.list_accounts(json_output=True)
+
+        out = capsys.readouterr().out
+        assert f"expires {self._day(4)} (+4d)" in out
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["planExpiresAt"] == self._day(4)
+        assert "planExpiresAt" not in rows[1]
+        assert "loginExpiresAt" not in rows[2]
+
+    def test_snapshot_carries_expires_at(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(4))
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            snap = s.accounts_snapshot()
+
+        by_num = {a.number: a for a in snap.accounts}
+        assert by_num["2"].expires_at == self._day(4)
+        assert by_num["1"].expires_at is None
+
+
 class TestDegradedReadProvenance:
     """M1 (stale-credential robustness): a credential read that fell back
     after a Keychain failure carries ``degraded=True`` — the bytes may be a

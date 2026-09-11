@@ -81,6 +81,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    expires_at: str | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -93,6 +94,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        expires_at=expires_at,
     )
 
 
@@ -593,6 +595,16 @@ class TestUsageRows:
         last_good = {"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}}
         row = usage_rows(last_good, now)[0]
         assert "pace" not in row[2]
+
+    def test_card_shows_recorded_expiration(self):
+        # The date recorded with `cswap expires` rides on the header line the
+        # way `(disabled)` does; absent when nothing is recorded.
+        from claude_swap.tui.widgets import account_card_text
+
+        with_date = account_card_text(make_account(1, expires_at="2026-09-16"), 100).plain
+        without = account_card_text(make_account(1), 100).plain
+        assert "expires 2026-09-16" in with_date.splitlines()[0]
+        assert "expires" not in without
 
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width

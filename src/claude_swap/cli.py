@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import date
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -620,7 +621,12 @@ Examples:
     if args.clear and args.account is None:
         parser.error("NUM|EMAIL is required with --clear")
     if args.account is not None and not args.clear and not args.date:
-        parser.error("YYYY-MM-DD is required (or pass --clear to remove the expiration)")
+        # `cswap expires 2026-09-16` — the date landed in the account slot.
+        try:
+            date.fromisoformat(args.account)
+        except ValueError:
+            parser.error("YYYY-MM-DD is required (or pass --clear to remove the expiration)")
+        parser.error("NUM|EMAIL is required before the date")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -632,8 +638,10 @@ Examples:
                 print(dimmed("No expirations recorded"))
                 return
             print(bolded("Expirations:"))
+            today = date.today()
             for num, expires, email in rows:
-                print(f"  {num}: {expires} {muted(f'({email})')}")
+                lapsed = " (lapsed)" if date.fromisoformat(expires) < today else ""
+                print(f"  {num}: {expires}{lapsed} {muted(f'({email})')}")
             return
 
         switcher.set_account_expires(args.account, None if args.clear else args.date)
