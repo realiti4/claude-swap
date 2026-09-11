@@ -605,6 +605,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --fallback-account enterprise  # force this account once all are exhausted
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -670,6 +671,17 @@ Defaults live in settings.json in the backup root; flags override them.
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest)"
+        ),
+    )
+    parser.add_argument(
+        "--fallback-account",
+        metavar="NUM|EMAIL|ALIAS",
+        help=(
+            "Force onto this account once the active account can no longer "
+            "carry on — out of quota, or its credential dead — and every "
+            "OAuth candidate is at or over the limit on whichever window "
+            "binds first (5h, 7d, or a --model weekly window), instead of "
+            "sitting blocked until the earliest reset"
         ),
     )
     parser.add_argument(

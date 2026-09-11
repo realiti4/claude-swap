@@ -91,6 +91,7 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --fallback-account enterprise  # force this account once everything's exhausted
 ```
 
 <details>
@@ -98,6 +99,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Fallback account** (`--fallback-account <num|email|alias>`, or `cswap config set autoswitch.fallbackAccount enterprise`): once the active account can no longer carry on — out of quota, or its credential dead — and every OAuth candidate is at or over the limit too, force onto one designated account instead of sitting blocked until the earliest reset. Normal rotation resumes as soon as any account recovers headroom. Off by default, and it never preempts an ordinary switch: while the active account still has quota, or any candidate is worth moving to, this changes nothing. An API-key account can't be the fallback, in either setting of `includeApiKeyAccounts`, and a warning says so: with it off, auto-switch would park on the metered account and never rotate off it; with it on, auto-switch already reaches for API-key accounts by itself as a last resort, in rotation order rather than by your designation.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

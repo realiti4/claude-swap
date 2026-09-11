@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -362,7 +362,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "fallback"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -684,6 +684,10 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # One-shot typo guard for ``autoswitch.fallbackAccount``. Unlike the
+        # model check this needs no usage data (it's a static identifier
+        # lookup), so it resolves on the very first tick.
+        self._fallback_check_done = not settings.fallback_account
 
     # -- state file ---------------------------------------------------------
 
@@ -959,6 +963,8 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+        if not self._fallback_check_done:
+            self._check_fallback_account()
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1224,7 +1230,21 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
-            if not any_known:
+            fallback_num = self._resolve_fallback_account_number()
+            fallback_ready = (
+                # The active account must be unable to carry on either:
+                # at-limit means it is out of quota, failover that its
+                # credential is dead. Resolved up front so an unreadable
+                # OTHER candidate can never hide this escape hatch behind
+                # "no candidate has readable usage" below — the fallback
+                # account's OWN unreadability doesn't disqualify it either,
+                # since the freshen step a few lines down is about to try it
+                # for real, not go on a cached, possibly-stale reading.
+                trigger in ("at-limit", "failover")
+                and fallback_num in candidates
+                and self._fallback_is_eligible(fallback_num)
+            )
+            if not any_known and not fallback_ready:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -1265,12 +1285,25 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             # "All exhausted" (and its bounded reset-aware sleep) only when it's
-            # literally true: every candidate's usage is known and at its
-            # limit. A candidate that merely failed the proactive hysteresis
-            # gate, or one whose usage is unreadable this tick, can become
-            # viable at any moment — and the active account can hit 100% and
-            # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
+            # literally true: every OTHER candidate's usage is known and at
+            # its limit. A candidate that merely failed the proactive
+            # hysteresis gate, or one whose usage is unreadable this tick,
+            # can become viable at any moment — and the active account can
+            # hit 100% and need the at-limit escape — so those keep the
+            # normal cadence. The one exception is the fallback destination
+            # when it is ready to be tried: it is excused from this "known
+            # and zero" requirement, because the freshen step below judges it
+            # live rather than by whether its cached usage happened to read
+            # as zero. The exemption is gated on `fallback_ready` so it can
+            # never shorten the OTHER path out of here — without the gate, a
+            # merely-proactive tick whose only unreadable peer is the
+            # fallback would drop to `_block_all_exhausted`'s long nap on a
+            # reading it never actually took.
+            candidate_headrooms = [
+                headroom.get(n)
+                for n in oauth_candidates
+                if not (fallback_ready and n == fallback_num)
+            ]
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
@@ -1286,20 +1319,17 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-            self._emit(
-                AllExhaustedEvent(
-                    earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
-                    )
-                )
-            )
-            return TickOutcome.BLOCKED
+            if fallback_ready:
+                # Everything else OAuth is at 0% headroom (or is the fallback
+                # itself) and no better option exists — a configured fallback
+                # beats sitting BLOCKED until the earliest reset. Reuses the
+                # freshen+switch loop below as its sole candidate rather than
+                # a bespoke switch path, and the loop's own exits restore
+                # this block if it cannot land.
+                ordered = [fallback_num]
+                trigger = "fallback"
+            else:
+                return self._block_all_exhausted(usage)
 
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
@@ -1377,7 +1407,22 @@ class AutoSwitchEngine:
                     transient=True,
                 )
             )
+            if trigger == "fallback":
+                # Nowhere left to go: every other candidate is spent and the
+                # escape hatch failed too. The ErrorEvent above says why, but
+                # the tick's OUTCOME is the block — see `_block_all_exhausted`.
+                # Since the fallback may have been excused from the exhaustion
+                # test rather than proven spent, this can now report the block
+                # on a headroom nobody read. That is the same bounded-nap trade
+                # the helper's docstring already takes for a self-clearing
+                # cause, and the fast retry that would shorten it is what
+                # 770d2a6 removed.
+                return self._block_all_exhausted(usage)
             return TickOutcome.ERROR
+        if trigger == "fallback":
+            # Nothing systemic and nothing transient, so the loop drained on
+            # a quarantine or `skip-live-session`.
+            return self._block_all_exhausted(usage)
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -2222,6 +2267,129 @@ class AutoSwitchEngine:
                     )
                 )
             )
+
+    def _block_all_exhausted(
+        self, usage: dict[str, dict | str | None]
+    ) -> TickOutcome:
+        """Park on the bounded, reset-aware slow cadence and say so.
+
+        Shared by the plain all-exhausted branch and by the fallback paths
+        that end up back in the same state, so a configured-but-unreachable
+        fallback cannot quietly cost the caller what the block provides: the
+        ``AllExhaustedEvent`` the menubar and TUI key on, ``earliestResetAt``
+        for ``--json`` consumers, and the BLOCKED ``--once`` exit code.
+
+        The nap applies even when the cause is self-clearing (a network blip,
+        a live session holding the slot), which does mean the escape hatch
+        can land up to ``MAX_SLEEP_S`` late. That is deliberate. Retrying
+        those at the normal interval saves at most one wake-up in the cases
+        that resolve — a quarantined fallback leaves ``candidates`` and naps
+        on the very next tick to the same reset target — while
+        ``skip-live-session`` never leaves ``candidates`` at all, so a user
+        running ``cswap run`` on their designated seat would spin the tick
+        loop at 10x for the lifetime of that session. Ten minutes late is a
+        rounding error against the hour of idling the fallback exists to
+        avoid; an unattended laptop waking all night is not.
+        """
+        self._blocked_wait_long = True
+        earliest = self._earliest_recovery(usage)
+        if earliest is not None:
+            self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+        self._emit(
+            AllExhaustedEvent(
+                earliest_reset_at=(
+                    earliest.isoformat().replace("+00:00", "Z")
+                    if earliest
+                    else None
+                )
+            )
+        )
+        return TickOutcome.BLOCKED
+
+    def _fallback_is_eligible(self, num: str | None) -> bool:
+        """Whether a resolved ``fallbackAccount`` slot can actually be used.
+
+        One definition for both the decision point and the typo guard, so
+        the warning cannot claim a fallback the engine would refuse.
+
+        An API-key slot is never eligible, in EITHER setting of
+        ``includeApiKeyAccounts``, because neither setting can honour the
+        designation:
+
+        * with the opt-in off, switching onto a metered slot from here is a
+          one-way door — the next tick's ``active-api-key`` early return
+          holds, so rotation never resumes even once the OAuth accounts
+          reset;
+        * with it on, the last-resort leg above already takes
+          ``api_key_candidates`` before this branch is reached, and it takes
+          them in rotation order — so the engine can land on a DIFFERENT
+          metered account than the one named here, and the bill follows.
+
+        Refusing both ways means the warning tells the truth in both, rather
+        than implying a control over billing that does not exist.
+        """
+        if num is None:
+            return False
+        return (
+            num in self.switcher.switchable_account_numbers()
+            and self.switcher.account_kind_for(num) != "api_key"
+        )
+
+    def _resolve_fallback_account_number(self) -> str | None:
+        """Resolve ``autoswitch.fallbackAccount`` to an account number, or
+        ``None`` if unset, unmatched, or ambiguous (an ambiguous email is
+        already reported by ``_check_fallback_account``; here it just means
+        "no usable fallback")."""
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return None
+        try:
+            return self.switcher._resolve_account_identifier(identifier)
+        except ConfigError:
+            return None
+
+    def _check_fallback_account(self) -> None:
+        """One-shot ``autoswitch.fallbackAccount`` typo guard, mirroring
+        ``_check_model_names``: a configured identifier that never reaches the
+        candidate list would otherwise look like a safety net while being
+        inert.
+
+        Resolution alone is not the bar, so this asks ``_fallback_is_eligible``
+        the same question the decision point asks. ``_resolve_account_identifier``
+        returns a bare digit unexamined, so ``--fallback-account 4`` with three
+        accounts resolves to ``"4"`` — the typo most worth catching, and one
+        that resolving alone reports as fine.
+
+        The wording stays one sentence listing every ineligible case rather
+        than naming which one applies, because the remedy does not vary: the
+        setting names something that cannot be the fallback, so it has to be
+        corrected or dropped either way.
+        """
+        self._fallback_check_done = True
+        identifier = self.settings.fallback_account
+        if not identifier:
+            return
+        try:
+            resolved = self.switcher._resolve_account_identifier(identifier)
+        except ConfigError as e:
+            self._emit(
+                ConfigWarningEvent(
+                    message=f"autoswitch.fallbackAccount: {e}",
+                )
+            )
+            return
+        if self._fallback_is_eligible(resolved):
+            return
+        self._emit(
+            ConfigWarningEvent(
+                message=(
+                    f"autoswitch.fallbackAccount: '{identifier}' cannot serve "
+                    "as the fallback (unknown identifier, or a slot that is "
+                    "disabled, has no usable backup, or is an API-key "
+                    "account) — the exhausted-fallback safety net is inert"
+                )
+            )
+        )
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]

@@ -606,6 +606,384 @@ class TestDecisionTable:
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
 
+class TestFallbackAccount:
+    """`autoswitch.fallbackAccount` forces a designated account once every
+    OAuth candidate is truly exhausted, instead of sitting BLOCKED until the
+    earliest reset."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switches_to_fallback_when_all_exhausted(self, temp_home):
+        h = self._seed(temp_home, fallback_account="2")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "fallback"
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_resolves_fallback_by_email(self, temp_home):
+        h = self._seed(temp_home, fallback_account="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_no_fallback_configured_still_blocks(self, temp_home):
+        # Unchanged default behavior: no fallback_account means AllExhaustedEvent.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_fallback_not_used_while_a_candidate_still_has_headroom(self, temp_home):
+        # Not truly exhausted (account 2 has room) — the normal hysteresis
+        # gate applies, the fallback is irrelevant, and it must not preempt
+        # the ordinary proactive switch.
+        h = self._seed(temp_home, fallback_account="3")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_fallback_already_active_stays_blocked(self, temp_home):
+        # Fallback resolves to the account already active — nothing to
+        # switch to, so this degrades to the ordinary all-exhausted block.
+        h = self._seed(temp_home, fallback_account="1")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_unresolvable_fallback_warns_once_and_blocks(self, temp_home):
+        h = self._seed(temp_home, fallback_account="nonexistent@example.com")
+        usage = {"1": _usage(100), "2": _usage(100), "3": _usage(100)}
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "nonexistent@example.com" in warnings[0].message
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_unknown_account_number_warns(self, temp_home):
+        # `_resolve_account_identifier` returns a bare digit unexamined, so a
+        # mistyped number resolves to itself and would otherwise stay silently
+        # inert — the typo the guard most needs to catch.
+        h = self._seed(temp_home, fallback_account="9")
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "'9'" in warnings[0].message
+        assert "cannot serve as the fallback" in warnings[0].message
+
+    def test_matching_fallback_never_warns(self, temp_home):
+        h = self._seed(temp_home, fallback_account="2")
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_resolves_fallback_by_alias(self, temp_home):
+        # The third identifier form the flag's metavar and the README example
+        # both advertise; number and email are covered above.
+        h = self._seed(temp_home)
+        h.switcher.set_alias("2", "enterprise")
+        h.settings = replace(h.settings, fallback_account="enterprise")
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_ambiguous_fallback_email_warns_and_blocks(self, temp_home):
+        # Two slots share an email, so `_resolve_account_identifier` raises
+        # ConfigError. Both the guard AND the hot path must absorb it: without
+        # the swallow in `_resolve_fallback_account_number` this tick raises
+        # straight out of the `cswap auto` loop.
+        h = EngineHarness(temp_home, fallback_account="dup@example.com")
+        h.seed(1, "a@example.com")
+        h.seed(2, "dup@example.com")
+        h.seed(3, "dup@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "ambiguous" in warnings[0].message
+        assert h.active_number() == 1
+
+    def test_api_key_fallback_refused_with_the_opt_in_off(self, temp_home):
+        # Switching onto a metered slot here is a one-way door: the next
+        # tick's `active-api-key` early return holds forever, so rotation
+        # would never resume once the OAuth accounts reset.
+        h = self._seed(temp_home, fallback_account="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": "api key", "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "API-key" in warnings[0].message
+
+    def test_api_key_fallback_refused_with_the_opt_in_on_too(self, temp_home):
+        # Turning includeApiKeyAccounts on does NOT make the designation
+        # work: the ordinary last-resort leg takes api_key_candidates in
+        # rotation order before the fallback branch is reached, so naming
+        # slot 3 here lands on slot 2 and the bill follows. Warn rather than
+        # imply a control over which metered key gets charged.
+        h = self._seed(
+            temp_home, fallback_account="3", include_api_key_accounts=True
+        )
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": "api key", "3": "api key",
+        })
+        # The last-resort leg still runs — it just isn't the fallback, and it
+        # picks by rotation order, not by `fallbackAccount`.
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "API-key" in warnings[0].message
+
+    def test_fallback_fires_on_failover_too(self, temp_home):
+        # The other arm of the gate: the active's usage is unreadable (dead
+        # credential), not merely at 0%. `at-limit` alone would leave the
+        # user blocked exactly when the active cannot be used at all.
+        h = self._seed(temp_home, fallback_account="2")
+        usage = {"1": None, "2": _usage(100), "3": _usage(100)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "fallback"
+
+    def test_fallback_fires_when_its_own_usage_is_unreadable(self, temp_home):
+        # Two-account fleet, the fallback IS the only other candidate, and
+        # its usage reads as unknown (e.g. a dead refresh token that hasn't
+        # hit quarantine yet). Previously this tripped the "no candidate has
+        # readable usage" / "no-qualifying-candidate" blocks before the
+        # fallback branch was ever reached, stranding a 100%-used active
+        # account even with a working fallback configured.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": None})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "fallback"
+
+    def test_unreadable_fallback_still_blocks_below_the_limit(self, temp_home):
+        # Same two-account shape, but the active account is merely past the
+        # threshold (proactive), not at-limit — the fallback must not
+        # preempt normal headroom just because the only peer is unreadable.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": None})
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_an_unreadable_fallback_does_not_shorten_the_proactive_hold(
+        self, temp_home
+    ):
+        # Excusing the fallback from the "known and <=0" exhaustion test must
+        # not leak into the path that does NOT use it. Here the active account
+        # is merely proactive, peer 2 is readable and spent, and peer 3 — the
+        # fallback — is unreadable. Peer 3 may well have full headroom, so
+        # this is "no qualifying candidate" on the normal cadence, never the
+        # all-exhausted nap towards the earliest reset.
+        h = EngineHarness(temp_home, fallback_account="3")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage(
+            {"1": _usage(95), "2": _usage(100), "3": None}
+        )
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert not h.engine._blocked_wait_long
+        no_switch = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert no_switch.reason == "no-qualifying-candidate"
+
+    def test_an_excused_fallback_that_cannot_land_still_takes_the_block(
+        self, temp_home
+    ):
+        # One of the tails the exemption newly exposes, where the block is
+        # reported on a headroom nobody read: the fallback is excused from the
+        # exhaustion test, tried, and the freshen fails. Consumers still get
+        # the AllExhaustedEvent and the bounded nap rather than a fast retry —
+        # the trade 770d2a6 settled. Without this the shape is unpinned.
+        h = EngineHarness(temp_home, fallback_account="2")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)  # long expired
+        h.make_live("a@example.com", 1)
+        recovers_at = h.clock() + 3_600.0
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome = h.tick_with_usage(
+                {"1": _usage(100, _iso_at(recovers_at)), "2": None}
+            )
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, ErrorEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is True
+        assert h.engine._sleep_until_ts == pytest.approx(
+            recovers_at + poll_policy.RESET_SLACK_S
+        )
+
+    def test_a_quarantined_fallback_is_not_reached(self, temp_home):
+        # Eligibility is not the only bar — `fallback_num in candidates`
+        # excludes quarantined slots, and it must, or the engine would keep
+        # re-freshening a credential it already proved dead.
+        h = self._seed(temp_home, fallback_account="2")
+        h.engine._quarantine("2", "b@example.com", "invalid_grant")
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        # Quarantine is transient (a re-add lifts it), so it is NOT a reason
+        # to tell the user their setting is broken.
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_fallback_not_used_while_the_active_still_has_headroom(self, temp_home):
+        # Past the threshold but not yet at the limit, so the active still
+        # holds quota that the (0%-headroom) fallback does not. Burning the
+        # remainder beats spending the escape hatch to buy strictly less.
+        h = self._seed(temp_home, fallback_account="2")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(100), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_unfreshenable_fallback_keeps_the_exhausted_block(self, temp_home):
+        # A fallback the freshen loop cannot land on must not cost the caller
+        # what the plain block provides: the AllExhaustedEvent consumers key
+        # on and the BLOCKED `--once` exit code.
+        h = self._seed(temp_home, fallback_account="2")
+        h.seed(2, "b@example.com", expires_at=1)  # long expired
+        recovers_at = h.clock() + 3_600.0
+        reset_at = _iso_at(recovers_at)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(100, reset_at),
+                "2": _usage(100, reset_at),
+                "3": _usage(100, reset_at),
+            })
+        # BLOCKED, not ERROR: the fleet is all-exhausted exactly as it would
+        # be with no fallback configured, and TickOutcome doubles as the
+        # `--once` exit code.
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, ErrorEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        # ...including the reset-aware sleep. Retrying at the normal interval
+        # would land the hatch sooner in this one case, but the same tail is
+        # reached by causes that never leave `candidates` — see
+        # `test_a_live_session_on_the_fallback_does_not_spin_the_tick_loop`.
+        assert h.engine._blocked_wait_long is True
+        assert h.engine._sleep_until_ts == pytest.approx(
+            recovers_at + poll_policy.RESET_SLACK_S
+        )
+
+    def test_unfreshenable_fallback_quarantined_keeps_the_block(self, temp_home):
+        # The other loop exit: a dead refresh token quarantines the fallback
+        # and drains `ordered`, reaching the `no-viable-target` tail.
+        h = self._seed(temp_home, fallback_account="2")
+        h.seed(2, "b@example.com", expires_at=1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(100), "2": _usage(100), "3": _usage(100),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, QuarantineEvent) for e in h.events)
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is True
+
+    def test_a_live_session_on_the_fallback_does_not_spin_the_tick_loop(
+        self, temp_home
+    ):
+        # `skip-live-session` reaches the same tail as a quarantine but does
+        # NOT quarantine, and `candidates` filters only on the quarantine
+        # set — so the slot is still there next tick, and the one after. A
+        # per-cause "retry fast, it clears itself" rule therefore never
+        # terminates here: running `cswap run` on the designated seat would
+        # wake the loop every interval for the life of that session.
+        h = self._seed(temp_home, fallback_account="2")
+        recovers_at = h.clock() + 3_600.0
+        reset_at = _iso_at(recovers_at)
+        exhausted = {
+            "1": _usage(100, reset_at),
+            "2": _usage(100, reset_at),
+            "3": _usage(100, reset_at),
+        }
+        with patch.object(
+            h.switcher, "live_session_pids_for", return_value=[4242]
+        ):
+            for _ in range(3):
+                assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+                assert h.engine._blocked_wait_long is True
+                assert h.engine._sleep_until_ts == pytest.approx(
+                    recovers_at + poll_policy.RESET_SLACK_S
+                )
+        assert h.active_number() == 1
+
+
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
 
