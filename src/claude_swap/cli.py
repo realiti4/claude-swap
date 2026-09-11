@@ -605,6 +605,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --model Fable --model-mode prefer   # ...and land on the account with the most Fable left
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -651,6 +652,19 @@ Defaults live in settings.json in the backup root; flags override them.
             "account-wide 5h/7d windows. One name or a comma-separated list "
             "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
             "for every per-model window an account reports"
+        ),
+    )
+    parser.add_argument(
+        "--model-mode",
+        dest="model_mode",
+        choices=("gate", "prefer"),
+        default=None,
+        help=(
+            "How the --model windows count. 'gate' (default): a spent model "
+            "quota also rules an account out as a target, like a spent 5h/7d "
+            "window. 'prefer': a spent model still makes the engine leave, "
+            "but only the 5h/7d windows can rule a target out. Among "
+            "targets with room there, the most model quota left wins"
         ),
     )
     parser.add_argument(
