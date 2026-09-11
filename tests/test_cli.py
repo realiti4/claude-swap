@@ -279,6 +279,50 @@ class TestCLI:
         )
         assert "--slot" in result.stdout
 
+    def test_preserve_active_and_expected_account_forwarded(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "add", "--preserve-active",
+                 "--expect-account", "2",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.add_account.assert_called_once_with(
+            slot=None,
+            alias=None,
+            preserve_active=True,
+            expect_account="2",
+        )
+
+    def test_expected_account_implies_preserve_active(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "add", "--expect-account", "2",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.add_account.assert_called_once_with(
+            slot=None,
+            alias=None,
+            preserve_active=True,
+            expect_account="2",
+        )
+
+    @pytest.mark.parametrize("flag", ["--preserve-active", "--expect-account"])
+    def test_reauth_flags_require_add(self, flag, capsys):
+        argv = ["claude-swap", "--list", flag]
+        if flag == "--expect-account":
+            argv.append("2")
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert f"{flag} can only be used with 'add'" in capsys.readouterr().err
+
     def test_account_flag_requires_export(self, capsys):
         """--account should only be accepted alongside --export."""
         with patch.object(
