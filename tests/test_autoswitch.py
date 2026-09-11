@@ -5925,12 +5925,12 @@ class TestHorizonAxisDoesNotFlap:
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
         stale_reread = ranking_now + 200.0             # past reset_at
 
-        # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, left_snapshot re-read, freshen expiry check,
-        # _perform's lastSwitchAt) with a couple of spares so neither code
-        # path can exhaust the sequence.
+        # Enough values for the clock() call order (pre-tick check, the
+        # next-target prediction, ranking now, a left_snapshot re-read,
+        # freshen expiry check, _perform's lastSwitchAt) with a couple of
+        # spares so neither code path can exhaust the sequence.
         clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
+            ranking_now, ranking_now, ranking_now, stale_reread,
             stale_reread, stale_reread, stale_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
@@ -6894,3 +6894,242 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# --- next-target prediction ---------------------------------------------------
+
+
+class TestNextTargetPrediction:
+    """`PollEvent.next_target` names the account the engine would move to if
+    the active account crossed the threshold on this tick's snapshot. It is
+    computed on EVERY tick, including below-threshold ticks where `best`
+    never reaches candidate ranking, so a watch screen can highlight "who is
+    next" before a switch is imminent."""
+
+    def _poll(self, h: EngineHarness) -> PollEvent:
+        return next(e for e in h.events if isinstance(e, PollEvent))
+
+    def test_best_below_threshold_predicts_most_headroom(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(20),   # active, healthy -> below-threshold hold
+            "2": _usage(10),   # most headroom -> would be next
+            "3": _usage(50),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._poll(harness).next_target == "2"
+
+    def test_consume_first_predicts_soonest_reset_not_most_headroom(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),    # active, resets later
+            "2": _usage7(50, 50, _R_SOON),     # less headroom, resets soonest
+            "3": _usage7(10, 10, _R_LATEST),   # most headroom, resets last
+        })
+        assert self._poll(h).next_target == "2"
+
+    def test_none_when_every_candidate_is_at_its_limit(self, harness):
+        harness.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(100),
+            "3": _usage(100),
+        })
+        assert self._poll(harness).next_target is None
+
+    def test_the_account_just_left_is_not_predicted_while_barred(
+        self, temp_home
+    ):
+        """Mirrors `test_the_bar_reaches_the_ranking_through_tick`: on the
+        recovery axis the barred account would win the ranking, so the
+        prediction must exclude it exactly as the decision does."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage(92, _iso_at(h.clock.now + 500 * 86400)),
+            "2": _usage(10, _iso_at(h.clock.now + 400 * 86400)),
+            "3": _usage(50, _iso_at(h.clock.now + 300 * 86400)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+        h.events.clear()
+        second = {
+            "1": _usage(99, _iso_at(h.clock.now + 1800)),   # left; back soonest
+            "2": _usage(99, _iso_at(h.clock.now + 7200)),   # active, spent
+            "3": _usage(99, _iso_at(h.clock.now + 3600)),
+        }
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 3, "premise: the decision honours the bar"
+        assert self._poll(h).next_target == "3"
+
+    def test_none_while_the_post_switch_cooldown_holds(self, harness):
+        """The decision path holds during cooldown, so the prediction must
+        not name a target the engine cannot take this tick."""
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(50),
+        }) is TickOutcome.SWITCHED
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(10), "2": _usage(95), "3": _usage(50)})
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["cooldown"], "premise: this tick is a cooldown hold"
+        assert self._poll(harness).next_target is None
+
+    def test_api_key_last_resort_is_predicted_when_included(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.tick_with_usage({"1": _usage(100), "2": "api key", "3": _usage(100)})
+        assert h.active_number() == 2, "premise: the decision lands on the key"
+        assert self._poll(h).next_target == "2"
+
+    def test_json_carries_next_target_only_when_known(self):
+        base = dict(active=None, headroom={}, threshold=90.0)
+        assert PollEvent(**base, next_target="2").to_json()["nextTarget"] == "2"
+        assert "nextTarget" not in PollEvent(**base).to_json()
+
+
+class TestStopRefusesAnInFlightSwitch:
+    """`stop()` only interrupts the inter-tick sleep. A tick that has already
+    ranked and is about to switch must notice the stop under the state lock
+    and hold — otherwise leaving the TUI's live mode (or SIGTERM to `cswap
+    auto`) can be followed by one more unrequested switch."""
+
+    def test_a_stopped_engine_holds_instead_of_switching(self, harness):
+        harness.engine.stop()
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["stopped"]
+
+    def test_dry_run_still_reports_the_would_switch_after_stop(self, temp_home):
+        """Dry-run never mutates anything, so there is nothing to refuse."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.stop()
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_stop_from_another_thread_waits_for_an_in_flight_switch(
+        self, harness
+    ):
+        """After `stop()` returns to the TUI, the account must not change:
+        a switch transaction already under way is allowed to finish, and
+        `stop()` does not return until it has."""
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        real_switch_to = harness.switcher.switch_to
+
+        def slow_switch_to(*args, **kwargs):
+            entered.set()
+            assert release.wait(5), "test harness never released the switch"
+            return real_switch_to(*args, **kwargs)
+
+        with patch.object(harness.switcher, "switch_to", side_effect=slow_switch_to):
+            tick = threading.Thread(
+                target=harness.tick_with_usage,
+                args=({"1": _usage(95), "2": _usage(10)},),
+            )
+            tick.start()
+            assert entered.wait(5), "premise: the tick reached switch_to"
+
+            stopped = threading.Event()
+            stopper = threading.Thread(
+                target=lambda: (harness.engine.stop(), stopped.set())
+            )
+            stopper.start()
+            assert not stopped.wait(0.3), "stop() returned mid-transaction"
+
+            release.set()
+            tick.join(5)
+            assert stopped.wait(5), "stop() never returned after the switch"
+        assert harness.active_number() == 2  # the in-flight switch completed
+
+    def test_stop_from_the_tick_thread_never_deadlocks(self, harness):
+        """`cswap auto` stops from a SIGTERM handler on the loop thread; a
+        stop() issued mid-switch on that same thread must return at once."""
+        real_switch_to = harness.switcher.switch_to
+
+        def stopping_switch_to(*args, **kwargs):
+            harness.engine.stop()
+            return real_switch_to(*args, **kwargs)
+
+        with patch.object(harness.switcher, "switch_to", side_effect=stopping_switch_to):
+            outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_events_are_never_delivered_while_the_switch_lock_is_held(
+        self, harness
+    ):
+        """The TUI delivers events synchronously onto its main thread, and
+        that same thread is what calls `stop()`. If an event were emitted
+        while `_switch_lock` is held, a main thread blocked in `stop()` and a
+        worker blocked delivering to it would wait on each other forever.
+        Modelled here with a UI thread that calls `stop()` and only accepts
+        events once `stop()` has returned."""
+        import threading
+
+        in_lock = threading.Event()
+        stop_pending = threading.Event()
+        ui_free = threading.Event()
+        delivered: list = []
+        starved: list = []
+
+        class GateEvent(threading.Event):
+            # The first thing `_perform` does under the lock is read this
+            # flag; park there until the UI thread is about to call stop().
+            def is_set(self):
+                in_lock.set()
+                stop_pending.wait(5)
+                return super().is_set()
+
+        gate = GateEvent()
+        harness.engine._stop = gate
+
+        def ui_delivery(event):
+            # The UI thread is unavailable only while it sits inside stop().
+            if stop_pending.is_set() and not ui_free.wait(3):
+                starved.append(event)
+            delivered.append(event)
+
+        harness.engine.on_event = ui_delivery
+        tick = threading.Thread(
+            target=harness.tick_with_usage,
+            args=({"1": _usage(95), "2": _usage(10)},),
+        )
+        tick.start()
+        assert in_lock.wait(5), "premise: the tick reached the locked block"
+
+        def ui_thread():
+            stop_pending.set()
+            harness.engine.stop()
+            ui_free.set()
+
+        ui = threading.Thread(target=ui_thread)
+        ui.start()
+        ui.join(8)
+        tick.join(8)
+        assert not ui.is_alive() and not tick.is_alive(), "deadlocked"
+        assert starved == [], "an event was delivered while stop() was blocked"
+        reasons = [e.reason for e in delivered if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["stopped"]
+        assert harness.active_number() == 1
