@@ -634,7 +634,31 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "this utilization (50-99.9; default 90). Acts as the fallback "
+            "for --threshold-5h / --threshold-7d"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-5h",
+        type=float,
+        metavar="PCT",
+        dest="threshold_5h",
+        help=(
+            "Override --threshold for the 5-hour window only (50-99.9). It "
+            "recovers within the session, so it is usually worth riding "
+            "higher than weekly quota"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-7d",
+        type=float,
+        metavar="PCT",
+        dest="threshold_7d",
+        help=(
+            "Override --threshold for weekly windows only (50-99.9), "
+            "including per-model weekly limits. Weekly quota does not come "
+            "back until the window resets, so it is usually worth leaving "
+            "earlier"
         ),
     )
     parser.add_argument(
@@ -664,12 +688,13 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "pace"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'pace' (best, plus rotate off an account "
+            "burning ahead of its weekly pace)"
         ),
     )
     parser.add_argument(

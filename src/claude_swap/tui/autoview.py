@@ -29,6 +29,8 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     binding_pct,
     pct_label,
+    policy_floor,
+    shifted_to_floor,
 )
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -106,8 +108,8 @@ class AutoScreen(Screen):
         # startup — sync it to the fresh file value so bars and engine agree,
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
-        self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self._configured_threshold = self._policy_floor()
+        self.app.threshold_pct = self._configured_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -148,7 +150,7 @@ class AutoScreen(Screen):
             self._end_adjust()
             return
         self._adjusting = True
-        self._entry_threshold = self._settings.threshold
+        self._entry_threshold = self._policy_floor()
         self._update_summary()
         self.refresh_bindings()
 
@@ -160,32 +162,49 @@ class AutoScreen(Screen):
         if not self._adjusting:
             return
         spec = SETTING_SPECS["autoswitch.threshold"]
-        value = min(spec.hi, max(spec.lo, self._settings.threshold + delta))
+        value = min(spec.hi, max(spec.lo, self._policy_floor() + delta))
         self._set_threshold(value)
 
     def _end_adjust(self) -> None:
         self._adjusting = False
         self._update_summary()
         self.refresh_bindings()
-        if self._settings.threshold == self._entry_threshold:
+        if self._policy_floor() == self._entry_threshold:
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
         self.query_one("#event-log", RichLog).write(
             Text(
-                f"— threshold set to {pct_label(self._settings.threshold)}% "
+                f"— threshold set to {pct_label(self._policy_floor())}% "
                 "for this session —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )
 
+    def _policy_floor(self) -> float:
+        """The value this control edits: the policy FLOOR.
+
+        With one threshold the floor IS the threshold, so this reads exactly
+        as `.threshold` always did. With a split policy `.threshold` is only
+        a fallback that `for_label` never consults, so editing it would move
+        no policy at all while the summary claimed otherwise. The floor is
+        also what the bar tick renders, so the number shown and the number
+        adjusted are the same number.
+        """
+        return policy_floor(self._settings)
+
     def _set_threshold(self, value: float) -> None:
-        if value == self._settings.threshold:
+        if value == self._policy_floor():
             return
-        self._settings = replace(self._settings, threshold=value)
+        # Both sides apply the SAME pure function to the same input, so the
+        # screen and the engine cannot drift. Deliberately not read back off
+        # the engine: that couples the view to a live engine existing at all,
+        # and the value would be identical anyway.
+        self._settings = shifted_to_floor(self._settings, value)
+        achieved = self._policy_floor()
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.threshold_pct = value
+        self.app.threshold_pct = achieved
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -194,10 +213,10 @@ class AutoScreen(Screen):
         text = Text()
         text.append("auto-switch · ")
         text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
+            f"threshold {pct_label(self._policy_floor())}%",
             style=palette.accent if self._adjusting else "",
         )
-        if self._settings.threshold != self._configured_threshold:
+        if self._policy_floor() != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:

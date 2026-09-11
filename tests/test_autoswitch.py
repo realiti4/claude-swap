@@ -37,6 +37,28 @@ from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+def _uniform_excess(headroom: dict, engine) -> dict:
+    """Threshold excess equivalent to a headroom map under a UNIFORM policy.
+
+    These tests predate per-window thresholds and all run a single
+    `autoswitch.threshold`, where `excess == (100 - headroom) - threshold`
+    exactly. Deriving it here keeps them asserting on the same fleet shapes
+    they always did instead of restating every case in the new units.
+    """
+    from claude_swap.autoswitch import _thresholds_for
+
+    # Some cases drive a bare AutoSwitchEngine stub that sets only `_models`;
+    # those construct a default AutoSwitchSettings of their own, so defaults
+    # are the right fallback.
+    settings = getattr(engine, "settings", None) or AutoSwitchSettings()
+    t = _thresholds_for(settings)
+    assert t.uniform, "helper is only valid for a single-threshold policy"
+    limit = t.for_label("7d")
+    return {
+        n: None if h is None else (100.0 - h) - limit for n, h in headroom.items()
+    }
+
+
 class FakeClock:
     def __init__(self, now: float = 1_000_000.0):
         self.now = now
@@ -2238,7 +2260,9 @@ class TestSessionThreshold:
         with patch.object(
             harness.switcher, "usage_entries_by_account", return_value=entries
         ) as collect:
-            harness.engine._collect_scheduled_usage("1", threshold=threshold)
+            harness.engine._collect_scheduled_usage(
+                "1", thresholds=oauth.WindowThresholds(default=threshold)
+            )
         return [c.kwargs.get("fetch") for c in collect.call_args_list]
 
     def test_collect_escalates_on_the_tick_snapshot_threshold(self, harness):
@@ -3234,10 +3258,10 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 
         failover_recovered = e._left_account_recovered(
             failover_state, usage, headroom, 5.0, settings, now, "2"
-        )
+        , excess=_uniform_excess(headroom, e))
         ordinary_recovered = e._left_account_recovered(
             consume_first_state, usage, headroom, 5.0, settings, now, "2"
-        )
+        , excess=_uniform_excess(headroom, e))
         assert failover_recovered is True, (
             "a real failover departure's landing floor (h > 10) releases "
             "on an 11-point peer with no baseline to diff against"
@@ -3275,7 +3299,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         }
         recovered = e._left_account_recovered(
             legacy_state, usage, headroom, 5.0, settings, now, "2"
-        )
+        , excess=_uniform_excess(headroom, e))
         assert recovered is True, (
             "no leftTrigger recorded -> fall back to the pre-I-B inference "
             "(both null -> failover), same as before this fix"
@@ -3311,7 +3335,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         }
         recovered = e._left_account_recovered(
             legacy_state_real_headroom, usage, headroom, 5.0, settings, now, "2"
-        )
+        , excess=_uniform_excess(headroom, e))
         assert recovered is False, (
             "leftHeadroom=10.0 is a real (non-null) baseline, so this is "
             "unambiguously an ORDINARY departure -- the failover landing "
@@ -4498,14 +4522,14 @@ class TestHorizonAxisDoesNotFlap:
             for active in (10.0, None):
                 assert harness.engine._no_return_account(
                     trigger, state, headroom, active, ["1", "3"], harness.settings
-                ) is None, (
+                , excess=_uniform_excess(headroom, harness.engine)) is None, (
                     f"trigger={trigger} active_headroom={active} barred the "
                     "account we left; an escape must reach every candidate"
                 )
         # The control: the SAME state bars on a proactive tick.
         assert harness.engine._no_return_account(
             "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
-        ) == "1", "premise: these inputs are barred when the trigger allows it"
+        , excess=_uniform_excess(headroom, harness.engine)) == "1", "premise: these inputs are barred when the trigger allows it"
 
     @pytest.mark.parametrize(
         "landed,live,expect",
@@ -4634,8 +4658,12 @@ class TestHorizonAxisDoesNotFlap:
             oauth_candidates=["1", "3"],
             usage={"1": _usage(40), "2": _usage(96), "3": _usage(99)},
             headroom={"1": 60.0, "2": 4.0, "3": 1.0},
+            excess=_uniform_excess(
+                {"1": 60.0, "2": 4.0, "3": 1.0}, harness.engine
+            ),
             current="2",
             active_headroom=4.0,
+            active_excess=(100.0 - 4.0) - AutoSwitchSettings().threshold,
             settings=AutoSwitchSettings(),
             now=harness.clock.now,
         )
@@ -4768,7 +4796,7 @@ class TestHorizonAxisDoesNotFlap:
         headroom = {"2": 10.0, "3": 40.0}       # slot 1 unreadable — absent
         assert harness.engine._no_return_account(
             "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
-        ) == "1", (
+        , excess=_uniform_excess(headroom, harness.engine)) == "1", (
             "an unreadable barred account must still bar — unknown headroom "
             "is not evidence it beats us"
         )
@@ -5107,7 +5135,7 @@ class TestHorizonAxisDoesNotFlap:
             60.0,
             harness.settings,
             harness.clock(),
-        )
+        excess=_uniform_excess({"1": 100.0}, harness.engine))
         assert recovered is True, (
             "the clamp must still release a departure recorded at a near-full "
             "leftHeadroom even where dominance over the active does not fire"
@@ -5149,10 +5177,10 @@ class TestHorizonAxisDoesNotFlap:
         usage = {"2": _usage(60.0)}  # peer frozen at 40 pts headroom
         readable = harness.engine._left_account_recovered(
             state, usage, {"2": 40.0}, 2.0, harness.settings, harness.clock(), "1",
-        )
+        excess=_uniform_excess({"2": 40.0}, harness.engine))
         unreadable = harness.engine._left_account_recovered(
             state, usage, {"2": 40.0}, None, harness.settings, harness.clock(), "1",
-        )
+        excess=_uniform_excess({"2": 40.0}, harness.engine))
         assert readable is True, "premise: a readable, dominant active releases"
         assert unreadable is True, (
             f"readable={readable} unreadable={unreadable} -- the SAME peer, "
@@ -5183,10 +5211,10 @@ class TestHorizonAxisDoesNotFlap:
         for trigger in ("proactive", "consume-first"):
             readable = harness.engine._no_return_account(
                 trigger, state, headroom, 2.0, recovered=True, settings=harness.settings
-            )
+            , excess=_uniform_excess(headroom, harness.engine))
             unreadable = harness.engine._no_return_account(
                 trigger, state, headroom, None, recovered=True, settings=harness.settings
-            )
+            , excess=_uniform_excess(headroom, harness.engine))
             assert readable is None, f"premise: {trigger} releases when readable"
             assert unreadable is None, (
                 f"trigger={trigger} readable={readable!r} "
@@ -5221,7 +5249,7 @@ class TestHorizonAxisDoesNotFlap:
         }
         recovered = h.engine._left_account_recovered(
             state, usage, {"1": 5.0}, 2.0, h.settings, h.clock(), "2",
-        )
+        excess=_uniform_excess({"1": 5.0}, h.engine))
         assert recovered is False, (
             "the peer's reset is only 60s sooner than the active's, well "
             "inside RECOVERY_HYSTERESIS_S (300s) -- without the margin any "
@@ -5245,7 +5273,7 @@ class TestHorizonAxisDoesNotFlap:
         usage = {"2": _usage(95.0)}  # 5 pts, no resets_at at all
         recovered = harness.engine._left_account_recovered(
             state, usage, {"2": 5.0}, None, harness.settings, harness.clock(), "1",
-        )
+        excess=_uniform_excess({"2": 5.0}, harness.engine))
         assert recovered is False, (
             "the peer is unreadable-active-fallback-eligible in shape only -- "
             "at 5 pts it is BELOW the landing floor (10), so the fallback "
@@ -5268,7 +5296,7 @@ class TestHorizonAxisDoesNotFlap:
         no_return = harness.engine._no_return_account(
             "proactive", state, headroom, None, recovered=True,
             settings=harness.settings,
-        )
+        excess=_uniform_excess(headroom, harness.engine))
         assert no_return == "2", (
             "the barred peer at 5 pts is below the landing floor (10); an "
             "unreadable active must not unconditionally release it"
@@ -5436,14 +5464,14 @@ class TestHorizonAxisDoesNotFlap:
 
         assert harness.engine._left_account_recovered(
             state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.settings, harness.clock()
-        ) is True, (
+        , excess=_uniform_excess({"2": 4.0}, harness.engine)) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently poor (4 pts) — absence of evidence "
             "is not the same state as a measured-unmeasurable failover"
         )
         assert harness.engine._left_account_recovered(
             state, {"2": None}, {"2": None}, 2.0, harness.settings, harness.clock()
-        ) is True, (
+        , excess=_uniform_excess({"2": None}, harness.engine)) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently unreadable — absence of evidence "
             "releases regardless of what can be measured right now"
@@ -6322,7 +6350,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
         assert harness.engine._left_account_recovered(
             state, {"2": _usage(85)}, {"2": 15.0}, 2.0, harness.settings, harness.clock()
-        ) is True, (
+        , excess=_uniform_excess({"2": 15.0}, harness.engine)) is True, (
             "a failover departure with the peer now readable at 15 points "
             "(past the threshold-derived floor of 10, under any floor of "
             "20 or 50) must release"
@@ -6346,7 +6374,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
         assert h_low.engine._left_account_recovered(
             state, {"2": _usage(65)}, {"2": 35.0}, 2.0, h_low.settings, h_low.clock()
-        ) is False, (
+        , excess=_uniform_excess({"2": 35.0}, h_low.engine)) is False, (
             "threshold=60 -> floor=40; a peer at 35 points is BELOW that "
             "floor and must hold"
         )
@@ -6357,7 +6385,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         h_high.make_live("a@example.com", 1)
         assert h_high.engine._left_account_recovered(
             state, {"2": _usage(65)}, {"2": 35.0}, 2.0, h_high.settings, h_high.clock()
-        ) is True, (
+        , excess=_uniform_excess({"2": 35.0}, h_high.engine)) is True, (
             "the SAME peer at 35 points, only `settings.threshold` changed "
             "(71 -> floor 29) — a hardcoded absolute floor would answer the "
             "same both times; this must flip, proving the floor is the "
@@ -6405,7 +6433,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         # 5.0 < 100 - 90 = 10, the threshold-derived floor: readable, but poor.
         assert harness.engine._left_account_recovered(
             state, {"2": _usage(95)}, {"2": 5.0}, 2.0, harness.settings, harness.clock()
-        ) is False, (
+        , excess=_uniform_excess({"2": 5.0}, harness.engine)) is False, (
             "a failover departure with the peer readable but under the "
             "floor must hold — readable is not the same as recovered"
         )
@@ -6415,7 +6443,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
         assert harness.engine._left_account_recovered(
             state, {"2": None}, {"2": None}, 2.0, harness.settings, harness.clock()
-        ) is False, (
+        , excess=_uniform_excess({"2": None}, harness.engine)) is False, (
             "a failover departure with the peer still unreadable must hold; "
             "unknown is not evidence of recovery"
         )
@@ -6442,7 +6470,8 @@ class TestTheReleasePredicateOneStateShapePerTest:
             8.0,
             harness.settings,
             harness.clock(),
-        ) is True, (
+        excess=_uniform_excess(# now back in 1 MINUTE
+            {"2": 4.0}, harness.engine)) is True, (
             "the peer's weekly-bound reset moved meaningfully nearer, which "
             "is a real recovery event the headroom leg cannot see"
         )
@@ -6452,7 +6481,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         state = {"lastSwitchFrom": "2"}  # no leftHeadroom / leftRecoveryAt key
         assert harness.engine._left_account_recovered(
             state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.settings, harness.clock()
-        ) is True, (
+        , excess=_uniform_excess({"2": 4.0}, harness.engine)) is True, (
             "absence of the snapshot fields (a pre-upgrade record) carries "
             "no evidence either way and must release, not hold forever"
         )
@@ -6471,7 +6500,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
             for recovered in (True, False):
                 assert harness.engine._no_return_account(
                     "at-limit", state, headroom, active, recovered, harness.settings
-                ) is None, (
+                , excess=_uniform_excess(headroom, harness.engine)) is None, (
                     "at-limit must escape the bar regardless of "
                     "active_headroom or the recovered predicate's answer"
                 )
@@ -6894,3 +6923,479 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+# --- pace strategy -------------------------------------------------------------
+
+# Weekly-reset instants for pace math, anchored to FakeClock's 1_000_000.0
+# epoch (~1970-01-12 13:46:40Z). Elapsed time in the current weekly cycle is
+# 7d minus the time remaining to the reset, and compute_pace's expected pct
+# is elapsed/7d, so each instant pins a known expected value:
+#   _R7_MIDWEEK  58.2h out -> 109.8h elapsed -> expected ~65.3%
+#   _R7_EARLY   138.0h out ->  30.0h elapsed -> expected ~17.9%
+#   _R7_FRESH   156.0h out ->  12.0h elapsed -> inside the 24h suppression
+_R7_MIDWEEK = "1970-01-15T00:00:00Z"
+_R7_EARLY = "1970-01-18T07:46:40Z"
+_R7_FRESH = "1970-01-19T01:46:40Z"
+
+
+class TestPaceStrategy:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_ahead_of_pace_switches_to_on_pace_candidate(self, temp_home):
+        """The discriminating case: the ahead-of-pace candidate has MORE
+        headroom than the on-pace one, so a plain headroom sort would pick it.
+        The pace landing gate must exclude it and land on the on-pace peer."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # active: 85 vs ~65 expected -> ahead
+            "2": _usage7(10, 50, _R7_MIDWEEK),  # on pace, 50 pts headroom
+            "3": _usage7(0, 40, _R7_EARLY),     # 60 pts headroom but ahead (40 vs ~18)
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "pace"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_on_pace_below_threshold_stays(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 50, _R7_MIDWEEK),  # 50 vs ~65 expected -> on pace
+            "2": _usage7(0, 10, _R7_MIDWEEK),
+            "3": _usage7(0, 10, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_every_candidate_ahead_stays(self, temp_home):
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # ahead
+            "2": _usage7(10, 82, _R7_MIDWEEK),  # also ahead (82 vs ~65: 16.7 over)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-on-pace-candidate"]
+
+    def test_pace_target_must_still_be_healthy(self, temp_home):
+        """An on-pace weekly window does not excuse a binding 5h window at or
+        over the threshold: landing there re-triggers on the next tick."""
+        h = EngineHarness(temp_home, strategy="pace")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),  # ahead
+            "2": _usage7(95, 20, _R7_MIDWEEK),  # weekly on pace, 5h over threshold
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-on-pace-candidate"]
+
+    def test_within_reset_suppression_stays(self, temp_home):
+        """85% at 12h into the week is hugely over expected, and exactly the
+        false positive compute_pace suppresses for the first day."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_FRESH),
+            "2": _usage7(0, 10, _R7_MIDWEEK),
+            "3": _usage7(0, 10, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)  # default cooldown 300s
+        h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),
+            "2": _usage7(10, 50, _R7_MIDWEEK),
+            "3": _usage7(10, 55, _R7_MIDWEEK),
+        })
+        assert h.active_number() == 2
+        h.clock.advance(60.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 85, _R7_MIDWEEK),
+            "2": _usage7(10, 85, _R7_MIDWEEK),  # the landing is now ahead itself
+            "3": _usage7(10, 55, _R7_MIDWEEK),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_over_threshold_behaves_like_best(self, temp_home):
+        """Above the threshold the pace gate is out of scope: we must move,
+        and any healthy account beats staying, exactly as `best` decides."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R7_MIDWEEK),  # over threshold
+            "2": _usage7(0, 81, _R7_MIDWEEK),   # ahead of pace, 19 pts
+            "3": _usage7(10, 10, _R7_MIDWEEK),  # most headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_weekly_ahead_ignores_the_5h_window(self):
+        from claude_swap.autoswitch import _weekly_ahead
+
+        usage = {
+            "five_hour": {"pct": 99.0, "resets_at": _R7_MIDWEEK},
+            "seven_day": {"pct": 10.0, "resets_at": _R7_MIDWEEK},
+        }
+        assert _weekly_ahead(usage, 1_000_000.0, ()) is False
+
+    def test_weekly_ahead_reads_configured_scoped_windows(self):
+        from claude_swap.autoswitch import _weekly_ahead
+
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 10.0, "resets_at": _R7_MIDWEEK},
+            "scoped": [
+                {"name": "Fable", "pct": 90.0, "resets_at": _R7_MIDWEEK},
+            ],
+        }
+        assert _weekly_ahead(usage, 1_000_000.0, ("Fable",)) is True
+        assert _weekly_ahead(usage, 1_000_000.0, ()) is False
+
+    def test_settings_accept_pace_strategy(self):
+        from claude_swap.settings import _clamped
+
+        assert _clamped(AutoSwitchSettings(strategy="pace")).strategy == "pace"
+
+
+# --- per-window thresholds -----------------------------------------------
+
+
+def _pw(five_h: float | None, weekly: float | None, default: float = 88.0):
+    return {"threshold": default, "threshold_5h": five_h, "threshold_7d": weekly}
+
+
+class TestPerWindowThresholds:
+    """A split policy: ride the 5h window, leave weekly quota early.
+
+    Fleet shape throughout is the one that motivated the feature: an active
+    account whose WEEKLY window is the binding one while its 5h window is
+    nearly idle, next to a peer in the mirror image.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_unset_overrides_are_identical_to_one_threshold(self, temp_home):
+        """The backward-compatibility pin: an unset pair must decide exactly
+        as the single-threshold policy did, including the detail string."""
+        h = self._harness(temp_home, threshold=88.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 50), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        detail = next(
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "below-threshold"
+        )
+        assert detail == "50% < 88%", (
+            "an unset per-window pair must not change the message shape; "
+            f"got {detail!r}"
+        )
+
+    def test_a_hot_5h_window_does_not_evict_an_account_with_weekly_left(
+        self, temp_home
+    ):
+        """The switch this feature exists to PREVENT.
+
+        Active is at 92% on a 5h window that resets within the session, and
+        at 5% on its weekly. Under one threshold of 88 that is a switch (and
+        a cold prompt cache in every live session) to save a window that
+        heals itself. Under 5h=95 it keeps working.
+        """
+        h = self._harness(temp_home, **_pw(95.0, 85.0))
+        outcome = h.tick_with_usage({
+            "1": _usage7(92, 5),     # hot 5h, weekly barely touched
+            "2": _usage7(10, 10),
+            "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "a 5h window under its own ceiling must not trigger a switch "
+            "just because it is over the account-wide default"
+        )
+        assert h.active_number() == 1
+        detail = next(
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "below-threshold"
+        )
+        assert detail == "5h 92% < 95%", (
+            f"a split policy must name the window it measured; got {detail!r}"
+        )
+
+    def test_the_same_pcts_under_one_threshold_do_switch(self, temp_home):
+        """Control for the test above: identical fleet, uniform policy."""
+        h = self._harness(temp_home, threshold=88.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(92, 5), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "premise: one threshold of 88 evicts this account; the split "
+            "policy is what changes the answer, not the fleet"
+        )
+
+    def test_a_weekly_window_trips_earlier_than_the_default(self, temp_home):
+        """The switch this feature exists to CAUSE. The live case: active
+        binding on 84% weekly with a nearly idle 5h window."""
+        h = self._harness(temp_home, **_pw(95.0, 85.0))
+        outcome = h.tick_with_usage({
+            "1": _usage7(27, 86),    # weekly over 85, under the 88 default
+            "2": _usage7(19, 3),
+            "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "a weekly window past its own lowered ceiling must rotate off "
+            "even though it is under the account-wide default"
+        )
+        assert h.active_number() in (2, 3)
+
+    # One fleet, two policies, different landings: the discriminating pair.
+    # #2 is hot only on its self-healing 5h window (88, under a 95 ceiling)
+    # with 81 points of weekly room; #3 is quiet on 5h but past a lowered
+    # weekly ceiling (87 > 85). Raw headroom prefers #3 (13 pts vs 12).
+    _SPLIT_FLEET = {
+        "1": _usage7(10, 90),    # active: past the 85 weekly ceiling, must move
+        "2": _usage7(88, 4),
+        "3": _usage7(10, 87),
+    }
+
+    def test_a_candidate_is_gated_per_window_too(self, temp_home):
+        """Landing uses the same per-window policy as the trigger."""
+        h = self._harness(temp_home, hysteresis_pct=0.0, **_pw(95.0, 85.0))
+        outcome = h.tick_with_usage(dict(self._SPLIT_FLEET))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            "#3 is past the lowered weekly ceiling and must be skipped even "
+            "though it holds more raw headroom; #2 is hot only on a window "
+            "that heals itself within the session"
+        )
+
+    def test_the_same_fleet_under_one_threshold_lands_elsewhere(self, temp_home):
+        """Control: identical fleet, uniform 88. #2 is now illegal (5h 88 is
+        at the ceiling) and #3 legal, so the landing flips; the policy is
+        what moved the answer, not the numbers."""
+        h = self._harness(temp_home, hysteresis_pct=0.0, threshold=88.0)
+        outcome = h.tick_with_usage(dict(self._SPLIT_FLEET))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "premise: one threshold picks the weekly-depleted account; the "
+            "split policy is what changes the landing"
+        )
+
+    def test_scoped_model_windows_follow_the_weekly_threshold(self, temp_home):
+        """Per-model windows reset weekly, so they are perishable the same
+        way and must be gated by threshold7d, not the 5h one."""
+        h = self._harness(temp_home, model="Fable", **_pw(95.0, 85.0))
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 90.0}],
+        }
+        outcome = h.tick_with_usage({
+            "1": usage, "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "a scoped weekly window at 90% is past the 85% weekly ceiling; "
+            "gating it with the 5h ceiling (95) would have held"
+        )
+
+    def test_at_limit_still_escapes_regardless_of_policy(self, temp_home):
+        """A real 100% is a hard limit, not a policy choice: the at-limit
+        escape reads headroom, which per-window thresholds must not shift."""
+        h = self._harness(temp_home, **_pw(99.0, 99.0))
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 10), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", (
+            "100% must still read as at-limit even with both ceilings at 99"
+        )
+
+    def test_the_fleet_that_rode_an_account_to_a_hard_limit(self, temp_home):
+        """Observed on a live 3-account fleet under heavy concurrent load.
+
+        Every account sat within a point or two of the single 88 ceiling at
+        once, but on DIFFERENT windows: one on a weekly window days from
+        resetting, one on a 5h window 39 minutes from resetting, and the
+        active one burning. With no candidate under the shared ceiling the
+        engine had nowhere legal to land, reported `no-qualifying-candidate`
+        for eight consecutive ticks, and rode the active account to a real
+        100% before the at-limit escape moved it. A hard rate limit, taken
+        while a peer held a full untouched week of quota.
+
+        The peer was only blocked by a 5h window that heals within the
+        session. Under a split policy it is a legal landing and the limit is
+        never reached, which is the entire point of separating the ceilings.
+        """
+        five_h = _iso_at(1_002_340.0)      # 39 minutes out
+        fleet = {
+            "1": {  # active, burning; 5h past 95 but weekly barely touched
+                "five_hour": {"pct": 96.0, "resets_at": five_h},
+                "seven_day": {"pct": 13.0, "resets_at": _iso_at(1_460_800.0)},
+            },
+            "2": {  # a full untouched week, blocked only by a healing 5h window
+                "five_hour": {"pct": 89.0, "resets_at": five_h},
+                "seven_day": {"pct": 0.0, "resets_at": _iso_at(1_604_800.0)},
+            },
+            "3": {  # genuinely depleted: weekly is days out
+                "five_hour": {"pct": 44.0, "resets_at": _iso_at(1_002_940.0)},
+                "seven_day": {"pct": 88.0, "resets_at": _iso_at(1_241_200.0)},
+            },
+        }
+
+        uniform = self._harness(temp_home, strategy="consume-first", threshold=88.0)
+        assert uniform.tick_with_usage(dict(fleet)) is not TickOutcome.SWITCHED, (
+            "premise: under one ceiling every account is over it, so nothing "
+            "is a legal landing and the active burns on to a hard limit"
+        )
+        assert uniform.active_number() == 1
+
+        # A second, independent home so the two policies cannot share a
+        # store (see EngineHarness.__init__ on per-instance isolation).
+        split_home = temp_home / "split"
+        (split_home / ".claude").mkdir(parents=True)
+        split = self._harness(
+            split_home, strategy="consume-first", **_pw(95.0, 85.0)
+        )
+        assert split.tick_with_usage(dict(fleet)) is TickOutcome.SWITCHED, (
+            "the peer's 5h window is under its own ceiling and its weekly is "
+            "untouched: a legal landing the shared ceiling hid"
+        )
+        assert split.active_number() == 2, (
+            "must land on the account holding a full week, not the one whose "
+            "weekly window is days from resetting"
+        )
+
+    @pytest.mark.parametrize(
+        "pct5,pct7,over,who",
+        [
+            (94.9, 10.0, False, "5h just under its ceiling"),
+            (95.0, 10.0, True, "5h exactly at its ceiling"),
+            (95.1, 10.0, True, "5h just over"),
+            (10.0, 84.9, False, "7d just under its ceiling"),
+            (10.0, 85.0, True, "7d exactly at its ceiling"),
+            (10.0, 85.1, True, "7d just over"),
+            (94.0, 84.0, False, "both just under, neither trips"),
+            (90.0, 86.0, True, "only the weekly trips, and that is enough"),
+        ],
+    )
+    def test_boundaries_at_each_ceiling(self, pct5, pct7, over, who):
+        """`excess >= 0` is the trip test, so equality trips. Pinned per
+        window because a split policy has two independent boundaries and an
+        off-by-one on either is a silent switch or a silent hold."""
+        t = oauth.WindowThresholds(default=88.0, five_hour=95.0, weekly=85.0)
+        excess = oauth.threshold_excess(_usage7(pct5, pct7), (), thresholds=t)
+        assert (excess >= 0) is over, f"{who}: excess={excess}"
+
+    @pytest.mark.parametrize("threshold", [50.0, 75.0, 88.0, 99.9])
+    def test_uniform_boundary_matches_the_legacy_comparison_exactly(self, threshold):
+        """Legacy equivalence at the boundary itself, across the settable
+        range: `excess >= 0` must agree with `(100 - headroom) >= threshold`
+        for every window value, including exact equality."""
+        flat = oauth.WindowThresholds(default=threshold)
+        for pct in (threshold - 0.1, threshold, threshold + 0.1, 0.0, 100.0):
+            usage = _usage7(pct, 0.0)
+            new = oauth.threshold_excess(usage, (), thresholds=flat) >= 0
+            legacy = (100.0 - oauth.account_headroom(usage, ())) >= threshold
+            assert new is legacy, f"pct={pct} threshold={threshold}"
+
+    def test_the_no_return_bar_still_applies_under_a_split_policy(self, temp_home):
+        """Anti-flap is not bypassed by the new axis: the engine still refuses
+        to undo its own last move when the ceilings are split."""
+        h = self._harness(temp_home, **_pw(95.0, 85.0))
+        first = h.tick_with_usage({
+            "1": _usage7(10, 90),   # active past the weekly ceiling
+            "2": _usage7(20, 10),
+            "3": _usage7(30, 10),
+        })
+        assert first is TickOutcome.SWITCHED
+        landed = h.active_number()
+        state = h.state()
+        assert state["lastSwitchTo"] == str(landed)
+        assert state["lastSwitchFrom"] == 1, (
+            "the departure must be recorded so the bar has something to "
+            "refuse to undo under a split policy too"
+        )
+
+    def test_thresholds_resolve_and_stay_uniform_when_unset(self):
+        from claude_swap.autoswitch import _thresholds_for
+
+        t = _thresholds_for(AutoSwitchSettings(threshold=88.0))
+        assert (t.for_label("5h"), t.for_label("7d"), t.uniform) == (88.0, 88.0, True)
+        split = _thresholds_for(
+            AutoSwitchSettings(threshold=88.0, threshold_5h=95.0, threshold_7d=85.0)
+        )
+        assert split.for_label("5h") == 95.0
+        assert split.for_label("Fable") == 85.0   # scoped -> weekly
+        assert split.floor == 85.0 and not split.uniform
+
+    def test_excess_matches_the_old_test_when_uniform(self):
+        """`threshold_excess` must be the exact generalisation of the old
+        `(100 - headroom) >= threshold` comparison."""
+        flat = oauth.WindowThresholds(default=88.0)
+        for pct5, pct7 in ((10, 50), (95, 5), (88, 88), (0, 100)):
+            usage = _usage7(pct5, pct7)
+            old = (100.0 - oauth.account_headroom(usage, ())) - 88.0
+            assert oauth.threshold_excess(usage, (), thresholds=flat) == old
+
+    def test_config_set_rejects_out_of_range_per_window_values(self):
+        from claude_swap.settings import SETTING_SPECS, parse_setting_value
+        from claude_swap.exceptions import ConfigError
+
+        spec = SETTING_SPECS["autoswitch.threshold5h"]
+        assert parse_setting_value(spec, "95") == 95.0
+        with pytest.raises(ConfigError):
+            parse_setting_value(spec, "120")
+
+
+class TestPollEventReportsThePolicy:
+    def test_uniform_policy_emits_no_extra_field(self, temp_home):
+        h = EngineHarness(temp_home, threshold=88.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage7(10, 10), "2": _usage7(10, 10)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "windowThresholds" not in poll.to_json(), (
+            "a single-threshold run must keep its JSON byte-identical"
+        )
+
+    def test_split_policy_reports_both_ceilings(self, temp_home):
+        h = EngineHarness(
+            temp_home, threshold=88.0, threshold_5h=95.0, threshold_7d=85.0
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage7(10, 10), "2": _usage7(10, 10)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["windowThresholds"] == {"5h": 95.0, "7d": 85.0}, (
+            "a reader of the stream must be able to explain the decision"
+        )

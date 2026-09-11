@@ -34,6 +34,8 @@ def _args(**kwargs) -> argparse.Namespace:
         "cooldown": None,
         "include_api_key_accounts": None,
         "strategy": None,
+        "threshold_5h": None,
+        "threshold_7d": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -262,6 +264,28 @@ class TestMergedWithCli:
         assert merged.threshold == 60.0
         assert merged.interval_seconds == 30.0
         assert merged.cooldown_seconds == 10.0  # untouched
+
+    def test_per_window_flags_beat_settings_and_leave_the_fallback_alone(self):
+        base = AutoSwitchSettings(
+            threshold=88.0, threshold_5h=91.0, threshold_7d=80.0
+        )
+        merged = merged_with_cli(base, _args(threshold_5h=95.0, threshold_7d=85.0))
+        assert (merged.threshold_5h, merged.threshold_7d) == (95.0, 85.0)
+        assert merged.threshold == 88.0, (
+            "the per-window flags must not disturb the fallback threshold"
+        )
+
+    def test_one_per_window_flag_leaves_the_other_from_settings(self):
+        base = AutoSwitchSettings(threshold=88.0, threshold_7d=85.0)
+        merged = merged_with_cli(base, _args(threshold_5h=95.0))
+        assert merged.threshold_5h == 95.0
+        assert merged.threshold_7d == 85.0, (
+            "an unset flag must not clear a value the settings file provided"
+        )
+
+    def test_per_window_cli_values_are_clamped(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(threshold_5h=200.0))
+        assert merged.threshold_5h == 99.9
 
     def test_cli_values_are_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(interval=1.0))
