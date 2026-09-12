@@ -1,70 +1,88 @@
-# Implementation Plan: Menubar redesign — Pen handoff
+# Implementation Plan: Claude Code Swap final UI
 
-Source: `SPEC.md` (committed) ← design doc
-`docs/superpowers/specs/2026-09-12-menubar-redesign-design.md` ← Pen
-handoff in `assets/` (authoritative visuals).
+Source: `SPEC.md` (committed 4d2e062) ← brainstorm design
+`docs/superpowers/specs/2026-09-12-claude-code-swap-final-ui-design.md` ←
+authoritative handoff `assets/ui-ux-handoff/HANDOFF.md` + 15 boards.
 
 ## Overview
 
-Rebuild the panel's web layer to the graphite/ivory Pen redesign as three
-plain script files (icons / sheets / panel) over a token-seeded CSS, with
-two additive view-model changes (account.status, preserve-measured
-windows) and one reply-path bug fix. Bridge protocol, shells, and all
-core contracts unchanged. Pure layers land first (fully pytest-covered),
-then the web layer rises against the fixture browser, then states,
-accessibility, and a full verification sweep.
+Land the final Claude Code Swap design on the existing menubar shell in
+five staged vertical slices: Account card + labels (fixing the WIP in
+the working tree forward), numbered index-tab selector, alias editor
+(bridge actions + sheet — the one new feature), segmented settings, and
+Interlock branding (panel SVG + native template status icon + packaged
+assets). Every stage lands green on `dev`; the bridge protocol gains
+exactly two actions (`setAlias`, `unsetAlias`) and one additive reply
+extension (`getPrefs`); nothing else in the core changes.
 
 ## Architecture Decisions
 
-- **In-place web rewrite (no parallel v2 dir)** — the wire-contract tests
-  and fixture mode keep the single source honest; mid-sequence commits
-  may be briefly ugly (old JS against new CSS) but never broken: the
-  panel always loads and every bridge action keeps working.
-- **Contract-first again**: status vocabulary + preserve-measured windows
-  are pinned by view-model tests before any UI consumes them.
-- **Native `<dialog>`** for sheets (focus trap/Esc/restore from the
-  platform). Fallback guard if `showModal` is unavailable in an older
-  WKWebView.
-- **Fixture browser is the UI gate**: every web task verifies by pushing
-  synthetic view-models to the fixture page; light theme is derived and
-  human-reviewed at Checkpoint B.
+- **Fix-forward the WIP card edits** (approved in brainstorm): stage 1
+  corrects the uncommitted `panel.js`/`panel.css` changes to final
+  spec — no WIP commit, no discard.
+- **Contract-first for the alias feature**: bridge specs + handler
+  tests (task 4) land before the sheet UI (task 5), mirroring the
+  0.28.0 pattern that kept the wire honest.
+- **New handlers stay inside the `_panel_handlers` block and
+  `payload_specs={...}` call** (app.py ~488–553) so the wire-contract
+  extraction anchors keep working; the wire test's send-scan gains the
+  alias sheet's literals in task 5.
+- **Inline SVG, not `<img>`**, for the panel Interlock (currentColor
+  must follow both themes); native icon = template NSImage from the
+  packaged `icon-template.pdf`, PNG pair as raster fallback.
+- **Fixture browser remains the UI gate** per task; native runs at
+  checkpoints for template rendering and persistence-across-relaunch.
 
 ## Task List
 
-### Phase 1: Pure layers (pytest-covered, no UI)
-- [x] Task 1: `account.status` mapping + contract tests
-- [x] Task 2: preserve-measured windows + pace gating + tests
-- [x] Task 3: JS reply-adapter error fix + wire-contract regression test
+Tasks tracked in `tasks/todo.md`.
 
-### Checkpoint A: pure layers
-- [x] `uv run pytest` green; status vocabulary + no-fabricated-zero pinned
+### Phase 1: Account card & labels
+- [ ] Task 1: Final Account card + section labels
+- [ ] Task 2: View-model card-field contract pin
 
-### Phase 2: Web layer (fixture-verified per task)
-- [x] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
-- [x] Task 5: `panel.js` core render — header, selector cards, identity, quotas
-- [x] Task 6: `panel.js` completion — disclosure, actions, auto-switch, footer
-- [x] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring
+### Checkpoint A: card & labels
+- [ ] Focused suites green; both themes render board 12 structure
 
-### Checkpoint B: full panel in fixture + hosted
-- [x] Both themes render the main artboard faithfully; sheets work; human review of derived light theme
+### Phase 2: Numbered selector
+- [ ] Task 3: Index-tab selector with radiogroup semantics
 
-### Phase 3: States, accessibility, verification
-- [x] Task 8: all artboard states, keyboard, reduced motion, icon fidelity
-- [x] Task 9: verification sweep — vision gates, live run, README/screenshots refresh
+### Checkpoint B: selector matrix
+- [ ] Fixture matrix passes: 3/10+ accounts, empty roster, states
 
-### Checkpoint C: complete
-- [x] SPEC success criteria 1–7 verified; Definition of Done satisfied
+### Phase 3: Alias editor (vertical slice)
+- [ ] Task 4: Bridge `setAlias`/`unsetAlias` + snapshot push
+- [ ] Task 5: Alias sheet UI + card Add/Edit/Remove
+
+### Checkpoint C: alias end-to-end
+- [ ] Save/normalize/reject/duplicate/cancel/remove/refresh-race pass
+
+### Phase 4: Settings segments
+- [ ] Task 6: Segmented settings + extended `getPrefs`
+
+### Checkpoint D: settings honesty
+- [ ] Stored values shown; persistence + rollback verified natively
+
+### Phase 5: Interlock branding
+- [ ] Task 7: Panel header rebrand + icons.js Interlock
+- [ ] Task 8: Native template icon + packaged assets
+
+### Checkpoint E: complete
+- [ ] Full state matrix + HANDOFF acceptance sweep + suite green
+- [ ] Fixture screenshots + native eyeball list to user → /review
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Mid-sequence commits look unstyled (old JS, new CSS) | Low | Fixture verification per task; functionality never breaks |
-| `<dialog>`/`showModal` missing in older WKWebView | Med | Capability check + class-based fallback at Task 7 |
-| Derived light theme drifts from Pen intent | Med | Human review gate at Checkpoint B; token table + mirrored layout |
-| Icon fidelity vs Pen artboards (no exports shipped) | Low | Existing icon language baseline; judged at Task 8 fixture pass |
-| Preserve-measured changes pace tests subtly | Low | Pace-gating tests extended in Task 2, before UI consumes them |
+| Template PDF renders poorly on some macOS build | Med | PNG 18/36 fallback path in same task; verify 1x/2x light/dark |
+| Selector rewrite breaks scroll/disclosure preservation | Med | Port the existing preservation logic verbatim; fixture check in-task |
+| Wire-contract anchors shift when handlers are added | Med | Keep new registrations inside the anchored blocks; suite gate |
+| Segmented settings regresses appearance rollback | Low | Extend the existing node-vm appearance tests to segments |
+| Hatch packaging misses new asset types | Low | Packaging test asserts files in built wheel |
+| iCloud working tree mid-build | Low | Commit per task; no service/runtime deps on repo paths |
 
 ## Open Questions
 
-None blocking (see SPEC).
+None — defaults recorded in SPEC.md; build-time choices resolve from
+the boards.

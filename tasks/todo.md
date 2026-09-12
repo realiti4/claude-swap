@@ -1,207 +1,82 @@
-# Tasks: Menubar redesign — Pen handoff
+# Claude Code Swap final UI — task list
 
 Plan: `tasks/plan.md` · Spec: `SPEC.md` · Design:
-`docs/superpowers/specs/2026-09-12-menubar-redesign-design.md`.
+`docs/superpowers/specs/2026-09-12-claude-code-swap-final-ui-design.md`.
 Definition of Done applies to every task on top of its own acceptance
 criteria.
 
-## Task 1: `account.status` mapping + contract tests
+## Phase 1: Account card & labels
 
-**Description:** Additive `status` field on view-model accounts, derived
-from the sentinel: `api key` → `"api-key"`, `re-login needed` →
-`"needs-login"`, `token expired`/`keychain unavailable`/foreign-credential
-→ `"unavailable"`, none → `"ok"`. `quarantined` remains emitted (wire
-compat) but the panel will key off `status`. Contract tests pin the
-vocabulary and every sentinel mapping.
+- [ ] Task 1: Final Account card + section labels
+  - Acceptance: card shows "Account" heading + Active/Preview badge; labeled Alias ("Not set" + Add alias, or value + Edit), Email, Team, Account Index (bare number) rows; "Usage" heading above meters; missing email/team read "Not available"; values wrap anywhere and stay selectable; fixtures use work/research/backup with long org/email examples, no "workspace" wording; every string esc()'d
+  - Verify: `uv run pytest tests/test_menubar.py tests/test_menubar_wire_contract.py -q`; fixture render of both themes matches board 12; `node --check` panel.js
+  - Files: src/claude_swap/menubar/web/panel.js, panel.css, tests/test_menubar.py
+  - Dependencies: none (folds in the uncommitted WIP)
 
-**Acceptance criteria:**
-- [x] Each sentinel maps to its status; non-sentinel accounts emit `"ok"`
-- [x] `status` added to ALLOWED/REQUIRED contract sets; vocabulary pinned
-- [x] No existing field changed or removed (additive only)
+- [ ] Task 2: View-model card-field contract pin
+  - Acceptance: viewmodel tests pin slot/email/org always present and alias absent-when-unset (never null) for the card rows
+  - Verify: `uv run pytest tests/test_menubar_viewmodel.py -q`
+  - Files: tests/test_menubar_viewmodel.py (viewmodel.py only if a gap surfaces)
+  - Dependencies: none
 
-**Verification:**
-- [x] `uv run pytest tests/test_menubar_viewmodel.py -x` green; full suite green
+## Checkpoint A
+- [ ] Focused suites green; both themes render the board-12 card; no workspace wording anywhere
 
-**Dependencies:** None
-**Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`
-**Estimated scope:** S
+## Phase 2: Numbered selector
 
-## Task 2: preserve-measured windows + pace gating
+- [ ] Task 3: Index-tab selector with radiogroup semantics
+  - Acceptance: each tab shows the large stable index spanning two lines with alias + status text right; status strings Ready/Active/Disabled/API key/Needs login/Unavailable; one ARIA radiogroup of radios with explicit Enter/Space activation; grid wraps to multiple rows; two-digit indices don't clip; long alias ellipsizes with full value in accessible name; selected (teal ring) ≠ active (mark) ≠ disabled visuals; per-account usage mini-bars removed; click-to-preview preserved; scroll/disclosure preservation intact
+  - Verify: DOM-guard tests + fixture matrix (3 accounts, 10+ accounts multi-row, empty roster, each status state, long alias); `node --check`
+  - Files: panel.js, panel.css, tests (DOM guards)
+  - Dependencies: Task 1 (status vocabulary renders against the final card)
 
-**Description:** Panel view-model stops zeroing rolled/passed windows:
-five-hour and weekly windows whose reset passed keep measured `pct`,
-`state: "stale"`, `countdownText: "Awaiting updated usage"`. Pace chip
-data is suppressed when the measurement is stale. Legacy helpers
-(`usage_summary`, `format_title`) untouched — CLI/TUI keep roll-to-zero.
+## Checkpoint B
+- [ ] Selector fixture matrix passes; selection preview and Active badge verified against board 03
 
-**Acceptance criteria:**
-- [x] Passed weekly AND five-hour windows keep measured pct + stale + awaiting text
-- [x] Pace absent for stale accounts; present otherwise (existing tests stay green)
-- [x] Legacy helper behavior unchanged (existing legacy tests prove it)
+## Phase 3: Alias editor
 
-**Verification:**
-- [x] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green; full suite green
+- [ ] Task 4: Bridge setAlias/unsetAlias + snapshot push
+  - Acceptance: `setAlias {slot, alias}` → `{slot, alias}` and `unsetAlias {slot}` → `{slot, alias: null}` registered inside the `_panel_handlers` block with payload specs; handlers call switcher.set_alias/unset_alias with normalize_alias as authority; errors flow through the bridge error channel; success pushes an updated snapshot (no usage round-trip) and rebuilds native menu labels; tests cover normalization (trim/lowercase), duplicate, invalid, purely-numeric, leading-hyphen, unknown slot, and assert no credential writes and no account switch
+  - Verify: `uv run pytest tests/test_menubar.py tests/test_menubar_bridge.py tests/test_menubar_wire_contract.py -q`
+  - Files: src/claude_swap/menubar/app.py, tests
+  - Dependencies: none (parallel-safe with tasks 1–3)
 
-**Dependencies:** Task 1 (same file)
-**Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`
-**Estimated scope:** S-M
+- [ ] Task 5: Alias sheet UI + card Add/Edit/Remove
+  - Acceptance: `dlg-alias` opens from the card's Add alias / Edit with the target slot captured at open (refreshes can't retarget); context row shows index + email; input prefilled; inline error shows the backend's real message and retains input; Save double-submit-guarded; Cancel closes without mutation; Remove alias appears when set, unsets and falls back to the account label (never deletes); focus contained, Escape safe, focus restored, state cleared on close; wire-contract send-scan covers the new literals; node-vm lifecycle test
+  - Verify: wire-contract + node-vm tests green; fixture: save/normalize/reject/duplicate/cancel/remove + rename during a background refresh
+  - Files: index.html, sheets.js, panel.js, panel.css, tests
+  - Dependencies: Tasks 1, 4
 
-## Task 3: reply-adapter error fix + wire regression test
+## Checkpoint C
+- [ ] Alias end-to-end green in fixture; selector, card, and (native) menu labels update immediately
 
-**Description:** `panel.js`'s `cswap.reply` currently forwards
-`result.data` on failures, so toasts show a generic message; pass
-`result.error` through. Wire-contract test pins that the reply path
-preserves error text (source-level or behavioral).
+## Phase 4: Settings segments
 
-**Acceptance criteria:**
-- [x] Reply path forwards `.error` on `ok:false` (source check in wire-contract tests)
-- [x] Full suite green
+- [ ] Task 6: Segmented settings + extended getPrefs
+  - Acceptance: getPrefs reply adds refreshInterval and titlePct (additive); Appearance/Refresh/Title% render as segmented controls showing the stored value on open; appearance.js keeps persistence + rollback (extended to all three controls); System follows live OS changes; failed save rolls back; help texts per boards; dropdown removed
+  - Verify: bridge getPrefs test; node-vm segmented behavior tests (current selection, save, rollback); native relaunch persistence check at checkpoint
+  - Files: app.py, appearance.js, index.html, panel.css, tests/test_menubar_appearance.py
+  - Dependencies: none (parallel-safe after Checkpoint A)
 
-**Verification:**
-- [x] `uv run pytest tests/test_menubar_wire_contract.py -x`; full suite green
+## Checkpoint D
+- [ ] Settings show stored values; all three choices persist across native relaunch; rollback verified
 
-**Dependencies:** None
-**Files:** `src/claude_swap/menubar/web/panel.js`, `tests/test_menubar_wire_contract.py`
-**Estimated scope:** S
+## Phase 5: Interlock branding
 
-## Checkpoint A: pure layers
-- [x] Full suite green; status vocabulary and no-fabricated-zero pinned by tests
+- [ ] Task 7: Panel header rebrand + icons.js Interlock
+  - Acceptance: header reads "Claude Code Swap" with the Interlock mark inlined as currentColor SVG (both themes); icons.js swap glyph geometry replaced by the Interlock paths with all `ic()` consumers intact; no other utility icons changed
+  - Verify: fixture render both themes; icons wire/DOM guards; `node --check`
+  - Files: index.html (or panel.js), icons.js, tests
+  - Dependencies: none
 
-## Task 4: token CSS foundation + icons + HTML skeletons
+- [ ] Task 8: Native template icon + packaged assets
+  - Acceptance: icon-template.pdf/-18/-36.png copied into src/claude_swap/menubar/assets/; status item uses template NSImage (18×18pt nominal, setTemplate_) replacing the SF Symbol, with PNG fallback if the PDF fails to load; accessibility description "Claude Code Swap"; title-percentage text feature unchanged; packaging test asserts the assets ship in the built wheel
+  - Verify: packaging test; native run — icon at 1x/2x in light/dark menubar with selection rendering, no boxed background, no stray color
+  - Files: src/claude_swap/menubar/assets/* (new), app.py, tests
+  - Dependencies: Task 7 (shared icon source)
 
-**Description:** Rebuild `panel.css` from
-`assets/menubar-redesign-tokens.css` (`--swap-*` vars, graphite/ivory,
-`data-swap-theme` + `?theme=` override, reduced-motion, Inter/Plex-Mono
-fallbacks, 44/486/30 frame, tabular numerals). New `icons.js`
-(currentColor SVG factory: swap/refresh/gear/best/rotate/chevron/activity).
-`index.html`: load order (icons → sheets → panel), static `<dialog>`
-skeletons (token/remove/activity), CSP unchanged. Old panel.js keeps
-functioning against the new CSS (ugly but working).
-
-**Acceptance criteria:**
-- [x] Fixture page loads with new tokens; both themes flip correctly via `?theme=`
-- [x] `node --check` passes on icons.js; every icon renders via `icon("name")`
-- [x] Old panel remains bridge-functional (fixture actions still log)
-
-**Verification:**
-- [x] Browser: fixture renders (unstyled-ish), theme override works
-- [x] `uv run pytest` green
-
-**Dependencies:** Task 3 (panel.js state)
-**Files:** `web/panel.css`, `web/icons.js`, `web/index.html`
-**Estimated scope:** M
-
-## Task 5: panel.js core render
-
-**Description:** Rewrite `panel.js` render to the main artboard: brand
-header (icon + wordmark + refresh + gear), account selector cards
-(selected = teal ring + dot; active/ready/disabled/needs-login subtitle),
-selected-identity row (alias ≥14px, full email, org, Active/Preview
-badge), primary quotas ("N% USED" + slim bar + countdown sub-line), and
-the state/pending plumbing for actions. Local countdown → "Awaiting
-updated usage" at zero.
-
-**Acceptance criteria:**
-- [x] Fixture with the spec's example data (Work 68%/41%, 84% model, $12.40/$100) matches the dark artboard's structure
-- [x] Selected ≠ active visually and behaviorally (selection never switches)
-- [x] Missing values render unavailable, never 0%; stale states render per Task 2
-
-**Verification:**
-- [x] Browser fixture: DOM + visual check vs artboard; theme flip
-- [x] `uv run pytest` green (wire contract: only registered actions)
-
-**Dependencies:** Tasks 1, 2, 4
-**Files:** `web/panel.js`
-**Estimated scope:** M
-
-## Task 6: panel.js completion — disclosure, actions, auto-switch, footer
-
-*(Absorbed into Task 5: the render template landed as one coherent unit
-covering disclosure, actions with pending states, auto-switch toggle, and
-footer. The gear overflow + settings remainder moved to Task 7, whose
-dialog machinery it requires.)*
-
-**Description:** Collapsed per-model + spend disclosure (`›`), full-width
-primary switch (pending/disabled states), half-width Best/Rotate with
-icons, iOS-style auto-switch toggle with persistent "at N% used ·
-strategy" summary, footer (freshness dot + age/stale note, Activity ›,
-Add account), overflow items under gear (disable/enable, remove…,
-settings).
-
-**Acceptance criteria:**
-- [x] Every bridge action reachable from the panel; pending blocks duplicates and keeps focus
-- [x] Disclosure collapsed by default; spend/model subordinate
-- [x] Auto-switch summary always visible; toggle reflects vm state immediately
-
-**Verification:**
-- [x] Browser fixture: click-through all controls; wire-contract green
-- [x] `uv run pytest` green
-
-**Dependencies:** Task 5
-**Files:** `web/panel.js`
-**Estimated scope:** M
-
-## Task 7: sheets.js — dialogs and wiring
-
-**Description:** Token sheet (concealed input, optional email, field
-errors, clears on close), remove confirmation (identity + consequence),
-activity sheet (switch history from `vm.history`), all native
-`<dialog>.showModal()` with Esc, focus trap/restore, plus a capability
-fallback if `showModal` is unavailable. Gear/footer buttons open sheets;
-submissions go through the existing bridge actions only.
-
-**Acceptance criteria:**
-- [x] Three sheets open/close via keyboard and pointer; focus restored to trigger
-- [x] Token field clears on close; empty/invalid token shows field error, never sends
-- [x] Activity lists `vm.history` entries with timestamps
-
-**Verification:**
-- [x] Browser fixture: Tab/Esc walk through each sheet; wire-contract green
-- [x] `uv run pytest` green
-
-**Dependencies:** Tasks 4, 6
-**Files:** `web/sheets.js`, `web/panel.js` (wiring)
-**Estimated scope:** M
-
-## Checkpoint B: full panel in fixture + hosted
-- [x] Both themes faithful to the artboards; sheets work; **human review of derived light theme**
-
-## Task 8: states, keyboard, reduced motion, icon fidelity
-
-**Description:** All eight artboard states in fixture (healthy,
-preview-selected, stale/offline, api-key, needs-login, empty roster, long
-identities, many accounts), full keyboard operation, reduced-motion
-verification, icon fidelity pass against the artboard.
-
-**Acceptance criteria:**
-- [x] Every state renders per spec rules (text+icon status, honest stale, empty CTA)
-- [x] Tab order sensible; Enter/Esc operate sheets; focus visible
-- [x] Reduced-motion honored (no essential animation)
-
-**Verification:**
-- [x] Browser fixture with synthetic vms for each state; visual review
-
-**Dependencies:** Task 7
-**Files:** `web/*` as needed
-**Estimated scope:** M
-
-## Task 9: verification sweep + docs
-
-**Description:** Vision-gated screenshots (dark + derived light) at final
-rendering, live hosted app run (real snapshot, popover opens, right-click
-menu intact), README screenshot refresh + copy tweak, full suite.
-
-**Acceptance criteria:**
-- [x] Screenshots pass vision gate both themes; README shows the redesign
-- [x] Live app clean run; right-click fallback untouched and working
-- [x] `uv run pytest` fully green
-
-**Verification:**
-- [x] Browser + live app + suite; SPEC success criteria 1–7 walked
-
-**Dependencies:** Task 8
-**Files:** `assets/menubar-panel-*.png`, `README.md`
-**Estimated scope:** S-M
-
-## Checkpoint C: complete
-- [x] SPEC success criteria 1–7 verified; Definition of Done satisfied
+## Checkpoint E
+- [ ] Full suite `uv run pytest -n 4 -q` green
+- [ ] Full state matrix in fixture (both themes, empty roster, API-key, needs-login, disabled, stale, expired countdown, missing optional data, long identities, 10+ accounts)
+- [ ] HANDOFF.md acceptance checklist walked end-to-end; fixture screenshots + native eyeball list to user
+- [ ] Ready for /review
