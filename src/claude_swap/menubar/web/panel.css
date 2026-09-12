@@ -2,8 +2,31 @@
  * Rebuilt from assets/menubar-redesign-tokens.css (graphite / warm ivory,
  * restrained teal). 360 x 560: 44px header / 486px scrollable body / 30px
  * footer. No framework, no build step, no external font requests —
- * Inter and IBM Plex Mono fall back to system stacks.
+ * Inter and IBM Plex Mono are bundled below (pixel-fidelity: the boards
+ * render in them, and @font-face shadows host-installed copies).
+ * Provenance and hashes: fonts/SOURCES.md.
  */
+
+/* Bundled board fonts — the declared families resolve to these files
+ * before any host-installed font of the same name. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900; /* variable: covers the boards' 400/600 */
+  src: url("fonts/inter-var.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  src: url("fonts/ibm-plex-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  src: url("fonts/ibm-plex-mono-600.woff2") format("woff2");
+}
 
 :root {
   --swap-panel-width: 360px;
