@@ -42,8 +42,8 @@ accessibility, and a full verification sweep.
 ### Phase 2: Web layer (fixture-verified per task)
 - [x] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
 - [x] Task 5: `panel.js` core render — header, selector cards, identity, quotas
-- [ ] Task 6: `panel.js` completion — disclosure, actions, auto-switch, footer
-- [ ] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring
+- [x] Task 6: `panel.js` completion — disclosure, actions, auto-switch, footer
+- [x] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring
 
 ### Checkpoint B: full panel in fixture + hosted
 - [ ] Both themes render the main artboard faithfully; sheets work; human review of derived light theme

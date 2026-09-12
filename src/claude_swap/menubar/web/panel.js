@@ -359,9 +359,13 @@ function wire() {
             toast("activity sheet arrives with the sheets module");
           }
           break;
-        case "gear":
-          toast("overflow menu arrives with the completion task");
+        case "gear": {
+          const target = selectedAccount() ?? activeAccount();
+          if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openOverflow && target) {
+            window.CSWAP_SHEETS.openOverflow(el, target);
+          }
           break;
+        }
       }
     });
   });

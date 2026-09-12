@@ -116,6 +116,11 @@ updated usage" at zero.
 
 ## Task 6: panel.js completion — disclosure, actions, auto-switch, footer
 
+*(Absorbed into Task 5: the render template landed as one coherent unit
+covering disclosure, actions with pending states, auto-switch toggle, and
+footer. The gear overflow + settings remainder moved to Task 7, whose
+dialog machinery it requires.)*
+
 **Description:** Collapsed per-model + spend disclosure (`›`), full-width
 primary switch (pending/disabled states), half-width Best/Rotate with
 icons, iOS-style auto-switch toggle with persistent "at N% used ·
@@ -124,13 +129,13 @@ Add account), overflow items under gear (disable/enable, remove…,
 settings).
 
 **Acceptance criteria:**
-- [ ] Every bridge action reachable from the panel; pending blocks duplicates and keeps focus
-- [ ] Disclosure collapsed by default; spend/model subordinate
-- [ ] Auto-switch summary always visible; toggle reflects vm state immediately
+- [x] Every bridge action reachable from the panel; pending blocks duplicates and keeps focus
+- [x] Disclosure collapsed by default; spend/model subordinate
+- [x] Auto-switch summary always visible; toggle reflects vm state immediately
 
 **Verification:**
-- [ ] Browser fixture: click-through all controls; wire-contract green
-- [ ] `uv run pytest` green
+- [x] Browser fixture: click-through all controls; wire-contract green
+- [x] `uv run pytest` green
 
 **Dependencies:** Task 5
 **Files:** `web/panel.js`
@@ -146,13 +151,13 @@ fallback if `showModal` is unavailable. Gear/footer buttons open sheets;
 submissions go through the existing bridge actions only.
 
 **Acceptance criteria:**
-- [ ] Three sheets open/close via keyboard and pointer; focus restored to trigger
-- [ ] Token field clears on close; empty/invalid token shows field error, never sends
-- [ ] Activity lists `vm.history` entries with timestamps
+- [x] Three sheets open/close via keyboard and pointer; focus restored to trigger
+- [x] Token field clears on close; empty/invalid token shows field error, never sends
+- [x] Activity lists `vm.history` entries with timestamps
 
 **Verification:**
-- [ ] Browser fixture: Tab/Esc walk through each sheet; wire-contract green
-- [ ] `uv run pytest` green
+- [x] Browser fixture: Tab/Esc walk through each sheet; wire-contract green
+- [x] `uv run pytest` green
 
 **Dependencies:** Tasks 4, 6
 **Files:** `web/sheets.js`, `web/panel.js` (wiring)

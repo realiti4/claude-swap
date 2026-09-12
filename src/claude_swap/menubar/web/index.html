@@ -44,6 +44,35 @@
   <div class="row"><button class="btn ghost" data-dlg="cancel">Close</button></div>
 </dialog>
 
+<dialog id="dlg-overflow" aria-labelledby="dlg-overflow-title">
+  <h3 id="dlg-overflow-title">Account</h3>
+  <div class="row" style="flex-direction:column;align-items:stretch;gap:8px;margin-top:0">
+    <button class="btn ghost" data-dlg="toggle-disabled">Disable account</button>
+    <button class="btn ghost" data-dlg="open-remove">Remove account…</button>
+    <button class="btn ghost" data-dlg="copy-email">Copy email</button>
+    <button class="btn ghost" data-dlg="open-settings">Panel settings…</button>
+  </div>
+  <div class="row"><button class="btn ghost" data-dlg="cancel">Close</button></div>
+</dialog>
+
+<dialog id="dlg-settings" aria-labelledby="dlg-settings-title">
+  <h3 id="dlg-settings-title">Panel settings</h3>
+  <p>Refresh interval</p>
+  <div class="row" style="justify-content:flex-start;gap:6px;margin-top:0">
+    <button class="btn ghost" data-dlg="iv" data-iv="30">30s</button>
+    <button class="btn ghost" data-dlg="iv" data-iv="60">60s</button>
+    <button class="btn ghost" data-dlg="iv" data-iv="300">5 min</button>
+  </div>
+  <p style="margin-top:12px">Title percentage</p>
+  <div class="row" style="justify-content:flex-start;gap:6px;margin-top:0">
+    <button class="btn ghost" data-dlg="tp" data-tp="off">off</button>
+    <button class="btn ghost" data-dlg="tp" data-tp="5h">5h</button>
+    <button class="btn ghost" data-dlg="tp" data-tp="7d">7d</button>
+    <button class="btn ghost" data-dlg="tp" data-tp="both">both</button>
+  </div>
+  <div class="row"><button class="btn ghost" data-dlg="cancel">Done</button></div>
+</dialog>
+
 <div id="toasts"></div>
 
 <script src="icons.js?v=3"></script>
