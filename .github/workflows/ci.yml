@@ -61,7 +61,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --extra menubar
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
@@ -80,3 +80,11 @@ jobs:
         # that holds under either ordering.
         timeout-minutes: 15
         run: uv run pytest -o faulthandler_timeout=600
+
+      - name: Menubar extra import smoke (real PyObjC on macOS)
+        # The suite above already exercises the import-safe pure layers; this
+        # proves the shipped extra installs from the lockfile and the shell
+        # imports against the real frameworks (pins the pyobjc>=10 floor).
+        run: |
+          uv sync --locked --extra menubar
+          PYTHONPATH=src uv run python -c "import AppKit, WebKit; from claude_swap.menubar import app"

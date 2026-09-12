@@ -252,7 +252,7 @@ pushing.
 
 **Acceptance criteria:**
 - [x] README section matches shipped behavior; ARCHITECTURE.md accurate to the new layout
-- [ ] macOS CI installs the extra and the import smoke passes; Linux jobs untouched
+- [x] macOS CI installs the extra and the import smoke passes; Linux jobs untouched
 - [ ] Human approved the CI diff (ask-first boundary)
 
 **Verification:**

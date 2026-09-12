@@ -24,7 +24,9 @@ def test_app_module_imports_headless() -> None:
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only shell")
 def test_ns_popover_api_assumptions() -> None:
-    import AppKit
+    AppKit = pytest.importorskip(
+        "AppKit", reason="pyobjc not installed (menubar extra absent)"
+    )
 
     popover = AppKit.NSPopover.alloc().init()
     assert popover.isShown() is False  # visibility accessor the shell polls
