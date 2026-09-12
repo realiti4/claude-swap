@@ -54,18 +54,18 @@ data is suppressed when the measurement is stale. Legacy helpers
 preserves error text (source-level or behavioral).
 
 **Acceptance criteria:**
-- [ ] Reply path forwards `.error` on `ok:false` (source check in wire-contract tests)
-- [ ] Full suite green
+- [x] Reply path forwards `.error` on `ok:false` (source check in wire-contract tests)
+- [x] Full suite green
 
 **Verification:**
-- [ ] `uv run pytest tests/test_menubar_wire_contract.py -x`; full suite green
+- [x] `uv run pytest tests/test_menubar_wire_contract.py -x`; full suite green
 
 **Dependencies:** None
 **Files:** `src/claude_swap/menubar/web/panel.js`, `tests/test_menubar_wire_contract.py`
 **Estimated scope:** S
 
 ## Checkpoint A: pure layers
-- [ ] Full suite green; status vocabulary and no-fabricated-zero pinned by tests
+- [x] Full suite green; status vocabulary and no-fabricated-zero pinned by tests
 
 ## Task 4: token CSS foundation + icons + HTML skeletons
 

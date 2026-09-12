@@ -55,6 +55,26 @@ class TestActionContract:
         assert not missing, f"payload actions without validation specs: {sorted(missing)}"
 
 
+class TestReplyErrorPreservation:
+    """The handoff flagged this bug: the JS reply adapter forwarded
+    result.data even on failure, so toasts showed a generic message instead
+    of the backend's real error."""
+
+    def test_reply_adapter_passes_error_through(self) -> None:
+        m = re.search(r"reply:\s*\(([^)]*)\)\s*=>\s*bridge\.reply\(([^)]*)\)", PANEL_JS)
+        assert m, "panel.js lost its cswap.reply adapter"
+        body = m.group(2)
+        assert ".error" in body, f"reply adapter drops error text: ...{body}..."
+
+    def test_reply_adapter_distinguishes_ok(self) -> None:
+        m = re.search(r"reply:\s*\(([^)]*)\)\s*=>\s*bridge\.reply\(([^)]*)\)", PANEL_JS)
+        assert m
+        body = m.group(2)
+        assert ".ok" in body and ".data" in body, (
+            "reply adapter must forward data on success and error on failure"
+        )
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings

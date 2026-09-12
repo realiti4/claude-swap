@@ -72,7 +72,9 @@ const bridge = {
 // protocol in menubar/bridge.py.
 window.cswap = {
   push: (msg) => bridge.push(msg.type, msg.data),
-  reply: (id, result) => bridge.reply(id, result && result.ok, result && result.data),
+  reply: (id, result) => bridge.reply(
+    id, result && result.ok, result ? (result.ok ? result.data : result.error) : undefined
+  ),
   send: (action, payload) => bridge.send(action, payload),
 };
 

@@ -34,10 +34,10 @@ accessibility, and a full verification sweep.
 ### Phase 1: Pure layers (pytest-covered, no UI)
 - [x] Task 1: `account.status` mapping + contract tests
 - [x] Task 2: preserve-measured windows + pace gating + tests
-- [ ] Task 3: JS reply-adapter error fix + wire-contract regression test
+- [x] Task 3: JS reply-adapter error fix + wire-contract regression test
 
 ### Checkpoint A: pure layers
-- [ ] `uv run pytest` green; status vocabulary + no-fabricated-zero pinned
+- [x] `uv run pytest` green; status vocabulary + no-fabricated-zero pinned
 
 ### Phase 2: Web layer (fixture-verified per task)
 - [ ] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
