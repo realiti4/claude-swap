@@ -1,80 +1,70 @@
-# Implementation Plan: Menubar v2 — CodexBar-class web panel
+# Implementation Plan: Menubar redesign — Pen handoff
 
-Source: `SPEC.md` (committed) ← design doc `docs/superpowers/specs/2026-09-12-menubar-panel-design.md`
+Source: `SPEC.md` (committed) ← design doc
+`docs/superpowers/specs/2026-09-12-menubar-redesign-design.md` ← Pen
+handoff in `assets/` (authoritative visuals).
 
 ## Overview
 
-Replace the rumps text-menu menubar with a PyObjC status item whose
-left-click opens an NSPopover + WKWebView panel (bundled vanilla HTML/CSS/JS),
-right-click keeps a slim NSMenu fallback. Pure Python layers (view-model,
-bridge routing) are built and unit-tested first on all platforms; the
-macOS-only shell follows as a vertical slice; feature completion and polish
-last. The core (switcher, usage store, locks, credentials) is untouched.
+Rebuild the panel's web layer to the graphite/ivory Pen redesign as three
+plain script files (icons / sheets / panel) over a token-seeded CSS, with
+two additive view-model changes (account.status, preserve-measured
+windows) and one reply-path bug fix. Bridge protocol, shells, and all
+core contracts unchanged. Pure layers land first (fully pytest-covered),
+then the web layer rises against the fixture browser, then states,
+accessibility, and a full verification sweep.
 
 ## Architecture Decisions
 
-- **Contract-first**: `viewmodel.py`'s additive JSON schema is the pivot
-  everything else consumes (panel.js renders it, bridge.py carries it).
-  Built and pinned by a key-snapshot test before any UI work.
-- **Old app preserved until replaced, not rewritten in place**: Task 1
-  converts `menubar.py` → `menubar/` package by moving the existing module
-  wholesale (re-exported), so the repo stays green at every commit; the
-  rumps glue is deleted only when the PyObjC shell replaces it (Task 4).
-- **Fail-fast on the one real unknown**: the riskiest piece is PyObjC
-  popover/WKWebView wiring. The shell lands early (Tasks 4-5) so the
-  approach is proven before polish investment; if it fails, a menu-only v2
-  from Task 4 still ships value and we reassess.
-- **Panel developed against fixtures**: `panel.js` runs standalone in a
-  browser with fixture data (`window.webkit` absent), so UI work is
-  parallel with shell work and independently verifiable.
-- **Vertical slices over layers**: each task leaves `cswap menubar` runnable
-  and the full pytest suite green.
+- **In-place web rewrite (no parallel v2 dir)** — the wire-contract tests
+  and fixture mode keep the single source honest; mid-sequence commits
+  may be briefly ugly (old JS against new CSS) but never broken: the
+  panel always loads and every bridge action keeps working.
+- **Contract-first again**: status vocabulary + preserve-measured windows
+  are pinned by view-model tests before any UI consumes them.
+- **Native `<dialog>`** for sheets (focus trap/Esc/restore from the
+  platform). Fallback guard if `showModal` is unavailable in an older
+  WKWebView.
+- **Fixture browser is the UI gate**: every web task verifies by pushing
+  synthetic view-models to the fixture page; light theme is derived and
+  human-reviewed at Checkpoint B.
 
 ## Task List
 
-(Details in `tasks/todo.md`.)
+### Phase 1: Pure layers (pytest-covered, no UI)
+- [ ] Task 1: `account.status` mapping + contract tests
+- [ ] Task 2: preserve-measured windows + pace gating + tests
+- [ ] Task 3: JS reply-adapter error fix + wire-contract regression test
 
-### Phase 1: Foundation — pure layers, fully testable
-- [x] Task 1: Convert `menubar.py` to `menubar/` package (pure re-export, zero behavior change)
-- [x] Task 2: `viewmodel.py` — move pure helpers, add `build()`, pin schema contract
-- [x] Task 3: Panel web v1 — fixture-mode rendering of the full view-model
+### Checkpoint A: pure layers
+- [ ] `uv run pytest` green; status vocabulary + no-fabricated-zero pinned
 
-### Checkpoint A: after Tasks 1-3
-- [x] `uv run pytest` green (existing + new viewmodel tests)
-- [x] `open src/claude_swap/menubar/web/index.html` renders fixture panel in browser
-- [x] Human review before shell work
+### Phase 2: Web layer (fixture-verified per task)
+- [ ] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
+- [ ] Task 5: `panel.js` core render — header, selector cards, identity, quotas
+- [ ] Task 6: `panel.js` completion — disclosure, actions, auto-switch, footer
+- [ ] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring
 
-### Phase 2: Shell — macOS vertical slice (fail-fast gate)
-- [x] Task 4: PyObjC status item + right-click menu + snapshot loop + osascript notifications; swap pyproject extra; delete rumps glue
-- [x] Task 5: Popover + WKWebView + bridge integration (live panel)
+### Checkpoint B: full panel in fixture + hosted
+- [ ] Both themes render the main artboard faithfully; sheets work; human review of derived light theme
 
-### Checkpoint B: after Tasks 4-5
-- [x] `uv run cswap menubar` shows panel with live data; right-click menu works
-- [x] `--install-service` / `--service-status` / `--uninstall-service` flow works
-- [x] Linux CI still green (no PyObjC imports leak)
-- [x] Human review — this is the go/no-go for the approach
-
-### Phase 3: Completion & polish
-- [x] Task 6: All panel actions end-to-end (switch/rotate/best/disable/enable/remove/add/auto-switch/prefs)
-- [x] Task 7: Stale, error, quarantine, and webview-failure states
-- [x] Task 8: Dark mode + CodexBar-class visual polish + README screenshot
-- [x] Task 9: Docs (README section, ARCHITECTURE.md §6.5/map) + macOS CI import smoke (ask-first)
+### Phase 3: States, accessibility, verification
+- [ ] Task 8: all artboard states, keyboard, reduced motion, icon fidelity
+- [ ] Task 9: verification sweep — vision gates, live run, README/screenshots refresh
 
 ### Checkpoint C: complete
-- [x] All SPEC.md success criteria met, Definition of Done satisfied
-- [x] Ready for `/review` and release
+- [ ] SPEC success criteria 1–7 verified; Definition of Done satisfied
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| PyObjC popover/WKWebView wiring unworkable in this env | High | Tasks 4-5 early (fail-fast); Task 4 alone still ships a better menu app; fallback documented |
-| WKWebView keyboard focus (token sheet input) | Med | Minimal input surface; test at Task 6; fallback = paste via right-click menu item |
-| PyObjC version floor wrong (open question in SPEC) | Med | Pin `>=10.0` initially; verify against CI runners at Task 9 |
-| Memory growth from WKWebView in always-on service | Med | launchd restart-on-crash already in place; monitor logs |
-| Moving ~400 lines of menubar.py helpers breaks hidden importers | Low | Re-export surface pinned by existing tests; grep repo for imports first |
+| Mid-sequence commits look unstyled (old JS, new CSS) | Low | Fixture verification per task; functionality never breaks |
+| `<dialog>`/`showModal` missing in older WKWebView | Med | Capability check + class-based fallback at Task 7 |
+| Derived light theme drifts from Pen intent | Med | Human review gate at Checkpoint B; token table + mirrored layout |
+| Icon fidelity vs Pen artboards (no exports shipped) | Low | Existing icon language baseline; judged at Task 8 fixture pass |
+| Preserve-measured changes pace tests subtly | Low | Pace-gating tests extended in Task 2, before UI consumes them |
 
 ## Open Questions
 
-- PyObjC minimum version (SPEC open question 1) — resolve at Task 9
-- README screenshot vs placeholder (SPEC open question 2) — Task 8 captures one if a populated store is available; else placeholder
+None blocking (see SPEC).

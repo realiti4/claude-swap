@@ -1,273 +1,202 @@
-# Tasks: Menubar v2 — CodexBar-class web panel
+# Tasks: Menubar redesign — Pen handoff
 
-Plan: `tasks/plan.md` · Spec: `SPEC.md`. Definition of Done
-(`references/definition-of-done.md` in agent-skills) applies to every task
-on top of its own acceptance criteria.
+Plan: `tasks/plan.md` · Spec: `SPEC.md` · Design:
+`docs/superpowers/specs/2026-09-12-menubar-redesign-design.md`.
+Definition of Done applies to every task on top of its own acceptance
+criteria.
 
-## Task 1: Convert `menubar.py` to `menubar/` package (pure re-export)
+## Task 1: `account.status` mapping + contract tests
 
-**Description:** Restructure without behavior change. Move the current
-module wholesale to `src/claude_swap/menubar/_legacy.py`; create
-`menubar/__init__.py` re-exporting the public surface (`run`,
-`framework_build_warning`, and every name `tests/test_menubar.py` /
-`tests/test_cli.py` / `cli.py` import — grep first). Delete `menubar.py`.
-Zero runtime behavior change.
+**Description:** Additive `status` field on view-model accounts, derived
+from the sentinel: `api key` → `"api-key"`, `re-login needed` →
+`"needs-login"`, `token expired`/`keychain unavailable`/foreign-credential
+→ `"unavailable"`, none → `"ok"`. `quarantined` remains emitted (wire
+compat) but the panel will key off `status`. Contract tests pin the
+vocabulary and every sentinel mapping.
 
 **Acceptance criteria:**
-- [x] `from claude_swap.menubar import run, framework_build_warning, ...` works for all existing importers (verified by grep + suite)
-- [x] `uv run cswap menubar` still launches the old rumps app (manual, if rumps installed)
-- [x] No public name removed (test_menubar.py untouched and green)
+- [ ] Each sentinel maps to its status; non-sentinel accounts emit `"ok"`
+- [ ] `status` added to ALLOWED/REQUIRED contract sets; vocabulary pinned
+- [ ] No existing field changed or removed (additive only)
 
 **Verification:**
-- [x] `uv run pytest` green (full suite, untouched tests)
+- [ ] `uv run pytest tests/test_menubar_viewmodel.py -x` green; full suite green
 
 **Dependencies:** None
-
-**Files likely touched:**
-- `src/claude_swap/menubar/__init__.py` (new)
-- `src/claude_swap/menubar/_legacy.py` (new, = old menubar.py)
-- `src/claude_swap/menubar.py` (deleted)
-
+**Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`
 **Estimated scope:** S
 
-## Task 2: `viewmodel.py` — pure helpers move + `build()` + schema contract
+## Task 2: preserve-measured windows + pace gating
 
-**Description:** Move the pure helpers out of `_legacy.py`
-(`format_title`, `usage_summary`, `format_account_label`,
-`_window_pct`, `_resets_at_ts`, `_live_countdown`,
-`_rolled_weekly_window`, `parse_switch_history`, `_adapt_snapshot`) into
-`viewmodel.py`; re-export from `__init__`. Add `build(snapshot,
-*, now=None) -> dict` producing the schemaVersion-1 additive view-model
-(SPEC §7): accounts with 5h/7d/model windows, spend, pace, freshness,
-quarantine from sentinel, autoSwitch block, history. Add
-`test_menubar_viewmodel.py` and a key-snapshot contract test.
+**Description:** Panel view-model stops zeroing rolled/passed windows:
+five-hour and weekly windows whose reset passed keep measured `pct`,
+`state: "stale"`, `countdownText: "Awaiting updated usage"`. Pace chip
+data is suppressed when the measurement is stale. Legacy helpers
+(`usage_summary`, `format_title`) untouched — CLI/TUI keep roll-to-zero.
 
 **Acceptance criteria:**
-- [x] `build()` handles: healthy accounts, api-key/sentinel accounts (quarantined + note, no bars), missing spend (field absent), stale usage (ageText, state), disabled/alias/active flags
-- [x] Additive contract: optional fields absent — never `null` — pinned by contract test
-- [x] countdownText baked for first paint + `resetsAt` epochs for local ticking
-- [x] Existing helper tests green via re-exports
+- [ ] Passed weekly AND five-hour windows keep measured pct + stale + awaiting text
+- [ ] Pace absent for stale accounts; present otherwise (existing tests stay green)
+- [ ] Legacy helper behavior unchanged (existing legacy tests prove it)
 
 **Verification:**
-- [x] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green
-- [x] `uv run pytest` full suite green
+- [ ] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green; full suite green
 
-**Dependencies:** Task 1
+**Dependencies:** Task 1 (same file)
+**Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`
+**Estimated scope:** S-M
 
-**Files likely touched:**
-- `src/claude_swap/menubar/viewmodel.py` (new)
-- `src/claude_swap/menubar/__init__.py`
-- `src/claude_swap/menubar/_legacy.py` (helpers removed)
-- `tests/test_menubar_viewmodel.py` (new)
+## Task 3: reply-adapter error fix + wire regression test
 
+**Description:** `panel.js`'s `cswap.reply` currently forwards
+`result.data` on failures, so toasts show a generic message; pass
+`result.error` through. Wire-contract test pins that the reply path
+preserves error text (source-level or behavioral).
+
+**Acceptance criteria:**
+- [ ] Reply path forwards `.error` on `ok:false` (source check in wire-contract tests)
+- [ ] Full suite green
+
+**Verification:**
+- [ ] `uv run pytest tests/test_menubar_wire_contract.py -x`; full suite green
+
+**Dependencies:** None
+**Files:** `src/claude_swap/menubar/web/panel.js`, `tests/test_menubar_wire_contract.py`
+**Estimated scope:** S
+
+## Checkpoint A: pure layers
+- [ ] Full suite green; status vocabulary and no-fabricated-zero pinned by tests
+
+## Task 4: token CSS foundation + icons + HTML skeletons
+
+**Description:** Rebuild `panel.css` from
+`assets/menubar-redesign-tokens.css` (`--swap-*` vars, graphite/ivory,
+`data-swap-theme` + `?theme=` override, reduced-motion, Inter/Plex-Mono
+fallbacks, 44/486/30 frame, tabular numerals). New `icons.js`
+(currentColor SVG factory: swap/refresh/gear/best/rotate/chevron/activity).
+`index.html`: load order (icons → sheets → panel), static `<dialog>`
+skeletons (token/remove/activity), CSP unchanged. Old panel.js keeps
+functioning against the new CSS (ugly but working).
+
+**Acceptance criteria:**
+- [ ] Fixture page loads with new tokens; both themes flip correctly via `?theme=`
+- [ ] `node --check` passes on icons.js; every icon renders via `icon("name")`
+- [ ] Old panel remains bridge-functional (fixture actions still log)
+
+**Verification:**
+- [ ] Browser: fixture renders (unstyled-ish), theme override works
+- [ ] `uv run pytest` green
+
+**Dependencies:** Task 3 (panel.js state)
+**Files:** `web/panel.css`, `web/icons.js`, `web/index.html`
 **Estimated scope:** M
 
-## Task 3: Panel web v1 — fixture-mode rendering
+## Task 5: panel.js core render
 
-**Description:** Build `web/index.html`, `web/panel.css`, `web/panel.js`
-(vanilla, no build step). Renders the full view-model per SPEC §8: header
-(active account, status pill, freshness, refresh button), account pills,
-selected-account card (5h/7d bars with live local countdown ticks, per-model
-rows, spend line, pace chip), actions row, auto-switch section, footer.
-Fixture mode: when `window.webkit` is absent, load an embedded fixture
-view-model and log actions to console. Both light/dark palettes via
-`prefers-color-scheme`.
+**Description:** Rewrite `panel.js` render to the main artboard: brand
+header (icon + wordmark + refresh + gear), account selector cards
+(selected = teal ring + dot; active/ready/disabled/needs-login subtitle),
+selected-identity row (alias ≥14px, full email, org, Active/Preview
+badge), primary quotas ("N% USED" + slim bar + countdown sub-line), and
+the state/pending plumbing for actions. Local countdown → "Awaiting
+updated usage" at zero.
 
 **Acceptance criteria:**
-- [x] Opening `index.html` in a browser renders the fixture panel with all sections
-- [x] Countdowns tick locally every 30s from `resetsAt` without a push
-- [x] Pills select cards without switching; action buttons emit calls (console in fixture mode)
-- [x] Light and dark palettes both readable (manual toggle via devtools)
-- [x] Bar thresholds: green <70, amber <90, red ≥90
+- [ ] Fixture with the spec's example data (Work 68%/41%, 84% model, $12.40/$100) matches the dark artboard's structure
+- [ ] Selected ≠ active visually and behaviorally (selection never switches)
+- [ ] Missing values render unavailable, never 0%; stale states render per Task 2
 
 **Verification:**
-- [x] Manual: `open src/claude_swap/menubar/web/index.html`
-- [x] Visual check against CodexBar reference screenshot
+- [ ] Browser fixture: DOM + visual check vs artboard; theme flip
+- [ ] `uv run pytest` green (wire contract: only registered actions)
 
-**Dependencies:** Task 2 (schema)
-
+**Dependencies:** Tasks 1, 2, 4
+**Files:** `web/panel.js`
 **Estimated scope:** M
 
-**Files likely touched:**
-- `src/claude_swap/menubar/web/index.html`, `panel.css`, `panel.js` (new)
+## Task 6: panel.js completion — disclosure, actions, auto-switch, footer
 
-## Checkpoint A: after Tasks 1-3
-
-- [x] `uv run pytest` green
-- [x] Fixture panel renders in browser
-- [x] Review with human before shell work
-
-## Task 4: PyObjC shell — status item, menu, loop, notifications; drop rumps
-
-**Description:** New `app.py`: NSStatusItem (SF Symbol
-`arrow.left.arrow.right`, `⇄` fallback; title pct via `format_title`),
-right-click NSMenu (best / rotate / refresh / auto-switch toggle /
-start-at-login / quit), NSTimer snapshot loop on `MenuBarSettings`
-interval → background-thread `accounts_snapshot()` → title update,
-osascript notifications for engine events, `AutoSwitchEngine` thread
-management, main-thread marshaling. `run()` dispatches to the new shell.
-Swap pyproject extra to `pyobjc-framework-Cocoa` + `pyobjc-framework-WebKit`,
-delete `_legacy.py` and `ensure_notification_identity`. Service flags
-unchanged.
+**Description:** Collapsed per-model + spend disclosure (`›`), full-width
+primary switch (pending/disabled states), half-width Best/Rotate with
+icons, iOS-style auto-switch toggle with persistent "at N% used ·
+strategy" summary, footer (freshness dot + age/stale note, Activity ›,
+Add account), overflow items under gear (disable/enable, remove…,
+settings).
 
 **Acceptance criteria:**
-- [x] `uv run cswap menubar` shows status item with live pct title; right-click menu fully functional (switch/rotate/refresh/auto-switch/quit)
-- [x] Auto-switch events produce osascript notifications
-- [x] `rumps` gone from pyproject and source; `grep -r rumps src/` empty
-- [x] Launchd flow works: `--install-service`, `--service-status`, `--uninstall-service`
-- [x] Linux import safety: `python -c "import claude_swap.menubar.viewmodel, claude_swap.menubar.bridge"` on Linux CI green (no AppKit import at module level)
+- [ ] Every bridge action reachable from the panel; pending blocks duplicates and keeps focus
+- [ ] Disclosure collapsed by default; spend/model subordinate
+- [ ] Auto-switch summary always visible; toggle reflects vm state immediately
 
 **Verification:**
-- [x] `uv run pytest` green
-- [x] Manual on macOS: run app, exercise every menu item, install+uninstall service
-
-**Dependencies:** Task 1 (package). Parallelizable with Tasks 2-3.
-
-**Files likely touched:**
-- `src/claude_swap/menubar/app.py` (new)
-- `src/claude_swap/menubar/__init__.py`
-- `src/claude_swap/menubar/_legacy.py` (deleted)
-- `pyproject.toml`
-- `tests/test_menubar_import_smoke.py` (new, macOS-gated import test)
-
-**Estimated scope:** M
-
-## Task 5: Popover + WKWebView + bridge integration
-
-**Description:** `bridge.py` (pure routing: action allowlist, payload
-validation, id/reply correlation, push serialization; unit-tested with a
-fake transport) + the popover wiring in `app.py`: left-click toggles
-NSPopover hosting WKWebView loading bundled `web/index.html`
-(`loadFileURL:allowingReadAccessTo:` package web dir, navigation
-elsewhere cancelled), `getSnapshot` on open, `cswap.push` view-model
-updates, `cswap.reply` for actions. Webview load failure → fallback
-notification, right-click menu still works.
-
-**Acceptance criteria:**
-- [x] Left-click opens panel showing live account data; click-outside closes; re-click reopens with fresh data
-- [x] Bridge: `uv run pytest tests/test_menubar_bridge.py` covers routing, correlation, allowlist rejection, error replies
-- [x] Webview loads bundled content only; external navigation cancelled
-- [x] Missing WebKit framework → clean error + menu-only operation
-
-**Verification:**
-- [x] `uv run pytest` green
-- [x] Manual: open/close panel repeatedly; verify bars/countdowns match `cswap list`
-
-**Dependencies:** Tasks 2, 3, 4
-
-**Files likely touched:**
-- `src/claude_swap/menubar/bridge.py` (new)
-- `src/claude_swap/menubar/app.py`
-- `tests/test_menubar_bridge.py` (new)
-
-**Estimated scope:** M
-
-## Checkpoint B: after Tasks 4-5 — go/no-go for the approach
-
-- [x] `uv run cswap menubar` runs with live panel + fallback menu
-- [x] Service flow intact; Linux CI green
-- [x] Human review before feature completion
-
-## Task 6: Panel actions end-to-end
-
-**Description:** Wire every SPEC §6 action through bridge → core on
-background threads with per-action UI feedback (button spinner →
-success toast / error toast): switch/rotate/best, disable/enable, remove
-(with in-panel confirm), addFromLogin, addFromToken (in-panel input
-sheet), setAutoSwitch, setPrefs (refresh interval, title pct), quit.
-Engine events push into the panel live.
-
-**Acceptance criteria:**
-- [x] Every action works against the real switcher with correct success/error feedback
-- [x] UI never blocks during actions (main thread stays responsive)
-- [x] Panel state stays consistent after every action (snapshot re-push)
-- [x] Auto-switch toggle starts/stops the engine; events appear in panel + notifications
-
-**Verification:**
-- [x] `uv run pytest` green (bridge tests extended for new handlers)
-- [x] Manual: exercise every action on macOS with a test account store
+- [ ] Browser fixture: click-through all controls; wire-contract green
+- [ ] `uv run pytest` green
 
 **Dependencies:** Task 5
-
-**Files likely touched:**
-- `src/claude_swap/menubar/app.py`, `bridge.py`
-- `src/claude_swap/menubar/web/panel.js`, `index.html`, `panel.css`
-
+**Files:** `web/panel.js`
 **Estimated scope:** M
 
-## Task 7: Stale, error, quarantine & failure states
+## Task 7: sheets.js — dialogs and wiring
 
-**Description:** Fetch failure → stale banner + age (stale-on-error);
-sentinel/quarantined cards with explainer + re-add actions; zero-account
-empty state with add-account CTA; allowlist rejection UX (toast, not
-crash); title keeps last-known pct on failure (parity with today).
+**Description:** Token sheet (concealed input, optional email, field
+errors, clears on close), remove confirmation (identity + consequence),
+activity sheet (switch history from `vm.history`), all native
+`<dialog>.showModal()` with Esc, focus trap/restore, plus a capability
+fallback if `showModal` is unavailable. Gear/footer buttons open sheets;
+submissions go through the existing bridge actions only.
 
 **Acceptance criteria:**
-- [x] Simulated fetch failure (network off) shows stale data + banner, no crash, title retains pct
-- [x] Quarantined account renders explainer card, not bars
-- [x] Zero-account state guides to add; removed account disappears cleanly while panel open
+- [ ] Three sheets open/close via keyboard and pointer; focus restored to trigger
+- [ ] Token field clears on close; empty/invalid token shows field error, never sends
+- [ ] Activity lists `vm.history` entries with timestamps
 
 **Verification:**
-- [x] `uv run pytest` green; viewmodel tests cover stale/error fixtures
-- [x] Manual: airplane-mode refresh; quarantine fixture in browser fixture mode
+- [ ] Browser fixture: Tab/Esc walk through each sheet; wire-contract green
+- [ ] `uv run pytest` green
 
-**Dependencies:** Task 6
+**Dependencies:** Tasks 4, 6
+**Files:** `web/sheets.js`, `web/panel.js` (wiring)
+**Estimated scope:** M
 
-**Files likely touched:**
-- `src/claude_swap/menubar/viewmodel.py`, `web/panel.js`, `web/panel.css`
+## Checkpoint B: full panel in fixture + hosted
+- [ ] Both themes faithful to the artboards; sheets work; **human review of derived light theme**
 
+## Task 8: states, keyboard, reduced motion, icon fidelity
+
+**Description:** All eight artboard states in fixture (healthy,
+preview-selected, stale/offline, api-key, needs-login, empty roster, long
+identities, many accounts), full keyboard operation, reduced-motion
+verification, icon fidelity pass against the artboard.
+
+**Acceptance criteria:**
+- [ ] Every state renders per spec rules (text+icon status, honest stale, empty CTA)
+- [ ] Tab order sensible; Enter/Esc operate sheets; focus visible
+- [ ] Reduced-motion honored (no essential animation)
+
+**Verification:**
+- [ ] Browser fixture with synthetic vms for each state; visual review
+
+**Dependencies:** Task 7
+**Files:** `web/*` as needed
+**Estimated scope:** M
+
+## Task 9: verification sweep + docs
+
+**Description:** Vision-gated screenshots (dark + derived light) at final
+rendering, live hosted app run (real snapshot, popover opens, right-click
+menu intact), README screenshot refresh + copy tweak, full suite.
+
+**Acceptance criteria:**
+- [ ] Screenshots pass vision gate both themes; README shows the redesign
+- [ ] Live app clean run; right-click fallback untouched and working
+- [ ] `uv run pytest` fully green
+
+**Verification:**
+- [ ] Browser + live app + suite; SPEC success criteria 1–7 walked
+
+**Dependencies:** Task 8
+**Files:** `assets/menubar-panel-*.png`, `README.md`
 **Estimated scope:** S-M
-
-## Task 8: Dark mode + CodexBar-class polish + screenshot
-
-**Description:** Visual pass against the CodexBar reference: typography
-scale, spacing rhythm, pill states, bar animations, status pill, toast
-design, focus states for the token sheet, both palettes. Capture a README
-screenshot (populated store) or confirm placeholder decision.
-
-**Acceptance criteria:**
-- [x] Side-by-side with CodexBar reference: flat cards, clean hierarchy, no default-browser look
-- [x] Dark/light both pass contrast on every state (bars, pills, toasts)
-- [x] Screenshot captured (or placeholder decision recorded)
-
-**Verification:**
-- [x] Manual visual review; human sign-off on aesthetics
-
-**Dependencies:** Task 6
-
-**Files likely touched:**
-- `src/claude_swap/menubar/web/panel.css`, `panel.js`
-- `README.md` (screenshot embed point)
-
-**Estimated scope:** S-M
-
-## Task 9: Docs + macOS CI import smoke
-
-**Description:** Rewrite README "Menu bar (macOS)" section (panel
-description, screenshot, unchanged install/service commands). Update
-`docs/ARCHITECTURE.md` directory map + §6.5. Add macOS-only import smoke
-(install menubar extra in macOS CI job, import `app.py` headless — no
-NSApplication). CI changes are ask-first: present the workflow diff before
-pushing.
-
-**Acceptance criteria:**
-- [x] README section matches shipped behavior; ARCHITECTURE.md accurate to the new layout
-- [x] macOS CI installs the extra and the import smoke passes; Linux jobs untouched
-- [x] Human approved the CI diff (ask-first boundary)
-
-**Verification:**
-- [x] `uv run pytest` green; CI green on all three platforms
-
-**Dependencies:** Task 5 (docs can trail shell completion)
-
-**Files likely touched:**
-- `README.md`, `docs/ARCHITECTURE.md`
-- `.github/workflows/ci.yml` (after approval)
-
-**Estimated scope:** S
 
 ## Checkpoint C: complete
-
-- [x] All SPEC.md success criteria (1-8) verified
-- [x] Definition of Done checklist satisfied
-- [x] Ready for `/review` → `/ship`
+- [ ] SPEC success criteria 1–7 verified; Definition of Done satisfied
