@@ -31,13 +31,16 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.menubar.bridge import Bridge
 from claude_swap.menubar.viewmodel import (
     EMPTY_SNAPSHOT,
     _adapt_snapshot,
     _usage_log_key,
+    build,
     format_account_label,
     format_title,
     format_usage_log,
+    parse_switch_history,
 )
 
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -197,11 +200,12 @@ def run(switcher) -> int:
     """Run the menu bar app on the AppKit main loop; returns an exit code."""
     try:
         import AppKit  # noqa: F401
+        import WebKit  # noqa: F401
     except ImportError as e:
         # A missing extra — the failure lands here at call time. Raise the
         # error type the CLI already renders cleanly instead of a traceback.
         raise ClaudeSwitchError(
-            "Menu bar mode requires PyObjC (pyobjc-framework-Cocoa). "
+            "Menu bar mode requires PyObjC (pyobjc-framework-Cocoa/-WebKit). "
             "Install with: pip install 'claude-swap[menubar]'"
         ) from e
 
@@ -212,6 +216,7 @@ def run(switcher) -> int:
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
+    log_path = switcher.backup_dir / "claude-swap.log"
 
     class MenuBarShell:
         """Owns the status item, menu, timers, and engine thread."""
@@ -234,7 +239,10 @@ def run(switcher) -> int:
             self._event_lock = threading.Lock()
             self._callbacks: dict[int, callable] = {}  # tag -> handler (keeps refs)
             self._next_tag = 1
+            self._vm: dict | None = None
+            self._menu = None
             self._install_status_item()
+            self._install_panel()
             self.rebuild_menu()
             self._refresh_timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
                 self.settings.refresh_interval,
@@ -259,6 +267,7 @@ def run(switcher) -> int:
         # ---- status item + target ------------------------------------------
 
         def _install_status_item(self) -> None:
+            self._target = self._make_target()
             self._status_item = AppKit.NSStatusBar.systemStatusBar(
             ).statusItemWithLength_(AppKit.NSVariableStatusItemLength)
             button = self._status_item.button()
@@ -269,11 +278,9 @@ def run(switcher) -> int:
                 image.setTemplate_(True)
                 button.cell().setImage_(image)
             button.setToolTip_("claude-swap")
+            button.setTarget_(self._target)
+            button.setAction_("onStatusClick:")
             self._button = button
-
-            # One NSObject target bridging every menu/timer action to Python.
-            Target = AppKit.NSObject  # subclassed lazily; see _make_target
-            self._target = self._make_target()
 
         def _make_target(self):
             shell = self
@@ -290,6 +297,30 @@ def run(switcher) -> int:
                     cb = shell._callbacks.get(tag)
                     if cb is not None:
                         cb()
+
+                def onStatusClick_(self, _sender):
+                    shell.on_status_click()
+
+                # WKScriptMessageHandler: the panel's only inbound channel.
+                def userContentController_didReceiveScriptMessage_(
+                    self, _ucc, message
+                ):
+                    body = message.body()
+                    if isinstance(body, str):
+                        shell.handle_webview_message(body)
+
+                # Navigation lockdown: the bundled file load is allowed;
+                # everything else (redirects, drag-navigation) is cancelled.
+                def webView_decidePolicyForNavigationAction_decisionHandler_(
+                    self, _webview, navigationAction, handler
+                ):
+                    url = navigationAction.request().URL()
+                    allowed = (
+                        url is not None
+                        and url.isFileURL()
+                        and str(url.path()).startswith(str(shell.web_dir))
+                    )
+                    handler(1 if allowed else 0)  # Allow / Cancel
 
             return ShellTarget.new()
 
@@ -389,7 +420,187 @@ def run(switcher) -> int:
             menu.addItem_(st_item)
             menu.addItem_(self._menu_item("Refresh now", cb=self.on_refresh_now))
             menu.addItem_(self._menu_item("Quit", cb=self.on_quit))
-            self._status_item.setMenu_(menu)
+            menu.setAutoenablesItems_(False)
+            self._menu = menu
+
+        # ---- popover panel ----------------------------------------------------
+
+        def _install_panel(self) -> None:
+            web_dir = Path(__file__).resolve().parent / "web"
+            self.web_dir = web_dir
+            config = WebKit.WKWebViewConfiguration.new()
+            config.userContentController().addScriptMessageHandler_name_(
+                self._target, "cswap"
+            )
+            self._webview = WebKit.WKWebView.alloc().initWithFrame_configuration_(
+                ((0.0, 0.0), (360.0, 560.0)), config
+            )
+            self._webview.setNavigationDelegate_(self._target)
+            controller = AppKit.NSViewController.alloc().init()
+            controller.setView_(self._webview)
+            self._popover = AppKit.NSPopover.alloc().init()
+            self._popover.setContentViewController_(controller)
+            self._popover.setContentSize_((360.0, 560.0))
+            self._popover.setBehavior_(AppKit.NSPopoverBehaviorTransient)
+            self._popover.setAppearance_(None)  # follow system light/dark
+            self._bridge = Bridge(
+                self._panel_handlers(),
+                send_js=self._send_js,
+                payload_specs={
+                    "switch": {"required": {"slot": str}},
+                    "disable": {"required": {"slot": str}},
+                    "enable": {"required": {"slot": str}},
+                    "remove": {"required": {"slot": str}},
+                    "addFromToken": {"required": {"token": str},
+                                     "optional": {"email": str}},
+                    "setAutoSwitch": {"required": {"enabled": bool}},
+                    "setPrefs": {"optional": {"refreshInterval": int,
+                                              "titlePct": str}},
+                },
+            )
+            self._webview.loadFileURL_allowingReadAccessToURL_(
+                AppKit.NSURL.fileURLWithPath_(str(web_dir / "index.html")),
+                AppKit.NSURL.fileURLWithPath_(str(web_dir)),
+            )
+
+        def _panel_handlers(self) -> dict:
+            sw = self.switcher
+
+            def do_switch(payload):
+                target = str(payload["slot"])
+                sw.switch_to(target)
+                self.refresh_async()
+                return {"switchedTo": target}
+
+            def do_strategy(strategy):
+                def handler(payload):
+                    sw.switch(strategy=strategy)
+                    self.refresh_async()
+                    return {"switched": True}
+                return handler
+
+            return {
+                "getSnapshot": lambda payload: self.current_vm(),
+                "refresh": lambda payload: (self.current_vm(full=True), self.push_vm())[1] or {},
+                "switch": do_switch,
+                "rotate": do_strategy(None),
+                "best": do_strategy("best"),
+                "disable": lambda payload: (
+                    sw.set_account_disabled(str(payload["slot"]), True),
+                    self.refresh_async(),
+                )[1] or {},
+                "enable": lambda payload: (
+                    sw.set_account_disabled(str(payload["slot"]), False),
+                    self.refresh_async(),
+                )[1] or {},
+                "remove": lambda payload: (
+                    sw.remove_account(str(payload["slot"]), assume_yes=True),
+                    self.refresh_async(),
+                )[1] or {},
+                "addFromLogin": lambda payload: (
+                    sw.add_account(slot=None), self.refresh_async(),
+                )[1] or {},
+                "addFromToken": self._add_from_token,
+                "setAutoSwitch": lambda payload: (
+                    AppHelper.callAfter(self._set_auto, payload["enabled"]),
+                )[0] or {"scheduled": True},
+                "setPrefs": self._set_prefs,
+                "quit": lambda payload: (
+                    AppHelper.callAfter(self.on_quit),
+                )[0] or {"scheduled": True},
+            }
+
+        def _add_from_token(self, payload):
+            if not hasattr(self.switcher, "add_account_from_token"):
+                raise ClaudeSwitchError("adding from a setup token is not supported")
+            self.switcher.add_account_from_token(
+                token=payload["token"], email=payload.get("email") or "", slot=None,
+            )
+            self.refresh_async()
+            return {"added": True}
+
+        def _set_auto(self, enabled: bool) -> None:
+            # Main thread: touches engine threads, settings, and the menu.
+            if self.settings.auto_switch_enabled != enabled:
+                self.on_toggle_autoswitch()
+            self.rebuild_menu()
+
+        def _set_prefs(self, payload):
+            interval = payload.get("refreshInterval")
+            title_pct = payload.get("titlePct")
+            if interval is not None and interval not in REFRESH_CHOICES:
+                raise ClaudeSwitchError(f"refresh interval must be one of {REFRESH_CHOICES}")
+            if title_pct is not None and title_pct not in TITLE_PCT_CHOICES:
+                raise ClaudeSwitchError(f"title percentage must be one of {TITLE_PCT_CHOICES}")
+
+            def apply():
+                if interval is not None:
+                    self.settings.refresh_interval = interval
+                    self._refresh_timer.setFireDate_(
+                        AppKit.NSDate.dateWithTimeIntervalSinceNow_(interval)
+                    )
+                if title_pct is not None:
+                    self.settings.title_pct = title_pct
+                self.settings.save(settings_path)
+                self.rebuild_menu()
+            AppHelper.callAfter(apply)
+            return {"saved": True}
+
+        def handle_webview_message(self, raw: str) -> None:
+            self._bridge.handle_message(raw)
+
+        def _send_js(self, js: str) -> None:
+            # evaluateJavaScript must run on the main thread.
+            AppHelper.callAfter(
+                lambda: self._webview.evaluateJavaScript_completionHandler_(js, None)
+            )
+
+        def push_vm(self) -> None:
+            if self._vm is not None:
+                self._bridge.push("vm", self._vm)
+
+        def _history(self) -> list[str]:
+            try:
+                return parse_switch_history(log_path.read_text(encoding="utf-8"))
+            except OSError:
+                return []
+
+        def current_vm(self, full: bool = False) -> dict:
+            """Take a paced snapshot (blocking — bridge thread) and build the vm."""
+            raw = self._snapshot_source.take(
+                full=full, store_only=self._engine is not None
+            )
+            self.snapshot = _adapt_snapshot(raw)
+            self._log_usage(self.snapshot)
+            core = load_settings(self.switcher.backup_dir)
+            self._vm = build(
+                raw,
+                auto_enabled=self.settings.auto_switch_enabled,
+                auto_threshold=core.threshold,
+                auto_strategy=core.strategy,
+                history=self._history(),
+            )
+            self._dirty = True
+            return self._vm
+
+        def on_status_click(self) -> None:
+            ev = AppKit.NSApplication.sharedApplication().currentEvent()
+            if ev is not None and ev.type() in (
+                AppKit.NSEventTypeRightMouseUp, AppKit.NSEventTypeRightMouseDown,
+            ):
+                if self._menu is not None:
+                    self._menu.popUpMenuPositioningItem_atLocation_inView_(
+                        None, (0.0, 0.0), self._button
+                    )
+                return
+            if self._popover.isVisible():
+                self._popover.performClose_(None)
+                return
+            self.push_vm()  # instant paint from the last vm before freshening
+            self._popover.show_relativeTo_of_preferredEdge_(
+                self._button.bounds(), self._button, 3  # NSMaxYEdge: below the item
+            )
+            self.refresh_async()
 
         def _save_and_rebuild(self) -> None:
             self.settings.save(settings_path)
@@ -511,17 +722,12 @@ def run(switcher) -> int:
             # store-only.
             try:
                 try:
-                    raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
-                    )
+                    self.current_vm(full=full)
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
-                    return
-                snap = _adapt_snapshot(raw)
-                self._log_usage(snap)
-                self.snapshot = snap
-                self._dirty = True  # picked up by the sync tick on the main thread
+                else:
+                    self._dirty = True  # picked up by the sync tick on the main thread
             finally:
                 self._refreshing = False
 
@@ -539,6 +745,8 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
+                if self._popover.isVisible():
+                    self.push_vm()
             self._detect_active_change()
             self._drain_engine_events()
 
@@ -600,9 +808,20 @@ def run(switcher) -> int:
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             for ev in events:
+                human = ev.human()
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    notify("Auto-switched account", ev.human())
+                    notify("Auto-switched account", human)
+                    self._bridge.push("engine", {"event": "switched", "text": human})
                     self.refresh_async()
+                elif ev.kind == "account-quarantined":
+                    notify("Account quarantined", human)
+                    self._bridge.push("engine", {"event": "quarantined", "text": human})
+                elif ev.kind == "all-exhausted":
+                    notify("All accounts exhausted", human)
+                    self._bridge.push("engine", {"event": "exhausted", "text": human})
+                elif ev.kind == "config-warning":
+                    notify("Configuration warning", human)
+                    self._bridge.push("engine", {"event": "warning", "text": human})
                 elif ev.kind == "account-quarantined":
                     notify("Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":

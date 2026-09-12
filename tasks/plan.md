@@ -45,8 +45,8 @@ last. The core (switcher, usage store, locks, credentials) is untouched.
 - [ ] Human review before shell work
 
 ### Phase 2: Shell — macOS vertical slice (fail-fast gate)
-- [ ] Task 4: PyObjC status item + right-click menu + snapshot loop + osascript notifications; swap pyproject extra; delete rumps glue
-- [ ] Task 5: Popover + WKWebView + bridge integration (live panel)
+- [x] Task 4: PyObjC status item + right-click menu + snapshot loop + osascript notifications; swap pyproject extra; delete rumps glue
+- [x] Task 5: Popover + WKWebView + bridge integration (live panel)
 
 ### Checkpoint B: after Tasks 4-5
 - [ ] `uv run cswap menubar` shows panel with live data; right-click menu works

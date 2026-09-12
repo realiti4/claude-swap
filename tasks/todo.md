@@ -111,15 +111,15 @@ delete `_legacy.py` and `ensure_notification_identity`. Service flags
 unchanged.
 
 **Acceptance criteria:**
-- [ ] `uv run cswap menubar` shows status item with live pct title; right-click menu fully functional (switch/rotate/refresh/auto-switch/quit)
-- [ ] Auto-switch events produce osascript notifications
-- [ ] `rumps` gone from pyproject and source; `grep -r rumps src/` empty
-- [ ] Launchd flow works: `--install-service`, `--service-status`, `--uninstall-service`
-- [ ] Linux import safety: `python -c "import claude_swap.menubar.viewmodel, claude_swap.menubar.bridge"` on Linux CI green (no AppKit import at module level)
+- [x] `uv run cswap menubar` shows status item with live pct title; right-click menu fully functional (switch/rotate/refresh/auto-switch/quit)
+- [x] Auto-switch events produce osascript notifications
+- [x] `rumps` gone from pyproject and source; `grep -r rumps src/` empty
+- [x] Launchd flow works: `--install-service`, `--service-status`, `--uninstall-service`
+- [x] Linux import safety: `python -c "import claude_swap.menubar.viewmodel, claude_swap.menubar.bridge"` on Linux CI green (no AppKit import at module level)
 
 **Verification:**
-- [ ] `uv run pytest` green
-- [ ] Manual on macOS: run app, exercise every menu item, install+uninstall service
+- [x] `uv run pytest` green
+- [x] Manual on macOS: run app, exercise every menu item, install+uninstall service
 
 **Dependencies:** Task 1 (package). Parallelizable with Tasks 2-3.
 
@@ -144,14 +144,14 @@ updates, `cswap.reply` for actions. Webview load failure → fallback
 notification, right-click menu still works.
 
 **Acceptance criteria:**
-- [ ] Left-click opens panel showing live account data; click-outside closes; re-click reopens with fresh data
-- [ ] Bridge: `uv run pytest tests/test_menubar_bridge.py` covers routing, correlation, allowlist rejection, error replies
-- [ ] Webview loads bundled content only; external navigation cancelled
-- [ ] Missing WebKit framework → clean error + menu-only operation
+- [x] Left-click opens panel showing live account data; click-outside closes; re-click reopens with fresh data
+- [x] Bridge: `uv run pytest tests/test_menubar_bridge.py` covers routing, correlation, allowlist rejection, error replies
+- [x] Webview loads bundled content only; external navigation cancelled
+- [x] Missing WebKit framework → clean error + menu-only operation
 
 **Verification:**
-- [ ] `uv run pytest` green
-- [ ] Manual: open/close panel repeatedly; verify bars/countdowns match `cswap list`
+- [x] `uv run pytest` green
+- [x] Manual: open/close panel repeatedly; verify bars/countdowns match `cswap list`
 
 **Dependencies:** Tasks 2, 3, 4
 
@@ -164,9 +164,9 @@ notification, right-click menu still works.
 
 ## Checkpoint B: after Tasks 4-5 — go/no-go for the approach
 
-- [ ] `uv run cswap menubar` runs with live panel + fallback menu
-- [ ] Service flow intact; Linux CI green
-- [ ] Human review before feature completion
+- [x] `uv run cswap menubar` runs with live panel + fallback menu
+- [x] Service flow intact; Linux CI green
+- [x] Human review before feature completion
 
 ## Task 6: Panel actions end-to-end
 
