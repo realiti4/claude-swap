@@ -236,8 +236,8 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
 ## Menu bar (macOS)
 
-<details>
-<summary>Optional macOS menu bar app — usage at a glance, click to switch</summary>
+<details open>
+<summary>Optional macOS menu bar app — a visual usage panel, one click to switch</summary>
 
 Needs the `menubar` extra (macOS only):
 
@@ -246,9 +246,29 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+**Left-click the ⇄ status item** for the panel: every account as a card
+with 5h / 7d / per-model utilization bars, live reset countdowns, spend,
+and ahead-of-pace markers. Switch (specific / rotate / best), hold an
+account out of rotation, remove, and add accounts — from the current
+login or a setup token — without touching a terminal. The panel follows
+the system's light/dark appearance, marks stale data when a fetch fails,
+and explains quarantined accounts instead of guessing. **Right-click**
+keeps a classic menu with the same actions as a fallback.
 
-**Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash, no `.app` bundle:
+<p>
+  <img src="assets/menubar-panel-light.png" width="384" alt="menu bar panel, light appearance">
+  <img src="assets/menubar-panel-dark.png" width="384" alt="menu bar panel, dark appearance">
+</p>
+
+Enable *Auto-switch* in the panel (or the right-click menu) to run the
+same engine as [`cswap auto`](#automatic-switching) in the background; it
+shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync.
+Off until you turn it on.
+
+**Keep it running without a terminal.** `cswap menubar` runs in the
+foreground, so the status item dies with the terminal that started it and
+does not come back after a reboot. `--install-service` hands it to
+launchd instead — starts at login, restarts on crash, no `.app` bundle:
 
 ```bash
 cswap menubar --install-service     # start now, and at every login
@@ -256,7 +276,15 @@ cswap menubar --service-status      # installed? loaded? pid?
 cswap menubar --uninstall-service   # stop it and remove the plist
 ```
 
-The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to `~/Library/Logs/com.cswap.menubar.{log,err}`. It pins the `cswap` console script, whose path survives an upgrade — but the running process keeps the old build until it restarts, so after `cswap upgrade` either re-run `--install-service` or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`.
+The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and
+logs to `~/Library/Logs/com.cswap.menubar.{log,err}`. It pins the `cswap`
+console script, whose path survives an upgrade — but the running process
+keeps the old build until it restarts, so after `cswap upgrade` either
+re-run `--install-service` or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`.
+
+> Upgrading from ≤0.27? The menubar extra changed from `rumps` to
+> PyObjC — reinstall with `uv tool install --force 'claude-swap[menubar]'`
+> (or the pipx equivalent) so the new dependencies are pulled in.
 
 </details>
 

@@ -45,7 +45,7 @@ Think of claude-swap as three concentric layers:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Frontends (thin, interchangeable)                               │
-│  cli.py  ·  tui/*.py  ·  menubar.py                               │
+│  cli.py  ·  tui/*.py  ·  menubar/ (PyObjC + web panel)           │
 │  — parse input, call the core, render output                     │
 ├─────────────────────────────────────────────────────────────────┤
 │  Core orchestration                                               │
@@ -483,7 +483,7 @@ adaptive cadence or they'll collectively trip it.
   never from a UI event loop, since it does file locks, Keychain
   subprocesses, and network I/O.
 
-### 6.5 TUI & menu bar (`tui/*.py`, `menubar.py`, `appearance.py`, `settings.py`, `launch_agent.py`)
+### 6.5 TUI & menu bar (`tui/*.py`, `menubar/`, `appearance.py`, `settings.py`, `launch_agent.py`)
 
 Both are thin frontends over the same core. The TUI (`tui/app.py`'s
 `CswapApp`) polls on a `set_interval` timer, running fetches in a Textual
@@ -492,12 +492,21 @@ thread itself never touches locks or the network. Mutating actions
 (switch/add/remove/disable) go through the same `_start_action` →
 background-thread → `call_from_thread` pattern, so the UI never blocks.
 
-The menu bar (`menubar.py`, uses `rumps`) mirrors this with `rumps.Timer`s
-instead of Textual's event loop, and — notably — when you enable "Auto-switch
-accounts" in its Settings menu, it constructs a real `AutoSwitchEngine` and
-runs `engine.run_loop()` in a background thread. It is not a separate
-reimplementation of the policy; it's the identical class `cswap auto` uses,
-reading and writing the identical `settings.json`/`autoswitch_state.json`.
+The menu bar (`menubar/`) is a PyObjC shell (the `menubar` extra installs
+`pyobjc-framework-Cocoa`/`-WebKit`; the old `rumps` dependency is gone, and
+notifications go through `osascript display notification` so no app-bundle
+plist hacks are needed). Left-click opens an `NSPopover` hosting a
+`WKWebView` that renders the bundled `web/` panel — a vanilla-JS client of
+the additive view-model built by `viewmodel.py` — and right-click keeps a
+classic `NSMenu` fallback. The webview talks to Python only through
+`bridge.py`'s allowlisted, payload-validated `{id, action, payload}`
+messages, and navigation is locked to the package's own `web/` directory.
+Snapshot refresh uses `NSTimer`s plus the same lock-free
+worker→main-thread-handoff pattern as the TUI, and when you enable
+auto-switch it constructs a real `AutoSwitchEngine` and runs
+`engine.run_loop()` in a background thread — the identical class
+`cswap auto` uses, reading and writing the identical
+`settings.json`/`autoswitch_state.json`.
 
 `settings.py` centers on one table, `SETTING_SPECS`
 (`settings.py:102`) — every `cswap config` key's section, JSON name, type,
