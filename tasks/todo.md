@@ -69,7 +69,7 @@ criteria.
   - Files: index.html (or panel.js), icons.js, tests
   - Dependencies: none
 
-- [ ] Task 8: Native template icon + packaged assets
+- [x] Task 8: Native template icon + packaged assets
   - Acceptance: icon-template.pdf/-18/-36.png copied into src/claude_swap/menubar/assets/; status item uses template NSImage (18×18pt nominal, setTemplate_) replacing the SF Symbol, with PNG fallback if the PDF fails to load; accessibility description "Claude Code Swap"; title-percentage text feature unchanged; packaging test asserts the assets ship in the built wheel
   - Verify: packaging test; native run — icon at 1x/2x in light/dark menubar with selection rendering, no boxed background, no stray color
   - Files: src/claude_swap/menubar/assets/* (new), app.py, tests

@@ -46,6 +46,9 @@ from claude_swap.menubar.viewmodel import (
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+# Native icon files ship inside the installed package (wheel/uv tool),
+# never read from the repo's assets/ design folder at runtime.
+_PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 THEME_CHOICES: tuple[str, ...] = ("system", "light", "dark")
 
 
@@ -294,13 +297,10 @@ def run(switcher) -> int:
             self._status_item = AppKit.NSStatusBar.systemStatusBar(
             ).statusItemWithLength_(AppKit.NSVariableStatusItemLength)
             button = self._status_item.button()
-            image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                "arrow.left.arrow.right", "claude-swap"
-            )
+            image = self._status_image()
             if image is not None:
-                image.setTemplate_(True)
                 button.cell().setImage_(image)
-            button.setToolTip_("claude-swap")
+            button.setToolTip_("Claude Code Swap")
             button.setTarget_(self._target)
             button.setAction_("onStatusClick:")
             # The default action mask is left-mouse-only; without right-mouse
@@ -310,6 +310,32 @@ def run(switcher) -> int:
                 AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp
             )
             self._button = button
+
+        def _status_image(self):
+            """Interlock template mark for the status item, 18×18pt nominal.
+
+            Vector PDF first; the 2x PNG (36px shown at 18pt) is the raster
+            fallback when a build won't load the PDF. Template rendering lets
+            macOS tint the glyph for light/dark menubars and the selected
+            state — no color of our own ships in the status bar.
+            """
+            for name, size in (
+                ("icon-template.pdf", None),
+                ("icon-template-36.png", 18.0),
+                ("icon-template-18.png", 18.0),
+            ):
+                path = _PACKAGE_ASSETS / name
+                if not path.is_file():
+                    continue
+                image = AppKit.NSImage.alloc().initWithContentsOfFile_(str(path))
+                if image is None:
+                    continue
+                if size is not None:
+                    image.setSize_((size, size))
+                image.setTemplate_(True)
+                image.setAccessibilityDescription_("Claude Code Swap")
+                return image
+            return None
 
         def _make_target(self):
             shell = self
