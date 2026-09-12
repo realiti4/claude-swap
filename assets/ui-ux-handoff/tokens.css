@@ -7,7 +7,7 @@
   --swap-panel-height: 560px;
   --swap-header-height: 44px;
   --swap-footer-height: 30px;
-  --swap-body-height: 486px;
+  /* Body height flexes with the viewport; no fixed body-height token. */
   --swap-radius-panel: 14px;
   --swap-radius-card: 12px;
   --swap-radius-control: 8px;
@@ -16,7 +16,7 @@
   --swap-font-ui: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
   --swap-font-numeric: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
   --swap-text-secondary-size: 12px;
-  --swap-text-identity-size: 14px;
+  --swap-text-identity-size: 12px;
 }
 [data-swap-theme="dark"] {
   color-scheme: dark;

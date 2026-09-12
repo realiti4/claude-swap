@@ -1,18 +1,18 @@
 {
-  "title": "Claude Code Swap \u2014 final UI/UX handoff",
+  "title": "Claude Code Swap \u2014 product-aligned baseline and planned timelines",
   "design_source": "../untitled.pen",
   "design_source_note": "Editable source verified in Pen; not parsed or hashed by filesystem tools.",
   "screen_count": 15,
   "assets": [
     {
       "path": "HANDOFF.md",
-      "bytes": 15627,
-      "sha256": "ddc35b815dfa9b375be22f0e07085802a57f78b5fe008497834dbba42aa00437"
+      "bytes": 16542,
+      "sha256": "10fa2f5d57d8baee131a35b2111997650541d4cda8f7e8018dd7a54ac279f4e8"
     },
     {
       "path": "START-HERE.md",
-      "bytes": 1141,
-      "sha256": "46462acf2e6aa6c420c4657d06f75488ba9a60b317b0228c5c0a0895e5d87436"
+      "bytes": 2294,
+      "sha256": "b5032e1b1d1d5bbbff9d2d2403576d0f430594f0c0bf91b642dd4ee4e1eccc1e"
     },
     {
       "path": "icons/icon-master-256.png",
@@ -60,80 +60,80 @@
     },
     {
       "path": "screens/01-main-dark.png",
-      "bytes": 30389,
-      "sha256": "ce4081ace92b3c5f090de7b3b19228f9071274125b0f21131d5e28c0986700a1",
+      "bytes": 34486,
+      "sha256": "036b94937f8e15753f1001ba54aa7c95c6f362e7cfa80354515bac6ee48fe9e5",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/02-main-light.png",
-      "bytes": 30540,
-      "sha256": "14682aca6326014cb79bffccc5e64bae27cecf963cbc49220a98aba6fba6daf3",
+      "bytes": 34518,
+      "sha256": "5a504065a20e1a2c0ff57973e88e744e1114eeb4a92b8e78a880855027d48799",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/03-account-preview.png",
-      "bytes": 31672,
-      "sha256": "383bc56975fda745c5403cc785bfd9c61dc580c7c4b3766c8814391df4a25de7",
+      "bytes": 37887,
+      "sha256": "e0c7db68e450bd01c4699e951cf90ca8c13be2bb8c49d841e0da2b96e51bff93",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/04-stale-offline.png",
-      "bytes": 33018,
-      "sha256": "4de591c7368f4527394a6f7c9e2f61ccd0ae28d0d094ebf3f81e50485bb08ded",
+      "bytes": 37688,
+      "sha256": "1fa70381a2966e418a0ab040f72f65fa539b2bb0e0de906e28896ee4bbe55175",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/05-no-accounts.png",
-      "bytes": 23607,
-      "sha256": "c6f0e59f630f98fdc621b520b9f6284e2999f026bcacc675f8ded76ee2664945",
+      "bytes": 23708,
+      "sha256": "8cc920fdb7201b1a90a18b9909f4fba468f736efbd7d408f4488e2b3c108e813",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/06-add-token.png",
-      "bytes": 33608,
-      "sha256": "13686d5035562bcfa3d3faf350498ad21657b7570dcf27a2281234744715d753",
+      "bytes": 33986,
+      "sha256": "c4d4ee981b0d5005113289d5dfc08bb812c47e0dc6f5ef2b88cf06ec5509ac0d",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/07-remove-account.png",
-      "bytes": 41033,
-      "sha256": "0da72aa75f423d7bd7200e15e51ec68435088286bbf71fe3f340805afaa04b62",
+      "bytes": 42572,
+      "sha256": "922b43f1475f4225fc36951fa5bf6713df40c57c126b24c34d8aabd876e9dc97",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/08-tokens-notes.png",
-      "bytes": 436978,
-      "sha256": "0dec6542837e04a91646a605fc36ba7628b576fef43d992e4f0ef3d0175ac2ec",
+      "bytes": 461489,
+      "sha256": "1a229a75ee1c00ee0535ca3c4e0eed97fd67d9737211b1186b21c4acd5a05500",
       "width": 820,
-      "height": 3038,
+      "height": 3158,
       "mode": "RGBA"
     },
     {
       "path": "screens/09-settings-dark.png",
-      "bytes": 28605,
-      "sha256": "f7a3bf44e784e62d4a01d8987655fc76ee554e1050ca8851c412b32f4225843c",
+      "bytes": 32543,
+      "sha256": "02057be9e9fab0f451c5a5a35f0799d528bbdc18cc5ac066ca9fa691a98ea258",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/10-settings-light.png",
-      "bytes": 29214,
-      "sha256": "09d92a823cf5164ba752505b139737b02c4077e86edbc7a4802e748564298610",
+      "bytes": 33804,
+      "sha256": "3f2e2c37253febf89d755b7a4a1d0262ab09b44fd7052c423f29a6e0c17156fb",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -148,32 +148,32 @@
     },
     {
       "path": "screens/12-account-dark.png",
-      "bytes": 31254,
-      "sha256": "e401f988d82a466e034307fc3b7f3b38bde2e7ebd37b45973094873d5cfa8f91",
+      "bytes": 34486,
+      "sha256": "036b94937f8e15753f1001ba54aa7c95c6f362e7cfa80354515bac6ee48fe9e5",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/13-account-light.png",
-      "bytes": 31362,
-      "sha256": "3581e25b93c0dd0cac7d298f8f7643effe0ef8a76e221879f35d36dd9ef99a60",
+      "bytes": 34518,
+      "sha256": "5a504065a20e1a2c0ff57973e88e744e1114eeb4a92b8e78a880855027d48799",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/14-edit-alias-dark.png",
-      "bytes": 32564,
-      "sha256": "07f5bc66d261ac428251be2a1317210de88f89a4afb16b5ea3736cad5a980aee",
+      "bytes": 34601,
+      "sha256": "23c41e732c688283c0b9cda1c381da4cf557dea5877bfd01c7e539aa8cd0e0ef",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/15-edit-alias-light.png",
-      "bytes": 33037,
-      "sha256": "fb1eb2adf7ade1c904fc75fb6a6e90bf7cba44a262cdb07e29f5778ff46b008a",
+      "bytes": 34669,
+      "sha256": "7956386ec4c44e4a3e18e07e2928918152c2670e9d157af3053fff0390712553",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -185,13 +185,13 @@
     },
     {
       "path": "tokens.css",
-      "bytes": 1248,
-      "sha256": "79f64449d19d381bb7125af61eb5455605c5f64bc9b45308e8cf33984502b592"
+      "bytes": 1293,
+      "sha256": "651a4b3bcd6a6c9ce056db0e6ad23a80d6b7dbf02d90d1d4e72d248c84d15eab"
     },
     {
       "path": "TIMELINES.md",
-      "bytes": 7093,
-      "sha256": "218d7779d1dfcba46f8da442751940384bc114c0bfd576b7a9984eb5049acce4"
+      "bytes": 7194,
+      "sha256": "cab597d36209f48b7583cbacbac1cff3e44ac8b03e10905e026b9b5f102af9f8"
     },
     {
       "path": "timeline-screens/17-timelines-right-dark-draft.png",
@@ -205,8 +205,8 @@
     {
       "path": "timeline-screens/16-timelines-closed.png",
       "status": "design reference",
-      "bytes": 30638,
-      "sha256": "16b375140b9fedc4bfe16b0b956968c0b8a53f8273eb893539ce9114a856ba28",
+      "bytes": 34718,
+      "sha256": "57f1f95d3ce63d0e81fa44ddfe4284102ef45c74a3edf21343f142a11976e3e6",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -214,8 +214,8 @@
     {
       "path": "timeline-screens/17-timelines-right-dark.png",
       "status": "design reference",
-      "bytes": 86989,
-      "sha256": "5510135dab607cfda1b0876d26cf6f37a6dcb01cad15d52fcafd7b6a4d276557",
+      "bytes": 91489,
+      "sha256": "9c9dc6327aabc46a50473fb6df6a8644557151649faef28e465636beec64e215",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -223,8 +223,8 @@
     {
       "path": "timeline-screens/18-timelines-right-light.png",
       "status": "design reference",
-      "bytes": 87671,
-      "sha256": "2dd452608490ae9cecaa90466d8d451c7c847f75b72edd9cf418330da9c2811a",
+      "bytes": 91913,
+      "sha256": "7848e7454a7f4c0f326ef5a25a5c7bb80c6f5cb9fb405bec1a947f066ce10152",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -232,8 +232,8 @@
     {
       "path": "timeline-screens/19-timelines-left.png",
       "status": "design reference",
-      "bytes": 110649,
-      "sha256": "405938bad87825c97136ed86aecb91162a93433fe17c4dfe2b7655a90bbfc0e2",
+      "bytes": 114981,
+      "sha256": "cdb20501edf77f19353fe9c443ed8b6b930c01bd4394b4f25db99d32fdea952a",
       "width": 1091,
       "height": 676,
       "mode": "RGBA"
@@ -241,13 +241,42 @@
     {
       "path": "timeline-screens/20-timeline-states.png",
       "status": "design reference",
-      "bytes": 315880,
-      "sha256": "9129b6bfaa42e0a263f901316898f04a9b2689d2070e46ca0c93e37fc11eb4ad",
+      "bytes": 315617,
+      "sha256": "2ce14d4ef384d0a19e05c614334157427e38e78e1c5b7ba39c9236043c6b5981",
       "width": 900,
       "height": 2346,
       "mode": "RGBA"
+    },
+    {
+      "path": "IMPLEMENTATION-NOTES.md",
+      "bytes": 5879,
+      "sha256": "3a46f98009b142f7dece6bfaab86c4e77738bc8f2e24be422bc9e9e296623eac"
+    },
+    {
+      "path": "VERIFICATION.md",
+      "bytes": 3017,
+      "sha256": "1da5471c71980ae02728d3a31febbc1c1cdf91a011274b88cd23d402c0465193"
+    },
+    {
+      "path": "implemented-main-dark.png",
+      "bytes": 54789,
+      "sha256": "6e7412d05146afbec2a1daef81b4cc48fb3717addecabcd371dbef93167371c5",
+      "width": 360,
+      "height": 560,
+      "mode": "RGB"
+    },
+    {
+      "path": "implemented-main-light.png",
+      "bytes": 56304,
+      "sha256": "bedc086f12d707efa272cb2d5274d944c4ed5ef63a18050461c169b79f670a03",
+      "width": 360,
+      "height": 560,
+      "mode": "RGB"
     }
   ],
   "timeline_draft_count": 1,
-  "timeline_screen_count": 5
+  "timeline_screen_count": 5,
+  "reconciled_against_commit": "26c0580",
+  "baseline_screen_count": 15,
+  "total_current_screen_count": 20
 }

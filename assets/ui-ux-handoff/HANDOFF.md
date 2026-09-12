@@ -1,7 +1,9 @@
 # Claude Code Swap — UI/UX implementation handoff
 
-Status: final design reference, ready for implementation. This handoff does not
-claim the application implements the complete design. Prepared 2026-09-12.
+Status: baseline aligned to the coding agent’s implemented 0.28.0-dev UI.
+The timeline extension remains planned design. Updated 2026-09-12.
+Read [IMPLEMENTATION-NOTES.md](IMPLEMENTATION-NOTES.md) for the implementation
+record and [TIMELINES.md](TIMELINES.md) for the separate extension.
 
 ## Start here
 
@@ -24,7 +26,7 @@ incidental example content in a screenshot.
 | Account section heading | **Account** |
 | Account rows | Alias, Email, Team, **Account Index** |
 | Account Index value | Just the slot number, e.g. **2**, never “Account 2” in this row |
-| Usage section | Heading **Usage** above the five-hour and weekly meters |
+| Usage section | Heading **Usage** above **Five-hour** and **Weekly** meters |
 | Selector button | Large stable account index on the left, spanning two lines; alias and status on separate single lines to the right |
 | Alias editing | Add/Edit alias, Save, Cancel, Remove alias, useful errors |
 | Appearance | System, Light, Dark; default System; persistent selection |
@@ -38,7 +40,7 @@ or file names merely to match the visible product title.
 
 | Asset | Usage |
 | --- | --- |
-| `../untitled.pen` | Authoritative editable source, 15 artboards, named layers and hidden states |
+| `../untitled.pen` | Editable source, 20 artboards (01–15 implemented baseline, 16–20 planned extension), named layers and hidden states |
 | `screens/01-main-dark.png`, `02-main-light.png` | Main panel, latest labels and logo |
 | `screens/03-account-preview.png` | Selected account differs from active account |
 | `screens/04-stale-offline.png` | Last-known usage and availability |
@@ -71,11 +73,15 @@ existing local Inter/system and IBM Plex Mono/system-monospace fallback stacks.
 
 ## Layout and appearance
 
-Keep the 360 × 560 popover, 44px header, 486px body and 30px footer. The body
-scrolls vertically; the header and footer remain pinned. Main screenshots show
-the initial scroll position, so action rows may be below the fold. Implement
-all rows and scrolling rather than deleting actions to reproduce a screenshot.
-Preserve scroll position and disclosure state during background refreshes.
+Keep the 360 × 560 popover, 44px header and 30px footer. The body flexes to
+fill the remaining viewport; do not hard-code its height. The default three
+accounts plus Add occupy one four-cell row (78px minimum tabs, 5px gap).
+Compact card/row padding keeps Account, Usage, Switch/Best/Rotate and Auto-switch
+visible without default scrolling. Switch/Best/Rotate share one horizontal row,
+with 84px Best and Rotate buttons and 6px gaps. Auto-switch uses heading and
+summary on two lines beside the toggle. Footer retains Activity and Add account.
+More accounts and opened disclosures may
+scroll. Header/footer remain pinned, and refresh preserves scroll/disclosures.
 
 Use graphite `#151A1C` and ivory `#F7F6F2` surfaces, restrained teal, fine borders,
 existing spacing rhythm and rounded cards. Treat `tokens.css` as a starting
@@ -84,14 +90,18 @@ secondary text and focus treatments, must be checked against board 8 and the
 rendered UI. Validate contrast rather than assuming the token seed guarantees it.
 
 The alias remains a single line in a selector, with a real ellipsis when too
-long. Keep its full value in the accessible name and in the Account card.
+long. Keep its full value in the accessible name and the Account card’s hover tooltip.
 Indices are stable slot identifiers, not positions after sorting. Allow wider
 indices without clipping; board 8 includes a two-digit example. Preserve the
 existing Add account entry point and support more than one row of accounts.
 
 The Account card has a fixed section heading plus Active/Preview status. Use
-labeled Alias, Email, Team, and Account Index rows. Full identity values wrap,
-including unbroken email strings, and remain selectable. Missing email/team
+labeled Alias, Email, Team, and Account Index rows. Values stay on one line,
+ellipsize, and expose the full value in a native hover tooltip (`title`).
+Account uses the same 13px semibold heading as Usage, without a divider below
+the heading. Keep the transparent 11px Alias pencil icon or Add alias text affordance
+unclipped; the pencil tooltip/accessibility label is Edit alias.
+Missing email/team
 values read “Not available”; a missing alias reads “Not set” with Add alias.
 The selector's fallback is the existing account label. Do not replace every
 missing alias with a fabricated name. Team uses the available `org` display
@@ -120,6 +130,10 @@ then displays the fallback account label; it must not delete an account.
 Alias changes never switch accounts, write active credentials, or restart a
 session. Keep active-slot identity and other accounts unchanged.
 
+The alias dialog title is Edit alias or Add alias; the context includes account
+index and email. Buttons are Remove alias (only if set), Cancel and Save in one footer row.
+Settings and alias dialogs follow the implemented centered 300px container
+with 16px padding and 12px radius; Settings Done uses quiet/ghost styling.
 The Pen file includes hidden duplicate/invalid/saving and unset-alias variants.
 They are behavior references; the default screenshots show normal states.
 
@@ -131,9 +145,11 @@ Apply immediately to the panel and sheets, persist across reopening/relaunch,
 and restore the previous saved appearance on save failure. System follows live
 OS changes; explicit Light/Dark override them. Keep URL theme overrides limited
 to fixture mode. Existing `appearance.js` already implements most persistence
-and rollback behavior; replace its dropdown presentation carefully.
+and rollback behavior. All Settings controls are now segmented radiogroups.
 
-Retain refresh interval and title percentage settings. Show actual current
+Refresh interval offers 30s / 60s / 5 min; Title percentage offers Off /
+5-hour / Weekly / Both. Include per-control help and Done to close. Re-read
+stored preferences on every open. Show actual current
 preferences rather than hard-coding the selected example from the screenshot.
 The selected-state semantics and persistence requirements apply to these controls
 as well. Appearance controls the panel; the native template status image follows
@@ -141,13 +157,19 @@ macOS appearance and selection rendering.
 
 ## Other states and interaction requirements
 
-- Usage bars and percentages mean **used**, not remaining. Missing data is
+- Usage meters always include an explicit percent sign, e.g. **68% USED**,
+  including per-model values. Usage bars and percentages mean **used**, not remaining. Missing data is
   unavailable, not zero. Keep last-known values visibly stale.
 - A reset countdown reaching zero becomes “Awaiting updated usage” until a new
   measurement arrives. Pace applies only to weekly/per-model weekly windows;
   hide pace for stale or unavailable measurements.
 - API-key accounts show “No subscription quota”; they are not failed logins.
   Disabled accounts stay distinct from authentication and availability errors.
+- Switch uses the Interlock icon and index-only label **Switch to 2**; its
+  tooltip includes the full alias. The active state is disabled **Current account**.
+- Tab statuses are Ready / Active / Disabled / API key / Needs login / Unavailable.
+  Disabled aliases are dimmed and struck through; selected ring/index and Active
+  status are distinct. Tab accessible names retain the full alias.
 - Best, Rotate, explicit Switch, auto-switch and management actions remain
   available. The offline example does not create a new auto-pause policy.
 - Setup-token entry takes token plus optional email, conceals the token and
@@ -167,49 +189,49 @@ other work may land while this handoff is being implemented.
 
 | File | Current state / implementation work |
 | --- | --- |
-| `src/claude_swap/menubar/web/panel.js` | Existing selector, wrapped identity card, meters/actions and render preservation. Header still uses `claude-swap`; card heading is the alias; fixtures contain “Research workspace”. Update final labels, index tabs, Alias row/actions and Usage heading. |
-| `src/claude_swap/menubar/web/panel.css` | Existing dark/light tokens, fixed body scrolling, initial expanded card. Adapt layout for numbered tabs and final Account rows; preserve long-value wrapping. |
-| `src/claude_swap/menubar/web/index.html` | Existing dialogs and Appearance dropdown. Add alias dialog and match Settings segmented presentation. |
-| `src/claude_swap/menubar/web/sheets.js` | Existing modal lifecycle and management actions. Extend for alias editing and correct focus/error behavior. |
-| `src/claude_swap/menubar/web/appearance.js` | Existing getPrefs/setPrefs theme persistence, preview application and rollback. Preserve while changing UI. |
-| `src/claude_swap/menubar/web/icons.js` | Replace old swap geometry with supplied Interlock; keep utility icons. |
-| `src/claude_swap/menubar/app.py` | Native shell, settings storage, bridge handlers/specs, image setup. Theme handling exists; add alias endpoints and custom NSImage template. Package assets under the installed package, not runtime paths into `assets/`. |
-| `src/claude_swap/menubar/bridge.py` | Allowlist/type checks and error replies. Extend through handler/spec configuration rather than bypassing validation. |
-| `src/claude_swap/menubar/viewmodel.py` | Provides slot, alias, email, org, active/status and usage. Keep additions compatible; refresh aliases without another usage API request if possible. |
-| `src/claude_swap/switcher.py` | `set_alias(identifier, alias)` returns `(slot, normalized_alias)`; `unset_alias(identifier)` returns slot. Reuse these methods. |
-| `src/claude_swap/models.py` | `normalize_alias` is validation authority. |
+| `src/claude_swap/menubar/web/panel.js` | Implemented indexed selector, single-line Account values, explicit percent meters and index-only switch labels. |
+| `src/claude_swap/menubar/web/panel.css` | Implemented flexible viewport layout, compressed cards, ellipsis and themes. |
+| `src/claude_swap/menubar/web/index.html` | Alias dialog and three segmented Settings groups. |
+| `src/claude_swap/menubar/web/sheets.js` | Dialog lifecycle, alias operations, errors and Settings persistence. |
+| `src/claude_swap/menubar/web/appearance.js` | Theme application and system-mode handling. |
+| `src/claude_swap/menubar/web/icons.js` | Interlock branding and utility icon system. |
+| `src/claude_swap/menubar/app.py` | Native shell, preference/alias bridge handlers and template image. Timeline native placement is separate planned work. |
+| `src/claude_swap/menubar/bridge.py` | Bridge validation and error replies; preserve protocol. |
+| `src/claude_swap/menubar/viewmodel.py` | Account identity, status and quota measurements. |
+| `src/claude_swap/switcher.py`, `models.py` | Core alias mutation and normalization authority. |
 
-Suggested additive bridge contracts (not implemented by this handoff):
-`setAlias {slot: string, alias: string}` → `{slot, alias}` and
-`unsetAlias {slot: string}` → `{slot, alias: null}`. Route exceptions through the
-existing bridge error channel. Rebuild native menu labels as needed and push
-updated view data so renaming does not wait for a remote usage refresh.
+Alias bridge actions `setAlias` / `unsetAlias` are implemented. Rename updates
+selector, card and native menu in place, without a remote usage refresh,
+credential changes or account activation. Preserve these semantics.
 
 Native logo: load the PDF or paired PNG representations, set nominal size to
 18 × 18 points and mark the image as a template. A 36px file is the 2x raster
 representation, not a 36pt status item. Keep transparent padding. For the panel,
-inline `swap-mark.svg` with currentColor (or use a CSS mask); an external SVG
+inline `swap-mark.svg` at 16px with currentColor (or use a CSS mask); an external SVG
 `img` does not inherit the parent element's text color automatically.
 
-## Implementation sequence
+## Maintenance sequence
 
-1. Inspect git status and preserve unrelated work. Review final Pen artboards
-   and this handoff. Audit what the current branch already implements.
-2. Integrate final product/section labels, Account card and numbered selectors.
-3. Add alias bridge handlers and dialog using existing core APIs; test outcomes.
-4. Match Settings controls while preserving saved appearance behavior.
-5. Integrate Interlock into panel and native status image; verify packaged assets.
-6. Exercise the complete state matrix below in a real browser and native WKWebView.
-7. Run appropriate tests, report results, and make a focused implementation commit.
-   Do not publish, change versions, or alter release infrastructure as part of this scope.
+1. Inspect git status, implementation notes and current source before changing a
+   surface. Preserve unrelated work and verify whether it is already implemented.
+2. For an intentional visible product change, update its implementation record,
+   corresponding Pen boards, exported previews and written behavior together.
+3. Compare 360 × 560 dark/light product fixtures, including long data and errors;
+   update manifest hashes and the verification record after exporting.
+4. Keep future features such as timelines explicitly marked planned until their
+   native and browser acceptance checks pass. Do not restore old design behavior
+   over a documented product decision just to match an obsolete screenshot.
+5. Run appropriate implementation tests only when changing application behavior.
 
 ## Acceptance checks
 
 - Both themes match final screenshots at 360 × 560; Account and Usage headings
   are visible; no workspace wording or duplicate Account value remains.
 - Long aliases, emails, team values, many accounts and multi-digit indices fit;
-  selector ellipsis is deliberate, full Account values never ellipsize.
-- All below-fold actions remain reachable; header/footer stay pinned; refresh
+  selector and Account value ellipsis is deliberate; native tooltips expose full
+  Account values and alias controls remain visible.
+- Default three-account actions and Auto-switch fit without scrolling; overflow
+  actions remain reachable; header/footer stay pinned; refresh
   preserves scroll and disclosure state.
 - Select another account without switching it. Active badge remains correct.
 - Save an alias, normalize mixed case, reject invalid/duplicate aliases, cancel,

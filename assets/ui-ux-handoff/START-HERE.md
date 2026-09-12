@@ -1,6 +1,8 @@
 # Coding agent entry point
 
-Implement the final **Claude Code Swap** menu bar UI using [HANDOFF.md](HANDOFF.md).
+Maintain the **Claude Code Swap** menu bar UI using [HANDOFF.md](HANDOFF.md).
+Read [IMPLEMENTATION-NOTES.md](IMPLEMENTATION-NOTES.md) for the implemented
+baseline; timeline screens are a separate planned extension.
 The saved [Pen source](../untitled.pen), all 15 final screen exports, exact SVG
 logo paths, native template PDF/PNGs, and token seed accompany it.
 
@@ -26,3 +28,14 @@ Implement the behavior and native-window acceptance checks in that addendum.
 The latest timeline revision shows full 5-hour/7-day windows, used-percent fill
 and a shared Now line throughout artboards 17–20, including narrow layouts,
 row details, stale/missing data and many-account scrolling examples.
+
+## Keeping product and design synchronized
+
+For each intentional visible product change, record the behavior, affected
+boards, source commit and rationale in IMPLEMENTATION-NOTES.md. Compare the
+product fixture at360×560 in both themes, update those Pen boards and their
+PNG exports, then reconcile HANDOFF.md/TIMELINES.md and refresh manifest hashes.
+Record the completed comparison in VERIFICATION.md. If an update is unfinished,
+mark its affected boards pending explicitly; do not call their exports current.
+Keep planned features labeled separately from implemented product behavior.
+This is a review workflow, not an automatic synchronization guarantee.

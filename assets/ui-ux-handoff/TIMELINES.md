@@ -24,7 +24,9 @@ Available references:
 These supersede the earlier timeline draft. The original 15 screen exports
 remain the baseline for the preceding redesign; use this extension for the
 new header trigger and timeline behavior. Both panels share the appearance
-setting. Main switching and auto-switch controls remain below the scroll fold.
+setting. Main switching and auto-switch controls use the compressed implemented baseline
+and remain visible in the default three-account view. Only genuine overflow
+states scroll.
 
 Fixture: Now is 12 September 2026 13:30 America/Los_Angeles. Session offsets
 30m, 1h45m, 3h and 4h30m end at 14:00, 15:15, 16:30 and 18:00 that day.

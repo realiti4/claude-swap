@@ -93,3 +93,22 @@ Bridge protocol apart from `setAlias`/`unsetAlias` and the extended
 `getPrefs`; credential/lock/polling/auto-switch/launchd contracts;
 CLI/TUI; the graphite/ivory palettes and tokens; all quota-state rules
 (stale, awaiting-updated-usage, no fabricated zeros).
+
+## Design reconciliation — 2026-09-12
+
+Reviewed this implementation record, its dark/light product screenshots and
+current panel.js/panel.css/index.html at repository HEAD `26c0580`. Updated
+the editable Pen document and refreshed all20 exported boards. The main
+layout, single-line identity rules, percentages, actions, statuses, branding,
+Settings controls and alias dialogs have been reconciled. Boards16–20 retain
+the planned timeline feature while using the implemented main-panel layout.
+
+HANDOFF.md now reflects implemented alias/settings/native-logo integration
+rather than asking a future agent to reimplement it. TIMELINES.md keeps the
+full-window chart behavior separate. START-HERE.md includes the recurring
+product/design review workflow; tokens.css no longer prescribes fixed body
+height. Sample identities, quota values and optional disclosure content vary
+between state boards and product fixtures; these are illustrative data, not
+new backend behavior. The product screenshots remain the implementation
+record, and Pen exports are design references rather than pixel-identical
+runtime captures. Future visible changes must repeat this reconciliation.

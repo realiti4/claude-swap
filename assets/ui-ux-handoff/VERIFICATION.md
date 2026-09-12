@@ -33,3 +33,18 @@ Active-account dots now agree with the main panel. Decoded all four PNGs and
 updated manifest dimensions and checksums. Static exports do not prove runtime
 scrolling, accessibility or native-window behavior; run the handoff acceptance
 checks when implementing.
+
+## Product/design reconciliation — 2026-09-12
+
+- Read IMPLEMENTATION-NOTES.md and both supplied implementation screenshots;
+  cross-checked source at HEAD26c0580 (panel.js, panel.css and index.html).
+- Saved Pen through its UI, then re-exported all20 boards. Reviewed main,
+  preview, centered Settings/alias and combined timeline images.
+- Confirmed compact default actions and auto-switch remain visible; identity
+  values use single-line treatment, percentages are explicit, and the timeline
+  fixture agrees with the main Usage card.
+- Decoded all20 PNGs and updated inventory dimensions/checksums.
+- Earlier notes about fixed486px bodies, mandatory default scrolling or
+  wrapping Account values are superseded by this reconciliation.
+- No application code was changed or runtime tests rerun. Static design review
+  does not verify native interaction behavior or guarantee pixel parity.
