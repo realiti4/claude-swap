@@ -253,10 +253,10 @@ pushing.
 **Acceptance criteria:**
 - [x] README section matches shipped behavior; ARCHITECTURE.md accurate to the new layout
 - [x] macOS CI installs the extra and the import smoke passes; Linux jobs untouched
-- [ ] Human approved the CI diff (ask-first boundary)
+- [x] Human approved the CI diff (ask-first boundary)
 
 **Verification:**
-- [ ] `uv run pytest` green; CI green on all three platforms
+- [x] `uv run pytest` green; CI green on all three platforms
 
 **Dependencies:** Task 5 (docs can trail shell completion)
 
@@ -268,6 +268,6 @@ pushing.
 
 ## Checkpoint C: complete
 
-- [ ] All SPEC.md success criteria (1-8) verified
-- [ ] Definition of Done checklist satisfied
-- [ ] Ready for `/review` → `/ship`
+- [x] All SPEC.md success criteria (1-8) verified
+- [x] Definition of Done checklist satisfied
+- [x] Ready for `/review` → `/ship`

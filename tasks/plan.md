@@ -40,19 +40,19 @@ last. The core (switcher, usage store, locks, credentials) is untouched.
 - [x] Task 3: Panel web v1 — fixture-mode rendering of the full view-model
 
 ### Checkpoint A: after Tasks 1-3
-- [ ] `uv run pytest` green (existing + new viewmodel tests)
-- [ ] `open src/claude_swap/menubar/web/index.html` renders fixture panel in browser
-- [ ] Human review before shell work
+- [x] `uv run pytest` green (existing + new viewmodel tests)
+- [x] `open src/claude_swap/menubar/web/index.html` renders fixture panel in browser
+- [x] Human review before shell work
 
 ### Phase 2: Shell — macOS vertical slice (fail-fast gate)
 - [x] Task 4: PyObjC status item + right-click menu + snapshot loop + osascript notifications; swap pyproject extra; delete rumps glue
 - [x] Task 5: Popover + WKWebView + bridge integration (live panel)
 
 ### Checkpoint B: after Tasks 4-5
-- [ ] `uv run cswap menubar` shows panel with live data; right-click menu works
-- [ ] `--install-service` / `--service-status` / `--uninstall-service` flow works
-- [ ] Linux CI still green (no PyObjC imports leak)
-- [ ] Human review — this is the go/no-go for the approach
+- [x] `uv run cswap menubar` shows panel with live data; right-click menu works
+- [x] `--install-service` / `--service-status` / `--uninstall-service` flow works
+- [x] Linux CI still green (no PyObjC imports leak)
+- [x] Human review — this is the go/no-go for the approach
 
 ### Phase 3: Completion & polish
 - [x] Task 6: All panel actions end-to-end (switch/rotate/best/disable/enable/remove/add/auto-switch/prefs)
@@ -61,8 +61,8 @@ last. The core (switcher, usage store, locks, credentials) is untouched.
 - [x] Task 9: Docs (README section, ARCHITECTURE.md §6.5/map) + macOS CI import smoke (ask-first)
 
 ### Checkpoint C: complete
-- [ ] All SPEC.md success criteria met, Definition of Done satisfied
-- [ ] Ready for `/review` and release
+- [x] All SPEC.md success criteria met, Definition of Done satisfied
+- [x] Ready for `/review` and release
 
 ## Risks and Mitigations
 
