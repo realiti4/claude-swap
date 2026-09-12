@@ -22,6 +22,7 @@ PANEL_JS = (WEB / "panel.js").read_text(encoding="utf-8")
 SHEETS_JS = (WEB / "sheets.js").read_text(encoding="utf-8")
 ICONS_JS = (WEB / "icons.js").read_text(encoding="utf-8")
 APPEARANCE_JS = (WEB / "appearance.js").read_text(encoding="utf-8")
+PANEL_CSS = (WEB / "panel.css").read_text(encoding="utf-8")
 INDEX_HTML = (WEB / "index.html").read_text(encoding="utf-8")
 APP_PY = (MENUBAR / "app.py").read_text(encoding="utf-8")
 BRIDGE_PY = (MENUBAR / "bridge.py").read_text(encoding="utf-8")
@@ -108,13 +109,14 @@ class TestAccountCard:
     """Final-handoff Account card: labels, index format, and terminology."""
 
     def test_account_card_row_labels(self) -> None:
-        for label in ("Alias", "Email", "Team", "Account Index"):
-            assert f"<dt>{label}</dt>" in PANEL_JS, f"card lost its {label} row"
+        assert "<dt>Alias</dt>" in PANEL_JS
+        for label in ("Email", "Team", "Account Index"):
+            assert f'row("{label}"' in PANEL_JS, f"card lost its {label} row"
 
     def test_account_index_is_the_bare_number(self) -> None:
         # "Account 2" in the card row is the exact mistake the final handoff
         # calls out: the index value is just the slot number
-        assert "<dt>Account Index</dt>" in PANEL_JS
+        assert 'row("Account Index"' in PANEL_JS
         assert not re.search(r"Account \$\{", PANEL_JS), (
             "card renders 'Account N' instead of the bare index"
         )
@@ -138,6 +140,21 @@ class TestAccountCard:
     def test_percent_values_carry_the_percent_sign(self) -> None:
         # pre-review fix: "68% USED", not "68USED"
         assert '<span class="unit">% USED</span>' in PANEL_JS
+
+    def test_card_rows_ellipsize_with_full_value_on_hover(self) -> None:
+        # pre-review fix: one line per row; long values ellipsize and the
+        # full value is revealed by the native title tooltip
+        assert 'class="val"' in PANEL_JS
+        assert re.search(r'title="\$\{esc\(', PANEL_JS), (
+            "card rows need a title tooltip with the full value"
+        )
+        assert "text-overflow: ellipsis" in PANEL_CSS
+
+    def test_switch_button_shows_index_and_short_name(self) -> None:
+        # pre-review fix: "Switch to 2 (resear…)" — index first, alias
+        # truncated so long names never stretch the action row
+        assert "Switch to ${esc(acct.slot)} (" in PANEL_JS
+        assert ".btn.primary" in PANEL_CSS and "text-overflow: ellipsis" in PANEL_CSS
 
     def test_no_workspace_terminology(self) -> None:
         assert "workspace" not in PANEL_JS.lower(), (

@@ -229,8 +229,16 @@ function identityHtml(acct) {
   // otherwise. Wired to the alias sheet in a later task; clicks are no-ops
   // until then (the dispatcher ignores unknown acts).
   const aliasCell = acct.alias
-    ? `${esc(acct.alias)} <button class="mini-btn" data-act="alias-edit" data-slot="${esc(acct.slot)}" title="Edit alias" aria-label="Edit alias">${ic("edit", 11)}</button>`
-    : `<span class="dim">Not set</span> <button class="mini-btn" data-act="alias-add" data-slot="${esc(acct.slot)}">Add alias</button>`;
+    ? `<dd title="${esc(acct.alias)}"><span class="val">${esc(acct.alias)}</span>`
+      + ` <button class="mini-btn" data-act="alias-edit" data-slot="${esc(acct.slot)}" title="Edit alias" aria-label="Edit alias">${ic("edit", 11)}</button></dd>`
+    : `<dd><span class="val dim">Not set</span>`
+      + ` <button class="mini-btn" data-act="alias-add" data-slot="${esc(acct.slot)}">Add alias</button></dd>`;
+  // One line per row: long values ellipsize (title reveals the full
+  // string) so a long email or team name can never stretch the card.
+  const row = (label, value) =>
+    `<dt>${label}</dt>` + (value
+      ? `<dd title="${esc(value)}"><span class="val">${esc(value)}</span></dd>`
+      : `<dd><span class="val dim">Not available</span></dd>`);
   return `
   <section class="identity" aria-labelledby="account-identity-title">
     <div class="identity-heading">
@@ -238,10 +246,10 @@ function identityHtml(acct) {
       ${badge}
     </div>
     <dl class="identity-details">
-      <dt>Alias</dt><dd>${aliasCell}</dd>
-      <dt>Email</dt><dd>${esc(acct.email || "Not available")}</dd>
-      <dt>Team</dt><dd>${esc(acct.org || "Not available")}</dd>
-      <dt>Account Index</dt><dd>${esc(acct.slot || "Not available")}</dd>
+      <dt>Alias</dt>${aliasCell}
+      ${row("Email", acct.email)}
+      ${row("Team", acct.org)}
+      ${row("Account Index", acct.slot)}
     </dl>
   </section>`;
 }
@@ -318,12 +326,18 @@ function quotaCardHtml(acct) {
 function actionsHtml(acct) {
   const cant = acct.active || !acct.switchable || acct.status === "needs-login";
   const pending = state.pendingAction === "switch";
+  // "Switch to 2 (resear…)" — the stable index first, the alias shortened
+  // so a long name never stretches the action row; the button's tooltip
+  // carries the full target.
+  const name = acct.alias ?? acct.label;
+  const short = name.length > 8 ? `${name.slice(0, 7)}…` : name;
   const label = pending ? "Switching…"
     : acct.active ? `${ic("check", 12)} Current account`
-    : `Switch to ${esc(acct.alias ?? acct.label)}`;
+    : `Switch to ${esc(acct.slot)} (${esc(short)})`;
   return `
   <div class="actions">
     <button class="btn primary" data-act="switch" data-slot="${esc(acct.slot)}"
+      title="${esc(acct.active ? "Current account" : `Switch to ${acct.slot} · ${name}`)}"
       ${cant || pending ? "disabled" : ""}>${label}</button>
     <button class="btn half" data-act="best" title="Switch to the account with most headroom">
       ${ic("best", 12)} Best
