@@ -13,7 +13,7 @@ criteria.
   - Files: src/claude_swap/menubar/web/panel.js, panel.css, tests/test_menubar.py
   - Dependencies: none (folds in the uncommitted WIP)
 
-- [ ] Task 2: View-model card-field contract pin
+- [x] Task 2: View-model card-field contract pin
   - Acceptance: viewmodel tests pin slot/email/org always present and alias absent-when-unset (never null) for the card rows
   - Verify: `uv run pytest tests/test_menubar_viewmodel.py -q`
   - Files: tests/test_menubar_viewmodel.py (viewmodel.py only if a gap surfaces)

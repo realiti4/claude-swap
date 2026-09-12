@@ -377,6 +377,41 @@ class TestAutoSwitchAndHistory:
         assert vm["history"] == ["2 → 1 · just now", "1 → 2 · 1h ago"]
 
 
+class TestCardFieldContract:
+    """The Account card renders Alias/Email/Team/Account Index for every
+    account. The row values must be non-null strings (the panel falls back
+    to \"Not available\" for empty ones), and alias must be absent — never
+    null — when unset, per the additive-schema rule."""
+
+    def _acct_vms(self) -> list[dict]:
+        healthy = account(alias="work", org_name="Acme")
+        no_alias = account(number="2", is_active=False)
+        api_key = account(
+            number="3",
+            is_active=False,
+            usage=UsageEntry(sentinel=USAGE_API_KEY),
+        )
+        held_out = account(number="4", is_active=False, disabled=True)
+        vm = viewmodel.build(
+            snapshot(healthy, no_alias, api_key, held_out), now=NOW
+        )
+        return vm["accounts"]
+
+    def test_card_rows_are_never_null(self) -> None:
+        for acct in self._acct_vms():
+            for field in ("slot", "email", "org"):
+                value = acct[field]
+                assert isinstance(value, str) and value != "", (
+                    f"{field} must be a non-empty string, got {value!r}"
+                )
+
+    def test_alias_absent_when_unset_never_null(self) -> None:
+        vms = self._acct_vms()
+        assert vms[0]["alias"] == "work"
+        for acct in vms[1:]:
+            assert "alias" not in acct, "unset alias must be absent, not null"
+
+
 class TestContract:
     """Pin the additive JSON contract: removals fail loudly, additions are deliberate."""
 
