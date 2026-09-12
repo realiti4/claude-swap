@@ -14,12 +14,12 @@ module wholesale to `src/claude_swap/menubar/_legacy.py`; create
 Zero runtime behavior change.
 
 **Acceptance criteria:**
-- [ ] `from claude_swap.menubar import run, framework_build_warning, ...` works for all existing importers (verified by grep + suite)
-- [ ] `uv run cswap menubar` still launches the old rumps app (manual, if rumps installed)
-- [ ] No public name removed (test_menubar.py untouched and green)
+- [x] `from claude_swap.menubar import run, framework_build_warning, ...` works for all existing importers (verified by grep + suite)
+- [x] `uv run cswap menubar` still launches the old rumps app (manual, if rumps installed)
+- [x] No public name removed (test_menubar.py untouched and green)
 
 **Verification:**
-- [ ] `uv run pytest` green (full suite, untouched tests)
+- [x] `uv run pytest` green (full suite, untouched tests)
 
 **Dependencies:** None
 
@@ -43,14 +43,14 @@ quarantine from sentinel, autoSwitch block, history. Add
 `test_menubar_viewmodel.py` and a key-snapshot contract test.
 
 **Acceptance criteria:**
-- [ ] `build()` handles: healthy accounts, api-key/sentinel accounts (quarantined + note, no bars), missing spend (field absent), stale usage (ageText, state), disabled/alias/active flags
-- [ ] Additive contract: optional fields absent — never `null` — pinned by contract test
-- [ ] countdownText baked for first paint + `resetsAt` epochs for local ticking
-- [ ] Existing helper tests green via re-exports
+- [x] `build()` handles: healthy accounts, api-key/sentinel accounts (quarantined + note, no bars), missing spend (field absent), stale usage (ageText, state), disabled/alias/active flags
+- [x] Additive contract: optional fields absent — never `null` — pinned by contract test
+- [x] countdownText baked for first paint + `resetsAt` epochs for local ticking
+- [x] Existing helper tests green via re-exports
 
 **Verification:**
-- [ ] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green
-- [ ] `uv run pytest` full suite green
+- [x] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green
+- [x] `uv run pytest` full suite green
 
 **Dependencies:** Task 1
 
@@ -74,15 +74,15 @@ view-model and log actions to console. Both light/dark palettes via
 `prefers-color-scheme`.
 
 **Acceptance criteria:**
-- [ ] Opening `index.html` in a browser renders the fixture panel with all sections
-- [ ] Countdowns tick locally every 30s from `resetsAt` without a push
-- [ ] Pills select cards without switching; action buttons emit calls (console in fixture mode)
-- [ ] Light and dark palettes both readable (manual toggle via devtools)
-- [ ] Bar thresholds: green <70, amber <90, red ≥90
+- [x] Opening `index.html` in a browser renders the fixture panel with all sections
+- [x] Countdowns tick locally every 30s from `resetsAt` without a push
+- [x] Pills select cards without switching; action buttons emit calls (console in fixture mode)
+- [x] Light and dark palettes both readable (manual toggle via devtools)
+- [x] Bar thresholds: green <70, amber <90, red ≥90
 
 **Verification:**
-- [ ] Manual: `open src/claude_swap/menubar/web/index.html`
-- [ ] Visual check against CodexBar reference screenshot
+- [x] Manual: `open src/claude_swap/menubar/web/index.html`
+- [x] Visual check against CodexBar reference screenshot
 
 **Dependencies:** Task 2 (schema)
 
@@ -93,9 +93,9 @@ view-model and log actions to console. Both light/dark palettes via
 
 ## Checkpoint A: after Tasks 1-3
 
-- [ ] `uv run pytest` green
-- [ ] Fixture panel renders in browser
-- [ ] Review with human before shell work
+- [x] `uv run pytest` green
+- [x] Fixture panel renders in browser
+- [x] Review with human before shell work
 
 ## Task 4: PyObjC shell — status item, menu, loop, notifications; drop rumps
 

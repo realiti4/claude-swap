@@ -35,9 +35,9 @@ last. The core (switcher, usage store, locks, credentials) is untouched.
 (Details in `tasks/todo.md`.)
 
 ### Phase 1: Foundation — pure layers, fully testable
-- [ ] Task 1: Convert `menubar.py` to `menubar/` package (pure re-export, zero behavior change)
-- [ ] Task 2: `viewmodel.py` — move pure helpers, add `build()`, pin schema contract
-- [ ] Task 3: Panel web v1 — fixture-mode rendering of the full view-model
+- [x] Task 1: Convert `menubar.py` to `menubar/` package (pure re-export, zero behavior change)
+- [x] Task 2: `viewmodel.py` — move pure helpers, add `build()`, pin schema contract
+- [x] Task 3: Panel web v1 — fixture-mode rendering of the full view-model
 
 ### Checkpoint A: after Tasks 1-3
 - [ ] `uv run pytest` green (existing + new viewmodel tests)
