@@ -226,12 +226,12 @@ design, focus states for the token sheet, both palettes. Capture a README
 screenshot (populated store) or confirm placeholder decision.
 
 **Acceptance criteria:**
-- [ ] Side-by-side with CodexBar reference: flat cards, clean hierarchy, no default-browser look
-- [ ] Dark/light both pass contrast on every state (bars, pills, toasts)
-- [ ] Screenshot captured (or placeholder decision recorded)
+- [x] Side-by-side with CodexBar reference: flat cards, clean hierarchy, no default-browser look
+- [x] Dark/light both pass contrast on every state (bars, pills, toasts)
+- [x] Screenshot captured (or placeholder decision recorded)
 
 **Verification:**
-- [ ] Manual visual review; human sign-off on aesthetics
+- [x] Manual visual review; human sign-off on aesthetics
 
 **Dependencies:** Task 6
 

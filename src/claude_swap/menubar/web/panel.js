@@ -153,7 +153,14 @@ function headerHtml(active) {
       <div class="fresh">${esc(freshText)}</div>
     </div>
     ${statusPill(active)}
-    <button class="icon-btn" data-act="refresh" title="Refresh">⟳</button>
+    <button class="icon-btn" data-act="refresh" title="Refresh" aria-label="Refresh">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="23 4 23 10 17 10"/>
+        <polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      </svg>
+    </button>
   </section>`;
 }
 
@@ -543,6 +550,12 @@ const FIXTURE = {
                 lastEventText: "2 → 1 · 18m ago" },
   history: ["2 → 1 · 18m ago", "1 → 2 · 3h ago"],
 };
+
+// Explicit theme override (screenshots, visual testing): ?theme=light|dark
+const themeOverride = new URLSearchParams(location.search).get("theme");
+if (themeOverride === "light" || themeOverride === "dark") {
+  document.documentElement.dataset.theme = themeOverride;
+}
 
 if (!bridge.hosted) {
   console.log("[fixture] claude-swap panel — fixture mode; actions log here");
