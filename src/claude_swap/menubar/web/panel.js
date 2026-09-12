@@ -504,11 +504,7 @@ const FIXTURE = {
   history: ["2 → 1 · 18m ago", "1 → 2 · 3h ago"],
 };
 
-// Explicit theme override (screenshots, visual testing)
-const themeOverride = new URLSearchParams(location.search).get("theme");
-if (themeOverride === "light" || themeOverride === "dark") {
-  document.documentElement.dataset.theme = themeOverride;
-}
+window.CSWAP_APPEARANCE.init(bridge);
 
 if (!bridge.hosted) {
   console.log("[fixture] claude-swap panel — fixture mode; actions log here");

@@ -21,6 +21,7 @@ WEB = MENUBAR / "web"
 PANEL_JS = (WEB / "panel.js").read_text(encoding="utf-8")
 SHEETS_JS = (WEB / "sheets.js").read_text(encoding="utf-8")
 ICONS_JS = (WEB / "icons.js").read_text(encoding="utf-8")
+APPEARANCE_JS = (WEB / "appearance.js").read_text(encoding="utf-8")
 INDEX_HTML = (WEB / "index.html").read_text(encoding="utf-8")
 APP_PY = (MENUBAR / "app.py").read_text(encoding="utf-8")
 BRIDGE_PY = (MENUBAR / "bridge.py").read_text(encoding="utf-8")
@@ -34,6 +35,10 @@ def panel_actions() -> set[str]:
     ternary because each string literal matches independently.
     """
     sent = set(re.findall(r'bridge\.send\(\s*"([A-Za-z]+)"', PANEL_JS))
+    # appearance.js sends are plain literals (getPrefs/setPrefs); if it ever
+    # gains a ternary send it needs the per-call-body scan sheets.js gets,
+    # which would otherwise read payload strings as phantom actions
+    sent |= set(re.findall(r'bridge\.send\(\s*"([A-Za-z]+)"', APPEARANCE_JS))
     # doAction(btn?, "action", payload, ...) — the fixture-mode paths
     sent |= set(re.findall(r'doAction\((?:[^,]+,\s*)?"([A-Za-z]+)"', PANEL_JS))
     # full send(...) call bodies, then every string literal inside — this

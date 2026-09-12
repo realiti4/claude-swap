@@ -27,7 +27,7 @@ import platform
 import subprocess
 import sys
 import threading
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -46,6 +46,7 @@ from claude_swap.menubar.viewmodel import (
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+THEME_CHOICES: tuple[str, ...] = ("system", "light", "dark")
 
 
 @dataclass
@@ -63,6 +64,7 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    theme: str = "system"
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -90,6 +92,8 @@ class MenuBarSettings:
                 and not (isinstance(value, bool) and not isinstance(default, bool))
             ):
                 kwargs[f.name] = value
+        if kwargs.get("theme") not in THEME_CHOICES:
+            kwargs.pop("theme", None)
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
@@ -490,7 +494,7 @@ def run(switcher) -> int:
                                      "optional": {"email": str}},
                     "setAutoSwitch": {"required": {"enabled": bool}},
                     "setPrefs": {"optional": {"refreshInterval": int,
-                                              "titlePct": str}},
+                                              "titlePct": str, "theme": str}},
                 },
             )
             self._webview.loadFileURL_allowingReadAccessToURL_(
@@ -539,6 +543,7 @@ def run(switcher) -> int:
                 "setAutoSwitch": lambda payload: (
                     AppHelper.callAfter(self._set_auto, payload["enabled"]),
                 )[0] or {"scheduled": True},
+                "getPrefs": lambda payload: {"theme": self.settings.theme},
                 "setPrefs": self._set_prefs,
                 "quit": lambda payload: (
                     AppHelper.callAfter(self.on_quit),
@@ -568,21 +573,42 @@ def run(switcher) -> int:
         def _set_prefs(self, payload):
             interval = payload.get("refreshInterval")
             title_pct = payload.get("titlePct")
+            theme = payload.get("theme")
+            if theme is not None and theme not in THEME_CHOICES:
+                raise ClaudeSwitchError(f"theme must be one of {THEME_CHOICES}")
             if interval is not None and interval not in REFRESH_CHOICES:
                 raise ClaudeSwitchError(f"refresh interval must be one of {REFRESH_CHOICES}")
             if title_pct is not None and title_pct not in TITLE_PCT_CHOICES:
                 raise ClaudeSwitchError(f"title percentage must be one of {TITLE_PCT_CHOICES}")
 
+            # Save on the main thread with the other preference writers, and
+            # acknowledge only after persistence succeeds (the bridge is a worker).
+            finished = threading.Event()
+            errors = []
+
             def apply():
-                if interval is not None:
-                    self.settings.refresh_interval = interval
-                    self._restart_refresh_timer(interval)
-                if title_pct is not None:
-                    self.settings.title_pct = title_pct
-                self.settings.save(settings_path)
-                self.rebuild_menu()
+                try:
+                    updated = replace(self.settings)
+                    if interval is not None:
+                        updated.refresh_interval = interval
+                    if title_pct is not None:
+                        updated.title_pct = title_pct
+                    if theme is not None:
+                        updated.theme = theme
+                    updated.save(settings_path)
+                    self.settings = updated
+                    if interval is not None:
+                        self._restart_refresh_timer(interval)
+                    self.rebuild_menu()
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
             AppHelper.callAfter(apply)
-            return {"saved": True}
+            finished.wait()
+            if errors:
+                raise errors[0]
+            return {"saved": True, "theme": self.settings.theme}
 
         def handle_webview_message(self, raw: str) -> None:
             self._bridge.handle_message(raw)

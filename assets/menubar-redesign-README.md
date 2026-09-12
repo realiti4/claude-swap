@@ -7,7 +7,7 @@ implement or activate the new interface. All handoff files live in this folder.
 
 | File | Purpose |
 | --- | --- |
-| [untitled.pen](untitled.pen) | Editable Pen source; authoritative visual reference with all eight artboards. Open in Pen. |
+| [untitled.pen](untitled.pen) | Editable Pen source; authoritative visual reference with all ten artboards. Open in Pen. |
 | [1 — Main DARK.png](1%20%E2%80%94%20Main%20DARK.png) | Actual 360 × 560 export of the main dark artboard. |
 | [menubar-redesign-spec.md](menubar-redesign-spec.md) | Layout, state rules, accessibility requirements, and integration notes. |
 | [menubar-redesign-tokens.css](menubar-redesign-tokens.css) | Hand-authored CSS variable seed for both themes; not an exact automated Pen export. |
@@ -26,7 +26,9 @@ editable in the Pen source.
 5. No accounts — login and token setup entry points.
 6. Add token sheet — concealed token, optional email, cancel and submit.
 7. Remove account — explicit confirmation and identity.
-8. Tokens & interaction notes — component and state guidance.
+8. Tokens & interaction notes — component and state guidance, including appearance.
+9. Settings DARK — Appearance selector with Dark selected.
+10. Settings LIGHT — Appearance selector with Light selected.
 
 ## Next-version implementation
 

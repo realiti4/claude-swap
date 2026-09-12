@@ -60,6 +60,15 @@
 
 <dialog id="dlg-settings" aria-labelledby="dlg-settings-title">
   <h3 id="dlg-settings-title">Panel settings</h3>
+  <div class="field">
+    <label for="fld-theme">Appearance</label>
+    <select id="fld-theme" aria-describedby="theme-help" disabled>
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <p id="theme-help">System follows your Mac’s appearance.</p>
+  </div>
   <p>Refresh interval</p>
   <div class="row" style="justify-content:flex-start;gap:6px;margin-top:0">
     <button class="btn ghost" data-dlg="iv" data-iv="30">30s</button>
@@ -79,6 +88,7 @@
 <div id="toasts"></div>
 
 <script src="icons.js?v=3"></script>
+<script src="appearance.js?v=1"></script>
 <script src="sheets.js?v=3"></script>
 <script src="panel.js?v=3"></script>
 </body>

@@ -9946,6 +9946,7 @@
                       "content": "alex@example.com",
                       "fontFamily": "$font-ui",
                       "fontSize": 11.5,
+                      "fontWeight": "normal",
                       "letterSpacing": -0.1
                     },
                     {
@@ -9981,6 +9982,7 @@
                       "content": "resets in 54m",
                       "fontFamily": "$font-ui",
                       "fontSize": 10,
+                      "fontWeight": "normal",
                       "letterSpacing": -0.1
                     },
                     {
@@ -12848,6 +12850,524 @@
         },
         {
           "type": "frame",
+          "id": "jaOhp",
+          "name": "Appearance Notes Section",
+          "width": "fill_container",
+          "layout": "vertical",
+          "gap": 12,
+          "children": [
+            {
+              "type": "frame",
+              "id": "vlX4B",
+              "name": "Appearance Notes Head",
+              "width": "fill_container",
+              "gap": 10,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "ls2cW",
+                  "name": "Appearance Notes Title",
+                  "fill": "$accent-text",
+                  "content": "APPEARANCE & SETTINGS",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "600",
+                  "letterSpacing": 1.2
+                },
+                {
+                  "type": "text",
+                  "id": "VMy1K",
+                  "name": "Appearance Notes Note",
+                  "fill": "$text-tertiary",
+                  "content": "artboards 9 and 10 · the Panel settings sheet",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "qmOwk",
+                  "name": "Appearance Notes Spacer",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "l6DRCU",
+              "name": "Appearance Notes Grid",
+              "width": "fill_container",
+              "gap": 14,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "z0mb2",
+                  "name": "Appearance Notes Column 1",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 10,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "nH2Y2",
+                      "name": "ANote System is the default",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "PFeq3",
+                          "name": "ANote System is the default Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A1",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "uClkM",
+                          "name": "ANote System is the default Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "guwpZ",
+                              "name": "ANote System is the default Title",
+                              "fill": "$text-primary",
+                              "content": "System is the default",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "zOP0P",
+                              "name": "ANote System is the default Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "A fresh install follows the Mac's appearance until someone explicitly picks Light or Dark.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "eZeBh",
+                      "name": "ANote Applies immediately",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "JxhOZ",
+                          "name": "ANote Applies immediately Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A2",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "ZlaqN",
+                          "name": "ANote Applies immediately Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "x73Dsz",
+                              "name": "ANote Applies immediately Title",
+                              "fill": "$text-primary",
+                              "content": "Applies immediately",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "VzQF9",
+                              "name": "ANote Applies immediately Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "Choosing a mode repaints the whole panel and every open sheet at once — no reopen, no relaunch.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Eecac",
+                      "name": "ANote Preference persists",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "f5DKZn",
+                          "name": "ANote Preference persists Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A3",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "eZdzj",
+                          "name": "ANote Preference persists Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "r5kVBp",
+                              "name": "ANote Preference persists Title",
+                              "fill": "$text-primary",
+                              "content": "Preference persists",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "J4sGSp",
+                              "name": "ANote Preference persists Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "The choice survives closing the popover, reopening it, and relaunching the app.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "lno1J",
+                      "name": "ANote System tracks the OS",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Dpivx",
+                          "name": "ANote System tracks the OS Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A4",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "p1AIbj",
+                          "name": "ANote System tracks the OS Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "qYftk",
+                              "name": "ANote System tracks the OS Title",
+                              "fill": "$text-primary",
+                              "content": "System tracks the OS",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "qMlmL",
+                              "name": "ANote System tracks the OS Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "With System selected, the panel follows a macOS appearance change — including the auto light/dark schedule — while it is open.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "gjXse",
+                  "name": "Appearance Notes Column 2",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 10,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "BTStV",
+                      "name": "ANote Save failure",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "n1t3b4",
+                          "name": "ANote Save failure Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A5",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "drpXO",
+                          "name": "ANote Save failure Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "itNTD",
+                              "name": "ANote Save failure Title",
+                              "fill": "$text-primary",
+                              "content": "Save failure",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "EXQXv",
+                              "name": "ANote Save failure Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "If the write fails, the panel restores the last saved appearance and shows an inline error with Retry. The selector never rests on a value that was not saved; a quiet 'Saving…' note sits in the label row while the write is in flight.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Wl0rO",
+                      "name": "ANote Keyboard",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "FxHC8",
+                          "name": "ANote Keyboard Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A6",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "yyYTF",
+                          "name": "ANote Keyboard Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "Q8bk0",
+                              "name": "ANote Keyboard Title",
+                              "fill": "$text-primary",
+                              "content": "Keyboard",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "CHTnb",
+                              "name": "ANote Keyboard Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "Arrow keys move across the segmented choices, Space or Enter selects, Tab reaches every control. Closing the sheet returns focus to the Settings button.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "wlQWd",
+                      "name": "ANote Never colour alone",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "LTpqv",
+                          "name": "ANote Never colour alone Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A7",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "C1f7s",
+                          "name": "ANote Never colour alone Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "jP3uA",
+                              "name": "ANote Never colour alone Title",
+                              "fill": "$text-primary",
+                              "content": "Never colour alone",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "edT2g",
+                              "name": "ANote Never colour alone Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "The selected choice carries a check mark, a heavier label and an accent border, so it reads without depending on hue.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bSKEV",
+                      "name": "ANote Other settings",
+                      "width": "fill_container",
+                      "gap": 9,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "U4x7Td",
+                          "name": "ANote Other settings Index",
+                          "fill": "$accent-text",
+                          "textGrowth": "fixed-width",
+                          "width": 18,
+                          "content": "A8",
+                          "fontFamily": "$font-num",
+                          "fontSize": 9.5,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "lq5Qx",
+                          "name": "ANote Other settings Text",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 2,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "D8EhP",
+                              "name": "ANote Other settings Title",
+                              "fill": "$text-primary",
+                              "content": "Other settings",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10.5,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "text",
+                              "id": "sxJYu",
+                              "name": "ANote Other settings Body",
+                              "fill": "$text-secondary",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "Refresh interval (30s / 60s / 5 min) and title percentage (Off / 5h / 7d / Both) keep the same segmented pattern and the same 12px label floor.",
+                              "lineHeight": 1.45,
+                              "fontFamily": "$font-ui",
+                              "fontSize": 10,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
           "id": "i9QrpU",
           "name": "Scope Note",
           "width": "fill_container",
@@ -12876,11 +13396,3893 @@
               "fill": "$text-secondary",
               "textGrowth": "fixed-width",
               "width": "fill_container",
-              "content": "Backed by the existing model only: slots, alias / email / org, active + switchable + disabled flags, 5h / 7d / per-model usage and resets, optional spend, last-good freshness and errors, auto policy and switch history. No trends, plan labels, forecasts or billing history are drawn anywhere in this design.",
+              "content": "Backed by the existing model only: slots, alias / email / org, active + switchable + disabled flags, 5h / 7d / per-model usage and resets, optional spend, last-good freshness and errors, auto policy and switch history, plus the panel's own local settings (appearance, refresh interval, title percentage). No trends, plan labels, forecasts or billing history are drawn anywhere in this design.",
               "lineHeight": 1.45,
               "fontFamily": "$font-ui",
               "fontSize": 10,
               "fontWeight": "normal"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "TAYjz",
+      "x": 0,
+      "y": 1280,
+      "name": "9 — Settings DARK",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 360,
+      "height": 560,
+      "fill": "$bg",
+      "cornerRadius": 14,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "zbsDX",
+          "name": "Header",
+          "width": "fill_container",
+          "height": 44,
+          "stroke": "$border",
+          "strokeWidth": {
+            "bottom": 1
+          },
+          "gap": 9,
+          "padding": [
+            0,
+            14
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "S0DILe",
+              "name": "Brand Mark",
+              "width": 24,
+              "height": 24,
+              "fill": "$accent-quiet",
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "HdnY9",
+                  "name": "Brand Swap Icon",
+                  "width": 13,
+                  "height": 13,
+                  "icon": "arrow-left-right",
+                  "library": "lucide",
+                  "fill": "$accent-text"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "BcqXo",
+              "name": "Brand Name",
+              "fill": "$text-primary",
+              "content": "claude-swap",
+              "fontFamily": "$font-ui",
+              "fontSize": 13.5,
+              "fontWeight": "600",
+              "letterSpacing": -0.2
+            },
+            {
+              "type": "frame",
+              "id": "L72SMB",
+              "name": "Header Spacer",
+              "width": "fill_container",
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "hCEC3",
+              "name": "Refresh Button",
+              "width": 26,
+              "height": 26,
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "g0QyZ8",
+                  "name": "Refresh Icon",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "refresh-cw",
+                  "library": "lucide",
+                  "fill": "$text-secondary"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "cDgsW",
+              "name": "Settings Button",
+              "width": 26,
+              "height": 26,
+              "fill": "$accent-quiet",
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "FvZbW",
+                  "name": "Settings Icon",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "settings",
+                  "library": "lucide",
+                  "fill": "$accent-text"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "C4Hh8",
+          "name": "Body",
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "gap": 10,
+          "padding": [
+            10,
+            14
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "G2fbp",
+              "name": "Account Card",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 9,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "gj0we",
+                  "name": "Chips Row",
+                  "width": "fill_container",
+                  "gap": 6,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "IoyZ6",
+                      "name": "Chip Work",
+                      "width": "fill_container",
+                      "fill": "$surface-3",
+                      "cornerRadius": 8,
+                      "stroke": "$accent",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "XgBHh",
+                          "name": "Chip Work Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "pNSvi",
+                              "name": "Chip Work Alias",
+                              "fill": "$text-primary",
+                              "content": "Work",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "jioWp",
+                              "name": "Chip Work Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "C9fWA",
+                              "name": "Chip Work Active Dot",
+                              "fill": "$ok",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "mvuD4",
+                          "name": "Chip Work Status",
+                          "fill": "$ok",
+                          "content": "Active",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "gHdwh",
+                      "name": "Chip Personal",
+                      "width": "fill_container",
+                      "fill": "$surface-2",
+                      "cornerRadius": 8,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "SR62W",
+                          "name": "Chip Personal Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "B9V7Y",
+                              "name": "Chip Personal Alias",
+                              "fill": "$text-primary",
+                              "content": "Personal",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "F3Gtq",
+                              "name": "Chip Personal Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "Ic892",
+                              "x": 0,
+                              "y": 0,
+                              "name": "Chip Personal Active Dot",
+                              "enabled": false,
+                              "fill": "#00000000",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "VeWda",
+                          "name": "Chip Personal Status",
+                          "fill": "$text-tertiary",
+                          "content": "Ready",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "mH4wg",
+                      "name": "Chip Backup",
+                      "width": "fill_container",
+                      "fill": "$surface-2",
+                      "cornerRadius": 8,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "K5Rxac",
+                          "name": "Chip Backup Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "cyIKA",
+                              "name": "Chip Backup Alias",
+                              "fill": "$text-secondary",
+                              "content": "Backup",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "XToCl",
+                              "name": "Chip Backup Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "fMN3q",
+                              "x": 0,
+                              "y": 0,
+                              "name": "Chip Backup Active Dot",
+                              "enabled": false,
+                              "fill": "#00000000",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "K7sKC",
+                          "name": "Chip Backup Status",
+                          "fill": "$text-tertiary",
+                          "content": "Disabled",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "fALZL",
+                  "name": "Account Divider",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "J1yYjr",
+                  "name": "Identity Row",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "zkjtC",
+                      "name": "Identity Text",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 2,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "x4IZ3F",
+                          "name": "Identity Email",
+                          "fill": "$text-primary",
+                          "content": "alex@example.com",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 14,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.25
+                        },
+                        {
+                          "type": "text",
+                          "id": "RFkin",
+                          "name": "Identity Meta",
+                          "fill": "$text-tertiary",
+                          "content": "acme-eng · slot 1 · selected",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10.5,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "s79MXh",
+                      "name": "Identity Pill",
+                      "fill": "$accent-quiet",
+                      "cornerRadius": 20,
+                      "gap": 4,
+                      "padding": [
+                        3,
+                        7
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Tt41m",
+                          "name": "Identity Pill Label",
+                          "fill": "$accent-text",
+                          "content": "ACTIVE",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "600",
+                          "letterSpacing": 0.45
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "MoNtR",
+              "name": "Usage Card",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 11,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "MGHKk",
+                  "name": "5h Meter",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 4,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "A6X0Xr",
+                      "name": "5h Head",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "pJznY",
+                          "name": "5h Label",
+                          "fill": "$text-secondary",
+                          "content": "5-hour window",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "AFtm6",
+                          "name": "5h Head Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "kf22v",
+                          "name": "5h Percent",
+                          "fill": "$text-primary",
+                          "content": "68% USED",
+                          "fontFamily": "$font-num",
+                          "fontSize": 12,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "XY0dA",
+                      "name": "5h Track",
+                      "clip": true,
+                      "width": "fill_container",
+                      "height": 6,
+                      "fill": "$track",
+                      "cornerRadius": 3,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "AZGhz",
+                          "name": "5h Fill",
+                          "width": 209,
+                          "height": "fill_container",
+                          "fill": "$accent",
+                          "cornerRadius": 3
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "EKwJt",
+                      "name": "5h Caption Row",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "zwDHf",
+                          "name": "5h Reset",
+                          "fill": "$text-tertiary",
+                          "content": "resets in 54m",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "gbSP4",
+                          "name": "5h Caption Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "LGZTb",
+                  "name": "Usage Divider A",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "Vun4F",
+                  "name": "7d Meter",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 4,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "gqCMj",
+                      "name": "7d Head",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "BsOH9",
+                          "name": "7d Label",
+                          "fill": "$text-secondary",
+                          "content": "7-day window",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "Uzzr1",
+                          "name": "7d Head Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "B3U8L",
+                          "name": "7d Percent",
+                          "fill": "$text-primary",
+                          "content": "41% USED",
+                          "fontFamily": "$font-num",
+                          "fontSize": 12,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "F8LmI",
+                      "name": "7d Track",
+                      "clip": true,
+                      "width": "fill_container",
+                      "height": 6,
+                      "fill": "$track",
+                      "cornerRadius": 3,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "bad7C",
+                          "name": "7d Fill",
+                          "width": 126,
+                          "height": "fill_container",
+                          "fill": "$accent",
+                          "cornerRadius": 3
+                        },
+                        {
+                          "type": "frame",
+                          "id": "F9jjF",
+                          "layoutPosition": "absolute",
+                          "x": 62,
+                          "y": 0,
+                          "name": "7d Pace Marker",
+                          "opacity": 0.55,
+                          "width": 1.5,
+                          "height": 6,
+                          "fill": "$text-primary"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "O1ngXt",
+                      "name": "7d Caption Row",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "WQe9s",
+                          "name": "7d Reset",
+                          "fill": "$text-tertiary",
+                          "content": "resets in 5d 14h",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "M3KFv",
+                          "name": "7d Caption Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "sGLb4",
+                          "name": "7d Note",
+                          "fill": "$warn",
+                          "content": "ahead of pace",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10.5,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "ndCvI",
+                  "name": "Usage Divider B",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "qjDCN",
+                  "name": "Per-model Section",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "e5i8g",
+                      "name": "Per-model Header",
+                      "width": "fill_container",
+                      "gap": 5,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "nQTBO",
+                          "name": "Per-model Chevron",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "chevron-right",
+                          "library": "lucide",
+                          "fill": "$text-tertiary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "H0fL0W",
+                          "name": "Per-model Title",
+                          "fill": "$text-secondary",
+                          "content": "Per-model · 7-day",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "mD4Fl",
+                          "name": "Per-model Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "ilBDM",
+                          "name": "Per-model Hint",
+                          "fill": "$warn",
+                          "content": "Opus 84% used",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "hsH9v",
+                      "x": 0,
+                      "y": 22,
+                      "name": "Opus Row",
+                      "enabled": false,
+                      "width": "fill_container(310)",
+                      "gap": 8,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "O6WDX",
+                          "name": "Opus Name Box",
+                          "width": 46,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "L4EqG",
+                              "name": "Opus Name",
+                              "fill": "$text-secondary",
+                              "content": "Opus",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "aiHgh",
+                          "name": "Opus Track",
+                          "clip": true,
+                          "width": "fill_container",
+                          "height": 4,
+                          "fill": "$track",
+                          "cornerRadius": 2,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "QRoNJ",
+                              "name": "Opus Fill",
+                              "width": 156,
+                              "height": "fill_container",
+                              "fill": "$warn",
+                              "cornerRadius": 2
+                            },
+                            {
+                              "type": "frame",
+                              "id": "BFpaj",
+                              "layoutPosition": "absolute",
+                              "x": 102,
+                              "y": 0,
+                              "name": "Opus Pace Marker",
+                              "opacity": 0.55,
+                              "width": 1.5,
+                              "height": 4,
+                              "fill": "$text-primary"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "cUmF4",
+                          "name": "Opus Percent",
+                          "fill": "$warn",
+                          "textGrowth": "fixed-width",
+                          "width": 62,
+                          "content": "84% used",
+                          "textAlign": "right",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11.5,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "oy3Cu",
+                      "x": 0,
+                      "y": 44,
+                      "name": "Sonnet Row",
+                      "enabled": false,
+                      "width": "fill_container(310)",
+                      "gap": 8,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "a0PUEL",
+                          "name": "Sonnet Name Box",
+                          "width": 46,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "aJ3Z8",
+                              "name": "Sonnet Name",
+                              "fill": "$text-secondary",
+                              "content": "Sonnet",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "gr3tl",
+                          "name": "Sonnet Track",
+                          "clip": true,
+                          "width": "fill_container",
+                          "height": 4,
+                          "fill": "$track",
+                          "cornerRadius": 2,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "u3JRb",
+                              "name": "Sonnet Fill",
+                              "width": 41,
+                              "height": "fill_container",
+                              "fill": "$accent",
+                              "cornerRadius": 2
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "S5z4UC",
+                          "name": "Sonnet Percent",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": 62,
+                          "content": "22% used",
+                          "textAlign": "right",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11.5,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.1
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "AE4Hc",
+                  "name": "Usage Divider C",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "h8pXv",
+                  "name": "Spend Row",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "a2QOIA",
+                      "name": "Spend Icon",
+                      "width": 12,
+                      "height": 12,
+                      "icon": "receipt",
+                      "library": "lucide",
+                      "fill": "$text-tertiary"
+                    },
+                    {
+                      "type": "text",
+                      "id": "p6Ixoc",
+                      "name": "Spend Label",
+                      "fill": "$text-secondary",
+                      "content": "Spend",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Ig46y",
+                      "name": "Spend Spacer",
+                      "width": "fill_container",
+                      "height": 1
+                    },
+                    {
+                      "type": "text",
+                      "id": "lwHMQ",
+                      "name": "Spend Value",
+                      "fill": "$text-primary",
+                      "content": "$12.40 / $100",
+                      "fontFamily": "$font-num",
+                      "fontSize": 12,
+                      "fontWeight": "normal",
+                      "letterSpacing": -0.1
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "x1uNID",
+              "name": "Actions",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 7,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Nqfpm",
+                  "name": "Primary Action",
+                  "width": "fill_container",
+                  "height": 34,
+                  "fill": "$surface-2",
+                  "cornerRadius": 9,
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "ZtRg3",
+                      "name": "Primary Action Icon",
+                      "width": 13,
+                      "height": 13,
+                      "icon": "check",
+                      "library": "lucide",
+                      "fill": "$text-tertiary"
+                    },
+                    {
+                      "type": "text",
+                      "id": "njkAH",
+                      "name": "Primary Action Label",
+                      "fill": "$text-tertiary",
+                      "content": "Current account",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 13,
+                      "fontWeight": "600",
+                      "letterSpacing": -0.1
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "S92iJJ",
+                  "name": "Secondary Actions",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "LGz0s",
+                      "name": "Best Button",
+                      "width": "fill_container",
+                      "height": 30,
+                      "fill": "$surface",
+                      "cornerRadius": 9,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "gap": 6,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "Xvis6",
+                          "name": "Best Icon",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "sparkles",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "nm2ef",
+                          "name": "Best Label",
+                          "fill": "$text-primary",
+                          "content": "Best",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "RRhwB",
+                      "name": "Rotate Button",
+                      "width": "fill_container",
+                      "height": 30,
+                      "fill": "$surface",
+                      "cornerRadius": 9,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "gap": 6,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "oSkto",
+                          "name": "Rotate Icon",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "rotate-cw",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "j6s5N",
+                          "name": "Rotate Label",
+                          "fill": "$text-primary",
+                          "content": "Rotate",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "d0khgH",
+              "name": "Auto-switch Row",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "gap": 10,
+              "padding": [
+                8,
+                12
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "itt6z",
+                  "name": "Auto-switch Text",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 2,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "wM77m",
+                      "name": "Auto-switch Title",
+                      "fill": "$text-primary",
+                      "content": "Auto-switch",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 12,
+                      "fontWeight": "normal",
+                      "letterSpacing": -0.1
+                    },
+                    {
+                      "type": "text",
+                      "id": "kEwUB",
+                      "name": "Auto-switch Policy",
+                      "fill": "$text-tertiary",
+                      "content": "at 90% used · best account",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 10.5,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "VNN0H",
+                  "name": "Auto-switch Toggle",
+                  "width": 32,
+                  "height": 19,
+                  "fill": "$accent",
+                  "cornerRadius": 10,
+                  "padding": [
+                    0,
+                    2
+                  ],
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "BDqrc",
+                      "name": "Auto-switch Knob",
+                      "fill": "$on-accent",
+                      "width": 15,
+                      "height": 15
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "tB3LE",
+          "name": "Footer",
+          "width": "fill_container",
+          "height": 30,
+          "stroke": "$border",
+          "strokeWidth": {
+            "top": 1
+          },
+          "gap": 6,
+          "padding": [
+            0,
+            14
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "ellipse",
+              "id": "uzULb",
+              "name": "Freshness Dot",
+              "fill": "$ok",
+              "width": 5,
+              "height": 5
+            },
+            {
+              "type": "text",
+              "id": "ODUel",
+              "name": "Freshness Label",
+              "fill": "$text-tertiary",
+              "content": "Updated 12s ago",
+              "fontFamily": "$font-ui",
+              "fontSize": 10.5,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "frame",
+              "id": "VlxVE",
+              "name": "Footer Spacer",
+              "width": "fill_container",
+              "height": 1
+            },
+            {
+              "type": "text",
+              "id": "O6M0yF",
+              "name": "Activity Link",
+              "fill": "$accent-text",
+              "content": "Activity",
+              "fontFamily": "$font-ui",
+              "fontSize": 10.5,
+              "fontWeight": "600"
+            },
+            {
+              "type": "icon",
+              "id": "f62xrW",
+              "name": "Activity Chevron",
+              "width": 11,
+              "height": 11,
+              "icon": "chevron-right",
+              "library": "lucide",
+              "fill": "$accent-text"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "dqAWb",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Settings Scrim",
+          "width": 360,
+          "height": 560,
+          "fill": "$overlay",
+          "layout": "vertical",
+          "justifyContent": "end",
+          "children": [
+            {
+              "type": "frame",
+              "id": "qK45B",
+              "name": "Settings Sheet",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": 14,
+              "stroke": "$border-strong",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "m98ed",
+                  "name": "Settings Sheet Header",
+                  "width": "fill_container",
+                  "height": 42,
+                  "stroke": "$border",
+                  "strokeWidth": {
+                    "bottom": 1
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    14
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "GORYj",
+                      "name": "Settings Sheet Title",
+                      "fill": "$text-primary",
+                      "content": "Settings",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 13.5,
+                      "fontWeight": "600",
+                      "letterSpacing": -0.2
+                    },
+                    {
+                      "type": "frame",
+                      "id": "elPkx",
+                      "name": "Settings Sheet Title Spacer",
+                      "width": "fill_container",
+                      "height": 1
+                    },
+                    {
+                      "type": "frame",
+                      "id": "McTCf",
+                      "name": "Settings Close Button",
+                      "width": 24,
+                      "height": 24,
+                      "cornerRadius": 7,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "Qopn0",
+                          "name": "Settings Close Icon",
+                          "width": 13,
+                          "height": 13,
+                          "icon": "x",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "dTtPI",
+                  "name": "Settings Body",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 14,
+                  "padding": 14,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "SRfH7",
+                      "name": "Appearance Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "jH6LK",
+                          "name": "Appearance Label Row",
+                          "width": "fill_container",
+                          "gap": 8,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "baxoV",
+                              "name": "Appearance Label",
+                              "fill": "$text-primary",
+                              "content": "Appearance",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "g9hGmD",
+                              "name": "Appearance Label Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "yuJRD",
+                              "x": 0,
+                              "y": 0,
+                              "name": "Appearance Saving (hidden variant)",
+                              "enabled": false,
+                              "gap": 5,
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "s5Hdr",
+                                  "name": "Appearance Saving Icon",
+                                  "width": 11,
+                                  "height": 11,
+                                  "icon": "loader-circle",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "X6Gv8",
+                                  "name": "Appearance Saving Text",
+                                  "fill": "$text-tertiary",
+                                  "content": "Saving…",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "normal"
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "NO34s",
+                          "name": "Appearance Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "gemFx",
+                              "name": "Appearance System",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "tjZS3",
+                                  "x": 0,
+                                  "y": 0,
+                                  "name": "Appearance System Check",
+                                  "enabled": false,
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "rvdR7",
+                                  "name": "Appearance System Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "monitor",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "vDe9s",
+                                  "name": "Appearance System Label",
+                                  "fill": "$text-secondary",
+                                  "content": "System",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "VJF92",
+                              "name": "Appearance Light",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "IxMUf",
+                                  "x": 0,
+                                  "y": 0,
+                                  "name": "Appearance Light Check",
+                                  "enabled": false,
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "W7HXr",
+                                  "name": "Appearance Light Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "sun",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "BbMTI",
+                                  "name": "Appearance Light Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Light",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "bQnfp",
+                              "name": "Appearance Dark",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "fQqSw",
+                                  "name": "Appearance Dark Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "w6nvnM",
+                                  "name": "Appearance Dark Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "moon",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "kMm6f",
+                                  "name": "Appearance Dark Label",
+                                  "fill": "$accent-text",
+                                  "content": "Dark",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "ogA7o",
+                          "name": "Appearance Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "System follows your Mac's appearance.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "o7meey",
+                          "x": 0,
+                          "y": 89,
+                          "name": "Appearance Error (hidden variant)",
+                          "enabled": false,
+                          "width": "fill_container(332)",
+                          "fill": "$danger-quiet",
+                          "cornerRadius": 8,
+                          "stroke": "$danger",
+                          "strokeWidth": 1,
+                          "gap": 6,
+                          "padding": [
+                            6,
+                            9
+                          ],
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "icon",
+                              "id": "iRt2v",
+                              "name": "Appearance Error Icon",
+                              "width": 12,
+                              "height": 12,
+                              "icon": "triangle-alert",
+                              "library": "lucide",
+                              "fill": "$danger"
+                            },
+                            {
+                              "type": "text",
+                              "id": "pnyzE",
+                              "name": "Appearance Error Text",
+                              "fill": "$danger",
+                              "content": "Couldn't save — kept last saved (Dark)",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            },
+                            {
+                              "type": "frame",
+                              "id": "U9ZyBC",
+                              "name": "Appearance Error Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "text",
+                              "id": "W8pUr",
+                              "name": "Appearance Error Retry",
+                              "fill": "$danger",
+                              "content": "Retry",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "r7ofu7",
+                      "name": "Refresh Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "VrsIO",
+                      "name": "Refresh Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "qID8E",
+                          "name": "Refresh Label",
+                          "fill": "$text-primary",
+                          "content": "Refresh interval",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "TwG5i",
+                          "name": "Refresh Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "fKtqZ",
+                              "name": "Refresh 30s",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "WJl1Q",
+                                  "name": "Refresh 30s Label",
+                                  "fill": "$text-secondary",
+                                  "content": "30s",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "ULnE5",
+                              "name": "Refresh 60s",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "m5xaS",
+                                  "name": "Refresh 60s Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "yFI4p",
+                                  "name": "Refresh 60s Label",
+                                  "fill": "$accent-text",
+                                  "content": "60s",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "FOhXx",
+                              "name": "Refresh 5 min",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "Bbw0E",
+                                  "name": "Refresh 5 min Label",
+                                  "fill": "$text-secondary",
+                                  "content": "5 min",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "fg7y0",
+                          "name": "Refresh Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "How often usage is re-measured.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "t7ElIB",
+                      "name": "Title Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "iLYeN",
+                      "name": "Title Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "hXluJ",
+                          "name": "Title Label",
+                          "fill": "$text-primary",
+                          "content": "Title percentage",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "y0PP3z",
+                          "name": "Title Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "snUwx",
+                              "name": "Title Off",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "j2SuA1",
+                                  "name": "Title Off Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Off",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "ElnVs",
+                              "name": "Title 5h",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "PDxIs",
+                                  "name": "Title 5h Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "mVn3c",
+                                  "name": "Title 5h Label",
+                                  "fill": "$accent-text",
+                                  "content": "5h",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "Bysbs",
+                              "name": "Title 7d",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "BxTH7",
+                                  "name": "Title 7d Label",
+                                  "fill": "$text-secondary",
+                                  "content": "7d",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "L7IlyW",
+                              "name": "Title Both",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "p0ANg",
+                                  "name": "Title Both Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Both",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "D0E9ta",
+                          "name": "Title Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "Shown next to the menu bar icon.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "d0LmIF",
+                      "name": "Settings Actions Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "eoZnK",
+                      "name": "Done Button",
+                      "width": "fill_container",
+                      "height": 34,
+                      "fill": "$accent",
+                      "cornerRadius": 9,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Fkphy",
+                          "name": "Done Label",
+                          "fill": "$on-accent",
+                          "content": "Done",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 13,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "zswVC",
+      "x": 420,
+      "y": 1280,
+      "name": "10 — Settings LIGHT",
+      "theme": {
+        "mode": "light"
+      },
+      "clip": true,
+      "width": 360,
+      "height": 560,
+      "fill": "$bg",
+      "cornerRadius": 14,
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "iYVma",
+          "name": "Header",
+          "width": "fill_container",
+          "height": 44,
+          "stroke": "$border",
+          "strokeWidth": {
+            "bottom": 1
+          },
+          "gap": 9,
+          "padding": [
+            0,
+            14
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "aXEUR",
+              "name": "Brand Mark",
+              "width": 24,
+              "height": 24,
+              "fill": "$accent-quiet",
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "rBdWC",
+                  "name": "Brand Swap Icon",
+                  "width": 13,
+                  "height": 13,
+                  "icon": "arrow-left-right",
+                  "library": "lucide",
+                  "fill": "$accent-text"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "j06DMr",
+              "name": "Brand Name",
+              "fill": "$text-primary",
+              "content": "claude-swap",
+              "fontFamily": "$font-ui",
+              "fontSize": 13.5,
+              "fontWeight": "600",
+              "letterSpacing": -0.2
+            },
+            {
+              "type": "frame",
+              "id": "GUOG6",
+              "name": "Header Spacer",
+              "width": "fill_container",
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "mA59s",
+              "name": "Refresh Button",
+              "width": 26,
+              "height": 26,
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "eA3ty",
+                  "name": "Refresh Icon",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "refresh-cw",
+                  "library": "lucide",
+                  "fill": "$text-secondary"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "WR5Ox",
+              "name": "Settings Button",
+              "width": 26,
+              "height": 26,
+              "fill": "$accent-quiet",
+              "cornerRadius": 7,
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "WdFlz",
+                  "name": "Settings Icon",
+                  "width": 14,
+                  "height": 14,
+                  "icon": "settings",
+                  "library": "lucide",
+                  "fill": "$accent-text"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "U8hZPS",
+          "name": "Body",
+          "width": "fill_container",
+          "height": "fill_container",
+          "layout": "vertical",
+          "gap": 10,
+          "padding": [
+            10,
+            14
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "Xhlrs",
+              "name": "Account Card",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 9,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Q0gPA",
+                  "name": "Chips Row",
+                  "width": "fill_container",
+                  "gap": 6,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "vtxMg",
+                      "name": "Chip Work",
+                      "width": "fill_container",
+                      "fill": "$surface-3",
+                      "cornerRadius": 8,
+                      "stroke": "$accent",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "iKGwx",
+                          "name": "Chip Work Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "mnwxY",
+                              "name": "Chip Work Alias",
+                              "fill": "$text-primary",
+                              "content": "Work",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "Sb3zV",
+                              "name": "Chip Work Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "UrfIB",
+                              "name": "Chip Work Active Dot",
+                              "fill": "$ok",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "jxyXc",
+                          "name": "Chip Work Status",
+                          "fill": "$ok",
+                          "content": "Active",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "gyFTe",
+                      "name": "Chip Personal",
+                      "width": "fill_container",
+                      "fill": "$surface-2",
+                      "cornerRadius": 8,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "iZHDH",
+                          "name": "Chip Personal Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "O40qO",
+                              "name": "Chip Personal Alias",
+                              "fill": "$text-primary",
+                              "content": "Personal",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "zQ8sS",
+                              "name": "Chip Personal Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "lOT10",
+                              "x": 0,
+                              "y": 0,
+                              "name": "Chip Personal Active Dot",
+                              "enabled": false,
+                              "fill": "#00000000",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "e5Dunt",
+                          "name": "Chip Personal Status",
+                          "fill": "$text-tertiary",
+                          "content": "Ready",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "y5TMg",
+                      "name": "Chip Backup",
+                      "width": "fill_container",
+                      "fill": "$surface-2",
+                      "cornerRadius": 8,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "layout": "vertical",
+                      "gap": 2,
+                      "padding": [
+                        6,
+                        8
+                      ],
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "l4P6Rh",
+                          "name": "Chip Backup Top",
+                          "width": "fill_container",
+                          "gap": 5,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "GVQYX",
+                              "name": "Chip Backup Alias",
+                              "fill": "$text-secondary",
+                              "content": "Backup",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "KrgLE",
+                              "name": "Chip Backup Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "ellipse",
+                              "id": "cZ1lF",
+                              "x": 0,
+                              "y": 0,
+                              "name": "Chip Backup Active Dot",
+                              "enabled": false,
+                              "fill": "#00000000",
+                              "width": 5,
+                              "height": 5
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "X67s5",
+                          "name": "Chip Backup Status",
+                          "fill": "$text-tertiary",
+                          "content": "Disabled",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.2
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "j8J4I",
+                  "name": "Account Divider",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "cD9cG",
+                  "name": "Identity Row",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "GTk4p",
+                      "name": "Identity Text",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 2,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "MTSJt",
+                          "name": "Identity Email",
+                          "fill": "$text-primary",
+                          "content": "alex@example.com",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 14,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.25
+                        },
+                        {
+                          "type": "text",
+                          "id": "uFDG3",
+                          "name": "Identity Meta",
+                          "fill": "$text-tertiary",
+                          "content": "acme-eng · slot 1 · selected",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10.5,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "P2Ig2k",
+                      "name": "Identity Pill",
+                      "fill": "$accent-quiet",
+                      "cornerRadius": 20,
+                      "gap": 4,
+                      "padding": [
+                        3,
+                        7
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "A0kqB",
+                          "name": "Identity Pill Label",
+                          "fill": "$accent-text",
+                          "content": "ACTIVE",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "600",
+                          "letterSpacing": 0.45
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Q9opdy",
+              "name": "Usage Card",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 11,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "tIJen",
+                  "name": "5h Meter",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 4,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "aQNXt",
+                      "name": "5h Head",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "vWgaG",
+                          "name": "5h Label",
+                          "fill": "$text-secondary",
+                          "content": "5-hour window",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "b3RFjM",
+                          "name": "5h Head Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "myfo1",
+                          "name": "5h Percent",
+                          "fill": "$text-primary",
+                          "content": "68% USED",
+                          "fontFamily": "$font-num",
+                          "fontSize": 12,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "HIIRp",
+                      "name": "5h Track",
+                      "clip": true,
+                      "width": "fill_container",
+                      "height": 6,
+                      "fill": "$track",
+                      "cornerRadius": 3,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "ewAqr",
+                          "name": "5h Fill",
+                          "width": 209,
+                          "height": "fill_container",
+                          "fill": "$accent",
+                          "cornerRadius": 3
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "IHYKz",
+                      "name": "5h Caption Row",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "WF1lx",
+                          "name": "5h Reset",
+                          "fill": "$text-tertiary",
+                          "content": "resets in 54m",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "phOvT",
+                          "name": "5h Caption Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "VVfvu",
+                  "name": "Usage Divider A",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "aYlxc",
+                  "name": "7d Meter",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 4,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "o1Z4X",
+                      "name": "7d Head",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "F4xX3Q",
+                          "name": "7d Label",
+                          "fill": "$text-secondary",
+                          "content": "7-day window",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "v23W9d",
+                          "name": "7d Head Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "HksoZ",
+                          "name": "7d Percent",
+                          "fill": "$text-primary",
+                          "content": "41% USED",
+                          "fontFamily": "$font-num",
+                          "fontSize": 12,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bjt9V",
+                      "name": "7d Track",
+                      "clip": true,
+                      "width": "fill_container",
+                      "height": 6,
+                      "fill": "$track",
+                      "cornerRadius": 3,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "LuCJ3",
+                          "name": "7d Fill",
+                          "width": 126,
+                          "height": "fill_container",
+                          "fill": "$accent",
+                          "cornerRadius": 3
+                        },
+                        {
+                          "type": "frame",
+                          "id": "zThLg",
+                          "layoutPosition": "absolute",
+                          "x": 62,
+                          "y": 0,
+                          "name": "7d Pace Marker",
+                          "opacity": 0.55,
+                          "width": 1.5,
+                          "height": 6,
+                          "fill": "$text-primary"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "pySzF",
+                      "name": "7d Caption Row",
+                      "width": "fill_container",
+                      "gap": 6,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "xLKEB",
+                          "name": "7d Reset",
+                          "fill": "$text-tertiary",
+                          "content": "resets in 5d 14h",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 11,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "DILQv",
+                          "name": "7d Caption Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "wSS2u",
+                          "name": "7d Note",
+                          "fill": "$warn",
+                          "content": "ahead of pace",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10.5,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "MQtCi",
+                  "name": "Usage Divider B",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "DnFsX",
+                  "name": "Per-model Section",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "tH3VS",
+                      "name": "Per-model Header",
+                      "width": "fill_container",
+                      "gap": 5,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "H8GrN",
+                          "name": "Per-model Chevron",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "chevron-right",
+                          "library": "lucide",
+                          "fill": "$text-tertiary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "d46oTS",
+                          "name": "Per-model Title",
+                          "fill": "$text-secondary",
+                          "content": "Per-model · 7-day",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "t9dc0",
+                          "name": "Per-model Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "text",
+                          "id": "R4mlGw",
+                          "name": "Per-model Hint",
+                          "fill": "$warn",
+                          "content": "Opus 84% used",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "U4Jkmw",
+                      "x": 0,
+                      "y": 22,
+                      "name": "Opus Row",
+                      "enabled": false,
+                      "width": "fill_container(310)",
+                      "gap": 8,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "cTPU2",
+                          "name": "Opus Name Box",
+                          "width": 46,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "g4SXw",
+                              "name": "Opus Name",
+                              "fill": "$text-secondary",
+                              "content": "Opus",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "aNR8t",
+                          "name": "Opus Track",
+                          "clip": true,
+                          "width": "fill_container",
+                          "height": 4,
+                          "fill": "$track",
+                          "cornerRadius": 2,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "V1nkD",
+                              "name": "Opus Fill",
+                              "width": 156,
+                              "height": "fill_container",
+                              "fill": "$warn",
+                              "cornerRadius": 2
+                            },
+                            {
+                              "type": "frame",
+                              "id": "jYBBO",
+                              "layoutPosition": "absolute",
+                              "x": 102,
+                              "y": 0,
+                              "name": "Opus Pace Marker",
+                              "opacity": 0.55,
+                              "width": 1.5,
+                              "height": 4,
+                              "fill": "$text-primary"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "V2UWjc",
+                          "name": "Opus Percent",
+                          "fill": "$warn",
+                          "textGrowth": "fixed-width",
+                          "width": 62,
+                          "content": "84% used",
+                          "textAlign": "right",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11.5,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "DmIdh",
+                      "x": 0,
+                      "y": 44,
+                      "name": "Sonnet Row",
+                      "enabled": false,
+                      "width": "fill_container(310)",
+                      "gap": 8,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "N7Kki",
+                          "name": "Sonnet Name Box",
+                          "width": 46,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "aLaml",
+                              "name": "Sonnet Name",
+                              "fill": "$text-secondary",
+                              "content": "Sonnet",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "uX9vX",
+                          "name": "Sonnet Track",
+                          "clip": true,
+                          "width": "fill_container",
+                          "height": 4,
+                          "fill": "$track",
+                          "cornerRadius": 2,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "ZcHBM",
+                              "name": "Sonnet Fill",
+                              "width": 41,
+                              "height": "fill_container",
+                              "fill": "$accent",
+                              "cornerRadius": 2
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "kCts0",
+                          "name": "Sonnet Percent",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": 62,
+                          "content": "22% used",
+                          "textAlign": "right",
+                          "fontFamily": "$font-num",
+                          "fontSize": 11.5,
+                          "fontWeight": "normal",
+                          "letterSpacing": 0.1
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "c5wuk",
+                  "name": "Usage Divider C",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "$border"
+                },
+                {
+                  "type": "frame",
+                  "id": "B0SvZ",
+                  "name": "Spend Row",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "VvaCe",
+                      "name": "Spend Icon",
+                      "width": 12,
+                      "height": 12,
+                      "icon": "receipt",
+                      "library": "lucide",
+                      "fill": "$text-tertiary"
+                    },
+                    {
+                      "type": "text",
+                      "id": "cycZ1",
+                      "name": "Spend Label",
+                      "fill": "$text-secondary",
+                      "content": "Spend",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "IVmUP",
+                      "name": "Spend Spacer",
+                      "width": "fill_container",
+                      "height": 1
+                    },
+                    {
+                      "type": "text",
+                      "id": "M7QfTI",
+                      "name": "Spend Value",
+                      "fill": "$text-primary",
+                      "content": "$12.40 / $100",
+                      "fontFamily": "$font-num",
+                      "fontSize": 12,
+                      "fontWeight": "normal",
+                      "letterSpacing": -0.1
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "DcGBr",
+              "name": "Actions",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 7,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "nITmO",
+                  "name": "Primary Action",
+                  "width": "fill_container",
+                  "height": 34,
+                  "fill": "$surface-2",
+                  "cornerRadius": 9,
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "HThpe",
+                      "name": "Primary Action Icon",
+                      "width": 13,
+                      "height": 13,
+                      "icon": "check",
+                      "library": "lucide",
+                      "fill": "$text-tertiary"
+                    },
+                    {
+                      "type": "text",
+                      "id": "NaWuG",
+                      "name": "Primary Action Label",
+                      "fill": "$text-tertiary",
+                      "content": "Current account",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 13,
+                      "fontWeight": "600",
+                      "letterSpacing": -0.1
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "QSMFe",
+                  "name": "Secondary Actions",
+                  "width": "fill_container",
+                  "gap": 8,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "of0Hz",
+                      "name": "Best Button",
+                      "width": "fill_container",
+                      "height": 30,
+                      "fill": "$surface",
+                      "cornerRadius": 9,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "gap": 6,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "cAhZl",
+                          "name": "Best Icon",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "sparkles",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "ijiZp",
+                          "name": "Best Label",
+                          "fill": "$text-primary",
+                          "content": "Best",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "R9pCr",
+                      "name": "Rotate Button",
+                      "width": "fill_container",
+                      "height": 30,
+                      "fill": "$surface",
+                      "cornerRadius": 9,
+                      "stroke": "$border",
+                      "strokeWidth": 1,
+                      "gap": 6,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "Yz2Z7",
+                          "name": "Rotate Icon",
+                          "width": 12,
+                          "height": 12,
+                          "icon": "rotate-cw",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        },
+                        {
+                          "type": "text",
+                          "id": "TJNhl",
+                          "name": "Rotate Label",
+                          "fill": "$text-primary",
+                          "content": "Rotate",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "WpNGW",
+              "name": "Auto-switch Row",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": "$radius",
+              "stroke": "$border",
+              "strokeWidth": 1,
+              "gap": 10,
+              "padding": [
+                8,
+                12
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "KZ66I",
+                  "name": "Auto-switch Text",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 2,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "WwOcX",
+                      "name": "Auto-switch Title",
+                      "fill": "$text-primary",
+                      "content": "Auto-switch",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 12,
+                      "fontWeight": "normal",
+                      "letterSpacing": -0.1
+                    },
+                    {
+                      "type": "text",
+                      "id": "Jj55i",
+                      "name": "Auto-switch Policy",
+                      "fill": "$text-tertiary",
+                      "content": "at 90% used · best account",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 10.5,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "TMj5k",
+                  "name": "Auto-switch Toggle",
+                  "width": 32,
+                  "height": 19,
+                  "fill": "$accent",
+                  "cornerRadius": 10,
+                  "padding": [
+                    0,
+                    2
+                  ],
+                  "justifyContent": "end",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "ellipse",
+                      "id": "X94OL",
+                      "name": "Auto-switch Knob",
+                      "fill": "$on-accent",
+                      "width": 15,
+                      "height": 15
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "q8QBj",
+          "name": "Footer",
+          "width": "fill_container",
+          "height": 30,
+          "stroke": "$border",
+          "strokeWidth": {
+            "top": 1
+          },
+          "gap": 6,
+          "padding": [
+            0,
+            14
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "ellipse",
+              "id": "f2prlF",
+              "name": "Freshness Dot",
+              "fill": "$ok",
+              "width": 5,
+              "height": 5
+            },
+            {
+              "type": "text",
+              "id": "vm7AC",
+              "name": "Freshness Label",
+              "fill": "$text-tertiary",
+              "content": "Updated 12s ago",
+              "fontFamily": "$font-ui",
+              "fontSize": 10.5,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "frame",
+              "id": "TmCFR",
+              "name": "Footer Spacer",
+              "width": "fill_container",
+              "height": 1
+            },
+            {
+              "type": "text",
+              "id": "QKN63",
+              "name": "Activity Link",
+              "fill": "$accent-text",
+              "content": "Activity",
+              "fontFamily": "$font-ui",
+              "fontSize": 10.5,
+              "fontWeight": "600"
+            },
+            {
+              "type": "icon",
+              "id": "Ujdx2",
+              "name": "Activity Chevron",
+              "width": 11,
+              "height": 11,
+              "icon": "chevron-right",
+              "library": "lucide",
+              "fill": "$accent-text"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "QbAAp",
+          "layoutPosition": "absolute",
+          "x": 0,
+          "y": 0,
+          "name": "Settings Scrim",
+          "width": 360,
+          "height": 560,
+          "fill": "$overlay",
+          "layout": "vertical",
+          "justifyContent": "end",
+          "children": [
+            {
+              "type": "frame",
+              "id": "VtH8h",
+              "name": "Settings Sheet",
+              "width": "fill_container",
+              "fill": "$surface",
+              "cornerRadius": 14,
+              "stroke": "$border-strong",
+              "strokeWidth": 1,
+              "layout": "vertical",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "MbInx",
+                  "name": "Settings Sheet Header",
+                  "width": "fill_container",
+                  "height": 42,
+                  "stroke": "$border",
+                  "strokeWidth": {
+                    "bottom": 1
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    14
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "z2luE",
+                      "name": "Settings Sheet Title",
+                      "fill": "$text-primary",
+                      "content": "Settings",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 13.5,
+                      "fontWeight": "600",
+                      "letterSpacing": -0.2
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Wst0j",
+                      "name": "Settings Sheet Title Spacer",
+                      "width": "fill_container",
+                      "height": 1
+                    },
+                    {
+                      "type": "frame",
+                      "id": "iYmTx",
+                      "name": "Settings Close Button",
+                      "width": 24,
+                      "height": 24,
+                      "cornerRadius": 7,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "WTerF",
+                          "name": "Settings Close Icon",
+                          "width": 13,
+                          "height": 13,
+                          "icon": "x",
+                          "library": "lucide",
+                          "fill": "$text-secondary"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "XVx3V",
+                  "name": "Settings Body",
+                  "width": "fill_container",
+                  "layout": "vertical",
+                  "gap": 14,
+                  "padding": 14,
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "KloGP",
+                      "name": "Appearance Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "DJnpN",
+                          "name": "Appearance Label Row",
+                          "width": "fill_container",
+                          "gap": 8,
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "B7W6U",
+                              "name": "Appearance Label",
+                              "fill": "$text-primary",
+                              "content": "Appearance",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600",
+                              "letterSpacing": -0.1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "lFpjO",
+                              "name": "Appearance Label Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "frame",
+                              "id": "H3GDpY",
+                              "x": 271,
+                              "y": 1,
+                              "name": "Appearance Saving (hidden variant)",
+                              "enabled": false,
+                              "gap": 5,
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "LvIpq",
+                                  "name": "Appearance Saving Icon",
+                                  "width": 11,
+                                  "height": 11,
+                                  "icon": "loader-circle",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "Ncv5o",
+                                  "name": "Appearance Saving Text",
+                                  "fill": "$text-tertiary",
+                                  "content": "Saving…",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "normal"
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "RLcZo",
+                          "name": "Appearance Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "ckYXd",
+                              "name": "Appearance System",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "H2PdOq",
+                                  "x": 0,
+                                  "y": 0,
+                                  "name": "Appearance System Check",
+                                  "enabled": false,
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "pzAFF",
+                                  "name": "Appearance System Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "monitor",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "asv4C",
+                                  "name": "Appearance System Label",
+                                  "fill": "$text-secondary",
+                                  "content": "System",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "QMobH",
+                              "name": "Appearance Light",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "EH04w",
+                                  "name": "Appearance Light Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "pIBlS",
+                                  "name": "Appearance Light Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "sun",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "Oi3Ki",
+                                  "name": "Appearance Light Label",
+                                  "fill": "$accent-text",
+                                  "content": "Light",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "ESRe1",
+                              "name": "Appearance Dark",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "stroke": "#00000000",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "TaVLC",
+                                  "x": 22.833333333333336,
+                                  "y": 10,
+                                  "name": "Appearance Dark Check",
+                                  "enabled": false,
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "icon",
+                                  "id": "Vhjzp",
+                                  "name": "Appearance Dark Icon",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "moon",
+                                  "library": "lucide",
+                                  "fill": "$text-tertiary"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "OtvMR",
+                                  "name": "Appearance Dark Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Dark",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "Y7FGa0",
+                          "name": "Appearance Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "System follows your Mac's appearance.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "xAE65",
+                          "x": 0,
+                          "y": 89,
+                          "name": "Appearance Error (hidden variant)",
+                          "enabled": false,
+                          "width": "fill_container(332)",
+                          "fill": "$danger-quiet",
+                          "cornerRadius": 8,
+                          "stroke": "$danger",
+                          "strokeWidth": 1,
+                          "gap": 6,
+                          "padding": [
+                            6,
+                            9
+                          ],
+                          "alignItems": "center",
+                          "children": [
+                            {
+                              "type": "icon",
+                              "id": "tHQZn",
+                              "name": "Appearance Error Icon",
+                              "width": 12,
+                              "height": 12,
+                              "icon": "triangle-alert",
+                              "library": "lucide",
+                              "fill": "$danger"
+                            },
+                            {
+                              "type": "text",
+                              "id": "zsMic",
+                              "name": "Appearance Error Text",
+                              "fill": "$danger",
+                              "content": "Couldn't save — kept last saved (Dark)",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            },
+                            {
+                              "type": "frame",
+                              "id": "qlI1c",
+                              "name": "Appearance Error Spacer",
+                              "width": "fill_container",
+                              "height": 1
+                            },
+                            {
+                              "type": "text",
+                              "id": "AGgBb",
+                              "name": "Appearance Error Retry",
+                              "fill": "$danger",
+                              "content": "Retry",
+                              "fontFamily": "$font-ui",
+                              "fontSize": 12,
+                              "fontWeight": "600"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Tc4SY",
+                      "name": "Refresh Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "m2CGc",
+                      "name": "Refresh Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "P2SgSk",
+                          "name": "Refresh Label",
+                          "fill": "$text-primary",
+                          "content": "Refresh interval",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "gsgAf",
+                          "name": "Refresh Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "yYLE1",
+                              "name": "Refresh 30s",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "tO2si",
+                                  "name": "Refresh 30s Label",
+                                  "fill": "$text-secondary",
+                                  "content": "30s",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "N1rzS",
+                              "name": "Refresh 60s",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "f7JzkG",
+                                  "name": "Refresh 60s Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "GPMbh",
+                                  "name": "Refresh 60s Label",
+                                  "fill": "$accent-text",
+                                  "content": "60s",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "c6ac7A",
+                              "name": "Refresh 5 min",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "eHoxX",
+                                  "name": "Refresh 5 min Label",
+                                  "fill": "$text-secondary",
+                                  "content": "5 min",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "ahadq",
+                          "name": "Refresh Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "How often usage is re-measured.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "p0JL7",
+                      "name": "Title Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "M903By",
+                      "name": "Title Group",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 7,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "NIbtT",
+                          "name": "Title Label",
+                          "fill": "$text-primary",
+                          "content": "Title percentage",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        },
+                        {
+                          "type": "frame",
+                          "id": "AgQh2",
+                          "name": "Title Track",
+                          "width": "fill_container",
+                          "fill": "$surface-2",
+                          "cornerRadius": 10,
+                          "stroke": "$border",
+                          "strokeWidth": 1,
+                          "gap": 3,
+                          "padding": 3,
+                          "children": [
+                            {
+                              "type": "frame",
+                              "id": "logb1",
+                              "name": "Title Off",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "BzZZe",
+                                  "name": "Title Off Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Off",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "C9vPvM",
+                              "name": "Title 5h",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "$surface",
+                              "cornerRadius": 8,
+                              "stroke": "$accent",
+                              "strokeWidth": 1.5,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "icon",
+                                  "id": "qvVf7",
+                                  "name": "Title 5h Check",
+                                  "width": 12,
+                                  "height": 12,
+                                  "icon": "check",
+                                  "library": "lucide",
+                                  "fill": "$accent-text"
+                                },
+                                {
+                                  "type": "text",
+                                  "id": "fYFqd",
+                                  "name": "Title 5h Label",
+                                  "fill": "$accent-text",
+                                  "content": "5h",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "fontWeight": "600",
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "L6TjV",
+                              "name": "Title 7d",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "ouFQY",
+                                  "name": "Title 7d Label",
+                                  "fill": "$text-secondary",
+                                  "content": "7d",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            },
+                            {
+                              "type": "frame",
+                              "id": "EbGdl",
+                              "name": "Title Both",
+                              "width": "fill_container",
+                              "height": 32,
+                              "fill": "#00000000",
+                              "cornerRadius": 8,
+                              "gap": 5,
+                              "justifyContent": "center",
+                              "alignItems": "center",
+                              "children": [
+                                {
+                                  "type": "text",
+                                  "id": "VCeRu",
+                                  "name": "Title Both Label",
+                                  "fill": "$text-secondary",
+                                  "content": "Both",
+                                  "fontFamily": "$font-ui",
+                                  "fontSize": 12,
+                                  "letterSpacing": -0.1
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "type": "text",
+                          "id": "gtyMk",
+                          "name": "Title Helper",
+                          "fill": "$text-tertiary",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "Shown next to the menu bar icon.",
+                          "lineHeight": 1.4,
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "acLYQ",
+                      "name": "Settings Actions Divider",
+                      "width": "fill_container",
+                      "height": 1,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "rZi6S",
+                      "name": "Done Button",
+                      "width": "fill_container",
+                      "height": 34,
+                      "fill": "$accent",
+                      "cornerRadius": 9,
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "jYxr8",
+                          "name": "Done Label",
+                          "fill": "$on-accent",
+                          "content": "Done",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 13,
+                          "fontWeight": "600",
+                          "letterSpacing": -0.1
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
             }
           ]
         }

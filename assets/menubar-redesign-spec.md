@@ -2,9 +2,10 @@
 
 Design brief derived from `menubar/app.py`, `menubar/viewmodel.py`,
 `menubar/bridge.py`, and `menubar/web/`. The editable design is saved in
-[`assets/untitled.pen`](untitled.pen), with eight artboards covering
+[`assets/untitled.pen`](untitled.pen), with ten artboards covering
 dark and light themes, account preview, stale usage, empty accounts, token
-setup, removal confirmation, and design tokens with interaction notes.
+setup, removal confirmation, Settings in both themes, and design tokens with
+interaction notes.
 The [main dark preview](1%20%E2%80%94%20Main%20DARK.png) was
 exported from Pen and visually inspected at 360 × 560. This deliverable is a
 design specification; application implementation is separate.
@@ -127,3 +128,24 @@ with browser interaction checks for both themes, long identities, many
 accounts, missing optional data, stale/error states, keyboard operation,
 and each action's success/failure path. Run existing menu bar tests and the
 full Python suite before reporting an implementation complete.
+
+## Settings appearance addition
+
+Add matching Settings DARK and Settings LIGHT artboards using the existing
+360 × 560 panel and sheet styling. Appearance has three mutually exclusive
+choices: System (default), Light, and Dark. Helper copy: “System follows your
+Mac’s appearance.” Keep refresh interval (30s, 60s, 5 min), title percentage
+(Off, 5h, 7d, Both), and Done visible beneath it.
+
+- Apply the selection immediately to the panel and all sheets.
+- Persist the preference across reopening and app relaunch.
+- System follows live macOS appearance changes; explicit Light/Dark override it.
+- Communicate selection with an indicator and text, not color alone.
+- Support keyboard selection; close returns focus to the Settings trigger.
+- While saving, prevent duplicate changes. On save failure, restore the last
+  saved appearance and show “Couldn’t save appearance. Please try again.”
+- Keep loading/error states honest: never report a saved preference before
+  persistence succeeds.
+
+Implementation must follow these Pen Settings artboards. The initial uncommitted
+code draft is paused pending this design update and is not the design authority.

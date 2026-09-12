@@ -279,12 +279,12 @@ dialog h3 { font-size: 13.5px; margin-bottom: calc(var(--swap-space) * 2); }
 dialog p { font-size: 12px; color: var(--swap-text-secondary); margin-bottom: calc(var(--swap-space) * 2.5); }
 dialog .field { margin-bottom: calc(var(--swap-space) * 2.5); }
 dialog label { display: block; font-size: 11.5px; color: var(--swap-text-secondary); margin-bottom: 4px; }
-dialog input {
+dialog input, dialog select {
   width: 100%; padding: 7px 9px; font: 12px var(--swap-font-ui);
   color: var(--swap-text); background: var(--swap-bg);
   border: 1px solid var(--swap-hairline); border-radius: var(--swap-radius-control);
 }
-dialog input:focus { outline: none; border-color: var(--swap-accent); }
+dialog input:focus, dialog select:focus { outline: none; border-color: var(--swap-accent); }
 dialog .ferr { font-size: 11px; color: var(--swap-error); margin-top: 3px; min-height: 13px; }
 dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: flex-end; margin-top: calc(var(--swap-space) * 2); }
 .hist { list-style: none; max-height: 260px; overflow-y: auto; }
@@ -316,3 +316,6 @@ dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+#fld-theme { min-height: 32px; font: inherit; }
+#theme-help { margin-top: 6px; }

@@ -575,3 +575,24 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+@pytest.mark.parametrize("theme", ["system", "light", "dark"])
+def test_settings_theme_round_trip(tmp_path, theme):
+    path = tmp_path / "menubar_settings.json"
+    settings = menubar.MenuBarSettings(theme=theme)
+    settings.save(path)
+    assert menubar.MenuBarSettings.load(path).theme == theme
+
+
+@pytest.mark.parametrize("theme", [None, True, 123, "sepia", "", [], {}])
+def test_settings_invalid_theme_follows_system(tmp_path, theme):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"theme": theme}))
+    assert menubar.MenuBarSettings.load(path).theme == "system"
+
+
+def test_settings_legacy_file_follows_system(tmp_path):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"title_pct": "5h"}))
+    assert menubar.MenuBarSettings.load(path).theme == "system"
