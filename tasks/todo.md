@@ -164,7 +164,7 @@ submissions go through the existing bridge actions only.
 **Estimated scope:** M
 
 ## Checkpoint B: full panel in fixture + hosted
-- [ ] Both themes faithful to the artboards; sheets work; **human review of derived light theme**
+- [x] Both themes faithful to the artboards; sheets work; **human review of derived light theme**
 
 ## Task 8: states, keyboard, reduced motion, icon fidelity
 
@@ -192,16 +192,16 @@ rendering, live hosted app run (real snapshot, popover opens, right-click
 menu intact), README screenshot refresh + copy tweak, full suite.
 
 **Acceptance criteria:**
-- [ ] Screenshots pass vision gate both themes; README shows the redesign
-- [ ] Live app clean run; right-click fallback untouched and working
-- [ ] `uv run pytest` fully green
+- [x] Screenshots pass vision gate both themes; README shows the redesign
+- [x] Live app clean run; right-click fallback untouched and working
+- [x] `uv run pytest` fully green
 
 **Verification:**
-- [ ] Browser + live app + suite; SPEC success criteria 1–7 walked
+- [x] Browser + live app + suite; SPEC success criteria 1–7 walked
 
 **Dependencies:** Task 8
 **Files:** `assets/menubar-panel-*.png`, `README.md`
 **Estimated scope:** S-M
 
 ## Checkpoint C: complete
-- [ ] SPEC success criteria 1–7 verified; Definition of Done satisfied
+- [x] SPEC success criteria 1–7 verified; Definition of Done satisfied

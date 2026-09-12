@@ -246,13 +246,18 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-**Left-click the ⇄ status item** for the panel: every account as a card
-with 5h / 7d / per-model utilization bars, live reset countdowns, spend,
-and ahead-of-pace markers. Switch (specific / rotate / best), hold an
-account out of rotation, remove, and add accounts — from the current
-login or a setup token — without touching a terminal. The panel follows
-the system's light/dark appearance, marks stale data when a fetch fails,
-and explains quarantined accounts instead of guessing. **Right-click**
+**Left-click the ⇄ status item** for the panel (graphite / warm-ivory
+design): every account as a selector card where *selected* (preview) is
+distinct from *active*, quotas as explicit **N% used** bars with live
+reset countdowns, per-model limits and spend behind a disclosure,
+one-click switch plus Best/Rotate, and an auto-switch toggle with its
+threshold and strategy always visible. Sheets are native dialogs — add
+from the current login or a setup token, remove with confirmation, and
+an Activity list of recent switches — all keyboard-operable. The panel
+follows the system's light/dark appearance and is honest about data:
+missing values show *unavailable* (never 0%), stale measurements keep
+their values labeled with age, a passed reset reads *Awaiting updated
+usage*, and API-key accounts are not failed logins. **Right-click**
 keeps a classic menu with the same actions as a fallback.
 
 <p>

@@ -46,14 +46,14 @@ accessibility, and a full verification sweep.
 - [x] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring
 
 ### Checkpoint B: full panel in fixture + hosted
-- [ ] Both themes render the main artboard faithfully; sheets work; human review of derived light theme
+- [x] Both themes render the main artboard faithfully; sheets work; human review of derived light theme
 
 ### Phase 3: States, accessibility, verification
 - [x] Task 8: all artboard states, keyboard, reduced motion, icon fidelity
-- [ ] Task 9: verification sweep — vision gates, live run, README/screenshots refresh
+- [x] Task 9: verification sweep — vision gates, live run, README/screenshots refresh
 
 ### Checkpoint C: complete
-- [ ] SPEC success criteria 1–7 verified; Definition of Done satisfied
+- [x] SPEC success criteria 1–7 verified; Definition of Done satisfied
 
 ## Risks and Mitigations
 
