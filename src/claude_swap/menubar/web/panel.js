@@ -203,12 +203,25 @@ function identityHtml(acct) {
   const badge = acct.active
     ? `<span class="badge active">Active</span>`
     : `<span class="badge preview">Preview</span>`;
+  // Alias row carries its own affordance: pencil Edit when set, Add alias
+  // otherwise. Wired to the alias sheet in a later task; clicks are no-ops
+  // until then (the dispatcher ignores unknown acts).
+  const aliasCell = acct.alias
+    ? `${esc(acct.alias)} <button class="mini-btn" data-act="alias-edit" data-slot="${esc(acct.slot)}" title="Edit alias" aria-label="Edit alias">${ic("edit", 11)}</button>`
+    : `<span class="dim">Not set</span> <button class="mini-btn" data-act="alias-add" data-slot="${esc(acct.slot)}">Add alias</button>`;
   return `
-  <div class="identity">
-    <span class="alias">${esc(acct.alias ?? acct.label)}</span>
-    <span class="meta">${esc(acct.email)} · ${esc(acct.org)} · slot ${esc(acct.slot)}</span>
-    ${badge}
-  </div>`;
+  <section class="identity" aria-labelledby="account-identity-title">
+    <div class="identity-heading">
+      <h2 id="account-identity-title">Account</h2>
+      ${badge}
+    </div>
+    <dl class="identity-details">
+      <dt>Alias</dt><dd>${aliasCell}</dd>
+      <dt>Email</dt><dd>${esc(acct.email || "Not available")}</dd>
+      <dt>Team</dt><dd>${esc(acct.org || "Not available")}</dd>
+      <dt>Account Index</dt><dd>${esc(acct.slot || "Not available")}</dd>
+    </dl>
+  </section>`;
 }
 
 function statusNoteHtml(acct) {
@@ -230,7 +243,6 @@ function statusNoteHtml(acct) {
 
 function quotaCardHtml(acct) {
   const note = statusNoteHtml(acct);
-  if (acct.windows.length === 0) return note;
 
   const primary = acct.windows.filter((w) => w.kind === "5h" || w.kind === "7d");
   const secondary = acct.windows.filter((w) => w.kind.startsWith("model:"));
@@ -274,6 +286,7 @@ function quotaCardHtml(acct) {
 
   return `${note}
   <div class="quota-card">
+    <h3 class="section-h">Usage</h3>
     ${primary.map(row).join("")}
     ${secondaryHtml}
     ${spend}
@@ -467,7 +480,7 @@ const FIXTURE = {
   freshness: { ageText: "2m ago", ok: true },
   accounts: [
     {
-      slot: "1", label: "alex", email: "alex@example.com", alias: "Work",
+      slot: "1", label: "alex", email: "alex@example.com", alias: "work",
       org: "Acme", kind: "oauth", active: true, switchable: true, status: "ok",
       windows: [
         { kind: "5h", label: "Five-hour", pct: 68, state: "ok",
@@ -481,8 +494,9 @@ const FIXTURE = {
       pace: { aheadOfPace: true, expectedPct: 21.4 },
     },
     {
-      slot: "2", label: "alex.personal", email: "alex.personal@example.com",
-      alias: "Personal", org: "personal", kind: "oauth", active: false,
+      slot: "2", label: "alex.research", email: "alexandra.research@example.com",
+      alias: "research", org: "Acme Research and Platform Engineering",
+      kind: "oauth", active: false,
       switchable: true, status: "ok",
       windows: [
         { kind: "5h", label: "Five-hour", pct: 12, state: "ok",
@@ -492,7 +506,7 @@ const FIXTURE = {
       ],
     },
     {
-      slot: "3", label: "backup", email: "backup@example.com", alias: "Backup",
+      slot: "3", label: "backup", email: "backup@example.com", alias: "backup",
       org: "personal", kind: "oauth", active: false, switchable: true,
       status: "needs-login",
       note: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",

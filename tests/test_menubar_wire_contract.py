@@ -104,6 +104,42 @@ class TestReplyErrorPreservation:
         ), "reply adapter polarity wrong or missing"
 
 
+class TestAccountCard:
+    """Final-handoff Account card: labels, index format, and terminology."""
+
+    def test_account_card_row_labels(self) -> None:
+        for label in ("Alias", "Email", "Team", "Account Index"):
+            assert f"<dt>{label}</dt>" in PANEL_JS, f"card lost its {label} row"
+
+    def test_account_index_is_the_bare_number(self) -> None:
+        # "Account 2" in the card row is the exact mistake the final handoff
+        # calls out: the index value is just the slot number
+        assert "<dt>Account Index</dt>" in PANEL_JS
+        assert not re.search(r"Account \$\{", PANEL_JS), (
+            "card renders 'Account N' instead of the bare index"
+        )
+
+    def test_missing_values_have_fallbacks(self) -> None:
+        assert "Not available" in PANEL_JS
+        assert "Not set" in PANEL_JS
+
+    def test_alias_row_has_add_and_edit_affordances(self) -> None:
+        assert 'data-act="alias-add"' in PANEL_JS
+        assert 'data-act="alias-edit"' in PANEL_JS
+
+    def test_usage_section_heading(self) -> None:
+        assert ">Usage</" in PANEL_JS, "meters lost their Usage section heading"
+
+    def test_no_workspace_terminology(self) -> None:
+        assert "workspace" not in PANEL_JS.lower(), (
+            "final handoff bans workspace wording; aliases are work/research/backup"
+        )
+
+    def test_fixture_aliases_are_work_research_backup(self) -> None:
+        for alias in ('"work"', '"research"', '"backup"'):
+            assert f"alias: {alias}," in PANEL_JS, f"fixture alias {alias} missing"
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings

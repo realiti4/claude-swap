@@ -7,7 +7,7 @@ criteria.
 
 ## Phase 1: Account card & labels
 
-- [ ] Task 1: Final Account card + section labels
+- [x] Task 1: Final Account card + section labels
   - Acceptance: card shows "Account" heading + Active/Preview badge; labeled Alias ("Not set" + Add alias, or value + Edit), Email, Team, Account Index (bare number) rows; "Usage" heading above meters; missing email/team read "Not available"; values wrap anywhere and stay selectable; fixtures use work/research/backup with long org/email examples, no "workspace" wording; every string esc()'d
   - Verify: `uv run pytest tests/test_menubar.py tests/test_menubar_wire_contract.py -q`; fixture render of both themes matches board 12; `node --check` panel.js
   - Files: src/claude_swap/menubar/web/panel.js, panel.css, tests/test_menubar.py
