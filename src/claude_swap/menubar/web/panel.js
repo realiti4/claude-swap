@@ -234,7 +234,7 @@ function identityHtml(acct) {
   return `
   <section class="identity" aria-labelledby="account-identity-title">
     <div class="identity-heading">
-      <h2 id="account-identity-title">Account</h2>
+      <h2 id="account-identity-title" class="section-h">Account</h2>
       ${badge}
     </div>
     <dl class="identity-details">
@@ -281,7 +281,7 @@ function quotaCardHtml(acct) {
     <div class="qrow">
       <div class="top">
         <span class="lbl">${esc(w.label)}</span>
-        <span class="pct num ${cls}">${w.pct.toFixed(0)}<span class="unit">USED</span></span>
+        <span class="pct num ${cls}">${w.pct.toFixed(0)}<span class="unit">% USED</span></span>
       </div>
       <div class="bar"><i class="${cls}${w.state === "stale" ? " stale" : ""}"
         style="width:${Math.min(100, Math.max(0, w.pct))}%"></i></div>

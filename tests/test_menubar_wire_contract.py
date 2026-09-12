@@ -130,6 +130,15 @@ class TestAccountCard:
     def test_usage_section_heading(self) -> None:
         assert ">Usage</" in PANEL_JS, "meters lost their Usage section heading"
 
+    def test_account_heading_matches_usage_style(self) -> None:
+        # pre-review fix: both card headings share the section-h treatment
+        # and the Account card carries no divider under its title
+        assert 'class="section-h">Account<' in PANEL_JS
+
+    def test_percent_values_carry_the_percent_sign(self) -> None:
+        # pre-review fix: "68% USED", not "68USED"
+        assert '<span class="unit">% USED</span>' in PANEL_JS
+
     def test_no_workspace_terminology(self) -> None:
         assert "workspace" not in PANEL_JS.lower(), (
             "final handoff bans workspace wording; aliases are work/research/backup"
