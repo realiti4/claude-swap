@@ -17,22 +17,37 @@ import re
 from pathlib import Path
 
 MENUBAR = Path(__file__).resolve().parents[1] / "src" / "claude_swap" / "menubar"
-PANEL_JS = (MENUBAR / "web" / "panel.js").read_text(encoding="utf-8")
+WEB = MENUBAR / "web"
+PANEL_JS = (WEB / "panel.js").read_text(encoding="utf-8")
+SHEETS_JS = (WEB / "sheets.js").read_text(encoding="utf-8")
+ICONS_JS = (WEB / "icons.js").read_text(encoding="utf-8")
+INDEX_HTML = (WEB / "index.html").read_text(encoding="utf-8")
 APP_PY = (MENUBAR / "app.py").read_text(encoding="utf-8")
 BRIDGE_PY = (MENUBAR / "bridge.py").read_text(encoding="utf-8")
 
 
 def panel_actions() -> set[str]:
-    """Every action literal the panel can send to Python."""
+    """Every action literal the panel or its sheets can send to Python.
+
+    sheets.js calls send(...) (and cswap.send via the same helper) with
+    plain and ternary literals — findall catches both branches of a
+    ternary because each string literal matches independently.
+    """
     sent = set(re.findall(r'bridge\.send\(\s*"([A-Za-z]+)"', PANEL_JS))
     # doAction(btn?, "action", payload, ...) — the fixture-mode paths
     sent |= set(re.findall(r'doAction\((?:[^,]+,\s*)?"([A-Za-z]+)"', PANEL_JS))
+    # full send(...) call bodies, then every string literal inside — this
+    # catches both branches of a ternary like `send(a ? "x" : "y", ...)`
+    for body in re.findall(r'\bsend\((.*?)\)', SHEETS_JS):
+        sent |= set(re.findall(r'"([A-Za-z]+)"', body))
     return sent
 
 
 def registered_handlers() -> set[str]:
-    block = APP_PY[APP_PY.index("return {") : APP_PY.index("def _add_from_token")]
-    return set(re.findall(r'"([A-Za-z]+)":\s', block))
+    block = APP_PY[APP_PY.index("def _panel_handlers") : APP_PY.index("def _add_from_token")]
+    # table entries map to callables; nested return dicts ({"scheduled": True})
+    # must not be mistaken for registrations
+    return set(re.findall(r'"([A-Za-z]+)":\s*(?:lambda|do_switch|do_strategy|self\._)', block))
 
 
 def payload_spec_keys() -> set[str]:
@@ -49,10 +64,20 @@ class TestActionContract:
         assert not missing, f"panel sends actions Python doesn't handle: {sorted(missing)}"
 
     def test_payload_bearing_actions_have_specs(self) -> None:
-        # actions the panel always calls with a meaningful payload
-        payload_actions = {"switch", "disable", "enable", "remove", "setAutoSwitch"}
+        # actions the panel/sheets always call with a meaningful payload
+        payload_actions = {"switch", "disable", "enable", "remove",
+                           "setAutoSwitch", "addFromToken"}
         missing = payload_actions - payload_spec_keys()
         assert not missing, f"payload actions without validation specs: {sorted(missing)}"
+
+    def test_every_registered_action_is_reachable(self) -> None:
+        """Capability honesty: a registered handler nothing can send is a
+        dead surface (this diff dropped quit/addFromLogin reachability
+        once already). Menu-only actions are the exception, declared here."""
+        reachable = panel_actions()
+        menu_only = {"quit", "getSnapshot", "refresh"}  # menu / boot paths
+        dead = registered_handlers() - reachable - menu_only
+        assert not dead, f"registered but unreachable from the panel: {sorted(dead)}"
 
 
 class TestReplyErrorPreservation:

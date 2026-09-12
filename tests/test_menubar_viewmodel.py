@@ -207,6 +207,28 @@ class TestAccountStatus:
         vm = viewmodel.build(snapshot(acc), now=NOW)
         assert vm["accounts"][0]["status"] == "ok"
 
+    def test_active_sentinel_freshness_shape(self) -> None:
+        # active + sentinel: freshness is exactly {ok: False} — no age or
+        # error keys (the API-key case the banner must NOT light up for)
+        acc = account(usage=UsageEntry(sentinel=USAGE_API_KEY, last_good=None))
+        vm = viewmodel.build(snapshot(acc), now=NOW)
+        assert vm["freshness"] == {"ok": False}
+
+    def test_active_error_without_measurement_shape(self) -> None:
+        acc = account(usage=UsageEntry(last_good=None, last_error="http 429"))
+        vm = viewmodel.build(snapshot(acc), now=NOW)
+        assert vm["accounts"][0]["status"] == "unavailable"
+        assert vm["freshness"] == {"ok": False, "error": "http 429"}
+
+    def test_ahead_of_pace_false_pin(self) -> None:
+        # only the true case was pinned; false is the other wire value
+        usage = usage_fixture()
+        usage["seven_day"] = _win(10.0, NOW + 5.5 * 86400)  # far under pace
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=usage, fetched_at=NOW - 120))),
+            now=NOW)
+        assert vm["accounts"][0]["pace"]["aheadOfPace"] is False
+
     def test_status_always_present_and_quarantined_unchanged(self) -> None:
         acc = account(number="2", is_active=False,
                       usage=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED, last_good=None))

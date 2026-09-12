@@ -17,6 +17,12 @@
     const d = dlg(`dlg-${name}`);
     if (!d) return;
     opener.set(d, trigger || null);
+    // showModal does NOT close on ::backdrop clicks by itself — a click on
+    // the dimmed area targets the dialog element, so close there.
+    if (!d.__backdropWired) {
+      d.__backdropWired = true;
+      d.addEventListener("click", (ev) => { if (ev.target === d) close(d); });
+    }
     if (typeof d.showModal === "function") d.showModal();
     else d.show();  // non-modal fallback; Esc handled below
   }
@@ -172,7 +178,9 @@
       case "toggle-disabled": {
         const acct = overflowAcct;
         if (!acct) return;
+        btn.disabled = true;
         send(acct.disabled ? "enable" : "disable", { slot: acct.slot }).then((res) => {
+          btn.disabled = false;
           if (res && res.ok === false) { toast(res.error || "failed", true); return; }
           close(d);
           toast(acct.disabled ? "back in rotation" : "held out of rotation");
@@ -186,6 +194,16 @@
         }
         close(d);
         toast("email copied");
+        break;
+      }
+      case "login": {
+        btn.disabled = true;
+        send("addFromLogin", {}).then((res) => {
+          btn.disabled = false;
+          if (res && res.ok === false) { toast(res.error || "adding failed", true); return; }
+          close(d);
+          toast("account added from current login");
+        });
         break;
       }
       case "open-settings":

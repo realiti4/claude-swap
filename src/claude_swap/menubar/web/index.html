@@ -13,9 +13,12 @@
 
 <!-- Sheets: native dialogs. Content is filled and managed by sheets.js. -->
 <dialog id="dlg-token" aria-labelledby="dlg-token-title">
-  <h3 id="dlg-token-title">Add from setup-token</h3>
+  <h3 id="dlg-token-title">Add account</h3>
+  <div class="row" style="justify-content:flex-start;margin:0 0 12px">
+    <button class="btn ghost" data-dlg="login">Use current Claude Code login</button>
+  </div>
   <div class="field">
-    <label for="fld-email">Email (optional)</label>
+    <label for="fld-email">…or email for a setup-token (optional)</label>
     <input id="fld-email" type="email" autocomplete="off">
   </div>
   <div class="field">

@@ -35,7 +35,11 @@ const bridge = {
 
   send(action, payload) {
     if (!bridge.hosted) {
-      console.log("[fixture] action", action, payload ?? {});
+      // never log secrets in full, even in dev mode
+      const safe = (action === "addFromToken" && payload && payload.token)
+        ? { ...payload, token: "…" + String(payload.token).slice(-4) }
+        : payload;
+      console.log("[fixture] action", action, safe ?? {});
       return Promise.resolve(null);
     }
     const id = String(bridge._nextId++);
@@ -126,6 +130,13 @@ function render() {
   if (!vm) { els.panel.innerHTML = ""; return; }
   const sel = selectedAccount() ?? activeAccount();
 
+  // A background refresh can push a fresh vm mid-read: preserve where the
+  // user was (body scroll position and an open per-model disclosure)
+  // across the re-render instead of yanking them back to the top.
+  const bodyEl = els.panel.querySelector(".body");
+  const savedScroll = bodyEl ? bodyEl.scrollTop : 0;
+  const savedOpen = !!els.panel.querySelector("details.disclosure[open]");
+
   els.panel.innerHTML = [
     headerHtml(),
     `<div class="body">`,
@@ -138,6 +149,12 @@ function render() {
     `</div>`,
     footerHtml(),
   ].join("");
+  const newBody = els.panel.querySelector(".body");
+  if (newBody) newBody.scrollTop = savedScroll;
+  if (savedOpen) {
+    const d = els.panel.querySelector("details.disclosure");
+    if (d) d.open = true;
+  }
   wire();
 }
 
@@ -149,7 +166,7 @@ function headerHtml() {
       ${ic("refresh", 13)}
     </button>
     <button class="icon-btn" data-act="gear" title="Settings" aria-label="Settings"
-      aria-haspopup="menu">${ic("gear", 14)}</button>
+      aria-haspopup="dialog">${ic("gear", 14)}</button>
   </header>`;
 }
 
@@ -220,6 +237,7 @@ function quotaCardHtml(acct) {
 
   const row = (w) => {
     const cls = pctClass(w.pct);
+    const hasCd = w.resetsAt != null || w.countdownText != null;
     const cd = w.resetsAt
       ? `<span data-resets-at="${esc(String(w.resetsAt))}">${esc(w.countdownText ?? "")}</span>`
       : `<span>${esc(w.countdownText ?? "")}</span>`;
@@ -233,7 +251,7 @@ function quotaCardHtml(acct) {
       </div>
       <div class="bar"><i class="${cls}${w.state === "stale" ? " stale" : ""}"
         style="width:${Math.min(100, Math.max(0, w.pct))}%"></i></div>
-      <div class="cd">resets ${cd}${pace}</div>
+      ${hasCd ? `<div class="cd">resets ${cd}${pace}</div>` : ""}
     </div>`;
   };
 
@@ -247,7 +265,10 @@ function quotaCardHtml(acct) {
   const spend = acct.spend
     ? `<div class="kv"><span class="k">Spend this period</span>
         <span class="v num">$${acct.spend.used.toFixed(2)}${
-          acct.spend.limit != null ? ` / $${acct.spend.limit.toFixed(0)}` : ""
+          acct.spend.limit != null
+            ? ` / $${acct.spend.limit % 1 === 0
+                ? acct.spend.limit.toFixed(0) : acct.spend.limit.toFixed(2)}`
+            : ""
         }</span></div>`
     : "";
 
@@ -437,10 +458,12 @@ function toast(text, isErr) {
 
 // ---------------------------------------------------------------- fixture --
 
+const FIXTURE_NOW = Date.now() / 1000;
+const _fx = (offset) => Math.round(FIXTURE_NOW + offset);
 const FIXTURE = {
   schemaVersion: 1,
   activeSlot: "1",
-  takenAt: 1757635200,
+  takenAt: _fx(-120),
   freshness: { ageText: "2m ago", ok: true },
   accounts: [
     {
@@ -448,11 +471,11 @@ const FIXTURE = {
       org: "Acme", kind: "oauth", active: true, switchable: true, status: "ok",
       windows: [
         { kind: "5h", label: "Five-hour", pct: 68, state: "ok",
-          resetsAt: 1757638440, countdownText: "54m" },
+          resetsAt: _fx(54 * 60), countdownText: "54m" },
         { kind: "7d", label: "Weekly", pct: 41, state: "ok",
-          resetsAt: 1758118800, countdownText: "5d 14h" },
+          resetsAt: _fx((5 * 24 + 14) * 3600), countdownText: "5d 14h" },
         { kind: "model:Fable", label: "Fable", pct: 84, state: "ok",
-          resetsAt: 1757809200, countdownText: "2d 1h" },
+          resetsAt: _fx((2 * 24 + 1) * 3600), countdownText: "2d 1h" },
       ],
       spend: { used: 12.4, limit: 100, pct: 12.4, currency: "USD" },
       pace: { aheadOfPace: true, expectedPct: 21.4 },
@@ -463,9 +486,9 @@ const FIXTURE = {
       switchable: true, status: "ok",
       windows: [
         { kind: "5h", label: "Five-hour", pct: 12, state: "ok",
-          resetsAt: 1757642400, countdownText: "2h" },
+          resetsAt: _fx(2 * 3600), countdownText: "2h" },
         { kind: "7d", label: "Weekly", pct: 9, state: "ok",
-          resetsAt: 1758154800, countdownText: "6d 2h" },
+          resetsAt: _fx((6 * 24 + 2) * 3600), countdownText: "6d 2h" },
       ],
     },
     {

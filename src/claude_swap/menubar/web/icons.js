@@ -31,6 +31,8 @@ const ICON_PATHS = {
 function icon(name, size = 14, cls = "") {
   const body = ICON_PATHS[name];
   if (!body) return "";
+  size = Number(size) || 14;  // sizes interpolate into markup: numeric only
+  cls = String(cls).replace(/[^a-z0-9 _-]/gi, "");
   return (
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" ` +
     `stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ` +
