@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 #: and not leading with '-' (argparse would treat it as an option, making the
 #: alias impossible to pass back into any command once set).
 _ALIAS_RE = re.compile(r"^[a-z0-9_.-]+$")
+#: Cap shared by every alias path (CLI, import, menubar): an alias is a short
+#: label shown in menus and the status-bar title — megabyte strings pass the
+#: charset but bloat storage and native menu rendering for no value.
+_ALIAS_MAX_LEN = 64
 
 
 def normalize_alias(name: str) -> str:
@@ -34,6 +38,10 @@ def normalize_alias(name: str) -> str:
     normalized = name.strip().lower()
     if not normalized:
         raise ValueError("alias cannot be empty")
+    if len(normalized) > _ALIAS_MAX_LEN:
+        raise ValueError(
+            f"alias '{name}' is longer than {_ALIAS_MAX_LEN} characters"
+        )
     if normalized.isdigit():
         raise ValueError(f"alias '{name}' cannot be purely numeric (reserved for slot numbers)")
     if normalized.startswith("-"):

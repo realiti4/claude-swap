@@ -100,6 +100,10 @@ const document = {
 const context = {
   window: {}, document, console,
   URLSearchParams, location: { search: "" },
+  // real timers: the transient status line restores itself on a timeout,
+  // and assertions must run while the status text is still shown
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
 };
 vm.runInNewContext(source, context);
 const APPEARANCE = context.window.CSWAP_APPEARANCE;

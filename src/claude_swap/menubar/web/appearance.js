@@ -8,6 +8,22 @@
 
 window.CSWAP_APPEARANCE = (() => {
   const help = () => document.getElementById("theme-help");
+  const DEFAULT_HELP = "System follows your Mac’s appearance.";
+  let statusTimer = null;
+
+  function setStatus(text) {
+    const h = help();
+    if (!h) return;
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    if (text === null) {
+      h.textContent = DEFAULT_HELP;
+      return;
+    }
+    h.textContent = text;
+    // transient status ("Saved." / failure) never permanently replaces the
+    // standing hint
+    statusTimer = setTimeout(() => { statusTimer = null; h.textContent = DEFAULT_HELP; }, 2400);
+  }
 
   // pref key → acceptable segment values; the theme entry also drives the
   // documentElement data-theme attribute that switches the palette
@@ -59,10 +75,12 @@ window.CSWAP_APPEARANCE = (() => {
   }
 
   async function sync(bridge) {
+    if (inFlight) return;  // a save is mid-flight; its completion repaints
     try {
       await load(bridge);
       applyTheme();
       paintAll();
+      setStatus(null);
     } catch (_) {
       const h = help();
       if (h) h.textContent = "Couldn’t load settings. Reopen the app to retry.";
@@ -76,16 +94,15 @@ window.CSWAP_APPEARANCE = (() => {
     stored[group] = value;   // optimistic; rolled back on failure
     paint(group);
     if (group === "theme") applyTheme();
-    const h = help();
     try {
       const res = await bridge.send("setPrefs", { [group]: group === "refreshInterval" ? Number(value) : value });
       if (bridge.hosted && (!res || !res.ok)) throw new Error("save");
-      if (h) h.textContent = "Saved.";
+      setStatus("Saved.");
     } catch (_) {
       stored[group] = previous;
       paint(group);
       if (group === "theme") applyTheme();
-      if (h) h.textContent = "Couldn’t save. Please try again.";
+      setStatus("Couldn’t save. Please try again.");
     } finally {
       inFlight = false;
     }
@@ -106,7 +123,10 @@ window.CSWAP_APPEARANCE = (() => {
 
   function wireKeys() {
     // Explicit keyboard activation, matching the panel and sheets: some
-    // engines don't synthesize clicks from Enter/Space on buttons.
+    // engines don't synthesize clicks from Enter/Space on buttons. Guarded
+    // like its siblings in case init ever runs twice.
+    if (wireKeys.__wired) return;
+    wireKeys.__wired = true;
     document.addEventListener("keydown", (ev) => {
       if (ev.key !== "Enter" && ev.key !== " ") return;
       const btn = ev.target.closest ? ev.target.closest(".seg-btn") : null;

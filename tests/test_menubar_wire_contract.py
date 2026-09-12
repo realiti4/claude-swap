@@ -132,6 +132,12 @@ class TestAccountCard:
     def test_usage_section_heading(self) -> None:
         assert ">Usage</" in PANEL_JS, "meters lost their Usage section heading"
 
+    def test_no_empty_usage_card_for_windowless_accounts(self) -> None:
+        # needs-login / API-key / never-measured accounts show only their
+        # status note — never a bordered card holding just a heading
+        assert "const hasContent" in PANEL_JS
+        assert "if (!hasContent) return note;" in PANEL_JS
+
     def test_account_heading_matches_usage_style(self) -> None:
         # pre-review fix: both card headings share the section-h treatment
         # and the Account card carries no divider under its title

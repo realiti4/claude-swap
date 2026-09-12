@@ -256,6 +256,9 @@ def run(switcher) -> int:
             self._snapshot_source = SnapshotSource(switcher)
             self.snapshot: dict = dict(EMPTY_SNAPSHOT)
             self._dirty = False
+            # bumped by _push_alias_update; read by _worker to detect a
+            # rename that landed while its snapshot was in flight
+            self._alias_gen = 0
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
@@ -618,17 +621,14 @@ def run(switcher) -> int:
             main thread. The active credential and other accounts are
             untouched — renaming never switches anything.
             """
+            # Bump the generation so an in-flight refresh worker — which may
+            # have read the roster *before* this rename — cannot install its
+            # stale-alias view model over this push. The worker re-checks
+            # the generation when it finishes (see _worker).
+            self._alias_gen += 1
             raw = self._snapshot_source.take(store_only=True)
             self.snapshot = _adapt_snapshot(raw)
-            core = load_settings(self.switcher.backup_dir)
-            self._vm = build(
-                raw,
-                auto_enabled=self.settings.auto_switch_enabled,
-                auto_threshold=core.threshold,
-                auto_strategy=core.strategy,
-                history=self._history(),
-            )
-            self._dirty = True
+            self._vm = self._build_vm(raw)
             self.push_vm()
             AppHelper.callAfter(self.rebuild_menu)
 
@@ -674,7 +674,11 @@ def run(switcher) -> int:
                 finally:
                     finished.set()
             AppHelper.callAfter(apply)
-            finished.wait()
+            # Bounded wait: if the user is holding the native menu open, the
+            # main thread may not service callAfter for a while — reply with
+            # an error instead of leaving the JS promise dangling forever.
+            if not finished.wait(timeout=5.0):
+                raise ClaudeSwitchError("saving preferences timed out; try again")
             if errors:
                 raise errors[0]
             return {"saved": True, "theme": self.settings.theme}
@@ -705,16 +709,19 @@ def run(switcher) -> int:
             )
             self.snapshot = _adapt_snapshot(raw)
             self._log_usage(self.snapshot)
+            self._vm = self._build_vm(raw)
+            self._dirty = True
+            return self._vm
+
+        def _build_vm(self, raw) -> dict:
             core = load_settings(self.switcher.backup_dir)
-            self._vm = build(
+            return build(
                 raw,
                 auto_enabled=self.settings.auto_switch_enabled,
                 auto_threshold=core.threshold,
                 auto_strategy=core.strategy,
                 history=self._history(),
             )
-            self._dirty = True
-            return self._vm
 
         def on_status_click(self) -> None:
             ev = AppKit.NSApplication.sharedApplication().currentEvent()
@@ -869,6 +876,7 @@ def run(switcher) -> int:
             # in CPython); the main-thread sync tick reads them. While the
             # engine runs it already paces all fetching, so the display reads
             # store-only.
+            gen_before = self._alias_gen
             try:
                 try:
                     self.current_vm(full=full)
@@ -876,6 +884,17 @@ def run(switcher) -> int:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
                 else:
+                    if self._alias_gen != gen_before:
+                        # An alias was renamed while this worker was in flight;
+                        # its snapshot predates the rename and would revert the
+                        # panel to the old alias for a whole refresh cycle.
+                        # Rebuild once from the store (free, no network).
+                        try:
+                            raw = self._snapshot_source.take(store_only=True)
+                            self.snapshot = _adapt_snapshot(raw)
+                            self._vm = self._build_vm(raw)
+                        except Exception:
+                            pass  # keep the just-built vm; aliases re-sync next tick
                     self._dirty = True  # picked up by the sync tick on the main thread
             finally:
                 self._refreshing = False

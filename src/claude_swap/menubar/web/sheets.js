@@ -89,7 +89,7 @@
 
   function openAlias(trigger, acct) {
     if (!acct) return;
-    aliasCtx = { slot: acct.slot, hadAlias: !!acct.alias };
+    aliasCtx = { slot: acct.slot };
     const d = dlg("dlg-alias");
     d.querySelector("#dlg-alias-title").textContent =
       acct.alias ? "Edit alias" : "Add alias";
@@ -141,7 +141,6 @@
   }
 
   function toast(text, isErr) {
-    if (window.cswap && window.cswap.send) { /* panel owns toasts; reuse via DOM */ }
     const host = document.getElementById("toasts");
     if (!host || !text) return;
     const el = document.createElement("div");

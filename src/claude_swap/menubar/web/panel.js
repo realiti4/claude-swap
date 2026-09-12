@@ -226,8 +226,7 @@ function identityHtml(acct) {
     ? `<span class="badge active">Active</span>`
     : `<span class="badge preview">Preview</span>`;
   // Alias row carries its own affordance: pencil Edit when set, Add alias
-  // otherwise. Wired to the alias sheet in a later task; clicks are no-ops
-  // until then (the dispatcher ignores unknown acts).
+  // otherwise; both open the alias sheet (sheets module owns the flow).
   const aliasCell = acct.alias
     ? `<dd title="${esc(acct.alias)}"><span class="val">${esc(acct.alias)}</span>`
       + ` <button class="mini-btn" data-act="alias-edit" data-slot="${esc(acct.slot)}" title="Edit alias" aria-label="Edit alias">${ic("edit", 11)}</button></dd>`
@@ -313,6 +312,11 @@ function quotaCardHtml(acct) {
             : ""
         }</span></div>`
     : "";
+
+  // No bars and no spend (needs-login, API key, never measured): the
+  // status note already explains it — an empty headed card adds nothing.
+  const hasContent = primary.length > 0 || secondary.length > 0 || !!acct.spend;
+  if (!hasContent) return note;
 
   return `${note}
   <div class="quota-card">
@@ -455,6 +459,10 @@ function wire() {
           const target = selectedAccount() ?? activeAccount();
           if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openOverflow && target) {
             window.CSWAP_SHEETS.openOverflow(el, target);
+          } else if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openSettings) {
+            // Empty roster: no account to scope the overflow menu to, but
+            // appearance/interval settings must stay reachable (board 05).
+            window.CSWAP_SHEETS.openSettings(el);
           }
           break;
         }
@@ -570,7 +578,30 @@ window.CSWAP_APPEARANCE.init(bridge);
 
 if (!bridge.hosted) {
   console.log("[fixture] claude-swap panel — fixture mode; actions log here");
-  bridge.push("vm", FIXTURE);
+  // ?accounts=N swaps the 3-account fixture for a synthetic roster — makes
+  // the multi-row / two-digit-index states one URL away for reviewers.
+  const raw = new URLSearchParams(location.search).get("accounts");
+  const wanted = raw == null ? NaN : Number(raw);  // Number(null) is 0 — guard it
+  if (Number.isInteger(wanted) && wanted >= 0) {
+    const accounts = [];
+    for (let i = 1; i <= wanted; i++) {
+      accounts.push({
+        slot: String(i), label: "acct" + i, email: `acct${i}@example.com`,
+        alias: "acct" + i, org: i % 3 === 0 ? "Acme Research and Platform Engineering" : "Acme",
+        kind: "oauth", active: i === 1, switchable: true,
+        status: i % 4 === 0 ? "unavailable" : "ok", windows: [
+          { kind: "5h", label: "Five-hour", pct: (i * 13) % 90, state: "ok",
+            resetsAt: _fx(3600), countdownText: "1h" },
+          { kind: "7d", label: "Weekly", pct: (i * 7) % 80, state: "ok",
+            resetsAt: _fx(86400), countdownText: "1d" },
+        ],
+      });
+    }
+    bridge.push("vm", { ...FIXTURE, accounts, activeSlot: wanted ? "1" : null,
+      autoSwitch: { enabled: false, thresholdPct: 90, strategy: "best" } });
+  } else {
+    bridge.push("vm", FIXTURE);
+  }
 } else {
   refresh();
 }

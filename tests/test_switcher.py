@@ -318,6 +318,13 @@ class TestAliasValidation:
             with pytest.raises(ValueError):
                 normalize_alias(alias)
 
+    def test_alias_length_is_capped(self, temp_home: Path):
+        # aliases render in the native menu and status-bar title; the shared
+        # cap keeps megabyte strings out of storage and AppKit
+        normalize_alias("a" * 64)  # exactly at the cap passes
+        with pytest.raises(ValueError, match="longer than"):
+            normalize_alias("a" * 65)
+
 
 class TestResolveByAlias:
     """Test resolving account identifiers via alias, and precedence."""

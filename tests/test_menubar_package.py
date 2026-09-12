@@ -44,7 +44,6 @@ def test_package_reexports_legacy_surface() -> None:
 
 # --- packaged native icon --------------------------------------------------
 
-import re  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 APP_SOURCE = (Path(menubar.__file__).parent / "app.py").read_text(encoding="utf-8")

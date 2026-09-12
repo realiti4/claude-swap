@@ -9,7 +9,6 @@
   --swap-panel-width: 360px;
   --swap-header-height: 44px;
   --swap-footer-height: 30px;
-  --swap-body-height: 486px;
   --swap-radius-panel: 14px;
   --swap-radius-card: 12px;
   --swap-radius-control: 8px;
@@ -341,6 +340,7 @@ dialog input, dialog select {
 }
 dialog input:focus, dialog select:focus { outline: none; border-color: var(--swap-accent); }
 .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+#theme-help { margin-top: 6px; }
 .seg-btn {
   flex: 1 1 auto; min-width: 52px; padding: 6px 10px;
   font: 12px var(--swap-font-ui); color: var(--swap-text-secondary);
@@ -385,5 +385,3 @@ dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: 
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 
-#fld-theme { min-height: 32px; font: inherit; }
-#theme-help { margin-top: 6px; }

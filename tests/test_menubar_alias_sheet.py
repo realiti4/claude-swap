@@ -70,7 +70,7 @@ const context = {
   window: { cswap: null },
   document,
   console,
-  setTimeout(fn) { fn(); },
+  setTimeout(fn) { fn(); },  // toasts self-remove instantly here (harness)
   navigator: {},
   location: { search: "" },
 };
@@ -84,14 +84,12 @@ assert.ok(SHEETS && SHEETS.openAlias, "sheets module must export openAlias");
   function click(btn, dlgId) {
     if (btn.disabled) return;  // real browsers never click a disabled button
     const handlers = document.handlers.click;
-  assert.ok(handlers && handlers.length, "sheets installs a click handler");
-  const target = Object.assign(el(), {
-    dataset: btn.dataset,
-    closest(sel) { return sel === "[data-dlg]" ? this : dialog(dlgId); },
-    disabled: btn.disabled,
-  });
-  for (const fn of handlers) fn({ target });
-}
+    assert.ok(handlers && handlers.length, "sheets installs a click handler");
+    // target the button object itself so the SUT's own disabled mutations
+    // are observable on the caller's reference
+    btn.closest = (sel) => (sel === "[data-dlg]" ? btn : dialog(dlgId));
+    for (const fn of handlers) fn({ target: btn });
+  }
 
 (async () => {
   const sent = [];
@@ -150,19 +148,39 @@ assert.ok(SHEETS && SHEETS.openAlias, "sheets module must export openAlias");
   assert.equal(input.value, "dup", "failed save retains input");
   assert.ok(dlg.open, "failed save keeps the dialog open");
 
-  // 4) double-submit guard: disabled button ignores clicks
-  saveBtn.disabled = true;
-  const sentBefore = sent.length;
-  input.value = "other";
+  // 4) double-submit guard, observed on the SUT: with a deferred reply the
+  //    button must disable itself synchronously, a second click must not
+  //    send, and the reply must re-enable + close
+  let release = null;
+  context.window.cswap.send = (action, payload) => {
+    sent.push({ action, payload });
+    return new Promise((res) => { release = res; });
+  };
+  SHEETS.openAlias(null, { slot: "2", email: "a@example.com", alias: "research" });
+  input.value = "held";
+  saveBtn.disabled = false;
   click(saveBtn, "dlg-alias");
-  await Promise.resolve();
-  assert.equal(sent.length, sentBefore, "disabled button must not send");
+  assert.ok(saveBtn.disabled, "submit must disable itself while in flight");
+  const sentWhenHeld = sent.length;
+  input.value = "second-click";
+  click(saveBtn, "dlg-alias");   // suppressed: browsers never click disabled buttons
+  assert.equal(sent.length, sentWhenHeld, "no second send while in flight");
+  release({ ok: true, data: { slot: "2", alias: "held" } });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(!saveBtn.disabled, "re-enabled after the reply");
+  assert.ok(!dlg.open, "held save closes after release");
+  // restore the immediate-resolving bridge for the remaining steps
+  context.window.cswap.send = (action, payload) => {
+    sent.push({ action, payload });
+    return Promise.resolve(reply);
+  };
 
   // 5) cancel: no mutation
   reply = okReply;
+  const beforeCancel = sent.length;
   click({ dataset: { dlg: "cancel" }, disabled: false }, "dlg-alias");
   assert.ok(!dlg.open);
-  assert.equal(sent.length, sentBefore);
+  assert.equal(sent.length, beforeCancel);
 
   // 6) remove alias: unset with captured slot, closes on success
   SHEETS.openAlias(null, { slot: "2", email: "a@example.com", alias: "research" });
