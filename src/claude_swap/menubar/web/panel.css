@@ -337,6 +337,19 @@ dialog input, dialog select {
   border: 1px solid var(--swap-hairline); border-radius: var(--swap-radius-control);
 }
 dialog input:focus, dialog select:focus { outline: none; border-color: var(--swap-accent); }
+.seg { display: flex; gap: 4px; flex-wrap: wrap; }
+.seg-btn {
+  flex: 1 1 auto; min-width: 52px; padding: 6px 10px;
+  font: 12px var(--swap-font-ui); color: var(--swap-text-secondary);
+  background: var(--swap-bg); border: 1px solid var(--swap-hairline);
+  border-radius: var(--swap-radius-control); cursor: pointer; white-space: nowrap;
+}
+.seg-btn:hover { color: var(--swap-text); }
+.seg-btn.selected {
+  color: var(--swap-accent); border-color: var(--swap-accent);
+  background: var(--swap-accent-quiet); font-weight: 600;
+}
+.seg-btn:disabled { opacity: 0.6; cursor: default; }
 dialog .ferr { font-size: 11px; color: var(--swap-error); margin-top: 3px; min-height: 13px; }
 dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: flex-end; margin-top: calc(var(--swap-space) * 2); }
 .hist { list-style: none; max-height: 260px; overflow-y: auto; }

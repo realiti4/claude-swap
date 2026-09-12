@@ -545,7 +545,11 @@ def run(switcher) -> int:
                 "setAutoSwitch": lambda payload: (
                     AppHelper.callAfter(self._set_auto, payload["enabled"]),
                 )[0] or {"scheduled": True},
-                "getPrefs": lambda payload: {"theme": self.settings.theme},
+                "getPrefs": lambda payload: {
+                    "theme": self.settings.theme,
+                    "refreshInterval": self.settings.refresh_interval,
+                    "titlePct": self.settings.title_pct,
+                },
                 "setPrefs": self._set_prefs,
                 "setAlias": self._set_alias,
                 "unsetAlias": self._unset_alias,

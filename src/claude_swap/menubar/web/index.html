@@ -77,26 +77,32 @@
 <dialog id="dlg-settings" aria-labelledby="dlg-settings-title">
   <h3 id="dlg-settings-title">Panel settings</h3>
   <div class="field">
-    <label for="fld-theme">Appearance</label>
-    <select id="fld-theme" aria-describedby="theme-help" disabled>
-      <option value="system">System</option>
-      <option value="light">Light</option>
-      <option value="dark">Dark</option>
-    </select>
+    <label id="lbl-appearance">Appearance</label>
+    <div class="seg" id="seg-theme" role="radiogroup" aria-labelledby="lbl-appearance">
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="theme" data-val="system">System</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="theme" data-val="light">Light</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="theme" data-val="dark">Dark</button>
+    </div>
     <p id="theme-help">System follows your Mac’s appearance.</p>
   </div>
-  <p>Refresh interval</p>
-  <div class="row" style="justify-content:flex-start;gap:6px;margin-top:0">
-    <button class="btn ghost" data-dlg="iv" data-iv="30">30s</button>
-    <button class="btn ghost" data-dlg="iv" data-iv="60">60s</button>
-    <button class="btn ghost" data-dlg="iv" data-iv="300">5 min</button>
+  <div class="field">
+    <label id="lbl-refresh">Refresh interval</label>
+    <div class="seg" id="seg-refreshInterval" role="radiogroup" aria-labelledby="lbl-refresh">
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="refreshInterval" data-val="30">30s</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="refreshInterval" data-val="60">60s</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="refreshInterval" data-val="300">5 min</button>
+    </div>
+    <p>How often usage refreshes in the background.</p>
   </div>
-  <p style="margin-top:12px">Title percentage</p>
-  <div class="row" style="justify-content:flex-start;gap:6px;margin-top:0">
-    <button class="btn ghost" data-dlg="tp" data-tp="off">off</button>
-    <button class="btn ghost" data-dlg="tp" data-tp="5h">5h</button>
-    <button class="btn ghost" data-dlg="tp" data-tp="7d">7d</button>
-    <button class="btn ghost" data-dlg="tp" data-tp="both">both</button>
+  <div class="field">
+    <label id="lbl-title">Title percentage</label>
+    <div class="seg" id="seg-titlePct" role="radiogroup" aria-labelledby="lbl-title">
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="titlePct" data-val="off">Off</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="titlePct" data-val="5h">5-hour</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="titlePct" data-val="7d">Weekly</button>
+      <button type="button" class="seg-btn" role="radio" aria-checked="false" data-seg="titlePct" data-val="both">Both</button>
+    </div>
+    <p>Usage shown next to the menu bar icon.</p>
   </div>
   <div class="row"><button class="btn ghost" data-dlg="cancel">Done</button></div>
 </dialog>
@@ -104,8 +110,8 @@
 <div id="toasts"></div>
 
 <script src="icons.js?v=3"></script>
-<script src="appearance.js?v=1"></script>
-<script src="sheets.js?v=3"></script>
-<script src="panel.js?v=3"></script>
+<script src="appearance.js?v=2"></script>
+<script src="sheets.js?v=4"></script>
+<script src="panel.js?v=4"></script>
 </body>
 </html>

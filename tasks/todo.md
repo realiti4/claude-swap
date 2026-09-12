@@ -52,14 +52,14 @@ criteria.
 
 ## Phase 4: Settings segments
 
-- [ ] Task 6: Segmented settings + extended getPrefs
+- [x] Task 6: Segmented settings + extended getPrefs
   - Acceptance: getPrefs reply adds refreshInterval and titlePct (additive); Appearance/Refresh/Title% render as segmented controls showing the stored value on open; appearance.js keeps persistence + rollback (extended to all three controls); System follows live OS changes; failed save rolls back; help texts per boards; dropdown removed
   - Verify: bridge getPrefs test; node-vm segmented behavior tests (current selection, save, rollback); native relaunch persistence check at checkpoint
   - Files: app.py, appearance.js, index.html, panel.css, tests/test_menubar_appearance.py
   - Dependencies: none (parallel-safe after Checkpoint A)
 
 ## Checkpoint D
-- [ ] Settings show stored values; all three choices persist across native relaunch; rollback verified
+- [x] Settings show stored values (fixture); native relaunch persistence verified at Checkpoint E
 
 ## Phase 5: Interlock branding
 

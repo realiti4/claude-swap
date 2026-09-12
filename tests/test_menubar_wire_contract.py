@@ -190,6 +190,24 @@ class TestAliasActions:
         )
 
 
+class TestSettingsSegments:
+    """Segmented settings: extended getPrefs reply, segments in markup, no
+    stale dropdown path left behind."""
+
+    def test_getprefs_reports_all_three_preferences(self) -> None:
+        assert '"theme": self.settings.theme' in APP_PY
+        assert '"refreshInterval": self.settings.refresh_interval' in APP_PY
+        assert '"titlePct": self.settings.title_pct' in APP_PY
+
+    def test_settings_sheet_uses_segments_not_a_dropdown(self) -> None:
+        assert '<select id="fld-theme"' not in INDEX_HTML
+        for group in ("theme", "refreshInterval", "titlePct"):
+            assert f'data-seg="{group}"' in INDEX_HTML, f"missing {group} segment"
+
+    def test_every_segment_button_is_a_radio(self) -> None:
+        assert INDEX_HTML.count('class="seg-btn" role="radio"') >= 10
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings

@@ -125,6 +125,10 @@
   }
 
   function openSettings(trigger) {
+    const d = dlg("dlg-settings");
+    // appearance.js re-reads stored preferences on every open — the CLI can
+    // change them between visits, and the segments must not go stale
+    d.dispatchEvent(new CustomEvent("cswap:settings-open"));
     open("settings", trigger);
   }
 
@@ -280,17 +284,6 @@
         close(d);
         openSettings(btn);
         break;
-      case "iv":
-      case "tp": {
-        const payload = act === "iv"
-          ? { refreshInterval: Number(btn.dataset.iv) }
-          : { titlePct: btn.dataset.tp };
-        send("setPrefs", payload).then((res) => {
-          if (res && res.ok === false) { toast(res.error || "not saved", true); return; }
-          toast("saved");
-        });
-        break;
-      }
     }
   });
 
