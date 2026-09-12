@@ -144,7 +144,9 @@
           return;
         }
         const email = d.querySelector("#fld-email").value.trim();
+        btn.disabled = true;   // no duplicate submission while in flight
         send("addFromToken", { token, email }).then((res) => {
+          btn.disabled = false;
           if (res && res.ok === false) {
             errEl.textContent = res.error || "Adding the account failed.";
             return;
@@ -159,7 +161,9 @@
         openRemove(btn, overflowAcct);
         break;
       case "submit-remove":
+        btn.disabled = true;   // no duplicate submission while in flight
         send("remove", { slot: String(removeSlot) }).then((res) => {
+          btn.disabled = false;
           if (res && res.ok === false) { toast(res.error || "remove failed", true); return; }
           close(d);
           toast(`removed ${removeSlot}`);

@@ -376,7 +376,16 @@ _STATUS_BY_SENTINEL = {
 def _account_status(entry) -> str:
     if entry.sentinel:
         return _STATUS_BY_SENTINEL.get(entry.sentinel, "unavailable")
+    if entry.last_error and entry.last_good is None:
+        # A fetch failure with nothing ever measured: not "ok" — the panel
+        # must not read a failing account as a fresh one awaiting first data.
+        return "unavailable"
     return "ok"
+
+
+def _ts_passed(ts: float, now: float) -> bool:
+    """A parseable reset time at or before now (one predicate, both callers)."""
+    return ts != float("inf") and ts <= now
 
 def _age_text(age_s: float | None) -> str | None:
     """Human age of a measurement: "just now" / "Nm ago" / "Nh [Nm] ago"."""
@@ -401,7 +410,7 @@ def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -
     if not math.isfinite(pct):
         return None
     ts = _resets_at_ts(window)
-    if ts != float("inf") and ts <= now:
+    if _ts_passed(ts, now):
         # The reset has passed: keep the MEASURED value (never fabricate a
         # zero), mark it stale, and say what we're waiting for.
         return {
@@ -499,7 +508,7 @@ def _account_vm(acc, *, now: float) -> dict:
             # stale-on-error or when the weekly reset has passed (the passed
             # window rule in _window_vm marks those stale).
             seven_ts = _resets_at_ts(display.get("seven_day"))
-            if seven_ts == float("inf") or seven_ts > now:
+            if not _ts_passed(seven_ts, now):
                 pace_result = pace.compute_pace(
                     display.get("seven_day"), fetched_at=entry.fetched_at
                 )

@@ -167,7 +167,6 @@ function selectorHtml(sel) {
     const cls = [
       "sel-card",
       a.slot === (sel && sel.slot) ? "selected" : "",
-      a.disabled ? "" : "",
     ].filter(Boolean).join(" ");
     const attrs = a.disabled ? ' data-disabled=""' : "";
     return `<button class="${cls}"${attrs} data-act="select" data-slot="${esc(a.slot)}"

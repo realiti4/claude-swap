@@ -189,6 +189,24 @@ class TestAccountStatus:
         vm = viewmodel.build(snapshot(account(), acc), now=NOW)
         assert vm["accounts"][1]["status"] == "unavailable"
 
+    def test_error_without_measurement_is_unavailable(self) -> None:
+        # A fetch failure with nothing ever measured must not read "ok" —
+        # the panel would call it a fresh account awaiting first data.
+        acc = account(number="2", is_active=False,
+                      usage=UsageEntry(last_good=None, last_error="http 429"))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        assert vm["accounts"][1]["status"] == "unavailable"
+        assert vm["accounts"][1]["note"] == "http 429"
+
+    def test_error_with_last_good_stays_ok(self) -> None:
+        # Stale-on-error keeps measured windows; status stays "ok" and the
+        # stale state carries the failure semantics instead.
+        acc = account(usage=UsageEntry(last_good=usage_fixture(),
+                                       fetched_at=NOW - 120, age_s=120.0,
+                                       last_error="http 429"))
+        vm = viewmodel.build(snapshot(acc), now=NOW)
+        assert vm["accounts"][0]["status"] == "ok"
+
     def test_status_always_present_and_quarantined_unchanged(self) -> None:
         acc = account(number="2", is_active=False,
                       usage=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED, last_good=None))
@@ -240,6 +258,7 @@ class TestDegradedStates:
         assert vm["freshness"]["ok"] is False
         assert vm["freshness"]["error"] == "http 429"
         assert vm["freshness"]["ageText"] == "1h ago"
+        assert "pace" not in vm["accounts"][0]  # hidden on fetch-error too
 
     def test_malformed_spend_is_skipped_not_fatal(self) -> None:
         # A persisted spend dict missing used/limit (shape drift across an
@@ -278,6 +297,19 @@ class TestDegradedStates:
         assert five["pct"] == 72.0
         assert five["state"] == "stale"
         assert five["countdownText"] == "Awaiting updated usage"
+
+    def test_passed_scoped_window_keeps_measured_value(self) -> None:
+        usage = usage_fixture()
+        usage["scoped"] = [_win(84.0, NOW - 7200, name="Fable")]
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=usage))), now=NOW
+        )
+        fable = [w for w in vm["accounts"][0]["windows"]
+                 if w["kind"] == "model:Fable"][0]
+        assert fable["pct"] == 84.0
+        assert fable["state"] == "stale"
+        assert fable["countdownText"] == "Awaiting updated usage"
+        assert "resetsAt" not in fable
 
     def test_pace_hidden_when_measurement_stale(self) -> None:
         stale_weekly = usage_fixture()

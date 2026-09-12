@@ -67,12 +67,11 @@ class TestReplyErrorPreservation:
         assert ".error" in body, f"reply adapter drops error text: ...{body}..."
 
     def test_reply_adapter_distinguishes_ok(self) -> None:
-        m = re.search(r"reply:\s*\(([^)]*)\)\s*=>\s*bridge\.reply\(([^)]*)\)", PANEL_JS)
-        assert m
-        body = m.group(2)
-        assert ".ok" in body and ".data" in body, (
-            "reply adapter must forward data on success and error on failure"
-        )
+        # pin the exact polarity: data on success, error on failure — an
+        # inverted ternary must fail this
+        assert re.search(
+            r"result\.ok\s*\?\s*result\.data\s*:\s*result\.error", PANEL_JS
+        ), "reply adapter polarity wrong or missing"
 
 
 class TestGlobalContract:
