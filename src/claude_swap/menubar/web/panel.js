@@ -130,6 +130,7 @@ function render() {
 
   els.panel.innerHTML = [
     headerHtml(active),
+    bannerHtml(),
     pillsHtml(sel),
     cardHtml(sel),
     actionsHtml(sel),
@@ -156,6 +157,14 @@ function headerHtml(active) {
   </section>`;
 }
 
+function bannerHtml() {
+  const fresh = state.vm.freshness;
+  if (fresh.ok) return "";
+  const when = fresh.ageText ? ` · ${esc(fresh.ageText)}` : "";
+  const why = fresh.error ? ` — ${esc(fresh.error)}` : "";
+  return `<section><div class="banner">${fresh.error ? "Showing last known usage" : "No usage yet"}${when}${why}</div></section>`;
+}
+
 function pillsHtml(sel) {
   const pills = state.vm.accounts.map((a) => {
     const cls = [
@@ -174,7 +183,9 @@ function pillsHtml(sel) {
 
 function cardHtml(acct) {
   if (!acct) {
-    return `<section class="card"><div class="note">No managed accounts yet — add one below.</div></section>`;
+    return `<section class="card"><div class="note">No managed accounts yet.
+      <button class="linkish" data-act="add">Add your first account</button> —
+      from the current Claude Code login or a setup token.</div></section>`;
   }
   const badges = [
     acct.active ? `<span class="badge active-badge">active</span>` : "",
@@ -215,7 +226,9 @@ function windowHtml(w) {
   <div class="window-row">
     <div class="row-top">
       <span class="row-label">${esc(w.label)}</span>
-      <span class="row-pct ${pctClass(w.pct)}">${w.pct.toFixed(0)}%</span>
+      <span class="row-pct ${pctClass(w.pct)}">${w.pct.toFixed(0)}%${
+        w.state === "stale" ? ` <span class="chip stale">stale</span>` : ""
+      }</span>
     </div>
     <div class="bar"><i class="${pctClass(w.pct)} ${w.state === "stale" ? "stale" : ""}"
       style="width:${pct}%"></i></div>

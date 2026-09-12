@@ -203,13 +203,13 @@ empty state with add-account CTA; allowlist rejection UX (toast, not
 crash); title keeps last-known pct on failure (parity with today).
 
 **Acceptance criteria:**
-- [ ] Simulated fetch failure (network off) shows stale data + banner, no crash, title retains pct
-- [ ] Quarantined account renders explainer card, not bars
-- [ ] Zero-account state guides to add; removed account disappears cleanly while panel open
+- [x] Simulated fetch failure (network off) shows stale data + banner, no crash, title retains pct
+- [x] Quarantined account renders explainer card, not bars
+- [x] Zero-account state guides to add; removed account disappears cleanly while panel open
 
 **Verification:**
-- [ ] `uv run pytest` green; viewmodel tests cover stale/error fixtures
-- [ ] Manual: airplane-mode refresh; quarantine fixture in browser fixture mode
+- [x] `uv run pytest` green; viewmodel tests cover stale/error fixtures
+- [x] Manual: airplane-mode refresh; quarantine fixture in browser fixture mode
 
 **Dependencies:** Task 6
 

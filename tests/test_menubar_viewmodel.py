@@ -189,6 +189,8 @@ class TestDegradedStates:
         windows = vm["accounts"][0]["windows"]
         assert windows and all(w["state"] == "stale" for w in windows)
         assert vm["freshness"]["ok"] is False
+        assert vm["freshness"]["error"] == "http 429"
+        assert vm["freshness"]["ageText"] == "1h ago"
 
     def test_rolled_weekly_window_zeroed(self) -> None:
         stale_weekly = usage_fixture()

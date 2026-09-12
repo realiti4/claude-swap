@@ -478,6 +478,8 @@ def build(
         age_text = _age_text(entry.age_s)
         if age_text:
             freshness["ageText"] = age_text
+        if entry.last_error:
+            freshness["error"] = entry.last_error
         freshness["ok"] = not (entry.sentinel or entry.last_error or entry.last_good is None)
 
     auto_switch: dict = {
