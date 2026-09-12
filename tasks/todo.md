@@ -24,14 +24,14 @@ criteria.
 
 ## Phase 2: Numbered selector
 
-- [ ] Task 3: Index-tab selector with radiogroup semantics
+- [x] Task 3: Index-tab selector with radiogroup semantics
   - Acceptance: each tab shows the large stable index spanning two lines with alias + status text right; status strings Ready/Active/Disabled/API key/Needs login/Unavailable; one ARIA radiogroup of radios with explicit Enter/Space activation; grid wraps to multiple rows; two-digit indices don't clip; long alias ellipsizes with full value in accessible name; selected (teal ring) ≠ active (mark) ≠ disabled visuals; per-account usage mini-bars removed; click-to-preview preserved; scroll/disclosure preservation intact
   - Verify: DOM-guard tests + fixture matrix (3 accounts, 10+ accounts multi-row, empty roster, each status state, long alias); `node --check`
   - Files: panel.js, panel.css, tests (DOM guards)
   - Dependencies: Task 1 (status vocabulary renders against the final card)
 
 ## Checkpoint B
-- [ ] Selector fixture matrix passes; selection preview and Active badge verified against board 03
+- [x] Selector fixture matrix passes; selection preview and Active badge verified against board 03
 
 ## Phase 3: Alias editor
 

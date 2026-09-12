@@ -112,7 +112,7 @@ const AWAITING = "Awaiting updated usage";
 
 /** Card subtitle per account: status as text, never color alone. */
 function cardSubtitle(acct) {
-  if (acct.disabled) return { text: "Held out", cls: "st-warn" };
+  if (acct.disabled) return { text: "Disabled", cls: "st-warn" };
   switch (acct.status) {
     case "api-key": return { text: "API key", cls: "st-warn" };
     case "needs-login": return { text: "Needs login", cls: "st-bad" };
@@ -124,6 +124,21 @@ function cardSubtitle(acct) {
 }
 
 // ---------------------------------------------------------------- render ---
+
+function emptyHtml() {
+  // Board 05: no tabs at all in the empty roster — one centered card with
+  // both setup entry points (the sheets module owns the actual flows).
+  return `
+  <div class="empty-card">
+    <span class="empty-icon">${ic("plus", 22)}</span>
+    <h3>No accounts yet</h3>
+    <p>Add your first account to start switching.</p>
+    <div class="row">
+      <button class="btn half" data-act="add-login">Use current Claude Code login</button>
+      <button class="btn half" data-act="add">Setup with token</button>
+    </div>
+  </div>`;
+}
 
 function render() {
   const vm = state.vm;
@@ -141,7 +156,7 @@ function render() {
     headerHtml(),
     `<div class="body">`,
     bannerHtml(),
-    selectorHtml(sel),
+    vm.accounts.length ? selectorHtml(sel) : emptyHtml(),
     sel ? identityHtml(sel) : "",
     sel ? quotaCardHtml(sel) : "",
     sel ? actionsHtml(sel) : "",
@@ -179,24 +194,31 @@ function bannerHtml() {
 }
 
 function selectorHtml(sel) {
+  // Index tabs: the stable slot number is the anchor identity; selection
+  // (aria-checked + ring) is preview-only and never implies activation —
+  // the Active status word is what marks the credentialed account.
   const cards = state.vm.accounts.map((a) => {
     const sub = cardSubtitle(a);
+    const selected = a.slot === (sel && sel.slot);
+    const name = a.alias ?? a.label;
     const cls = [
-      "sel-card",
-      a.slot === (sel && sel.slot) ? "selected" : "",
+      "tab",
+      selected ? "selected" : "",
+      a.disabled ? "off" : "",
     ].filter(Boolean).join(" ");
-    const attrs = a.disabled ? ' data-disabled=""' : "";
-    return `<button class="${cls}"${attrs} data-act="select" data-slot="${esc(a.slot)}"
-              aria-pressed="${a.slot === (sel && sel.slot)}">
-      <span class="alias">${esc(a.alias ?? a.label)}</span>
-      <span class="sub"><span class="${sub.cls}">${sub.text}</span></span>
+    return `<button class="${cls}" role="radio" aria-checked="${selected}"
+              data-act="select" data-slot="${esc(a.slot)}"
+              aria-label="${esc(a.slot)} ${esc(name)} · ${sub.text}">
+      <span class="idx num">${esc(a.slot)}</span>
+      <span class="txt"><span class="alias">${esc(name)}</span>
+        <span class="sub ${sub.cls}">${sub.text}</span></span>
     </button>`;
   });
-  cards.push(`<button class="sel-card add-card" data-act="add" aria-label="Add account">
-    <span class="alias">${ic("plus", 13)}</span>
-    <span class="sub">Add</span>
+  cards.push(`<button class="tab add-tab" data-act="add" aria-label="Add account">
+    <span class="idx">${ic("plus", 13)}</span>
+    <span class="txt"><span class="sub">Add</span></span>
   </button>`);
-  return `<div class="sel-grid" role="listbox" aria-label="Accounts">${cards.join("")}</div>`;
+  return `<div class="tabs" role="radiogroup" aria-label="Accounts">${cards.join("")}</div>`;
 }
 
 function identityHtml(acct) {
@@ -395,6 +417,11 @@ function wire() {
           } else {
             toast("add-account sheet arrives with the sheets module");
           }
+          break;
+        case "add-login":
+          // empty-roster entry point (board 05): same backend path the
+          // token sheet's login button uses
+          doAction(el, "addFromLogin", {}, "account added from current login");
           break;
         case "activity":
           if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openActivity) {

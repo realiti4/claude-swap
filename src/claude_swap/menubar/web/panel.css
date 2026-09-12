@@ -141,26 +141,44 @@ button:disabled { cursor: default; }
 .fresh-dot.stale { background: var(--swap-warning); }
 .fresh-dot.bad { background: var(--swap-error); }
 
-/* ---- account selector cards ---------------------------------------- */
+/* ---- account index tabs ---------------------------------------------- */
 
-.sel-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: calc(var(--swap-space) * 1.5); }
-.sel-card {
+.tabs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: calc(var(--swap-space) * 1.5); }
+.tab {
   border: 1px solid var(--swap-hairline); border-radius: var(--swap-radius-card);
   background: var(--swap-surface); padding: calc(var(--swap-space) * 2) calc(var(--swap-space) * 2.5);
-  text-align: left; display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  text-align: left; display: flex; align-items: stretch; gap: 9px; min-width: 0;
 }
-.sel-card .alias { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sel-card .sub { font-size: 11px; color: var(--swap-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sel-card.selected { border-color: var(--swap-accent); background: var(--swap-accent-quiet); }
-.sel-card.selected .alias::before {
-  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--swap-accent); margin-right: 5px; vertical-align: 1px;
+.tab .idx {
+  font-size: 17px; font-weight: 600; line-height: 1.1; flex: none; min-width: 1ch;
+  color: var(--swap-text-secondary); align-self: center;
 }
-.sel-card .sub .st-ok { color: var(--swap-accent); }
-.sel-card .sub .st-warn { color: var(--swap-warning); }
-.sel-card .sub .st-bad { color: var(--swap-error); }
-.sel-card[data-disabled] .alias { text-decoration: line-through; text-decoration-color: var(--swap-text-faint); }
-.sel-card.add-card { align-items: center; justify-content: center; color: var(--swap-text-secondary); border-style: dashed; }
+.tab .txt { min-width: 0; display: flex; flex-direction: column; gap: 1px; justify-content: center; }
+.tab .alias { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab .sub { font-size: 11px; color: var(--swap-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab.selected { border-color: var(--swap-accent); background: var(--swap-accent-quiet); }
+.tab.selected .idx { color: var(--swap-accent); }
+.tab .sub .st-ok { color: var(--swap-accent); }
+.tab .sub .st-warn { color: var(--swap-warning); }
+.tab .sub .st-bad { color: var(--swap-error); }
+.tab.off { opacity: 0.55; }
+.tab.off .alias { text-decoration: line-through; text-decoration-color: var(--swap-text-faint); }
+.tab.add-tab { color: var(--swap-text-secondary); border-style: dashed; align-items: center; }
+
+.empty-card {
+  background: var(--swap-surface); border: 1px solid var(--swap-hairline);
+  border-radius: var(--swap-radius-card); padding: calc(var(--swap-space) * 8) calc(var(--swap-space) * 5);
+  text-align: center; display: flex; flex-direction: column; align-items: center;
+  gap: calc(var(--swap-space) * 1.5); margin: calc(var(--swap-space) * 3) 0;
+}
+.empty-card .empty-icon {
+  color: var(--swap-text-secondary); border: 1px solid var(--swap-hairline);
+  border-radius: 50%; width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+}
+.empty-card h3 { font-size: 14px; font-weight: 600; margin: 0; }
+.empty-card p { font-size: 12px; color: var(--swap-text-secondary); margin: 0 0 calc(var(--swap-space) * 2); }
+.empty-card .row { display: flex; gap: calc(var(--swap-space) * 2); width: 100%; }
 
 /* ---- selected identity --------------------------------------------- */
 

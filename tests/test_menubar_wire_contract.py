@@ -140,6 +140,32 @@ class TestAccountCard:
             assert f"alias: {alias}," in PANEL_JS, f"fixture alias {alias} missing"
 
 
+class TestNumberedSelector:
+    """Index-tab selector: radiogroup semantics, stable index, status words."""
+
+    def test_selector_is_a_radiogroup(self) -> None:
+        assert 'role="radiogroup"' in PANEL_JS
+        assert 'aria-label="Accounts"' in PANEL_JS
+
+    def test_tabs_are_radios_with_checked_state(self) -> None:
+        assert 'role="radio"' in PANEL_JS
+        assert "aria-checked=" in PANEL_JS
+
+    def test_tab_shows_the_stable_index(self) -> None:
+        assert 'class="idx' in PANEL_JS
+
+    def test_status_vocabulary(self) -> None:
+        for word in ("Ready", "Active", "Disabled", "API key", "Needs login", "Unavailable"):
+            assert word in PANEL_JS, f"selector lost the {word!r} status word"
+        assert "Held out" not in PANEL_JS, "final design renames Held out to Disabled"
+
+    def test_tab_accessible_name_carries_full_identity(self) -> None:
+        # the ellipsized alias must not be the accessible name; slot + alias + status
+        assert re.search(r'aria-label="\$\{[^}]*slot[^}]*\}', PANEL_JS) or re.search(
+            r"aria-label=\`\$\{", PANEL_JS
+        ), "tabs need an aria-label built from slot/alias/status"
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings
