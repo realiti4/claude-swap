@@ -81,14 +81,27 @@ class MenuBarSettings:
             return defaults
         kwargs = {}
         for f in fields(cls):
-            if f.name in raw and isinstance(raw[f.name], type(getattr(defaults, f.name))):
-                kwargs[f.name] = raw[f.name]
+            default = getattr(defaults, f.name)
+            value = raw.get(f.name)
+            # bool is an int subclass: `"refresh_interval": true` would load
+            # as 1 (a 1-second timer) without this exclusion.
+            if (
+                isinstance(value, type(default))
+                and not (isinstance(value, bool) and not isinstance(default, bool))
+            ):
+                kwargs[f.name] = value
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
-        """Write settings as pretty JSON, creating parent directories."""
+        """Write settings as JSON via the shared atomic-write helper.
+
+        A torn plain write silently reverts every pref to defaults on the
+        next load; atomic_write_json (temp file + rename) can't tear.
+        """
+        from claude_swap.settings import atomic_write_json
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        atomic_write_json(path, asdict(self))
 
 
 # ---- notifications (no app bundle required) ---------------------------------
@@ -109,12 +122,18 @@ def notify(title: str, message: str) -> None:
         f'display notification "{_osa_quote(message)}" '
         f'with title "{_osa_quote(title)}" sound name "Glass"'
     )
-    try:
-        subprocess.run(
-            ["/usr/bin/osascript", "-e", script], check=False, timeout=5
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+
+    def run_osascript() -> None:
+        try:
+            subprocess.run(
+                ["/usr/bin/osascript", "-e", script], check=False, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Fire-and-forget: osascript can take seconds, and notify() is called
+    # from the 1s sync tick — it must never block the AppKit main thread.
+    threading.Thread(target=run_osascript, daemon=True).start()
 
 
 # ---- environment gating (unchanged from the legacy module) ------------------
@@ -280,6 +299,12 @@ def run(switcher) -> int:
             button.setToolTip_("claude-swap")
             button.setTarget_(self._target)
             button.setAction_("onStatusClick:")
+            # The default action mask is left-mouse-only; without right-mouse
+            # masks the fallback-menu branch in on_status_click is dead code
+            # (verified: the cell's default mask is NSEventMaskLeftMouseUp).
+            button.cell().sendActionOn_(
+                AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp
+            )
             self._button = button
 
         def _make_target(self):
@@ -315,11 +340,15 @@ def run(switcher) -> int:
                     self, _webview, navigationAction, handler
                 ):
                     url = navigationAction.request().URL()
-                    allowed = (
-                        url is not None
-                        and url.isFileURL()
-                        and str(url.path()).startswith(str(shell.web_dir))
-                    )
+                    try:
+                        allowed = (
+                            url is not None
+                            and url.isFileURL()
+                            and Path(str(url.path())).resolve()
+                            .is_relative_to(shell.web_dir.resolve())
+                        )
+                    except OSError:
+                        allowed = False
                     handler(1 if allowed else 0)  # Allow / Cancel
 
             return ShellTarget.new()
@@ -347,6 +376,12 @@ def run(switcher) -> int:
         # ---- menu ------------------------------------------------------------
 
         def rebuild_menu(self) -> None:
+            # The old NSMenu is discarded with this rebuild; its tag->closure
+            # entries must go with it or the registry grows forever in a
+            # launchd-resident process (a smaller echo of the rumps leak the
+            # legacy module documented).
+            self._callbacks.clear()
+            self._next_tag = 1
             self._button.setTitle_(format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
@@ -513,6 +548,10 @@ def run(switcher) -> int:
         def _add_from_token(self, payload):
             if not hasattr(self.switcher, "add_account_from_token"):
                 raise ClaudeSwitchError("adding from a setup token is not supported")
+            if not str(payload.get("token", "")).strip():
+                # The switcher falls back to getpass for a missing token —
+                # on a bridge daemon thread that would wedge invisibly.
+                raise ClaudeSwitchError("token is required")
             self.switcher.add_account_from_token(
                 token=payload["token"], email=payload.get("email") or "", slot=None,
             )
@@ -524,6 +563,7 @@ def run(switcher) -> int:
             if self.settings.auto_switch_enabled != enabled:
                 self.on_toggle_autoswitch()
             self.rebuild_menu()
+            self.refresh_async()  # the open panel's toggle must not go stale
 
         def _set_prefs(self, payload):
             interval = payload.get("refreshInterval")
@@ -833,15 +873,10 @@ def run(switcher) -> int:
                 elif ev.kind == "all-exhausted":
                     notify("All accounts exhausted", human)
                     self._bridge.push("engine", {"event": "exhausted", "text": human})
-                elif ev.kind == "config-warning":
+                else:
+                    # config-warning and anything the engine adds later
                     notify("Configuration warning", human)
                     self._bridge.push("engine", {"event": "warning", "text": human})
-                elif ev.kind == "account-quarantined":
-                    notify("Account quarantined", ev.human())
-                elif ev.kind == "all-exhausted":
-                    notify("All accounts exhausted", ev.human())
-                elif ev.kind == "config-warning":
-                    notify("Configuration warning", ev.human())
 
         def _threshold(self) -> int:
             try:

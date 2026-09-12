@@ -34,6 +34,98 @@ def test_ns_popover_api_assumptions() -> None:
     assert callable(popover.performClose_)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only shell")
+def test_shell_selector_api_assumptions() -> None:
+    """Every PyObjC selector the shell calls, checked as metadata.
+
+    The class of bug this guards against already shipped once
+    (mistranslated NSPopover selectors, silently dead clicks); this
+    generalizes the guard to the rest of the AppKit/WebKit surface without
+    needing a window server.
+    """
+    AppKit = pytest.importorskip(
+        "AppKit", reason="pyobjc not installed (menubar extra absent)"
+    )
+    WebKit = pytest.importorskip(
+        "WebKit", reason="pyobjc not installed (menubar extra absent)"
+    )
+
+    # status item: the click-delivery API whose absence killed right-click
+    assert AppKit.NSCell.instancesRespondToSelector_("sendActionOn:")
+    assert AppKit.NSStatusBar.instancesRespondToSelector_(
+        "statusItemWithLength:"
+    )
+    # webview: the inbound channel + lockdown + outbound calls
+    assert WebKit.WKWebView.instancesRespondToSelector_(
+        "evaluateJavaScript:completionHandler:"
+    )
+    assert WebKit.WKWebView.instancesRespondToSelector_(
+        "loadFileURL:allowingReadAccessToURL:"
+    )
+    assert WebKit.WKUserContentController.instancesRespondToSelector_(
+        "addScriptMessageHandler:name:"
+    )
+    # timers + fallback menu
+    assert AppKit.NSTimer.respondsToSelector_(
+        "timerWithTimeInterval:target:selector:userInfo:repeats:"
+    )
+    assert AppKit.NSMenu.instancesRespondToSelector_(
+        "popUpMenuPositioningItem:atLocation:inView:"
+    )
+
+
+def test_target_action_selector_strings_match_methods() -> None:
+    """Every @"..." selector string in app.py must name a real ShellTarget
+    method (source-level check, all platforms)."""
+    import re
+    from pathlib import Path
+
+    import claude_swap.menubar.app as app_module
+
+    source = Path(app_module.__file__).read_text(encoding="utf-8")
+    selector_strings = set(re.findall(r'"([a-zA-Z]+:)"', source))
+    # selectors used as actions/timers, not NSMenu titles like "Quit"
+    method_defs = set(re.findall(r"def ([a-zA-Z]+)_\(", source))
+    used = {name for name in selector_strings if name.startswith(("on", "auto"))}
+    missing = {sel[:-1] for sel in used} - method_defs  # strip the trailing ':'
+    assert not missing, f"selector strings without backing methods: {sorted(missing)}"
+
+
+class TestNotify:
+    """The osascript notification path replaced rumps.notification — it needs
+    the behavioral tests the old path had (escaping + never raising)."""
+
+    def test_osa_quote_escapes_terminators(self) -> None:
+        from claude_swap.menubar.app import _osa_quote
+
+        assert _osa_quote('say "hi"') == 'say \\"hi\\"'
+        assert _osa_quote("back\\slash") == "back\\\\slash"
+        assert _osa_quote("plain") == "plain"
+
+    def test_notify_never_raises_and_runs_off_thread(self, monkeypatch) -> None:
+        import claude_swap.menubar.app as app_module
+
+        ran = []
+        monkeypatch.setattr(
+            app_module.subprocess, "run",
+            lambda *a, **k: ran.append(1) or (_ for _ in ()).throw(OSError("no")),
+        )
+        started = []
+
+        class InlineThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+
+            def start(self):
+                started.append(1)
+                self._target()
+
+        monkeypatch.setattr(app_module.threading, "Thread", InlineThread)
+        app_module.notify("t", "m")  # must not propagate the OSError
+        assert started == [1]
+        assert ran == [1]
+
+
 def test_source_uses_real_ns_popover_selectors() -> None:
     """The status-item click path died silently twice (issue: clicking the
     item did nothing) because PyObjC selector names were mistranslated —

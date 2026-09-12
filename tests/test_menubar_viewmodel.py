@@ -300,6 +300,16 @@ class TestContract:
         assert "5h" not in kinds  # NaN never reaches the wire
         assert "7d" in kinds
 
+    def test_spend_without_limit_omits_the_key(self) -> None:
+        usage = usage_fixture()
+        usage["spend"] = {"used": 5.0, "pct": 5.0, "currency": "USD"}
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=usage))), now=NOW
+        )
+        spend = vm["accounts"][0]["spend"]
+        assert "limit" not in spend  # absent, never null
+        assert spend["used"] == 5.0
+
     def test_vm_serializes_as_strict_json(self) -> None:
         import json as _json
 

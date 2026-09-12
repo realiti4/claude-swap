@@ -17,7 +17,6 @@
 const state = {
   vm: null,
   selectedSlot: null,      // pill selection (never switches by itself)
-  pending: new Set(),      // action ids with an outstanding reply
   history: [],
 };
 
@@ -227,7 +226,7 @@ function cardHtml(acct) {
 function windowHtml(w) {
   const pct = Math.min(100, Math.max(0, w.pct));
   const cd = w.resetsAt
-    ? `<div class="row-countdown" data-resets-at="${w.resetsAt}">resets ${esc(w.countdownText ?? "")}</div>`
+    ? `<div class="row-countdown" data-resets-at="${esc(String(w.resetsAt))}">resets ${esc(w.countdownText ?? "")}</div>`
     : "";
   return `
   <div class="window-row">
@@ -258,7 +257,7 @@ function autoSwitchHtml() {
   const as = state.vm.autoSwitch;
   const line2 = as.lastEventText
     ? esc(as.lastEventText)
-    : `threshold ${as.thresholdPct}% · ${esc(as.strategy)}`;
+    : `threshold ${esc(String(as.thresholdPct))}% · ${esc(as.strategy)}`;
   return `
   <section class="autoswitch">
     <div class="as-copy">
@@ -407,13 +406,12 @@ function openRemoveConfirm(slot) {
 }
 
 function openAddSheet() {
-  const tokenSupported = state.vm.accounts.length >= 0; // bridge replies with the error if not
   openSheet(`
     <h3>Add account</h3>
     <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
       <button class="ghost" data-sheet="login">From current login —<br>
         <span style="font-size:11px;color:var(--text-dim)">captures whatever Claude Code is logged in as now</span></button>
-      ${tokenSupported ? `<button class="ghost" data-sheet="token">From setup-token…</button>` : ""}
+      <button class="ghost" data-sheet="token">From setup-token…</button>
     </div>
     <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Cancel</button></div>
   `);
@@ -430,7 +428,7 @@ function openTokenSheet() {
     <h3>Add from setup-token</h3>
     <p>Paste the token Claude Code printed for account linking.</p>
     <input type="email" placeholder="email for this token" data-field="email">
-    <input type="text" placeholder="sk-ant-oat01-…" data-field="token">
+    <input type="password" placeholder="sk-ant-oat01-…" data-field="token" autocomplete="off">
     <div class="row">
       <button class="ghost" data-sheet="cancel">Cancel</button>
       <button class="primary" data-sheet="add" style="flex:none">Add</button>
@@ -464,7 +462,7 @@ function openSettingsSheet() {
       ${["off", "5h", "7d", "both"].map((m) =>
         `<button class="ghost" data-sheet="tp" data-tp="${m}">${m}</button>`).join("")}
     </div>
-    <p style="margin-top:10px">Auto-switch policy (threshold ${as.thresholdPct}% ·
+    <p style="margin-top:10px">Auto-switch policy (threshold ${esc(String(as.thresholdPct))}% ·
       ${esc(as.strategy)}) lives in <code>cswap config</code>.</p>
     <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Done</button></div>
   `);
@@ -491,7 +489,7 @@ setInterval(() => {
   const now = Date.now() / 1000;
   els.panel.querySelectorAll("[data-resets-at]").forEach((el) => {
     const cd = countdownFrom(parseFloat(el.dataset.resetsAt), now);
-    if (cd) el.textContent = `resets ${cd}`;
+    el.textContent = cd ? `resets ${cd}` : "resets now";
   });
 }, 30000);
 

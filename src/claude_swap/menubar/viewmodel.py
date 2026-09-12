@@ -399,10 +399,11 @@ def _spend_vm(spend: dict, *, now: float) -> dict | None:
         return None
     vm = {
         "used": used,
-        "limit": limit,
         "pct": pct,
         "currency": spend.get("currency", "USD"),
     }
+    if limit is not None:
+        vm["limit"] = limit
     ts = _resets_at_ts(spend)
     if ts != float("inf"):
         vm["resetsAt"] = ts
