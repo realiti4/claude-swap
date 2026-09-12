@@ -176,7 +176,7 @@ function render() {
 function headerHtml() {
   return `
   <header class="hdr">
-    <div class="brand">${ic("swap", 15)}<span class="name">claude-swap</span></div>
+    <div class="brand">${ic("swap", 16)}<span class="name">Claude Code Swap</span></div>
     <button class="icon-btn" data-act="refresh" title="Refresh" aria-label="Refresh">
       ${ic("refresh", 13)}
     </button>

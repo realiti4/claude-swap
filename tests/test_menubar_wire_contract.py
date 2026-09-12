@@ -208,6 +208,27 @@ class TestSettingsSegments:
         assert INDEX_HTML.count('class="seg-btn" role="radio"') >= 10
 
 
+class TestBranding:
+    """Claude Code Swap header + Interlock mark from the final handoff."""
+
+    def test_header_reads_claude_code_swap(self) -> None:
+        assert ">Claude Code Swap<" in PANEL_JS
+
+    def test_interlock_glyph_ships_in_icons(self) -> None:
+        # exact Pen-export geometry: the S-ribbon start and an arrowhead
+        assert "M17.5 4.5 L8.5 4.5" in ICONS_JS
+        assert "M17.5 2.6" in ICONS_JS
+        # the mark is a fill glyph, not the stroke language of utility icons
+        assert re.search(r"swap:\s*\{", ICONS_JS) or "fillGlyph" in ICONS_JS or \
+            re.search(r'"swap":\s*\{', ICONS_JS), "swap must be a fill-glyph entry"
+
+    def test_old_swap_arrows_are_gone(self) -> None:
+        assert "M4 7h13l-3.5-3.5" not in ICONS_JS
+
+    def test_page_title_is_branded(self) -> None:
+        assert "<title>Claude Code Swap</title>" in INDEX_HTML
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings

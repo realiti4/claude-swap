@@ -63,7 +63,7 @@ criteria.
 
 ## Phase 5: Interlock branding
 
-- [ ] Task 7: Panel header rebrand + icons.js Interlock
+- [x] Task 7: Panel header rebrand + icons.js Interlock
   - Acceptance: header reads "Claude Code Swap" with the Interlock mark inlined as currentColor SVG (both themes); icons.js swap glyph geometry replaced by the Interlock paths with all `ic()` consumers intact; no other utility icons changed
   - Verify: fixture render both themes; icons wire/DOM guards; `node --check`
   - Files: index.html (or panel.js), icons.js, tests

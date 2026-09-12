@@ -7,7 +7,16 @@
 "use strict";
 
 const ICON_PATHS = {
-  swap: '<path d="M4 7h13l-3.5-3.5"/><path d="M20 17H7l3.5 3.5"/>',
+  // The Interlock brand mark: exact Pen-export geometry, filled rather
+  // than stroked (entry form `{fill: true, body}`; utility icons stay
+  // plain stroke strings).
+  swap: {
+    fill: true,
+    body:
+      '<path d="M17.5 4.5 L8.5 4.5 Q6 4.5 6 7 L6 11 Q6 13.5 8.5 13.5 L15.5 13.5 Q18 13.5 18 16 L18 17 Q18 19.5 15.5 19.5 L6.5 19.5 L6.5 16.5 L14.25 16.5 Q15 16.5 15 15.75 L15 11.25 Q15 10.5 14.25 10.5 L9.75 10.5 Q9 10.5 9 9.75 L9 8.25 Q9 7.5 9.75 7.5 L17.5 7.5 Z"/>' +
+      '<path d="M17.5 2.6 L20.5 5.44 Q21.3 6 20.5 6.56 L17.5 9.4 Z"/>' +
+      '<path d="M6.5 21.4 L3.5 18.56 Q2.7 18 3.5 17.44 L6.5 14.6 Z"/>',
+  },
   refresh:
     '<polyline points="23 4 23 10 17 10"/>' +
     '<polyline points="1 20 1 14 7 14"/>' +
@@ -30,14 +39,18 @@ const ICON_PATHS = {
 };
 
 function icon(name, size = 14, cls = "") {
-  const body = ICON_PATHS[name];
-  if (!body) return "";
+  const def = ICON_PATHS[name];
+  if (!def) return "";
+  const isFill = typeof def === "object" && !!def.fill;
+  const body = isFill ? def.body : def;
   size = Number(size) || 14;  // sizes interpolate into markup: numeric only
   cls = String(cls).replace(/[^a-z0-9 _-]/gi, "");
+  const paint = isFill
+    ? `fill="currentColor" stroke="none"`
+    : `fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"`;
   return (
-    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" ` +
-    `stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ` +
-    `stroke-linejoin="round" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>` +
+    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" ${paint} ` +
+    `aria-hidden="true"${cls ? ` class="${cls}"` : ""}>` +
     body +
     "</svg>"
   );
