@@ -151,10 +151,10 @@ class TestAccountCard:
         assert "text-overflow: ellipsis" in PANEL_CSS
 
     def test_switch_button_shows_index_and_short_name(self) -> None:
-        # pre-review fix: "Switch to 2 (resear…)" — index first, alias
-        # truncated so long names never stretch the action row
-        assert "Switch to ${esc(acct.slot)} (" in PANEL_JS
-        assert ".btn.primary" in PANEL_CSS and "text-overflow: ellipsis" in PANEL_CSS
+        # pre-review fix: "Switch to 2" with an icon, matching Best/Rotate;
+        # the full target name lives in the tooltip only
+        assert '`${ic("swap", 12)} Switch to ${esc(acct.slot)}`' in PANEL_JS
+        assert "Switch to ${esc(acct.slot)} (" not in PANEL_JS
 
     def test_no_workspace_terminology(self) -> None:
         assert "workspace" not in PANEL_JS.lower(), (

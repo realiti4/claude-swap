@@ -326,14 +326,12 @@ function quotaCardHtml(acct) {
 function actionsHtml(acct) {
   const cant = acct.active || !acct.switchable || acct.status === "needs-login";
   const pending = state.pendingAction === "switch";
-  // "Switch to 2 (resear…)" — the stable index first, the alias shortened
-  // so a long name never stretches the action row; the button's tooltip
-  // carries the full target.
+  // "⇄ Switch to 2" — icon-led like Best/Rotate, index-only label; the
+  // button's tooltip carries the full target name.
   const name = acct.alias ?? acct.label;
-  const short = name.length > 8 ? `${name.slice(0, 7)}…` : name;
   const label = pending ? "Switching…"
     : acct.active ? `${ic("check", 12)} Current account`
-    : `Switch to ${esc(acct.slot)} (${esc(short)})`;
+    : `${ic("swap", 12)} Switch to ${esc(acct.slot)}`;
   return `
   <div class="actions">
     <button class="btn primary" data-act="switch" data-slot="${esc(acct.slot)}"
