@@ -22,6 +22,33 @@ def test_app_module_imports_headless() -> None:
     assert app.MenuBarSettings is not None
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only shell")
+def test_ns_popover_api_assumptions() -> None:
+    import AppKit
+
+    popover = AppKit.NSPopover.alloc().init()
+    assert popover.isShown() is False  # visibility accessor the shell polls
+    assert callable(popover.showRelativeToRect_ofView_preferredEdge_)
+    assert callable(popover.performClose_)
+
+
+def test_source_uses_real_ns_popover_selectors() -> None:
+    """The status-item click path died silently twice (issue: clicking the
+    item did nothing) because PyObjC selector names were mistranslated —
+    NSPopover has no isVisible()/showRelativeTo_... — and exceptions raised
+    inside action selectors vanish into NSLog, never stderr. Guard the exact
+    names the shell calls so a rename or typo fails HERE, loudly, everywhere.
+    """
+    import claude_swap.menubar.app as app_module
+    from pathlib import Path
+
+    source = Path(app_module.__file__).read_text(encoding="utf-8")
+    for bad in ("isVisible()", "show_relativeTo_", "showRelativeTo_ofView_"):
+        assert bad not in source, f"app.py uses non-existent NSPopover API: {bad}"
+    assert ".isShown()" in source
+    assert "showRelativeToRect_ofView_preferredEdge_(" in source
+
+
 def test_app_module_import_safe_without_pyobjc_anywhere() -> None:
     # The import itself must never pull AppKit at module level: this is the
     # guarantee Linux CI depends on.

@@ -22,6 +22,7 @@ the network.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -593,11 +594,11 @@ def run(switcher) -> int:
                         None, (0.0, 0.0), self._button
                     )
                 return
-            if self._popover.isVisible():
+            if self._popover.isShown():
                 self._popover.performClose_(None)
                 return
             self.push_vm()  # instant paint from the last vm before freshening
-            self._popover.show_relativeTo_of_preferredEdge_(
+            self._popover.showRelativeToRect_ofView_preferredEdge_(
                 self._button.bounds(), self._button, 3  # NSMaxYEdge: below the item
             )
             self.refresh_async()
@@ -745,7 +746,7 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
-                if self._popover.isVisible():
+                if self._popover.isShown():
                     self.push_vm()
             self._detect_active_change()
             self._drain_engine_events()
