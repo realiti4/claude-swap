@@ -3,14 +3,51 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-swap</title>
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
-<title>claude-swap</title>
-<link rel="stylesheet" href="panel.css?v=2">
+<link rel="stylesheet" href="panel.css?v=3">
 </head>
 <body>
 <div id="panel" aria-live="polite"></div>
+
+<!-- Sheets: native dialogs. Content is filled and managed by sheets.js. -->
+<dialog id="dlg-token" aria-labelledby="dlg-token-title">
+  <h3 id="dlg-token-title">Add from setup-token</h3>
+  <div class="field">
+    <label for="fld-email">Email (optional)</label>
+    <input id="fld-email" type="email" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="fld-token">Setup token</label>
+    <input id="fld-token" type="password" placeholder="sk-ant-oat01-…" autocomplete="off">
+    <div class="ferr" id="fld-token-err" role="alert"></div>
+  </div>
+  <div class="row">
+    <button class="btn ghost" data-dlg="cancel">Cancel</button>
+    <button class="btn primary" data-dlg="submit-token" style="flex:none">Add account</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-remove" aria-labelledby="dlg-remove-title">
+  <h3 id="dlg-remove-title">Remove account</h3>
+  <p id="dlg-remove-body"></p>
+  <div class="row">
+    <button class="btn ghost" data-dlg="cancel">Cancel</button>
+    <button class="btn primary danger" data-dlg="submit-remove" style="flex:none">Remove</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-activity" aria-labelledby="dlg-activity-title">
+  <h3 id="dlg-activity-title">Recent switches</h3>
+  <ul class="hist" id="dlg-activity-list"></ul>
+  <div class="row"><button class="btn ghost" data-dlg="cancel">Close</button></div>
+</dialog>
+
 <div id="toasts"></div>
-<script src="panel.js?v=2"></script>
+
+<script src="icons.js?v=3"></script>
+<script src="sheets.js?v=3"></script>
+<script src="panel.js?v=3"></script>
 </body>
 </html>

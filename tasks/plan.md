@@ -40,7 +40,7 @@ accessibility, and a full verification sweep.
 - [x] `uv run pytest` green; status vocabulary + no-fabricated-zero pinned
 
 ### Phase 2: Web layer (fixture-verified per task)
-- [ ] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
+- [x] Task 4: `panel.css` token foundation + `icons.js` + `index.html` skeletons
 - [ ] Task 5: `panel.js` core render — header, selector cards, identity, quotas
 - [ ] Task 6: `panel.js` completion — disclosure, actions, auto-switch, footer
 - [ ] Task 7: `sheets.js` — token/remove/activity `<dialog>`s + wiring

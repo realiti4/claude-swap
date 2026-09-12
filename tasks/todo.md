@@ -79,13 +79,13 @@ skeletons (token/remove/activity), CSP unchanged. Old panel.js keeps
 functioning against the new CSS (ugly but working).
 
 **Acceptance criteria:**
-- [ ] Fixture page loads with new tokens; both themes flip correctly via `?theme=`
-- [ ] `node --check` passes on icons.js; every icon renders via `icon("name")`
-- [ ] Old panel remains bridge-functional (fixture actions still log)
+- [x] Fixture page loads with new tokens; both themes flip correctly via `?theme=`
+- [x] `node --check` passes on icons.js; every icon renders via `icon("name")`
+- [x] Old panel remains bridge-functional (fixture actions still log)
 
 **Verification:**
-- [ ] Browser: fixture renders (unstyled-ish), theme override works
-- [ ] `uv run pytest` green
+- [x] Browser: fixture renders (unstyled-ish), theme override works
+- [x] `uv run pytest` green
 
 **Dependencies:** Task 3 (panel.js state)
 **Files:** `web/panel.css`, `web/icons.js`, `web/index.html`
