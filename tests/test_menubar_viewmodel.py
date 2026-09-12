@@ -237,14 +237,14 @@ class TestContract:
         "accounts", "autoSwitch", "history",
     }
     ALLOWED_ACCOUNT = {
-        "slot", "label", "org", "kind", "active", "switchable", "windows",
+        "slot", "label", "email", "org", "kind", "active", "switchable", "windows",
         "alias", "disabled", "quarantined", "note", "spend", "pace", "lastError",
     }
     ALLOWED_WINDOW = {
         "kind", "label", "pct", "state",
         "resetsAt", "countdownText", "note",
     }
-    REQUIRED_ACCOUNT = {"slot", "label", "org", "kind", "active", "switchable", "windows"}
+    REQUIRED_ACCOUNT = {"slot", "label", "email", "org", "kind", "active", "switchable", "windows"}
     REQUIRED_WINDOW = {"kind", "label", "pct", "state"}
 
     def test_keys_neither_removed_nor_accidentally_added(self) -> None:

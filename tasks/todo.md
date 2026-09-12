@@ -178,14 +178,14 @@ sheet), setAutoSwitch, setPrefs (refresh interval, title pct), quit.
 Engine events push into the panel live.
 
 **Acceptance criteria:**
-- [ ] Every action works against the real switcher with correct success/error feedback
-- [ ] UI never blocks during actions (main thread stays responsive)
-- [ ] Panel state stays consistent after every action (snapshot re-push)
-- [ ] Auto-switch toggle starts/stops the engine; events appear in panel + notifications
+- [x] Every action works against the real switcher with correct success/error feedback
+- [x] UI never blocks during actions (main thread stays responsive)
+- [x] Panel state stays consistent after every action (snapshot re-push)
+- [x] Auto-switch toggle starts/stops the engine; events appear in panel + notifications
 
 **Verification:**
-- [ ] `uv run pytest` green (bridge tests extended for new handlers)
-- [ ] Manual: exercise every action on macOS with a test account store
+- [x] `uv run pytest` green (bridge tests extended for new handlers)
+- [x] Manual: exercise every action on macOS with a test account store
 
 **Dependencies:** Task 5
 

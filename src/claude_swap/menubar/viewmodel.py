@@ -391,6 +391,7 @@ def _account_vm(acc, *, now: float) -> dict:
     vm: dict = {
         "slot": acc.number,
         "label": _local_part(acc.email),
+        "email": acc.email,
         "org": acc.display_tag,
         "kind": acc.kind,
         "active": acc.is_active,

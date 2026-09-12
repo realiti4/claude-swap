@@ -271,12 +271,22 @@ function wire() {
         case "select": state.selectedSlot = slot; render(); break;
         case "refresh": doRefresh(btn); break;
         case "switch": doAction(btn, "switch", { slot }, `switched to ${slot}`); break;
-        case "autoswitch":
-          doAction(btn, "setAutoSwitch", { enabled: !state.vm.autoSwitch.enabled }, null);
+        case "autoswitch": {
+          const target = !state.vm.autoSwitch.enabled;
+          doAction(null, "setAutoSwitch", { enabled: target }, null)
+            .then((r) => {
+              // hosted mode re-renders from the fresh vm the reply triggers;
+              // fixture mode has no reply, so apply the flip locally.
+              if (r.ok && !bridge.hosted) {
+                state.vm.autoSwitch.enabled = target;
+                render();
+              }
+            });
           break;
-        case "add": toast("add-account flow arrives in the actions task"); break;
-        case "overflow": toast("disable / remove menu arrives in the actions task"); break;
-        case "settings": toast("settings arrive with the actions task"); break;
+        }
+        case "add": openAddSheet(); break;
+        case "overflow": openOverflowMenu(slot); break;
+        case "settings": openSettingsSheet(); break;
         case "quit": doAction(btn, "quit", {}, null); break;
       }
     });
@@ -296,18 +306,163 @@ async function doAction(btn, action, payload, successText) {
   if (btn) btn.disabled = true;
   const res = await bridge.send(action, payload);
   if (btn) btn.disabled = false;
-  if (!res) return;                          // fixture mode: already logged
+  if (!res) { refresh(); return { ok: true }; }   // fixture mode: already logged
   if (res.ok) {
     if (successText) toast(successText);
     refresh();
-  } else {
-    toast(res.error || `${action} failed`, true);
+    return { ok: true };
   }
+  toast(res.error || `${action} failed`, true);
+  return { ok: false };
 }
 
 function refresh() {
   bridge.send("getSnapshot", {}).then((res) => {
     if (res && res.ok) bridge.push("vm", res.data);
+  });
+}
+
+// ---------------------------------------------------------------- sheets --
+
+function closeSheet() {
+  const backdrop = document.querySelector(".sheet-backdrop");
+  if (backdrop) backdrop.remove();
+}
+
+function openSheet(html) {
+  closeSheet();
+  const backdrop = document.createElement("div");
+  backdrop.className = "sheet-backdrop";
+  backdrop.innerHTML = `<div class="sheet">${html}</div>`;
+  backdrop.addEventListener("click", (ev) => {
+    if (ev.target === backdrop) closeSheet();
+  });
+  document.body.appendChild(backdrop);
+  return backdrop;
+}
+
+function openOverflowMenu(slot) {
+  const acct = state.vm.accounts.find((a) => a.slot === slot);
+  if (!acct) return;
+  const verb = acct.disabled ? "Enable" : "Disable";
+  openSheet(`
+    <h3>${esc(acct.alias ?? acct.label)} · ${esc(acct.slot)}</h3>
+    <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
+      <button class="ghost" data-sheet="toggle">${verb} account</button>
+      <button class="ghost" data-sheet="copyemail">Copy email</button>
+      <button class="ghost" data-sheet="remove" style="color:var(--crit)">Remove account…</button>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Cancel</button></div>
+  `);
+  wireSheet({
+    toggle: () => doAction(null, acct.disabled ? "enable" : "disable", { slot },
+                           acct.disabled ? "back in rotation" : "held out of rotation")
+                  .then((r) => { if (r.ok) closeSheet(); }),
+    copyemail: () => {
+      if (navigator.clipboard) navigator.clipboard.writeText(acct.email).catch(() => {});
+      toast("email copied"); closeSheet();
+    },
+    remove: () => { closeSheet(); openRemoveConfirm(slot); },
+    close: () => closeSheet(),
+  });
+}
+
+function openRemoveConfirm(slot) {
+  const acct = state.vm.accounts.find((a) => a.slot === slot);
+  if (!acct) return;
+  openSheet(`
+    <h3>Remove account ${esc(acct.slot)}?</h3>
+    <p>${esc(acct.alias ?? acct.label)} (${esc(acct.org)}) — the stored backup is
+    deleted. The account can be re-added later from a fresh login.</p>
+    <div class="row">
+      <button class="ghost" data-sheet="cancel">Cancel</button>
+      <button class="primary" data-sheet="remove" style="flex:none">Remove</button>
+    </div>
+  `);
+  wireSheet({
+    cancel: () => closeSheet(),
+    remove: () => doAction(null, "remove", { slot }, `removed ${slot}`)
+                  .then((r) => { if (r.ok) closeSheet(); }),
+  });
+}
+
+function openAddSheet() {
+  const tokenSupported = state.vm.accounts.length >= 0; // bridge replies with the error if not
+  openSheet(`
+    <h3>Add account</h3>
+    <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
+      <button class="ghost" data-sheet="login">From current login —<br>
+        <span style="font-size:11px;color:var(--text-dim)">captures whatever Claude Code is logged in as now</span></button>
+      ${tokenSupported ? `<button class="ghost" data-sheet="token">From setup-token…</button>` : ""}
+    </div>
+    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Cancel</button></div>
+  `);
+  wireSheet({
+    login: () => doAction(null, "addFromLogin", {}, "account added")
+                 .then((r) => { if (r.ok) closeSheet(); }),
+    token: () => { closeSheet(); openTokenSheet(); },
+    close: () => closeSheet(),
+  });
+}
+
+function openTokenSheet() {
+  openSheet(`
+    <h3>Add from setup-token</h3>
+    <p>Paste the token Claude Code printed for account linking.</p>
+    <input type="email" placeholder="email for this token" data-field="email">
+    <input type="text" placeholder="sk-ant-oat01-…" data-field="token">
+    <div class="row">
+      <button class="ghost" data-sheet="cancel">Cancel</button>
+      <button class="primary" data-sheet="add" style="flex:none">Add</button>
+    </div>
+  `);
+  const backdrop = document.querySelector(".sheet-backdrop");
+  const get = (f) => backdrop.querySelector(`[data-field="${f}"]`).value.trim();
+  wireSheet({
+    cancel: () => closeSheet(),
+    add: () => {
+      const token = get("token");
+      if (!token) { toast("paste the token first", true); return; }
+      doAction(null, "addFromToken",
+               { token, email: get("email") || "" }, "account added")
+        .then((r) => { if (r.ok) closeSheet(); });
+    },
+  });
+}
+
+function openSettingsSheet() {
+  const as = state.vm.autoSwitch;
+  openSheet(`
+    <h3>Panel settings</h3>
+    <p>Refresh interval</p>
+    <div class="row" style="justify-content:flex-start;gap:6px;margin-bottom:10px">
+      ${[30, 60, 300].map((s) => `<button class="ghost" data-sheet="iv" data-iv="${s}">${
+        s === 300 ? "5 min" : `${s}s`}</button>`).join("")}
+    </div>
+    <p>Title percentage</p>
+    <div class="row" style="justify-content:flex-start;gap:6px">
+      ${["off", "5h", "7d", "both"].map((m) =>
+        `<button class="ghost" data-sheet="tp" data-tp="${m}">${m}</button>`).join("")}
+    </div>
+    <p style="margin-top:10px">Auto-switch policy (threshold ${as.thresholdPct}% ·
+      ${esc(as.strategy)}) lives in <code>cswap config</code>.</p>
+    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Done</button></div>
+  `);
+  wireSheet({
+    iv: (target) => doAction(null, "setPrefs", { refreshInterval: Number(target.dataset.iv) }, "saved"),
+    tp: (target) => doAction(null, "setPrefs", { titlePct: target.dataset.tp }, "saved"),
+    close: () => closeSheet(),
+  });
+}
+
+function wireSheet(handlers) {
+  const backdrop = document.querySelector(".sheet-backdrop");
+  if (!backdrop) return;
+  backdrop.querySelectorAll("[data-sheet]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const fn = handlers[btn.dataset.sheet];
+      if (fn) fn(btn);
+    });
   });
 }
 
