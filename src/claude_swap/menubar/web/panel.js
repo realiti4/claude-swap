@@ -1,14 +1,13 @@
-/* claude-swap menubar panel.
+/* claude-swap menubar panel — Pen redesign render.
  *
- * Vanilla JS state/render module. Renders the additive schemaVersion-1
- * view-model built by claude_swap.menubar.viewmodel. Two modes:
+ * Vanilla JS state/render module for the graphite/ivory panel. Renders the
+ * additive schemaVersion-1 view-model built by claude_swap.menubar.viewmodel.
+ * Two modes, as before: hosted (WKWebView bridge) and fixture (plain
+ * browser, embedded vm, actions logged to the console).
  *
- *   - hosted:   window.webkit.messageHandlers.cswap exists (WKWebView);
- *               actions go to the Python bridge, pushes come back as
- *               cswap.push(...) / cswap.reply(id, ...).
- *   - fixture:  opened as a plain file in a browser — renders an embedded
- *               fixture view-model and logs actions to the console, so the
- *               panel can be developed and visually iterated without macOS.
+ * Selection ≠ activation everywhere: clicking an account card previews it;
+ * only the explicit Switch action activates. Success/error UI appears only
+ * after the backend reply.
  */
 "use strict";
 
@@ -16,8 +15,8 @@
 
 const state = {
   vm: null,
-  selectedSlot: null,      // pill selection (never switches by itself)
-  history: [],
+  selectedSlot: null,   // preview selection; never switches by itself
+  pendingAction: null,  // action name while a reply is in flight
 };
 
 const els = {
@@ -32,6 +31,7 @@ const bridge = {
              && window.webkit.messageHandlers.cswap),
 
   _nextId: 1,
+  _pending: {},
 
   send(action, payload) {
     if (!bridge.hosted) {
@@ -45,16 +45,15 @@ const bridge = {
         JSON.stringify({ id, action, payload: payload ?? {} }));
     });
   },
-  _pending: {},
 
-  reply(id, ok, data) {           // called from Python via evaluateJavaScript
+  reply(id, ok, dataOrError) {   // invoked from Python via evaluateJavaScript
     const resolve = bridge._pending[id];
     if (!resolve) return;
     delete bridge._pending[id];
-    resolve(ok ? { ok: true, data } : { ok: false, error: data });
+    resolve(ok ? { ok: true, data: dataOrError } : { ok: false, error: dataOrError });
   },
 
-  push(type, data) {              // called from Python: {type:"vm"|"engine"}
+  push(type, data) {
     if (type === "vm") {
       state.vm = data;
       if (state.selectedSlot === null && data.accounts.length) {
@@ -68,8 +67,6 @@ const bridge = {
   },
 };
 
-// Expose the Python-facing surface under one global, matching the bridge
-// protocol in menubar/bridge.py.
 window.cswap = {
   push: (msg) => bridge.push(msg.type, msg.data),
   reply: (id, result) => bridge.reply(
@@ -80,35 +77,21 @@ window.cswap = {
 
 // ---------------------------------------------------------------- helpers --
 
+// NB: icons.js already declares a global `icon`; this file must not
+// redeclare it (classic scripts share the global lexical scope).
+const ic = (name, size, cls) =>
+  (window.CSWAP_ICONS ? window.CSWAP_ICONS.icon(name, size, cls) : "");
+
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[c]));
 
-const pctClass = (pct) => (pct >= 90 ? "crit" : pct >= 70 ? "warn" : "ok");
-
-const bindingPct = (acct) => {
-  let worst = null;
-  for (const w of acct.windows) worst = worst === null ? w.pct : Math.max(worst, w.pct);
-  return worst;                    // null = unknown — never treat as 0
-};
-
-const statusPill = (acct) => {
-  if (!acct) return "";
-  if (acct.quarantined) {
-    return `<span class="pill crit">needs attention</span>`;
-  }
-  const pct = bindingPct(acct);
-  if (pct === null) return `<span class="pill warn">no usage yet</span>`;
-  if (pct >= 95) return `<span class="pill crit">exhausted</span>`;
-  if (pct >= 70) return `<span class="pill warn">near limit</span>`;
-  return `<span class="pill ok">OK</span>`;
-};
+const pctClass = (pct) => (pct >= 90 ? "bad" : pct >= 70 ? "warn" : "");
 
 const activeAccount = () =>
-  (state.vm ? state.vm.accounts.find((a) => a.active) : null);
-
+  state.vm ? state.vm.accounts.find((a) => a.active) : null;
 const selectedAccount = () =>
-  (state.vm ? state.vm.accounts.find((a) => a.slot === state.selectedSlot) : null);
+  state.vm ? state.vm.accounts.find((a) => a.slot === state.selectedSlot) : null;
 
 function countdownFrom(ts, now) {
   const remaining = Math.floor(ts - now);
@@ -121,377 +104,309 @@ function countdownFrom(ts, now) {
   return `${minutes}m`;
 }
 
+const AWAITING = "Awaiting updated usage";
+
+/** Card subtitle per account: status as text, never color alone. */
+function cardSubtitle(acct) {
+  if (acct.disabled) return { text: "Held out", cls: "st-warn" };
+  switch (acct.status) {
+    case "api-key": return { text: "API key", cls: "st-warn" };
+    case "needs-login": return { text: "Needs login", cls: "st-bad" };
+    case "unavailable": return { text: "Unavailable", cls: "st-warn" };
+    default: return acct.active
+      ? { text: "Active", cls: "st-ok" }
+      : { text: "Ready", cls: "" };
+  }
+}
+
 // ---------------------------------------------------------------- render ---
 
 function render() {
   const vm = state.vm;
   if (!vm) { els.panel.innerHTML = ""; return; }
-  const active = activeAccount();
-  const sel = selectedAccount() ?? active;
+  const sel = selectedAccount() ?? activeAccount();
 
   els.panel.innerHTML = [
-    headerHtml(active),
+    headerHtml(),
+    `<div class="body">`,
     bannerHtml(),
-    pillsHtml(sel),
-    cardHtml(sel),
-    actionsHtml(sel),
-    autoSwitchHtml(),
+    selectorHtml(sel),
+    sel ? identityHtml(sel) : "",
+    sel ? quotaCardHtml(sel) : "",
+    sel ? actionsHtml(sel) : "",
+    autoswitchHtml(),
+    `</div>`,
     footerHtml(),
   ].join("");
   wire();
 }
 
-function headerHtml(active) {
-  const fresh = state.vm.freshness;
-  const freshText = fresh.ageText ? `Updated ${fresh.ageText}` : "No usage yet";
-  const name = active
-    ? `${esc(active.alias ?? active.label)}<span style="font-weight:400;color:var(--text-dim)"> · ${esc(active.org)}</span>`
-    : "no active account";
+function headerHtml() {
   return `
-  <section class="header">
-    <div class="who">
-      <div class="name">${name}</div>
-      <div class="fresh">${esc(freshText)}</div>
-    </div>
-    ${statusPill(active)}
+  <header class="hdr">
+    <div class="brand">${ic("swap", 15)}<span class="name">claude-swap</span></div>
     <button class="icon-btn" data-act="refresh" title="Refresh" aria-label="Refresh">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="23 4 23 10 17 10"/>
-        <polyline points="1 20 1 14 7 14"/>
-        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-      </svg>
+      ${ic("refresh", 13)}
     </button>
-  </section>`;
+    <button class="icon-btn" data-act="gear" title="Settings" aria-label="Settings"
+      aria-haspopup="menu">${ic("gear", 14)}</button>
+  </header>`;
 }
 
 function bannerHtml() {
   const fresh = state.vm.freshness;
-  if (fresh.ok) return "";
+  if (!fresh || fresh.ok) return "";
   const when = fresh.ageText ? ` · ${esc(fresh.ageText)}` : "";
   const why = fresh.error ? ` — ${esc(fresh.error)}` : "";
-  return `<section><div class="banner">${fresh.error ? "Showing last known usage" : "No usage yet"}${when}${why}</div></section>`;
+  return `<div class="note warn">Showing last known usage${when}${why}</div>`;
 }
 
-function pillsHtml(sel) {
-  const pills = state.vm.accounts.map((a) => {
+function selectorHtml(sel) {
+  const cards = state.vm.accounts.map((a) => {
+    const sub = cardSubtitle(a);
     const cls = [
-      "acct-pill",
-      a.slot === sel?.slot ? "selected" : "",
-      a.active ? "active" : "",
-      a.disabled ? "disabled-slot" : "",
-      a.quarantined ? "quarantined" : "",
+      "sel-card",
+      a.slot === (sel && sel.slot) ? "selected" : "",
+      a.disabled ? "" : "",
     ].filter(Boolean).join(" ");
-    return `<button class="${cls}" data-act="select" data-slot="${esc(a.slot)}">
-      <span class="dot"></span>${esc(a.slot)} ${esc(a.label)}</button>`;
+    const attrs = a.disabled ? ' data-disabled=""' : "";
+    return `<button class="${cls}"${attrs} data-act="select" data-slot="${esc(a.slot)}"
+              aria-pressed="${a.slot === (sel && sel.slot)}">
+      <span class="alias">${esc(a.alias ?? a.label)}</span>
+      <span class="sub"><span class="${sub.cls}">${sub.text}</span></span>
+    </button>`;
   });
-  pills.push(`<button class="acct-pill add" data-act="add">+</button>`);
-  return `<section class="pills">${pills.join("")}</section>`;
+  cards.push(`<button class="sel-card add-card" data-act="add" aria-label="Add account">
+    <span class="alias">${ic("plus", 13)}</span>
+    <span class="sub">Add</span>
+  </button>`);
+  return `<div class="sel-grid" role="listbox" aria-label="Accounts">${cards.join("")}</div>`;
 }
 
-function cardHtml(acct) {
-  if (!acct) {
-    return `<section class="card"><div class="note">No managed accounts yet.
-      <button class="linkish" data-act="add">Add your first account</button> —
-      from the current Claude Code login or a setup token.</div></section>`;
-  }
-  const badges = [
-    acct.active ? `<span class="badge active-badge">active</span>` : "",
-    acct.disabled ? `<span class="badge disabled-badge">held out</span>` : "",
-    acct.quarantined ? `<span class="badge disabled-badge">quarantined</span>` : "",
-  ].join("");
-  let body;
-  if (acct.quarantined || acct.windows.length === 0) {
-    body = `<div class="note">${esc(acct.note ?? "usage unavailable")}</div>`;
-  } else {
-    body = acct.windows.map(windowHtml).join("");
-    if (acct.spend) {
-      const limit = acct.spend.limit != null
-        ? ` / $${acct.spend.limit % 1 === 0 ? acct.spend.limit.toFixed(0) : acct.spend.limit.toFixed(2)}`
-        : "";
-      body += `<div class="kv"><span class="k">Spend${esc(acct.spend.currency === "USD" ? "" : " (" + acct.spend.currency + ")")}</span>
-        <span class="v">$${acct.spend.used.toFixed(2)}${limit} · ${acct.spend.pct.toFixed(0)}%</span></div>`;
-    }
-  }
-  const paceChip = acct.pace && acct.pace.aheadOfPace
-    ? `<span class="chip ahead">ahead of pace</span>` : "";
+function identityHtml(acct) {
+  const badge = acct.active
+    ? `<span class="badge active">Active</span>`
+    : `<span class="badge preview">Preview</span>`;
   return `
-  <section class="card">
-    <div class="card-head">
-      <span class="email">${esc(acct.alias ?? acct.label)}</span>${paceChip}
-      <span class="org">${esc(acct.org)}</span>${badges}
-    </div>
-    ${body}
-  </section>`;
+  <div class="identity">
+    <span class="alias">${esc(acct.alias ?? acct.label)}</span>
+    <span class="meta">${esc(acct.email)} · ${esc(acct.org)} · slot ${esc(acct.slot)}</span>
+    ${badge}
+  </div>`;
 }
 
-function windowHtml(w) {
-  const pct = Math.min(100, Math.max(0, w.pct));
-  const cd = w.resetsAt
-    ? `<div class="row-countdown" data-resets-at="${esc(String(w.resetsAt))}">resets ${esc(w.countdownText ?? "")}</div>`
+function statusNoteHtml(acct) {
+  if (acct.status === "api-key") {
+    return `<div class="note">${ic("warn", 12)} No subscription quota — API key account.</div>`;
+  }
+  if (acct.status === "needs-login") {
+    return `<div class="note warn">${ic("warn", 12)} Needs login — refresh token dead.
+      Log in with Claude Code, then re-add the account.</div>`;
+  }
+  if (acct.status === "unavailable" && acct.windows.length === 0) {
+    return `<div class="note">${ic("warn", 12)} ${esc(acct.note ?? "Usage unavailable right now.")}</div>`;
+  }
+  if (acct.windows.length === 0) {
+    return `<div class="note">No usage yet — first measurement pending.</div>`;
+  }
+  return "";
+}
+
+function quotaCardHtml(acct) {
+  const note = statusNoteHtml(acct);
+  if (acct.windows.length === 0) return note;
+
+  const primary = acct.windows.filter((w) => w.kind === "5h" || w.kind === "7d");
+  const secondary = acct.windows.filter((w) => w.kind.startsWith("model:"));
+
+  const row = (w) => {
+    const cls = pctClass(w.pct);
+    const cd = w.resetsAt
+      ? `<span data-resets-at="${esc(String(w.resetsAt))}">${esc(w.countdownText ?? "")}</span>`
+      : `<span>${esc(w.countdownText ?? "")}</span>`;
+    const pace = (w.kind === "7d" && acct.pace && acct.pace.aheadOfPace)
+      ? `<span class="pace">ahead of pace</span>` : "";
+    return `
+    <div class="qrow">
+      <div class="top">
+        <span class="lbl">${esc(w.label)}</span>
+        <span class="pct num ${cls}">${w.pct.toFixed(0)}<span class="unit">USED</span></span>
+      </div>
+      <div class="bar"><i class="${cls}${w.state === "stale" ? " stale" : ""}"
+        style="width:${Math.min(100, Math.max(0, w.pct))}%"></i></div>
+      <div class="cd">resets ${cd}${pace}</div>
+    </div>`;
+  };
+
+  const secondaryHtml = secondary.length
+    ? `<details class="disclosure">
+        <summary>${ic("chevron", 11, "chev")} Per-model limits</summary>
+        ${secondary.map(row).join("")}
+      </details>`
     : "";
-  return `
-  <div class="window-row">
-    <div class="row-top">
-      <span class="row-label">${esc(w.label)}</span>
-      <span class="row-pct ${pctClass(w.pct)}">${w.pct.toFixed(0)}%${
-        w.state === "stale" ? ` <span class="chip stale">stale</span>` : ""
-      }</span>
-    </div>
-    <div class="bar"><i class="${pctClass(w.pct)} ${w.state === "stale" ? "stale" : ""}"
-      style="width:${pct}%"></i></div>
-    ${cd}
+
+  const spend = acct.spend
+    ? `<div class="kv"><span class="k">Spend this period</span>
+        <span class="v num">$${acct.spend.used.toFixed(2)}${
+          acct.spend.limit != null ? ` / $${acct.spend.limit.toFixed(0)}` : ""
+        }</span></div>`
+    : "";
+
+  return `${note}
+  <div class="quota-card">
+    ${primary.map(row).join("")}
+    ${secondaryHtml}
+    ${spend}
   </div>`;
 }
 
 function actionsHtml(acct) {
-  if (!acct) return "";
-  const cant = acct.active || !acct.switchable || acct.quarantined;
-  const label = acct.active ? "Current account" : "Switch here";
+  const cant = acct.active || !acct.switchable || acct.status === "needs-login";
+  const pending = state.pendingAction === "switch";
+  const label = pending ? "Switching…"
+    : acct.active ? `${ic("check", 12)} Current account`
+    : `Switch to ${esc(acct.alias ?? acct.label)}`;
   return `
-  <section class="actions">
-    <button class="primary" data-act="switch" data-slot="${esc(acct.slot)}" ${cant ? "disabled" : ""}>${label}</button>
-    <button class="ghost" data-act="overflow" data-slot="${esc(acct.slot)}">⋯</button>
-  </section>`;
+  <div class="actions">
+    <button class="btn primary" data-act="switch" data-slot="${esc(acct.slot)}"
+      ${cant || pending ? "disabled" : ""}>${label}</button>
+    <button class="btn half" data-act="best" title="Switch to the account with most headroom">
+      ${ic("best", 12)} Best
+    </button>
+    <button class="btn half" data-act="rotate" title="Rotate to the next account in order">
+      ${ic("rotate", 12)} Rotate
+    </button>
+  </div>`;
 }
 
-function autoSwitchHtml() {
+function autoswitchHtml() {
   const as = state.vm.autoSwitch;
-  const line2 = as.lastEventText
-    ? esc(as.lastEventText)
-    : `threshold ${esc(String(as.thresholdPct))}% · ${esc(as.strategy)}`;
+  const pending = state.pendingAction === "setAutoSwitch";
   return `
-  <section class="autoswitch">
-    <div class="as-copy">
-      <div class="line1">Auto-switch</div>
-      <div class="line2">${as.enabled ? "watching" : "off"} · ${line2}</div>
+  <div class="autoswitch">
+    <div class="copy">
+      <div class="l1">Auto-switch</div>
+      <div class="l2">${as.enabled ? "on" : "off"} · at ${esc(String(as.thresholdPct))}% used · ${esc(as.strategy)}${
+        as.lastEventText ? ` · ${esc(as.lastEventText)}` : ""
+      }</div>
     </div>
-    <button class="switch ${as.enabled ? "on" : ""}" data-act="autoswitch"
-      title="Run the same engine as cswap auto"></button>
-  </section>`;
+    <button class="toggle" role="switch" aria-checked="${as.enabled}"
+      aria-label="Auto-switch accounts" data-act="autoswitch" ${pending ? "disabled" : ""}></button>
+  </div>`;
 }
 
 function footerHtml() {
+  const fresh = state.vm.freshness || {};
+  const dotCls = fresh.ok ? "" : fresh.error ? "bad" : "stale";
   return `
-  <section class="footer">
+  <footer class="foot">
+    <span class="fresh-dot ${dotCls}"></span>
+    <span>${fresh.ageText ? `Updated ${esc(fresh.ageText)}` : "No usage yet"}</span>
+    <span class="spacer"></span>
+    <button data-act="activity">Activity ›</button>
     <button data-act="add">Add account</button>
-    <button data-act="settings">Settings</button>
-    <button data-act="quit">Quit</button>
-  </section>`;
+  </footer>`;
 }
 
 // ---------------------------------------------------------------- wiring ---
 
 function wire() {
-  els.panel.querySelectorAll("[data-act]").forEach((btn) => {
-    btn.addEventListener("click", (ev) => {
+  els.panel.querySelectorAll("[data-act]").forEach((el) => {
+    el.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      const act = btn.dataset.act;
-      const slot = btn.dataset.slot;
+      const act = el.dataset.act;
+      const slot = el.dataset.slot;
       switch (act) {
-        case "select": state.selectedSlot = slot; render(); break;
-        case "refresh": doRefresh(btn); break;
-        case "switch": doAction(btn, "switch", { slot }, `switched to ${slot}`); break;
-        case "autoswitch": {
-          const target = !state.vm.autoSwitch.enabled;
-          doAction(null, "setAutoSwitch", { enabled: target }, null)
-            .then((r) => {
-              // hosted mode re-renders from the fresh vm the reply triggers;
-              // fixture mode has no reply, so apply the flip locally.
-              if (r.ok && !bridge.hosted) {
-                state.vm.autoSwitch.enabled = target;
-                render();
-              }
-            });
+        case "select":
+          state.selectedSlot = slot;
+          render();
+          break;
+        case "refresh": {
+          el.classList.add("busy");
+          doRefresh(el);
           break;
         }
-        case "add": openAddSheet(); break;
-        case "overflow": openOverflowMenu(slot); break;
-        case "settings": openSettingsSheet(); break;
-        case "quit": doAction(btn, "quit", {}, null); break;
+        case "switch":
+          doAction(el, "switch", { slot }, `switched to ${slot}`);
+          break;
+        case "best":
+          doAction(el, "best", {}, "switched to best account");
+          break;
+        case "rotate":
+          doAction(el, "rotate", {}, "rotated");
+          break;
+        case "autoswitch": {
+          const target = !state.vm.autoSwitch.enabled;
+          doAction(el, "setAutoSwitch", { enabled: target }, null).then((r) => {
+            if (r.ok && !bridge.hosted) {
+              state.vm.autoSwitch.enabled = target;
+              render();
+            }
+          });
+          break;
+        }
+        case "add":
+          if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openToken) {
+            window.CSWAP_SHEETS.openToken(el);
+          } else {
+            toast("add-account sheet arrives with the sheets module");
+          }
+          break;
+        case "activity":
+          if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openActivity) {
+            window.CSWAP_SHEETS.openActivity(el, state.vm.history);
+          } else {
+            toast("activity sheet arrives with the sheets module");
+          }
+          break;
+        case "gear":
+          toast("overflow menu arrives with the completion task");
+          break;
       }
     });
   });
 }
 
 async function doRefresh(btn) {
-  btn.classList.add("busy");
   await bridge.send("refresh", {});
-  // hosted mode: the reply precedes a vm push that re-renders; fixture:
-  // drop the spinner after a beat.
-  setTimeout(() => btn.classList.remove("busy"), 600);
   if (!bridge.hosted) toast("refresh requested");
+  render(); // drop the spinner state either way
 }
 
-async function doAction(btn, action, payload, successText) {
-  if (btn) btn.disabled = true;
+async function doAction(el, action, payload, successText) {
+  if (state.pendingAction) return { ok: false };  // no duplicate submission
+  state.pendingAction = action;
+  if (el) el.disabled = true;
+  render(); // paint pending state (button label / toggle disabled)
   const res = await bridge.send(action, payload);
-  if (btn) btn.disabled = false;
-  if (!res) { refresh(); return { ok: true }; }   // fixture mode: already logged
+  state.pendingAction = null;
+  if (!res) {
+    refresh();
+    return { ok: true };   // fixture mode: already logged
+  }
   if (res.ok) {
     if (successText) toast(successText);
     refresh();
     return { ok: true };
   }
   toast(res.error || `${action} failed`, true);
+  render();
   return { ok: false };
 }
 
 function refresh() {
   bridge.send("getSnapshot", {}).then((res) => {
     if (res && res.ok) bridge.push("vm", res.data);
+    else if (!bridge.hosted) render(); // fixture: just repaint
   });
 }
 
-// ---------------------------------------------------------------- sheets --
-
-function closeSheet() {
-  const backdrop = document.querySelector(".sheet-backdrop");
-  if (backdrop) backdrop.remove();
-}
-
-function openSheet(html) {
-  closeSheet();
-  const backdrop = document.createElement("div");
-  backdrop.className = "sheet-backdrop";
-  backdrop.innerHTML = `<div class="sheet">${html}</div>`;
-  backdrop.addEventListener("click", (ev) => {
-    if (ev.target === backdrop) closeSheet();
-  });
-  document.body.appendChild(backdrop);
-  return backdrop;
-}
-
-function openOverflowMenu(slot) {
-  const acct = state.vm.accounts.find((a) => a.slot === slot);
-  if (!acct) return;
-  const verb = acct.disabled ? "Enable" : "Disable";
-  openSheet(`
-    <h3>${esc(acct.alias ?? acct.label)} · ${esc(acct.slot)}</h3>
-    <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
-      <button class="ghost" data-sheet="toggle">${verb} account</button>
-      <button class="ghost" data-sheet="copyemail">Copy email</button>
-      <button class="ghost" data-sheet="remove" style="color:var(--crit)">Remove account…</button>
-    </div>
-    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Cancel</button></div>
-  `);
-  wireSheet({
-    toggle: () => doAction(null, acct.disabled ? "enable" : "disable", { slot },
-                           acct.disabled ? "back in rotation" : "held out of rotation")
-                  .then((r) => { if (r.ok) closeSheet(); }),
-    copyemail: () => {
-      if (navigator.clipboard) navigator.clipboard.writeText(acct.email).catch(() => {});
-      toast("email copied"); closeSheet();
-    },
-    remove: () => { closeSheet(); openRemoveConfirm(slot); },
-    close: () => closeSheet(),
-  });
-}
-
-function openRemoveConfirm(slot) {
-  const acct = state.vm.accounts.find((a) => a.slot === slot);
-  if (!acct) return;
-  openSheet(`
-    <h3>Remove account ${esc(acct.slot)}?</h3>
-    <p>${esc(acct.alias ?? acct.label)} (${esc(acct.org)}) — the stored backup is
-    deleted. The account can be re-added later from a fresh login.</p>
-    <div class="row">
-      <button class="ghost" data-sheet="cancel">Cancel</button>
-      <button class="primary" data-sheet="remove" style="flex:none">Remove</button>
-    </div>
-  `);
-  wireSheet({
-    cancel: () => closeSheet(),
-    remove: () => doAction(null, "remove", { slot }, `removed ${slot}`)
-                  .then((r) => { if (r.ok) closeSheet(); }),
-  });
-}
-
-function openAddSheet() {
-  openSheet(`
-    <h3>Add account</h3>
-    <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
-      <button class="ghost" data-sheet="login">From current login —<br>
-        <span style="font-size:11px;color:var(--text-dim)">captures whatever Claude Code is logged in as now</span></button>
-      <button class="ghost" data-sheet="token">From setup-token…</button>
-    </div>
-    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Cancel</button></div>
-  `);
-  wireSheet({
-    login: () => doAction(null, "addFromLogin", {}, "account added")
-                 .then((r) => { if (r.ok) closeSheet(); }),
-    token: () => { closeSheet(); openTokenSheet(); },
-    close: () => closeSheet(),
-  });
-}
-
-function openTokenSheet() {
-  openSheet(`
-    <h3>Add from setup-token</h3>
-    <p>Paste the token Claude Code printed for account linking.</p>
-    <input type="email" placeholder="email for this token" data-field="email">
-    <input type="password" placeholder="sk-ant-oat01-…" data-field="token" autocomplete="off">
-    <div class="row">
-      <button class="ghost" data-sheet="cancel">Cancel</button>
-      <button class="primary" data-sheet="add" style="flex:none">Add</button>
-    </div>
-  `);
-  const backdrop = document.querySelector(".sheet-backdrop");
-  const get = (f) => backdrop.querySelector(`[data-field="${f}"]`).value.trim();
-  wireSheet({
-    cancel: () => closeSheet(),
-    add: () => {
-      const token = get("token");
-      if (!token) { toast("paste the token first", true); return; }
-      doAction(null, "addFromToken",
-               { token, email: get("email") || "" }, "account added")
-        .then((r) => { if (r.ok) closeSheet(); });
-    },
-  });
-}
-
-function openSettingsSheet() {
-  const as = state.vm.autoSwitch;
-  openSheet(`
-    <h3>Panel settings</h3>
-    <p>Refresh interval</p>
-    <div class="row" style="justify-content:flex-start;gap:6px;margin-bottom:10px">
-      ${[30, 60, 300].map((s) => `<button class="ghost" data-sheet="iv" data-iv="${s}">${
-        s === 300 ? "5 min" : `${s}s`}</button>`).join("")}
-    </div>
-    <p>Title percentage</p>
-    <div class="row" style="justify-content:flex-start;gap:6px">
-      ${["off", "5h", "7d", "both"].map((m) =>
-        `<button class="ghost" data-sheet="tp" data-tp="${m}">${m}</button>`).join("")}
-    </div>
-    <p style="margin-top:10px">Auto-switch policy (threshold ${esc(String(as.thresholdPct))}% ·
-      ${esc(as.strategy)}) lives in <code>cswap config</code>.</p>
-    <div class="row" style="margin-top:10px"><button class="ghost" data-sheet="close">Done</button></div>
-  `);
-  wireSheet({
-    iv: (target) => doAction(null, "setPrefs", { refreshInterval: Number(target.dataset.iv) }, "saved"),
-    tp: (target) => doAction(null, "setPrefs", { titlePct: target.dataset.tp }, "saved"),
-    close: () => closeSheet(),
-  });
-}
-
-function wireSheet(handlers) {
-  const backdrop = document.querySelector(".sheet-backdrop");
-  if (!backdrop) return;
-  backdrop.querySelectorAll("[data-sheet]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const fn = handlers[btn.dataset.sheet];
-      if (fn) fn(btn);
-    });
-  });
-}
-
-// countdowns tick locally between pushes, from the resetsAt epochs
+// countdowns tick locally; a countdown reaching zero shows AWAITING, never 0%
 setInterval(() => {
   const now = Date.now() / 1000;
-  els.panel.querySelectorAll("[data-resets-at]").forEach((el) => {
-    const cd = countdownFrom(parseFloat(el.dataset.resetsAt), now);
-    el.textContent = cd ? `resets ${cd}` : "resets now";
+  els.panel.querySelectorAll("[data-resets-at]").forEach((el_) => {
+    const cd = countdownFrom(parseFloat(el_.dataset.resetsAt), now);
+    el_.textContent = cd ?? AWAITING;
   });
 }, 30000);
 
@@ -515,43 +430,44 @@ const FIXTURE = {
   freshness: { ageText: "2m ago", ok: true },
   accounts: [
     {
-      slot: "1", label: "hungtrv", alias: "Work", org: "personal", kind: "oauth",
-      active: true, switchable: true,
+      slot: "1", label: "alex", email: "alex@example.com", alias: "Work",
+      org: "Acme", kind: "oauth", active: true, switchable: true, status: "ok",
       windows: [
-        { kind: "5h", label: "5-hour", pct: 68.4, state: "ok",
+        { kind: "5h", label: "Five-hour", pct: 68, state: "ok",
           resetsAt: 1757638440, countdownText: "54m" },
-        { kind: "7d", label: "7-day", pct: 41.2, state: "ok",
+        { kind: "7d", label: "Weekly", pct: 41, state: "ok",
           resetsAt: 1758118800, countdownText: "5d 14h" },
-        { kind: "model:Fable", label: "Fable", pct: 84.0, state: "ok",
+        { kind: "model:Fable", label: "Fable", pct: 84, state: "ok",
           resetsAt: 1757809200, countdownText: "2d 1h" },
       ],
-      spend: { used: 12.4, limit: 100, pct: 12.4, currency: "USD",
-               resetsAt: 1757894400 },
+      spend: { used: 12.4, limit: 100, pct: 12.4, currency: "USD" },
       pace: { aheadOfPace: true, expectedPct: 21.4 },
     },
     {
-      slot: "2", label: "honeybad", org: "Acme Corp", kind: "oauth",
-      active: false, switchable: true,
+      slot: "2", label: "alex.personal", email: "alex.personal@example.com",
+      alias: "Personal", org: "personal", kind: "oauth", active: false,
+      switchable: true, status: "ok",
       windows: [
-        { kind: "5h", label: "5-hour", pct: 12.0, state: "ok",
+        { kind: "5h", label: "Five-hour", pct: 12, state: "ok",
           resetsAt: 1757642400, countdownText: "2h" },
-        { kind: "7d", label: "7-day", pct: 8.5, state: "ok",
+        { kind: "7d", label: "Weekly", pct: 9, state: "ok",
           resetsAt: 1758154800, countdownText: "6d 2h" },
       ],
     },
     {
-      slot: "3", label: "backup", org: "personal", kind: "oauth",
-      active: false, switchable: true, quarantined: true,
+      slot: "3", label: "backup", email: "backup@example.com", alias: "Backup",
+      org: "personal", kind: "oauth", active: false, switchable: true,
+      status: "needs-login",
       note: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
       windows: [],
     },
   ],
-  autoSwitch: { enabled: true, thresholdPct: 80, strategy: "best",
+  autoSwitch: { enabled: true, thresholdPct: 90, strategy: "best",
                 lastEventText: "2 → 1 · 18m ago" },
   history: ["2 → 1 · 18m ago", "1 → 2 · 3h ago"],
 };
 
-// Explicit theme override (screenshots, visual testing): ?theme=light|dark
+// Explicit theme override (screenshots, visual testing)
 const themeOverride = new URLSearchParams(location.search).get("theme");
 if (themeOverride === "light" || themeOverride === "dark") {
   document.documentElement.dataset.theme = themeOverride;

@@ -102,13 +102,13 @@ the state/pending plumbing for actions. Local countdown → "Awaiting
 updated usage" at zero.
 
 **Acceptance criteria:**
-- [ ] Fixture with the spec's example data (Work 68%/41%, 84% model, $12.40/$100) matches the dark artboard's structure
-- [ ] Selected ≠ active visually and behaviorally (selection never switches)
-- [ ] Missing values render unavailable, never 0%; stale states render per Task 2
+- [x] Fixture with the spec's example data (Work 68%/41%, 84% model, $12.40/$100) matches the dark artboard's structure
+- [x] Selected ≠ active visually and behaviorally (selection never switches)
+- [x] Missing values render unavailable, never 0%; stale states render per Task 2
 
 **Verification:**
-- [ ] Browser fixture: DOM + visual check vs artboard; theme flip
-- [ ] `uv run pytest` green (wire contract: only registered actions)
+- [x] Browser fixture: DOM + visual check vs artboard; theme flip
+- [x] `uv run pytest` green (wire contract: only registered actions)
 
 **Dependencies:** Tasks 1, 2, 4
 **Files:** `web/panel.js`
