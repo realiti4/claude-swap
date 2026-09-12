@@ -251,7 +251,7 @@ NSApplication). CI changes are ask-first: present the workflow diff before
 pushing.
 
 **Acceptance criteria:**
-- [ ] README section matches shipped behavior; ARCHITECTURE.md accurate to the new layout
+- [x] README section matches shipped behavior; ARCHITECTURE.md accurate to the new layout
 - [ ] macOS CI installs the extra and the import smoke passes; Linux jobs untouched
 - [ ] Human approved the CI diff (ask-first boundary)
 

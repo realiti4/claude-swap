@@ -58,7 +58,7 @@ last. The core (switcher, usage store, locks, credentials) is untouched.
 - [x] Task 6: All panel actions end-to-end (switch/rotate/best/disable/enable/remove/add/auto-switch/prefs)
 - [x] Task 7: Stale, error, quarantine, and webview-failure states
 - [x] Task 8: Dark mode + CodexBar-class visual polish + README screenshot
-- [ ] Task 9: Docs (README section, ARCHITECTURE.md §6.5/map) + macOS CI import smoke (ask-first)
+- [x] Task 9: Docs (README section, ARCHITECTURE.md §6.5/map) + macOS CI import smoke (ask-first)
 
 ### Checkpoint C: complete
 - [ ] All SPEC.md success criteria met, Definition of Done satisfied
