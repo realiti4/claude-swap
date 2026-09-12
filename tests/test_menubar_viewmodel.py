@@ -192,6 +192,18 @@ class TestDegradedStates:
         assert vm["freshness"]["error"] == "http 429"
         assert vm["freshness"]["ageText"] == "1h ago"
 
+    def test_malformed_spend_is_skipped_not_fatal(self) -> None:
+        # A persisted spend dict missing used/limit (shape drift across an
+        # upgrade) must not crash build() for every account.
+        usage = usage_fixture()
+        usage["spend"] = {"pct": 12.4, "currency": "USD"}  # pct-only
+        vm = viewmodel.build(snapshot(account(usage=UsageEntry(last_good=usage))), now=NOW)
+        assert "spend" not in vm["accounts"][0]
+
+        usage["spend"] = {"used": "12.4", "limit": 100.0, "pct": 12.4}  # wrong type
+        vm = viewmodel.build(snapshot(account(usage=UsageEntry(last_good=usage))), now=NOW)
+        assert "spend" not in vm["accounts"][0]
+
     def test_rolled_weekly_window_zeroed(self) -> None:
         stale_weekly = usage_fixture()
         stale_weekly["seven_day"] = _win(95.0, NOW - 86400)  # reset passed

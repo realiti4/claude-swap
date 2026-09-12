@@ -27,7 +27,6 @@ import platform
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -537,9 +536,7 @@ def run(switcher) -> int:
             def apply():
                 if interval is not None:
                     self.settings.refresh_interval = interval
-                    self._refresh_timer.setFireDate_(
-                        AppKit.NSDate.dateWithTimeIntervalSinceNow_(interval)
-                    )
+                    self._restart_refresh_timer(interval)
                 if title_pct is not None:
                     self.settings.title_pct = title_pct
                 self.settings.save(settings_path)
@@ -609,24 +606,31 @@ def run(switcher) -> int:
 
         # ---- callbacks --------------------------------------------------------
 
-        def _guard(self, fn) -> bool:
-            """Run a switcher action on the main thread, alerting on error."""
-            # Blocking work stays off the main thread: the action runs in a
-            # worker, the alert (if any) is marshalled back.
+        def _guard(self, fn, on_success=None) -> None:
+            """Run a switcher action on a worker thread, alerting on error.
+
+            ``on_success`` (if given) runs on the main thread only when the
+            action actually succeeded — the outcome is only known when the
+            worker finishes, so success side effects (notifications, refresh)
+            belong in the completion callback, not the caller.
+            """
             def run_action():
                 try:
                     fn()
                     ok, err = True, None
                 except ClaudeSwitchError as e:
                     ok, err = False, str(e)
-                AppHelper.callAfter(self._action_done, ok, err)
+                AppHelper.callAfter(self._action_done, ok, err, on_success)
             threading.Thread(target=run_action, daemon=True).start()
-            return True
 
-        def _action_done(self, ok: bool, err: str | None) -> None:
+        def _action_done(self, ok: bool, err: str | None, on_success=None) -> None:
             if not ok:
                 AppKit.NSRunAlertPanel("claude-swap", err or "Action failed",
                                        "OK", None, None)
+                return
+            if on_success is not None:
+                on_success()
+            self.refresh_async()
 
         def _notify_switched(self) -> None:
             notify(
@@ -636,16 +640,14 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb():
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
-                    self.refresh_async()
+                self._guard(lambda: self.switcher.switch_to(str(num)),
+                            on_success=self._notify_switched)
             return cb
 
         def _switch(self, strategy):
             def cb():
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
-                    self._notify_switched()
-                    self.refresh_async()
+                self._guard(lambda: self.switcher.switch(strategy=strategy),
+                            on_success=self._notify_switched)
             return cb
 
         def on_add_login(self) -> None:
@@ -681,11 +683,22 @@ def run(switcher) -> int:
         def _make_interval(self, secs):
             def cb():
                 self.settings.refresh_interval = secs
-                self._refresh_timer.setFireDate_(
-                    AppKit.NSDate.dateWithTimeIntervalSinceNow_(secs)
-                )
+                self._restart_refresh_timer(secs)
                 self._save_and_rebuild()
             return cb
+
+        def _restart_refresh_timer(self, secs: float) -> None:
+            """A refresh-interval change needs a fresh NSTimer: the interval
+            is fixed at creation, and setFireDate_ only delays the next fire
+            before the old cadence resumes."""
+            if self._refresh_timer is not None:
+                self._refresh_timer.invalidate()
+            self._refresh_timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                secs, self._target, "onRefreshTick:", None, True
+            )
+            AppKit.NSRunLoop.mainRunLoop().addTimer_forMode_(
+                self._refresh_timer, AppKit.NSRunLoopCommonModes
+            )
 
         def on_toggle_autoswitch(self) -> None:
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled

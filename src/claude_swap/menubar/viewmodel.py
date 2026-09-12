@@ -372,10 +372,18 @@ def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -
     return vm
 
 
-def _spend_vm(spend: dict, *, now: float) -> dict:
+def _spend_vm(spend: dict, *, now: float) -> dict | None:
+    # ``last_good`` is persisted JSON that outlives upgrades, so a spend
+    # entry can drift from the current shape; a KeyError here would fail
+    # build() for *every* account. Degrade to "no spend row" instead.
+    used, limit = spend.get("used"), spend.get("limit")
+    if not isinstance(used, (int, float)) or isinstance(used, bool):
+        return None
+    if limit is not None and not isinstance(limit, (int, float)):
+        return None
     vm = {
-        "used": spend["used"],
-        "limit": spend["limit"],
+        "used": used,
+        "limit": limit,
         "pct": float(spend["pct"]),
         "currency": spend.get("currency", "USD"),
     }
@@ -431,7 +439,9 @@ def _account_vm(acc, *, now: float) -> dict:
                 )
         spend = display.get("spend")
         if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-            vm["spend"] = _spend_vm(spend, now=now)
+            spend_vm = _spend_vm(spend, now=now)
+            if spend_vm is not None:
+                vm["spend"] = spend_vm
         pace_result = pace.compute_pace(
             _rolled_weekly_window(display.get("seven_day"), now),
             fetched_at=entry.fetched_at,

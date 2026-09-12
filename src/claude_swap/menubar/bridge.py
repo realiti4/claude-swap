@@ -59,7 +59,10 @@ class Bridge:
         """Parse and dispatch one webview message; never raises."""
         try:
             msg = json.loads(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # RecursionError: a pathologically nested payload — the bridge
+            # contract says any input is survivable, and this exception would
+            # otherwise propagate into the AppKit script-message callback.
             logger.debug("menubar bridge: unparseable message dropped")
             return
         if not isinstance(msg, dict):
@@ -114,7 +117,12 @@ class Bridge:
 
     def _reply(self, reply_id: str | int, result: dict) -> None:
         body = json.dumps(result, ensure_ascii=False)
-        self._send_js(f"cswap.reply({reply_id}, {body})")
+        # The id came from the webview; it is interpolated into JS that
+        # evaluateJavaScript will run, so it must be a JSON literal — raw
+        # text would be an injection sink (and a ReferenceError for any
+        # non-numeric id).
+        id_literal = json.dumps(reply_id)
+        self._send_js(f"cswap.reply({id_literal}, {body})")
 
     def push(self, type_: str, data: Any) -> None:
         """Push a vm/engine event into the panel (serialized as a JS call)."""

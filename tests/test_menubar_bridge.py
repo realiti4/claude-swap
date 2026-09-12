@@ -44,7 +44,14 @@ def sent_jsons(transport: FakeTransport):
     for call in transport.calls:
         if call.startswith("cswap.reply("):
             rest = call[len("cswap.reply(") : -1]
-            _reply_id, body = rest.split(", ", 1)
+            # the id literal is everything before the JSON body (which starts '{"');
+            # it may be quoted (string id) or bare (numeric id)
+            _sep, body = ", {", None
+            idx = rest.find(", {\"")
+            if idx == -1:
+                raise AssertionError(f"reply body not found in {call!r}")
+            _id_literal = rest[:idx]
+            body = "{" + rest[idx + 3:]
             out.append(("cswap.reply(", json.loads(body)))
         else:
             body = call[len("cswap.push(") : -1]
@@ -68,7 +75,7 @@ class TestValidDispatch:
             json.dumps({"id": "42", "action": "switch", "payload": {"slot": "2"}})
         )
         assert t.calls == [
-            'cswap.reply(42, {"ok": true, "data": {"switchedTo": "2"}})'
+            'cswap.reply("42", {"ok": true, "data": {"switchedTo": "2"}})'
         ]
 
     def test_payload_forwarded(self) -> None:
@@ -152,6 +159,38 @@ class TestErrors:
         assert body["ok"] is False
         assert "secret internals" not in body["error"]
         assert body["error"]  # something human-readable
+
+
+class TestReplyIdSafety:
+    """B1: the webview-supplied id is interpolated into evaluateJavaScript —
+    it must be a JSON literal, never raw text."""
+
+    def test_string_id_is_quoted_in_reply_js(self) -> None:
+        t = FakeTransport()
+        make_bridge(t).handle_message(
+            json.dumps({"id": "abc", "action": "getSnapshot", "payload": {}})
+        )
+        assert t.calls == [
+            'cswap.reply("abc", {"ok": true, "data": {"schemaVersion": 1, "accounts": []}})'
+        ]
+
+    def test_hostile_id_cannot_break_out_of_the_call(self) -> None:
+        t = FakeTransport()
+        make_bridge(t).handle_message(
+            json.dumps({"id": "1); evil(", "action": "getSnapshot", "payload": {}})
+        )
+        (call,) = t.calls
+        assert call.startswith('cswap.reply("1); evil(",')  # inert string literal
+        assert "evil(" not in call[len('cswap.reply("1); evil(",'):] or "evil(" not in call
+
+    def test_deeply_nested_message_never_raises(self) -> None:
+        t = FakeTransport()
+        bridge = make_bridge(t)
+        # json.loads raises RecursionError past the interpreter recursion
+        # limit; the bridge contract says any input is survivable.
+        bridge.handle_message("[" * 5000 + "]" * 5000)
+        bridge.handle_message('{"id": "ok", "action": "getSnapshot", "payload": {}}')
+        assert len(t.calls) == 1  # only the well-formed message got a reply
 
 
 class TestPush:
