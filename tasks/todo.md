@@ -35,20 +35,20 @@ criteria.
 
 ## Phase 3: Alias editor
 
-- [ ] Task 4: Bridge setAlias/unsetAlias + snapshot push
+- [x] Task 4: Bridge setAlias/unsetAlias + snapshot push
   - Acceptance: `setAlias {slot, alias}` → `{slot, alias}` and `unsetAlias {slot}` → `{slot, alias: null}` registered inside the `_panel_handlers` block with payload specs; handlers call switcher.set_alias/unset_alias with normalize_alias as authority; errors flow through the bridge error channel; success pushes an updated snapshot (no usage round-trip) and rebuilds native menu labels; tests cover normalization (trim/lowercase), duplicate, invalid, purely-numeric, leading-hyphen, unknown slot, and assert no credential writes and no account switch
   - Verify: `uv run pytest tests/test_menubar.py tests/test_menubar_bridge.py tests/test_menubar_wire_contract.py -q`
   - Files: src/claude_swap/menubar/app.py, tests
   - Dependencies: none (parallel-safe with tasks 1–3)
 
-- [ ] Task 5: Alias sheet UI + card Add/Edit/Remove
+- [x] Task 5: Alias sheet UI + card Add/Edit/Remove
   - Acceptance: `dlg-alias` opens from the card's Add alias / Edit with the target slot captured at open (refreshes can't retarget); context row shows index + email; input prefilled; inline error shows the backend's real message and retains input; Save double-submit-guarded; Cancel closes without mutation; Remove alias appears when set, unsets and falls back to the account label (never deletes); focus contained, Escape safe, focus restored, state cleared on close; wire-contract send-scan covers the new literals; node-vm lifecycle test
   - Verify: wire-contract + node-vm tests green; fixture: save/normalize/reject/duplicate/cancel/remove + rename during a background refresh
   - Files: index.html, sheets.js, panel.js, panel.css, tests
   - Dependencies: Tasks 1, 4
 
 ## Checkpoint C
-- [ ] Alias end-to-end green in fixture; selector, card, and (native) menu labels update immediately
+- [x] Alias end-to-end green in fixture; selector, card, and (native) menu labels update immediately
 
 ## Phase 4: Settings segments
 

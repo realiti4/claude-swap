@@ -423,6 +423,15 @@ function wire() {
           // token sheet's login button uses
           doAction(el, "addFromLogin", {}, "account added from current login");
           break;
+        case "alias-add":
+        case "alias-edit": {
+          const target = (state.vm.accounts || [])
+            .find((a) => a.slot === slot);
+          if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openAlias && target) {
+            window.CSWAP_SHEETS.openAlias(el, target);
+          }
+          break;
+        }
         case "activity":
           if (window.CSWAP_SHEETS && window.CSWAP_SHEETS.openActivity) {
             window.CSWAP_SHEETS.openActivity(el, state.vm.history);

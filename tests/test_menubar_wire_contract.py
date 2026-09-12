@@ -166,6 +166,30 @@ class TestNumberedSelector:
         ), "tabs need an aria-label built from slot/alias/status"
 
 
+class TestAliasActions:
+    """The alias editor's bridge contract: specs, registration, sends, and
+    the no-network push requirement from the handoff."""
+
+    def test_alias_actions_have_payload_specs(self) -> None:
+        assert '"setAlias": {"required": {"slot": str, "alias": str}}' in APP_PY
+        assert '"unsetAlias": {"required": {"slot": str}}' in APP_PY
+
+    def test_alias_actions_are_registered_and_reachable(self) -> None:
+        handlers = registered_handlers()
+        assert {"setAlias", "unsetAlias"} <= handlers
+        assert {"setAlias", "unsetAlias"} <= panel_actions()
+
+    def test_alias_push_avoids_the_usage_api(self) -> None:
+        m = re.search(r"def _push_alias_update.*?store_only=True", APP_PY, re.S)
+        assert m, "alias updates must rebuild from the store, not the usage API"
+
+    def test_alias_sheet_sends_the_captured_slot(self) -> None:
+        # the slot is captured when the dialog opens; every send must use it
+        assert re.search(r"aliasCtx\.slot", SHEETS_JS), (
+            "alias sends must go through the slot captured at open"
+        )
+
+
 class TestGlobalContract:
     def test_bridge_emits_the_globals_panel_defines(self) -> None:
         # bridge.py builds cswap.reply(...) / cswap.push(...) strings

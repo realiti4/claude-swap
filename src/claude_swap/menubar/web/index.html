@@ -41,6 +41,22 @@
   </div>
 </dialog>
 
+<dialog id="dlg-alias" aria-labelledby="dlg-alias-title">
+  <h3 id="dlg-alias-title">Edit alias</h3>
+  <p class="alias-ctx" id="alias-ctx"></p>
+  <div class="field">
+    <label for="fld-alias">Alias</label>
+    <input id="fld-alias" type="text" autocomplete="off" spellcheck="false"
+           placeholder="work" aria-describedby="fld-alias-err">
+    <div class="ferr" id="fld-alias-err" role="alert"></div>
+  </div>
+  <div class="row">
+    <button class="btn ghost" data-dlg="remove-alias">Remove alias</button>
+    <button class="btn ghost" data-dlg="cancel" style="flex:none">Cancel</button>
+    <button class="btn primary" data-dlg="submit-alias" style="flex:none">Save</button>
+  </div>
+</dialog>
+
 <dialog id="dlg-activity" aria-labelledby="dlg-activity-title">
   <h3 id="dlg-activity-title">Recent switches</h3>
   <ul class="hist" id="dlg-activity-list"></ul>

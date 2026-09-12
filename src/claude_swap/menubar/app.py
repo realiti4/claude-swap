@@ -493,6 +493,8 @@ def run(switcher) -> int:
                     "addFromToken": {"required": {"token": str},
                                      "optional": {"email": str}},
                     "setAutoSwitch": {"required": {"enabled": bool}},
+                    "setAlias": {"required": {"slot": str, "alias": str}},
+                    "unsetAlias": {"required": {"slot": str}},
                     "setPrefs": {"optional": {"refreshInterval": int,
                                               "titlePct": str, "theme": str}},
                 },
@@ -545,6 +547,8 @@ def run(switcher) -> int:
                 )[0] or {"scheduled": True},
                 "getPrefs": lambda payload: {"theme": self.settings.theme},
                 "setPrefs": self._set_prefs,
+                "setAlias": self._set_alias,
+                "unsetAlias": self._unset_alias,
                 "quit": lambda payload: (
                     AppHelper.callAfter(self.on_quit),
                 )[0] or {"scheduled": True},
@@ -562,6 +566,41 @@ def run(switcher) -> int:
             )
             self.refresh_async()
             return {"added": True}
+
+        def _set_alias(self, payload):
+            slot, alias = self.switcher.set_alias(
+                str(payload["slot"]), str(payload["alias"])
+            )
+            self._push_alias_update()
+            return {"slot": slot, "alias": alias}
+
+        def _unset_alias(self, payload):
+            slot = self.switcher.unset_alias(str(payload["slot"]))
+            self._push_alias_update()
+            return {"slot": slot, "alias": None}
+
+        def _push_alias_update(self) -> None:
+            """Reflect an alias change everywhere, without the usage API.
+
+            Aliases live in local config, so the view model is rebuilt from
+            the store (``store_only`` never spends request budget), pushed
+            to the open panel, and the native menu labels rebuilt on the
+            main thread. The active credential and other accounts are
+            untouched — renaming never switches anything.
+            """
+            raw = self._snapshot_source.take(store_only=True)
+            self.snapshot = _adapt_snapshot(raw)
+            core = load_settings(self.switcher.backup_dir)
+            self._vm = build(
+                raw,
+                auto_enabled=self.settings.auto_switch_enabled,
+                auto_threshold=core.threshold,
+                auto_strategy=core.strategy,
+                history=self._history(),
+            )
+            self._dirty = True
+            self.push_vm()
+            AppHelper.callAfter(self.rebuild_menu)
 
         def _set_auto(self, enabled: bool) -> None:
             # Main thread: touches engine threads, settings, and the menu.
