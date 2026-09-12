@@ -82,6 +82,8 @@ window.CSWAP_APPEARANCE = (() => {
       paintAll();
       setStatus(null);
     } catch (_) {
+      // a pending "Saved." restore timer must not overwrite the load error
+      if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
       const h = help();
       if (h) h.textContent = "Couldn’t load settings. Reopen the app to retry.";
     }

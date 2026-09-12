@@ -580,11 +580,13 @@ if (!bridge.hosted) {
   console.log("[fixture] claude-swap panel — fixture mode; actions log here");
   // ?accounts=N swaps the 3-account fixture for a synthetic roster — makes
   // the multi-row / two-digit-index states one URL away for reviewers.
+  // Clamped so a fat-fingered 1e9 can't hang the tab.
   const raw = new URLSearchParams(location.search).get("accounts");
   const wanted = raw == null ? NaN : Number(raw);  // Number(null) is 0 — guard it
   if (Number.isInteger(wanted) && wanted >= 0) {
+    const n = Math.min(wanted, 50);
     const accounts = [];
-    for (let i = 1; i <= wanted; i++) {
+    for (let i = 1; i <= n; i++) {
       accounts.push({
         slot: String(i), label: "acct" + i, email: `acct${i}@example.com`,
         alias: "acct" + i, org: i % 3 === 0 ? "Acme Research and Platform Engineering" : "Acme",

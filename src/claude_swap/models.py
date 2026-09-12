@@ -39,8 +39,10 @@ def normalize_alias(name: str) -> str:
     if not normalized:
         raise ValueError("alias cannot be empty")
     if len(normalized) > _ALIAS_MAX_LEN:
+        # truncate the echo: the cap exists to keep oversized pastes out of
+        # storage, menus, and logs — don't funnel the whole thing back in
         raise ValueError(
-            f"alias '{name}' is longer than {_ALIAS_MAX_LEN} characters"
+            f"alias '{name[:24]}…' is longer than {_ALIAS_MAX_LEN} characters"
         )
     if normalized.isdigit():
         raise ValueError(f"alias '{name}' cannot be purely numeric (reserved for slot numbers)")

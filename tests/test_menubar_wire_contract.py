@@ -138,6 +138,12 @@ class TestAccountCard:
         assert "const hasContent" in PANEL_JS
         assert "if (!hasContent) return note;" in PANEL_JS
 
+    def test_gear_opens_settings_on_empty_roster(self) -> None:
+        # board 05: with no accounts to scope an overflow menu to, settings
+        # must still be reachable from the header gear
+        m = re.search(r'case "gear":.*?openSettings', PANEL_JS, re.S)
+        assert m, "gear needs the no-account openSettings fallback"
+
     def test_account_heading_matches_usage_style(self) -> None:
         # pre-review fix: both card headings share the section-h treatment
         # and the Account card carries no divider under its title
@@ -214,6 +220,16 @@ class TestAliasActions:
     def test_alias_push_avoids_the_usage_api(self) -> None:
         m = re.search(r"def _push_alias_update.*?store_only=True", APP_PY, re.S)
         assert m, "alias updates must rebuild from the store, not the usage API"
+
+    def test_alias_generation_guard_pins_the_worker_recheck(self) -> None:
+        # A rename saved while a usage refresh is in flight must not be
+        # reverted by that worker's stale roster: the worker re-checks the
+        # generation and rebuilds from the store on mismatch. Pinned at
+        # source level (AppKit closure) per the file's convention.
+        assert "gen_before = self._alias_gen" in APP_PY
+        assert "self._alias_gen != gen_before" in APP_PY
+        m = re.search(r"_alias_gen != gen_before.*?store_only=True", APP_PY, re.S)
+        assert m, "the re-check rebuild must be store-only (no usage budget)"
 
     def test_alias_sheet_sends_the_captured_slot(self) -> None:
         # the slot is captured when the dialog opens; every send must use it
