@@ -11,8 +11,8 @@
     },
     {
       "path": "START-HERE.md",
-      "bytes": 1142,
-      "sha256": "669171f54f9ad56e607f9473790b9f3a88c83cfddc9637905a4af364441c72d2"
+      "bytes": 1141,
+      "sha256": "46462acf2e6aa6c420c4657d06f75488ba9a60b317b0228c5c0a0895e5d87436"
     },
     {
       "path": "icons/icon-master-256.png",
@@ -190,8 +190,8 @@
     },
     {
       "path": "TIMELINES.md",
-      "bytes": 7354,
-      "sha256": "de211239441756445adf15666c05ad4372b5285cfea3a82314f3ed3fa49680a7"
+      "bytes": 7093,
+      "sha256": "218d7779d1dfcba46f8da442751940384bc114c0bfd576b7a9984eb5049acce4"
     },
     {
       "path": "timeline-screens/17-timelines-right-dark-draft.png",
@@ -214,8 +214,8 @@
     {
       "path": "timeline-screens/17-timelines-right-dark.png",
       "status": "design reference",
-      "bytes": 86887,
-      "sha256": "8ada5e74efdc51f3cbb4db0214b24c72551e29afbc3eb52a9ef99404d0ff51d4",
+      "bytes": 86989,
+      "sha256": "5510135dab607cfda1b0876d26cf6f37a6dcb01cad15d52fcafd7b6a4d276557",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -223,8 +223,8 @@
     {
       "path": "timeline-screens/18-timelines-right-light.png",
       "status": "design reference",
-      "bytes": 87506,
-      "sha256": "690d655e9b49849b86971b2e1def71786f2d9b022fd74730f6b0b220830dd3bc",
+      "bytes": 87671,
+      "sha256": "2dd452608490ae9cecaa90466d8d451c7c847f75b72edd9cf418330da9c2811a",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -232,19 +232,19 @@
     {
       "path": "timeline-screens/19-timelines-left.png",
       "status": "design reference",
-      "bytes": 110448,
-      "sha256": "64a7df414e73a2707813621e3f8ababa0800ef3ec49dc4feb8543befe634e124",
+      "bytes": 110649,
+      "sha256": "405938bad87825c97136ed86aecb91162a93433fe17c4dfe2b7655a90bbfc0e2",
       "width": 1091,
       "height": 676,
       "mode": "RGBA"
     },
     {
       "path": "timeline-screens/20-timeline-states.png",
-      "status": "prior timeline model; interaction guidance only",
-      "bytes": 269806,
-      "sha256": "6bb7908e878127727c2a783ee27ffcaa242f09b984ad34742774ae12fb08cb88",
+      "status": "design reference",
+      "bytes": 315880,
+      "sha256": "9129b6bfaa42e0a263f901316898f04a9b2689d2070e46ca0c93e37fc11eb4ad",
       "width": 900,
-      "height": 2132,
+      "height": 2346,
       "mode": "RGBA"
     }
   ],

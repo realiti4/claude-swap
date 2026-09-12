@@ -7,14 +7,11 @@ requires implementation; it is not part of the running application's behavior.
 
 ## Design reference and exports
 
-The full-window revision is saved in Pen on artboards 17–19. Artboard 16
-remains the closed state. **Artboard 20 still shows the previous remaining-time
-model**: Pen reached its usage limit before updating it. Use its focus, motion
-and placement guidance only; its charts and old bar-meaning notes are superseded
-by this document and artboards 17–19. Its full-window row detail, narrow and
-many-account examples remain pending. Also align the active dot with the main
-account status during final polish (the new chart fixture dots research while
-the main panel still labels work active). Selected-row styling is independent.
+The full-window revision is saved in Pen on artboards 17–20. Artboard 16
+remains the closed state. Row details, many-account and narrow-screen examples
+now use full windows, percentage-used fills and shared Now markers. The active
+account is work (1), consistent with the main panel; the state board separately
+demonstrates research (2) selected without activation.
 
 Available references:
 

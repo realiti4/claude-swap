@@ -23,10 +23,13 @@ Native placement, scrolling, animations and keyboard behavior are specified
 for implementation; these static assets do not verify running app behavior.
 No application source was edited for this design session.
 
-### Full-window revision
+### Full-window revision — completed
 
-Exported revised artboards 17–19 and checked the dark preview: equal-duration
-shifted windows, used-percent labels/fills, reset endpoints, and dashed Now
-lines are visible. Decoded all three PNGs. Pen reached its usage limit before
-updating artboard 20; that board's chart semantics are superseded. See the
-remaining visual consistency notes in TIMELINES.md.
+Saved and exported revised artboards 17–20. Reviewed the dark chart and the
+complete interaction board: equal-duration shifted windows, used-percent
+labels/fills, reset endpoints, dashed Now lines, unavailable/stale/elapsed rows,
+full-alias detail with inferred starts, and narrow/many-account examples.
+Active-account dots now agree with the main panel. Decoded all four PNGs and
+updated manifest dimensions and checksums. Static exports do not prove runtime
+scrolling, accessibility or native-window behavior; run the handoff acceptance
+checks when implementing.
