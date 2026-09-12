@@ -1,0 +1,40 @@
+/* Claude Swap menu bar redesign — implementation seed, not a Pen export.
+ * Not loaded by the application. Reconcile against untitled.pen during implementation.
+ * Fonts are references only; no font binaries or external font requests included.
+ */
+:root {
+  --swap-panel-width: 360px;
+  --swap-panel-height: 560px;
+  --swap-header-height: 44px;
+  --swap-footer-height: 30px;
+  --swap-body-height: 486px;
+  --swap-radius-panel: 14px;
+  --swap-radius-card: 12px;
+  --swap-radius-control: 8px;
+  --swap-space-unit: 4px;
+  --swap-panel-inset: 14px;
+  --swap-font-ui: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  --swap-font-numeric: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  --swap-text-secondary-size: 12px;
+  --swap-text-identity-size: 14px;
+}
+[data-swap-theme="dark"] {
+  color-scheme: dark;
+  --swap-bg: #151a1c;
+  --swap-surface: #20282b;
+  --swap-text: #f2f5f4;
+  --swap-text-secondary: #aab9b5;
+  --swap-accent: #3fc2b2;
+  --swap-warning: #f2bf70;
+  --swap-error: #ffa097;
+}
+[data-swap-theme="light"] {
+  color-scheme: light;
+  --swap-bg: #f7f6f2;
+  --swap-surface: #ffffff;
+  --swap-text: #182623;
+  --swap-text-secondary: #526760;
+  --swap-accent: #0c8577;
+  --swap-warning: #865400;
+  --swap-error: #b3372e;
+}

@@ -1,0 +1,192 @@
+{
+  "title": "Claude Code Swap \u2014 final UI/UX handoff",
+  "design_source": "../untitled.pen",
+  "design_source_note": "Editable source verified in Pen; not parsed or hashed by filesystem tools.",
+  "screen_count": 15,
+  "assets": [
+    {
+      "path": "HANDOFF.md",
+      "bytes": 15627,
+      "sha256": "ddc35b815dfa9b375be22f0e07085802a57f78b5fe008497834dbba42aa00437"
+    },
+    {
+      "path": "START-HERE.md",
+      "bytes": 564,
+      "sha256": "a1e38c038eb4edf3ceb2f87e587703eedeeac784827dc7ac68cf97b81e8eb094"
+    },
+    {
+      "path": "icons/icon-master-256.png",
+      "bytes": 3787,
+      "sha256": "f149510453e8560142b20a6aa8b00af9ab20c8a06db8b30cf4ccaf6312722a27",
+      "width": 256,
+      "height": 256,
+      "mode": "RGBA",
+      "transparent_background": true
+    },
+    {
+      "path": "icons/icon-template-18.png",
+      "bytes": 280,
+      "sha256": "2fe0f9e51454ff6a8d4dc03105b2748fbba5e0e0ef739770afb85ac8d42f409c",
+      "width": 18,
+      "height": 18,
+      "mode": "RGBA",
+      "transparent_background": true
+    },
+    {
+      "path": "icons/icon-template-36.png",
+      "bytes": 474,
+      "sha256": "9567e95eec02b17578342e3d181a0ed8ca3f3b91faf7dab6690cc3a95f103cd3",
+      "width": 36,
+      "height": 36,
+      "mode": "RGBA",
+      "transparent_background": true
+    },
+    {
+      "path": "icons/icon-template.pdf",
+      "bytes": 1049,
+      "sha256": "9a9f7809c8407822667e53305b750ab86e8eed68cd6340ea58e1cdf95d2079f5"
+    },
+    {
+      "path": "icons/swap-mark.svg",
+      "bytes": 502,
+      "sha256": "397f80a2a4d8b1e9120400b17fc9cb6476270ac4caba0bd265fe1c252f5e05fc",
+      "vector_paths": 3
+    },
+    {
+      "path": "icons/swap-template.svg",
+      "bytes": 497,
+      "sha256": "09ef78282a72df49bba6d1b65c0f1716d7a7f0914201ef02433ccdbd09be6df6",
+      "vector_paths": 3
+    },
+    {
+      "path": "screens/01-main-dark.png",
+      "bytes": 30389,
+      "sha256": "ce4081ace92b3c5f090de7b3b19228f9071274125b0f21131d5e28c0986700a1",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/02-main-light.png",
+      "bytes": 30540,
+      "sha256": "14682aca6326014cb79bffccc5e64bae27cecf963cbc49220a98aba6fba6daf3",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/03-account-preview.png",
+      "bytes": 31672,
+      "sha256": "383bc56975fda745c5403cc785bfd9c61dc580c7c4b3766c8814391df4a25de7",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/04-stale-offline.png",
+      "bytes": 33018,
+      "sha256": "4de591c7368f4527394a6f7c9e2f61ccd0ae28d0d094ebf3f81e50485bb08ded",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/05-no-accounts.png",
+      "bytes": 23607,
+      "sha256": "c6f0e59f630f98fdc621b520b9f6284e2999f026bcacc675f8ded76ee2664945",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/06-add-token.png",
+      "bytes": 33608,
+      "sha256": "13686d5035562bcfa3d3faf350498ad21657b7570dcf27a2281234744715d753",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/07-remove-account.png",
+      "bytes": 41033,
+      "sha256": "0da72aa75f423d7bd7200e15e51ec68435088286bbf71fe3f340805afaa04b62",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/08-tokens-notes.png",
+      "bytes": 436978,
+      "sha256": "0dec6542837e04a91646a605fc36ba7628b576fef43d992e4f0ef3d0175ac2ec",
+      "width": 820,
+      "height": 3038,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/09-settings-dark.png",
+      "bytes": 28605,
+      "sha256": "f7a3bf44e784e62d4a01d8987655fc76ee554e1050ca8851c412b32f4225843c",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/10-settings-light.png",
+      "bytes": 29214,
+      "sha256": "09d92a823cf5164ba752505b139737b02c4077e86edbc7a4802e748564298610",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/11-icon-system.png",
+      "bytes": 166464,
+      "sha256": "06a11e91dbba8fb08e2fe262b398f01839b27e3bcebba926da6b756bf1814113",
+      "width": 880,
+      "height": 1604,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/12-account-dark.png",
+      "bytes": 31254,
+      "sha256": "e401f988d82a466e034307fc3b7f3b38bde2e7ebd37b45973094873d5cfa8f91",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/13-account-light.png",
+      "bytes": 31362,
+      "sha256": "3581e25b93c0dd0cac7d298f8f7643effe0ef8a76e221879f35d36dd9ef99a60",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/14-edit-alias-dark.png",
+      "bytes": 32564,
+      "sha256": "07f5bc66d261ac428251be2a1317210de88f89a4afb16b5ea3736cad5a980aee",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "screens/15-edit-alias-light.png",
+      "bytes": 33037,
+      "sha256": "fb1eb2adf7ade1c904fc75fb6a6e90bf7cba44a262cdb07e29f5778ff46b008a",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "source/icon-master-pen-export.html",
+      "bytes": 2401,
+      "sha256": "122b55be5afa34c753b6cf67e158d7f60dc42d9843a91725cb3c5d6f1ce34141"
+    },
+    {
+      "path": "tokens.css",
+      "bytes": 1248,
+      "sha256": "79f64449d19d381bb7125af61eb5455605c5f64bc9b45308e8cf33984502b592"
+    }
+  ]
+}

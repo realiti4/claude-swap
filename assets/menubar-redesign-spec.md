@@ -1,4 +1,4 @@
-# Claude Swap — menu bar redesign
+# Claude Code Swap — menu bar redesign
 
 Design brief derived from `menubar/app.py`, `menubar/viewmodel.py`,
 `menubar/bridge.py`, and `menubar/web/`. The editable design is saved in
@@ -22,7 +22,8 @@ Additional accounts, model windows, and activity can scroll or disclose.
 1. Brand header: swap icon, claude-swap, refresh, settings.
 2. Account selector: alias preferred, with a distinct active indicator.
    Selection previews the account; it never activates it.
-3. Selected identity: alias, full email, organization, and Active or Preview.
+3. Account card: full alias with Edit action, email, team, account
+   index, and Active or Preview status.
 4. Primary quotas: five-hour and weekly usage, percentage explicitly labeled
    **used**, a slim bar, and the next reset countdown.
 5. Optional model limits and spend, visually subordinate to primary quotas.
@@ -149,3 +150,59 @@ Mac’s appearance.” Keep refresh interval (30s, 60s, 5 min), title percentage
 
 Implementation must follow these Pen Settings artboards. The initial uncommitted
 code draft is paused pending this design update and is not the design authority.
+
+## Expanded selected-account card
+
+Artboards 12 (dark) and 13 (light) replace the compact inline identity row with
+a separate full-width surface below the selector. Use an Account
+heading, Active/Preview badge, and labeled Alias, Email, Team, and Account rows.
+Values are at least 13px, wrap naturally (including unbroken email addresses),
+and remain selectable. Labels are at least 12px. Missing email/team values read
+“Not available”. Escape all account-provided content when rendering HTML.
+
+The card grows with content; the existing panel body scrolls while the header
+and footer stay fixed. Do not truncate identity values, shrink quota labels,
+or remove switch actions to keep all content within the initial viewport.
+
+## Alias editing, numbered selectors, and unified branding
+
+The selected-account section is titled **Account**. Alias is its
+own labeled row, followed by Email, Team, and Account. This product has no
+workspace concept; example aliases use `work`, `research`, and `backup`.
+Show the full alias in the information card, wrapping as necessary.
+
+Each selector button has a large stable account index on the left, spanning
+two text lines. To its right, show the alias on one line and status on the
+next. Use the slot identifier, not the current sort position. Accommodate
+two-digit indices. Only the compact selector alias may truncate. When an alias
+is absent, use the existing account label in the selector and “Not set” in
+the card. Active status and selected-preview styling remain distinct.
+
+The Alias row exposes Edit alias (Add alias when absent). The editor includes
+account index and email context, a labeled input, Cancel, Save alias, and a
+secondary Remove alias action when an alias exists. Keep user input on failure,
+show a useful inline error, prevent duplicate saves while pending, and return
+focus to the trigger on close. Success updates both the selector and details;
+cancel leaves values unchanged. Editing an alias never activates the account.
+
+Reuse `ClaudeAccountSwitcher.set_alias` / `unset_alias` and `normalize_alias`:
+trim whitespace and normalize to lowercase; allow letters, digits, period,
+hyphen, underscore; reject empty values, purely numeric names, leading hyphens,
+and duplicates. The menu-bar bridge will need explicit alias actions during
+implementation; the existence of the core API does not mean the panel already
+exposes it.
+
+Use board 11's recommended **A — Interlock** vector geometry throughout every
+UI artboard and sheet background. Teal belongs in panel headers and branding;
+menu-bar template examples stay monochrome. Historical icon candidates remain
+on board 11 as exploration, not alternative production logos.
+
+## Final display labels
+
+- Visible product title: **Claude Code Swap**, retaining the Interlock logo.
+- Selected-account section heading: **Account**.
+- Index row: label **Account Index**, value is just the slot number (for example **2**).
+- Quota section heading: **Usage**, above the five-hour and weekly meters.
+
+Apply these labels across the main panels, previews, stale states and panel
+backgrounds beneath sheets. Preserve literal CLI commands and repository paths.

@@ -1,6 +1,6 @@
 # Claude Swap menu bar icon
 
-Status: design brief submitted to the Pen prompt; generation pending.
+Status: designed in Pen and visually reviewed. Recommended mark: A — Interlock.
 Source design: [untitled.pen](untitled.pen).
 
 ## Direction
@@ -30,5 +30,7 @@ Preserve aspect ratio and optical padding. The current shell already marks its
 SF Symbol image as a template; a future implementation can replace that image
 without changing status-item behavior.
 
-Do not replace the current icon until the Pen design has been generated and
-reviewed. Existing UI artboards and application code remain outside this icon task.
+The design is saved on board 11. The [presentation preview](menubar-icon-system.png)
+is exported alongside it. Transparent 18px, 36px and 256px master export frames
+remain editable inside Pen; they have not yet been exported as standalone assets.
+Existing UI artboards and application code remain outside this icon task.
