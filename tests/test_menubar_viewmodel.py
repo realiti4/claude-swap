@@ -274,7 +274,8 @@ class TestContract:
             now=NOW,
         )
         assert set(vm) <= self.ALLOWED_TOP
-        assert self.ALLOWED_TOP - {"history", "autoSwitch"} <= set(vm)
+        # activeSlot is optional (absent when no active account)
+        assert self.ALLOWED_TOP - {"history", "autoSwitch", "activeSlot"} <= set(vm)
         for acct in vm["accounts"]:
             assert self.REQUIRED_ACCOUNT <= set(acct)
             assert set(acct) <= self.ALLOWED_ACCOUNT
@@ -285,9 +286,25 @@ class TestContract:
     def test_empty_snapshot(self) -> None:
         vm = viewmodel.build(snapshot(), now=NOW)
         assert vm["accounts"] == []
-        assert vm["activeSlot"] is None
+        assert "activeSlot" not in vm  # additive: absent, never null
         assert vm["freshness"]["ok"] is False
         assert "ageText" not in vm["freshness"]
+
+    def test_nonfinite_pct_rows_are_skipped(self) -> None:
+        bad = usage_fixture()
+        bad["five_hour"] = _win(float("nan"), NOW + 3600)
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=bad))), now=NOW
+        )
+        kinds = [w["kind"] for w in vm["accounts"][0]["windows"]]
+        assert "5h" not in kinds  # NaN never reaches the wire
+        assert "7d" in kinds
+
+    def test_vm_serializes_as_strict_json(self) -> None:
+        import json as _json
+
+        vm = viewmodel.build(snapshot(account()), now=NOW)
+        _json.dumps(vm, allow_nan=False)  # raises on NaN/Infinity leaks
 
 
 class TestAgeText:

@@ -36,7 +36,13 @@ def make_bridge(transport: FakeTransport, **extra) -> Bridge:
         ),
         **extra,
     }
-    return Bridge(handlers, send_js=transport, dispatch=lambda fn: fn())
+    return Bridge(
+        handlers, send_js=transport, dispatch=lambda fn: fn(),
+        payload_specs={
+            "switch": {"required": {"slot": str}},
+            "setAutoSwitch": {"required": {"enabled": bool}},
+        },
+    )
 
 
 def sent_jsons(transport: FakeTransport):
@@ -82,7 +88,8 @@ class TestValidDispatch:
         t = FakeTransport()
         seen = {}
         handlers = {"setAutoSwitch": lambda p: seen.update(p) or {"done": True}}
-        Bridge(handlers, send_js=t).handle_message(
+        Bridge(handlers, send_js=t,
+               payload_specs={"setAutoSwitch": {"required": {"enabled": bool}}}).handle_message(
             json.dumps({"id": "1", "action": "setAutoSwitch", "payload": {"enabled": True}})
         )
         assert seen == {"enabled": True}
@@ -159,6 +166,44 @@ class TestErrors:
         assert body["ok"] is False
         assert "secret internals" not in body["error"]
         assert body["error"]  # something human-readable
+
+
+class TestPayloadHardening:
+    def test_extra_payload_keys_stripped_before_handler(self) -> None:
+        seen = {}
+        def handler(p):
+            seen.update(p)
+        Bridge({"switch": handler}, send_js=FakeTransport(),
+               dispatch=lambda fn: fn(),
+               payload_specs={"switch": {"required": {"slot": str}}}).handle_message(
+            json.dumps({"id": "1", "action": "switch",
+                        "payload": {"slot": "2", "evil": object.__name__,
+                                    "junk": [1, {"deep": True}]}}))
+        assert seen == {"slot": "2"}
+
+    def test_unspeced_action_payload_emptied(self) -> None:
+        seen = {}
+        def handler(p):
+            seen.update(p)
+        Bridge({"getSnapshot": handler}, send_js=FakeTransport(),
+               dispatch=lambda fn: fn()).handle_message(
+            json.dumps({"id": "2", "action": "getSnapshot",
+                        "payload": {"anything": "goes"}}))
+        assert seen == {}
+
+    def test_unserializable_handler_result_replies_error(self) -> None:
+        t = FakeTransport()
+        Bridge({"bad": lambda p: {"nope": object()}}, send_js=t,
+               dispatch=lambda fn: fn()).handle_message(
+            json.dumps({"id": "3", "action": "bad", "payload": {}}))
+        [(head, body)] = sent_jsons(t)
+        assert body["ok"] is False
+        assert "unserializable" in body["error"]
+
+    def test_push_with_nan_is_dropped(self) -> None:
+        t = FakeTransport()
+        make_bridge(t).push("vm", {"pct": float("nan")})
+        assert t.calls == []
 
 
 class TestReplyIdSafety:

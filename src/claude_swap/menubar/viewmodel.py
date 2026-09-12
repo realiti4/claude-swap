@@ -15,6 +15,7 @@ between pushes.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -79,6 +80,10 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     ts = _resets_at_ts(window)
     if ts == float("inf"):
         return None
+    return _countdown_text(ts, now)
+
+
+def _countdown_text(ts: float, now: float) -> str | None:
     remaining = int(ts - now)
     if remaining <= 0:
         return None
@@ -360,13 +365,20 @@ def _age_text(age_s: float | None) -> str | None:
     return f"{hours}h ago" if minutes == 0 else f"{hours}h {minutes}m ago"
 
 
-def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -> dict:
-    """One bar's view-model: pct + reset epoch + baked first-paint countdown."""
-    vm = {"kind": kind, "label": label, "pct": float(window["pct"]), "state": state}
+def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -> dict | None:
+    """One bar's view-model: pct + reset epoch + baked first-paint countdown.
+
+    None when the pct isn't a finite number — NaN/Infinity must never reach
+    the wire (legal JS literals, illegal JSON).
+    """
+    pct = float(window["pct"])
+    if not math.isfinite(pct):
+        return None
+    vm = {"kind": kind, "label": label, "pct": pct, "state": state}
     ts = _resets_at_ts(window)
     if ts != float("inf"):
         vm["resetsAt"] = ts
-        countdown = _live_countdown(window, now)
+        countdown = _countdown_text(ts, now)
         if countdown:
             vm["countdownText"] = countdown
     return vm
@@ -381,10 +393,14 @@ def _spend_vm(spend: dict, *, now: float) -> dict | None:
         return None
     if limit is not None and not isinstance(limit, (int, float)):
         return None
+    pct = float(spend["pct"])
+    if not (math.isfinite(pct) and math.isfinite(used)
+            and (limit is None or math.isfinite(limit))):
+        return None
     vm = {
         "used": used,
         "limit": limit,
-        "pct": float(spend["pct"]),
+        "pct": pct,
         "currency": spend.get("currency", "USD"),
     }
     ts = _resets_at_ts(spend)
@@ -417,15 +433,15 @@ def _account_vm(acc, *, now: float) -> dict:
         vm["note"] = display
     elif isinstance(display, dict):
         state = "stale" if entry.last_error else "ok"
-        for key, kind, label in (
-            ("five_hour", "5h", "5-hour"),
-            ("seven_day", "7d", "7-day"),
+        seven_day = _rolled_weekly_window(display.get("seven_day"), now)
+        for key, kind, label, window in (
+            ("five_hour", "5h", "5-hour", display.get("five_hour")),
+            ("seven_day", "7d", "7-day", seven_day),  # rolled once, reused for pace
         ):
-            window = display.get(key)
-            if key == "seven_day":
-                window = _rolled_weekly_window(window, now)  # reflect a passed reset
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-                windows.append(_window_vm(kind, label, window, now=now, state=state))
+                bar = _window_vm(kind, label, window, now=now, state=state)
+                if bar is not None:
+                    windows.append(bar)
         for window in display.get("scoped") or []:
             window = _rolled_weekly_window(window, now)  # weekly cadence, same roll
             if (
@@ -433,19 +449,16 @@ def _account_vm(acc, *, now: float) -> dict:
                 and isinstance(window.get("pct"), (int, float))
                 and window.get("name")
             ):
-                windows.append(
-                    _window_vm(f"model:{window['name']}", str(window["name"]), window,
-                               now=now, state=state)
-                )
+                name = str(window["name"])
+                bar = _window_vm(f"model:{name}", name, window, now=now, state=state)
+                if bar is not None:
+                    windows.append(bar)
         spend = display.get("spend")
         if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
             spend_vm = _spend_vm(spend, now=now)
             if spend_vm is not None:
                 vm["spend"] = spend_vm
-        pace_result = pace.compute_pace(
-            _rolled_weekly_window(display.get("seven_day"), now),
-            fetched_at=entry.fetched_at,
-        )
+        pace_result = pace.compute_pace(seven_day, fetched_at=entry.fetched_at)
         if pace_result is not None:
             vm["pace"] = {
                 "aheadOfPace": pace_result.ahead,
@@ -500,12 +513,14 @@ def build(
     if history:
         auto_switch["lastEventText"] = history[0]
 
-    return {
+    vm = {
         "schemaVersion": SCHEMA_VERSION,
-        "activeSlot": snapshot.active_number,
         "takenAt": snapshot.taken_at,
         "freshness": freshness,
         "accounts": [_account_vm(acc, now=now) for acc in snapshot.accounts],
         "autoSwitch": auto_switch,
         "history": history,
     }
+    if snapshot.active_number is not None:
+        vm["activeSlot"] = snapshot.active_number
+    return vm

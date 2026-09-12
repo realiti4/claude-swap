@@ -90,6 +90,12 @@ class Bridge:
             error = self._validate_payload(payload, spec)
             if error:
                 return {"ok": False, "error": error}
+            # Only spec'd keys reach the handler — unknown keys of arbitrary
+            # type/size never cross into switcher code.
+            allowed = {**spec.get("required", {}), **spec.get("optional", {})}
+            payload = {k: v for k, v in payload.items() if k in allowed}
+        else:
+            payload = {}
         try:
             data = self._handlers[action](payload)
         except ClaudeSwitchError as e:
@@ -116,7 +122,11 @@ class Bridge:
     # ---- outbound ----------------------------------------------------------
 
     def _reply(self, reply_id: str | int, result: dict) -> None:
-        body = json.dumps(result, ensure_ascii=False)
+        body = self._dumps(result)
+        if body is None:
+            # A handler result that can't serialize (or carries NaN) must not
+            # dangle the panel's promise — answer with an error instead.
+            body = self._dumps({"ok": False, "error": "unserializable action result"})
         # The id came from the webview; it is interpolated into JS that
         # evaluateJavaScript will run, so it must be a JSON literal — raw
         # text would be an injection sink (and a ReferenceError for any
@@ -126,5 +136,17 @@ class Bridge:
 
     def push(self, type_: str, data: Any) -> None:
         """Push a vm/engine event into the panel (serialized as a JS call)."""
-        body = json.dumps({"type": type_, "data": data}, ensure_ascii=False)
+        body = self._dumps({"type": type_, "data": data})
+        if body is None:
+            logger.warning("menubar bridge: dropping unserializable push")
+            return
         self._send_js(f"cswap.push({body})")
+
+    @staticmethod
+    def _dumps(obj: Any) -> str | None:
+        """Strict JSON: NaN/Infinity and non-serializable objects yield None
+        instead of poisoning the wire (NaN is legal JS, illegal JSON)."""
+        try:
+            return json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
