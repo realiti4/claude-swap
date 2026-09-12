@@ -32,7 +32,7 @@ accessibility, and a full verification sweep.
 ## Task List
 
 ### Phase 1: Pure layers (pytest-covered, no UI)
-- [ ] Task 1: `account.status` mapping + contract tests
+- [x] Task 1: `account.status` mapping + contract tests
 - [ ] Task 2: preserve-measured windows + pace gating + tests
 - [ ] Task 3: JS reply-adapter error fix + wire-contract regression test
 

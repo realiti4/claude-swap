@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.menubar import viewmodel
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import SENTINEL_NOTES
@@ -149,6 +155,49 @@ class TestHealthyAccount:
         assert vm["freshness"] == {"ageText": "2m ago", "ok": True}
 
 
+class TestAccountStatus:
+    """The redesign's status vocabulary: sentinels are not all dead logins."""
+
+    def test_healthy_account_is_ok(self) -> None:
+        vm = viewmodel.build(snapshot(account()), now=NOW)
+        assert vm["accounts"][0]["status"] == "ok"
+
+    def test_api_key_account(self) -> None:
+        acc = account(number="2", is_active=False,
+                      usage=UsageEntry(sentinel=USAGE_API_KEY, last_good=None))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        assert vm["accounts"][1]["status"] == "api-key"
+
+    def test_relogin_account(self) -> None:
+        acc = account(number="2", is_active=False,
+                      usage=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED, last_good=None))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        assert vm["accounts"][1]["status"] == "needs-login"
+
+    @pytest.mark.parametrize("sentinel", [
+        USAGE_TOKEN_EXPIRED, USAGE_KEYCHAIN_UNAVAILABLE, USAGE_FOREIGN_CREDENTIAL,
+    ])
+    def test_transient_sentinels_are_unavailable(self, sentinel) -> None:
+        acc = account(number="3", is_active=False,
+                      usage=UsageEntry(sentinel=sentinel, last_good=None))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        assert vm["accounts"][1]["status"] == "unavailable"
+
+    def test_unknown_sentinel_defaults_to_unavailable(self) -> None:
+        acc = account(number="3", is_active=False,
+                      usage=UsageEntry(sentinel="mystery", last_good=None))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        assert vm["accounts"][1]["status"] == "unavailable"
+
+    def test_status_always_present_and_quarantined_unchanged(self) -> None:
+        acc = account(number="2", is_active=False,
+                      usage=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED, last_good=None))
+        vm = viewmodel.build(snapshot(account(), acc), now=NOW)
+        # status is the display key now; quarantined stays on the wire (compat)
+        assert vm["accounts"][1]["status"] == "needs-login"
+        assert vm["accounts"][1]["quarantined"] is True
+
+
 class TestDegradedStates:
     def test_sentinel_account_is_quarantined_without_bars(self) -> None:
         acc = account(
@@ -251,14 +300,16 @@ class TestContract:
         "accounts", "autoSwitch", "history",
     }
     ALLOWED_ACCOUNT = {
-        "slot", "label", "email", "org", "kind", "active", "switchable", "windows",
-        "alias", "disabled", "quarantined", "note", "spend", "pace", "lastError",
+        "slot", "label", "email", "org", "kind", "active", "switchable", "status",
+        "windows", "alias", "disabled", "quarantined", "note", "spend", "pace",
+        "lastError",
     }
     ALLOWED_WINDOW = {
         "kind", "label", "pct", "state",
         "resetsAt", "countdownText", "note",
     }
-    REQUIRED_ACCOUNT = {"slot", "label", "email", "org", "kind", "active", "switchable", "windows"}
+    REQUIRED_ACCOUNT = {"slot", "label", "email", "org", "kind", "active",
+                        "switchable", "status", "windows"}
     REQUIRED_WINDOW = {"kind", "label", "pct", "state"}
 
     def test_keys_neither_removed_nor_accidentally_added(self) -> None:

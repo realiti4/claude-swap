@@ -15,12 +15,12 @@ compat) but the panel will key off `status`. Contract tests pin the
 vocabulary and every sentinel mapping.
 
 **Acceptance criteria:**
-- [ ] Each sentinel maps to its status; non-sentinel accounts emit `"ok"`
-- [ ] `status` added to ALLOWED/REQUIRED contract sets; vocabulary pinned
-- [ ] No existing field changed or removed (additive only)
+- [x] Each sentinel maps to its status; non-sentinel accounts emit `"ok"`
+- [x] `status` added to ALLOWED/REQUIRED contract sets; vocabulary pinned
+- [x] No existing field changed or removed (additive only)
 
 **Verification:**
-- [ ] `uv run pytest tests/test_menubar_viewmodel.py -x` green; full suite green
+- [x] `uv run pytest tests/test_menubar_viewmodel.py -x` green; full suite green
 
 **Dependencies:** None
 **Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`

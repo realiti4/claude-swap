@@ -21,6 +21,13 @@ import time
 from datetime import datetime, timezone
 
 from claude_swap import pace
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
@@ -352,6 +359,24 @@ def _adapt_snapshot(snap) -> dict:
 
 # ---- v2 panel view-model ----------------------------------------------------
 
+# Display status per sentinel: sentinels are *derived states*, not verdicts —
+# an API-key account has no quota to show (not a failure), a dead refresh
+# token genuinely needs a re-login, and the rest are transient availability
+# problems that must never read as dead logins.
+_STATUS_BY_SENTINEL = {
+    USAGE_API_KEY: "api-key",
+    USAGE_RELOGIN_REQUIRED: "needs-login",
+    USAGE_TOKEN_EXPIRED: "unavailable",
+    USAGE_KEYCHAIN_UNAVAILABLE: "unavailable",
+    USAGE_FOREIGN_CREDENTIAL: "unavailable",
+}
+
+
+def _account_status(entry) -> str:
+    if entry.sentinel:
+        return _STATUS_BY_SENTINEL.get(entry.sentinel, "unavailable")
+    return "ok"
+
 def _age_text(age_s: float | None) -> str | None:
     """Human age of a measurement: "just now" / "Nm ago" / "Nh [Nm] ago"."""
     if age_s is None:
@@ -421,6 +446,7 @@ def _account_vm(acc, *, now: float) -> dict:
         "kind": acc.kind,
         "active": acc.is_active,
         "switchable": acc.switchable,
+        "status": _account_status(entry),
     }
     if acc.alias:
         vm["alias"] = acc.alias
