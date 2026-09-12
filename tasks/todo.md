@@ -174,12 +174,12 @@ identities, many accounts), full keyboard operation, reduced-motion
 verification, icon fidelity pass against the artboard.
 
 **Acceptance criteria:**
-- [ ] Every state renders per spec rules (text+icon status, honest stale, empty CTA)
-- [ ] Tab order sensible; Enter/Esc operate sheets; focus visible
-- [ ] Reduced-motion honored (no essential animation)
+- [x] Every state renders per spec rules (text+icon status, honest stale, empty CTA)
+- [x] Tab order sensible; Enter/Esc operate sheets; focus visible
+- [x] Reduced-motion honored (no essential animation)
 
 **Verification:**
-- [ ] Browser fixture with synthetic vms for each state; visual review
+- [x] Browser fixture with synthetic vms for each state; visual review
 
 **Dependencies:** Task 7
 **Files:** `web/*` as needed

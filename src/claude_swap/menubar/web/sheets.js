@@ -113,6 +113,14 @@
 
   // ---------------------------------------------------------------- wiring
 
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const btn = ev.target.closest("button[data-dlg]");
+    if (!btn || btn.disabled) return;
+    ev.preventDefault();
+    btn.click();
+  });
+
   document.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-dlg]");
     if (!btn) return;

@@ -49,7 +49,7 @@ accessibility, and a full verification sweep.
 - [ ] Both themes render the main artboard faithfully; sheets work; human review of derived light theme
 
 ### Phase 3: States, accessibility, verification
-- [ ] Task 8: all artboard states, keyboard, reduced motion, icon fidelity
+- [x] Task 8: all artboard states, keyboard, reduced motion, icon fidelity
 - [ ] Task 9: verification sweep — vision gates, live run, README/screenshots refresh
 
 ### Checkpoint C: complete

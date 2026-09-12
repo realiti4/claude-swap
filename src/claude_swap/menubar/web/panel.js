@@ -310,6 +310,17 @@ function footerHtml() {
 
 // ---------------------------------------------------------------- wiring ---
 
+// Explicit keyboard activation: some engines' automation (and any embedder
+// that suppresses default actions) don't synthesize clicks from Enter/Space
+// on buttons; making activation explicit guarantees keyboard operability.
+els.panel.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn || btn.disabled) return;
+  ev.preventDefault();
+  btn.click();
+});
+
 function wire() {
   els.panel.querySelectorAll("[data-act]").forEach((el) => {
     el.addEventListener("click", (ev) => {
