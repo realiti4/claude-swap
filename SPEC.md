@@ -1,184 +1,189 @@
-# Spec: Menubar v2 — CodexBar-class web panel
+# Spec: Menubar redesign — Pen handoff (graphite/ivory, statuses, dialogs)
 
-Source design: `docs/superpowers/specs/2026-09-12-menubar-panel-design.md`
-(approved in brainstorming, 2026-09-12). This spec is the implementation
-contract; the design doc carries the reasoning.
+Supersedes the menubar-v2 SPEC.md (fully implemented and shipped as
+0.28.0). Design rationale lives in
+`docs/superpowers/specs/2026-09-12-menubar-redesign-design.md`; the Pen
+handoff in `assets/` is the authoritative visual reference.
 
 ## ASSUMPTIONS I'M MAKING
 
-1. Target is the existing Python package — no Xcode, no second codebase
-   (approach B, approved).
-2. `rumps` is dropped; the `menubar` extra becomes
-   `pyobjc-framework-Cocoa` + `pyobjc-framework-WebKit` (floor ~10.x).
-3. Notifications go through `osascript display notification`; the
-   `ensure_notification_identity` plist hack is deleted (banner-only, same
-   as today).
-4. macOS 11+ gets the SF Symbol status icon; older systems fall back to the
-   `⇄` text title. WKWebView is available on every macOS we support.
-5. The panel is vanilla HTML/CSS/JS — no framework, no build step, no npm;
-   assets are plain files bundled with the package (hatchling already
-   packages everything under `src/claude_swap`).
-6. Light and dark mode both ship, driven by `prefers-color-scheme`.
-7. UI text is English, matching the rest of the project.
+1. The Pen artwork is authoritative where the handoff token CSS and the
+   artwork disagree; the token seed is the starting point, not the law.
+2. Light theme is derived from the token table + mirrored layout and is
+   human-reviewed in the fixture browser before sign-off.
+3. No new bridge actions or protocol changes — the redesign is the web
+   layer, additive view-model fields, and one reply-path bug fix.
+4. Fonts: Inter / IBM Plex Mono with system fallback stacks; no font
+   binaries ship (per the handoff).
+5. Full pass: all eight artboards in one implementation.
 
 ## Objective
 
-Replace the rumps text-menu menubar with a visual popover panel of
-CodexBar-class quality. One left-click on the status item shows every
-managed Claude account with 5h / 7d / per-model utilization bars, live reset
-countdowns, spend, and freshness; switching accounts, hold-out (disable),
-add/remove, and the auto-switch engine are all operable from the panel. A
-right-click classic menu remains as a fallback. The core —
-`ClaudeAccountSwitcher`, `accounts_snapshot()`, `AutoSwitchEngine`, usage
-store, locking, credential storage — is untouched; the panel is a fourth
-thin frontend over it, like the TUI.
+Rebuild the menubar panel's UI/UX to the Pen redesign: graphite and warm
+ivory themes with restrained teal accents; account selection as segmented
+cards where **selected** (teal ring) is distinct from **active**
+(subtitle); "68% USED" quota bars with countdown sub-lines and collapsed
+per-model/spend disclosures; explicit Best/Rotate actions; an iOS-style
+auto-switch toggle with a persistent summary; native-`<dialog>` sheets
+(token add with concealed input and field errors, remove confirmation,
+switch-history Activity); honest states everywhere — missing ≠ 0%, stale
+keeps measured values, API-key accounts aren't dead logins, countdowns at
+zero say *Awaiting updated usage*.
 
-Success looks like: the user never opens a terminal for day-to-day account
-management; `cswap menubar` and its launchd service behave exactly as
-before from the outside.
+Success looks like: the panel matches the main dark artboard at 360×560
+(and its light twin), passes keyboard/reduced-motion/accessibility rules
+from the handoff, keeps every existing capability working through the
+unchanged bridge, and the full suite stays green.
+
+## User Stories
+
+1. **At-a-glance quota awareness** — As a multi-account developer, I want
+   each account's five-hour and weekly usage shown as clearly labeled
+   "used" bars with reset countdowns, so I know where headroom remains
+   without opening a terminal.
+2. **Safe browsing** — As a user flipping between accounts, I want
+   *selected* (preview) visually distinct from *active*, so I never
+   switch accounts by accident; only an explicit Switch action activates.
+3. **Deliberate switching** — As a user near a limit, I want a primary
+   "Switch to …" action plus discoverable Best and Rotate alternatives,
+   so the right switch is one deliberate click.
+4. **Progressive detail** — As a user who hits per-model limits or cares
+   about spend, I want those available behind a disclosure, subordinate
+   to the primary quotas, so the panel stays calm by default.
+5. **Trustworthy automation** — As a user relying on auto-switch, I want
+   its on/off state and "at N% used · strategy" summary always visible,
+   so I can trust what the automation will do.
+6. **Honest stale data** — As a user whose measurements are stale or
+   offline, I want last-known values kept and labeled stale with their
+   age (and "Awaiting updated usage" once a countdown hits zero), so I'm
+   never misled by fabricated zeros or blanks.
+7. **No crying wolf** — As an API-key account owner, I want my account
+   to read "No subscription quota", not as a broken login; and when a
+   token genuinely dies, I want "Needs login" with the recovery path.
+8. **Safe account management** — As a user adding an account from a
+   setup token, I want a focused sheet with a concealed token field,
+   field-level errors, Esc-to-close, and no residue on cancel; as a user
+   removing one, I want explicit identity and consequence before
+   deletion — so neither action is ever accidental.
+9. **Audit trail** — As a user watching the automation work, I want an
+   Activity sheet listing recent switches with timestamps, so I can see
+   what switched and when.
+10. **Accessible operation** — As a keyboard-only or motion-sensitive
+    user, I want full Tab/Esc/Enter operation, visible focus, and
+    reduced-motion behavior, so the panel works for me.
 
 ## Tech Stack
 
-- Python 3.12+ (existing package), PyObjC (`pyobjc-framework-Cocoa`,
-  `pyobjc-framework-WebKit`) for the AppKit/WebKit shell
-- Vanilla JS + CSS, WKWebView-rendered, no build tooling
-- pytest 8 (+ xdist parallel, existing config) for everything testable
-- Design reference: [steipete/codexbar](https://github.com/steipete/codexbar)
+Unchanged: Python 3.12+ package, PyObjC shell, WKWebView, vanilla JS/CSS
+(no framework, no build step — plain `<script>` tags), pytest 8.
 
 ## Commands
 
 ```
-Test (all, parallel by default):   uv run pytest
-Test one file:                     uv run pytest tests/test_menubar_viewmodel.py -x
-Test one test:                     uv run pytest tests/test_menubar_viewmodel.py::test_name -x
-Run the app (dev):                 uv run cswap menubar
-Panel in browser (fixture mode):   open src/claude_swap/menubar/web/index.html
-Service install/status/remove:     uv run cswap menubar --install-service | --service-status | --uninstall-service
+Test (all):                        uv run pytest
+Focused:                           uv run pytest tests/test_menubar_viewmodel.py -x
+Run the app:                       PYTHONPATH=src uv run python -m claude_swap menubar
+Panel in browser (fixture mode):   open 'http://127.0.0.1:8765/index.html'   (serve web/ no-store)
+Theme override for screenshots:    ?theme=light|dark
+JS syntax floor:                   node --check src/claude_swap/menubar/web/panel.js (and sheets.js, icons.js)
 ```
-
-No build step: hatchling packages `src/claude_swap` wholesale, so
-`menubar/web/*` assets ship as package data with no manifest change.
 
 ## Project Structure
 
 ```
-src/claude_swap/menubar/         NEW package (menubar.py becomes a shim)
-  __init__.py                    re-exports run, framework_build_warning,
-                                 pure helpers — existing imports keep working
-  app.py                         PyObjC glue: NSStatusItem, NSPopover,
-                                 WKWebView, timers, right-click NSMenu,
-                                 engine thread, osascript notifications
-  bridge.py                      action routing table + id/reply correlation
-                                 (routing logic pure and unit-tested)
-  viewmodel.py                   PURE AccountsSnapshot → JSON view-model;
-                                 absorbs menubar.py's pure helpers
-  web/                           panel assets (package data)
-    index.html  panel.css  panel.js
+src/claude_swap/menubar/web/       rewritten assets (same directory)
+  index.html        CSP; <dialog> skeletons (token / remove / activity); script tags
+  panel.css         rebuilt from assets/menubar-redesign-tokens.css (--swap-* vars)
+  icons.js          currentColor SVG factory (swap, refresh, gear, best, rotate, chevron, activity)
+  sheets.js         <dialog> management: showModal, Esc, focus trap/restore, token clear,
+                    field errors, activity/switch-history rendering
+  panel.js          state + main-panel render (header, selector cards, identity,
+                    quotas, disclosure, actions, auto-switch, footer)
+src/claude_swap/menubar/viewmodel.py   additive: account.status; preserve-measured
+                                       windows; pace gating on staleness
 tests/
-  test_menubar.py                existing — keeps passing via re-exports
-  test_menubar_viewmodel.py      NEW — view-model construction
-  test_menubar_bridge.py         NEW — dispatch/reply/allowlist
-  test_menubar_import_smoke.py   NEW — macOS-only import smoke of app.py
-docs/ARCHITECTURE.md             update §6.5 + directory map
-README.md                        rewrite "Menu bar (macOS)" section
+  test_menubar_viewmodel.py        extended: status mapping, preserved windows, pace gating
+  test_menubar_wire_contract.py    extended: sheets.js/icons.js on the wire; reply-path
+                                   behavior pinned (error messages survive)
+  (all other menubar suites untouched or extended, never weakened)
 ```
 
 ## Code Style
 
-Python follows the existing codebase: module docstring explaining the
-layer's contract, `from __future__ import annotations`, type hints,
-dataclasses for value objects, no GUI imports at module level in
-platform-independent files:
-
-```python
-"""Pure snapshot → view-model transform for the menubar panel.
-
-Import-safe on every platform (no PyObjC); ``app.py`` owns all GUI glue.
-Countdown text is baked here for first paint; ``resetsAt`` epochs let the
-panel tick locally between pushes.
-"""
-
-from __future__ import annotations
-
-from claude_swap.models import AccountsSnapshot
-
-def build(snapshot: AccountsSnapshot, *, now: float | None = None) -> dict:
-    """Return the additive schemaVersion-1 view-model for the panel."""
-```
-
-JS is one IIFE-free module per file, `const`-first, state + render
-functions, no dependencies; CSS uses custom properties for the two palettes.
+Python: existing conventions (docstring'd modules, `from __future__`,
+type hints, no GUI imports in platform-safe files). JS: one IIFE-free
+module per file, `const`-first, no dependencies, `esc()` for every
+string interpolation, tabular numerals for measurements. CSS:
+`--swap-*` custom properties, `prefers-color-scheme` default +
+`data-swap-theme` override, `prefers-reduced-motion` support.
 
 ## Testing Strategy
 
-- **viewmodel / bridge**: pure pytest on all platforms, synthetic
-  `AccountsSnapshot`/`UsageEntry` fixtures (port/extend existing
-  `test_menubar.py` helper tests). Windows in fixtures for: 5h/7d/model
-  windows, sentinel quarantine, spend presence/absence, pace gating,
-  additive-field behavior (field absent, not `null`).
-- **Contract**: a key-snapshot test pins the view-model schema so fields
-  can't be silently removed (additive convention, like `json_output.py`).
-- **Bridge**: fake transport tests routing, id/reply correlation, allowlist
-  rejection of unknown actions and malformed payloads, error replies.
-- **Import smoke**: macOS CI installs the `menubar` extra and imports
-  `app.py` (no `NSApplication` run — headless-safe). Linux CI unchanged.
-- **Panel visuals**: manual + fixture-mode browser pass; GUI automation can
-  drive `index.html` fixture mode later.
-- Repo rules apply absolutely: no test may touch the real account store
-  (`tests/conftest.py` audit hook enforces this); suite stays green before
-  every commit.
+- **viewmodel**: status vocabulary (ok / api-key / needs-login /
+  unavailable) pinned by contract tests; rolled/passed windows keep
+  measured pct with `state: "stale"` + "Awaiting updated usage"; pace
+  hidden when stale; additive-field behavior preserved.
+- **wire contract**: every action `sheets.js`/`panel.js` can send is
+  registered in `_panel_handlers` with payload specs; the reply adapter
+  forwards `result.error` on failure (regression test for the bug).
+- **Fixture-mode browser verification** (the primary UI gate): all eight
+  artboard states pushed as synthetic view-models; keyboard Tab/Esc
+  through sheets; long identities, many accounts, reduced motion; both
+  themes; vision-gated screenshots of the final rendering.
+- Repo rules unchanged: no test touches the real account store; full
+  suite green before every commit.
 
 ## Boundaries
 
 **Always:**
-- Run `uv run pytest` before committing; full suite green.
-- Keep GUI imports lazy/macOS-gated so Linux CI never sees PyObjC.
-- Run every blocking operation (locks, Keychain, network) on background
-  threads; never block the AppKit main thread.
-- Keep the view-model JSON additive: new fields optional, never `null`
-  placeholders, never repurpose or remove.
-- Use `fsutil.replace_with_retry` for any new file write (e.g. prefs).
-- Webview loads bundled local content only; navigation elsewhere cancelled;
-  bridge validates action + payload types against an allowlist.
+- Run `uv run pytest` before committing; suite green.
+- Keep all view-model changes additive (new optional fields; never
+  repurpose or remove; absent ≠ null).
+- Escape every string interpolation in JS; status conveyed by text/icon,
+  never color alone.
+- Keep fixture mode working in a plain browser (it is the verification
+  harness).
 
 **Ask first:**
-- Any `pyproject.toml` change beyond swapping the `menubar` extra.
-- CI workflow changes.
-- Any new `cswap config` / `SETTING_SPECS` additions.
-- Changes to the launchd plist contract (label, paths, log locations).
+- Any change to `bridge.py` message protocol or `_panel_handlers`
+  semantics.
+- Any change to `app.py` beyond what the reply-path fix requires.
+- Adding files beyond the four web assets listed above.
 
 **Never:**
-- Touch the credential write path: `_classify_outgoing_credential`,
-  `_prepare_credentials_for_activation`, `shared_credential_fields`.
-- Reorder or re-enter the three-lock acquisition (`FileLock` →
-  `claude_credentials_lock` → `claude_config_lock`).
-- Add network calls that bypass the shared usage store / adaptive polling
-  (the ~28 req/hour budget is sacred).
-- Break `cswap menubar` / `--install-service` / launchd-label compatibility
-  or the `claude_swap.menubar` import surface used by tests.
-- Remove or weaken a failing test.
+- Touch credential writes, lock ordering, usage polling, auto-switch
+  policy, launchd contracts, CLI, or TUI behavior.
+- Change legacy roll-to-zero semantics for CLI/TUI (panel-only
+  preserve-measured).
+- Introduce a frontend framework, build step, or external font/asset
+  request.
+- Remove or weaken existing tests; break the bridge protocol or the
+  right-click fallback menu.
 
 ## Success Criteria
 
-1. `uv run cswap menubar` shows the status item; left-click opens the
-   panel; every managed account renders with 5h/7d bars + live countdowns,
-   per-model rows, and spend when present.
-2. Switch (explicit / rotate / best), disable/enable, remove, add (from
-   login / from setup-token), and the auto-switch toggle all work from the
-   panel, with per-action spinner/toast feedback.
-3. Right-click menu works even if the webview fails to load.
-4. Dark mode follows the system appearance.
-5. `uv run pytest` fully green, including untouched `tests/test_menubar.py`
-   and the new viewmodel/bridge/contract tests, on Linux and macOS CI.
-6. `cswap menubar --install-service` flow works unchanged (same label
-   `com.cswap.menubar`, same logs).
-7. Auto-switch events push to the panel and notify via `osascript`.
-8. README menubar section rewritten (screenshot placeholder acceptable);
-   ARCHITECTURE.md §6.5 and directory map updated.
+1. Panel matches the main dark artboard at 360×560 (44/486/30 layout),
+   and a derived light twin — both human-reviewed in the fixture browser
+   with vision-gated screenshots.
+2. Selected ≠ active everywhere; only the explicit Switch action
+   activates; success/error UI reflects the backend reply, with real
+   error messages in toasts (reply-adapter fix).
+3. Quotas: explicit **used** labeling, countdown sub-lines, collapsed
+   per-model/spend disclosure; missing → *unavailable* (never 0%);
+   rolled windows keep measured values marked stale; countdown at zero →
+   *Awaiting updated usage*; pace hidden when stale.
+4. Account status distinctions render correctly: API-key → *No
+   subscription quota*; re-login → *Needs login*; transient sentinels →
+   availability note (none presented as dead logins).
+5. Sheets are native `<dialog>`s: Esc closes, focus trapped and restored
+   to trigger, token input cleared on close, field-level errors; the
+   Activity sheet lists switch history.
+6. Keyboard operable (Tab/Esc/Enter), reduced-motion respected, tabular
+   numerals for all measurements.
+7. Wire-contract, viewmodel, bridge, package, and import-smoke suites
+   extended and green; full suite green; live app verified.
 
 ## Open Questions
 
-1. Exact PyObjC minimum version to pin — assumed `>=10.0`; confirm during
-   implementation against the oldest macOS we test (CI runners).
-2. README screenshot: capture during implementation (needs a populated
-   account store) — acceptable to merge with a placeholder first?
+None blocking. Icon fidelity against the Pen artboards is judged during
+fixture verification (handoff ships no icon exports).
