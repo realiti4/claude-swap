@@ -60,6 +60,30 @@
   --swap-hairline: rgba(255, 255, 255, 0.07);
   --swap-bar-track: rgba(255, 255, 255, 0.08);
   --swap-focus: #6fe3d5;
+
+  /* Reset-timeline tokens (--swap-tl-*), extracted from the Pen source
+   * boards 16–20 (see next-wave/extraction-notes.md). Separate namespace:
+   * several Pen values differ subtly from the legacy main-panel tokens
+   * above, and the fidelity mandate pins timelines to the boards. Nothing
+   * references these until the timeline rules land. */
+  --swap-tl-surface: #1b2224; --swap-tl-surface-2: #212a2c;
+  --swap-tl-surface-3: #283234; --swap-tl-border: #2b3538;
+  --swap-tl-border-strong: #3a4649; --swap-tl-text: #ecefee;
+  --swap-tl-text-2: #a3aeaf; --swap-tl-text-3: #899395;
+  --swap-tl-accent: #3fc2b2; --swap-tl-accent-quiet: #23423f;
+  --swap-tl-accent-text: #7fe0d2; --swap-tl-warn: #d9a441;
+  --swap-tl-ok: #5fb98a;
+  --swap-tl-width: 600px; --swap-tl-gap: 8px; --swap-tl-radius: 14px;
+  --swap-tl-header-h: 44px; --swap-tl-radius-card: 10px;
+  --swap-tl-card-pad: 10px; --swap-tl-card-gap: 6px;
+  --swap-tl-axis-h: 16px; --swap-tl-rows-h: 142px;
+  --swap-tl-row-h: 22px; --swap-tl-row-gap: 2px; --swap-tl-row-radius: 6px;
+  --swap-tl-left-w: 140px; --swap-tl-detail-w: 152px; --swap-tl-track-w: 242px;
+  --swap-tl-bar-h: 10px; --swap-tl-bar-radius: 5px;
+  --swap-tl-cap-w: 2.5px; --swap-tl-cap-h: 14px;
+  --swap-tl-rail-w: 2.5px; --swap-tl-badge: 22px; --swap-tl-badge-radius: 6px;
+  --swap-tl-now-w: 2px; --swap-tl-gridline-w: 1px; --swap-tl-tick-w: 36px;
+  --swap-tl-fallback-back-h: 34px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -80,6 +104,14 @@
     --swap-hairline: rgba(24, 38, 35, 0.10);
     --swap-bar-track: rgba(24, 38, 35, 0.09);
     --swap-focus: #0c8577;
+
+    --swap-tl-surface: #fffdf9; --swap-tl-surface-2: #f0ede6;
+    --swap-tl-surface-3: #e7e3da; --swap-tl-border: #e3dfd5;
+    --swap-tl-border-strong: #d3cec2; --swap-tl-text: #14191b;
+    --swap-tl-text-2: #565d5b; --swap-tl-text-3: #6b726e;
+    --swap-tl-accent: #0c8577; --swap-tl-accent-quiet: #dcede9;
+    --swap-tl-accent-text: #0a6e62; --swap-tl-warn: #9a6b10;
+    --swap-tl-ok: #2f7d57;
   }
 }
 
@@ -93,6 +125,14 @@
   --swap-hairline: rgba(255, 255, 255, 0.07);
   --swap-bar-track: rgba(255, 255, 255, 0.08);
   --swap-focus: #6fe3d5;
+
+  --swap-tl-surface: #1b2224; --swap-tl-surface-2: #212a2c;
+  --swap-tl-surface-3: #283234; --swap-tl-border: #2b3538;
+  --swap-tl-border-strong: #3a4649; --swap-tl-text: #ecefee;
+  --swap-tl-text-2: #a3aeaf; --swap-tl-text-3: #899395;
+  --swap-tl-accent: #3fc2b2; --swap-tl-accent-quiet: #23423f;
+  --swap-tl-accent-text: #7fe0d2; --swap-tl-warn: #d9a441;
+  --swap-tl-ok: #5fb98a;
 }
 
 [data-theme="light"] {
@@ -105,6 +145,14 @@
   --swap-hairline: rgba(24, 38, 35, 0.10);
   --swap-bar-track: rgba(24, 38, 35, 0.09);
   --swap-focus: #0c8577;
+
+  --swap-tl-surface: #fffdf9; --swap-tl-surface-2: #f0ede6;
+  --swap-tl-surface-3: #e7e3da; --swap-tl-border: #e3dfd5;
+  --swap-tl-border-strong: #d3cec2; --swap-tl-text: #14191b;
+  --swap-tl-text-2: #565d5b; --swap-tl-text-3: #6b726e;
+  --swap-tl-accent: #0c8577; --swap-tl-accent-quiet: #dcede9;
+  --swap-tl-accent-text: #0a6e62; --swap-tl-warn: #9a6b10;
+  --swap-tl-ok: #2f7d57;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
