@@ -949,6 +949,12 @@ def _menubar_service(args) -> int:
                 unsupported + "\n  Then run: cswap menubar --install-service",
                 file=sys.stderr,
             )
+        # Same reasoning as above: a service pinned into file-provider storage
+        # (iCloud Drive) cannot run under launchd at all — say so now, not
+        # after the user finds an empty menubar and a log full of exec errors.
+        synced = launch_agent.synced_location_warning(result["program"][0])
+        if synced:
+            warning(synced, file=sys.stderr)
         return 0
 
     if args.uninstall_service:

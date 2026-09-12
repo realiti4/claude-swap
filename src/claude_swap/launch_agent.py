@@ -106,6 +106,48 @@ def resolve_program() -> list[str]:
     return [sys.executable, "-m", "claude_swap"]
 
 
+def _mobile_documents_root(home: Path | None = None) -> Path:
+    """Root of Apple's file-provider mounts (iCloud Drive and kin)."""
+    return (home or Path.home()) / "Library" / "Mobile Documents"
+
+
+def synced_location_warning(program: str, home: Path | None = None) -> str | None:
+    """Warning text when the plist would pin a program inside Mobile Documents.
+
+    ``~/Library/Mobile Documents`` is where macOS mounts file-provider storage
+    such as iCloud Drive. launchd agents cannot reach it: on macOS 26 an agent
+    that execs a script stored there fails with ``Operation not permitted``,
+    and one that merely reads package files from it is killed outright — the
+    service crash-loops with nothing in its log but the exec error. Even on
+    releases where execution works, the file provider can evict the program's
+    files under storage pressure, breaking the agent later and silently.
+
+    Judged on the pinned path, deliberately not resolved: the plist keeps the
+    path as written (see :func:`resolve_program`), and a symlink stored inside
+    the synced tree still carries the rest of its venv with it.
+    """
+    try:
+        pinned = Path(os.path.abspath(program)).is_relative_to(
+            _mobile_documents_root(home)
+        )
+    except ValueError:  # abspath on a mangled path — nothing to warn about
+        return None
+    if not pinned:
+        return None
+    return (
+        "The service would run a program stored under ~/Library/Mobile "
+        "Documents (iCloud Drive or other file-provider storage), which "
+        "launchd agents cannot use: macOS has been observed to deny them "
+        'outright ("/bin/sh: ...: Operation not permitted"), and the file '
+        "provider can evict the files under storage pressure even where "
+        "execution works.\n"
+        "  Install claude-swap outside that tree and re-run "
+        "cswap menubar --install-service from it, e.g.\n"
+        "  uv tool install --force --with pyobjc-framework-Cocoa "
+        "--with pyobjc-framework-WebKit /path/to/claude-swap"
+    )
+
+
 def _path_env(program: list[str]) -> str:
     """PATH for the agent, with the program's own directory first."""
     dirs: list[str] = []

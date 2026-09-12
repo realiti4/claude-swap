@@ -164,6 +164,56 @@ def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
             assert launch_agent.resolve_program() == [str(found)]
 
 
+# --- synced-location warning ------------------------------------------------
+
+
+def test_synced_location_warning_names_the_icloud_drive_program(tmp_path):
+    program = (
+        tmp_path
+        / "Library"
+        / "Mobile Documents"
+        / "com~apple~CloudDocs"
+        / "code"
+        / "claude-swap"
+        / ".venv"
+        / "bin"
+        / "cswap"
+    )
+    text = launch_agent.synced_location_warning(str(program), home=tmp_path)
+    assert text is not None
+    assert "Operation not permitted" in text
+    assert "uv tool install" in text
+
+
+def test_synced_location_warning_is_silent_outside_mobile_documents(tmp_path):
+    program = tmp_path / ".local" / "bin" / "cswap"
+    assert launch_agent.synced_location_warning(str(program), home=tmp_path) is None
+
+
+def test_synced_location_warning_judges_the_pinned_path_not_the_target(tmp_path):
+    """The plist pins the path as written; a symlink stored inside iCloud Drive
+    still lives in a directory launchd cannot read around, so the warning keys
+    on the pinned path, not on where the symlink resolves."""
+    inside = (
+        tmp_path
+        / "Library"
+        / "Mobile Documents"
+        / "com~apple~CloudDocs"
+        / "code"
+        / "claude-swap"
+        / "bin"
+        / "cswap"
+    )
+    inside.parent.mkdir(parents=True)
+    outside = tmp_path / ".local" / "bin" / "real-cswap"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("#!/bin/sh\n")
+    inside.symlink_to(outside)
+
+    assert launch_agent.synced_location_warning(str(inside), home=tmp_path) is not None
+    assert launch_agent.synced_location_warning(str(outside), home=tmp_path) is None
+
+
 # --- install ---------------------------------------------------------------
 
 

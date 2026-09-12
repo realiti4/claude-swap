@@ -580,6 +580,26 @@ class TestCLI:
         captured = capsys.readouterr()
         assert "draws nothing" not in (captured.out + captured.err)
 
+    def test_install_service_warns_when_the_program_lives_in_icloud_drive(
+        self, monkeypatch, capsys
+    ):
+        # launchd agents cannot execute or read anything under
+        # ~/Library/Mobile Documents: the service crash-loops with
+        # "Operation not permitted". The install must say so at install time.
+        self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
+        monkeypatch.setattr(
+            "claude_swap.launch_agent.synced_location_warning",
+            lambda program: "iCloud Drive program cannot run under launchd",
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert "iCloud Drive program cannot run under launchd" in (
+            captured.out + captured.err
+        )
+
     def test_menubar_uninstall_service_routes_to_launch_agent(self, monkeypatch, capsys):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar", "--uninstall-service"])
 

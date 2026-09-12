@@ -287,6 +287,14 @@ console script, whose path survives an upgrade — but the running process
 keeps the old build until it restarts, so after `cswap upgrade` either
 re-run `--install-service` or `launchctl kickstart -k gui/$(id -u)/com.cswap.menubar`.
 
+> Installing from a checkout inside iCloud Drive (`~/Library/Mobile
+> Documents`)? launchd agents cannot execute or read anything stored there —
+> the service crash-loops with `Operation not permitted`. Install the build
+> somewhere launchd can reach it instead (`uv tool install --force --with
+> pyobjc-framework-Cocoa --with pyobjc-framework-WebKit /path/to/claude-swap`)
+> and run `--install-service` from that install. `--install-service` from
+> the synced checkout prints this same warning.
+
 > Upgrading from ≤0.27? The menubar extra changed from `rumps` to
 > PyObjC — reinstall with `uv tool install --force 'claude-swap[menubar]'`
 > (or the pipx equivalent) so the new dependencies are pulled in.
