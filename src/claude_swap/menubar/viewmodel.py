@@ -34,6 +34,7 @@ ICON = "⇄"
 SWITCH_HISTORY_LIMIT = 10
 
 SCHEMA_VERSION = 1
+AWAITING_USAGE_TEXT = "Awaiting updated usage"
 
 
 # ---- window helpers (operate on the usage-window dict shape produced by
@@ -399,8 +400,15 @@ def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -
     pct = float(window["pct"])
     if not math.isfinite(pct):
         return None
-    vm = {"kind": kind, "label": label, "pct": pct, "state": state}
     ts = _resets_at_ts(window)
+    if ts != float("inf") and ts <= now:
+        # The reset has passed: keep the MEASURED value (never fabricate a
+        # zero), mark it stale, and say what we're waiting for.
+        return {
+            "kind": kind, "label": label, "pct": pct, "state": "stale",
+            "countdownText": AWAITING_USAGE_TEXT,
+        }
+    vm = {"kind": kind, "label": label, "pct": pct, "state": state}
     if ts != float("inf"):
         vm["resetsAt"] = ts
         countdown = _countdown_text(ts, now)
@@ -460,17 +468,18 @@ def _account_vm(acc, *, now: float) -> dict:
         vm["note"] = display
     elif isinstance(display, dict):
         state = "stale" if entry.last_error else "ok"
-        seven_day = _rolled_weekly_window(display.get("seven_day"), now)
+        # Panel display keeps MEASURED values for windows whose reset has
+        # passed (the legacy helpers still roll them forward for CLI/TUI);
+        # _window_vm applies the passed-reset rule uniformly.
         for key, kind, label, window in (
             ("five_hour", "5h", "5-hour", display.get("five_hour")),
-            ("seven_day", "7d", "7-day", seven_day),  # rolled once, reused for pace
+            ("seven_day", "7d", "7-day", display.get("seven_day")),
         ):
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
                 bar = _window_vm(kind, label, window, now=now, state=state)
                 if bar is not None:
                     windows.append(bar)
         for window in display.get("scoped") or []:
-            window = _rolled_weekly_window(window, now)  # weekly cadence, same roll
             if (
                 isinstance(window, dict)
                 and isinstance(window.get("pct"), (int, float))
@@ -485,7 +494,19 @@ def _account_vm(acc, *, now: float) -> dict:
             spend_vm = _spend_vm(spend, now=now)
             if spend_vm is not None:
                 vm["spend"] = spend_vm
-        pace_result = pace.compute_pace(seven_day, fetched_at=entry.fetched_at)
+        if state == "ok":
+            # Pace is only meaningful on a current measurement: hide it when
+            # stale-on-error or when the weekly reset has passed (the passed
+            # window rule in _window_vm marks those stale).
+            seven_ts = _resets_at_ts(display.get("seven_day"))
+            if seven_ts == float("inf") or seven_ts > now:
+                pace_result = pace.compute_pace(
+                    display.get("seven_day"), fetched_at=entry.fetched_at
+                )
+            else:
+                pace_result = None
+        else:
+            pace_result = None
         if pace_result is not None:
             vm["pace"] = {
                 "aheadOfPace": pace_result.ahead,

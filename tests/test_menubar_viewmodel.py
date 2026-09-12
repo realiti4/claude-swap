@@ -253,15 +253,46 @@ class TestDegradedStates:
         vm = viewmodel.build(snapshot(account(usage=UsageEntry(last_good=usage))), now=NOW)
         assert "spend" not in vm["accounts"][0]
 
-    def test_rolled_weekly_window_zeroed(self) -> None:
+    def test_passed_weekly_window_keeps_measured_value(self) -> None:
+        """Redesign rule: a passed reset must not fabricate a zero — the
+        panel keeps the last measured pct, marked stale, awaiting a fresh
+        measurement. (CLI/TUI keep the legacy roll-to-zero display.)"""
         stale_weekly = usage_fixture()
         stale_weekly["seven_day"] = _win(95.0, NOW - 86400)  # reset passed
         vm = viewmodel.build(
             snapshot(account(usage=UsageEntry(last_good=stale_weekly))), now=NOW
         )
         seven = vm["accounts"][0]["windows"][1]
-        assert seven["pct"] == 0.0
-        assert seven["resetsAt"] > NOW  # advanced to next boundary
+        assert seven["pct"] == 95.0  # measured value preserved
+        assert seven["state"] == "stale"
+        assert seven["countdownText"] == "Awaiting updated usage"
+        assert "resetsAt" not in seven  # nothing left to count down to
+
+    def test_passed_five_hour_window_awaits_too(self) -> None:
+        stale_5h = usage_fixture()
+        stale_5h["five_hour"] = _win(72.0, NOW - 600)
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=stale_5h))), now=NOW
+        )
+        five = vm["accounts"][0]["windows"][0]
+        assert five["pct"] == 72.0
+        assert five["state"] == "stale"
+        assert five["countdownText"] == "Awaiting updated usage"
+
+    def test_pace_hidden_when_measurement_stale(self) -> None:
+        stale_weekly = usage_fixture()
+        stale_weekly["seven_day"] = _win(95.0, NOW - 3600)
+        vm = viewmodel.build(
+            snapshot(account(usage=UsageEntry(last_good=stale_weekly))), now=NOW
+        )
+        assert "pace" not in vm["accounts"][0]
+
+    def test_future_windows_unchanged_by_rule(self) -> None:
+        vm = viewmodel.build(snapshot(account()), now=NOW)
+        five = vm["accounts"][0]["windows"][0]
+        assert five["state"] == "ok"
+        assert five["countdownText"] == "2h 14m"
+        assert "pace" in vm["accounts"][0]
 
 
 class TestAutoSwitchAndHistory:

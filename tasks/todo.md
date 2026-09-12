@@ -35,12 +35,12 @@ data is suppressed when the measurement is stale. Legacy helpers
 (`usage_summary`, `format_title`) untouched — CLI/TUI keep roll-to-zero.
 
 **Acceptance criteria:**
-- [ ] Passed weekly AND five-hour windows keep measured pct + stale + awaiting text
-- [ ] Pace absent for stale accounts; present otherwise (existing tests stay green)
-- [ ] Legacy helper behavior unchanged (existing legacy tests prove it)
+- [x] Passed weekly AND five-hour windows keep measured pct + stale + awaiting text
+- [x] Pace absent for stale accounts; present otherwise (existing tests stay green)
+- [x] Legacy helper behavior unchanged (existing legacy tests prove it)
 
 **Verification:**
-- [ ] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green; full suite green
+- [x] `uv run pytest tests/test_menubar_viewmodel.py tests/test_menubar.py -x` green; full suite green
 
 **Dependencies:** Task 1 (same file)
 **Files:** `src/claude_swap/menubar/viewmodel.py`, `tests/test_menubar_viewmodel.py`
