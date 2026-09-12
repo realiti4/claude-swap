@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import plistlib
 import sys
 from pathlib import Path
 
@@ -22,48 +21,6 @@ from claude_swap.switcher import USAGE_API_KEY
 
 
 # --- notification identity -----------------------------------------------------
-
-def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
-    executable = tmp_path / "bin" / "python3"
-    executable.parent.mkdir()
-    info = executable.parent / "Info.plist"
-    info.write_bytes(plistlib.dumps({"ExistingKey": "kept"}))
-
-    result = menubar.ensure_notification_identity(executable, platform="darwin")
-
-    assert result == info
-    data = plistlib.loads(info.read_bytes())
-    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
-    assert data["CFBundleName"] == "claude-swap"
-    assert data["ExistingKey"] == "kept"
-
-
-def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
-    executable = tmp_path / "bin" / "python3"
-    executable.parent.mkdir()
-    info = executable.parent / "Info.plist"
-    # truncated XML plist: plistlib raises ExpatError, not InvalidFileException
-    info.write_bytes(
-        b'<?xml version="1.0" encoding="UTF-8"?>\n'
-        b'<plist version="1.0"><dict><key>CFBundle'
-    )
-
-    result = menubar.ensure_notification_identity(executable, platform="darwin")
-
-    assert result == info
-    data = plistlib.loads(info.read_bytes())
-    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
-    assert data["CFBundleName"] == "claude-swap"
-    assert not (executable.parent / "Info.plist.tmp").exists()
-
-
-def test_notification_identity_is_noop_off_macos(tmp_path: Path):
-    executable = tmp_path / "bin" / "python3"
-    assert menubar.ensure_notification_identity(
-        executable, platform="linux"
-    ) is None
-    assert not (executable.parent / "Info.plist").exists()
-
 
 # --- settings ------------------------------------------------------------------
 
@@ -544,16 +501,17 @@ def test_format_title_reflects_passed_weekly_reset():
 
 # --- run() app glue ------------------------------------------------------------
 
-def test_run_without_rumps_raises_clean_error(monkeypatch):
+def test_run_without_pyobjc_raises_clean_error(monkeypatch):
     """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
 
-    The module is import-safe without rumps, so the CLI's ImportError guard
+    The module is import-safe without PyObjC, so the CLI's ImportError guard
     around ``from claude_swap.menubar import run`` can never fire — the import
     failure happens inside ``run()``. Blocking the import (a ``None`` entry in
-    ``sys.modules`` makes ``import rumps`` raise) checks that ``run()`` turns
+    ``sys.modules`` makes ``import AppKit`` raise) checks that ``run()`` turns
     it into the error type the CLI renders with the install hint.
     """
-    monkeypatch.setitem(sys.modules, "rumps", None)
+    monkeypatch.setitem(sys.modules, "AppKit", None)
+    monkeypatch.setitem(sys.modules, "PyObjCTools", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
 

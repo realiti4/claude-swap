@@ -16,7 +16,7 @@ REQUIRED_SURFACE = (
     # public helpers + app entry points
     "run",
     "framework_build_warning",
-    "ensure_notification_identity",
+    "notify",
     "MenuBarSettings",
     "EMPTY_SNAPSHOT",
     "SENTINEL_NOTES",

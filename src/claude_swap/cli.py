@@ -1453,7 +1453,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
             if args.install_service or args.uninstall_service or args.service_status:
                 sys.exit(_menubar_service(args))
-            # menubar is import-safe without the extra; a missing rumps
+            # menubar is import-safe without the extra; a missing PyObjC
             # surfaces from run() as a ClaudeSwitchError with the install hint.
             from claude_swap.menubar import run as menubar_run
 
