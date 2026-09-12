@@ -11,8 +11,8 @@
     },
     {
       "path": "START-HERE.md",
-      "bytes": 564,
-      "sha256": "a1e38c038eb4edf3ceb2f87e587703eedeeac784827dc7ac68cf97b81e8eb094"
+      "bytes": 1142,
+      "sha256": "669171f54f9ad56e607f9473790b9f3a88c83cfddc9637905a4af364441c72d2"
     },
     {
       "path": "icons/icon-master-256.png",
@@ -187,6 +187,67 @@
       "path": "tokens.css",
       "bytes": 1248,
       "sha256": "79f64449d19d381bb7125af61eb5455605c5f64bc9b45308e8cf33984502b592"
+    },
+    {
+      "path": "TIMELINES.md",
+      "bytes": 7354,
+      "sha256": "de211239441756445adf15666c05ad4372b5285cfea3a82314f3ed3fa49680a7"
+    },
+    {
+      "path": "timeline-screens/17-timelines-right-dark-draft.png",
+      "bytes": 79867,
+      "sha256": "2d5411d9e5571132be7d9f18b77e3cee175430c6f6e54164a019dd23d78a7de1",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "historical draft"
+    },
+    {
+      "path": "timeline-screens/16-timelines-closed.png",
+      "status": "design reference",
+      "bytes": 30638,
+      "sha256": "16b375140b9fedc4bfe16b0b956968c0b8a53f8273eb893539ce9114a856ba28",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "timeline-screens/17-timelines-right-dark.png",
+      "status": "design reference",
+      "bytes": 86887,
+      "sha256": "8ada5e74efdc51f3cbb4db0214b24c72551e29afbc3eb52a9ef99404d0ff51d4",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "timeline-screens/18-timelines-right-light.png",
+      "status": "design reference",
+      "bytes": 87506,
+      "sha256": "690d655e9b49849b86971b2e1def71786f2d9b022fd74730f6b0b220830dd3bc",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA"
+    },
+    {
+      "path": "timeline-screens/19-timelines-left.png",
+      "status": "design reference",
+      "bytes": 110448,
+      "sha256": "64a7df414e73a2707813621e3f8ababa0800ef3ec49dc4feb8543befe634e124",
+      "width": 1091,
+      "height": 676,
+      "mode": "RGBA"
+    },
+    {
+      "path": "timeline-screens/20-timeline-states.png",
+      "status": "prior timeline model; interaction guidance only",
+      "bytes": 269806,
+      "sha256": "6bb7908e878127727c2a783ee27ffcaa242f09b984ad34742774ae12fb08cb88",
+      "width": 900,
+      "height": 2132,
+      "mode": "RGBA"
     }
-  ]
+  ],
+  "timeline_draft_count": 1,
+  "timeline_screen_count": 5
 }
