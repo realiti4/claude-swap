@@ -76,7 +76,7 @@ criteria.
   - Dependencies: Task 7 (shared icon source)
 
 ## Checkpoint E
-- [ ] Full suite `uv run pytest -n 4 -q` green
-- [ ] Full state matrix in fixture (both themes, empty roster, API-key, needs-login, disabled, stale, expired countdown, missing optional data, long identities, 10+ accounts)
-- [ ] HANDOFF.md acceptance checklist walked end-to-end; fixture screenshots + native eyeball list to user
-- [ ] Ready for /review
+- [x] Full suite `uv run pytest -n 4 -q` green (2,380 passed)
+- [x] Full state matrix in fixture: all states verified, both themes QA-clean
+- [x] HANDOFF acceptance walked; screenshots delivered; native eyeball items with user
+- [x] Ready for /review
