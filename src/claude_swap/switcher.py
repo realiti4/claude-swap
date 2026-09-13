@@ -573,27 +573,47 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON file with validation.
+
+        Audit F06: the temporary file is created exclusive-and-private
+        (``os.open`` with ``O_CREAT|O_EXCL`` mode ``0600``) and written
+        through that descriptor — under an ordinary umask the old
+        PID-named file was briefly ``0644`` with the full config content
+        (and PID-only names collided between same-process writers). The
+        rename stays the atomic commit.
+        """
         content = json.dumps(data, indent=2)
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
-
-        # Validate written content
+        temp_path = path.with_suffix(f".{os.getpid()}-{os.urandom(4).hex()}.tmp")
+        fd = os.open(
+            temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
 
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            # Validate written content
+            try:
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                raise ConfigError("Generated invalid JSON")
+        except Exception:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise
+
+        # Permissions went on at creation, so the rename below is the
+        # final, atomic commit: nothing can fail after the file is
+        # published (a chmod on the final path could raise with the write
+        # already live, making callers roll back around committed
+        # metadata).
+        if sys.platform == "win32":
+            # Windows ignores the O_CREAT mode; the best-effort private
+            # stance there is inherited ACLs (documented posture).
+            pass
+        os.replace(temp_path, path)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #

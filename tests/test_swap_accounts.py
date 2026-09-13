@@ -1,6 +1,7 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -268,28 +269,65 @@ class TestSwapAccounts:
         # Clean rollback: no staged copies left behind either.
         assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
 
-    def test_write_json_publishes_only_after_chmod(
+    def test_write_json_publishes_only_after_private_creation(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """chmod runs on the temp file, making the rename the final commit —
-        a chmod failure must abort *without* publishing, otherwise callers
-        would roll files back around already-committed metadata."""
+        """F06: privacy is enforced at temp-file creation (O_EXCL, 0600),
+        making the rename the final commit — a creation failure must
+        abort *without* publishing, otherwise callers would roll files
+        back around already-committed metadata."""
         if sys.platform == "win32":
-            pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
+            pytest.skip("_write_json relies on POSIX creation modes")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         before = switcher.sequence_file.read_text(encoding="utf-8")
 
-        def failing_chmod(path, mode):
-            raise OSError("chmod denied (injected)")
+        def failing_open(*args, **kwargs):
+            raise OSError("open denied (injected)")
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            mp.setattr("claude_swap.switcher.os.open", failing_open)
             with pytest.raises(OSError):
                 switcher._write_json(switcher.sequence_file, {"x": 1})
 
         assert switcher.sequence_file.read_text(encoding="utf-8") == before
+
+    def test_write_json_temp_is_private_from_creation(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Audit F06 acceptance: under an ordinary umask (022) the
+        secret-bearing temporary file must never exist world-readable —
+        its mode is 0600 from the moment of creation, observed by a hook
+        at the first write."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX file modes only")
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        observed: dict[str, object] = {}
+
+        real_replace = os.replace
+
+        def observing_replace(src, dst):
+            observed["mode"] = stat.S_IMODE(os.stat(src).st_mode)
+            observed["path"] = str(src)
+            return real_replace(src, dst)
+
+        old_umask = os.umask(0o022)
+        try:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("claude_swap.switcher.os.replace", observing_replace)
+                switcher._write_json(
+                    switcher.sequence_file, {"secret": "synthetic"}
+                )
+        finally:
+            os.umask(old_umask)
+
+        assert observed["mode"] == 0o600, (
+            f"temp file was {observed['mode']:o} before publication — the "
+            "audit's 0644-before-chmod window"
+        )
+        assert not Path(observed["path"]).exists()  # published, not left behind
 
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict
