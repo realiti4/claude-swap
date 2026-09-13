@@ -17,6 +17,7 @@ const state = {
   vm: null,
   selectedSlot: null,   // preview selection; never switches by itself
   pendingAction: null,  // action name while a reply is in flight
+  lastPanelHeight: null,
 };
 
 const els = {
@@ -174,6 +175,7 @@ function render() {
     if (d) d.open = true;
   }
   wire();
+  sizeToContent();
   const trig = els.panel.querySelector(".tl-trigger");
   if (trig) {
     const empty = !state.vm || !state.vm.accounts.length;
@@ -395,6 +397,27 @@ function footerHtml() {
     <button data-act="add">Add account</button>
   </footer>`;
 }
+
+// ------------------------------------------------------------ auto-height ---
+// The popover's height follows the content (owner decision 2026-09-12:
+// variable length, never scroll). Native clamps to the screen and
+// resizes; the default three-account roster measures exactly 560, so
+// the boards remain the rendered truth for the default state.
+function sizeToContent() {
+  if (!bridge.hosted) return;
+  if (CSWAP_TIMELINES.state.mode) return;  // expanded pair is board-fixed
+  const h = Math.ceil(els.panel.offsetHeight);
+  if (h > 0 && h !== state.lastPanelHeight) {
+    state.lastPanelHeight = h;
+    bridge.send("sizePanel", { height: h });
+  }
+}
+els.panel.addEventListener("toggle", (ev) => {
+  if (ev.target.matches("details.disclosure")) {
+    // the disclosure animates open over a couple of frames; re-measure
+    setTimeout(sizeToContent, 60);
+  }
+});
 
 // ---------------------------------------------------------------- wiring ---
 

@@ -162,8 +162,9 @@ html, body {
   color: var(--swap-text);
   font: 13px/1.45 var(--swap-font-ui);
   -webkit-font-smoothing: antialiased;
-  height: 100%;
+  height: auto;  /* the popover height follows the content (sizePanel) */
 }
+body.tl-expanded, body.tl-expanded html { height: 100%; }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 button:disabled { cursor: default; }
@@ -176,7 +177,12 @@ button:disabled { cursor: default; }
    browser pane in fixture mode); the body flexes to the remainder and
    only scrolls when content genuinely overflows. */
 
-#panel { width: var(--swap-panel-width); height: 100%; display: flex; flex-direction: column; }
+#panel { width: var(--swap-panel-width); height: auto; display: flex;
+  flex-direction: column;
+  min-height: var(--swap-panel-h, 560px);  /* board floor: every
+    board-drawn state is 560; taller content grows, never scrolls */ }
+/* expanded surface: the main column fills the (fixed, board-exact) pair */
+body.tl-expanded #panel { height: 100%; }
 
 .hdr {
   height: var(--swap-header-height); flex: none;
@@ -467,6 +473,7 @@ body.tl-expanded #panel {
   position: absolute;
   left: var(--tl-anchor-x, 0px);
   top: 0;
+  height: 100%;
 }
 
 #tl-companion {

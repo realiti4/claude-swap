@@ -139,3 +139,48 @@ native-proof.json` and the decision record in `next-wave/tasks/plan.md`.
 The fidelity gate: zero-tolerance geometry/color/type via exact-point
 layout records; glyph rasterization masked (renderer-dependent); image
 budgets at the measured WebKit-vs-Pen sub-pixel floor (4%/6%).
+
+## Limit Timelines design re-export — 2026-09-12
+
+Completed the requested Pen reconciliation and exported boards01–18 at PNG1x.
+Main-header instances carry the calendar-clock trigger before Refresh, including
+modal backgrounds; the empty-account trigger is disabled. Board08 retains its
+reference-sheet role; board11 has no main header and remains the icon system.
+Board16 shows the closed trigger. Boards17/18 now show countdown chips in both
+charts, a neutral pointer crosshair with a15:30 timestamp distinct from amber
+Now, and the T shortcut note. Long row aliases use an ellipsis.
+
+Pen source was saved through the UI. Packaged images are direct native Pen
+exports. Inter and IBM Plex Mono family/weight assignments were checked in Pen,
+but exact bundled WOFF2 binding is unsupported: see [FONT-RENDERING.md](FONT-RENDERING.md).
+Do not describe these as verified renders of the app's exact font binaries.
+
+Coding-agent follow-up for fidelity capture (no product code changed here):
+
+- Reconcile CSWAP_TL_BOARD, which currently suppresses countdown/crosshair
+  additions, and refresh capture fixtures/layout records before comparing
+  against these new references. Prior passing image metrics cover older images.
+- The chips required more detail-column room: Pen narrowed the alias column
+  and shifted the242px track, shared grid and Now together. Preserve full-window
+  semantics and inspect final Pen geometry when updating exact-point records.
+- Static chip labels use compact illustrative durations (3h,3d,40m); the
+  runtime formatter floors minutes and includes spaces/zero remainder units.
+  Keep the runtime calculation authoritative when rebuilding frozen fixtures.
+- The inactive calendar container has a quiet rounded background to keep the
+  glyph visible in native Pen export; align the runtime control style during
+  fidelity review.
+
+Boards19/20 and Settings21–28 were outside this re-export scope and are retained.
+The organized canvas and Settings wave are preserved.
+
+## Variable panel height — owner decision 2026-09-12 (post-wave)
+
+The main panel's height now follows its content instead of fixed 560:
+the panel measures its natural height on every render and disclosure
+toggle (`sizePanel` bridge action), native clamps to the screen and
+resizes the popover; the expanded pair stays board-fixed at 560 unless
+content is taller. A **560px floor** keeps every board-drawn state
+board-exact (the default three-account rhythm fills it exactly; the
+empty state and short rosters hold it); taller rosters grow the panel
+and the no-scroll rule holds absolutely. Boards need no re-export —
+they depict the default state at 560, which is unchanged.

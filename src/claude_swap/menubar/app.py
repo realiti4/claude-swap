@@ -274,6 +274,7 @@ def run(switcher) -> int:
             # surface is a borderless NSPanel; the collapsed popover stays
             # untouched). None = collapsed.
             self._tl_mode: str | None = None
+            self._panel_height = 560.0
             self._tl_panel = None
             self._tl_monitors: list = []
             self._install_status_item()
@@ -545,6 +546,7 @@ def run(switcher) -> int:
                                               "titlePct": str, "theme": str}},
                     # view-only toggle: no fields, no credential/polling side
                     "toggleTimelines": {},
+                    "sizePanel": {"required": {"height": int}},
                 },
             )
             self._webview.loadFileURL_allowingReadAccessToURL_(
@@ -604,6 +606,7 @@ def run(switcher) -> int:
                 "toggleTimelines": lambda payload: (
                     AppHelper.callAfter(self._toggle_timelines),
                 )[0] or {"scheduled": True},
+                "sizePanel": self._size_panel,
                 "quit": lambda payload: (
                     AppHelper.callAfter(self.on_quit),
                 )[0] or {"scheduled": True},
@@ -745,6 +748,35 @@ def run(switcher) -> int:
                 history=self._history(),
             )
 
+        TL_MIN_H = 460.0  # empty-state composition + margin
+
+        def _size_panel(self, payload):
+            height = self._clamp_panel_height(int(payload["height"]))
+            AppHelper.callAfter(self._apply_panel_height, height)
+            return {"height": height}
+
+        def _clamp_panel_height(self, height: int) -> float:
+            screen = (self._button.window().screen()
+                      or AppKit.NSScreen.mainScreen())
+            vis = screen.visibleFrame()
+            return max(self.TL_MIN_H, min(float(height), vis.size.height - 12.0))
+
+        def _apply_panel_height(self, height: float) -> None:
+            # Variable-length panel (owner decision 2026-09-12): the
+            # popover follows content height, clamped to the screen —
+            # the no-scroll rule holds absolutely.
+            self._panel_height = height
+            if self._tl_mode is None:
+                self._popover.setContentSize_((360.0, height))
+            else:
+                # expanded pair: board-fixed 560 unless content is taller
+                h = max(self.TL_HEIGHT, height)
+                frame = self._tl_panel.frame()
+                self._tl_panel.setFrame_display_(
+                    ((frame.origin.x, frame.origin.y),
+                     (frame.size.width, h)), True)
+                self._webview.setFrame_(((0.0, 0.0), (frame.size.width, h)))
+
         # ---- reset timelines: expanded native surface -----------------------
         #
         # T1 decision (proof in scripts/timeline_native_proof.py, evidence in
@@ -783,14 +815,15 @@ def run(switcher) -> int:
             if screen is None:
                 screen = AppKit.NSScreen.mainScreen()
             vis = screen.visibleFrame()
-            if vis.size.height < self.TL_HEIGHT:
+            exp_h = max(self.TL_HEIGHT, self._panel_height)
+            if vis.size.height < exp_h:
                 return "in-panel", None
             bw = button_win.frame() if button_win is not None else None
             anchor_x = (
                 bw.origin.x + bw.size.width / 2 if bw is not None
                 else vis.origin.x + vis.size.width / 2
             )
-            top_y = vis.origin.y + vis.size.height - 6.0 - self.TL_HEIGHT
+            top_y = vis.origin.y + vis.size.height - 6.0 - exp_h
             # main column edge-aligned under the anchor: its center sits at
             # the anchor, so companion-right places the surface at
             # anchor-180 and companion-left at anchor+180-968.
@@ -801,7 +834,7 @@ def run(switcher) -> int:
                 if (x >= vis.origin.x
                         and x + self.TL_TOTAL_W
                         <= vis.origin.x + vis.size.width):
-                    return mode, ((x, top_y), (self.TL_TOTAL_W, self.TL_HEIGHT))
+                    return mode, ((x, top_y), (self.TL_TOTAL_W, exp_h))
             return "in-panel", None
 
         def _expand_timelines(self, mode: str, frame) -> None:
@@ -822,8 +855,9 @@ def run(switcher) -> int:
                 panel.setBecomesKeyOnlyIfNeeded_(False)
                 panel.setHidesOnDeactivate_(False)
                 self._tl_panel = panel
+            exp_h = max(self.TL_HEIGHT, self._panel_height)
             self._webview.setFrame_(
-                ((0.0, 0.0), (self.TL_TOTAL_W, self.TL_HEIGHT))
+                ((0.0, 0.0), (self.TL_TOTAL_W, exp_h))
             )
             self._tl_panel.setContentView_(self._webview)
             self._tl_panel.setFrame_display_(frame, True)
@@ -839,7 +873,7 @@ def run(switcher) -> int:
             if self._tl_panel is not None:
                 self._tl_panel.orderOut_(None)
             self._webview.setFrame_(
-                ((0.0, 0.0), (self.TL_MAIN_W, self.TL_HEIGHT))
+                ((0.0, 0.0), (self.TL_MAIN_W, self._panel_height))
             )
             self._panel_vc.setView_(self._webview)
             if reshow_popover and not self._popover.isShown():

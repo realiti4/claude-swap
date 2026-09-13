@@ -586,3 +586,70 @@ class TestHardening:
         )
         panel.spin(0.15)
         assert panel.rows("5h"), "roster returning restores rows"
+
+
+class TestVariablePanelHeight:
+    """Owner decision 2026-09-12: the panel's height follows its content
+    (never scroll). The default three-account roster still measures
+    exactly 560 — the boards remain the rendered truth for it."""
+
+    def test_default_roster_measures_board_height(self):
+        # fresh default fixture (3 accounts) — the module panel carries
+        # the tlf roster and earlier tests' mutations
+        p = Panel("")
+        p.spin(0.3)
+        h = p.eval("document.getElementById('panel').offsetHeight")
+        assert h == 560, "the baseline rhythm fills the board exactly"
+
+    def test_height_follows_roster_size(self, panel):
+        panel.eval("CSWAP_TIMELINES.apply({mode: null}); 'ok'")  # collapse
+        panel.spin(0.15)
+        vm = json.loads(panel.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)"))
+        one = json.loads(json.dumps(vm))
+        one["accounts"] = one["accounts"][:1]
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': one})}); 'ok'"
+        )
+        panel.spin(0.15)
+        small = panel.eval("document.getElementById('panel').offsetHeight")
+        assert small == 560, "short rosters hold the board floor"
+
+        many = json.loads(json.dumps(vm))
+        base = many["accounts"][:3]
+        roster = list(base)
+        for i in range(9):
+            c = json.loads(json.dumps(base[0]))
+            c.update({"slot": f"3{i}", "alias": f"acct{i}", "label": f"acct{i}",
+                      "active": False})
+            roster.append(c)
+        many["accounts"] = roster
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': many})}); 'ok'"
+        )
+        panel.spin(0.15)
+        tall = panel.eval("document.getElementById('panel').offsetHeight")
+        assert tall > 560, "a tall roster lengthens the panel"
+        body = panel.eval("""
+          (() => { const b = document.querySelector('#panel .body');
+            return b.scrollHeight; })()
+        """)
+        client = panel.eval(
+            "document.querySelector('#panel .body').clientHeight"
+        )
+        assert body == client, "no internal scrolling at natural height"
+        # restore
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': vm})}); 'ok'"
+        )
+        panel.spin(0.15)
+
+    def test_disclosure_opening_grows_the_panel(self, panel):
+        if not panel.eval("!!document.querySelector('details.disclosure')"):
+            pytest.skip("no disclosure in this roster state")
+        before = panel.eval("document.getElementById('panel').offsetHeight")
+        panel.eval("document.querySelector('details.disclosure').open = true; 'ok'")
+        panel.spin(0.3)
+        after = panel.eval("document.getElementById('panel').offsetHeight")
+        assert after > before, "opened disclosure lengthens, never scrolls"
+        panel.eval("document.querySelector('details.disclosure').open = false; 'ok'")
+        panel.spin(0.2)
