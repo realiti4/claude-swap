@@ -270,8 +270,21 @@ def run(switcher) -> int:
             self._next_tag = 1
             self._vm: dict | None = None
             self._menu = None
+            # Reset-timelines expanded state (T1 decision: the expanded
+            # surface is a borderless NSPanel; the collapsed popover stays
+            # untouched). None = collapsed.
+            self._tl_mode: str | None = None
+            self._tl_panel = None
+            self._tl_monitors: list = []
             self._install_status_item()
             self._install_panel()
+            # Re-place or degrade the expanded surface when the display
+            # arrangement changes while open.
+            AppKit.NSNotificationCenter.defaultCenter(
+            ).addObserver_selector_name_object_(
+                self._target, "onScreensChanged:",
+                AppKit.NSApplicationDidChangeScreenParametersNotification, None,
+            )
             self.rebuild_menu()
             self._refresh_timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
                 self.settings.refresh_interval,
@@ -358,6 +371,9 @@ def run(switcher) -> int:
 
                 def onStatusClick_(self, _sender):
                     shell.on_status_click()
+
+                def onScreensChanged_(self, _note):
+                    shell._tl_screens_changed(_note)
 
                 # WKScriptMessageHandler: the panel's only inbound channel.
                 def userContentController_didReceiveScriptMessage_(
@@ -506,6 +522,7 @@ def run(switcher) -> int:
             self._webview.setNavigationDelegate_(self._target)
             controller = AppKit.NSViewController.alloc().init()
             controller.setView_(self._webview)
+            self._panel_vc = controller  # reclaim the webview on collapse
             self._popover = AppKit.NSPopover.alloc().init()
             self._popover.setContentViewController_(controller)
             self._popover.setContentSize_((360.0, 560.0))
@@ -526,6 +543,8 @@ def run(switcher) -> int:
                     "unsetAlias": {"required": {"slot": str}},
                     "setPrefs": {"optional": {"refreshInterval": int,
                                               "titlePct": str, "theme": str}},
+                    # view-only toggle: no fields, no credential/polling side
+                    "toggleTimelines": {},
                 },
             )
             self._webview.loadFileURL_allowingReadAccessToURL_(
@@ -582,6 +601,9 @@ def run(switcher) -> int:
                 "setPrefs": self._set_prefs,
                 "setAlias": self._set_alias,
                 "unsetAlias": self._unset_alias,
+                "toggleTimelines": lambda payload: (
+                    AppHelper.callAfter(self._toggle_timelines),
+                )[0] or {"scheduled": True},
                 "quit": lambda payload: (
                     AppHelper.callAfter(self.on_quit),
                 )[0] or {"scheduled": True},
@@ -723,7 +745,172 @@ def run(switcher) -> int:
                 history=self._history(),
             )
 
+        # ---- reset timelines: expanded native surface -----------------------
+        #
+        # T1 decision (proof in scripts/timeline_native_proof.py, evidence in
+        # next-wave/tasks/plan.md): a resized NSPopover always centers on the
+        # anchor and starves the 600px companion, so the expanded state is a
+        # borderless NSPanel manually placed with the main column
+        # edge-aligned under the status item. The same WKWebView is
+        # re-parented (DOM state survives); collapsing returns it to the
+        # untouched transient popover.
+
+        TL_MAIN_W, TL_GAP, TL_COMPANION_W, TL_HEIGHT = 360.0, 8.0, 600.0, 560.0
+        TL_TOTAL_W = TL_MAIN_W + TL_GAP + TL_COMPANION_W  # 968
+
+        def _toggle_timelines(self) -> None:
+            if self._tl_mode is not None:
+                self._collapse_timelines(reshow_popover=True)
+                return
+            mode, frame = self._timeline_placement()
+            if mode == "in-panel":
+                self._tl_mode = mode
+                self._push_timeline_layout()
+                return
+            self._expand_timelines(mode, frame)
+
+        def _timeline_placement(self):
+            """(mode, frame) for the expanded surface from the live anchor.
+
+            Right is preferred (boards 17/18); left mirrors it near the
+            right display edge (board 19); anything that cannot hold
+            360+8+600 in the visible frame degrades to the designed
+            in-panel fallback. Screen math is AppKit-only — never browser
+            viewport assumptions.
+            """
+            button_win = self._button.window()
+            screen = button_win.screen() if button_win is not None else None
+            if screen is None:
+                screen = AppKit.NSScreen.mainScreen()
+            vis = screen.visibleFrame()
+            if vis.size.height < self.TL_HEIGHT:
+                return "in-panel", None
+            bw = button_win.frame() if button_win is not None else None
+            anchor_x = (
+                bw.origin.x + bw.size.width / 2 if bw is not None
+                else vis.origin.x + vis.size.width / 2
+            )
+            top_y = vis.origin.y + vis.size.height - 6.0 - self.TL_HEIGHT
+            # main column edge-aligned under the anchor: its center sits at
+            # the anchor, so companion-right places the surface at
+            # anchor-180 and companion-left at anchor+180-968.
+            for mode, x in (
+                ("right", anchor_x - self.TL_MAIN_W / 2),
+                ("left", anchor_x + self.TL_MAIN_W / 2 - self.TL_TOTAL_W),
+            ):
+                if (x >= vis.origin.x
+                        and x + self.TL_TOTAL_W
+                        <= vis.origin.x + vis.size.width):
+                    return mode, ((x, top_y), (self.TL_TOTAL_W, self.TL_HEIGHT))
+            return "in-panel", None
+
+        def _expand_timelines(self, mode: str, frame) -> None:
+            self._popover.close()  # keep the popover; only hide it
+            if self._tl_panel is None:
+                panel = AppKit.NSPanel.alloc(
+                ).initWithContentRect_styleMask_backing_defer_(
+                    frame,
+                    AppKit.NSWindowStyleMaskBorderless
+                    | AppKit.NSWindowStyleMaskNonactivatingPanel,
+                    AppKit.NSBackingStoreBuffered, False,
+                )
+                panel.setLevel_(AppKit.NSPopUpMenuWindowLevel)
+                panel.setCollectionBehavior_(
+                    AppKit.NSCollectionBehaviorCanJoinAllSpaces
+                    | AppKit.NSCollectionBehaviorIgnoresCycle
+                )
+                panel.setBecomesKeyOnlyIfNeeded_(False)
+                panel.setHidesOnDeactivate_(False)
+                self._tl_panel = panel
+            self._webview.setFrame_(
+                ((0.0, 0.0), (self.TL_TOTAL_W, self.TL_HEIGHT))
+            )
+            self._tl_panel.setContentView_(self._webview)
+            self._tl_panel.setFrame_display_(frame, True)
+            self._tl_panel.makeKeyAndOrderFront_(None)
+            self._install_tl_monitors()
+            self._tl_mode = mode
+            self._push_timeline_layout()
+
+        def _collapse_timelines(self, reshow_popover: bool) -> None:
+            mode = self._tl_mode
+            self._tl_mode = None
+            self._remove_tl_monitors()
+            if self._tl_panel is not None:
+                self._tl_panel.orderOut_(None)
+            self._webview.setFrame_(
+                ((0.0, 0.0), (self.TL_MAIN_W, self.TL_HEIGHT))
+            )
+            self._panel_vc.setView_(self._webview)
+            if reshow_popover and not self._popover.isShown():
+                self.push_vm()
+                self._popover.showRelativeToRect_ofView_preferredEdge_(
+                    self._button.bounds(), self._button, 3  # NSMaxYEdge
+                )
+            if mode is not None:
+                self._push_timeline_layout()
+
+        def _install_tl_monitors(self) -> None:
+            # Outside-click dismissal across the combined region: the global
+            # monitor sees other apps' clicks; the local one covers our own
+            # windows that are not the expanded panel (the status item keeps
+            # its own click handling). Escape is owned by the webview's JS
+            # two-stage hierarchy.
+            mask = (AppKit.NSEventMaskLeftMouseDown
+                    | AppKit.NSEventMaskRightMouseDown)
+            self._tl_monitors.append(AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                mask, lambda ev: AppHelper.callAfter(
+                    self._dismiss_timelines_from_outside)
+            ))
+            def local(ev):
+                win = ev.window()
+                if win is not None and win is not self._tl_panel:
+                    AppHelper.callAfter(self._dismiss_timelines_from_outside)
+                return ev
+            self._tl_monitors.append(AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                mask, local
+            ))
+
+        def _remove_tl_monitors(self) -> None:
+            for mon in self._tl_monitors:
+                AppKit.NSEvent.removeMonitor_(mon)
+            self._tl_monitors = []
+
+        def _dismiss_timelines_from_outside(self) -> None:
+            if self._tl_mode is not None:
+                self._collapse_timelines(reshow_popover=False)
+
+        def _push_timeline_layout(self) -> None:
+            offset = 0.0
+            if self._tl_mode in ("right", "left") and self._tl_panel is not None:
+                bw = self._button.window()
+                pf = self._tl_panel.frame()
+                if bw is not None:
+                    offset = (
+                        bw.origin.x + bw.size.width / 2 - pf.origin.x
+                        - self.TL_MAIN_W / 2
+                    )
+            self._bridge.push("timelineLayout", {
+                "mode": self._tl_mode,
+                "anchorOffset": round(float(offset), 1),
+            })
+
+        def _tl_screens_changed(self, _note) -> None:
+            if self._tl_mode in ("right", "left"):
+                mode, frame = self._timeline_placement()
+                if mode == "in-panel" or frame is None:
+                    self._collapse_timelines(reshow_popover=True)
+                else:
+                    self._tl_panel.setFrame_display_(frame, True)
+                    self._tl_mode = mode
+                    self._push_timeline_layout()
+
         def on_status_click(self) -> None:
+            if self._tl_mode is not None:
+                # Clicking the item while expanded collapses the surface
+                # (the click is the dismissal; no popover re-show).
+                self._collapse_timelines(reshow_popover=False)
+                return
             ev = AppKit.NSApplication.sharedApplication().currentEvent()
             if ev is not None and ev.type() in (
                 AppKit.NSEventTypeRightMouseUp, AppKit.NSEventTypeRightMouseDown,
@@ -805,6 +992,8 @@ def run(switcher) -> int:
             self.refresh_async(full=True)
 
         def on_quit(self) -> None:
+            if self._tl_mode is not None:
+                self._collapse_timelines(reshow_popover=False)
             self._stop_engine()
             AppKit.NSApplication.sharedApplication().stop_(None)
 

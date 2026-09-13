@@ -129,6 +129,30 @@ class TestValidation:
         [(head, body)] = sent_jsons(t)
         assert body["ok"] is False
 
+    def test_payloadless_action_strips_all_fields(self) -> None:
+        # toggleTimelines is a view-only toggle: an empty spec means the
+        # handler only ever sees {} — junk keys are stripped before dispatch
+        # (the bridge's allowlist model), never forwarded.
+        seen = []
+        t = FakeTransport()
+        bridge = Bridge(
+            {"toggleTimelines": lambda p: (seen.append(p), {"scheduled": True})[1]},
+            send_js=t, dispatch=lambda fn: fn(),
+            payload_specs={"toggleTimelines": {}},
+        )
+        bridge.handle_message(
+            json.dumps({"id": "5", "action": "toggleTimelines", "payload": {}})
+        )
+        [(_h, body)] = sent_jsons(t)
+        assert body["ok"] is True
+        bridge.handle_message(
+            json.dumps({"id": "6", "action": "toggleTimelines",
+                        "payload": {"slot": "1", "enabled": True}})
+        )
+        (_h2, also_ok) = sent_jsons(t)[-1]
+        assert also_ok["ok"] is True
+        assert seen == [{}, {}], "payload fields leaked into a payloadless action"
+
     def test_non_dict_payload_rejected(self) -> None:
         t = FakeTransport()
         make_bridge(t).handle_message(

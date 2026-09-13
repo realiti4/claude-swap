@@ -20,6 +20,7 @@ MENUBAR = Path(__file__).resolve().parents[1] / "src" / "claude_swap" / "menubar
 WEB = MENUBAR / "web"
 PANEL_JS = (WEB / "panel.js").read_text(encoding="utf-8")
 SHEETS_JS = (WEB / "sheets.js").read_text(encoding="utf-8")
+TIMELINES_JS = (WEB / "timelines.js").read_text(encoding="utf-8")
 ICONS_JS = (WEB / "icons.js").read_text(encoding="utf-8")
 APPEARANCE_JS = (WEB / "appearance.js").read_text(encoding="utf-8")
 PANEL_CSS = (WEB / "panel.css").read_text(encoding="utf-8")
@@ -46,6 +47,8 @@ def panel_actions() -> set[str]:
     # catches both branches of a ternary like `send(a ? "x" : "y", ...)`
     for body in re.findall(r'\bsend\((.*?)\)', SHEETS_JS):
         sent |= set(re.findall(r'"([A-Za-z]+)"', body))
+    # timelines.js talks through the cswap adapter directly
+    sent |= set(re.findall(r'cswap\.send\(\s*"([A-Za-z]+)"', TIMELINES_JS))
     return sent
 
 

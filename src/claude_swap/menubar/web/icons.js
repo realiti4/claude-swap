@@ -36,6 +36,14 @@ const ICON_PATHS = {
   edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
   warn: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+  // Reset timelines: the header trigger and the companion close affordance
+  // (lucide calendar-clock / x geometry, Pen boards 16-17).
+  "calendar-clock":
+    '<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"/>' +
+    '<path d="M16 2v4M8 2v4M3 10h5"/>' +
+    '<circle cx="17" cy="17" r="5"/>' +
+    '<path d="M17 15v2h2"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
 };
 
 function icon(name, size = 14, cls = "") {

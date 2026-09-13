@@ -456,3 +456,55 @@ dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: 
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 
+
+/* ---- reset timelines: expanded surface (scaffold) ---------------------
+ * Functional geometry from the extracted tokens; board-exact chart
+ * styling lands with the chart-ui tasks. The main #panel keeps its
+ * 360px column; the companion occupies 600px with the 8px gap, either
+ * side per the native timelineLayout push. */
+body.tl-expanded #panel {
+  position: absolute;
+  left: var(--tl-anchor-x, 0px);
+  top: 0;
+  width: var(--swap-panel-width);
+}
+
+#tl-companion {
+  position: absolute;
+  top: 0;
+  width: var(--swap-tl-width);
+  height: 100%;
+  background: var(--swap-tl-surface-2);
+  border-radius: var(--swap-tl-radius);
+  color: var(--swap-tl-text);
+  display: flex;
+  flex-direction: column;
+}
+/* right mode: companion starts gap px right of the main column */
+body.tl-expanded.tl-right #tl-companion {
+  left: calc(var(--tl-anchor-x, 0px) + var(--swap-panel-width) + var(--swap-tl-gap));
+  right: auto;
+}
+/* left mode: companion ends gap px left of the main column */
+body.tl-expanded.tl-left #tl-companion {
+  left: auto;
+  right: calc(100% - var(--tl-anchor-x, 0px) + var(--swap-tl-gap));
+}
+/* in-panel fallback: companion takes over the main surface */
+body.tl-expanded.tl-inpanel-mode #tl-companion {
+  left: 0;
+  right: 0;
+  width: auto;
+}
+
+.tl-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: var(--swap-tl-header-h);
+  padding: 0 10px;
+  border-bottom: 1px solid var(--swap-tl-border);
+}
+.tl-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.2px; }
+.tl-spacer { flex: 1; }
+.tl-caption { font-size: 11.5px; line-height: 1.35; color: var(--swap-tl-text-2); padding: 10px; }

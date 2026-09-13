@@ -67,6 +67,8 @@ const bridge = {
     } else if (type === "engine") {
       toast(data.text);
       refresh();
+    } else if (type === "timelineLayout") {
+      CSWAP_TIMELINES.apply(data);
     }
   },
 };
@@ -174,9 +176,14 @@ function render() {
 }
 
 function headerHtml() {
+  const tlOpen = !!(window.CSWAP_TIMELINES && CSWAP_TIMELINES.state.mode);
   return `
   <header class="hdr">
     <div class="brand">${ic("swap", 16)}<span class="name">Claude Code Swap</span></div>
+    <button class="icon-btn tl-trigger" data-act="timelines" title="Reset timelines"
+      aria-label="Reset timelines" aria-expanded="${tlOpen ? "true" : "false"}">
+      ${ic("calendar-clock", 14)}
+    </button>
     <button class="icon-btn" data-act="refresh" title="Refresh" aria-label="Refresh">
       ${ic("refresh", 13)}
     </button>
@@ -402,6 +409,9 @@ function wire() {
         case "select":
           state.selectedSlot = slot;
           render();
+          break;
+        case "timelines":
+          CSWAP_TIMELINES.toggle();
           break;
         case "refresh": {
           el.classList.add("busy");
