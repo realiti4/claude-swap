@@ -148,6 +148,8 @@ accumulation.
 
 ## Task 7: Pure geometry module + node tests
 
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
+
 **Description:** `timelines.js` geometry layer (DOM-free): `x(t)` mapping,
 nominal start, fill fraction with cap-at-track + true label, Now at 50%,
 six-step state precedence, offscale detection, tick sparsity, DST-stable
@@ -166,6 +168,8 @@ epoch arithmetic. Tested against the frozen fixture fractions.
 **Estimated scope:** M
 
 ## Task 8: Header trigger + companion scaffold + layout modes
+
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
 
 **Description:** Calendar icon (utility-icon system) in the main header with
 open-state indication; `timelines.js` DOM scaffold renders the companion
@@ -187,6 +191,8 @@ Task 2 tokens.
 
 ## Task 9: Full chart rendering
 
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
+
 **Description:** Rows (stable slot order, index/alias, same order both
 charts, independent scrolling, fixed heading/axis), neutral full-window
 tracks, quota fills with explicit `% used` labels, amber dashed Now line
@@ -206,6 +212,8 @@ markers. Board-exact styling.
 **Estimated scope:** M
 
 ## Task 10: Honest states + live updates + snapshot sync
+
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
 
 **Description:** State matrix from `timelineWindows` (stale/elapsed/
 usage-unavailable/reset-unavailable/unavailable/no-window, offscale,
@@ -227,6 +235,8 @@ selection, detail, and scroll; detail closes safely when its account goes.
 
 ## Task 11: Details, keyboard, a11y, Escape hierarchy
 
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
+
 **Description:** Keyboard/focus details (full alias, index, percent,
 remaining, exact local start/reset + timezone, inferred-start marking);
 Tab/Enter/Space; two-stage Escape restoring opener focus; ARIA roles/labels;
@@ -243,6 +253,8 @@ keyboard access equal to hover.
 **Estimated scope:** M
 
 ## Task 12: Session additions — crosshair, chips, `T` shortcut
+
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
 
 **Description:** Pointer crosshair with timestamp guide (hover-capable
 pointers, reduced-motion respected); per-chart countdown chips on rows
@@ -266,6 +278,8 @@ tooltip documents it.
 
 ## Task 13: Fallback/scroll/reduced-motion/modal hardening pass
 
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
+
 **Description:** Sweep the QA browser/native matrix for narrow fallback,
 many-account (10+) scrolling, reduced-motion instant transitions, and modal
 coordination edge cases; fix what the sweep finds.
@@ -281,6 +295,8 @@ coordination edge cases; fix what the sweep finds.
 **Estimated scope:** S
 
 ## Task 14: Full verification, packaging, reconciliation, completion report
+
+**Status: COMPLETE** (see git log and ../COMPLETION-REPORT.md)
 
 **Description:** Full suites + wheel inspection; native multi-display
 evidence and the manual-pass checklist; IMPLEMENTATION-NOTES and handoff

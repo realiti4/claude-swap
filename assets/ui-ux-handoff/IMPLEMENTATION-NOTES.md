@@ -112,3 +112,30 @@ between state boards and product fixtures; these are illustrative data, not
 new backend behavior. The product screenshots remain the implementation
 record, and Pen exports are design references rather than pixel-identical
 runtime captures. Future visible changes must repeat this reconciliation.
+
+
+## Reset timelines wave — 2026-09-12
+
+Implemented on `dev` (commits `799bfa5..b3735bd`, v0.29.0 unchanged).
+Entry point: `next-wave/COMPLETION-REPORT.md`. Deltas the design owner
+should fold into the Pen source and re-export:
+
+1. **Boards 01-15**: the main-panel headers now carry the timelines
+   trigger (calendar-clock icon button before Refresh); re-export under
+   the bundled Inter/IBM Plex Mono rendering (see 2).
+2. **Fonts ship with the app now** (Inter variable + Plex Mono 400/600
+   latin WOFF2, `@font-face` shadowing host copies): on machines
+   without the fonts installed, main-panel text moves *toward* the
+   boards — boards remain the authority.
+3. **Boards 17/18**: session-approved additions — per-chart countdown
+   chips on rows, pointer crosshair with timestamp, `T` shortcut — are
+   deliberate deltas awaiting board re-export; the board-exact capture
+   fixture suppresses them meanwhile (`CSWAP_TL_BOARD`).
+4. **Board 16**: closed state includes the trigger button.
+
+Native strategy (T1 proof): expanded state = borderless NSPanel with
+the webview re-parented; evidence in `tests/fixtures/captures/
+native-proof.json` and the decision record in `next-wave/tasks/plan.md`.
+The fidelity gate: zero-tolerance geometry/color/type via exact-point
+layout records; glyph rasterization masked (renderer-dependent); image
+budgets at the measured WebKit-vs-Pen sub-pixel floor (4%/6%).
