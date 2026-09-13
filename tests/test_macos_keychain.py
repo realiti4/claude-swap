@@ -50,7 +50,12 @@ def test_get_password_returns_none_only_on_rc44():
 
 def test_get_password_raises_on_other_nonzero():
     # e.g. locked / denied / unavailable — must NOT be masked as "not found".
-    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+    # Framework pinned off: with bindings present, nonzero CLI reads fall
+    # back to the framework channel (their own test covers that), which in
+    # a dev env would touch the real keychain.
+    with patch("claude_swap.macos_keychain._security_framework",
+               return_value=None), \
+         patch("claude_swap.macos_keychain.subprocess.run") as run:
         run.return_value = _completed(51, stderr="boom")
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain.get_password("svc", "acct")
@@ -220,7 +225,11 @@ def test_delete_password_rc0_and_rc44_are_success():
 
 
 def test_delete_password_raises_on_other_nonzero():
-    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+    # framework pinned off: in a dev env with the menubar extra the
+    # denial fallback would engage and touch the real keychain
+    with patch("claude_swap.macos_keychain._security_framework",
+               return_value=None), \
+         patch("claude_swap.macos_keychain.subprocess.run") as run:
         run.return_value = _completed(51, stderr="locked")
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain.delete_password("svc", "acct")
@@ -245,7 +254,12 @@ def test_calls_pass_timeout_to_subprocess():
 ])
 def test_timeout_becomes_keychain_error(fn, args):
     timeout = subprocess.TimeoutExpired(cmd="security", timeout=5)
-    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
+    # framework pinned off (see delete test); the fallback path has its
+    # own coverage below
+    with patch("claude_swap.macos_keychain._security_framework",
+               return_value=None), \
+         patch("claude_swap.macos_keychain.subprocess.run",
+               side_effect=timeout):
         with pytest.raises(macos_keychain.KeychainError):
             getattr(macos_keychain, fn)(*args)
 

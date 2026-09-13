@@ -119,6 +119,11 @@ def get_password(service: str, account: str) -> str | None:
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
+        if _security_framework() is not None:
+            data = _get_via_security_framework(service, account)
+            if data is not None:
+                return data.decode("utf-8")
+            return None
         raise KeychainError(
             f"security find-generic-password timed out after {_TIMEOUT}s"
         ) from e
@@ -128,6 +133,13 @@ def get_password(service: str, account: str) -> str | None:
         return result.stdout.removesuffix("\n")
     if result.returncode == _NOT_FOUND_RC:
         return None
+    if _security_framework() is not None:
+        # rc 128 (auth denied / interaction not allowed) is the signature of
+        # an item this process created through the framework (F01 large-
+        # write path): the CLI cannot decrypt it without a prompt. A
+        # genuine miss is rc 44 above, so this never masks one.
+        data = _get_via_security_framework(service, account)
+        return data.decode("utf-8") if data is not None else None
     raise KeychainError(
         f"security find-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
@@ -191,17 +203,55 @@ def _set_via_security_framework(service: str, account: str, password: bytes) -> 
         Security.kSecAttrAccount: account,
     }
     data = Foundation.NSData.dataWithBytes_length_(password, len(password))
-    status = Security.SecItemCopyMatching(query, None)
+
+    def _status(result):
+        # PyObjC returns (status, out-param) tuples for functions with
+        # out arguments; plain statuses otherwise.
+        return result[0] if isinstance(result, tuple) else result
+
+    status = _status(Security.SecItemCopyMatching(query, None))
     if status == _ERR_SEC_ITEM_NOT_FOUND:
         attrs = dict(query)
         attrs[Security.kSecValueData] = data
-        status = Security.SecItemAdd(attrs, None)
+        status = _status(Security.SecItemAdd(attrs, None))
     elif status == 0:
-        status = Security.SecItemUpdate(query, {Security.kSecValueData: data})
+        status = _status(
+            Security.SecItemUpdate(query, {Security.kSecValueData: data})
+        )
     if status != 0:
         raise KeychainError(
             f"Security.framework write failed (status={status})"
         )
+
+
+def _get_via_security_framework(service: str, account: str) -> bytes | None:
+    """Read through Security.framework; None on item-not-found.
+
+    Only reached when the ``security`` CLI channel times out — the
+    signature of an item this process created through the framework
+    (F01 large-write path), whose ACL the CLI cannot read without a
+    user prompt. Same-process framework reads of framework-owned items
+    need no prompt; a foreign item would prompt, which is why this
+    stays a fallback, never the first channel.
+    """
+    Security, _Foundation = _security_framework()
+    query = {
+        Security.kSecClass: Security.kSecClassGenericPassword,
+        Security.kSecAttrService: service,
+        Security.kSecAttrAccount: account,
+        Security.kSecReturnData: True,
+    }
+    result = Security.SecItemCopyMatching(query, None)
+    status, data = result if isinstance(result, tuple) else (result, None)
+    if status == _ERR_SEC_ITEM_NOT_FOUND:
+        return None
+    if status != 0:
+        raise KeychainError(
+            f"Security.framework read failed (status={status})"
+        )
+    if data is None:
+        return None
+    return bytes(data)
 
 
 def set_password(service: str, account: str, password: str) -> None:
@@ -269,6 +319,22 @@ def delete_password(service: str, account: str) -> None:
         ) from e
     if result.returncode in (0, _NOT_FOUND_RC):
         return
+    if _security_framework() is not None and result.returncode != _NOT_FOUND_RC:
+        # An item created through the framework (F01 large-write path)
+        # cannot always be deleted by the CLI without a prompt; same-
+        # process framework deletion can. Best effort — a nonzero status
+        # still raises below.
+        Security, _F = _security_framework()
+        query = {
+            Security.kSecClass: Security.kSecClassGenericPassword,
+            Security.kSecAttrService: service,
+            Security.kSecAttrAccount: account,
+        }
+        status = Security.SecItemDelete(query)
+        if isinstance(status, tuple):
+            status = status[0]
+        if status in (0, _ERR_SEC_ITEM_NOT_FOUND):
+            return
     raise KeychainError(
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
