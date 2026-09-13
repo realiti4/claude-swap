@@ -226,7 +226,7 @@ def main() -> int:
             ((0.0, 0.0), (w, h)), config
         )
         window.setContentView_(view)
-        window.orderFront_(None)
+        window.makeKeyAndOrderFront_(None)
 
         url = "file://" + str(WEB_DIR / "index.html")
         if cfg["query"]:
@@ -257,6 +257,23 @@ def main() -> int:
                 break
             spin_runloop(0.05)
         time.sleep(args.settle)
+        # Two rAF ticks prove the page composited at least one frame: the
+        # window-server capture below races WKWebView's first paint
+        # otherwise (blank 9KB PNGs with a fully-built DOM). evaluate-
+        # JavaScript cannot await Promises, so drive the ticks through a
+        # window flag polled from here.
+        eval_sync(
+            view,
+            "window.__painted = false; "
+            "requestAnimationFrame(() => requestAnimationFrame("
+            "  () => { window.__painted = true; })); 'ok'",
+        )
+        self_spin = spin_runloop
+        for _ in range(60):
+            if eval_sync(view, "window.__painted") is True:
+                break
+            self_spin(0.05)
+        time.sleep(0.05)
         if cfg.get("click"):
             eval_sync(
                 view,
