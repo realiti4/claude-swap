@@ -4,7 +4,7 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "claude-swap"
-version = "0.28.0"
+version = "0.29.0"
 source = { editable = "." }
 dependencies = [
     { name = "keyring", marker = "sys_platform == 'win32'" },

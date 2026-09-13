@@ -1,0 +1,11 @@
+Audit commit: 504f67d
+Date: 2026-09-12
+Python: 3.14.7 on macOS
+Main suite: 2330 passed, 4 skipped, 1 sandbox-related failure; 20.06s
+Failing test: tests/test_process_detection.py::TestProcessStartedAt::test_own_process_started_in_the_past
+Cause: sandbox denies /bin/ps (operation not permitted)
+Authorized isolated rerun outside sandbox: 1 passed in 2.58s
+uv 0.12.13 audit --frozen --cache-dir /tmp/cswap-audit-uv-cache --no-python-downloads
+Authorized network-enabled audit: Found no known vulnerabilities and no adverse project statuses in 28 packages
+Selected secret signatures: no matches in tracked files or 3233 named reachable Git objects; 578 reachable commits
+No production code modified. No real credentials used in reproductions.

@@ -1,0 +1,37 @@
+credential-probes.py
+PASS exposure reproduced: full 2325 byte synthetic credential recoverable from argv
+PASS redirect policy reproduced: HTTPS Authorization forwarded to different-origin HTTP URL (no request sent)
+PASS import capability reproduced: ordinary import + activation installs arbitrary mcpServers on fresh profile, no --full/import trust flag; command was NOT executed
+state-probes.py
+migration first attempt: MigrationError
+CONFIRMED: retry destroyed sole credential copy in committed destination
+Removed Account-1 (one@example.test)
+CONFIRMED: removal completed despite held global account lock
+CONFIRMED: removal lost concurrent update to unrelated account alias
+This will remove ALL claude-swap data from your system:
+  - Backup directory: /var/folders/fj/qcxbvth96_71gmqckyz70g3r0000gn/T/cswap-audit-pjf228gz/backup
+  - All stored account credentials (macOS Keychain and/or files)
+
+Note: This does NOT affect your current Claude Code login.
+
+
+Removed:
+  - Credential: account-1-one@example.test
+  - Credential: account-None-one@example.test
+  - Directory: /var/folders/fj/qcxbvth96_71gmqckyz70g3r0000gn/T/cswap-audit-pjf228gz/backup
+
+Purge complete.
+CONFIRMED: purge never requests .prev Keychain deletion; failed deletes= False ; roster still destroyed
+This will remove ALL claude-swap data from your system:
+  - Backup directory: /var/folders/fj/qcxbvth96_71gmqckyz70g3r0000gn/T/cswap-audit-wbp5f2u1/backup
+  - All stored account credentials (macOS Keychain and/or files)
+
+Note: This does NOT affect your current Claude Code login.
+
+
+Removed:
+  - Directory: /var/folders/fj/qcxbvth96_71gmqckyz70g3r0000gn/T/cswap-audit-wbp5f2u1/backup
+
+Purge complete.
+CONFIRMED: purge never requests .prev Keychain deletion; failed deletes= True ; roster still destroyed
+CONFIRMED: full config temp initially 0644 before chmod; final= 0o600

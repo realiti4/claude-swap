@@ -1,0 +1,64 @@
+bringing up nodes...
+bringing up nodes...
+
+............................ss.s........................................ [  3%]
+........................................................................ [  6%]
+........................................................................ [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 15%]
+........................................................................ [ 18%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........................................................................ [ 27%]
+........................................................................ [ 30%]
+........................................................................ [ 33%]
+........................................................................ [ 37%]
+........................................................................ [ 40%]
+........................................................................ [ 43%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+........................s..................F............................ [ 52%]
+........................................................................ [ 55%]
+........................................................................ [ 58%]
+........................................................................ [ 61%]
+........................................................................ [ 64%]
+........................................................................ [ 67%]
+........................................................................ [ 70%]
+........................................................................ [ 74%]
+........................................................................ [ 77%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 86%]
+........................................................................ [ 89%]
+........................................................................ [ 92%]
+........................................................................ [ 95%]
+........................................................................ [ 98%]
+...............................                                          [100%]
+=================================== FAILURES ===================================
+__________ TestProcessStartedAt.test_own_process_started_in_the_past ___________
+[gw1] darwin -- Python 3.14.7 /Users/honeybadgerxai/Library/Mobile Documents/com~apple~CloudDocs/Developer/Hung/Agents/Code/claude-swap/.venv/bin/python
+
+self = <tests.test_process_detection.TestProcessStartedAt object at 0x105da28b0>
+
+    @pytest.mark.skipif(os.name != "posix", reason="ps is POSIX")
+    def test_own_process_started_in_the_past(self):
+        started = process_started_at(os.getpid())
+>       assert started is not None
+E       assert None is not None
+
+tests/test_process_detection.py:204: AssertionError
+=============================== warnings summary ===============================
+tests/test_colour_cache_isolation.py::TestScopedContextDoesNotLeakTheAutouseScrub::test_scoped_context_does_not_leak_it
+tests/test_printer.py::TestColourEnvDoesNotLeakIntoTests::test_detection_reaches_isatty_rather_than_an_override
+tests/test_printer.py::TestColourEnvDoesNotLeakIntoTests::test_styled_output_is_plain
+  /Users/honeybadgerxai/Library/Mobile Documents/com~apple~CloudDocs/Developer/Hung/Agents/Code/claude-swap/.venv/lib/python3.14/site-packages/_pytest/fixtures.py:1313: PytestRemovedIn10Warning: Class-scoped fixture defined as instance method is deprecated.
+  Instance attributes set in this fixture will NOT be visible to test methods,
+  as each test gets a new instance while the fixture runs only once per class.
+  Use @classmethod decorator and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_process_detection.py::TestProcessStartedAt::test_own_process_started_in_the_past
+1 failed, 2330 passed, 4 skipped, 3 warnings in 20.06s
