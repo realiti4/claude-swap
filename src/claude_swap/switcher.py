@@ -496,6 +496,22 @@ class ClaudeAccountSwitcher:
             return None
         return data
 
+    @staticmethod
+    def _identity_only_config(config_data: dict) -> dict:
+        """Reduce a stored/imported account config to identity-only keys.
+
+        Audit F02: bootstrapping a fresh profile writes this object into the
+        live config verbatim, which makes it an executable-configuration
+        trust boundary (mcpServers, projects, trust settings). Only the
+        keys a switch actually consumes cross it; a config without a
+        usable ``oauthAccount`` passes through unchanged for the existing
+        error paths to handle.
+        """
+        oauth = config_data.get("oauthAccount")
+        if isinstance(oauth, dict):
+            return {"oauthAccount": oauth}
+        return config_data
+
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
     ) -> Path:
@@ -6939,7 +6955,10 @@ class ClaudeAccountSwitcher:
                                 config_path, emit_output, warnings_out
                             )
                             del salvage
-                        self._write_json(config_path, target_config_data)
+                        self._write_json(
+                            config_path,
+                            self._identity_only_config(target_config_data),
+                        )
                     config_written = True
 
                     data["activeAccountNumber"] = int(target_account)
@@ -7203,7 +7222,10 @@ class ClaudeAccountSwitcher:
                         self._salvage_unreadable(
                             config_path, emit_output, warnings_out
                         )
-                    self._write_json(config_path, target_config_data)
+                    self._write_json(
+                        config_path,
+                        self._identity_only_config(target_config_data),
+                    )
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 

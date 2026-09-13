@@ -383,6 +383,19 @@ def import_accounts(
         config_obj = raw.get("config")
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
+        # Audit F02: an import bundle is untrusted input. Strip it to the
+        # identity keys a switch actually consumes before storing it, so a
+        # hostile "config" (mcpServers, projects, trust settings, env
+        # fields...) can never ride into the live profile through the
+        # fresh-config activation fallback. Dropped keys are reported.
+        slimmed = _slim_config(config_obj, f"config for {email}")
+        if slimmed != config_obj:
+            dropped = sorted(set(config_obj) - set(slimmed))
+            _eprint(
+                f"warning: ignored untrusted config fields for {email}: "
+                + ", ".join(dropped)
+            )
+        config_obj = slimmed
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
