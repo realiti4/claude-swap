@@ -3697,57 +3697,61 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        # Audit F04: the whole mutation tail (displace/migrate cleanup, credential +
+        # config writes, roster rewrite) runs inside the canonical account
+        # lock so concurrent roster writers cannot interleave.
+        with FileLock(self.lock_file):
+            # Now safe to perform destructive cleanup (new account data is in memory)
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            # Store backups
+            self._write_account_credentials(account_num, current_email, current_creds)
+            self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+
+            # Update sequence.json
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            data["accounts"][account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            carried_alias = alias if alias is not None else existing_alias
+            if carried_alias:
+                data["accounts"][account_num]["alias"] = carried_alias
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
-        tag = self._get_display_tag(current_email, organization_name, organization_uuid)
-        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
-        if migrate_from:
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
-        print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+            tag = self._get_display_tag(current_email, organization_name, organization_uuid)
+            self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+            if migrate_from:
+                print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+            print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
         self,
@@ -3904,58 +3908,61 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        # Audit F04: same transaction boundary as add_account — the
+        # token-add mutation tail runs inside the canonical lock.
+        with FileLock(self.lock_file):
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config)
+            # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+            # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
+
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            record = {
+                "email": email,
+                "uuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": get_timestamp(),
+            }
+            if is_api_key:
+                record["kind"] = "api_key"
+            data["accounts"][account_num] = record
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
-        self._logger.info(f"Added account {account_num} from {source_label}: {email}")
-        if migrate_from:
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
-        print(
-            f"{accent('Added')} Account {account_num}: {email} "
-            f"{muted('[personal]')} {muted(f'(from {source_label})')}"
-        )
+            source_label = "API key" if is_api_key else "token"
+            self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+            if migrate_from:
+                print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+            print(
+                f"{accent('Added')} Account {account_num}: {email} "
+                f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+            )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -4031,19 +4038,43 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        # Audit F04: confirmation ran outside the lock, so the roster may
+        # have changed while we waited on input. Re-read under the
+        # canonical account lock and verify the slot still holds the
+        # identity the user approved; then delete and rewrite inside the
+        # same transaction so concurrent writers cannot interleave.
+        with FileLock(self.lock_file):
+            fresh = self._get_sequence_data() or {}
+            current = fresh.get("accounts", {}).get(account_num)
+            if not current:
+                raise AccountNotFoundError(
+                    f"Account-{account_num} no longer exists (changed by "
+                    f"another process while the removal was confirmed)"
+                )
+            if (current.get("email"), current.get("uuid")) != (
+                    email, account_info.get("uuid")):
+                raise ConfigError(
+                    f"Account-{account_num} now holds {current.get('email')} "
+                    f"— changed while the removal was being confirmed. "
+                    f"Abort and re-run against the current roster."
+                )
+            data = fresh
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+            # Remove backup files
+            self._delete_account_files(account_num, email)
 
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"{accent('Removed')} Account-{account_num} ({email})")
+            # Update sequence.json
+            del data["accounts"][account_num]
+            data["sequence"] = [
+                n for n in data["sequence"] if n != int(account_num)
+            ]
+            data["lastUpdated"] = get_timestamp()
 
-        self._prune_mappings(email, account_info.get("organizationUuid", ""))
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"Removed account {account_num}: {email}")
+            print(f"{accent('Removed')} Account-{account_num} ({email})")
+
+            self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
