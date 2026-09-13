@@ -535,10 +535,10 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 14px;  /* Pen pad token; cards 572 wide, row math closes exact */
+  gap: 6px;  /* re-exported boards: legend at y77, cards at y101/321 */
+  padding: 14px;
 }
-.tl-caption { font-size: 11.5px; line-height: 1.35; color: var(--swap-tl-text-2); }
+.tl-caption { font-size: 11.5px; line-height: 1.2; color: var(--swap-tl-text-2); }
 
 .tl-legend { display: flex; align-items: center; gap: 14px; }
 .tl-legend .sw { width: 20px; height: 9px; border-radius: 4.5px; }
@@ -641,7 +641,7 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   border-radius: 1.25px;
 }
 .row-left {
-  flex: none; width: 140px;
+  flex: none; width: 104px;
   display: flex; align-items: center; gap: 6px;
   overflow: hidden;
 }
@@ -702,13 +702,13 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   border-bottom: 4px solid transparent;
 }
 .row-status {
-  width: 402px;  /* track + gap + detail: one honest sentence, no bar */
+  width: 438px;  /* track + gap + detail: one honest sentence, no bar */
   font-size: 12px;
   color: var(--swap-tl-text-3);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .row-detail {
-  flex: none; width: 152px;
+  flex: none; width: 188px;
   display: flex; align-items: center; justify-content: flex-end; gap: 4px;
   white-space: nowrap;
 }
@@ -758,13 +758,13 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
 
 /* ---- session additions: countdown chip, crosshair ----------------------- */
 .row-cd {
+  /* re-exported boards: plain mono text "30m · 14:00" ahead of the pct —
+     no pill; tertiary grey, tabular */
   font-family: var(--swap-font-numeric);
   font-size: 11px;
-  color: var(--swap-tl-text-2);
-  background: var(--swap-tl-surface-3);
-  border-radius: 9px;
-  padding: 1px 7px;
+  color: var(--swap-tl-text-3);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .tl-crosshair {

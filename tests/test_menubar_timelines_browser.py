@@ -412,13 +412,16 @@ class TestSessionAdditions:
     def test_countdown_chips_tick_per_chart(self, panel):
         panel.open_timelines()
         chips = json.loads(panel.eval(
-            "JSON.stringify(Array.from(document.querySelectorAll('[data-tl-cd]'))"
-            ".map(c => ({kind: c.dataset.kind, text: c.textContent})))"
+            "JSON.stringify(Array.from(document.querySelectorAll('.row-cd'))"
+            ".map(c => ({kind: c.dataset.kind,"
+            " text: c.textContent.trim()})))"
         ))
         assert chips, "rows with future resets carry a chip"
         assert any(c["kind"] == "5h" for c in chips)
         assert any(c["kind"] == "7d" for c in chips)
         assert all(c["text"] for c in chips), "chips are populated immediately"
+        assert any("\u00b7" in c["text"] for c in chips), \
+            "merged pill carries countdown \u00b7 reset"
 
     def test_t_shortcut_toggles_and_ignores_fields(self, panel):
         was_open = panel.eval("CSWAP_TIMELINES.state.mode !== null")

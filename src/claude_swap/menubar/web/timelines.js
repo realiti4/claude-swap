@@ -66,14 +66,16 @@ function axisTicks(kind) {
 }
 
 function countdownText(resetsAt, now) {
+  // Compact per the re-exported boards: zero units drop ("3h", "3d"),
+  // never "3h 0m" — the chip and the detail both use this.
   if (resetsAt == null || !Number.isFinite(resetsAt)) return null;
   const remaining = Math.floor(resetsAt - now);
   if (remaining <= 0) return null;
   const days = Math.floor(remaining / 86400);
   const hours = Math.floor((remaining % 86400) / 3600);
   const minutes = Math.floor((remaining % 3600) / 60);
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
   return `${minutes}m`;
 }
 
@@ -149,11 +151,11 @@ window.CSWAP_TIMELINES = (() => {
   // Row internals from the extraction (board 17/20): left identity block,
   // 242px track, right detail block; the axis/gridlines/Now overlays align
   // to the same track coordinates.
-  const LEFT_W = 140, TRACK_W = 242, DETAIL_W = 152, ROW_GAP = 8;
-  // 146, not LEFT_W+GAP: measured on the board-17 export (vertical
-  // features at track [172, 414] against card content x=26) — the Pen
-  // serialization rounds the left block a hair wide.
-  const TRACK_X = 146;
+  // Re-exported boards (2026-09-12 21:51): left block 104 (narrower),
+  // track [138, 380] against card content x=26, detail 188 — measured
+  // from the export's vertical features.
+  const LEFT_W = 104, TRACK_W = 242, DETAIL_W = 188, ROW_GAP = 8;
+  const TRACK_X = LEFT_W + ROW_GAP;  // 112
 
   // Same predicate bridge.hosted uses: the message handler exists only
   // under WKWebView. window.cswap itself is defined in fixture mode too,
@@ -466,8 +468,9 @@ window.CSWAP_TIMELINES = (() => {
       style="left:calc(${((g.leftFraction + g.widthFraction) * 100).toFixed(3)}% - 1.25px)"></span>`;
     const pctText = w.pct == null ? "no usage data"
       : `${Math.round(w.pct)}% used`;
+    const future = w.resetsAt != null && w.resetsAt > now;
     const resetText = stale ? "\u00b7 last known"
-      : w.resetsAt != null ? clockLabel(w.resetsAt, kind) : "";
+      : (!future && w.resetsAt != null) ? clockLabel(w.resetsAt, kind) : "";
     const offscale = g && g.offscale
       ? '<span class="offscale-mark" title="Reset is outside the visible window"></span>'
       : "";
@@ -479,11 +482,12 @@ window.CSWAP_TIMELINES = (() => {
           width:${(g.widthFraction * 100).toFixed(3)}%"></span>${fill}${cap}
       </div>
       <div class="row-detail">
-        ${(w.resetsAt != null && w.resetsAt > now
-            && !(typeof window !== "undefined" && window.CSWAP_TL_BOARD))
-          ? `<span class="row-cd" data-tl-cd="${w.resetsAt}" data-kind="${kind}"></span>` : ""}
+        ${(future && !(typeof window !== "undefined" && window.CSWAP_TL_BOARD === "suppress"))
+          ? `<span class="row-cd" data-kind="${kind}"><span class="tl-text"
+               data-tl-cd="${w.resetsAt}"></span><span class="tl-text">
+               \u00b7 ${clockLabel(w.resetsAt, kind).slice(2)}</span></span>` : ""}
         <span class="row-pct tl-text${w.pct == null || stale ? " dim" : ""}">${pctText}</span>
-        <span class="row-reset tl-text">${resetText}</span>
+        ${resetText ? `<span class="row-reset tl-text">${resetText}</span>` : ""}
       </div></div>`;
   }
 

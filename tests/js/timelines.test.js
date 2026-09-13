@@ -121,7 +121,9 @@ test("ticks: exact fractions and labels for both charts", () => {
 test("countdown text formats and boundaries", () => {
   assert.equal(G.countdownText(NOW + 54 * 60, NOW), "54m");
   assert.equal(G.countdownText(NOW + (2 * 24 + 14) * 3600, NOW), "2d 14h");
-  assert.equal(G.countdownText(NOW + 3600, NOW), "1h 0m");
+  assert.equal(G.countdownText(NOW + 3600, NOW), "1h");
+  assert.equal(G.countdownText(NOW + 3 * 3600, NOW), "3h");
+  assert.equal(G.countdownText(NOW + 3 * 86400, NOW), "3d");
   assert.equal(G.countdownText(NOW, NOW), null, "passed reset has no countdown");
   assert.equal(G.countdownText(null, NOW), null);
 });

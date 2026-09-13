@@ -90,3 +90,29 @@ belongs to other work): the image gate runs via
 
 Scripts `scripts/timeline_native_proof.py` and `scripts/board_capture.py`
 cover the scripted halves on any Mac with the dev environment.
+
+
+## Reconciliation pass — 2026-09-12 (boards re-exported 21:51)
+
+Owner re-exported boards 01/02/16/17/18 (trigger folded in; 17/18 now
+carry the countdown). Product re-aligned and re-gated against the new
+exports:
+
+- The countdown is **plain mono text** ("30m · 14:00" / "1d 12h ·
+  14 Sep 01:30") before the pct — not a pill; compact format drops zero
+  units ("3h", "3d"), countdownText updated (node tests re-pinned).
+- Row anatomy re-measured from the export: left block 104 (was 140),
+  track [138, 380], detail 188 (was 152) — bars/gridlines/Now align
+  within 1px of the export's vertical features.
+- Vertical rhythm: caption lh 1.2, body gap 6 — cards land at y103/326
+  vs the export's 101/321 (masked diff in budget).
+- `CSWAP_TL_BOARD` no longer suppresses chips (boards include them);
+  the flag now guards future additions only.
+
+Verification: board gate 9/9 against the 21:51 exports, browser 20/20,
+node 8/8, full pytest 2410+10 skipped. Boards 19/20 unchanged (15:34);
+19's composition is pinned by TestLeftComposition, 20's states by the
+browser/node suites. Main-panel deltas vs the new 01/02 remain
+informational (13.4%/14.3% — roster/illustrative-data variance; the
+trigger now matches on both sides). VERIFICATION.md left for the owner
+to commit with the design-session changes.

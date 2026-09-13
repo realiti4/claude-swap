@@ -662,11 +662,10 @@ if (_tlfWanted && !bridge.hosted) {
     },
   ];
   window.CSWAP_TL_TZ = "America/Los_Angeles";
-  // Board-exact rendering: the session additions (countdown chips) are
-  // approved deltas AWAITING board re-export; the fidelity gate compares
-  // the boards as drawn, so the fixture suppresses them. The additions
-  // are covered by the browser suite meanwhile.
-  window.CSWAP_TL_BOARD = true;
+  // Boards 17/18 re-exported 2026-09-12 21:51 WITH the countdown chips:
+  // the fixture now renders them and the gate diffs against the new
+  // exports (crosshair/T remain runtime-only, pointer-driven).
+  window.CSWAP_TL_BOARD = false;
   FIXTURE.accounts = tlAccounts;
   FIXTURE.takenAt = NOW - 120;
   FIXTURE.freshness = { ageText: "2m ago", ok: true };
