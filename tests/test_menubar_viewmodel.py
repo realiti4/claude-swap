@@ -422,7 +422,7 @@ class TestContract:
     ALLOWED_ACCOUNT = {
         "slot", "label", "email", "org", "kind", "active", "switchable", "status",
         "windows", "alias", "disabled", "quarantined", "note", "spend", "pace",
-        "lastError",
+        "lastError", "timelineWindows",
     }
     ALLOWED_WINDOW = {
         "kind", "label", "pct", "state",

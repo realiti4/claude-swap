@@ -400,6 +400,68 @@ def _age_text(age_s: float | None) -> str | None:
     return f"{hours}h ago" if minutes == 0 else f"{hours}h {minutes}m ago"
 
 
+_TIMELINE_KIND_SOURCES = (("five_hour", "5h"), ("seven_day", "7d"))
+
+
+def _timeline_window_vm(
+    kind: str,
+    window: dict | None,
+    *,
+    now: float,
+    stale: bool,
+    observed_at: float | None,
+    forced_state: str | None = None,
+) -> dict:
+    """One ``timelineWindows`` entry — explicit nullables, precedence-honest.
+
+    Within ``timelineWindows`` the wire convention deliberately differs from
+    the vm-wide absent-when-optional rule: the six fields are always present,
+    ``None`` meaning *unknown* (null is never zero; the chart distinguishes
+    unknown from absent). State precedence mirrors DATA-CONTRACT.md: no
+    window > missing reset > elapsed > stale > missing usage > ok.
+    ``resetsAt`` survives elapsed resets — unlike ``windows[]``, which drops
+    it — because the chart must show the last measured boundary without
+    rolling a new cycle. Scoped/model and spend windows are excluded.
+    """
+    if forced_state is not None:
+        pct = resets = None
+        state = forced_state
+    else:
+        pct = resets = None
+        if isinstance(window, dict):
+            raw = window.get("pct")
+            if (
+                isinstance(raw, (int, float))
+                and not isinstance(raw, bool)
+                and math.isfinite(float(raw))
+                and float(raw) >= 0
+            ):
+                pct = float(raw)
+            ts = _resets_at_ts(window)
+            if ts != float("inf"):
+                resets = ts
+        if window is None:
+            state = "no-window"
+        elif resets is None:
+            state = "reset-unavailable"
+        elif resets <= now:
+            state = "elapsed"
+        elif stale:
+            state = "stale"
+        elif pct is None:
+            state = "usage-unavailable"
+        else:
+            state = "ok"
+    return {
+        "kind": kind,
+        "pct": pct,
+        "resetsAt": resets,
+        "startsAt": None,  # no measured start in the wire model yet
+        "state": state,
+        "observedAt": observed_at,
+    }
+
+
 def _window_vm(kind: str, label: str, window: dict, *, now: float, state: str) -> dict | None:
     """One bar's view-model: pct + reset epoch + baked first-paint countdown.
 
@@ -526,6 +588,29 @@ def _account_vm(acc, *, now: float) -> dict:
         # otherwise plainly unavailable.
         vm["note"] = entry.last_error if entry.last_error else "usage unavailable"
     vm["windows"] = windows
+    # Timeline charts: same snapshot, additive richer states (see
+    # _timeline_window_vm). One entry per primary kind for every account —
+    # rows are stable even when the data is absent.
+    tl_stale = bool(entry.last_error)
+    if isinstance(display, dict):
+        vm["timelineWindows"] = [
+            _timeline_window_vm(
+                kind, display.get(key), now=now, stale=tl_stale,
+                observed_at=entry.fetched_at,
+            )
+            for key, kind in _TIMELINE_KIND_SOURCES
+        ]
+    else:
+        # Sentinel note replaces bars (no-window); a bare error with no
+        # measurement ever is account-level unavailable.
+        forced = "no-window" if isinstance(display, str) else "unavailable"
+        vm["timelineWindows"] = [
+            _timeline_window_vm(
+                kind, None, now=now, stale=tl_stale,
+                observed_at=entry.fetched_at, forced_state=forced,
+            )
+            for _key, kind in _TIMELINE_KIND_SOURCES
+        ]
     if entry.last_error:
         vm["lastError"] = entry.last_error
     return vm
