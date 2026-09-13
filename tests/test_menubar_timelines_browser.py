@@ -450,3 +450,29 @@ class TestSessionAdditions:
         assert panel.eval(
             "document.querySelectorAll('.tl-crosshair').length"
         ) >= 2, "each chart mounts a crosshair guide"
+
+
+class TestLeftComposition:
+    """Board 19: near the right display edge the companion flips to the
+    LEFT of the anchored main panel (annotations on that board are not
+    UI). This pins the composition, not the annotation art."""
+
+    def test_left_mode_places_companion_left_of_main(self, panel):
+        panel.eval(
+            "CSWAP_TIMELINES.apply({mode: 'left', anchorOffset: 608}); 'ok'"
+        )
+        panel.spin(0.15)
+        comp = json.loads(panel.eval(
+            "(() => { const c = document.getElementById('tl-companion');"
+            " const p = document.getElementById('panel');"
+            " const cr = c.getBoundingClientRect(), pr = p.getBoundingClientRect();"
+            " return JSON.stringify({cl: cr.x, cw: cr.width,"
+            " px: pr.x, pw: pr.width, gap: pr.x - (cr.x + cr.width)}); })()"
+        ))
+        assert comp["cw"] == 600 and comp["pw"] == 360
+        assert comp["cl"] == 0, "companion hugs the surface's left edge"
+        assert abs(comp["gap"] - 8) < 1, "8px gap, main column at the anchor"
+        panel.eval(
+            "CSWAP_TIMELINES.apply({mode: 'right', anchorOffset: 0}); 'ok'"
+        )
+        panel.spin(0.1)
