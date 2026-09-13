@@ -1308,7 +1308,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+             patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response):
             switcher.list_accounts()
 
         output = capsys.readouterr().out
@@ -1368,7 +1368,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
-             patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+             patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response):
             switcher.list_accounts()
 
         output = capsys.readouterr().out

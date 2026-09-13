@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap import oauth
+from claude_swap import oauth as claude_swap_oauth
 
 
 class TestExtractAccessToken:
@@ -206,7 +207,7 @@ class TestFetchUsage:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response), \
              patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
@@ -217,7 +218,7 @@ class TestFetchUsage:
         assert result["five_hour"]["countdown"] == "1h 0m"
 
     def test_network_error(self):
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=Exception("timeout")):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=Exception("timeout")):
             result = oauth.fetch_usage("sk-test-token")
         assert result is None
 
@@ -236,7 +237,7 @@ class TestFetchUsage:
                 fp=None,
             )
 
-            with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=http_error):
+            with patch("claude_swap.oauth._bearer_urlopen", side_effect=http_error):
                 result = oauth.fetch_usage("sk-test-token")
 
             assert result is None
@@ -253,7 +254,7 @@ class TestFetchUsage:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response):
             result = oauth.fetch_usage("sk-test-token")
         assert result is None
 
@@ -271,7 +272,7 @@ class TestFetchUsage:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response), \
              patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
@@ -291,7 +292,7 @@ class TestFetchUsage:
         mock_response.read.return_value = json.dumps(response_data).encode()
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response):
             return oauth.fetch_usage("sk-test-token")
 
     def test_extra_usage_complete(self):
@@ -391,7 +392,7 @@ class TestFetchUsage:
         mock_response.read.return_value = json.dumps(response_data).encode()
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=mock_response), \
              patch("claude_swap.oauth.datetime") as mock_dt:
             mock_dt.fromisoformat = datetime.fromisoformat
             mock_dt.now.return_value = fixed_now
@@ -448,7 +449,7 @@ class TestRefreshOAuthCredentials:
             seen_body.update(json.loads(req.data.decode()))
             return mock_response
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             refreshed = oauth.refresh_oauth_credentials(self._make_credentials())
 
         assert refreshed is not None
@@ -482,7 +483,7 @@ class TestTryRefreshOAuthCredentials:
         mock_response.__exit__ = MagicMock(return_value=False)
 
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+            "claude_swap.oauth._bearer_urlopen", return_value=mock_response
         ):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
 
@@ -493,26 +494,26 @@ class TestTryRefreshOAuthCredentials:
 
     def test_invalid_grant_body_on_400_is_permanent(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.credentials is None
         assert outcome.error == "invalid_grant"
 
     def test_400_without_marker_is_transient(self):
         err = self._http_error(400, b'{"error": "temporarily_unavailable"}')
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
 
     def test_5xx_is_transient_even_with_marker(self):
         err = self._http_error(500, b'{"error": "invalid_grant"}')
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
 
     def test_network_error_is_transient(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             side_effect=urllib.error.URLError("dns"),
         ):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
@@ -532,7 +533,7 @@ class TestTryRefreshOAuthCredentials:
 
     def test_wrapper_returns_none_on_failure(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err):
             assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
 
 
@@ -635,7 +636,7 @@ class TestFetchUsageForAccount:
                 return usage_resp
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
@@ -679,7 +680,7 @@ class TestFetchUsageForAccount:
                 return usage_resp
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "2", "test@example.com", credentials,
                 is_active=False,
@@ -705,7 +706,7 @@ class TestFetchUsageForAccount:
                 return usage_resp
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen), \
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen), \
              patch("claude_swap.oauth.refresh_oauth_credentials") as refresh_mock:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
@@ -732,7 +733,7 @@ class TestFetchUsageForAccount:
                 )
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
@@ -768,7 +769,7 @@ class TestFetchUsageForAccount:
                 return usage_resp
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
@@ -804,7 +805,7 @@ class TestFetchUsageForAccount:
                 )
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=True,
@@ -832,7 +833,7 @@ class TestFetchUsageForAccount:
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
         persist_mock = MagicMock()
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=True,
@@ -966,7 +967,7 @@ class TestTryFetchUsageOutcome:
         resp.__enter__ = lambda s: s
         resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
+        with patch("claude_swap.oauth._bearer_urlopen", return_value=resp):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
             )
@@ -983,7 +984,7 @@ class TestTryFetchUsageOutcome:
             hdrs=hdrs, fp=None,
         )
         with (
-            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err),
+            patch("claude_swap.oauth._bearer_urlopen", side_effect=err),
             caplog.at_level(logging.WARNING, logger="claude-swap"),
         ):
             outcome = oauth.try_fetch_usage_for_account(
@@ -1017,7 +1018,7 @@ class TestTryFetchUsageOutcome:
             hdrs=hdrs, fp=None,
         )
         with (
-            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err),
+            patch("claude_swap.oauth._bearer_urlopen", side_effect=err),
             caplog.at_level(logging.WARNING, logger="claude-swap"),
         ):
             outcome = oauth.try_fetch_usage_for_account(
@@ -1035,7 +1036,7 @@ class TestTryFetchUsageOutcome:
 
     def test_timeout_outcome(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             side_effect=urllib.error.URLError(TimeoutError()),
         ):
             outcome = oauth.try_fetch_usage_for_account(
@@ -1093,7 +1094,7 @@ class TestInvalidGrantPropagation:
             "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
             hdrs=None, fp=None,
         )
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")):
             outcome = oauth.try_fetch_usage_for_account(
@@ -1107,7 +1108,7 @@ class TestInvalidGrantPropagation:
             "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
             hdrs=None, fp=None,
         )
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=err), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "transient")):
             outcome = oauth.try_fetch_usage_for_account(
@@ -1160,7 +1161,7 @@ class TestTokenAccountParsing:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+            "claude_swap.oauth._bearer_urlopen", return_value=mock_response
         ):
             return oauth.try_refresh_oauth_credentials(self._make_credentials())
 
@@ -1257,7 +1258,7 @@ class TestFetchOauthProfile:
                 "organization": {"uuid": "org-uuid"},
             })
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_oauth_profile("sk-live")
         assert result == {
             "uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid",
@@ -1276,20 +1277,20 @@ class TestFetchOauthProfile:
                 "account": {"uuid": "acc-uuid", "email": "a@b.c"},
             })
 
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("claude_swap.oauth._bearer_urlopen", side_effect=mock_urlopen):
             oauth.fetch_oauth_profile("sk-live")
         assert seen["timeout"] == 5
 
     def test_network_failure_is_unresolvable_not_error(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             side_effect=urllib.error.URLError("down"),
         ):
             assert oauth.fetch_oauth_profile("sk-live") is None
 
     def test_missing_account_object_is_unresolvable(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({"unexpected": True}),
         ):
             assert oauth.fetch_oauth_profile("sk-live") is None
@@ -1301,7 +1302,7 @@ class TestFetchOauthProfile:
 
     def test_missing_uuid_is_unresolvable(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"email": "a@b.c"},
                 "organization": {"uuid": "org-uuid"},
@@ -1311,7 +1312,7 @@ class TestFetchOauthProfile:
 
     def test_non_string_uuid_is_unresolvable(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": 12345, "email": "a@b.c"},
             }),
@@ -1320,7 +1321,7 @@ class TestFetchOauthProfile:
 
     def test_blank_uuid_is_unresolvable(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": "   ", "email": "a@b.c"},
             }),
@@ -1333,13 +1334,13 @@ class TestFetchOauthProfile:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response,
+            "claude_swap.oauth._bearer_urlopen", return_value=mock_response,
         ):
             assert oauth.fetch_oauth_profile("sk-live") is None
 
     def test_uuid_whitespace_normalized_at_boundary(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": "  acc-uuid  ", "email": "a@b.c"},
             }),
@@ -1350,7 +1351,7 @@ class TestFetchOauthProfile:
     def test_valid_uuid_with_missing_email_still_resolves(self):
         """email/organization are optional; uuid is the identity."""
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": "acc-uuid"},
             }),
@@ -1360,7 +1361,7 @@ class TestFetchOauthProfile:
 
     def test_non_string_optional_fields_are_dropped_not_fatal(self):
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen",
+            "claude_swap.oauth._bearer_urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": "acc-uuid", "email": {"weird": True}},
                 "organization": {"uuid": 99},
@@ -1380,7 +1381,7 @@ class TestFetchOauthProfile:
             "Unauthorized", {}, None,
         )
         with patch(
-            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+            "claude_swap.oauth._bearer_urlopen", side_effect=err,
         ), caplog.at_level(logging.WARNING, logger="claude-swap"):
             assert oauth.fetch_oauth_profile("sk-live") is None
         assert any(
@@ -1407,7 +1408,7 @@ class TestInvalidGrantTaxonomy:
             )
 
         monkeypatch.setattr(
-            "claude_swap.oauth.urllib.request.urlopen", raise_http
+            "claude_swap.oauth._bearer_urlopen", raise_http
         )
         return oauth.try_refresh_oauth_credentials(creds)
 
@@ -1522,3 +1523,58 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestBearerRedirectsRefused:
+    """Audit F07: credential-bearing requests never follow redirects —
+    the default urllib handler would re-send the Authorization header to
+    whatever the endpoint (or a trusted-path compromise) names,
+    including cross-origin HTTP."""
+
+    def test_redirect_refusal_surfaces_through_helpers(self):
+        """A refused redirect (URLError from the no-redirect handler)
+        propagates out of the usage helper instead of silently
+        following the redirect — fully offline."""
+        import urllib.error
+        from unittest.mock import patch
+
+        with patch(
+            "claude_swap.oauth._bearer_urlopen",
+            side_effect=urllib.error.URLError(
+                "refusing redirect for credential-bearing request "
+                "(302 -> http://attacker.invalid/)"
+            ),
+        ):
+            with pytest.raises(urllib.error.URLError, match="refusing"):
+                oauth.request_usage_data("SYNTHETIC")
+
+    def test_handler_raises_instead_of_following(self):
+        import urllib.error
+        from claude_swap.oauth import _NoRedirectBearerHandler
+
+        handler = _NoRedirectBearerHandler()
+        with pytest.raises(urllib.error.URLError, match="refusing redirect"):
+            handler.redirect_request(
+                None, None, 302, "Found",
+                {"Location": "http://attacker.invalid/steal"},
+                "http://attacker.invalid/steal",
+            )
+
+    def test_no_redirect_normal_flow_unchanged(self):
+        """A plain 200 through the bearer opener still works (mocked)."""
+        import urllib.request
+        from unittest.mock import patch, MagicMock
+
+        resp = MagicMock()
+        resp.read.return_value = b'{"ok": true}'
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = MagicMock(return_value=False)
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={"Authorization": "Bearer SYNTHETIC"},
+        )
+        from claude_swap.oauth import _bearer_urlopen
+        with patch("urllib.request.OpenerDirector.open",
+                   return_value=resp) as m:
+            out = _bearer_urlopen(req, timeout=5)
+            assert out.read() == b'{"ok": true}'

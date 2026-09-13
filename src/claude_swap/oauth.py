@@ -182,7 +182,7 @@ def try_refresh_oauth_credentials(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _bearer_urlopen(req, timeout=timeout_s) as resp:
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -257,6 +257,30 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
+class _NoRedirectBearerHandler(urllib.request.HTTPRedirectHandler):
+    """Audit F07: credential-bearing requests never follow redirects.
+
+    The default urllib redirect handler re-sends the original headers —
+    including ``Authorization`` — to the redirect target, which a
+    cross-origin or HTTP-downgrade hop turns into bearer-token
+    forwarding. These API calls address fixed Anthropic origins that do
+    not redirect in practice; if one ever does, failing closed is the
+    correct behavior.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError(
+            f"refusing redirect for credential-bearing request "
+            f"({code} -> {newurl})"
+        )
+
+
+def _bearer_urlopen(req, timeout: float):
+    """urlopen with redirects refused for the credential-bearing helpers."""
+    opener = urllib.request.build_opener(_NoRedirectBearerHandler)
+    return opener.open(req, timeout=timeout)
+
+
 def refresh_oauth_credentials(credentials: str) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
     return try_refresh_oauth_credentials(credentials).credentials
@@ -287,7 +311,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _bearer_urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -403,7 +427,7 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with _bearer_urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
 
