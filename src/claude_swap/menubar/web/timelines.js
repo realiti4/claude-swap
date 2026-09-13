@@ -437,8 +437,15 @@ window.CSWAP_TIMELINES = (() => {
   function renderRows(vm) {
     if (vm !== undefined) state.vm = vm;
     const accounts = (state.vm && state.vm.accounts) || [];
-    if (state.selectedSlot === null && accounts.length) {
-      state.selectedSlot = state.vm.activeSlot ?? accounts[0].slot;
+    const slots = new Set(accounts.map((a) => String(a.slot)));
+    if (accounts.length && (state.selectedSlot === null
+                            || !slots.has(String(state.selectedSlot)))) {
+      // first open, or the selected account vanished from a push: fall
+      // back to the active account when it still exists, else the first
+      // row — never dangle (the active slot can be the removed one).
+      const active = state.vm.activeSlot;
+      state.selectedSlot = (active != null && slots.has(String(active)))
+        ? active : accounts[0].slot;
     }
     const now = (typeof window !== "undefined" && window.CSWAP_TL_NOW)
       ? window.CSWAP_TL_NOW() : Date.now() / 1000;
