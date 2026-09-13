@@ -127,8 +127,7 @@ class TestBundledFonts:
             return
         with zipfile.ZipFile(wheels[-1]) as zf:
             names = zf.namelist()
-        for base, weights in self.EXPECTED.items():
-            for weight in weights:
-                assert any(
-                    n.endswith(f"web/fonts/{base}-{weight}.woff2") for n in names
-                ), f"wheel missing {base}-{weight}.woff2"
+        for name in self.EXPECTED:
+            assert any(n.endswith(f"web/fonts/{name}") for n in names), (
+                f"wheel missing {name}"
+            )
