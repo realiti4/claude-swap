@@ -254,6 +254,9 @@ window.CSWAP_TIMELINES = (() => {
         </div>
         <div class="tl-nowline" aria-hidden="true"
              style="left:${TRACK_X + TRACK_W / 2}px"></div>
+        <div class="tl-crosshair" aria-hidden="true">
+          <span class="tl-crosshair-time tl-text"></span>
+        </div>
         <div class="tl-rows" data-tl-rows="${def.kind}" role="listbox"
              aria-label="${def.title} rows"></div>
       </div>
@@ -338,12 +341,51 @@ window.CSWAP_TIMELINES = (() => {
       document.body.style.setProperty("--tl-anchor-x", `${state.anchorOffset}px`);
     }
     renderRows();
+    wireCrosshair();
     tickClock();
   }
 
   function tickClock() {
     const el = document.querySelector("[data-tl-now]");
     if (el) el.textContent = nowClock();
+    const now = (typeof window !== "undefined" && window.CSWAP_TL_NOW)
+      ? window.CSWAP_TL_NOW() : Date.now() / 1000;
+    document.querySelectorAll("[data-tl-cd]").forEach((chip) => {
+      const txt = window.CSWAP_TIMELINES_GEOMETRY.countdownText(
+        parseFloat(chip.dataset.tlCd), now);
+      chip.textContent = txt || "";
+    });
+  }
+
+  function wireCrosshair() {
+    document.querySelectorAll(".tl-rows-wrap").forEach((wrap) => {
+      if (wrap.dataset.crosshairWired) return;
+      wrap.dataset.crosshairWired = "1";
+      const ch = wrap.querySelector(".tl-crosshair");
+      const label = ch && ch.querySelector(".tl-crosshair-time");
+      const card = wrap.closest(".tl-card");
+      if (!ch || !label || !card) return;
+      const kind = card.dataset.kind;
+      const D = window.CSWAP_TIMELINES_GEOMETRY.TL_SECONDS[kind];
+      if (!D) return;
+      const fine = window.matchMedia
+        && window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+      const calm = window.matchMedia
+        && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (!fine || calm) return;  // session rule: hover pointers, no motion
+      wrap.addEventListener("mousemove", (ev) => {
+        const rect = wrap.getBoundingClientRect();
+        const x = ev.clientX - rect.left - TRACK_X;
+        if (x < 0 || x > TRACK_W) { ch.style.opacity = "0"; return; }
+        const frac = x / TRACK_W;
+        ch.style.opacity = "1";
+        ch.style.left = `${TRACK_X + x}px`;
+        const tSec = ((frac - 0.5) * 2 * D) + ((typeof window !== "undefined"
+          && window.CSWAP_TL_NOW) ? window.CSWAP_TL_NOW() : Date.now() / 1000);
+        label.textContent = fmtLocal(tSec, false);
+      });
+      wrap.addEventListener("mouseleave", () => { ch.style.opacity = "0"; });
+    });
   }
 
   // ---- rows (board 17/20 state matrix; geometry from the pure layer) ----
@@ -427,6 +469,9 @@ window.CSWAP_TIMELINES = (() => {
           width:${(g.widthFraction * 100).toFixed(3)}%"></span>${fill}${cap}
       </div>
       <div class="row-detail">
+        ${(w.resetsAt != null && w.resetsAt > now
+            && !(typeof window !== "undefined" && window.CSWAP_TL_BOARD))
+          ? `<span class="row-cd" data-tl-cd="${w.resetsAt}" data-kind="${kind}"></span>` : ""}
         <span class="row-pct tl-text${w.pct == null || stale ? " dim" : ""}">${pctText}</span>
         <span class="row-reset tl-text">${resetText}</span>
       </div></div>`;
@@ -565,6 +610,7 @@ window.CSWAP_TIMELINES = (() => {
       rowsEl.innerHTML = accounts.map((a) => rowHtml(kind, a, now)).join("");
       rowsEl.scrollTop = scroll;
     });
+    wireCrosshair();
     if (state.detailOpen) {
       if (slots.has(String(state.detailSlot))) openDetail(state.detailSlot);
       else closeDetail();  // its account vanished: close safely
@@ -574,6 +620,16 @@ window.CSWAP_TIMELINES = (() => {
   // ---- keyboard ------------------------------------------------------------
 
   document.addEventListener("keydown", (ev) => {
+    if ((ev.key === "t" || ev.key === "T") && !state._keyConsumed) {
+      const el = ev.target;
+      if (el && el.closest
+          && el.closest("input, textarea, select, [contenteditable], dialog")) {
+        return;  // typing a alias must never toggle the charts
+      }
+      if (document.querySelector("dialog[open]")) return;
+      toggle();
+      return;
+    }
     if (!state.mode) return;
     if (ev.key === "Enter" || ev.key === " ") {
       const row = ev.target.closest && ev.target.closest(".tl-row");

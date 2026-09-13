@@ -755,3 +755,37 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
 .dt-span { font-size: 12px; color: var(--swap-tl-text-2);
   font-variant-numeric: tabular-nums; }
 .dt-inferred { font-size: 11px; color: var(--swap-tl-text-3); }
+
+/* ---- session additions: countdown chip, crosshair ----------------------- */
+.row-cd {
+  font-family: var(--swap-font-numeric);
+  font-size: 11px;
+  color: var(--swap-tl-text-2);
+  background: var(--swap-tl-surface-3);
+  border-radius: 9px;
+  padding: 1px 7px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-crosshair {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 1px;
+  background: var(--swap-tl-text-3);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+.tl-crosshair-time {
+  position: absolute;
+  top: -2px;
+  left: 4px;
+  font-family: var(--swap-font-numeric);
+  font-size: 10px;
+  color: var(--swap-tl-text-2);
+  background: var(--swap-tl-surface);
+  border: 1px solid var(--swap-tl-border);
+  border-radius: 4px;
+  padding: 0 4px;
+  white-space: nowrap;
+}

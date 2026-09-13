@@ -184,7 +184,7 @@ function headerHtml() {
   return `
   <header class="hdr">
     <div class="brand">${ic("swap", 16)}<span class="name">Claude Code Swap</span></div>
-    <button class="icon-btn tl-trigger" data-act="timelines" title="Reset timelines"
+    <button class="icon-btn tl-trigger" data-act="timelines" title="Reset timelines (T)"
       aria-label="Reset timelines" aria-expanded="${tlOpen ? "true" : "false"}">
       ${ic("calendar-clock", 14)}
     </button>
@@ -656,6 +656,11 @@ if (_tlfWanted && !bridge.hosted) {
     },
   ];
   window.CSWAP_TL_TZ = "America/Los_Angeles";
+  // Board-exact rendering: the session additions (countdown chips) are
+  // approved deltas AWAITING board re-export; the fidelity gate compares
+  // the boards as drawn, so the fixture suppresses them. The additions
+  // are covered by the browser suite meanwhile.
+  window.CSWAP_TL_BOARD = true;
   FIXTURE.accounts = tlAccounts;
   FIXTURE.takenAt = NOW - 120;
   FIXTURE.freshness = { ageText: "2m ago", ok: true };

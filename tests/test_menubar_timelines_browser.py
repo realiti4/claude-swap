@@ -178,6 +178,9 @@ def panel():
         return 'ok';
       })()
     """)
+    # the tlf fixture suppresses board-delta additions for the image
+    # gate; these checks verify the additions, so enable them
+    p.eval("window.CSWAP_TL_BOARD = false; 'ok'")
     p.open_timelines()  # every class assumes the charts are up
     yield p
 
@@ -403,3 +406,47 @@ class TestEscapeAndFocus:
         panel.eval("document.querySelector('.tl-close-btn').click(); 'ok'")
         panel.spin(0.15)
         assert panel.eval("document.getElementById('tl-companion') === null")
+
+
+class TestSessionAdditions:
+    def test_countdown_chips_tick_per_chart(self, panel):
+        panel.open_timelines()
+        chips = json.loads(panel.eval(
+            "JSON.stringify(Array.from(document.querySelectorAll('[data-tl-cd]'))"
+            ".map(c => ({kind: c.dataset.kind, text: c.textContent})))"
+        ))
+        assert chips, "rows with future resets carry a chip"
+        assert any(c["kind"] == "5h" for c in chips)
+        assert any(c["kind"] == "7d" for c in chips)
+        assert all(c["text"] for c in chips), "chips are populated immediately"
+
+    def test_t_shortcut_toggles_and_ignores_fields(self, panel):
+        was_open = panel.eval("CSWAP_TIMELINES.state.mode !== null")
+        panel.eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 't', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.15)
+        assert panel.eval("CSWAP_TIMELINES.state.mode !== null") != was_open, \
+            "T toggles the timelines"
+        panel.eval(
+            "const inp = Object.assign(document.createElement('input'), {value: ''});"
+            "document.body.appendChild(inp); inp.focus();"
+            "inp.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 't', bubbles: true})); inp.remove(); 'ok'"
+        )
+        panel.spin(0.1)
+        state_after_field = panel.eval("CSWAP_TIMELINES.state.mode !== null")
+        panel.eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 't', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.1)
+        assert panel.eval("CSWAP_TIMELINES.state.mode !== null") != state_after_field, \
+            "T works again once focus leaves the field; the field typed nothing"
+
+    def test_crosshair_present_for_fine_pointers(self, panel):
+        panel.open_timelines()
+        assert panel.eval(
+            "document.querySelectorAll('.tl-crosshair').length"
+        ) >= 2, "each chart mounts a crosshair guide"
