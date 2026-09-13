@@ -501,7 +501,7 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   align-items: center;
   gap: 9px;
   height: var(--swap-tl-header-h);
-  padding: 0 10px;
+  padding: 0 14px;  /* Pen pad token; measured on the board-17 export */
   border-bottom: 1px solid var(--swap-tl-border);
 }
 .tl-mark {
@@ -536,7 +536,7 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   display: flex;
   flex-direction: column;
   gap: 9px;
-  padding: 10px;
+  padding: 14px;  /* Pen pad token; cards 572 wide, row math closes exact */
 }
 .tl-caption { font-size: 11.5px; line-height: 1.35; color: var(--swap-tl-text-2); }
 
@@ -597,3 +597,122 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   background: var(--swap-tl-accent-quiet);
   color: var(--swap-tl-accent-text);
 }
+
+/* ---- timeline rows (boards 17/20; extraction-notes.md) ------------------
+ * Row: 22px, r6, gap 8 = left 140 / track 242 / detail 152 (+30px slack).
+ * Only selected rows get a surface fill; the rail marks selection and the
+ * $ok dot marks the ACTIVE credential — never the same thing. */
+.tl-rows-wrap { position: relative; height: var(--swap-tl-rows-h); }
+.tl-gridlines, .tl-nowline {
+  position: absolute; top: 0; bottom: 0; left: 0; width: 100%;
+  pointer-events: none;
+}
+.tl-gridlines .gridline {
+  position: absolute; top: 0; bottom: 0;
+  width: var(--swap-tl-gridline-w);
+  background: var(--swap-tl-border);
+  /* on-pixel: a -0.5px transform splits the hairline across two device
+     columns and halves its contrast against the board export */
+}
+.tl-nowline {
+  width: var(--swap-tl-now-w);
+  background: repeating-linear-gradient(
+    to bottom, var(--swap-tl-warn) 0 5px, transparent 5px 9px);
+}
+.tl-rows { position: relative; z-index: 1; height: 100%; overflow-y: auto;
+  display: flex; flex-direction: column; gap: var(--swap-tl-row-gap);
+  background: transparent; }
+
+.tl-row {
+  position: relative;
+  flex: none;
+  height: var(--swap-tl-row-h);
+  border-radius: var(--swap-tl-row-radius);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: default;
+}
+.tl-row.selected { background: var(--swap-tl-surface-2); }
+.row-rail {
+  position: absolute; left: 0; top: 3px;
+  width: var(--swap-tl-rail-w); height: 16px;
+  background: var(--swap-tl-accent);
+  border-radius: 1.25px;
+}
+.row-left {
+  flex: none; width: 140px;
+  display: flex; align-items: center; gap: 6px;
+  overflow: hidden;
+}
+.row-idx {
+  flex: none;
+  width: var(--swap-tl-badge); height: var(--swap-tl-badge);
+  border-radius: var(--swap-tl-badge-radius);
+  background: var(--swap-tl-surface-2);
+  color: var(--swap-tl-text-2);
+  font-family: var(--swap-font-numeric); font-size: 12px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.tl-row.selected .row-idx {
+  background: var(--swap-tl-accent-quiet);
+  color: var(--swap-tl-accent-text);
+}
+.row-alias {
+  font-size: 12px; letter-spacing: -0.1px;
+  color: var(--swap-tl-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row-dot { flex: none; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--swap-tl-ok); }
+
+.row-track {
+  flex: none; width: 242px; height: var(--swap-tl-row-h);
+  position: relative;
+}
+.bar-window, .bar-fill {
+  position: absolute; top: 6px; height: var(--swap-tl-bar-h);
+  border-radius: var(--swap-tl-bar-radius);
+}
+.bar-window {
+  background: var(--swap-tl-surface-3);
+  border: 1px solid var(--swap-tl-border);
+  box-sizing: border-box;
+}
+.bar-window.stale {
+  background: transparent;
+  border-color: var(--swap-tl-border-strong);
+}
+.bar-fill { background: var(--swap-tl-accent); }
+.bar-fill.warn { background: var(--swap-tl-warn); }
+.bar-fill.stale { background: var(--swap-tl-border-strong); opacity: 0.7; }
+.bar-cap {
+  position: absolute; top: 4px;
+  width: var(--swap-tl-cap-w); height: var(--swap-tl-cap-h);
+  background: var(--swap-tl-accent-text);
+  border-radius: 1.25px;
+}
+.bar-cap.stale { background: var(--swap-tl-text-3); }
+.offscale-mark {
+  position: absolute; top: 8px; right: -8px;
+  width: 0; height: 0;
+  border-left: 5px solid var(--swap-tl-warn);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+.row-status {
+  width: 402px;  /* track + gap + detail: one honest sentence, no bar */
+  font-size: 12px;
+  color: var(--swap-tl-text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row-detail {
+  flex: none; width: 152px;
+  display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+  white-space: nowrap;
+}
+.row-pct { font-size: 12px; font-weight: 600; color: var(--swap-tl-text); }
+.row-pct.dim { color: var(--swap-tl-text-3); }
+.row-reset { font-size: 12px; color: var(--swap-tl-text-2);
+  font-variant-numeric: tabular-nums; }

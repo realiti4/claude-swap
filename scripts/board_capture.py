@@ -60,6 +60,18 @@ STATES: dict[str, dict] = {
         "selectors": ["#panel", "#tl-companion", ".tl-head", ".tl-body",
                        ".tl-card"],
     },
+    # Gated fidelity states: the handoff's frozen timeline fixture drives
+    # both panels; boards 17/18 equivalents at 968x560.
+    "17-right-dark": {
+        "width": 968, "height": 560, "query": "tlf=1", "theme": "dark",
+        "click": ".tl-trigger",
+        "selectors": ["#panel", "#tl-companion", ".tl-card"],
+    },
+    "18-right-light": {
+        "width": 968, "height": 560, "query": "tlf=1", "theme": "light",
+        "click": ".tl-trigger",
+        "selectors": ["#panel", "#tl-companion", ".tl-card"],
+    },
 }
 
 LAYOUT_JS = """
@@ -73,6 +85,11 @@ LAYOUT_JS = """
                   x: r.x, y: r.y, w: r.width, h: r.height});
     }
   }
+  const texts = [];
+  for (const el of document.querySelectorAll(".tl-text")) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0) texts.push([r.x, r.y, r.width, r.height]);
+  }
   const fids = [];
   for (const el of document.querySelectorAll("[data-fid]")) {
     const r = el.getBoundingClientRect();
@@ -82,7 +99,7 @@ LAYOUT_JS = """
                fs: cs.fontSize, fw: cs.fontWeight});
   }
   return JSON.stringify({viewport: {w: innerWidth, h: innerHeight},
-                         boxes, fids});
+                         boxes, fids, texts});
 })()
 """
 

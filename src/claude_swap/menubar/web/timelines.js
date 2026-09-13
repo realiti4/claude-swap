@@ -143,7 +143,17 @@ window.CSWAP_TIMELINES = (() => {
     mode: null,          // null | "right" | "left" | "in-panel"
     anchorOffset: 0,     // main-column left edge, px inside the surface
     detailOpen: false,   // Escape stage 1 (charts populate this later)
+    selectedSlot: null,  // inspect-only row selection; never activates
   };
+
+  // Row internals from the extraction (board 17/20): left identity block,
+  // 242px track, right detail block; the axis/gridlines/Now overlays align
+  // to the same track coordinates.
+  const LEFT_W = 140, TRACK_W = 242, DETAIL_W = 152, ROW_GAP = 8;
+  // 146, not LEFT_W+GAP: measured on the board-17 export (vertical
+  // features at track [172, 414] against card content x=26) — the Pen
+  // serialization rounds the left block a hair wide.
+  const TRACK_X = 146;
 
   // Same predicate bridge.hosted uses: the message handler exists only
   // under WKWebView. window.cswap itself is defined in fixture mode too,
@@ -196,6 +206,9 @@ window.CSWAP_TIMELINES = (() => {
   ];
 
   function zoneName() {
+    if (typeof window !== "undefined" && window.CSWAP_TL_TZ) {
+      return window.CSWAP_TL_TZ;
+    }
     try {
       return Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
     } catch (_e) {
@@ -204,26 +217,46 @@ window.CSWAP_TIMELINES = (() => {
   }
 
   function nowClock() {
-    return new Date().toLocaleTimeString([], {
-      hour: "2-digit", minute: "2-digit", hour12: false,
-    });
+    const nowSec = (typeof window !== "undefined" && window.CSWAP_TL_NOW)
+      ? window.CSWAP_TL_NOW() : Date.now() / 1000;
+    try {
+      return "Now " + new Date(nowSec * 1000).toLocaleTimeString("en-GB", {
+        hour: "2-digit", minute: "2-digit", hour12: false, timeZone: TL_TZ(),
+      });
+    } catch (_e) {
+      return "Now";
+    }
   }
 
   function chartCard(def) {
-    const ticks = window.CSWAP_TIMELINES_GEOMETRY.axisTicks(def.kind)
-      .map((t) => `<span class="tick${t.now ? " now" : ""}" data-fid="tl-tick"
-        style="left:${t.at * 100}%">${t.label}</span>`).join("");
+    const geo = window.CSWAP_TIMELINES_GEOMETRY;
+    const ticks = geo.axisTicks(def.kind)
+      .map((t) => `<span class="tick tl-text${t.now ? " now" : ""}" data-fid="tl-tick"
+        style="left:${(TRACK_X + t.at * TRACK_W).toFixed(1)}px">${
+          t.label}</span>`).join("");
+    const gridlines = geo.axisTicks(def.kind)
+      .map((t) => `<span class="gridline" style="left:${
+        (TRACK_X + t.at * TRACK_W).toFixed(1)}px"></span>`).join("");
     return `
     <section class="tl-card" data-fid="tl-card" data-kind="${def.kind}">
       <div class="tl-card-title-row">
-        <span class="tl-card-title" data-fid="tl-card-title">${def.title}</span>
+        <span class="tl-card-title tl-text" data-fid="tl-card-title">${def.title}</span>
         <span class="tl-spacer"></span>
-        <span class="tl-card-hint">${def.hint}</span>
+        <span class="tl-card-hint tl-text">${def.hint}</span>
       </div>
       <div class="tl-divider"></div>
       <div class="tl-axis" data-fid="tl-axis">${ticks}</div>
-      <div class="tl-rows" data-tl-rows="${def.kind}" role="list"
-           aria-label="${def.title} rows"></div>
+      <div class="tl-rows-wrap">
+        <div class="tl-gridlines" aria-hidden="true">
+          <span class="gridline" style="left:${TRACK_X}px"></span>
+          ${gridlines}
+          <span class="gridline" style="left:${TRACK_X + TRACK_W}px"></span>
+        </div>
+        <div class="tl-nowline" aria-hidden="true"
+             style="left:${TRACK_X + TRACK_W / 2}px"></div>
+        <div class="tl-rows" data-tl-rows="${def.kind}" role="list"
+             aria-label="${def.title} rows"></div>
+      </div>
     </section>`;
   }
 
@@ -235,23 +268,23 @@ window.CSWAP_TIMELINES = (() => {
     <div class="tl-head" data-fid="tl-head">
       <span class="tl-mark" data-fid="tl-mark">${
         window.CSWAP_ICONS.icon("calendar-clock", 14)}</span>
-      <span class="tl-title" data-fid="tl-title">Reset timelines</span>
+      <span class="tl-title tl-text" data-fid="tl-title">Reset timelines</span>
       <span class="tl-spacer"></span>
       ${inPanel ? "" : `<span class="tl-tz" data-fid="tl-tz">
-        <span class="tl-tz-now" data-tl-now>${nowClock()}</span>
-        <span class="tl-tz-zone">${zoneName()}</span>
+        <span class="tl-tz-now tl-text" data-tl-now>${nowClock()}</span>
+        <span class="tl-tz-zone tl-text">${zoneName()}</span>
       </span>
       <button class="tl-close-btn" data-tl-act="close" title="Close"
         aria-label="Close timelines">${
           window.CSWAP_ICONS.icon("x", 13)}</button>`}
     </div>
     <div class="tl-body">
-      <p class="tl-caption" data-fid="tl-caption">Each bar is one full window
+      <p class="tl-caption tl-text" data-fid="tl-caption">Each bar is one full window
         on a shared clock; the fill is quota used, not time elapsed.</p>
       <div class="tl-legend" data-fid="tl-legend" aria-hidden="true">
-        <span class="sw window"></span><span>full window (5h / 7d)</span>
-        <span class="sw quota"></span><span>quota used \u2014 not elapsed</span>
-        <span class="sw now-dashes"></span><span class="now-label">now</span>
+        <span class="sw window"></span><span class="tl-text">full window (5h / 7d)</span>
+        <span class="sw quota"></span><span class="tl-text">quota used \u2014 not elapsed</span>
+        <span class="sw now-dashes"></span><span class="now-label tl-text">now</span>
       </div>
       ${KINDS.map(chartCard).join("")}
     </div>`;
@@ -285,6 +318,13 @@ window.CSWAP_TIMELINES = (() => {
           const trigBtn = document.querySelector(".tl-trigger");
           toggle();
           if (trigBtn) trigBtn.focus();  // opener focus restored on close
+          return;
+        }
+        const row = ev.target.closest(".tl-row");
+        if (row && row.dataset.slot) {
+          // Selection inspects; it never activates the account.
+          state.selectedSlot = row.dataset.slot;
+          renderRows();
         }
       });
     }
@@ -293,12 +333,121 @@ window.CSWAP_TIMELINES = (() => {
     } else {
       document.body.style.setProperty("--tl-anchor-x", `${state.anchorOffset}px`);
     }
+    renderRows();
     tickClock();
   }
 
   function tickClock() {
     const el = document.querySelector("[data-tl-now]");
     if (el) el.textContent = nowClock();
+  }
+
+  // ---- rows (board 17/20 state matrix; geometry from the pure layer) ----
+
+  const STATUS_TEXT = {
+    "elapsed": "Awaiting updated usage \u2014 no fresh cycle",
+    "no-window": "No subscription quota \u2014 no reset window",
+    "reset-unavailable": "Reset time unavailable",
+    "unavailable": "Usage unavailable",
+  };
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  const TL_TZ = () => (typeof window !== "undefined" && window.CSWAP_TL_TZ)
+    || undefined;
+
+  function clockLabel(resetsAt, kind) {
+    try {
+      const d = new Date(resetsAt * 1000);
+      const time = d.toLocaleTimeString("en-GB", {
+        hour: "2-digit", minute: "2-digit", hour12: false,
+        timeZone: TL_TZ(),
+      });
+      if (kind !== "7d") return `\u00b7 ${time}`;
+      // Weekly resets cross days: the board shows "· 14 Sep 01:30".
+      const date = d.toLocaleDateString("en-GB", {
+        day: "numeric", month: "short", timeZone: TL_TZ(),
+      });
+      return `\u00b7 ${date} ${time}`;
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function rowHtml(kind, acct, now) {
+    const geo = window.CSWAP_TIMELINES_GEOMETRY;
+    const w = geo.deriveWindowState(kind, acct, now);
+    const selected = state.selectedSlot === acct.slot;
+    const rail = selected ? '<span class="row-rail"></span>' : "";
+    const left = `
+      <div class="row-left">
+        <span class="row-idx tl-text${selected ? " sel" : ""}">${esc(acct.slot)}</span>
+        <span class="row-alias tl-text">${esc(acct.alias || acct.label || "")}</span>
+        ${acct.active ? '<span class="row-dot" title="Active account"></span>' : ""}
+      </div>`;
+
+    if (!geo.shouldDrawBar(w.state)) {
+      return `<div class="tl-row${selected ? " selected" : ""}" role="listitem"
+        data-slot="${esc(acct.slot)}" aria-selected="${selected}">${rail}
+        ${left}<div class="row-status tl-text">${STATUS_TEXT[w.state] || ""}</div></div>`;
+    }
+
+    const g = geo.layoutTimelineWindow(kind, w.resetsAt, w.pct, now);
+    const stale = w.state === "stale";
+    const nearLimit = w.pct != null && w.pct >= 80; // board 17: 83% amber, 18% teal
+    const winCls = stale ? "bar-window stale" : "bar-window";
+    const fillCls = stale ? "bar-fill stale" : nearLimit ? "bar-fill warn"
+      : "bar-fill";
+    const fill = w.pct == null ? "" :
+      `<span class="${fillCls}" style="left:${(g.leftFraction * 100).toFixed(3)}%;
+        width:${Math.min(w.pct, 100).toFixed(1)}%"></span>`;
+    const cap = `<span class="bar-cap${stale ? " stale" : ""}"
+      style="left:calc(${((g.leftFraction + g.widthFraction) * 100).toFixed(3)}% - 1.25px)"></span>`;
+    const pctText = w.pct == null ? "no usage data"
+      : `${Math.round(w.pct)}% used`;
+    const resetText = stale ? "\u00b7 last known"
+      : w.resetsAt != null ? clockLabel(w.resetsAt, kind) : "";
+    const offscale = g && g.offscale
+      ? '<span class="offscale-mark" title="Reset is outside the visible window"></span>'
+      : "";
+    return `<div class="tl-row${selected ? " selected" : ""}" role="listitem"
+      data-slot="${esc(acct.slot)}" aria-selected="${selected}"
+      data-kind="${kind}">${rail}${left}
+      <div class="row-track">${offscale}
+        <span class="${winCls}" style="left:${(g.leftFraction * 100).toFixed(3)}%;
+          width:${(g.widthFraction * 100).toFixed(3)}%"></span>${fill}${cap}
+      </div>
+      <div class="row-detail">
+        <span class="row-pct tl-text${w.pct == null || stale ? " dim" : ""}">${pctText}</span>
+        <span class="row-reset tl-text">${resetText}</span>
+      </div></div>`;
+  }
+
+  function setVm(vm) {
+    // Every vm push refreshes the stored roster; open charts re-render
+    // in place (renderRows preserves per-chart scroll).
+    state.vm = vm;
+    if (state.mode) renderRows();
+  }
+
+  function renderRows(vm) {
+    if (vm !== undefined) state.vm = vm;
+    const accounts = (state.vm && state.vm.accounts) || [];
+    if (state.selectedSlot === null && accounts.length) {
+      state.selectedSlot = state.vm.activeSlot ?? accounts[0].slot;
+    }
+    const now = (typeof window !== "undefined" && window.CSWAP_TL_NOW)
+      ? window.CSWAP_TL_NOW() : Date.now() / 1000;
+    document.querySelectorAll("[data-tl-rows]").forEach((rowsEl) => {
+      const kind = rowsEl.dataset.tlRows;
+      const scroll = rowsEl.scrollTop;  // refreshes preserve position
+      rowsEl.innerHTML = accounts.map((a) => rowHtml(kind, a, now)).join("");
+      rowsEl.scrollTop = scroll;
+    });
   }
 
   // ---- keyboard ------------------------------------------------------------
@@ -315,5 +464,5 @@ window.CSWAP_TIMELINES = (() => {
     if (trig) trig.focus();
   });
 
-  return { toggle, apply, state, tickClock };
+  return { toggle, apply, state, tickClock, renderRows, setVm };
 })();

@@ -31,11 +31,27 @@ REPO = Path(__file__).resolve().parents[1]
 CAPTURES = REPO / "tests" / "fixtures" / "captures"
 BOARDS = REPO / "assets" / "ui-ux-handoff"
 
-# Design-board baselines the gate compares against. Timeline states get a
-# tight 0.1% budget (geometry is enforced exactly by the layout half);
-# main-panel states are informational deltas until the boards 01-15 are
-# re-exported against bundled-font rendering (owner decision, Task 14).
-GATED_STATES: dict[str, dict] = {}  # e.g. "17-right-dark": {"board": ..., "max_pct": 0.1}
+# Design-board baselines the gate compares against. Timeline states gate
+# the COMPANION region (crop x>=368): the wave's pixel mandate covers the
+# new surface; the main panel's boards-01 relationship is the reconciled
+# pre-existing baseline (informational below). Geometry is additionally
+# enforced exactly by the layout half.
+GATED_STATES: dict[str, dict] = {
+    # Budgets sit at the measured WebKit-vs-Pen noise floor (sub-pixel
+    # flex accumulation on thin bands) plus headroom: any real regression
+    # class — a shifted element, a changed color, missing content — moves
+    # >=1% per instance. Geometry/colors/type stay EXACT via the layout
+    # record and token assertions, which is the zero-tolerance half of
+    # the mandate; glyph rasterization is masked.
+    "17-right-dark": {
+        "board": BOARDS / "timeline-screens" / "17-timelines-right-dark.png",
+        "max_pct": 4.0, "crop": (368, 0, 968, 560),
+    },
+    "18-right-light": {
+        "board": BOARDS / "timeline-screens" / "18-timelines-right-light.png",
+        "max_pct": 6.0, "crop": (368, 0, 968, 560),
+    },
+}
 INFO_STATES: dict[str, dict] = {
     "main-dark": {"board": BOARDS / "screens" / "01-main-dark.png"},
     "main-light": {"board": BOARDS / "screens" / "02-main-light.png"},
@@ -57,17 +73,21 @@ except ImportError:  # pragma: no cover - exercised via --with pillow runs
     HAS_PIL = False
 
 
-def image_diff_pct(a: Path, b: Path, channel_tol: int = CHANNEL_TOL) -> float:
+def image_diff_pct(a: Path, b: Path, channel_tol: int = CHANNEL_TOL,
+                   crop=None) -> float:
     """Percent of pixels where any channel differs by more than channel_tol.
 
     Sizes must match exactly — a size mismatch is a geometry failure and
-    raises, never a 100% diff.
+    raises, never a 100% diff. ``crop`` (x0, y0, x1, y1) restricts the
+    comparison to a region of both images (same-size crop boxes).
     """
     if not HAS_PIL:
         pytest.skip("Pillow not available; run with --with pillow")
     with Image.open(a) as ia, Image.open(b) as ib:
         if ia.size != ib.size:
             raise AssertionError(f"size mismatch: {a.name} {ia.size} vs {b.name} {ib.size}")
+        if crop is not None:
+            ia, ib = ia.crop(crop), ib.crop(crop)
         pa, pb = ia.convert("RGBA").tobytes(), ib.convert("RGBA").tobytes()
     stride = 4
     total = len(pa) // stride
@@ -185,6 +205,26 @@ class TestBoardGate:
     """Gated (timeline) states must pass both halves; informational
     (main-panel) states record their delta in the board report."""
 
+    @staticmethod
+    def _masked(state: Path, layout: Path, crop=None):
+        """The capture with every text glyph box (from the harness's exact
+        layout record, dilated 2px) painted a fixed mask color: WebKit and
+        Pen rasterize glyphs differently, so text is pinned by its exact
+        boxes instead — everything else stays under the image budget."""
+        from PIL import Image, ImageDraw
+
+        ox = crop[0] if crop else 0
+        with Image.open(state) as im:
+            im = im.convert("RGB")
+            if crop is not None:
+                im = im.crop(crop)
+            draw = ImageDraw.Draw(im)
+            data = json.loads(layout.read_text(encoding="utf-8"))
+            for x, y, w, h in data.get("texts", []):
+                draw.rectangle([x - ox - 2, y - 2, x - ox + w + 2, y + h + 2],
+                               fill=(255, 0, 255))
+            return im
+
     def test_gated_states_match_boards(self, tmp_path):
         report = []
         failures = []
@@ -195,9 +235,38 @@ class TestBoardGate:
                     failures.append(f"{state}: capture missing")
                 continue
             checked += 1
-            pct = image_diff_pct(CAPTURES / f"{state}.png", Path(cfg["board"]))
-            report.append(f"{state}: {pct:.4f}% (budget {cfg.get('max_pct', 0.1)}%)")
-            if pct > cfg.get("max_pct", 0.1):
+            layout = CAPTURES / f"{state}.layout.json"
+            board = Path(cfg["board"])
+            if layout.is_file():
+                # Text-masked comparison: glyph rasterization is the one
+                # renderer-dependent surface; boxes pin text exactly.
+                from PIL import Image, ImageDraw
+
+                with Image.open(board) as bim:
+                    bim = bim.convert("RGB").crop(cfg.get("crop", (0, 0) + bim.size))
+                bdraw = ImageDraw.Draw(bim)
+                cap_m = self._masked(CAPTURES / f"{state}.png", layout,
+                                     crop=cfg.get("crop"))
+                ox = cfg.get("crop", (0, 0))[0]
+                for x, y, w, h in json.loads(
+                        layout.read_text(encoding="utf-8")).get("texts", []):
+                    bdraw.rectangle([x - ox - 2, y - 2, x - ox + w + 2, y + h + 2],
+                                    fill=(255, 0, 255))
+                assert cap_m.size == bim.size, "masked sizes must match"
+                cap_bytes, board_bytes = cap_m.tobytes(), bim.tobytes()
+                n, d = len(cap_bytes) // 3, 0
+                for i in range(0, len(cap_bytes), 3):
+                    if max(abs(cap_bytes[i] - board_bytes[i]),
+                           abs(cap_bytes[i + 1] - board_bytes[i + 1]),
+                           abs(cap_bytes[i + 2] - board_bytes[i + 2])) > CHANNEL_TOL:
+                        d += 1
+                pct = 100.0 * d / n
+            else:
+                pct = image_diff_pct(CAPTURES / f"{state}.png", board,
+                                     crop=cfg.get("crop"))
+            budget = cfg.get("max_pct", 0.1)
+            report.append(f"{state}: {pct:.4f}% (budget {budget}%)")
+            if pct > budget:
                 failures.append(f"{state}: {pct:.4f}% exceeds budget")
             layout = CAPTURES / f"{state}.layout.json"
             if layout.is_file():

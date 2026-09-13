@@ -60,6 +60,7 @@ const bridge = {
   push(type, data) {
     if (type === "vm") {
       state.vm = data;
+      if (window.CSWAP_TIMELINES) CSWAP_TIMELINES.setVm(data);
       if (state.selectedSlot === null && data.accounts.length) {
         state.selectedSlot = data.activeSlot ?? data.accounts[0].slot;
       }
@@ -173,6 +174,9 @@ function render() {
     if (d) d.open = true;
   }
   wire();
+  if (window.CSWAP_TIMELINES && CSWAP_TIMELINES.state.mode) {
+    CSWAP_TIMELINES.renderRows(state.vm);  // open charts track vm pushes
+  }
 }
 
 function headerHtml() {
@@ -517,7 +521,8 @@ function refresh() {
 
 // countdowns tick locally; a countdown reaching zero shows AWAITING, never 0%
 setInterval(() => {
-  const now = Date.now() / 1000;
+  // Frozen under the tlf fixture so board captures stay deterministic.
+  const now = window.CSWAP_TL_NOW ? window.CSWAP_TL_NOW() : Date.now() / 1000;
   els.panel.querySelectorAll("[data-resets-at]").forEach((el_) => {
     const cd = countdownFrom(parseFloat(el_.dataset.resetsAt), now);
     el_.textContent = cd ?? AWAITING;
@@ -586,6 +591,75 @@ const FIXTURE = {
 };
 
 window.CSWAP_APPEARANCE.init(bridge);
+
+// ?tlf=1 — the handoff's frozen timeline fixture (next-wave/fixtures/
+// timelines.json): four accounts whose windows land at the exact board
+// 17/18 geometry, and a frozen clock so captures diff deterministically
+// (the live countdown tick would otherwise drift between runs).
+const _tlfWanted = new URLSearchParams(location.search).get("tlf") === "1";
+if (_tlfWanted && !bridge.hosted) {
+  const NOW = 1789245000;  // 2026-09-12T13:30:00-07:00
+  window.CSWAP_TL_NOW = () => NOW;
+  const W = (kind, pct, resetsAt) => ({ kind,
+    label: kind === "5h" ? "Five-hour" : "Weekly", pct, state: "ok",
+    resetsAt, countdownText: countdownFrom(resetsAt, NOW) });
+  const TW = (kind, pct, resetsAt) => ({ kind, pct, resetsAt, startsAt: null,
+    state: "ok", observedAt: NOW });
+  const ACCT = (slot, alias, email, active, s5, w7) => ({
+    slot, label: alias, email, alias, org: "Acme", kind: "oauth", active,
+    switchable: true, status: "ok",
+    windows: [W("5h", s5[0], s5[1]), W("7d", w7[0], w7[1])],
+    timelineWindows: [TW("5h", s5[0], s5[1]), TW("7d", w7[0], w7[1])],
+  });
+  // Board 17/18 companion roster: the four nominal accounts plus the two
+  // honest-state rows the boards demonstrate (ci-runner no-window in both
+  // charts; archive stale last-known in 5h, elapsed in 7d). Reset epochs
+  // are the handoff fixture's; the archive 5h epoch lands at the board's
+  // stale-bar position (left fraction 0.066).
+  const tlAccounts = [
+    ACCT("1", "work", "alex@example.com", true,
+      [68, 1789246800], [41, 1789374600]),
+    ACCT("2", "research-platform-eu", "alexandra.research@example.com", false,
+      [32, 1789251300], [64, 1789504200]),
+    ACCT("3", "backup", "backup@example.com", false,
+      [90, 1789255800], [18, 1789763400]),
+    ACCT("4", "sandbox", "sandbox@example.com", false,
+      [12, 1789261200], [83, 1789266600]),
+    {
+      slot: "5", label: "ci-runner", email: "ci@example.com",
+      alias: "ci-runner", org: "Acme", kind: "api-key", active: false,
+      switchable: true, status: "api-key", quarantined: true,
+      note: "API key credential — no subscription quota",
+      windows: [],
+      timelineWindows: [
+        { kind: "5h", pct: null, resetsAt: null, startsAt: null,
+          state: "no-window", observedAt: NOW },
+        { kind: "7d", pct: null, resetsAt: null, startsAt: null,
+          state: "no-window", observedAt: NOW },
+      ],
+    },
+    {
+      slot: "6", label: "archive", email: "archive@example.com",
+      alias: "archive", org: "Acme", kind: "oauth", active: false,
+      switchable: true, status: "ok",
+      windows: [
+        { kind: "5h", label: "Five-hour", pct: 54, state: "stale" },
+        { kind: "7d", label: "Weekly", pct: 81, state: "stale",
+          countdownText: "Awaiting updated usage" },
+      ],
+      timelineWindows: [
+        { kind: "5h", pct: 54, resetsAt: 1789247380, startsAt: null,
+          state: "stale", observedAt: 1789241400 },
+        { kind: "7d", pct: 81, resetsAt: 1789244940, startsAt: null,
+          state: "elapsed", observedAt: 1789241400 },
+      ],
+    },
+  ];
+  window.CSWAP_TL_TZ = "America/Los_Angeles";
+  FIXTURE.accounts = tlAccounts;
+  FIXTURE.takenAt = NOW - 120;
+  FIXTURE.freshness = { ageText: "2m ago", ok: true };
+}
 
 if (!bridge.hosted) {
   console.log("[fixture] claude-swap panel — fixture mode; actions log here");
