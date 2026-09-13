@@ -459,9 +459,13 @@ class TestLeftComposition:
 
     def test_left_mode_places_companion_left_of_main(self, panel):
         panel.eval(
+            "const st = document.createElement('style');"
+            "st.textContent = '#tl-companion{animation:none !important}';"
+            "document.head.appendChild(st);"
             "CSWAP_TIMELINES.apply({mode: 'left', anchorOffset: 608}); 'ok'"
         )
         panel.spin(0.15)
+
         comp = json.loads(panel.eval(
             "(() => { const c = document.getElementById('tl-companion');"
             " const p = document.getElementById('panel');"
@@ -476,3 +480,106 @@ class TestLeftComposition:
             "CSWAP_TIMELINES.apply({mode: 'right', anchorOffset: 0}); 'ok'"
         )
         panel.spin(0.1)
+
+
+class TestHardening:
+    def test_inpanel_fallback_takes_over_with_back_row(self, panel):
+        panel.eval("CSWAP_TIMELINES.apply({mode: 'in-panel'}); 'ok'")
+        panel.spin(0.3)
+        back = panel.eval("""
+          (() => { const b = document.querySelector('.tl-back-row');
+            const c = document.getElementById('tl-companion');
+            const cr = c.getBoundingClientRect();
+            return JSON.stringify({back: !!b, text: b ? b.textContent.trim() : '',
+              x: cr.x, w: cr.width, tz: !!document.querySelector('.tl-tz'),
+              close: !!document.querySelector('.tl-close-btn')}); })()
+        """)
+        d = json.loads(back)
+        assert d["back"] and "Accounts" in d["text"]
+        vw = panel.eval("document.documentElement.clientWidth")
+        assert d["x"] == 0 and d["w"] == vw, \
+            "companion takes over the whole surface (the 360px popover in production)"
+        assert not d["tz"] and not d["close"], "wide-mode affordances hidden"
+        panel.eval("document.querySelector('.tl-back-row').click(); 'ok'")
+        panel.spin(0.15)
+        assert panel.eval("CSWAP_TIMELINES.state.mode === null")
+
+    def test_many_accounts_scroll_independently_with_pinned_axis(self, panel):
+        panel.open_timelines()  # the in-panel test's Back collapsed it
+        vm = json.loads(panel.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)"))
+        base = vm["accounts"][:4]
+        roster = list(base)
+        for i in range(8):
+            clone = json.loads(json.dumps(base[0]))
+            clone.update({"slot": f"2{i}", "alias": f"acct{i}", "active": False,
+                          "label": f"acct{i}"})
+            roster.append(clone)
+        vm["accounts"] = roster
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': vm})}); 'ok'"
+        )
+        panel.spin(0.15)
+        assert len(panel.rows("5h")) == 12
+        panel.eval(
+            "const s5 = document.querySelector('[data-tl-rows=\"5h\"]');"
+            "const w7 = document.querySelector('[data-tl-rows=\"7d\"]');"
+            "s5.scrollTop = 60; 'ok'"
+        )
+        panel.spin(0.1)
+        reads = json.loads(panel.eval("""
+          JSON.stringify({s5: document.querySelector('[data-tl-rows="5h"]').scrollTop,
+                          w7: document.querySelector('[data-tl-rows="7d"]').scrollTop,
+                          axisTop: document.querySelectorAll('.tl-axis')[0].getBoundingClientRect().top,
+                          now: !!document.querySelector('.tl-nowline')})
+        """))
+        assert reads["s5"] == 60 and reads["w7"] == 0, "charts scroll independently"
+        # pinned means UNMOVED by scrolling, wherever the card sits
+        after = panel.eval(
+            "document.querySelectorAll('.tl-axis')[0].getBoundingClientRect().top"
+        )
+        assert after == reads["axisTop"], "axis stays pinned while rows scroll"
+        assert reads["now"], "Now line pinned across scrolling"
+
+    def test_settings_dialog_coexists_with_open_charts(self, panel):
+        panel.open_timelines()
+        panel.eval(
+            "const g = document.querySelector('[data-act=\"gear\"]');"
+            "g.click(); 'ok'"
+        )
+        panel.spin(0.2)
+        assert panel.eval("!!document.querySelector('dialog[open]')"), \
+            "settings dialog opens over the expanded surface"
+        # T is inert while a dialog is open
+        open_mode = panel.eval("CSWAP_TIMELINES.state.mode !== null")
+        panel.eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 't', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.1)
+        assert panel.eval("CSWAP_TIMELINES.state.mode !== null") == open_mode
+        panel.eval(
+            "document.querySelector('dialog[open] [data-dlg=\"cancel\"]').click(); 'ok'"
+        )
+        panel.spin(0.15)
+        assert panel.eval("!document.querySelector('dialog[open]')")
+        assert panel.eval("CSWAP_TIMELINES.state.mode !== null"), \
+            "charts survive the modal round-trip"
+
+    def test_empty_roster_survives_and_disables_trigger(self, panel):
+        panel.open_timelines()
+        vm = json.loads(panel.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)"))
+        keep = json.loads(json.dumps(vm))
+        vm["accounts"] = []
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': vm})}); 'ok'"
+        )
+        panel.spin(0.15)
+        assert panel.rows("5h") == [], "empty roster renders no rows, no crash"
+        assert panel.eval(
+            "document.querySelector('.tl-trigger').disabled"
+        ), "trigger disabled with its why-tooltip"
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': keep})}); 'ok'"
+        )
+        panel.spin(0.15)
+        assert panel.rows("5h"), "roster returning restores rows"

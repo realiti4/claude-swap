@@ -309,6 +309,11 @@ window.CSWAP_TIMELINES = (() => {
     }
 
     let el = existing;
+    if (el && el.dataset.inpanel !== String(state.mode === "in-panel")) {
+      // mode changed between wide and in-panel: the header affordances
+      // (timezone/close vs Accounts back row) differ — rebuild the shell
+      el.innerHTML = companionHtml();
+    }
     if (!el) {
       el = document.createElement("section");
       el.id = "tl-companion";
@@ -335,6 +340,7 @@ window.CSWAP_TIMELINES = (() => {
         }
       });
     }
+    el.dataset.inpanel = String(state.mode === "in-panel");
     if (state.mode === "in-panel") {
       document.body.style.removeProperty("--tl-anchor-x");
     } else {
@@ -589,10 +595,33 @@ window.CSWAP_TIMELINES = (() => {
     }
   }
 
+  function skeletonRows() {
+    // First read in flight: keep headings/axis/geometry in place with
+    // placeholder rows — nothing that reads as a bar or a number.
+    const bars = [[12, 121], [42, 121], [73, 121], [109, 121]];
+    return bars.map(([x, w], i) => `
+      <div class="tl-row skeleton" aria-hidden="true">
+        <div class="row-left">
+          <span class="row-idx">${i + 1}</span>
+        </div>
+        <div class="row-track">
+          <span class="sk-bar" style="left:${x}px;width:${w}px"></span>
+        </div>
+        <div class="row-detail"><span class="sk-detail"></span></div>
+      </div>`).join("");
+  }
+
   function renderRows(vm) {
     if (vm !== undefined) state.vm = vm;
-    const accounts = (state.vm && state.vm.accounts) || [];
+    const haveVm = !!(state.vm && Array.isArray(state.vm.accounts));
+    const accounts = haveVm ? state.vm.accounts : [];
     const slots = new Set(accounts.map((a) => String(a.slot)));
+    if (!haveVm) {
+      document.querySelectorAll("[data-tl-rows]").forEach((rowsEl) => {
+        rowsEl.innerHTML = skeletonRows();
+      });
+      return;
+    }
     if (accounts.length && (state.selectedSlot === null
                             || !slots.has(String(state.selectedSlot)))) {
       // first open, or the selected account vanished from a push: fall

@@ -174,6 +174,12 @@ function render() {
     if (d) d.open = true;
   }
   wire();
+  const trig = els.panel.querySelector(".tl-trigger");
+  if (trig) {
+    const empty = !state.vm || !state.vm.accounts.length;
+    trig.disabled = empty;
+    trig.title = empty ? "No accounts yet" : "Reset timelines (T)";
+  }
   if (window.CSWAP_TIMELINES && CSWAP_TIMELINES.state.mode) {
     CSWAP_TIMELINES.renderRows(state.vm);  // open charts track vm pushes
   }

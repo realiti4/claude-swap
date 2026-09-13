@@ -789,3 +789,37 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   padding: 0 4px;
   white-space: nowrap;
 }
+
+/* ---- open/close motion (interaction board: 140ms toward the side) ------ */
+@keyframes tl-slide-right {
+  from { transform: translateX(16px); opacity: 0.4; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+@keyframes tl-slide-left {
+  from { transform: translateX(-16px); opacity: 0.4; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+body.tl-expanded.tl-right #tl-companion {
+  animation: tl-slide-right 140ms ease-out;
+}
+body.tl-expanded.tl-left #tl-companion {
+  animation: tl-slide-left 140ms ease-out;
+}
+body.tl-expanded.tl-inpanel-mode #tl-companion {
+  animation: none;  /* takeover, not a slide */
+}
+@media (prefers-reduced-motion: reduce) {
+  body.tl-expanded #tl-companion { animation: none !important; }
+}
+
+/* skeleton rows (board 20 Loading: headings/axis stay, no bar yet) */
+.tl-row.skeleton .row-left { opacity: 0.55; }
+.tl-row.skeleton .sk-bar {
+  position: absolute; top: 6px; height: var(--swap-tl-bar-h);
+  border-radius: var(--swap-tl-bar-radius);
+  background: var(--swap-tl-surface-3);
+}
+.tl-row.skeleton .sk-detail {
+  position: absolute; right: 0; top: 5px; height: 12px; width: 88px;
+  border-radius: 4px; background: var(--swap-tl-surface-3);
+}
