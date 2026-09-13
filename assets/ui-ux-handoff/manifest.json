@@ -1,18 +1,18 @@
 {
-  "title": "Claude Code Swap \u2014 product-aligned baseline and planned timelines",
+  "title": "Claude Code Swap \u2014 baseline, released timelines and Settings design wave",
   "design_source": "../untitled.pen",
   "design_source_note": "Editable source verified in Pen; not parsed or hashed by filesystem tools.",
   "screen_count": 15,
   "assets": [
     {
       "path": "HANDOFF.md",
-      "bytes": 16542,
-      "sha256": "10fa2f5d57d8baee131a35b2111997650541d4cda8f7e8018dd7a54ac279f4e8"
+      "bytes": 16669,
+      "sha256": "6573224c697d4a1c6aa1ba8eea7243df779812de54760be7a6f180e98533372a"
     },
     {
       "path": "START-HERE.md",
-      "bytes": 2294,
-      "sha256": "b5032e1b1d1d5bbbff9d2d2403576d0f430594f0c0bf91b642dd4ee4e1eccc1e"
+      "bytes": 3016,
+      "sha256": "d53fd780cc2c72ce683aa20ae53cfea6108e3a0a7069e66794e5ae53c44e6c97"
     },
     {
       "path": "icons/icon-master-256.png",
@@ -60,56 +60,56 @@
     },
     {
       "path": "screens/01-main-dark.png",
-      "bytes": 34486,
-      "sha256": "036b94937f8e15753f1001ba54aa7c95c6f362e7cfa80354515bac6ee48fe9e5",
+      "bytes": 35124,
+      "sha256": "4f8b39e78486175b4913c7b042e421a2dc72d954330267c448929eefbc7b2c1a",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/02-main-light.png",
-      "bytes": 34518,
-      "sha256": "5a504065a20e1a2c0ff57973e88e744e1114eeb4a92b8e78a880855027d48799",
+      "bytes": 35166,
+      "sha256": "8426c1d62cd8b0204c38f9aa5a1aa11a57fa91334ee5bf91608a141d9417e5c2",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/03-account-preview.png",
-      "bytes": 37887,
-      "sha256": "e0c7db68e450bd01c4699e951cf90ca8c13be2bb8c49d841e0da2b96e51bff93",
+      "bytes": 38542,
+      "sha256": "c8be71538bc5984425c6518ff8346c6ff55269f68cf87e024dc89c0080120e57",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/04-stale-offline.png",
-      "bytes": 37688,
-      "sha256": "1fa70381a2966e418a0ab040f72f65fa539b2bb0e0de906e28896ee4bbe55175",
+      "bytes": 38321,
+      "sha256": "c1686c4a4b0394cc901baf70a1aa6b7aec76115e72901fcb684d09d38dba6074",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/05-no-accounts.png",
-      "bytes": 23708,
-      "sha256": "8cc920fdb7201b1a90a18b9909f4fba468f736efbd7d408f4488e2b3c108e813",
+      "bytes": 24392,
+      "sha256": "e7cfa2f33e1c02ad0200afe5c08ad319e6220ad432bbe3df6c5fcd36b25cffea",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/06-add-token.png",
-      "bytes": 33986,
-      "sha256": "c4d4ee981b0d5005113289d5dfc08bb812c47e0dc6f5ef2b88cf06ec5509ac0d",
+      "bytes": 34595,
+      "sha256": "1273c79a641deee36e3baf87e21576059f94b02139ff8a3f92914c95362cc0b8",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/07-remove-account.png",
-      "bytes": 42572,
-      "sha256": "922b43f1475f4225fc36951fa5bf6713df40c57c126b24c34d8aabd876e9dc97",
+      "bytes": 43171,
+      "sha256": "dd474673dfc456abb6fc219e7bee6b4dd0ee2e8c7a05dace1bd62779c0afd6d5",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -124,16 +124,16 @@
     },
     {
       "path": "screens/09-settings-dark.png",
-      "bytes": 32543,
-      "sha256": "02057be9e9fab0f451c5a5a35f0799d528bbdc18cc5ac066ca9fa691a98ea258",
+      "bytes": 33161,
+      "sha256": "c467ea7ea5418149a1d7843c8484146ace021c04a989b49f0ab3c660d568fd05",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/10-settings-light.png",
-      "bytes": 33804,
-      "sha256": "3f2e2c37253febf89d755b7a4a1d0262ab09b44fd7052c423f29a6e0c17156fb",
+      "bytes": 34436,
+      "sha256": "9a6257593fe00fc68b379d4f433a2f48ea9df22d0b18ea997527aa91cfdbd09c",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -148,32 +148,32 @@
     },
     {
       "path": "screens/12-account-dark.png",
-      "bytes": 34486,
-      "sha256": "036b94937f8e15753f1001ba54aa7c95c6f362e7cfa80354515bac6ee48fe9e5",
+      "bytes": 35124,
+      "sha256": "4f8b39e78486175b4913c7b042e421a2dc72d954330267c448929eefbc7b2c1a",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/13-account-light.png",
-      "bytes": 34518,
-      "sha256": "5a504065a20e1a2c0ff57973e88e744e1114eeb4a92b8e78a880855027d48799",
+      "bytes": 35166,
+      "sha256": "8426c1d62cd8b0204c38f9aa5a1aa11a57fa91334ee5bf91608a141d9417e5c2",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/14-edit-alias-dark.png",
-      "bytes": 34601,
-      "sha256": "23c41e732c688283c0b9cda1c381da4cf557dea5877bfd01c7e539aa8cd0e0ef",
+      "bytes": 35204,
+      "sha256": "ccbfe88316d128f964ddb6b9ddf9ad6ebfd6ec705f3fefbd96a05a186acba53c",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
     },
     {
       "path": "screens/15-edit-alias-light.png",
-      "bytes": 34669,
-      "sha256": "7956386ec4c44e4a3e18e07e2928918152c2670e9d157af3053fff0390712553",
+      "bytes": 35293,
+      "sha256": "dbda192940ed2eb73c5692be3fa61b5e64e0a7de9a3bbf01872f600c309adf57",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -190,8 +190,8 @@
     },
     {
       "path": "TIMELINES.md",
-      "bytes": 7194,
-      "sha256": "cab597d36209f48b7583cbacbac1cff3e44ac8b03e10905e026b9b5f102af9f8"
+      "bytes": 7533,
+      "sha256": "7b4967aa15780caaca3f600a3d24b8bd8c5e8c3c533b20e774af38a4475a9c8e"
     },
     {
       "path": "timeline-screens/17-timelines-right-dark-draft.png",
@@ -205,8 +205,8 @@
     {
       "path": "timeline-screens/16-timelines-closed.png",
       "status": "design reference",
-      "bytes": 34718,
-      "sha256": "57f1f95d3ce63d0e81fa44ddfe4284102ef45c74a3edf21343f142a11976e3e6",
+      "bytes": 35124,
+      "sha256": "4f8b39e78486175b4913c7b042e421a2dc72d954330267c448929eefbc7b2c1a",
       "width": 360,
       "height": 560,
       "mode": "RGBA"
@@ -214,8 +214,8 @@
     {
       "path": "timeline-screens/17-timelines-right-dark.png",
       "status": "design reference",
-      "bytes": 91489,
-      "sha256": "9c9dc6327aabc46a50473fb6df6a8644557151649faef28e465636beec64e215",
+      "bytes": 97208,
+      "sha256": "a1124166977888439569e881a60000c0cc371ffee8001154f06a42c7886b6890",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -223,8 +223,8 @@
     {
       "path": "timeline-screens/18-timelines-right-light.png",
       "status": "design reference",
-      "bytes": 91913,
-      "sha256": "7848e7454a7f4c0f326ef5a25a5c7bb80c6f5cb9fb405bec1a947f066ce10152",
+      "bytes": 97455,
+      "sha256": "47ec4b385a9f15d6c4a4554bf3ee4e8427ee2875f23c1f7259b5e70a2bd30376",
       "width": 968,
       "height": 560,
       "mode": "RGBA"
@@ -249,13 +249,13 @@
     },
     {
       "path": "IMPLEMENTATION-NOTES.md",
-      "bytes": 5879,
-      "sha256": "3a46f98009b142f7dece6bfaab86c4e77738bc8f2e24be422bc9e9e296623eac"
+      "bytes": 9289,
+      "sha256": "8c8b8d92bb928f9b52b00c67ff641a28a3990bacfe54c0b8a1c64b3107f81776"
     },
     {
       "path": "VERIFICATION.md",
-      "bytes": 3017,
-      "sha256": "1da5471c71980ae02728d3a31febbc1c1cdf91a011274b88cd23d402c0465193"
+      "bytes": 4771,
+      "sha256": "ddba49f795e925317bb234bfee45f68fe530db7a75ea228a95aa08f4c93878fa"
     },
     {
       "path": "implemented-main-dark.png",
@@ -272,11 +272,163 @@
       "width": 360,
       "height": 560,
       "mode": "RGB"
+    },
+    {
+      "path": "next-wave/DATA-CONTRACT.md",
+      "bytes": 4439,
+      "sha256": "b1f9b5ff19c423cd1bdda47b9f1afb237dd93e6b4650a48245176a7569453de3"
+    },
+    {
+      "path": "next-wave/QA.md",
+      "bytes": 3357,
+      "sha256": "e623f4e13eb3bd5ff271bb19b488bce90a5cc66ce28c0709629ab191c80705f6"
+    },
+    {
+      "path": "next-wave/README.md",
+      "bytes": 2397,
+      "sha256": "9d09759ea67e143447ab14a6204bcd3589f18e43b279ef50fdddafaf4cb826a9"
+    },
+    {
+      "path": "next-wave/CODING-AGENT.md",
+      "bytes": 2039,
+      "sha256": "db95e19589c53687ad60627ed777d128ccfd0db3d53513dec93df58bd6f5282a"
+    },
+    {
+      "path": "next-wave/tasks/todo.md",
+      "bytes": 13769,
+      "sha256": "07a41a2a35c13ce449a0d3bd86a77b953a15168610eabc646aabb4d30187609b"
+    },
+    {
+      "path": "next-wave/tasks/plan.md",
+      "bytes": 7302,
+      "sha256": "3f3169de08de13ddced9a4e15518a242926251bee2feabacfa8c7467f1629e63"
+    },
+    {
+      "path": "next-wave/fixtures/timelines.json",
+      "bytes": 7481,
+      "sha256": "55e62c23718b30cc6be0c679d19346d7125c58a52240ead46851206259925992"
+    },
+    {
+      "path": "SETTINGS.md",
+      "bytes": 8106,
+      "sha256": "ad38a9fe38314897bff95592e9217a04c34e09e0fb3758f0c2f10dcdb121ccbd"
+    },
+    {
+      "path": "CANVAS-MAP.md",
+      "bytes": 1109,
+      "sha256": "f1d9c9b8b0ef60ae1fa857a542e590a3044199a0108f6547bb1bf9036556f66e"
+    },
+    {
+      "path": "settings-screens/27-settings-left.png",
+      "bytes": 79147,
+      "sha256": "382e4c31646dcc4ab1f96997bf6930f466f05a7ba7dd004364d99c283deb9164",
+      "width": 1091,
+      "height": 660,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/21-main-active-highlight.png",
+      "bytes": 38124,
+      "sha256": "862a8213861a77f297d6daecd50027230312bc0634dd4e3adfb38b1b1143208f",
+      "width": 360,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/22-settings-appearance-dark.png",
+      "bytes": 58614,
+      "sha256": "84a630c956b0c6463ec7c02039ce3c789852f460f01fccf8f681c815cb5991c1",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/28-settings-states.png",
+      "bytes": 220017,
+      "sha256": "0159e6540d3b323c488015e936baf7c8b86f2a0e361cedfce2652f51478acac4",
+      "width": 900,
+      "height": 1899,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/24-settings-refresh-dark.png",
+      "bytes": 63457,
+      "sha256": "9470479617582747657ca5d70476e1ebc80b7091b7f99ddf12a42ce770967572",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/25-settings-auto-switch-dark.png",
+      "bytes": 73388,
+      "sha256": "5218689d7c40626eecfa3015e61e4aab89a564a2cf72feacb19aecc9ac489c67",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/26-settings-appearance-light.png",
+      "bytes": 58329,
+      "sha256": "c008c20f5641fea9f18c319b92537a3627cb34bbcd1ad8d09874e237eda53859",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "settings-screens/23-settings-menu-bar-dark.png",
+      "bytes": 66569,
+      "sha256": "2fe0e6c6ad499e438e0b51ad40dbcee142d9d329f21c98388eaea3254a831e81",
+      "width": 968,
+      "height": 560,
+      "mode": "RGBA",
+      "status": "reviewed design reference; not implemented"
+    },
+    {
+      "path": "FONT-RENDERING.md",
+      "bytes": 1625,
+      "sha256": "66b23f2f7dcb087e99084414e384d26b046c2915adee9560af8e09c25fd5f82c"
     }
   ],
   "timeline_draft_count": 1,
   "timeline_screen_count": 5,
   "reconciled_against_commit": "26c0580",
   "baseline_screen_count": 15,
-  "total_current_screen_count": 20
+  "total_current_screen_count": 20,
+  "next_wave_prepared_against_commit": "9d0467192257efd553ed4d462457e6afdbd16729",
+  "settings_wave_status": "reviewed, saved and exported; not implemented",
+  "settings_screen_count": 8,
+  "canvas_artboard_count": 28,
+  "limit_timelines_reexport": {
+    "date": "2026-09-12",
+    "boards": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18
+    ],
+    "format": "native Pen PNG 1x",
+    "font_status": "Inter and IBM Plex Mono by name; exact bundled WOFF2 binding unsupported",
+    "runtime_fidelity_status": "capture fixtures and geometry records need reconciliation; see IMPLEMENTATION-NOTES.md"
+  }
 }

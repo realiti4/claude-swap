@@ -98,6 +98,13 @@ values, empty roster, missing/reset-unavailable data, API-key accounts, stale
 and elapsed reset states, long aliases, many accounts, and a narrow-screen
 fallback. Keep both chart types distinct even if one has no data.
 
+## Implementation package
+
+See [next-wave/README.md](next-wave/README.md) for the implementation sequence,
+proposed additive data contract, deterministic geometry fixtures and QA matrix.
+The current view model omits missing-percentage windows and elapsed reset
+epochs; the data contract addresses those gaps without changing quota cards.
+
 ## Native integration implications
 
 The current shell creates a transient NSPopover at 360 × 560. A DOM slide alone

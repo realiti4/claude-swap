@@ -68,8 +68,10 @@ Tailwind's CDN, but neither the SVGs nor the implementation should depend on it.
 
 Utility icons already live in `web/icons.js`; reuse that system for refresh,
 settings, edit, close, etc. Replace only its old swap-brand glyph with Interlock.
-Do not ship exploration candidates B/C. No font binaries are supplied: use the
-existing local Inter/system and IBM Plex Mono/system-monospace fallback stacks.
+Do not ship exploration candidates B/C. The app now bundles Inter variable and
+IBM Plex Mono400/600 in `web/fonts/`; use those @font-face declarations. See
+[FONT-RENDERING.md](FONT-RENDERING.md) for the distinction between Pen family
+selection and exact bundled-byte runtime rendering.
 
 ## Layout and appearance
 

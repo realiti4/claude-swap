@@ -1,8 +1,13 @@
 # Coding agent entry point
 
+**Next wave:** start with [next-wave/README.md](next-wave/README.md) for the
+implementation brief, ordered checklist, data contract, fixtures and QA matrix.
+
 Maintain the **Claude Code Swap** menu bar UI using [HANDOFF.md](HANDOFF.md).
 Read [IMPLEMENTATION-NOTES.md](IMPLEMENTATION-NOTES.md) for the implemented
-baseline; timeline screens are a separate planned extension.
+baseline and completed Reset Timelines release. Boards01–18 have been
+re-exported with the trigger/chip/crosshair additions; read the appended
+reconciliation and [font rendering limits](FONT-RENDERING.md) before updating captures.
 The saved [Pen source](../untitled.pen), all 15 final screen exports, exact SVG
 logo paths, native template PDF/PNGs, and token seed accompany it.
 
@@ -39,3 +44,11 @@ Record the completed comparison in VERIFICATION.md. If an update is unfinished,
 mark its affected boards pending explicitly; do not call their exports current.
 Keep planned features labeled separately from implemented product behavior.
 This is a review workflow, not an automatic synchronization guarantee.
+
+## Following design wave: Settings companion
+
+[SETTINGS.md](SETTINGS.md) describes the categorized Settings companion, Quit
+action and stronger active-account treatment. This follows the timeline wave;
+its new Pen boards21–28 are now reviewed, saved and exported.
+See CANVAS-MAP.md for the organized document. Do not silently
+expand the existing coding-agent timeline brief to include it.
