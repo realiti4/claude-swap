@@ -341,8 +341,17 @@ class TestEscapeAndFocus:
         assert "→" in text, "exact start → end span present"
 
     def test_escape_closes_detail_before_companion(self, panel):
+        # self-sufficient: open the detail here rather than relying on the
+        # previous test's leftover (order-fragile under reordering)
+        panel.eval(
+            "const r0 = document.querySelector('[data-tl-rows=\"5h\"] .tl-row');"
+            "if (r0) { r0.focus();"
+            " r0.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Enter', bubbles: true})); } 'ok'"
+        )
+        panel.spin(0.15)
         assert panel.eval("document.getElementById('tl-detail') !== null"), \
-            "detail open from the previous test"
+            "detail open"
         panel.eval(
             "document.dispatchEvent(new KeyboardEvent('keydown', "
             "{key: 'Escape', bubbles: true})); 'ok'"
