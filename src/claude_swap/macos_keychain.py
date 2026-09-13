@@ -156,12 +156,64 @@ def item_exists(service: str, account: str) -> bool:
     return result.returncode == 0
 
 
+_ERR_SEC_ITEM_NOT_FOUND = -25300
+
+
+def _security_framework():
+    """Security.framework bindings, or None when PyObjC is not installed.
+
+    Probed once: the CLI runs on machines without the (optional) PyObjC
+    extra, and probing per call would import on every credential op.
+    """
+    global _SECURITY_FRAMEWORK
+    if _SECURITY_FRAMEWORK is None:
+        try:
+            from Foundation import NSData  # noqa: F401
+            import Security  # noqa: F401
+
+            _SECURITY_FRAMEWORK = (Security, __import__("Foundation"))
+        except Exception:
+            _SECURITY_FRAMEWORK = False
+    return _SECURITY_FRAMEWORK or None
+
+
+_SECURITY_FRAMEWORK = None
+
+
+def _set_via_security_framework(service: str, account: str, password: bytes) -> None:
+    """Write through Security.framework — no subprocess, no argv, no line
+    limit. Raises :class:`KeychainError` on any nonzero status; the error
+    carries the status code only, never secret material."""
+    Security, Foundation = _security_framework()
+    query = {
+        Security.kSecClass: Security.kSecClassGenericPassword,
+        Security.kSecAttrService: service,
+        Security.kSecAttrAccount: account,
+    }
+    data = Foundation.NSData.dataWithBytes_length_(password, len(password))
+    status = Security.SecItemCopyMatching(query, None)
+    if status == _ERR_SEC_ITEM_NOT_FOUND:
+        attrs = dict(query)
+        attrs[Security.kSecValueData] = data
+        status = Security.SecItemAdd(attrs, None)
+    elif status == 0:
+        status = Security.SecItemUpdate(query, {Security.kSecValueData: data})
+    if status != 0:
+        raise KeychainError(
+            f"Security.framework write failed (status={status})"
+        )
+
+
 def set_password(service: str, account: str, password: str) -> None:
     """Create or update a generic-password item (``-U``).
 
-    Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
-    argv only for payloads that would overflow the stdin line buffer. Raises
-    :class:`KeychainError` on a non-zero exit or a timeout.
+    Small payloads go through ``security -i`` stdin so the secret never
+    appears in argv. Payloads that would overflow the stdin line buffer
+    go through Security.framework (no subprocess at all); when those
+    bindings are unavailable the write is **refused** — an oversized
+    credential is never placed in argv, where any process observer could
+    recover it byte-for-byte (audit F01). Raises :class:`KeychainError`
+    on a non-zero exit, a timeout, or the refusal above.
     """
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
@@ -169,28 +221,25 @@ def set_password(service: str, account: str, password: str) -> None:
         f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
         f"-X {hex_value}\n"
     )
+    if len(command.encode("utf-8")) > SECURITY_STDIN_LINE_LIMIT:
+        if _security_framework() is None:
+            raise KeychainError(
+                "credential too large for the Keychain stdin channel and "
+                "Security.framework bindings are unavailable; refusing the "
+                "write rather than exposing the secret in process arguments "
+                "(install pyobjc-framework-Security or use a smaller "
+                "credential)"
+            )
+        _set_via_security_framework(service, account, password.encode("utf-8"))
+        return
     try:
-        if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
-                [_SECURITY, "-i"],
-                input=command,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-            )
-        else:
-            # Overflows the stdin line buffer; fall back to argv. Hex in argv is
-            # recoverable by a determined observer but defeats naive plaintext-grep
-            # rules, and the alternative — silent corruption — is strictly worse.
-            result = subprocess.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-            )
+        result = subprocess.run(
+            [_SECURITY, "-i"],
+            input=command,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+        )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
             f"security add-generic-password timed out after {_TIMEOUT}s"

@@ -99,18 +99,88 @@ def test_set_password_small_payload_uses_security_i_stdin():
         assert '-a "acct"' in stdin and '-s "svc"' in stdin
 
 
-def test_set_password_large_payload_falls_back_to_argv():
+def test_set_password_large_payload_refuses_without_framework():
+    """Audit F01: an oversized credential is never placed in argv, where a
+    process observer recovers it byte-for-byte. Without Security.framework
+    bindings the write is refused outright."""
     big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT  # hex doubles the length
-    with patch("claude_swap.macos_keychain.subprocess.run") as run:
-        run.return_value = _completed(0)
-        macos_keychain.set_password("svc", "acct", big)
+    with patch("claude_swap.macos_keychain.subprocess.run") as run,          patch("claude_swap.macos_keychain._security_framework",
+               return_value=None):
+        with pytest.raises(macos_keychain.KeychainError, match="refusing"):
+            macos_keychain.set_password("svc", "acct", big)
+        run.assert_not_called()  # never spawned with the secret anywhere
 
-        args = run.call_args.args[0]
-        assert args[:3] == ["/usr/bin/security", "add-generic-password", "-U"]  # argv path
-        assert "input" not in run.call_args.kwargs  # not via stdin
-        # Hex value passed as a raw list element (no shell, no quoting).
-        assert big.encode().hex() in args
-        assert "acct" in args and "svc" in args
+
+def test_set_password_large_payload_uses_security_framework():
+    """With the framework available the oversized write goes through
+    SecItemAdd/SecItemUpdate — no subprocess, no argv, no line limit."""
+    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT
+    calls = {}
+
+    class FakeSecurity:
+        kSecClass = "class"
+        kSecClassGenericPassword = "generic"
+        kSecAttrService = "service"
+        kSecAttrAccount = "account"
+        kSecValueData = "value"
+
+        @staticmethod
+        def SecItemCopyMatching(query, _out):
+            calls["match"] = query
+            return macos_keychain._ERR_SEC_ITEM_NOT_FOUND
+
+        @staticmethod
+        def SecItemAdd(attrs, _out):
+            calls["add"] = attrs
+            return 0
+
+        @staticmethod
+        def SecItemUpdate(_query, _attrs):
+            calls["update"] = True
+            return 0
+
+    class FakeFoundation:
+        @staticmethod
+        def NSData():
+            raise AssertionError("replaced below")
+
+    import types
+    nsdata = types.SimpleNamespace(
+        dataWithBytes_length_=lambda b, n: ("data", b))
+    fake_foundation = types.SimpleNamespace(NSData=nsdata)
+    with patch("claude_swap.macos_keychain.subprocess.run") as run,          patch("claude_swap.macos_keychain._security_framework",
+               return_value=(FakeSecurity, fake_foundation)):
+        macos_keychain.set_password("svc", "acct", big)
+    run.assert_not_called()
+    assert calls["add"]["value"] == ("data", big.encode())
+    # update path: item already exists
+    FakeSecurity.SecItemCopyMatching = staticmethod(
+        lambda q, _o: 0)
+    with patch("claude_swap.macos_keychain.subprocess.run") as run,          patch("claude_swap.macos_keychain._security_framework",
+               return_value=(FakeSecurity, fake_foundation)):
+        macos_keychain.set_password("svc", "acct", big)
+    assert calls["update"] is True
+
+
+def test_set_password_framework_error_raises_without_secret():
+    class FailingSecurity:
+        kSecClass = "c"; kSecClassGenericPassword = "g"
+        kSecAttrService = "s"; kSecAttrAccount = "a"; kSecValueData = "v"
+
+        @staticmethod
+        def SecItemCopyMatching(_q, _o):
+            return -34018  # errSecMissingEntitlement
+
+    import types
+    fake_foundation = types.SimpleNamespace(NSData=types.SimpleNamespace(
+        dataWithBytes_length_=lambda b, n: ("data", b)))
+    big = "y" * macos_keychain.SECURITY_STDIN_LINE_LIMIT
+    with patch("claude_swap.macos_keychain._security_framework",
+               return_value=(FailingSecurity, fake_foundation)):
+        with pytest.raises(macos_keychain.KeychainError,
+                           match="status=-34018") as exc:
+            macos_keychain.set_password("svc", "acct", big)
+        assert big not in str(exc.value)  # error never carries the secret
 
 
 def test_set_password_raises_on_nonzero():
