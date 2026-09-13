@@ -38,6 +38,30 @@ def _web_dir():
     return WEB_DIR
 
 
+_DELEGATE_SEQ = {"n": 0}
+
+
+def _make_delegate_class():
+    """One didFinishNavigation delegate class per Panel: PyObjC refuses
+    re-registering a name, and a shared class with a static owner trips
+    native teardown when two panels coexist."""
+    import AppKit
+
+    _DELEGATE_SEQ["n"] += 1
+
+    def did_finish(self, _wv, _nav):
+        owner = getattr(self, "owner", None)  # the loaded-flag dict
+        if owner is not None:
+            owner["ok"] = True
+
+    # the selector must be in the type dict at creation — post-hoc
+    # assignment never wires the ObjC method and crashes at dispatch
+    return type(
+        f"_PanelNavDelegate{_DELEGATE_SEQ['n']}", (AppKit.NSObject,),
+        {"webView_didFinishNavigation_": did_finish},
+    )
+
+
 class Panel:
     """One WKWebView on the fixture page; eval via a runloop spin."""
 
@@ -50,17 +74,9 @@ class Panel:
         self._AppHelper = AppHelper
         self.app = AppKit.NSApplication.sharedApplication()
         self.loaded = {"ok": False}
-
-        class Nav(AppKit.NSObject):
-            pass
-
-        nav = Nav.new()
-        panel = self
-
-        # PyObjC turns function attrs on ObjC subclasses into methods; a
-        # closure over self via class-level dict is the safe carrier.
-        Nav.handler = None
-        import objc  # noqa: F401
+        delegate = _make_delegate_class().new()
+        delegate.owner = self.loaded
+        self.delegate = delegate
 
         win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             ((60.0, 60.0), (968.0, 560.0)), 0,
@@ -72,12 +88,6 @@ class Panel:
         win.setContentView_(view)
         win.orderFront_(None)
         self.view = view
-
-        class Delegate(AppKit.NSObject):
-            def webView_didFinishNavigation_(self, _wv, _nav):
-                panel.loaded["ok"] = True
-
-        self.delegate = Delegate.new()
         view.setNavigationDelegate_(self.delegate)
         url = "file://" + str(_web_dir() / "index.html")
         if query:
@@ -120,7 +130,9 @@ class Panel:
         self.view.evaluateJavaScript_completionHandler_(js, done)
         self._run_until(lambda: "v" in box or "e" in box, timeout)
         if box.get("e") is not None:
-            raise RuntimeError(str(box["e"].localizedDescription()))
+            raise RuntimeError(
+                f"{box['e'].localizedDescription()}: {js[:100]}"
+            )
         return box.get("v")
 
     # ---- panel actions ----------------------------------------------------
@@ -287,10 +299,11 @@ class TestPushPreservation:
         assert sel and sel[0] != "10", "selection survives; removed row falls back"
 
     def test_selected_row_removal_falls_back_cleanly(self, panel):
+        before = panel.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)")
         panel.eval(
             "document.querySelector('[data-tl-rows=\"5h\"] .tl-row[data-slot=\"2\"]').click(); 'ok'"
         )
-        vm = json.loads(panel.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)"))
+        vm = json.loads(before)
         vm["accounts"] = [a for a in vm["accounts"] if a["slot"] != "2"]
         panel.eval(
             f"window.cswap.push({json.dumps({'type': 'vm', 'data': vm})}); 'ok'"
@@ -299,9 +312,79 @@ class TestPushPreservation:
         sel = [r["slot"] for r in panel.rows("5h") if r["selected"] == "true"]
         assert sel, "selection falls back rather than dangling"
         assert sel[0] != "2"
+        # restore: later classes (detail content) target the full roster
+        panel.eval(
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': json.loads(before)})}); 'ok'"
+        )
+        panel.spin(0.15)
 
 
 class TestEscapeAndFocus:
+    def test_enter_opens_detail_with_exact_content(self, panel):
+        panel.eval(
+            "const r = document.querySelector('[data-tl-rows=\"5h\"] .tl-row[data-slot=\"2\"]');"
+            "r.focus(); r.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Enter', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.15)
+        text = panel.eval(
+            "(() => { const d = document.getElementById('tl-detail');"
+            " return d ? d.textContent.replace(/\\s+/g, ' ') : 'MISSING'; })()"
+        )
+        assert "research-platform-eu" in text, "full alias, never ellipsized"
+        assert "Session window · 5 hours" in text
+        assert "32% used" in text and "64% used" in text
+        assert "start inferred (reset − 5h)" in text
+        assert "→" in text, "exact start → end span present"
+
+    def test_escape_closes_detail_before_companion(self, panel):
+        assert panel.eval("document.getElementById('tl-detail') !== null"), \
+            "detail open from the previous test"
+        panel.eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Escape', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.1)
+        assert panel.eval("document.getElementById('tl-detail') === null"), \
+            "stage 1 closes the detail only"
+        assert panel.eval("document.getElementById('tl-companion') !== null"), \
+            "companion survives stage 1"
+        panel.eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Escape', bubbles: true})); 'ok'"
+        )
+        panel.spin(0.1)
+        assert panel.eval("document.getElementById('tl-companion') === null"), \
+            "stage 2 collapses the companion"
+
+    def test_detail_closes_when_its_account_vanishes(self):
+        # fresh panel: the shared module panel's roster carries earlier
+        # tests' mutations, and this flow needs a deterministic roster
+        p = Panel()
+        p.open_timelines()
+        slots = [r["slot"] for r in p.rows("5h")]
+        assert slots, "rows present before opening the detail"
+        victim = slots[0]
+        p.eval(
+            f"const r = document.querySelector('[data-tl-rows=\"5h\"] "
+            f".tl-row[data-slot=\"{victim}\"]');"
+            "r.focus(); r.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Enter', bubbles: true})); 'ok'"
+        )
+        p.spin(0.15)
+        assert p.eval("document.getElementById('tl-detail') !== null")
+        vm = json.loads(p.eval("JSON.stringify(CSWAP_TIMELINES.state.vm)"))
+        vm["accounts"] = [a for a in vm["accounts"] if a["slot"] != victim]
+        outcome = p.eval(
+            "(() => { try {"
+            f"window.cswap.push({json.dumps({'type': 'vm', 'data': vm})});"
+            " return 'pushed'; } catch (e) { return 'THREW: ' + e.message; } })()"
+        )
+        p.spin(0.15)
+        assert outcome == "pushed", outcome
+        assert p.eval("document.getElementById('tl-detail') === null"), \
+            "detail closes safely when its account disappears"
+
     def test_escape_collapses_and_returns_focus_to_trigger(self, panel):
         panel.open_timelines()
         panel.eval(

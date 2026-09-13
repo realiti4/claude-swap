@@ -254,7 +254,7 @@ window.CSWAP_TIMELINES = (() => {
         </div>
         <div class="tl-nowline" aria-hidden="true"
              style="left:${TRACK_X + TRACK_W / 2}px"></div>
-        <div class="tl-rows" data-tl-rows="${def.kind}" role="list"
+        <div class="tl-rows" data-tl-rows="${def.kind}" role="listbox"
              aria-label="${def.title} rows"></div>
       </div>
     </section>`;
@@ -320,6 +320,10 @@ window.CSWAP_TIMELINES = (() => {
           if (trigBtn) trigBtn.focus();  // opener focus restored on close
           return;
         }
+        if (act && act.dataset.tlAct === "close-detail") {
+          closeDetail();
+          return;
+        }
         const row = ev.target.closest(".tl-row");
         if (row && row.dataset.slot) {
           // Selection inspects; it never activates the account.
@@ -382,6 +386,7 @@ window.CSWAP_TIMELINES = (() => {
     const geo = window.CSWAP_TIMELINES_GEOMETRY;
     const w = geo.deriveWindowState(kind, acct, now);
     const selected = state.selectedSlot === acct.slot;
+    const focusable = selected ? "0" : "-1";  // roving tabindex
     const rail = selected ? '<span class="row-rail"></span>' : "";
     const left = `
       <div class="row-left">
@@ -414,9 +419,9 @@ window.CSWAP_TIMELINES = (() => {
     const offscale = g && g.offscale
       ? '<span class="offscale-mark" title="Reset is outside the visible window"></span>'
       : "";
-    return `<div class="tl-row${selected ? " selected" : ""}" role="listitem"
-      data-slot="${esc(acct.slot)}" aria-selected="${selected}"
-      data-kind="${kind}">${rail}${left}
+    return `<div class="tl-row${selected ? " selected" : ""}" role="option"
+      tabindex="${focusable}" data-slot="${esc(acct.slot)}"
+      aria-selected="${selected}" data-kind="${kind}">${rail}${left}
       <div class="row-track">${offscale}
         <span class="${winCls}" style="left:${(g.leftFraction * 100).toFixed(3)}%;
           width:${(g.widthFraction * 100).toFixed(3)}%"></span>${fill}${cap}
@@ -432,6 +437,111 @@ window.CSWAP_TIMELINES = (() => {
     // in place (renderRows preserves per-chart scroll).
     state.vm = vm;
     if (state.mode) renderRows();
+  }
+
+  // ---- row detail (board 20: surface-3 r8, border-strong, inferred) ----
+
+  function fmtLocal(tsSec, withDate = true) {
+    try {
+      const d = new Date(tsSec * 1000);
+      const time = d.toLocaleTimeString("en-GB", {
+        hour: "2-digit", minute: "2-digit", hour12: false, timeZone: TL_TZ(),
+      });
+      if (!withDate) return time;
+      const date = d.toLocaleDateString("en-GB", {
+        weekday: "short", day: "numeric", month: "short", timeZone: TL_TZ(),
+      });
+      return `${date} ${time}`;
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function windowDetail(acct, kind, now) {
+    const geo = window.CSWAP_TIMELINES_GEOMETRY;
+    const w = geo.deriveWindowState(kind, acct, now);
+    const D = geo.TL_SECONDS[kind];
+    const unit = kind === "5h" ? "5 hours" : "7 days";
+    let body;
+    if (w.state === "no-window" || w.state === "unavailable") {
+      body = `<p class="tl-text">${STATUS_TEXT[w.state] || "Usage unavailable"}</p>`;
+    } else if (w.state === "elapsed") {
+      body = `<p class="tl-text">${STATUS_TEXT["elapsed"]}</p>`;
+    } else if (w.state === "reset-unavailable") {
+      body = `<p class="tl-text">Reset time unavailable — usage last read ${
+        w.pct != null ? Math.round(w.pct) + "%" : "n/a"}</p>`;
+    } else {
+      const start = w.startsAt != null ? w.startsAt : w.resetsAt - D;
+      const inferred = w.startsAt == null;
+      const left = geo.countdownText(w.resetsAt, now);
+      const pctLine = w.pct == null
+        ? `<span class="dim">no usage data</span>`
+        : `${Math.round(w.pct)}% used`;
+      const leftLine = left != null ? ` \u00b7 ${left} left` : "";
+      body = `
+        <p class="dt-row tl-text"><strong>${pctLine}</strong>${leftLine}</p>
+        <p class="dt-span tl-text">${fmtLocal(start)} \u2192 ${fmtLocal(w.resetsAt)}</p>
+        ${inferred ? `<p class="dt-inferred tl-text">start inferred (reset \u2212 ${
+          kind === "5h" ? "5h" : "7d"})</p>` : ""}`;
+    }
+    return `
+      <div class="dt-window">
+        <p class="dt-label tl-text">${kind === "5h" ? "Session" : "Weekly"}
+          window \u00b7 ${unit}</p>
+        ${body}
+      </div>`;
+  }
+
+  function openDetail(slot) {
+    state.detailSlot = String(slot);
+    state.detailOpen = true;
+    const card = document.querySelector('.tl-card[data-kind="5h"]');
+    const row = card && card.querySelector(`.tl-row[data-slot="${CSS.escape(String(slot))}"]`);
+    let el = document.getElementById("tl-detail");
+    if (!el && card) {
+      el = document.createElement("div");
+      el.id = "tl-detail";
+      el.setAttribute("role", "dialog");
+      el.setAttribute("aria-label", "Row detail");
+      card.querySelector(".tl-rows-wrap").appendChild(el);
+    }
+    if (!el) return;
+    const now = (typeof window !== "undefined" && window.CSWAP_TL_NOW)
+      ? window.CSWAP_TL_NOW() : Date.now() / 1000;
+    const accounts = (state.vm && state.vm.accounts) || [];
+    const acct = accounts.find((a) => String(a.slot) === String(slot));
+    if (!acct) { closeDetail(); return; }
+    el.innerHTML = `
+      <div class="dt-head">
+        <span class="dt-badge tl-text">${esc(acct.slot)}</span>
+        <span class="dt-alias tl-text">${esc(acct.alias || acct.label || "")}</span>
+        <button class="dt-close" data-tl-act="close-detail" title="Close"
+          aria-label="Close detail">${window.CSWAP_ICONS.icon("x", 11)}</button>
+      </div>
+      <div class="dt-divider"></div>
+      ${windowDetail(acct, "5h", now)}
+      <div class="dt-divider"></div>
+      ${windowDetail(acct, "7d", now)}`;
+    // anchor under the row, clamped inside the rows viewport
+    const wrap = el.parentElement;
+    const top = row
+      ? Math.min(Math.max(row.offsetTop + row.offsetHeight + 2, 0),
+                 wrap.clientHeight - el.offsetHeight - 2)
+      : 0;
+    el.style.top = `${Math.max(0, top)}px`;
+  }
+
+  function closeDetail() {
+    const el = document.getElementById("tl-detail");
+    const prev = state.detailSlot;
+    state.detailOpen = false;
+    state.detailSlot = null;
+    if (el) el.remove();
+    if (prev != null) {
+      const row = document.querySelector(
+        `.tl-row[data-slot="${CSS.escape(String(prev))}"]`);
+      if (row) row.focus();
+    }
   }
 
   function renderRows(vm) {
@@ -455,18 +565,32 @@ window.CSWAP_TIMELINES = (() => {
       rowsEl.innerHTML = accounts.map((a) => rowHtml(kind, a, now)).join("");
       rowsEl.scrollTop = scroll;
     });
+    if (state.detailOpen) {
+      if (slots.has(String(state.detailSlot))) openDetail(state.detailSlot);
+      else closeDetail();  // its account vanished: close safely
+    }
   }
 
   // ---- keyboard ------------------------------------------------------------
 
   document.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Escape" || !state.mode) return;
-    if (state.detailOpen) {
-      state.detailOpen = false;  // stage 1: close the row detail only
-      document.dispatchEvent(new CustomEvent("tl-close-detail"));
+    if (!state.mode) return;
+    if (ev.key === "Enter" || ev.key === " ") {
+      const row = ev.target.closest && ev.target.closest(".tl-row");
+      if (row && row.dataset.slot) {
+        ev.preventDefault();
+        state.selectedSlot = row.dataset.slot;
+        renderRows();
+        openDetail(row.dataset.slot);
+      }
       return;
     }
-    toggle();                    // stage 2: collapse, focus returns to trigger
+    if (ev.key !== "Escape") return;
+    if (state.detailOpen) {
+      closeDetail();               // stage 1: detail only
+      return;
+    }
+    toggle();                      // stage 2: collapse, focus to trigger
     const trig = document.querySelector(".tl-trigger");
     if (trig) trig.focus();
   });
