@@ -1,0 +1,280 @@
+{
+  "fixtureVersion": 1,
+  "purpose": "normalized design-test input; proposed additive representation, not current production wire response",
+  "now": 1789245000.0,
+  "nowLocal": "2026-09-12T13:30:00-07:00",
+  "timezone": "America/Los_Angeles",
+  "selectedSlot": "1",
+  "accounts": [
+    {
+      "slot": "1",
+      "alias": "work",
+      "active": true,
+      "timelineWindows": [
+        {
+          "kind": "5h",
+          "pct": 68,
+          "resetsAt": 1789246800.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1789228800.0,
+            "startLocal": "2026-09-12T09:00:00-07:00",
+            "resetLocal": "2026-09-12T14:00:00-07:00",
+            "leftFraction": 0.05,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.34,
+            "nowFraction": 0.5
+          }
+        },
+        {
+          "kind": "7d",
+          "pct": 41,
+          "resetsAt": 1789374600.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1788769800.0,
+            "startLocal": "2026-09-07T01:30:00-07:00",
+            "resetLocal": "2026-09-14T01:30:00-07:00",
+            "leftFraction": 0.10714285714285714,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.205,
+            "nowFraction": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "slot": "2",
+      "alias": "research-platform-eu",
+      "active": false,
+      "timelineWindows": [
+        {
+          "kind": "5h",
+          "pct": 32,
+          "resetsAt": 1789251300.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1789233300.0,
+            "startLocal": "2026-09-12T10:15:00-07:00",
+            "resetLocal": "2026-09-12T15:15:00-07:00",
+            "leftFraction": 0.175,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.16,
+            "nowFraction": 0.5
+          }
+        },
+        {
+          "kind": "7d",
+          "pct": 64,
+          "resetsAt": 1789504200.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1788899400.0,
+            "startLocal": "2026-09-08T13:30:00-07:00",
+            "resetLocal": "2026-09-15T13:30:00-07:00",
+            "leftFraction": 0.21428571428571427,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.32,
+            "nowFraction": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "slot": "3",
+      "alias": "backup",
+      "active": false,
+      "timelineWindows": [
+        {
+          "kind": "5h",
+          "pct": 90,
+          "resetsAt": 1789255800.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1789237800.0,
+            "startLocal": "2026-09-12T11:30:00-07:00",
+            "resetLocal": "2026-09-12T16:30:00-07:00",
+            "leftFraction": 0.3,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.45,
+            "nowFraction": 0.5
+          }
+        },
+        {
+          "kind": "7d",
+          "pct": 18,
+          "resetsAt": 1789763400.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1789158600.0,
+            "startLocal": "2026-09-11T13:30:00-07:00",
+            "resetLocal": "2026-09-18T13:30:00-07:00",
+            "leftFraction": 0.42857142857142855,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.09,
+            "nowFraction": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "slot": "4",
+      "alias": "sandbox",
+      "active": false,
+      "timelineWindows": [
+        {
+          "kind": "5h",
+          "pct": 12,
+          "resetsAt": 1789261200.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1789243200.0,
+            "startLocal": "2026-09-12T13:00:00-07:00",
+            "resetLocal": "2026-09-12T18:00:00-07:00",
+            "leftFraction": 0.45,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.06,
+            "nowFraction": 0.5
+          }
+        },
+        {
+          "kind": "7d",
+          "pct": 83,
+          "resetsAt": 1789266600.0,
+          "startsAt": null,
+          "state": "ok",
+          "observedAt": 1789245000.0,
+          "expected": {
+            "inferredStart": 1788661800.0,
+            "startLocal": "2026-09-05T19:30:00-07:00",
+            "resetLocal": "2026-09-12T19:30:00-07:00",
+            "leftFraction": 0.017857142857142856,
+            "widthFraction": 0.5,
+            "fillFractionOfPlot": 0.415,
+            "nowFraction": 0.5
+          }
+        }
+      ]
+    }
+  ],
+  "edgeCases": [
+    {
+      "name": "usage-unavailable",
+      "window": {
+        "kind": "5h",
+        "state": "usage-unavailable",
+        "pct": null,
+        "resetsAt": 1789254300.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "neutral window; No usage data"
+    },
+    {
+      "name": "reset-unavailable",
+      "window": {
+        "kind": "5h",
+        "state": "reset-unavailable",
+        "pct": 44,
+        "resetsAt": null,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "no positioned bar"
+    },
+    {
+      "name": "stale",
+      "window": {
+        "kind": "5h",
+        "state": "stale",
+        "pct": 54,
+        "resetsAt": 1789247400.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "muted last-known window"
+    },
+    {
+      "name": "elapsed",
+      "window": {
+        "kind": "7d",
+        "state": "elapsed",
+        "pct": 81,
+        "resetsAt": 1789244940.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "awaiting updated usage"
+    },
+    {
+      "name": "exact-expiry",
+      "window": {
+        "kind": "5h",
+        "state": "ok",
+        "pct": 68,
+        "resetsAt": 1789245000.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "awaiting updated usage"
+    },
+    {
+      "name": "no-window",
+      "window": {
+        "kind": "5h",
+        "state": "no-window",
+        "pct": null,
+        "resetsAt": null,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "no subscription quota/no window"
+    },
+    {
+      "name": "offscale",
+      "window": {
+        "kind": "5h",
+        "state": "ok",
+        "pct": 20,
+        "resetsAt": 1789266600.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "offscale indicator and exact detail"
+    },
+    {
+      "name": "exceeded",
+      "window": {
+        "kind": "5h",
+        "state": "ok",
+        "pct": 115,
+        "resetsAt": 1789248600.0,
+        "startsAt": null,
+        "observedAt": 1789241400.0
+      },
+      "expected": "115% label, fill capped at full track"
+    }
+  ],
+  "dstExample": {
+    "kind": "7d",
+    "reset": 1793741400.0,
+    "inferredStart": 1793136600.0,
+    "resetLocal": "2026-11-03T13:30:00-08:00",
+    "startLocal": "2026-10-27T14:30:00-07:00",
+    "expectedDurationSeconds": 604800
+  }
+}
