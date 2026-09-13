@@ -799,17 +799,17 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   from { transform: translateX(-16px); opacity: 0.4; }
   to   { transform: translateX(0); opacity: 1; }
 }
-body.tl-expanded.tl-right #tl-companion {
+/* The enter class is added on open and removed by JS after 200ms:
+   WebKit suspends animation ticking in non-key windows, which would
+   otherwise strand the from-state transform (a stuck +16px shift). */
+body.tl-expanded.tl-right #tl-companion.tl-enter {
   animation: tl-slide-right 140ms ease-out;
 }
-body.tl-expanded.tl-left #tl-companion {
+body.tl-expanded.tl-left #tl-companion.tl-enter {
   animation: tl-slide-left 140ms ease-out;
 }
-body.tl-expanded.tl-inpanel-mode #tl-companion {
-  animation: none;  /* takeover, not a slide */
-}
 @media (prefers-reduced-motion: reduce) {
-  body.tl-expanded #tl-companion { animation: none !important; }
+  body.tl-expanded #tl-companion.tl-enter { animation: none; }
 }
 
 /* skeleton rows (board 20 Loading: headings/axis stay, no bar yet) */

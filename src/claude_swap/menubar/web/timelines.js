@@ -341,6 +341,10 @@ window.CSWAP_TIMELINES = (() => {
       });
     }
     el.dataset.inpanel = String(state.mode === "in-panel");
+    // Enter slide: the class times the animation out from JS so a
+    // suspended animation (non-key window) can never strand the shift.
+    el.classList.add("tl-enter");
+    setTimeout(() => el.classList.remove("tl-enter"), 200);
     if (state.mode === "in-panel") {
       document.body.style.removeProperty("--tl-anchor-x");
     } else {
