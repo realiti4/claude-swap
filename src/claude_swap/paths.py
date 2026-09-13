@@ -21,6 +21,7 @@ References:
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from pathlib import Path
@@ -155,6 +156,27 @@ def migration_flag_for(target: Path) -> Path:
     return target.parent / f".{target.name}.migrating"
 
 
+# Migration phases (audit F03): "copying" means the destination may be
+# partial and the legacy source is intact; "copied" is the commit point —
+# the destination is complete and authoritative, and only source cleanup
+# may remain. A bare/empty flag file (legacy of the old scheme) is
+# treated as "copying".
+_PHASE_COPYING = "copying"
+_PHASE_COMMITTED = "copied"
+
+
+def _write_phase(flag: Path, phase: str) -> None:
+    flag.write_text(phase, encoding="utf-8")
+
+
+def _read_phase(flag: Path) -> str:
+    try:
+        text = flag.read_text(encoding="utf-8").strip()
+    except OSError:
+        return _PHASE_COPYING
+    return text if text in (_PHASE_COPYING, _PHASE_COMMITTED) else _PHASE_COPYING
+
+
 def migrate_legacy_backup_dir(target: Path) -> bool:
     """Move the legacy backup directory to ``target`` if needed.
 
@@ -196,8 +218,19 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
 
     try:
         if flag.exists():
-            # Prior run was interrupted before completion. Discard any
-            # (potentially partial) target and retry the move from legacy.
+            phase = _read_phase(flag)
+            if phase == _PHASE_COMMITTED:
+                # Audit F03: the destination copy completed and was
+                # committed; only the source cleanup was interrupted (the
+                # cross-filesystem move deletes the source after the copy).
+                # The destination is authoritative — finish cleaning the
+                # source, never discard the committed copy.
+                shutil.rmtree(legacy, ignore_errors=True)
+                flag.unlink()
+                return True
+            # Phase "copying" (or a legacy bare flag): the copy never
+            # committed, so the target may be partial and legacy is
+            # intact. Discard the partial target and retry.
             if target.exists():
                 shutil.rmtree(target)
         elif target.exists():
@@ -210,8 +243,21 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
             _wipe_throwaway_artifacts(target)
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        flag.touch()
-        shutil.move(legacy, target)
+        _write_phase(flag, _PHASE_COPYING)
+        # Same-filesystem: atomic rename (source disappears with the
+        # rename, so no separate cleanup window). Cross-filesystem: copy,
+        # COMMIT the destination, then delete the source — an interruption
+        # at any point leaves either an intact legacy (phase "copying") or
+        # a committed destination plus a partial legacy (phase "copied"),
+        # both of which recover without data loss.
+        try:
+            os.rename(legacy, target)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copytree(legacy, target, dirs_exist_ok=True)
+            _write_phase(flag, _PHASE_COMMITTED)
+            shutil.rmtree(legacy)
         flag.unlink()
     except OSError as exc:
         raise MigrationError(

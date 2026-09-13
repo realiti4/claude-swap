@@ -7,6 +7,7 @@ cswap will read the wrong files and misattribute accounts (see issue #16).
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -289,15 +290,67 @@ class TestMigrateLegacyBackupDir:
         (legacy / "sequence.json").write_text("{}")
         target = isolated_home / ".local" / "share" / "claude-swap"
 
-        def exploding_move(*args, **kwargs):
+        def exdev_rename(*args, **kwargs):
+            raise OSError(errno.EXDEV, "simulated cross-filesystem")
+
+        def exploding_copy(*args, **kwargs):
             raise PermissionError("simulated EACCES")
 
-        monkeypatch.setattr("claude_swap.paths.shutil.move", exploding_move)
+        monkeypatch.setattr("claude_swap.paths.os.rename", exdev_rename)
+        monkeypatch.setattr("claude_swap.paths.shutil.copytree", exploding_copy)
 
         with pytest.raises(MigrationError, match="failed"):
             migrate_legacy_backup_dir(target)
-        # Legacy untouched (the real shutil.move was never called).
+        # Legacy untouched (the copy never ran to completion).
         assert (legacy / "sequence.json").read_text() == "{}"
+
+    def test_committed_destination_survives_interrupted_source_cleanup(
+            self, isolated_home):
+        """Audit F03: cross-filesystem move completed the copy (phase
+        "copied") but died deleting the legacy source. The committed
+        destination must survive byte-identical; the retry finishes the
+        source cleanup instead of discarding the only complete copy."""
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        # Source already partially deleted by the interrupted cleanup.
+        (legacy / "sequence.json").write_text("{}")
+
+        target = isolated_home / ".local" / "share" / "claude-swap"
+        target.mkdir(parents=True)
+        (target / "sequence.json").write_text('{"complete": true}')
+        (target / "credentials" / "acct-1.enc").parent.mkdir(
+            parents=True, exist_ok=True)
+        (target / "credentials" / "acct-1.enc").write_text("secret")
+        flag = target.parent / f".{target.name}.migrating"
+        flag.write_text("copied")
+
+        assert migrate_legacy_backup_dir(target) is True
+        assert (target / "sequence.json").read_text() == '{"complete": true}'
+        assert (target / "credentials" / "acct-1.enc").read_text() == "secret"
+        assert not legacy.exists()
+        assert not flag.exists()
+
+    def test_uncommitted_partial_target_is_discarded_safely(
+            self, isolated_home):
+        """Phase "copying": the copy never committed, so legacy is intact
+        and a partial target is safely discarded and re-copied."""
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        (legacy / "sequence.json").write_text('{"src": "legacy"}')
+        (legacy / "creds.enc").write_text("legacy-secret")
+
+        target = isolated_home / ".local" / "share" / "claude-swap"
+        target.mkdir(parents=True)
+        (target / "partial-only.txt").write_text("garbage")
+        flag = target.parent / f".{target.name}.migrating"
+        flag.write_text("copying")
+
+        assert migrate_legacy_backup_dir(target) is True
+        assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
+        assert (target / "creds.enc").read_text() == "legacy-secret"
+        assert not (target / "partial-only.txt").exists()
+        assert not legacy.exists()
+        assert not flag.exists()
 
     def test_preserves_file_modes(self, isolated_home: Path):
         if os.name == "nt":
