@@ -522,6 +522,7 @@ setInterval(() => {
     const cd = countdownFrom(parseFloat(el_.dataset.resetsAt), now);
     el_.textContent = cd ?? AWAITING;
   });
+  if (window.CSWAP_TIMELINES) CSWAP_TIMELINES.tickClock();
 }, 30000);
 
 // ---------------------------------------------------------------- toasts ---

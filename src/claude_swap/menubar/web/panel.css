@@ -457,16 +457,16 @@ dialog .row { display: flex; gap: calc(var(--swap-space) * 2); justify-content: 
 }
 
 
-/* ---- reset timelines: expanded surface (scaffold) ---------------------
- * Functional geometry from the extracted tokens; board-exact chart
- * styling lands with the chart-ui tasks. The main #panel keeps its
- * 360px column; the companion occupies 600px with the 8px gap, either
- * side per the native timelineLayout push. */
+/* ---- reset timelines: companion (board-exact, extracted tokens) -----
+ * Geometry and type from assets/untitled.pen boards 16-20; see
+ * next-wave/extraction-notes.md. The main #panel keeps its 360px column;
+ * the companion is 600px with the 8px gap, right or left of it per the
+ * native timelineLayout push. data-fid markers feed the board harness's
+ * zero-tolerance layout record. */
 body.tl-expanded #panel {
   position: absolute;
   left: var(--tl-anchor-x, 0px);
   top: 0;
-  width: var(--swap-panel-width);
 }
 
 #tl-companion {
@@ -474,23 +474,21 @@ body.tl-expanded #panel {
   top: 0;
   width: var(--swap-tl-width);
   height: 100%;
-  background: var(--swap-tl-surface-2);
+  background: var(--swap-bg);  /* Pen: companion frame fills $bg */
   border-radius: var(--swap-tl-radius);
   color: var(--swap-tl-text);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
-/* right mode: companion starts gap px right of the main column */
 body.tl-expanded.tl-right #tl-companion {
   left: calc(var(--tl-anchor-x, 0px) + var(--swap-panel-width) + var(--swap-tl-gap));
   right: auto;
 }
-/* left mode: companion ends gap px left of the main column */
 body.tl-expanded.tl-left #tl-companion {
   left: auto;
   right: calc(100% - var(--tl-anchor-x, 0px) + var(--swap-tl-gap));
 }
-/* in-panel fallback: companion takes over the main surface */
 body.tl-expanded.tl-inpanel-mode #tl-companion {
   left: 0;
   right: 0;
@@ -498,6 +496,7 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
 }
 
 .tl-head {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -505,6 +504,96 @@ body.tl-expanded.tl-inpanel-mode #tl-companion {
   padding: 0 10px;
   border-bottom: 1px solid var(--swap-tl-border);
 }
+.tl-mark {
+  width: 24px; height: 24px;
+  border-radius: 7px;
+  background: var(--swap-tl-accent-quiet);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--swap-tl-accent-text);
+}
 .tl-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.2px; }
 .tl-spacer { flex: 1; }
-.tl-caption { font-size: 11.5px; line-height: 1.35; color: var(--swap-tl-text-2); padding: 10px; }
+.tl-tz {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--swap-tl-surface-2);
+  border-radius: 20px;
+  padding: 3px 10px;
+}
+.tl-tz-now { font-family: var(--swap-font-numeric); font-size: 12px;
+  font-weight: 600; font-variant-numeric: tabular-nums; }
+.tl-tz-zone { font-size: 12px; color: var(--swap-tl-text-2); }
+.tl-close-btn {
+  width: 24px; height: 24px;
+  border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--swap-tl-text-2);
+}
+.tl-close-btn:hover { background: var(--swap-tl-surface-2); color: var(--swap-tl-text); }
+
+.tl-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px;
+}
+.tl-caption { font-size: 11.5px; line-height: 1.35; color: var(--swap-tl-text-2); }
+
+.tl-legend { display: flex; align-items: center; gap: 14px; }
+.tl-legend .sw { width: 20px; height: 9px; border-radius: 4.5px; }
+.tl-legend .sw.window { background: var(--swap-tl-surface-3);
+  border: 1px solid var(--swap-tl-border); }
+.tl-legend .sw.quota { background: var(--swap-tl-accent); }
+.tl-legend .sw.now-dashes {
+  width: 2px; height: 18px; border-radius: 1px;
+  background: repeating-linear-gradient(
+    to bottom, var(--swap-tl-warn) 0 4px, transparent 4px 7px);
+}
+.tl-legend span { font-size: 12px; color: var(--swap-tl-text-2); }
+.tl-legend .now-label { color: var(--swap-tl-warn); font-weight: 600; }
+
+.tl-card {
+  background: var(--swap-tl-surface);  /* Pen: cards fill $surface */
+  border: 1px solid var(--swap-tl-border);
+  border-radius: var(--swap-tl-radius-card);
+  padding: var(--swap-tl-card-pad);
+  display: flex;
+  flex-direction: column;
+  gap: var(--swap-tl-card-gap);
+}
+.tl-card-title-row { display: flex; align-items: center; gap: 8px; }
+.tl-card-title { font-size: 14px; font-weight: 600; letter-spacing: -0.2px;
+  line-height: 1.3; }
+.tl-card-hint { font-size: 11px; color: var(--swap-tl-text-3); }
+.tl-divider { height: 1px; background: var(--swap-tl-border); }
+.tl-axis { position: relative; height: var(--swap-tl-axis-h); }
+.tl-axis .tick {
+  position: absolute; top: 1px;
+  width: var(--swap-tl-tick-w);
+  text-align: center;
+  font-size: 12px;
+  color: var(--swap-tl-text-3);
+  transform: translateX(-50%);
+}
+.tl-axis .tick.now { color: var(--swap-tl-warn); font-weight: 600; }
+.tl-rows { position: relative; height: var(--swap-tl-rows-h); overflow-y: auto; }
+
+/* in-panel fallback (board 20): timelines take over the main surface */
+.tl-back-row {
+  flex: none;
+  display: flex; align-items: center; gap: 6px;
+  height: var(--swap-tl-fallback-back-h);
+  padding: 0 10px;
+  border-bottom: 1px solid var(--swap-tl-border);
+  background: none; border-left: none; border-right: none; border-top: none;
+  font-size: 12px; color: var(--swap-tl-text-2);
+  cursor: pointer;
+}
+
+/* Header trigger open state (board 20 "Open — highlighted while the
+ * companion is open"): the companion-mark treatment. */
+.tl-trigger[aria-expanded="true"] {
+  background: var(--swap-tl-accent-quiet);
+  color: var(--swap-tl-accent-text);
+}

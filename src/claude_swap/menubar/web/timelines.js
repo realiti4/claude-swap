@@ -186,6 +186,77 @@ window.CSWAP_TIMELINES = (() => {
     return document.getElementById("tl-companion");
   }
 
+  // ---- DOM (board-exact structure; values from the token extraction) ----
+
+  const KINDS = [
+    { kind: "5h", title: "Session resets \u00b7 5-hour",
+      hint: "full 5-hour window per account" },
+    { kind: "7d", title: "Weekly resets \u00b7 7-day",
+      hint: "full 7-day window per account" },
+  ];
+
+  function zoneName() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+    } catch (_e) {
+      return "local";
+    }
+  }
+
+  function nowClock() {
+    return new Date().toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+  }
+
+  function chartCard(def) {
+    const ticks = window.CSWAP_TIMELINES_GEOMETRY.axisTicks(def.kind)
+      .map((t) => `<span class="tick${t.now ? " now" : ""}" data-fid="tl-tick"
+        style="left:${t.at * 100}%">${t.label}</span>`).join("");
+    return `
+    <section class="tl-card" data-fid="tl-card" data-kind="${def.kind}">
+      <div class="tl-card-title-row">
+        <span class="tl-card-title" data-fid="tl-card-title">${def.title}</span>
+        <span class="tl-spacer"></span>
+        <span class="tl-card-hint">${def.hint}</span>
+      </div>
+      <div class="tl-divider"></div>
+      <div class="tl-axis" data-fid="tl-axis">${ticks}</div>
+      <div class="tl-rows" data-tl-rows="${def.kind}" role="list"
+           aria-label="${def.title} rows"></div>
+    </section>`;
+  }
+
+  function companionHtml() {
+    const inPanel = state.mode === "in-panel";
+    return `
+    ${inPanel ? `<button class="tl-back-row" data-tl-act="close">
+      \u2039 Accounts</button>` : ""}
+    <div class="tl-head" data-fid="tl-head">
+      <span class="tl-mark" data-fid="tl-mark">${
+        window.CSWAP_ICONS.icon("calendar-clock", 14)}</span>
+      <span class="tl-title" data-fid="tl-title">Reset timelines</span>
+      <span class="tl-spacer"></span>
+      ${inPanel ? "" : `<span class="tl-tz" data-fid="tl-tz">
+        <span class="tl-tz-now" data-tl-now>${nowClock()}</span>
+        <span class="tl-tz-zone">${zoneName()}</span>
+      </span>
+      <button class="tl-close-btn" data-tl-act="close" title="Close"
+        aria-label="Close timelines">${
+          window.CSWAP_ICONS.icon("x", 13)}</button>`}
+    </div>
+    <div class="tl-body">
+      <p class="tl-caption" data-fid="tl-caption">Each bar is one full window
+        on a shared clock; the fill is quota used, not time elapsed.</p>
+      <div class="tl-legend" data-fid="tl-legend" aria-hidden="true">
+        <span class="sw window"></span><span>full window (5h / 7d)</span>
+        <span class="sw quota"></span><span>quota used \u2014 not elapsed</span>
+        <span class="sw now-dashes"></span><span class="now-label">now</span>
+      </div>
+      ${KINDS.map(chartCard).join("")}
+    </div>`;
+  }
+
   function paint() {
     document.body.classList.toggle("tl-expanded", state.mode !== null);
     document.body.classList.toggle("tl-right", state.mode === "right");
@@ -206,23 +277,15 @@ window.CSWAP_TIMELINES = (() => {
       el = document.createElement("section");
       el.id = "tl-companion";
       el.setAttribute("aria-label", "Reset timelines");
-      el.innerHTML = [
-        '<div class="tl-head">',
-        '<span class="tl-title">Reset timelines</span>',
-        '<span class="tl-spacer"></span>',
-        '<button class="tl-close icon-btn" data-tl-act="close" ',
-        'title="Close" aria-label="Close timelines"></button>',
-        '</div>',
-        '<div class="tl-body" data-tl-scaffold="1">',
-        '<p class="tl-caption">Charts land with chart-ui tasks.</p>',
-        '</div>',
-      ].join("");
+      el.innerHTML = companionHtml();
       document.body.appendChild(el);
-      el.querySelector(".tl-close").innerHTML =
-        window.CSWAP_ICONS.icon("x", 13);
       el.addEventListener("click", (ev) => {
         const act = ev.target.closest("[data-tl-act]");
-        if (act && act.dataset.tlAct === "close") toggle();
+        if (act && act.dataset.tlAct === "close") {
+          const trigBtn = document.querySelector(".tl-trigger");
+          toggle();
+          if (trigBtn) trigBtn.focus();  // opener focus restored on close
+        }
       });
     }
     if (state.mode === "in-panel") {
@@ -230,6 +293,12 @@ window.CSWAP_TIMELINES = (() => {
     } else {
       document.body.style.setProperty("--tl-anchor-x", `${state.anchorOffset}px`);
     }
+    tickClock();
+  }
+
+  function tickClock() {
+    const el = document.querySelector("[data-tl-now]");
+    if (el) el.textContent = nowClock();
   }
 
   // ---- keyboard ------------------------------------------------------------
@@ -246,5 +315,5 @@ window.CSWAP_TIMELINES = (() => {
     if (trig) trig.focus();
   });
 
-  return { toggle, apply, state };
+  return { toggle, apply, state, tickClock };
 })();

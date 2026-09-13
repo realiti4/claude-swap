@@ -124,6 +124,63 @@ def _captures(state: str) -> bool:
     return (CAPTURES / f"{state}.png").is_file()
 
 
+class TestScaffoldGeometry:
+    """Board-exact frame geometry for the expanded surface (Task 8):
+    surface composition, companion header, legend/cards frame, and the
+    extracted token values — asserted from the harness's zero-tolerance
+    layout record. Row-level internals (track ticks, bars) belong to the
+    chart-rendering tasks."""
+
+    @staticmethod
+    def _fids(state):
+        path = CAPTURES / f"{state}.layout.json"
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {f["fid"]: f for f in data.get("fids", [])}
+
+    def _need(self, state):
+        fids = self._fids(state)
+        if fids is None:
+            pytest.skip(f"no {state} capture; run scripts/board_capture.py")
+        return fids
+
+    def test_dark_surface_composition(self):
+        fids = self._need("tl-open-dark")
+        boxes = json.loads(
+            (CAPTURES / "tl-open-dark.layout.json").read_text(encoding="utf-8")
+        )["boxes"]
+        panel = next(b for b in boxes if b["sel"] == "#panel")
+        comp = next(b for b in boxes if b["sel"] == "#tl-companion")
+        assert (panel["x"], panel["y"], panel["w"], panel["h"]) == (0, 0, 360, 560)
+        assert (comp["x"], comp["y"], comp["w"], comp["h"]) == (368, 0, 600, 560)
+
+    def test_dark_header_and_cards_match_extracted_tokens(self):
+        fids = self._need("tl-open-dark")
+        head = fids["tl-head"]
+        assert head["h"] == 44 and head["w"] == 600
+        mark = fids["tl-mark"]
+        assert (mark["w"], mark["h"]) == (24, 24)
+        assert mark["bg"] == "rgb(35, 66, 63)"      # $accent-quiet #23423F
+        assert mark["radius"] == "7px"
+        title = fids["tl-title"]
+        assert title["fs"] == "13.5px" and title["fw"] == "600"
+        tz = fids["tl-tz"]
+        assert tz["bg"] == "rgb(33, 42, 44)"        # $surface-2 #212A2C
+        assert tz["radius"] == "20px"
+        card = fids["tl-card"]
+        assert card["bg"] == "rgb(27, 34, 36)"      # $surface #1B2224
+        assert card["radius"] == "10px"
+        card_title = fids["tl-card-title"]
+        assert card_title["fs"] == "14px" and card_title["fw"] == "600"
+        assert fids["tl-axis"]["h"] == 16
+
+    def test_light_theme_overrides_apply(self):
+        fids = self._need("tl-open-light")
+        assert fids["tl-card"]["bg"] == "rgb(255, 253, 249)"  # $surface #FFFDF9
+        assert fids["tl-mark"]["bg"] == "rgb(220, 237, 233)"  # $accent-quiet #DCEDE9
+
+
 class TestBoardGate:
     """Gated (timeline) states must pass both halves; informational
     (main-panel) states record their delta in the board report."""

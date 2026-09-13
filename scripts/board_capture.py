@@ -46,6 +46,20 @@ STATES: dict[str, dict] = {
         "width": 360, "height": 560, "query": "", "theme": "light",
         "selectors": ["#panel", "header", "footer"],
     },
+    # Expanded surface (fixture mode expands locally): main column at
+    # anchor 0 + companion right — the board-17/18 composition at 968x560.
+    "tl-open-dark": {
+        "width": 968, "height": 560, "query": "", "theme": "dark",
+        "click": ".tl-trigger",
+        "selectors": ["#panel", "#tl-companion", ".tl-head", ".tl-body",
+                       ".tl-card"],
+    },
+    "tl-open-light": {
+        "width": 968, "height": 560, "query": "", "theme": "light",
+        "click": ".tl-trigger",
+        "selectors": ["#panel", "#tl-companion", ".tl-head", ".tl-body",
+                       ".tl-card"],
+    },
 }
 
 LAYOUT_JS = """
@@ -55,11 +69,20 @@ LAYOUT_JS = """
   for (const sel of sels) {
     for (const el of document.querySelectorAll(sel)) {
       const r = el.getBoundingClientRect();
-      boxes.push({sel, id: el.id || null, cls: el.className || null,
+      boxes.push({sel, id: el.id || null, cls: String(el.className || ""),
                   x: r.x, y: r.y, w: r.width, h: r.height});
     }
   }
-  return JSON.stringify({viewport: {w: innerWidth, h: innerHeight}, boxes});
+  const fids = [];
+  for (const el of document.querySelectorAll("[data-fid]")) {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    fids.push({fid: el.dataset.fid, x: r.x, y: r.y, w: r.width, h: r.height,
+               bg: cs.backgroundColor, fg: cs.color, radius: cs.borderRadius,
+               fs: cs.fontSize, fw: cs.fontWeight});
+  }
+  return JSON.stringify({viewport: {w: innerWidth, h: innerHeight},
+                         boxes, fids});
 })()
 """
 
@@ -217,6 +240,12 @@ def main() -> int:
                 break
             spin_runloop(0.05)
         time.sleep(args.settle)
+        if cfg.get("click"):
+            eval_sync(
+                view,
+                f"document.querySelector({cfg['click']!r}).click(); 'clicked'",
+            )
+            spin_runloop(0.3)
 
         capture_png(view, out_dir / f"{state}.png", cfg["width"], cfg["height"])
         layout = eval_sync(view, LAYOUT_JS % json.dumps(cfg["selectors"]))
