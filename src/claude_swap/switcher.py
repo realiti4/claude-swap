@@ -7405,6 +7405,22 @@ class ClaudeAccountSwitcher:
             return
 
         removed_items = []
+        failed_items = []  # audit F05: never claim completion over these
+
+        # Audit F05: a durable retry inventory. Ordinary removals suppress
+        # credential-deletion failures (best-effort by design — a locked
+        # Keychain must not block account management); those names land
+        # here so purge — the one operation that promises erasure —
+        # sweeps them instead of silently orphaning them after the roster
+        # that would discover them is destroyed.
+        tombstone = self.backup_dir.parent / ".credential-deletion-failures.json"
+        tombstoned: list[str] = []
+        try:
+            tombstoned = json.loads(tombstone.read_text(encoding="utf-8"))
+            if not isinstance(tombstoned, list):
+                tombstoned = []
+        except (OSError, ValueError):
+            tombstoned = []
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
@@ -7415,17 +7431,33 @@ class ClaudeAccountSwitcher:
                 nums = [account_num]
                 if str(account_num) != "None":
                     nums.append("None")
-                usernames = [f"account-{num}-{email}" for num in nums]
+                # Current AND retained .prev generations (audit F05: the
+                # previous generation is just as much a secret as the
+                # current one, and the old sweep never touched it).
+                usernames = [
+                    f"account-{num}-{email}{suffix}"
+                    for num in nums
+                    for suffix in ("", ".prev")
+                ]
 
-                # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+                # .enc files (Linux/WSL/Windows always; macOS fallback copies),
+                # including the retained .enc.prev generation.
                 for num in nums:
-                    cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
+                    for suffix in ("", ".prev"):
+                        cred_file = (
+                            self.credentials_dir
+                            / f".creds-{num}-{email}.enc{suffix}"
+                        )
+                        try:
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(
+                                    f"Credential file: {cred_file.name}"
+                                )
+                        except OSError as e:
+                            failed_items.append(
+                                f"{cred_file.name} ({e})"
+                            )
 
                 # macOS Keychain items via `security` (current macOS backend).
                 if self.platform == Platform.MACOS:
@@ -7433,8 +7465,8 @@ class ClaudeAccountSwitcher:
                         try:
                             macos_keychain.delete_password(SECURITY_SERVICE, username)
                             removed_items.append(f"Credential: {username}")
-                        except Exception:
-                            pass  # Ignore errors during purge
+                        except Exception as e:
+                            failed_items.append(f"{username} ({e})")
 
                 # Best-effort sweep of any pre-migration keyring / Credential
                 # Manager entries left behind by an incomplete keyring → files
@@ -7474,6 +7506,16 @@ class ClaudeAccountSwitcher:
             except OSError:
                 pass
 
+        # Sweep names ordinary removals failed to delete (audit F05's
+        # durable retry inventory). "not found" counts as done — the item
+        # may have been removed manually since.
+        for name in tombstoned:
+            try:
+                macos_keychain.delete_password(SECURITY_SERVICE, name)
+                removed_items.append(f"Credential (retried): {name}")
+            except Exception as e:
+                failed_items.append(f"{name} ({e})")
+
         if removed_items:
             print(f"\n{accent('Removed:')}")
             for item in removed_items:
@@ -7481,4 +7523,27 @@ class ClaudeAccountSwitcher:
         else:
             print(f"\n{dimmed('No claude-swap data found to remove.')}")
 
-        print(f"\n{accent('Purge complete.')}")
+        if failed_items:
+            # Honest completion (audit F05): "Purge complete" is only ever
+            # printed when every store was actually verified gone. The
+            # failures are preserved for a retry — the backup dir (and the
+            # roster that would rediscover them) is gone either way.
+            tombstone.write_text(
+                json.dumps(
+                    [f.split(" (")[0] for f in failed_items], indent=1
+                ),
+                encoding="utf-8",
+            )
+            warning(
+                f"Purge INCOMPLETE: {len(failed_items)} item(s) could not "
+                f"be verified as deleted:"
+            )
+            for item in failed_items:
+                print(f"  {dimmed('-')} {item}")
+            print(dimmed(
+                f"Retry names preserved in {tombstone}; remove them "
+                "manually (e.g. Keychain Access) and re-run --purge."
+            ))
+        else:
+            tombstone.unlink(missing_ok=True)
+            print(f"\n{accent('Purge complete.')}")

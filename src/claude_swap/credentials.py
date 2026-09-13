@@ -1439,6 +1439,9 @@ class CredentialStore:
                 self._host._logger.warning(
                     f"Failed to delete .prev from Keychain: {e}"
                 )
+                self._record_deletion_failure(
+                    self._prev_backup_username(account_num, email)
+                )
 
     # -- previous-generation retention -------------------------------------
     #

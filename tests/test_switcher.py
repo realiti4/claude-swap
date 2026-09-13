@@ -5377,15 +5377,20 @@ class TestPurge:
              patch.dict(sys.modules, {"keyring": mock_keyring}):
             switcher.purge()
 
-        # New security service: account + legacy account-None both cleaned.
+        # New security service: account + legacy account-None both cleaned,
+        # including the retained .prev generations (audit F05).
         mock_kc.delete_password.assert_has_calls([
             call("claude-swap", "account-1-user@example.com"),
+            call("claude-swap", "account-1-user@example.com.prev"),
             call("claude-swap", "account-None-user@example.com"),
+            call("claude-swap", "account-None-user@example.com.prev"),
         ])
         # Best-effort legacy keyring cleanup of the old claude-code service.
         mock_keyring.delete_password.assert_has_calls([
             call("claude-code", "account-1-user@example.com"),
+            call("claude-code", "account-1-user@example.com.prev"),
             call("claude-code", "account-None-user@example.com"),
+            call("claude-code", "account-None-user@example.com.prev"),
         ])
 
 
@@ -12493,3 +12498,66 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestPurgeHonestCompletion:
+    """Audit F05: purge only ever claims completion over verified
+    deletions; failures are preserved for a retry."""
+
+    def _macos_switcher(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.MACOS
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {"1": {
+                "email": "user@example.com", "uuid": "",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z"}},
+        })
+        return switcher
+
+    def test_failed_keychain_delete_reports_incomplete_and_tombstones(
+            self, temp_home, capsys):
+        from claude_swap.macos_keychain import KeychainError
+
+        switcher = self._macos_switcher(temp_home)
+
+        def failing_delete(service, username):
+            raise KeychainError("locked (synthetic)")
+
+        with patch("builtins.input", return_value="y"), \
+             patch("claude_swap.switcher.macos_keychain") as mock_kc:
+            mock_kc.delete_password.side_effect = failing_delete
+            mock_kc.KeychainError = KeychainError
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert "Purge complete." not in out, \
+            "completion claimed over failed deletions"
+        assert "Purge INCOMPLETE" in out
+        assert "account-1-user@example.com" in out
+        tombstone = (
+            switcher.backup_dir.parent / ".credential-deletion-failures.json"
+        )
+        assert tombstone.exists()
+        assert "account-1-user@example.com" in tombstone.read_text()
+
+    def test_tombstoned_names_are_swept_on_retry(self, temp_home, capsys):
+        switcher = self._macos_switcher(temp_home)
+        tombstone = (
+            switcher.backup_dir.parent / ".credential-deletion-failures.json"
+        )
+        tombstone.write_text('["account-9-ghost@example.com"]')
+        with patch("builtins.input", return_value="y"), \
+             patch("claude_swap.switcher.macos_keychain") as mock_kc:
+            switcher.purge()
+        deleted = [
+            c.args[1] for c in mock_kc.delete_password.call_args_list
+        ]
+        assert "account-9-ghost@example.com" in deleted, \
+            "tombstoned retry name was not swept"
+        assert not tombstone.exists(), \
+            "successful purge must clear the retry inventory"
+        assert "Purge complete." in capsys.readouterr().out
