@@ -1394,11 +1394,16 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
-    def test_fast_path_keeps_env_untouched(
-        self, manager, capture_exec, monkeypatch
+    def test_fast_path_scrubs_overrides_for_explicit_selection(
+        self, manager, capture_exec, monkeypatch, capsys
     ):
-        """Plain-claude fast path must NOT scrub: it's normal claude behavior."""
+        """Audit F08: `run N` for the ACTIVE account is still an explicit
+        selection — an inherited override credential must not silently
+        act as another identity inside the reassuring account message.
+        The scrub matches the session path; plain `claude` (exec_default)
+        keeps normal env semantics."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
         monkeypatch.setattr(
             manager.switcher,
             "_get_current_account",
@@ -1407,7 +1412,9 @@ class TestRun:
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
-        assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
+        assert "ANTHROPIC_API_KEY" not in exc.value.env
+        assert exc.value.env["UNRELATED_VAR"] == "kept"
+        assert "Ignoring ANTHROPIC_API_KEY" in capsys.readouterr().out
 
     def test_exec_default_uses_plain_env(self, manager, capture_exec, monkeypatch):
         """exec_default launches plain claude with the unmodified environment."""

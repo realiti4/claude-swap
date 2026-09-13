@@ -600,7 +600,24 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                # Audit F08: this is an EXPLICIT account selection; an
+                # exported override credential would silently bill/act as
+                # another identity despite the selected-account message.
+                # Scrub consistently with the session path — plain `claude`
+                # (no explicit selection) keeps normal env semantics.
+                scrubbed = [
+                    v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)
+                ]
+                if scrubbed:
+                    warning(
+                        f"Ignoring {', '.join(scrubbed)} — it would override "
+                        f"the selected account inside Claude Code."
+                    )
+                env = {
+                    k: v for k, v in os.environ.items()
+                    if k not in AUTH_OVERRIDE_ENV_VARS
+                }
+                self._exec(claude_bin, claude_args, env=env)
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
