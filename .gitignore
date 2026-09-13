@@ -11,3 +11,4 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+tests/fixtures/captures/
