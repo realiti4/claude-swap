@@ -492,6 +492,9 @@ def build_usage_result(data: dict) -> dict | None:
         used_credits = eu.get("used_credits")
         monthly_limit = eu.get("monthly_limit")
         utilization = eu.get("utilization")
+        # Newly funded accounts can omit utilization even with valid amounts.
+        if utilization is None and isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)) and monthly_limit > 0:
+            utilization = used_credits / monthly_limit * 100
         if used_credits is not None and monthly_limit is not None and utilization is not None:
             try:
                 spend_entry: dict = {
