@@ -484,7 +484,7 @@ def build_usage_result(data: dict) -> dict | None:
         result["seven_day"] = d7_entry
 
     eu = data.get("extra_usage")
-    if eu and eu.get("is_enabled"):
+    if eu and (eu.get("is_enabled") or eu.get("credits_ever_enabled")):
         # Claude Code returns nullable used_credits, monthly_limit, and utilization
         # (monthly_limit=None = unlimited). All three are needed to render the spend
         # line, so when any is null skip just the spend entry; five_hour/seven_day
@@ -500,6 +500,10 @@ def build_usage_result(data: dict) -> dict | None:
                     "pct": float(utilization),
                     "currency": eu.get("currency", "USD"),
                 }
+                # A configured account can be temporarily unavailable (for
+                # example out of credits); retain its spend row and status.
+                spend_entry["enabled"] = bool(eu.get("is_enabled"))
+                spend_entry["disabled_reason"] = eu.get("disabled_reason")
                 if eu.get("resets_at"):
                     spend_entry["resets_at"] = eu["resets_at"]
                     spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])

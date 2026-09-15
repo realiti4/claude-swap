@@ -386,3 +386,35 @@ pipx uninstall claude-swap
 ## License
 
 MIT
+
+### Optional paid overflow fallback
+
+Paid overflow is opt-in and requires available Claude usage credits. Configure
+an existing managed account by email and the largest monthly USD spending cap
+you are willing to accept from the provider:
+
+```bash
+cswap config set autoswitch.paidOverflowAccount overflow@example.com
+cswap config set autoswitch.paidOverflowMaxMonthlyUsd 100
+cswap config set autoswitch.model all
+```
+
+Restart `cswap auto` after changing its settings. Ordinary proactive rotation
+continues while included quota remains. At a hard included limit, remaining
+included quota is preferred, including small amounts below the proactive
+threshold. Only when every eligible account's measured included quota is
+exhausted does auto-switch use the configured paid account. It stays there
+until included quota becomes available again. Selected per-model limits count
+in this decision; `model all` includes every reported model window.
+
+The provider must report paid usage as enabled, a finite USD monthly cap no
+higher than the configured maximum, and spending below that cap. Missing usage,
+out-of-credits status, disabled/quarantined accounts, unlimited caps, and
+non-USD caps do not qualify for paid fallback. The watch dashboard shows paid
+spending against the monthly cap and its availability, including out of credits.
+
+This setting does **not** buy credits or change/enforce the provider's billing
+limit: set the actual spending cap in Claude. Polling and credential pickup are
+not instantaneous, so this does not guarantee uninterrupted in-flight requests.
+Unset `autoswitch.paidOverflowAccount` to disable the fallback. Existing behavior
+is unchanged when the fallback is not configured.
