@@ -745,6 +745,109 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _wrap_command(argv: list[str]) -> None:
+    """Handle `cswap wrap [options] [--] [<claude args>...]`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`
+    (same limitation: `wrap` must be the first argument). Runs claude under
+    a PTY and watches for "You've hit your ... limit" messages: on a hit it
+    switches to the best account with quota and types "continue" so the
+    aborted turn resumes; when every account is exhausted it waits for the
+    earliest window reset (5h/7d/per-model) and resumes then.
+
+    The `--` separator is required before claude's own flags (argparse
+    would otherwise reject them as unknown wrap options) — same contract
+    as `cswap run`. claude's exit code becomes the wrapper's.
+    """
+    # Everything after the first `--` is forwarded to claude verbatim.
+    if "--" in argv:
+        split = argv.index("--")
+        head, tail = argv[:split], argv[split + 1 :]
+    else:
+        head, tail = argv, []
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} wrap",
+        description=(
+            "Run claude under a PTY that recovers from mid-turn rate "
+            "limits: switches to an account with quota and resumes the turn "
+            "automatically, or waits for the earliest limit reset when "
+            "every account is exhausted."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                            # plain claude, guarded
+  %(prog)s -- --resume                # forward args after '--'
+  %(prog)s --model Fable              # also watch per-model limits
+  %(prog)s --no-auto-continue         # switch, but don't type 'continue'
+  %(prog)s --strategy next-available  # rotate instead of best-headroom
+
+Complements `cswap auto`: auto switches proactively between turns; wrap is
+the reactive net for turns that hit the limit mid-flight.
+        """,
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("best", "next-available"),
+        default="best",
+        help=(
+            "Target selection on a limit hit: 'best' (most quota left; "
+            "default) or 'next-available' (rotate, skipping limited accounts)"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        metavar="NAMES",
+        default=None,
+        help=(
+            "Also treat these models' per-model weekly limits as binding "
+            "(comma-separated display names, or 'all'). Defaults to the "
+            "autoswitch.model setting"
+        ),
+    )
+    parser.add_argument(
+        "--auto-continue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Type 'continue' at the prompt after switching (default: on). "
+            "With --no-auto-continue the wrapper only switches accounts"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args(head)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.settings import load_settings, parse_model_names
+        from claude_swap.wrap import WrapSession
+
+        model_value = args.model
+        if model_value is None:
+            model_value = load_settings(switcher.backup_dir).model
+        session = WrapSession(
+            switcher,
+            tail,
+            strategy=args.strategy,
+            models=parse_model_names(model_value),
+            auto_continue=args.auto_continue,
+        )
+        sys.exit(session.run())
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -996,6 +1099,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "wrap":
+        _wrap_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1056,6 +1162,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s wrap [-- ...]              run claude, resume on rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1078,6 +1185,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s wrap -- --resume                  # claude guarded against rate limits
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
 

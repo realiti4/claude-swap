@@ -116,6 +116,27 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Surviving mid-turn rate limits (wrap mode)
+
+`cswap auto` switches *between* turns, but a long turn can still burn through the limit mid-flight: Claude Code aborts with "You've hit your session limit" (or the weekly / per-model / spend variant) and sits idle — even if another account has quota. `cswap wrap` is the reactive safety net: it runs claude under a PTY, watches for that message, switches to the best account with quota, and types `continue` so the turn resumes on its own.
+
+```bash
+cswap wrap                        # plain claude, guarded
+cswap wrap -- --resume            # forward claude's own args after '--'
+cswap wrap --model Fable          # also watch per-model weekly limits
+cswap wrap --no-auto-continue     # switch accounts, but don't type 'continue'
+```
+
+When **every** account is exhausted, wrap computes the earliest moment any account gets quota back — per account the latest reset among its exhausted windows (5h, 7d, and configured per-model windows), then the soonest across accounts — prints a countdown, sleeps, and switches + resumes when the first account recovers. It re-checks on a bounded cadence, so quota granted early (or an account you re-enable meanwhile) is picked up.
+
+Wrap never interprets claude's arguments: everything after `--` is passed through verbatim, and claude's exit code becomes the wrapper's — so it drops into aliases and scripts:
+
+```bash
+alias clauded='cswap wrap -- --dangerously-skip-permissions'
+```
+
+It complements `cswap auto` rather than replacing it: auto keeps you off the limit proactively; wrap catches the turns that hit it anyway. Both can run at the same time.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
