@@ -121,6 +121,29 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             (_paths.get_default_claude_config_home(), False),
             (_paths.get_global_config_path().parent, False),
             (_paths.get_default_global_config_path().parent, False),
+            # $HOME EXPLICITLY, not only via those two parents. Both
+            # resolvers return `<config home>/.config.json` when that legacy
+            # file exists, so on a machine carrying it both `.parent` values
+            # collapse to `~/.claude` and $HOME -- whose direct children
+            # `~/.claude.json`, `~/.claude.json.lock` and `~/.claude.lock`
+            # this docstring names as the protected set -- drops out of the
+            # frozen roots entirely.
+            (Path.home(), False),
+            # THE MIGRATION FLAG, which no other root reaches: it is a
+            # SIBLING of the backup root, not a child. A test allowed to
+            # create it leaves it behind -- `RealStoreWriteBlocked` is not an
+            # OSError, so the migration's own `flag.unlink()` never runs --
+            # and the next real run reads it as "a prior migration was
+            # interrupted" and rmtree's the live store instead of refusing
+            # the collision.
+            (_paths.migration_flag_for(_paths.get_backup_root()), False),
+            # TWO LEVELS DOWN, so the non-recursive `~/.claude` above does
+            # not reach them. `--share-history` moves real transcripts to
+            # `~/.claude/projects/<slug>/<uuid>.jsonl`, and `_mkdir_private`
+            # walks only while the path is missing -- on a real box that
+            # directory exists, so not one mkdir is attempted above them.
+            (_paths.get_default_claude_config_home() / "projects", True),
+            (_paths.get_claude_config_home() / "projects", True),
         )
 
     ambient_specs = _resolve()
@@ -238,6 +261,11 @@ def _derive_real_store_hints(
 
 _REAL_STORE_HINTS = _derive_real_store_hints(_REAL_STORE_SPECS, _HOME_AT_FREEZE_TIME)
 
+# The single filename test_real_store_guard.py's controls plant in the real
+# store to prove the hook refuses them. Its removal is exempt so those cases
+# can clean up after themselves; nothing else may carry this name.
+_GUARD_PROBE_MARKER = ".cswap-test-real-store-guard-probe-DELETE-ME"
+
 _WRITE_EVENTS = frozenset(
     {
         "open", "os.rename", "os.mkdir", "os.remove", "os.rmdir",
@@ -351,14 +379,16 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         # case (an absolute path with no hint substring) never pays for a
         # cwd lookup or a Path() construction below.
         hinted = any(hint in candidate for hint in _REAL_STORE_HINTS)
-        if not hinted and not os.path.isabs(candidate):
+        if not os.path.isabs(candidate):
             # I-3: a RELATIVE path is resolved against os.getcwd() by every
             # syscall this hook guards — `open("sequence.json", "w")` with a
             # cwd inside a protected root writes there exactly as much as
-            # the absolute spelling would. The raw relative string never
-            # contains a hint substring on its own (it's just a filename),
-            # so the cheap reject above cannot be trusted for it alone —
-            # join against the real cwd and re-check before rejecting.
+            # the absolute spelling would. EVERY relative candidate is
+            # joined, hinted or not: a relative path that already carries a
+            # hint (`configs/.claude-config-1-<email>.json`) passes the
+            # cheap reject and then can never equal, or sit under, an
+            # ABSOLUTE root — so gating the join on a missed pre-filter
+            # let exactly the store-shaped spellings through.
             # Relative candidates are rare (pytest/import-machinery/stdlib
             # activity — the overwhelming majority of audit events — pass
             # absolute paths), so this extra join only costs the uncommon
@@ -368,6 +398,21 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
             candidate = joined
         if not hinted:
             continue  # cheap reject — the common case
+        # The controls in test_real_store_guard.py must be able to remove the
+        # one marker they plant, and only that. Exempting it HERE keeps the
+        # exemption path-scoped: blanking the specs around the unlink instead
+        # would disarm the hook for every path and every thread in the
+        # process for the width of that call. `os.remove` only, so the
+        # controls' own `open`-mode writes of the same name stay refused.
+        if (event == "os.remove"
+                and os.path.basename(candidate) == _GUARD_PROBE_MARKER):
+            continue
+        # A non-recursive root matches on `target.parent`, which pathlib
+        # reports literally, so `<root>/sub/..` reached a direct child the
+        # long way. A symlinked spelling still does: closing THAT needs the
+        # frozen roots resolved too -- resolving only the candidate lets the
+        # plain spelling through whenever a root is itself a symlink.
+        candidate = os.path.normpath(candidate)
         target = Path(candidate)
         for root, recursive in _REAL_STORE_SPECS:
             hit = (

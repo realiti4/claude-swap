@@ -1103,6 +1103,20 @@ class TestSentinels:
         assert entry.sentinel is None  # never persisted
         assert entry.last_good == USAGE
 
+    def test_refused_credential_stamp_rides_a_sentinel(self, store):
+        """The one thing a sentinel persists: which access token a live
+        session's fetch was refused with. Kept across plain sentinels,
+        cleared by a success."""
+        store.record(
+            {"1": FetchRecord(sentinel="token expired", rejected_fp="sha256-at:abc")},
+            IDENT,
+        )
+        assert store.entries(IDENT)["1"].rejected_fingerprint == "sha256-at:abc"
+        store.record({"1": FetchRecord(sentinel="token expired")}, IDENT)
+        assert store.entries(IDENT)["1"].rejected_fingerprint == "sha256-at:abc"
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].rejected_fingerprint is None
+
     def test_overlay_wins_decisions_but_not_display(self, store):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         entry = with_sentinel(store.entries(IDENT)["1"], "token expired")

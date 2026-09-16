@@ -140,7 +140,8 @@ def usage_fields(
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired and the refresh was deferred this pass — lock
     contention, unattributable lineage, or a failed persist; retried
-    automatically), the ``USAGE_API_KEY`` sentinel
+    automatically — or a live session's credential refused, which only that
+    session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
@@ -180,16 +181,34 @@ def usage_freshness_fields(
     ``lastGoodFetchedAt``/``lastGoodAgeSeconds`` for null-``usage`` rows."""
     if fetched_at is None:
         return {}
-    fields: dict = {
-        "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-    }
+    fields: dict = {"usageFetchedAt": _timestamp(fetched_at)}
     if age_s is not None:
         fields["usageAgeSeconds"] = round(age_s, 1)
     return fields
+
+
+def _timestamp(epoch_s: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch_s, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def usage_failure_fields(
+    status: str, last_error: str | None, backoff_until: float | None
+) -> dict:
+    """Additive ``usageError``/``usageRetryAt`` fields for a row that is
+    ``unavailable`` with nothing else to say for itself: the last fetch
+    failure by kind (``http-429``, ``timeout``, ...) and, while the store is
+    backing off from it, when the next attempt is due. Every other status
+    already explains the null ``usage``, so nothing is added to it."""
+    if status != "unavailable" or not last_error:
+        return {}
+    out = {"usageError": last_error}
+    if backoff_until is not None:
+        out["usageRetryAt"] = _timestamp(backoff_until)
+    return out
 
 
 def last_good_usage_fields(
@@ -219,10 +238,14 @@ def account_row(
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
+    last_error: str | None = None,
+    backoff_until: float | None = None,
     alias: str = "",
     disabled: bool = False,
+    login_expires_at: str | None = None,
 ) -> dict:
-    """A full account row for ``--list``."""
+    """A full account row for ``--list``. ``backoff_until`` is the live
+    backoff only; a lapsed one is the caller's to withhold."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -240,6 +263,11 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field: when the stored login records the expiry of its refresh
+    # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
+    # ``relogin_required`` that follows; absent when the login carries none.
+    if login_expires_at:
+        row["loginExpiresAt"] = login_expires_at
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
@@ -248,6 +276,7 @@ def account_row(
                 last_good_usage, usage_fetched_at, usage_age_s
             )
         )
+        row.update(usage_failure_fields(status, last_error, backoff_until))
     return row
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import plistlib
 import re
 import sys
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
@@ -438,9 +440,92 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+# macOS 26 stopped drawing status items for processes launched through an
+# exec trampoline, and a CPython *framework* build is exactly that: its
+# ``bin/python3.x`` is a stub that posix_spawns into ``Python.app``
+# (Mac/Tools/pythonw.c). Homebrew and python.org ship framework builds;
+# uv-managed and most other interpreters do not.
+#
+# Measured on macOS 26.6.2 with rumps 0.4.0, same bare rumps app throughout:
+#
+#   Homebrew 3.14.6   sys._framework 'Python'   no status item
+#   Homebrew 3.10.21  sys._framework 'Python'   no status item
+#   uv 3.14.7         sys._framework ''         status item drawn
+#   uv 3.13.15        sys._framework ''         status item drawn
+#
+# The interpreter version is not the variable; the build is.
+
+
+MIN_AFFECTED_MACOS = 26
+
+
+def _macos_major(mac_ver: str | None = None) -> int | None:
+    """Major version of the running macOS, or None if it cannot be read."""
+    raw = platform.mac_ver()[0] if mac_ver is None else mac_ver
+    head = raw.split(".")[0]
+    return int(head) if head.isdigit() else None
+
+
+def framework_build_warning(
+    framework=None, install_method=None, mac_ver: str | None = None
+) -> str | None:
+    """Text to show when this interpreter cannot draw a status item.
+
+    Returns None wherever the menu bar is known to work. Both halves of the
+    condition matter: the evidence is a framework build *on macOS 26*, and
+    framework builds draw fine on earlier releases — gating on the build alone
+    would nag every Homebrew user on macOS 14 or 15, on every launch and in
+    the service log on every restart.
+
+    Nothing here can fix the incompatibility. The point is that it fails
+    silently, with a healthy process and empty logs, so it is worth one line.
+    """
+    fw = getattr(sys, "_framework", "") if framework is None else framework
+    if not fw:
+        return None
+
+    major = _macos_major(mac_ver)
+    if major is None or major < MIN_AFFECTED_MACOS:
+        return None
+
+    if install_method is None:
+        from claude_swap.update_check import _detect_install_method
+
+        install_method = _detect_install_method()
+
+    if install_method == "uv":
+        remedy = (
+            "  uv tool install --managed-python --force 'claude-swap[menubar]'"
+        )
+    elif install_method == "pipx":
+        remedy = (
+            "  Reinstall against a non-framework interpreter, e.g. one from "
+            "`uv python install 3.13`:\n"
+            "  pipx install --force --python <that python> 'claude-swap[menubar]'"
+        )
+    else:
+        remedy = (
+            "  Reinstall against a non-framework interpreter "
+            "(uv-managed ones are; Homebrew and python.org are not)."
+        )
+
+    return (
+        "This is a framework build of Python, which on macOS 26 has been "
+        "observed not to draw the menu bar icon: the process runs and logs "
+        "nothing, but no status item appears.\n" + remedy
+    )
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
+    _warn = framework_build_warning()
+    if _warn:
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
@@ -654,6 +739,25 @@ def run(switcher) -> int:
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
             )
+            # Stop a rumps memory leak: rumps registers each menu item's callback
+            # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
+            # never removes them, so rebuilding the whole menu on every refresh
+            # leaks every item forever (~1GB after days on a busy machine). Purge
+            # this menu's entries before we tear it down. We walk the *native*
+            # NSMenu tree (itemArray, recursing into submenus) rather than the
+            # rumps Python dict: that dict is keyed by title and silently drops
+            # same-title items, which would leave leaked entries behind.
+            # Guard the private rumps attribute: if a future rumps release renames
+            # it, degrade to "leaks again" rather than crashing on every rebuild.
+            _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
+            if _reg is not None:
+                def _purge(nsmenu):
+                    for _it in nsmenu.itemArray():
+                        _reg.pop(_it, None)
+                        _sub = _it.submenu()
+                        if _sub is not None:
+                            _purge(_sub)
+                _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:

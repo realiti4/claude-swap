@@ -262,6 +262,11 @@ class FetchRecord:
     # predate the field — those strikes bind unconditionally, the legacy
     # behavior).
     struck_fp: str | None = None
+    # Hash of the access token a live session's read-only fetch was refused
+    # with. Rides on the sentinel and is the one thing a sentinel record
+    # persists: later passes skip the request while the credential still
+    # carries that token, and a success clears it.
+    rejected_fp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +299,9 @@ class UsageEntry:
     # Fingerprint of the generation the strikes condemned (absent on legacy
     # rows → strikes bind unconditionally). See ``token_dead``.
     struck_fingerprint: str | None = None
+    # The refused access token a live session's fetch stamped (see
+    # ``FetchRecord.rejected_fp``); None once a fetch succeeds.
+    rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -937,6 +945,7 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
+                rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1052,7 +1061,8 @@ class UsageStore:
         exclusive writers: success resets the failure fields, failure never
         touches ``lastGood``/``fetchedAt``. A supplied success plan commits
         in the same transaction as its measurement. Sentinel records clear
-        only the claim and are otherwise never persisted. Unfenced callers
+        only the claim and are otherwise never persisted, save the refused
+        credential stamp one may carry. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
         """
@@ -1067,6 +1077,8 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             if rec.sentinel is not None:
+                if rec.rejected_fp is not None:
+                    row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
@@ -1080,6 +1092,7 @@ class UsageStore:
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
+                row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1

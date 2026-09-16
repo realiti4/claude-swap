@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -57,6 +58,38 @@ def credential_fingerprint(credentials: str) -> str | None:
     if isinstance(token, str) and token:
         return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
+
+
+def access_token_fingerprint(credentials: str) -> str | None:
+    """Hash of the access token alone: the part that rotates within a
+    lineage, so a refused token and its replacement compare unequal."""
+    data = extract_oauth_data(credentials)
+    token = data.get("accessToken") if data else None
+    if not isinstance(token, str) or not token:
+        return None
+    return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def login_expires_at_iso(credentials: str) -> str | None:
+    """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
+
+    Claude Code stores ``refreshTokenExpiresAt`` (epoch milliseconds) next to the
+    access token's ``expiresAt``. The two age differently: the access token is
+    renewed from the refresh token on its own, while the refresh token is only
+    ever replaced by a fresh ``/login``. Once it lapses the slot reports
+    ``relogin_required`` and nothing short of logging in again fixes it, so this
+    is the date worth showing *before* that happens. Logins issued before Claude
+    Code recorded the field carry nothing, which means "unknown", never "now".
+    """
+    data = extract_oauth_data(credentials)
+    value = data.get("refreshTokenExpiresAt") if data else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return (
+        datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -764,7 +797,10 @@ def _persist(
             email,
             e,
         )
+        # stderr, not stdout: this runs inside ``cswap list --json`` and the
+        # other ``--json`` commands, whose stdout is one machine-readable object.
         print_warning(
             f"Warning: failed to save refreshed token for account {account_num} ({email}). "
-            f"If the next refresh fails, re-run `cswap --add-account` after logging in."
+            f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
+            file=sys.stderr,
         )

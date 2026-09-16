@@ -31,10 +31,16 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import paths
+from claude_swap import paths, session
 from claude_swap.models import Platform
 from tests import conftest
 
+
+#: Captured at import, BEFORE the autouse `_isolate_real_home` patches it.
+#: `monkeypatch.undo()` is the only other way back and it is far too wide --
+#: it also uninstalls `block_real_keychain`, the fake that keeps the suite off
+#: the real Keychain.
+_REAL_PATH_HOME = Path.home
 
 def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
     """CONTROL A: the guard must not block everything — a legitimate write
@@ -42,6 +48,17 @@ def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
     target = tmp_path / "control-a-allowed.txt"
     target.write_text("ok", encoding="utf-8")
     assert target.read_text(encoding="utf-8") == "ok"
+
+
+def _remove_our_marker(marker: Path) -> None:
+    """Remove OUR probe marker. No window: `conftest`'s hook exempts exactly
+    this basename for `os.remove`, so the guard stays armed for every other
+    path and every other thread while this runs. Blanking the specs around
+    the unlink instead disarmed the hook process-wide for the width of the
+    call, which is a worse trade than the litter it was fixing.
+    """
+    assert marker.name == conftest._GUARD_PROBE_MARKER, marker
+    marker.unlink(missing_ok=True)
 
 
 def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
@@ -65,8 +82,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
 
     real_backup_root = paths.get_backup_root()
     real_marker = real_backup_root / marker_name
-    if real_marker.exists():
-        real_marker.unlink()  # defensive: a prior failed run left one behind
+    _remove_our_marker(real_marker)  # a prior failed run may have left one
 
     # -- CONTROL B: main thread --------------------------------------
     outcome_main: dict = {}
@@ -86,8 +102,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the write was reported as refused but the file exists anyway"
         )
     finally:
-        if real_marker.exists():
-            real_marker.unlink()  # never leave real-store litter, pass or fail
+        _remove_our_marker(real_marker)  # never leave real-store litter
 
     # -- CONTROL C: a thread that outlives its own test's teardown ---
     # (the case the incident actually was: a thread started while isolation
@@ -121,8 +136,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the thread's write was reported as refused but the file exists anyway"
         )
     finally:
-        if real_marker.exists():
-            real_marker.unlink()
+        _remove_our_marker(real_marker)
 
 
 def test_rmtree_of_a_protected_root_is_refused_before_any_child_is_removed(
@@ -246,14 +260,47 @@ def test_non_recursive_root_protects_only_direct_children(
     assert not direct_target.exists()
 
 
-def test_frozen_specs_include_the_two_non_recursive_roots(monkeypatch, tmp_path):
+def test_a_dot_dot_spelling_cannot_walk_past_a_non_recursive_root(
+    tmp_path: Path, monkeypatch
+):
+    """A non-recursive root matches on ``target.parent``, which pathlib
+    reports literally: ``<root>/sub/..`` is not ``<root>``, so the direct
+    child the root exists to protect was reachable by spelling its own
+    parent the long way. A recursive root is immune -- ``root in
+    target.parents`` still holds -- so nothing but this class of root ever
+    showed the gap.
+    """
+    non_recursive_root = tmp_path / ".claude"
+    (non_recursive_root / "sub").mkdir(parents=True)  # before the guard is armed
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((non_recursive_root, False),))
+
+    walked = f"{non_recursive_root}/sub/../.credentials.json"
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open(walked, "w"):
+            pass
+    assert not (non_recursive_root / ".credentials.json").exists()
+
+
+@pytest.mark.parametrize("legacy_global_config", [False, True])
+def test_frozen_specs_include_the_two_non_recursive_roots(
+    monkeypatch, tmp_path, legacy_global_config
+):
     """M11: dropping the four non-recursive-root entries survived because
     no test inspects ``_REAL_STORE_SPECS`` directly — these two roots
     (``~/.claude``, ``$HOME``) are the ONLY protection for
-    ``~/.claude/.credentials.json`` and ``~/.claude.json``."""
+    ``~/.claude/.credentials.json`` and ``~/.claude.json``.
+
+    The ``legacy_global_config`` arm is the one that could not fail before:
+    both global-config resolvers return ``<config home>/.config.json`` when
+    that file exists, so both ``.parent`` values collapse to ``~/.claude``
+    and $HOME reached the specs through nothing at all.
+    """
     home = tmp_path / "home"
     home.mkdir()
     (home / ".claude").mkdir()
+    if legacy_global_config:
+        (home / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
@@ -263,6 +310,83 @@ def test_frozen_specs_include_the_two_non_recursive_roots(monkeypatch, tmp_path)
 
     assert home / ".claude" in non_recursive_roots
     assert home in non_recursive_roots
+
+
+@pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
+    monkeypatch, tmp_path, platform
+):
+    """Two writes that reach past every root the test above checks.
+
+    The migration flag is a SIBLING of the backup root, and transcripts land
+    two levels under a ``~/.claude`` that is non-recursive on purpose. Both
+    were allowed while every root here was armed, so a spec test that only
+    counts the roots cannot see either.
+
+    Parametrized over the two store layouts, because they put the flag in
+    different places: XDG at ``~/.local/share/.claude-swap.migrating``,
+    whose parent is no root at all, and legacy (macOS, and Windows through
+    the same branch) at ``~/..claude-swap-backup.migrating``, a direct child
+    of the ``$HOME`` root. Only the XDG layout leaves it uncovered without
+    this entry, so a premise phrased for that one alone is false on the
+    other two platforms.
+    """
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(Platform, "detect", staticmethod(lambda: platform))
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
+
+    # CONTROL: the patch above really selected this layout. Without it both
+    # arms resolve the same store, and the legacy coverage this test exists
+    # for disappears with nothing failing.
+    assert paths.get_backup_root() == (
+        home / ".claude-swap-backup" if platform is Platform.MACOS
+        else home / ".local" / "share" / "claude-swap"
+    )
+
+    specs = conftest._freeze_real_store_specs()
+    roots = {root for root, _ in specs}
+    recursive_roots = {root for root, recursive in specs if recursive}
+
+    flag = paths.migration_flag_for(paths.get_backup_root())
+    assert flag in roots, (
+        f"the migration flag is unprotected; a test that creates it leaves it "
+        f"behind and the next real run rmtree's the store it names. {flag}"
+    )
+    # PREMISE: a SIBLING of the backup root, so no recursive root covering
+    # that root ever reaches it -- on either layout.
+    assert not any(root in flag.parents for root in recursive_roots)
+    # BEHAVIOUR, not membership. A FILE root is reachable only through the
+    # `target == root` arm -- nothing can sit under a file -- and deleting
+    # that arm leaves the ENTIRE suite green, so assert the refusal itself.
+    # The parent is made first, while nothing protects it yet, so a
+    # regression reads as a write that was ALLOWED, not a missing directory.
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", specs)
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        flag.touch()
+
+    # Every DIRECTORY `--share-history` shares needs a recursive root of its
+    # own: its contents land two levels under the non-recursive `~/.claude`.
+    # A `.jsonl` item is a file and a direct child, already covered -- the
+    # same discriminator `_prepare_history_share` itself branches on. Read
+    # from `HISTORY_ITEMS` rather than naming `projects`, so the day a
+    # second directory joins it this fails instead of covering one of two.
+    for name in session.HISTORY_ITEMS:
+        if name.endswith(".jsonl"):
+            continue
+        assert home / ".claude" / name in recursive_roots, (
+            f"`--share-history` writes into {name}/<slug>/..., which a "
+            f"non-recursive ~/.claude does not reach"
+        )
+    # PREMISE: ~/.claude is a root AND still non-recursive -- this suite runs
+    # from under it, so making it recursive would refuse its own writes.
+    # Asserted as membership in the non-recursive set, not as absence from
+    # the recursive one: absence is also true when it is no root at all,
+    # which is the exact regression the commit below this range fixed.
+    assert (home / ".claude") in {root for root, rec in specs if not rec}
 
 
 def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(
@@ -637,6 +761,76 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
 
 
+def test_a_relative_candidate_that_already_carries_a_hint_is_still_joined(
+    tmp_path, monkeypatch
+):
+    """A relative path that ALREADY matches the pre-filter must still be
+    joined against the cwd, or it can never match an absolute root.
+
+    The store's own layout supplies such spellings — `configs/.claude-config
+    -<n>-<email>.json` carries `.claude` in the relative string itself — so
+    gating the join on `not hinted` let precisely the store-shaped relative
+    writes through while refusing the bare-filename ones.
+    """
+    stand_in_root = tmp_path / "claude-swap"
+    (stand_in_root / "configs").mkdir(parents=True)
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+    monkeypatch.chdir(stand_in_root)
+
+    # CONTROL: the bare filename misses the pre-filter, so it takes the join
+    # and is refused. If this stops failing the case below proves nothing.
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open("sequence.json", "w", encoding="utf-8") as handle:
+            handle.write("{}")
+
+    hinted_relative = "configs/.claude-config-1-someone_example.com.json"
+    assert any(h in hinted_relative for h in conftest._REAL_STORE_HINTS), (
+        "premise: this spelling must PASS the cheap reject, or the case is "
+        "exercising the control's path instead of the one under test"
+    )
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open(hinted_relative, "w", encoding="utf-8") as handle:
+            handle.write('{"pwned": true}')
+    assert not (stand_in_root / hinted_relative).exists()
+
+
+def test_the_legacy_backup_root_is_protected_recursively():
+    """`~/.claude-swap-backup` is a SEPARATE live path on Linux -- `switcher`
+    migrates data out of it and purges it -- and nothing was asserting it.
+
+    RECURSIVELY, because the flag is what the hook branches on: a
+    non-recursive root protects only its direct children, and the file the
+    original incident overwrote was nested (`credentials/*.enc`). Asserting
+    membership alone passes on a spec downgraded to non-recursive.
+
+    On macOS and Windows `get_backup_root()` returns this same path, so the
+    entry is a duplicate there and dropping it is a no-op. The assert is
+    Linux-only in effect and needs no marker: if those platforms ever stop
+    aliasing the two, it starts firing there too.
+    """
+    # THE ARTIFACT THE HOOK READS, not the factory that built it. The hook
+    # branches on the module global frozen at import; asserting on a fresh
+    # `_freeze_real_store_specs()` call leaves the two unconnected, and
+    # flattening every flag in that global was measured green across the whole
+    # suite while a nested `credentials/*.enc` write went REFUSED -> ALLOWED.
+    frozen = dict(conftest._REAL_STORE_SPECS)
+    frozen_legacy = conftest._HOME_AT_FREEZE_TIME / paths.LEGACY_BACKUP_DIRNAME
+    assert frozen.get(frozen_legacy) is True, (
+        f"the legacy backup root {frozen_legacy} is not frozen as RECURSIVELY "
+        "protected in the specs the audit hook actually reads, so a nested "
+        f"write under it is allowed: {sorted((str(r), f) for r, f in frozen.items())}"
+    )
+    recursive_roots = {
+        root for root, recursive in conftest._freeze_real_store_specs() if recursive
+    }
+    legacy = paths.get_legacy_backup_root()
+    assert legacy in recursive_roots, (
+        f"the legacy backup root {legacy} is not frozen as recursively "
+        "protected, so a test whose isolation has unwound can write into the "
+        f"account's real pre-XDG store: {sorted(map(str, recursive_roots))}"
+    )
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason=(
@@ -654,7 +848,12 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     # fallback the third snapshot depends on. Restore the real
     # `Path.home` for this test -- $HOME stays scratch, which is the
     # condition under test.
-    monkeypatch.undo()
+    from claude_swap import macos_keychain
+
+    monkeypatch.setattr(Path, "home", _REAL_PATH_HOME)
+    assert (
+        macos_keychain.get_password.__qualname__ != "get_password"
+    ), "premise: the Keychain fake was uninstalled, so this test can reach the real one"
     scratch = tmp_path / "scratch-home"
     scratch.mkdir()
     monkeypatch.setenv("HOME", str(scratch))
@@ -662,16 +861,52 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     pwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    # POINTED AWAY -- ON LINUX AND WSL ONLY. There the ambient pass then
+    # cannot supply the scratch root, so the assert below rests on the pass
+    # this case names, and dropping `default_specs` fails it. On macOS and
+    # Windows `get_backup_root()` ignores `XDG_DATA_HOME` entirely and
+    # answers `~/.claude-swap-backup`, so both passes resolve to the same
+    # directory and this case cannot tell them apart -- the mutation it
+    # claims to kill SURVIVES on those jobs. Measured on both.
+    #
+    # The pass is still load-bearing in the scenario this case exists for:
+    # the mandated recipe exports HOME AND `XDG_DATA_HOME` before the
+    # interpreter starts, and only `default_specs` then protects the scratch
+    # HOME's own store.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-outside"))
     specs = conftest._freeze_real_store_specs()
     roots = [root for root, _recursive in specs]
 
-    assert pwd_home / ".local" / "share" / "claude-swap" in roots, (
+    # THE LAYOUT IS PER-PLATFORM, so both expectations are DERIVED under the
+    # HOME each snapshot resolves against, never spelled out. Written as the
+    # XDG path they named a directory macOS does not use: the backup root
+    # there is `~/.claude-swap-backup`, so this case failed on the one
+    # platform whose store lives somewhere else.
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(pwd_home))
+    # THE PREMISE FOR THE THING THAT CAN SILENTLY BREAK. `_REAL_PATH_HOME` is
+    # captured at import; if that capture ever lands on a PATCHED `Path.home`,
+    # both roots below collapse to the isolated home and every assert passes
+    # whatever the specs contain. The Keychain fake asserted above cannot fail
+    # that way -- this one can.
+    assert Path.home() == pwd_home, (
+        "premise: `Path.home` still answers the isolation fixture's constant, "
+        "so both roots below are the same isolated path and this case cannot "
+        "fail whatever the frozen specs hold"
+    )
+    pwd_root = paths.get_backup_root()
+    monkeypatch.setenv("HOME", str(scratch))
+    scratch_root = paths.get_backup_root()
+
+    assert pwd_root in roots, (
         "with $HOME pointed at a scratch dir -- what the mandated isolation "
         "recipe does BEFORE the interpreter starts -- the account's true "
         "store under the OS account home must still be frozen as protected; "
         "otherwise the guard is armed only for a bare-pytest developer and "
         "disarmed for exactly the population running mutation batteries"
     )
-    assert scratch / ".local" / "share" / "claude-swap" in roots, (
+    # WHAT THIS CASE OWNS is the HOME axis: the OS account home and the
+    # scratch HOME must BOTH be protected, which no other case asks.
+    assert scratch_root in roots, (
         "the scratch HOME's own root must stay protected too"
     )

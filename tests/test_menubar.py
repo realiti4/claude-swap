@@ -556,3 +556,64 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+class TestFrameworkBuildWarning:
+    """The menu bar draws nothing from a framework build on macOS 26.
+
+    See #310. The interpreter *version* is not the variable — measured with the
+    same bare rumps app, Homebrew 3.14.6 and 3.10.21 (both framework) draw
+    nothing while uv-managed 3.14.7 and 3.13.15 (neither framework) draw.
+    Nothing here can fix that; these tests are about the warning, not the icon.
+    """
+
+    def test_silent_on_a_build_that_draws(self):
+        assert menubar.framework_build_warning("", "uv", "26.6.2") is None
+
+    def test_silent_on_macos_where_framework_builds_still_draw(self):
+        # The evidence is a framework build *on macOS 26*. Warning on 14 or 15
+        # would nag every Homebrew user on every launch, and in the service log
+        # on every restart, about something that works there.
+        assert menubar.framework_build_warning("Python", "uv", "15.7") is None
+        assert menubar.framework_build_warning("Python", "uv", "14.2") is None
+
+    def test_warns_from_macos_26_onwards(self):
+        assert menubar.framework_build_warning("Python", "uv", "26.0") is not None
+        assert menubar.framework_build_warning("Python", "uv", "27.1") is not None
+
+    def test_unreadable_macos_version_stays_quiet(self):
+        assert menubar.framework_build_warning("Python", "uv", "") is None
+
+    def test_the_wording_does_not_overclaim(self):
+        # An observation on one machine that has also been seen to behave
+        # otherwise; "observed" is what the evidence supports.
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "observed" in msg
+
+    def test_warns_on_a_framework_build(self):
+        assert menubar.framework_build_warning("Python", "uv", "26.6.2") is not None
+
+    def test_the_version_is_not_the_gate(self):
+        # A framework build warns whatever the version; a non-framework one
+        # never does. Keying on version_info was the original mistake here.
+        assert menubar.framework_build_warning("Python", None, "26.6.2") is not None
+        assert menubar.framework_build_warning("", None, "26.6.2") is None
+
+    def test_uv_gets_a_uv_remedy(self):
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "--managed-python" in msg
+
+    def test_pipx_is_not_handed_a_uv_command(self):
+        # `uv tool install --force` would overwrite pipx's own executable.
+        msg = menubar.framework_build_warning("Python", "pipx", "26.6.2")
+        assert "uv tool install" not in msg
+        assert "pipx install" in msg
+
+    def test_unknown_install_method_still_says_what_to_aim_for(self):
+        msg = menubar.framework_build_warning("Python", None, "26.6.2")
+        assert "non-framework" in msg
+
+    def test_the_warning_names_the_silence(self):
+        # The symptom is that everything looks healthy, so say so.
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "logs nothing" in msg
