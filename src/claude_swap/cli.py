@@ -1423,12 +1423,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
-            switcher.note_manual_switch()
+            if payload is not None:
+                switcher.note_manual_switch()
         elif args.switch_to:
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
-            switcher.note_manual_switch()
+            # None means nothing moved (cancelled prompt, auto-add notice) —
+            # a pick that never happened must not arm a hold on the old account.
+            if payload is not None:
+                switcher.note_manual_switch()
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

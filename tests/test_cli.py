@@ -927,6 +927,13 @@ class TestSubcommandAliases:
             cli.main()
         switcher_cls.return_value.note_manual_switch.assert_called_once_with()
 
+    def test_cancelled_switch_records_no_pick(self):
+        """A switch that never moved (None payload) must not arm a hold."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,              patch.object(sys, "argv", ["claude-swap", "switch", "2"]),              patch("os.geteuid", return_value=1000, create=True),              patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.switch_to.return_value = None
+            cli.main()
+        switcher_cls.return_value.note_manual_switch.assert_not_called()
+
     def test_list_subcommand_with_json(self):
         """`cswap list --json` reaches list_accounts(json_output=True)."""
         payload = {"schemaVersion": 1, "accounts": []}
