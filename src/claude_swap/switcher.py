@@ -6315,6 +6315,17 @@ class ClaudeAccountSwitcher:
             )
         return result
 
+    def note_manual_switch(self) -> None:
+        """Record the live account as a human's pick for the auto-switch
+        engine's ``manualHoldSeconds``. Called by the CLI after a person's
+        ``switch`` — never by the engine, whose moves are not picks. A re-pick
+        of the already-active account refreshes the hold on purpose."""
+        from claude_swap.autoswitch import record_manual_switch
+
+        number = self.current_account_number()
+        if number is not None:
+            record_manual_switch(self.backup_dir, number, time.time())
+
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.
 
