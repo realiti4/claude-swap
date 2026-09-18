@@ -4037,7 +4037,10 @@ class TestSwitchToSelfSlotAndForce:
             for p in patches:
                 p.stop()
 
-        assert result is None
+        # Human mode still reports the resolved no-op (the CLI arms the
+        # manual hold off this payload); only the printing is mode-specific.
+        assert result["switched"] is False
+        assert result["reason"] == "already-active"
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
         assert live["creds"] == self.LIVE_1
         out = capsys.readouterr().out
@@ -4063,7 +4066,9 @@ class TestSwitchToSelfSlotAndForce:
             for p in patches:
                 p.stop()
 
-        assert result is None
+        # Reported in human mode too: a forced self-activation is a real
+        # rewrite, so the CLI treats it as a pick that landed.
+        assert result["reason"] == "activated"
         assert live["creds"] == self.IMPORTED_1
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
         data = switcher._get_sequence_data()
@@ -4092,6 +4097,31 @@ class TestSwitchToSelfSlotAndForce:
         assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
         data = switcher._get_sequence_data()
         assert data["activeAccountNumber"] == 2
+
+    def test_human_mode_switch_reports_the_landing(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A plain `cswap switch 2` (no --json) still returns the result the
+        CLI needs to arm the manual hold. Regression: the hub uplink runs
+        exactly this form, and a None return here silently disabled
+        autoswitch.manualHoldSeconds for every human switch made without
+        --json."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 2
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
 
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
@@ -8590,7 +8620,9 @@ class TestSwitchRemoveGatesAcceptAlias:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         with patch.object(switcher, "_perform_switch", return_value={
-            "from": None, "to": {"number": 2}, "warnings": [],
+            "from": {"number": 1, "email": "test@example.com"},
+            "to": {"number": 2, "email": "account2@example.com"},
+            "warnings": [],
         }) as perform:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
