@@ -915,6 +915,18 @@ class TestSubcommandAliases:
             strategy=None, json_output=False, models=(), model_source=None
         )
 
+    @pytest.mark.parametrize(
+        "argv",
+        [["switch", "2"], ["switch"], ["switch", "--strategy", "best"]],
+        ids=["target", "rotate", "best"],
+    )
+    def test_human_switch_records_a_manual_pick(self, argv):
+        """Every `cswap switch` form notes the pick for autoswitch's manual hold."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,              patch.object(sys, "argv", ["claude-swap", *argv]),              patch("os.geteuid", return_value=1000, create=True),              patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = Path("/nonexistent")
+            cli.main()
+        switcher_cls.return_value.note_manual_switch.assert_called_once_with()
+
     def test_list_subcommand_with_json(self):
         """`cswap list --json` reaches list_accounts(json_output=True)."""
         payload = {"schemaVersion": 1, "accounts": []}
