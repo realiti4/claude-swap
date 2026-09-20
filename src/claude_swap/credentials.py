@@ -1196,7 +1196,13 @@ class CredentialStore:
             enc_present = True
         if enc_present:
             try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
+                # BYTES, not text: `read_text` decodes inside the read and
+                # `UnicodeDecodeError` is a `ValueError`, so a .enc of garbled
+                # bytes escaped this arm AND the corrupt-content arm below, and
+                # raised out of a reader whose contract is `""`. Garbled bytes
+                # are what that second arm exists for, and `b64decode` rejects
+                # them there. Same split as `_read_stash_manifest_ex`.
+                encoded = enc_file.read_bytes().strip()
             except OSError as e:
                 # The .enc EXISTS but could not be read (permissions, a
                 # mid-unmount, ...) — a real read failure, not "no backup".
@@ -1822,7 +1828,11 @@ class CredentialStore:
         """
         path = self._stash_entry_path(entry_id)
         try:
-            encoded = path.read_text(encoding="utf-8").strip()
+            # BYTES for the same reason as the backup read above: undecodable
+            # bytes are a CORRUPT entry, the verdict the base64 arm below
+            # already gives, not an exception out of the reader the adopt path
+            # relies on to answer.
+            encoded = path.read_bytes().strip()
         except FileNotFoundError:
             return "", False
         except OSError as e:
