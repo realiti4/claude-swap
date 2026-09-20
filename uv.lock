@@ -35,7 +35,7 @@ provides-extras = ["menubar"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-xdist", specifier = ">=3.5" },
 ]
