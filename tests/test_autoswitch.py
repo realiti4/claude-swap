@@ -2782,6 +2782,44 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _two_phase_tick(
+    h: EngineHarness, stored: dict, fresh: dict
+) -> tuple[TickOutcome, list[set]]:
+    """Drive one tick where stored-snapshot collections serve ``stored``
+    and the all-candidates escalation serves ``fresh``.
+
+    Usable only on ticks where the collector does not reach for every
+    candidate on its own, because such a call is indistinguishable from the
+    phase-2 refetch — both ask for ``{current, *candidates}``, and the fetch
+    set is all this has to tell the phases apart. ``escalate`` in
+    `_collect_scheduled_usage` reaches for everyone in TWO cases, not one: when the
+    active account's utilization is within ``ESCALATION_MARGIN_PCT`` of the
+    threshold, and when its headroom cannot be read at all. Either way the
+    GATE is served ``fresh``, so nothing is ever provisionally decided on
+    ``stored`` and the phase-2 branch under test is not reached at all.
+
+    The unreadable case is measured, not reasoned: it is why
+    ``test_a_failover_moves_on_when_the_drain_account_stops_qualifying``
+    discriminates by call ORDER instead of using this helper.
+
+    Shared by both refetching paths (consume-first and a forced drain
+    target) so that fetch set cannot drift in one copy: a set that stops
+    matching does not fail, it serves ``stored`` to phase 2 and the test
+    passes without exercising the verification it is named after.
+    """
+    fetch_sets: list[set] = []
+
+    def collect(fetch=None, **_kwargs):
+        requested = set(fetch or ())
+        fetch_sets.append(requested)
+        view = fresh if requested == {"1", "2", "3"} else stored
+        return {num: _entry_for(value, h.clock.now) for num, value in view.items()}
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+        outcome = h.engine.tick()
+    return outcome, fetch_sets
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -3067,35 +3105,6 @@ class TestConsumeFirstStrategy:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["reset-unknown"]
 
-    def _two_phase_tick(
-        self, h: EngineHarness, stored: dict, fresh: dict
-    ) -> tuple[TickOutcome, list[set]]:
-        """Drive one tick where stored-snapshot collections serve ``stored``
-        and the all-candidates escalation serves ``fresh``.
-
-        These ticks run outside the escalation band (utilization far below
-        threshold - ESCALATION_MARGIN_PCT), so the collector never escalates
-        on its own and the only all-candidates call a tick can make is the
-        consume-first phase-2 refetch — the returned fetch sets prove whether
-        it happened.
-        """
-        fetch_sets: list[set] = []
-
-        def collect(fetch=None, **_kwargs):
-            requested = set(fetch or ())
-            fetch_sets.append(requested)
-            view = fresh if requested == {"1", "2", "3"} else stored
-            return {
-                num: _entry_for(value, h.clock.now)
-                for num, value in view.items()
-            }
-
-        with patch.object(
-            h.switcher, "usage_entries_by_account", side_effect=collect
-        ):
-            outcome = h.engine.tick()
-        return outcome, fetch_sets
-
     def test_two_phase_refetch_disqualifies_stale_pick(self, temp_home):
         # The stored snapshot ranks #2; the phase-2 refetch shows it
         # exhausted. The tick must re-decide on the fresh data and hold.
@@ -3110,7 +3119,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(100, 100, _R_SOON),   # burned out since the snapshot
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -3126,7 +3135,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, view, view)
+        outcome, fetch_sets = _two_phase_tick(h, view, view)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
@@ -3146,7 +3155,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATER),    # still sooner than active
             "3": _usage7(10, 10, _R_SOON),     # but #3 is now soonest
         }
-        outcome, _ = self._two_phase_tick(h, stored, fresh)
+        outcome, _ = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
@@ -3168,7 +3177,7 @@ class TestConsumeFirstStrategy:
             "2": _usage7(10, 10, _R_LATEST),   # no longer strictly sooner
             "3": _usage7(10, 10, _R_LATEST),
         }
-        outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
@@ -6894,3 +6903,746 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestDrainAccount:
+    """`autoswitch.drainAccount` — a user-named account the engine returns to.
+
+    The engine already leaves an account that hits the threshold. What it has
+    never done is come BACK: the tick gate returns NO_ACTION for every
+    strategy but consume-first once the active account sits below the
+    threshold, so an account the user prefers is left behind permanently
+    after one departure, even when its window has since reset.
+
+    `consume-first` does not cover this: its anchor is "whichever weekly
+    window resets soonest", chosen from the data. A drain account is named by the
+    user and does not move.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _leave_the_drain_account(self, h: EngineHarness) -> None:
+        """Burn the drain account past the threshold so the ENGINE leaves it.
+
+        Going through a real departure is the point: it arms `lastSwitchTo`
+        and with it the `_no_return_account` bar (PR #202, "NEVER UNDO THE
+        PREVIOUS MOVE"). A test that merely starts the engine on the away
+        account would pass without ever touching the gate that actually
+        blocks this feature.
+        """
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)  # clear the proactive cooldown (default 300s)
+        h.events.clear()
+
+    def test_returns_once_the_drain_account_is_back_under_the_threshold(self, temp_home):
+        """The whole feature: the drain account's window reset, so go back."""
+        h = self._harness(temp_home, drain_account="1")
+        self._leave_the_drain_account(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10),   # drain account recovered
+            "2": _usage7(20, 20),   # away is fine too -- irrelevant
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "the drain account recovered but the engine is parked away; "
+            "today the tick gate answers below-threshold NO_ACTION and the "
+            "user never gets back to the account they chose"
+        )
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "drain-return"
+
+    def test_stays_away_while_the_drain_account_is_still_over_the_threshold(self, temp_home):
+        """Not a magnet: the drain account must be usable before we go back."""
+        h = self._harness(temp_home, drain_account="1")
+        self._leave_the_drain_account(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # drain account still spent
+            "2": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_drain_return_ignores_hysteresis(self, temp_home):
+        """`hysteresis_pct` must not gate the return.
+
+        Hysteresis exists to stop two accounts trading places while both
+        hover near the line -- it asks "is the target BETTER?". Drain-return
+        does not ask that question: the target is named, not ranked. Gating
+        it here would strand the user on an away account that merely happens
+        to have more headroom, which is the normal case after a return.
+        """
+        h = self._harness(temp_home, drain_account="1", hysteresis_pct=10.0)
+        self._leave_the_drain_account(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(80, 20),   # drain usable, but WORSE than away
+            "2": _usage7(5, 5),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_unset_drain_account_leaves_todays_behaviour_untouched(self, temp_home):
+        """Regression guard: the default must change nothing."""
+        h = self._harness(temp_home)  # home unset
+        self._leave_the_drain_account(h)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10),
+            "2": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+
+class TestDrainAccountWithMoreThanTwoAccounts:
+    """The drain account is one among many — the other axes must keep working.
+
+    With two accounts "leave the drain account" and "go to the other one" are the
+    same decision, so a two-account suite cannot tell whether drain-return
+    distorts target selection or merely adds a return leg.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")   # drain account
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_departure_from_the_drain_account_still_obeys_the_strategy(self, temp_home):
+        """Naming a drain account must not bias which account we LEAVE to.
+
+        it answers "where do I return", not "where do I go next" — the
+        strategy still owns departure, so the most-headroom peer wins.
+        """
+        h = self._harness(temp_home, drain_account="1")
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # drain account, spent -> must leave
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),   # most headroom -> `best` picks this
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_returns_to_the_drain_account_not_the_roomiest_peer(self, temp_home):
+        """The return target is the drain account, not whoever ranks best."""
+        h = self._harness(temp_home, drain_account="1")
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 20),   # drain recovered, but NOT the roomiest
+            "2": _usage7(1, 1),     # roomiest by far -- must lose to drain
+            "3": _usage7(30, 30),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "drain-return"
+
+    def test_no_shuffling_between_peers_while_the_drain_account_is_spent(self, temp_home):
+        """Below the threshold with the drain account unusable, NO_ACTION stands.
+
+        A drain account that cannot be returned to must not turn the gate into a
+        general-purpose "move to the roomiest account" rule.
+        """
+        h = self._harness(temp_home, drain_account="1")
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(50, 50),
+            "3": _usage7(10, 10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),   # drain account still spent
+            "2": _usage7(1, 1),     # far roomier than where we are
+            "3": _usage7(30, 30),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+
+class TestDrainReturnFreshnessAndKind:
+    """The two ways a naive drain-return lands somewhere it should not."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_stale_drain_account_snapshot_does_not_trigger_a_doomed_return(self, temp_home):
+        """The drain account is a CANDIDATE, so its snapshot can be minutes old.
+
+        `_drain_account_target` argues drain-return cannot flap because its
+        utilization only falls on a window reset. That holds for the TRUE
+        value; it does not hold for a stale one. It can be burned from
+        another machine or a `cswap run` terminal while we are away, and a
+        stale-low reading would send us back to a spent account and straight out
+        again on the next tick — the one way the no-flap argument is
+        defeated. consume-first already re-decides on fresh data before
+        committing a below-threshold move; drain-return has the same exposure.
+        """
+        h = self._harness(temp_home, drain_account="2")
+        stored = {
+            "1": _usage7(20, 20),
+            "2": _usage7(10, 10),    # drain looks recovered...
+            "3": _usage7(20, 20),
+        }
+        fresh = {
+            "1": _usage7(20, 20),
+            "2": _usage7(99, 99),    # ...but it was burned elsewhere since
+            "3": _usage7(20, 20),
+        }
+
+        outcome, fetch_sets = _two_phase_tick(h, stored, fresh)
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "returned on a stale snapshot; the fresh read shows the drain "
+            "spent, so this lands on an exhausted account and leaves again "
+            "next tick"
+        )
+        assert h.active_number() == 1
+        assert {"1", "2", "3"} in fetch_sets, "phase-2 refetch never happened"
+
+    def test_a_fresh_confirmation_still_returns(self, temp_home):
+        """The refetch is a check, not a veto: agreeing data still switches."""
+        h = self._harness(temp_home, drain_account="2")
+        view = {
+            "1": _usage7(20, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }
+
+        outcome, fetch_sets = _two_phase_tick(h, view, view)
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert {"1", "2", "3"} in fetch_sets
+
+    def test_an_api_key_drain_account_is_never_returned_to(self, temp_home):
+        """`include_api_key_accounts` must gate this like every other target.
+
+        The ranking path splits OAuth from API-key candidates and keeps the
+        metered ones as a last resort; drain-return skips `_rank` entirely, so
+        it has to carry that rule itself. Relying on API-key accounts merely
+        happening to report unreadable headroom leaves the invariant to an
+        accident somewhere else in the codebase.
+        """
+        h = self._harness(temp_home, drain_account="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),
+            "2": _usage7(0, 0),      # a readable, wide-open API-key drain
+            "3": _usage7(20, 20),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+
+class TestDrainAccountWithConsumeFirst:
+    """`drainAccount` + `consume-first`: two below-threshold triggers.
+
+    drain-return was written as orthogonal to `strategy`, but consume-first is
+    the one strategy that also moves BELOW the threshold. Its departure rule
+    (go to the soonest weekly reset) and drain-return's return rule (go to
+    the drain account) are not disjoint, so the pair cycles on data that never
+    changes.
+    """
+
+    def test_consume_first_does_not_drag_us_off_a_healthy_drain_account(self, temp_home):
+        """Fixed snapshot, one cooldown apart: the active account must settle.
+
+        drain #1 resets LAST, so consume-first always wants to leave it;
+        drain-return always wants to come back. `_no_return_account` cannot break
+        the tie because it only bars the account we most recently left, and a
+        third account keeps the cycle supplied with a fresh target.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", strategy="consume-first"
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        snapshot = {
+            "1": _usage7(20, 20, _R_LATEST),  # drain account, resets last
+            "2": _usage7(20, 20, _R_SOON),
+            "3": _usage7(20, 20, _R_LATER),
+        }
+
+        seen = []
+        for _ in range(6):
+            h.tick_with_usage(snapshot)
+            seen.append(h.active_number())
+            h.clock.advance(301)  # clear the cooldown between ticks
+
+        assert seen == [1, 1, 1, 1, 1, 1], (
+            f"nothing about the usage changed, yet the engine kept moving: "
+            f"{seen}. Naming a drain account means preferring it; "
+            f"consume-first must not drag us off one still under the threshold"
+        )
+
+    def test_other_strategies_keep_the_below_threshold_event_verbatim(
+        self, temp_home
+    ):
+        """The cycle fix must not spread beyond consume-first.
+
+        Only consume-first can reach a move from a healthy drain account, so
+        only it needs intercepting. Sitting on it under `best` must still report
+        `below-threshold`, not a new reason -- an event rename is a behaviour
+        change for anyone parsing `cswap auto --json`.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="1", strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage7(20, 20), "2": _usage7(10, 10)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+
+class TestDrainReturnRefusesWhatItCannotTrust:
+    """Every way `autoswitch.drainAccount` can name something unusable.
+
+    Each one must fall through to today's below-threshold behaviour rather
+    than switch — the setting is a preference, not an override of the checks
+    that keep the engine off accounts it cannot use.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _healthy(self) -> dict:
+        return {"1": _usage7(20, 20), "2": _usage7(10, 10)}
+
+    def test_a_quarantined_drain_account_is_not_returned_to(self, temp_home):
+        """A dead refresh token makes it unusable however preferred it is."""
+        h = self._harness(temp_home, drain_account="2")
+        h.engine._quarantine("2", "b@example.com", "identity-conflict")
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_disabled_drain_account_is_not_returned_to(self, temp_home):
+        """`cswap disable` is newer and more specific than a drain set earlier."""
+        h = self._harness(temp_home, drain_account="2")
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_ambiguous_drain_account_email_never_guesses_a_slot(self, temp_home):
+        """Two slots, one email — resolution raises, and we must not pick one.
+
+        This is the real shape for anyone with a personal and an org account
+        under the same address: `cswap switch <email>` already refuses it, so
+        silently choosing a slot here would be worse than doing nothing.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="dup@example.com")
+        h.seed(1, "a@example.com")
+        h.seed(2, "dup@example.com")
+        h.seed(3, "dup@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_unknown_drain_account_name_is_inert(self, temp_home):
+        """A typo'd or removed account must not break the tick."""
+        h = self._harness(temp_home, drain_account="nope@example.com")
+
+        outcome = h.tick_with_usage(self._healthy())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_unreadable_drain_account_holds_rather_than_guesses(self, temp_home):
+        """Unknown headroom is not 'probably fine'.
+
+        Landing on an account whose usage we cannot read would re-trigger
+        blind on the next tick — the same harm the landing gate in
+        `_rank_candidates` exists to prevent.
+        """
+        h = self._harness(temp_home, drain_account="2")
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),
+            "2": USAGE_TOKEN_EXPIRED,   # sentinel: no readable window
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+
+class TestDrainReturnHonoursTheModelWindow:
+    """`autoswitch.model` must gate the return, not just the departure.
+
+    Drain-return reads headroom from the same `_headroom_by_account` the rest of
+    the engine uses, so folding a per-model weekly window in should apply for
+    free. "For free" is exactly the kind of inherited property that breaks
+    silently later, and it is the live configuration here: an account whose
+    5h and 7d have room while its Fable weekly window is spent is a normal
+    state, not a corner case.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="2", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_drain_account_whose_model_window_is_spent_is_not_returned_to(self, temp_home):
+        h = self._harness(temp_home, model="Fable")
+
+        outcome = h.tick_with_usage({
+            "1": _model_usage(20, 20),
+            "2": _model_usage(5, 95),   # 5h/7d wide open, Fable spent
+        })
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "returned to a drain account whose Fable weekly window is at 95%: the "
+            "5h/7d headroom says it is fine, but the model the user actually "
+            "works in is blocked there"
+        )
+        assert h.active_number() == 1
+
+    def test_the_same_account_is_returned_to_when_the_model_is_not_watched(
+        self, temp_home
+    ):
+        """The differential: identical usage, `model` unset -> the return fires.
+
+        Without this pair the test above would also pass if drain-return were
+        broken in some unrelated way, and it would not show that `model` is
+        what made the difference.
+        """
+        h = self._harness(temp_home)  # model unset
+
+        outcome = h.tick_with_usage({
+            "1": _model_usage(20, 20),
+            "2": _model_usage(5, 95),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestDrainReturnOutranksTheOverflowAccountsState:
+    """The return must not depend on how the account we are ON is doing.
+
+    `_drain_account_target` was consulted only inside the below-threshold
+    branch, so a tick where the drain account recovers AND the overflow
+    account crosses the threshold fell through to ordinary ranking. That is
+    the one tick where the setting matters most, and it is exactly when it
+    was ignored.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, drain_account="1", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_recovered_drain_account_beats_a_roomier_third_account(self, temp_home):
+        """Overflow hits the threshold the same tick the drain account resets.
+
+        Ranking would send us to the roomiest peer, adding a hop the user did
+        not ask for — and that hop records a cooldown, so the return they DID
+        ask for is delayed by another `cooldownSeconds` on top.
+        """
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),   # drain account spent -> leave
+            "2": _usage7(10, 10),   # roomiest -> lands here
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),   # drain account recovered
+            "2": _usage7(95, 20),   # where we are, now over the threshold
+            "3": _usage7(0, 0),     # roomier than the drain account
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            "went to the roomiest peer instead of the account the user named; "
+            "the drain order should not be contingent on how the overflow "
+            "account happens to be doing"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "drain-return"
+
+    def test_an_exhausted_overflow_still_escapes_during_the_cooldown(self, temp_home):
+        """Making the return outrank `at-limit` must not re-gate the escape.
+
+        `at-limit` bypasses the cooldown by design — sitting still on a spent
+        account is never right. Routing that tick through drain-return must
+        keep the bypass, or the fix trades an extra hop for being stranded.
+        """
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(5)  # still well inside the default 300s cooldown
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),    # drain account recovered
+            "2": _usage7(100, 100),  # where we are, fully exhausted
+            "3": _usage7(0, 0),
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "held on a 100% account because the cooldown was applied to a "
+            "move that had to happen"
+        )
+        assert h.active_number() == 1
+
+
+    def test_a_failover_move_also_lands_on_the_drain_account(self, temp_home):
+        """Failover picks a target too, and that target is a spend-order call.
+
+        The debounce is untouched — a single unreadable tick must not move
+        anyone. But once failover has decided to move, ranking used to send us
+        to whichever peer was roomiest: measured, drain #1 recovered at 20%
+        and the engine went to #3 at 0% instead, leaving the user off the
+        account they named until some later tick happened to bring them back.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20),   # drain account recovered
+            "2": None,              # where we are — unreadable, so failover
+            "3": _usage7(0, 0),     # roomier than the drain account
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover", (
+            "the trigger records WHY we moved, not where we landed; "
+            "relabelling it would rewrite `leftTrigger` and mislead the "
+            "anti-flap release legs that a failover departure is owed"
+        )
+
+    def test_a_failover_landing_on_a_stale_drain_row_is_verified_first(
+        self, temp_home
+    ):
+        """The hard target must not skip the freshness check failover rides past.
+
+        The two-phase refetch is keyed on the trigger string, so routing
+        `failover` through the same hard target quietly reintroduced exactly
+        the staleness hole this PR closed for `drain-return`: a drain row read
+        minutes ago can say 20% while the account has since been burned to 99%
+        from another machine, and we land on a spent account and leave again
+        next tick.
+
+        Holding is not the answer here the way it is for `drain-return` --
+        failover fires precisely because staying put is not an option. It has
+        to fall back to a fresh ordinary candidate instead.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        now = h.clock.now
+        stale = UsageEntry(
+            last_good=_usage7(20, 20), fetched_at=now - 240.0, age_s=240.0
+        )
+        outcome = h.tick_with_entries({
+            "1": stale,                                   # drain, but not fresh
+            "2": _entry_for(None, now),                   # unreadable -> failover
+            # Fresh, and DELIBERATELY worse than the stale drain row. With the
+            # peer roomier the drain loses on merit and the test passes without
+            # the exclusion ever running — it has to be the one that looks
+            # better on stale data for this to isolate the mechanism.
+            "3": _entry_for(_usage7(50, 50), now),
+        })
+
+        assert outcome is TickOutcome.SWITCHED, (
+            "failover must still move — holding on an unreadable account is "
+            "the one thing this trigger exists to prevent"
+        )
+        assert h.active_number() == 3, (
+            "landed on the drain account from a 240s-old row without "
+            "re-verifying it. A stale-low reading is indistinguishable from a "
+            "reset that never happened, and dropping the hard target is not "
+            "enough on its own: ordinary ranking will re-pick the same "
+            "unverified account whenever it looks the roomiest"
+        )
+
+    def test_a_failover_moves_on_when_the_drain_account_stops_qualifying(
+        self, temp_home
+    ):
+        """The hold that is right for `drain-return` is wrong for `failover`.
+
+        Phase 2 can find the drain account not merely stale but no longer
+        under the threshold at all — burned elsewhere between the snapshot
+        the gate read and the refetch. For `drain-return` the answer is to
+        hold and say `drain-unavailable`: the active account is healthy, so
+        staying put is a correct outcome. `failover` fires because the active
+        account cannot even be READ, so holding is the one thing it must
+        never do.
+
+        Only the ORDER of two branches separates those cases — a failover
+        whose drain account stopped qualifying satisfies both — and nothing
+        else pins it: with this test absent, swapping the two arms leaves the
+        whole suite green while every failover in this state stalls.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, drain_account="1", unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(10, 10),
+            "3": _usage7(50, 50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+
+        stored = {
+            "1": _usage7(20, 20),   # drain looks recovered -> forced target
+            "2": None,              # where we are: unreadable -> failover
+            "3": _usage7(50, 50),
+        }
+        # The drain account was burned elsewhere since, so the refetch
+        # disqualifies it outright rather than merely finding it stale.
+        fresh = {**stored, "1": _usage7(99, 99)}
+        served: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            # `_two_phase_tick` cannot express this tick. It tells the two
+            # phases apart by the all-candidates fetch set, and the collector
+            # asks for exactly that set on its own whenever the active
+            # account's headroom is unreadable — which is this tick's whole
+            # premise, since that is what makes it a failover. The gate would
+            # then already see `fresh`, the drain would never be forced, and
+            # phase 2 would never run (measured: the branch under test was
+            # not reached even once).
+            #
+            # Order tells them apart instead: the pre-gate escalation comes
+            # first, the phase-2 refetch second.
+            requested = set(fetch or ())
+            served.append(requested)
+            everyone = requested == {"1", "2", "3"}
+            phase2 = everyone and served.count({"1", "2", "3"}) > 1
+            view = fresh if phase2 else stored
+            return {
+                num: _entry_for(value, h.clock.now) for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+
+        assert served.count({"1", "2", "3"}) > 1, (
+            "the phase-2 refetch never happened, so nothing re-asked whether "
+            "the drain account still qualifies"
+        )
+        assert outcome is TickOutcome.SWITCHED, (
+            "stalled on an account it cannot read because the drain account "
+            "stopped qualifying; that answer belongs to drain-return, which "
+            "has a healthy account to stay on"
+        )
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
