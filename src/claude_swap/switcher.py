@@ -110,6 +110,17 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # instant (request hygiene; see issue #85).
 _FETCH_STAGGER_S = 0.25
 
+# Slack allowed between two slots' reset instants before the lockstep
+# heuristic stops calling them the same window. The two slots are read by two
+# separate usage requests (see _FETCH_STAGGER_S), and the endpoint serialises
+# one shared boundary with sub-second jitter across them — issue #161 saw the
+# same 5h reset come back as ...:00.129393 and ...:00.340384, so an exact
+# comparison never fires. A few seconds covers the stagger and the latency
+# spread of a whole collect pass; it cannot merge two real accounts, whose
+# windows open when their own first request lands and would have to coincide
+# on the 5h *and* the 7d boundary to within that same slack.
+_LOCKSTEP_RESET_TOLERANCE_S = 5.0
+
 # Show a "· Xm ago" age note on displayed usage older than this. Inside the
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
@@ -5416,13 +5427,14 @@ class ClaudeAccountSwitcher:
         fingerprints and untouched sequence.json identities, so
         ``_duplicate_account_warnings`` cannot see them. But both tokens
         report the same account's usage: identical 5h *and* 7d percentages
-        with identical reset timestamps — the exact signal the issue's
+        with reset instants that agree to within
+        ``_LOCKSTEP_RESET_TOLERANCE_S`` — the exact signal the issue's
         reporter had to reverse-engineer by hand, automated here from data
         ``list``/watch already fetched.
 
         Heuristic, not proof: it goes quiet once the older generation dies
         and stops producing comparable usage, and only rows where both
-        windows carry a non-null ``resets_at`` are compared (two idle
+        windows carry a parseable ``resets_at`` are compared (two idle
         accounts at 0% with nothing scheduled are indistinguishable, never
         flagged; API-key slots have sentinel usage and never reach the
         comparison). Known benign false-positive source until PR #119 lands:
@@ -5430,7 +5442,7 @@ class ClaudeAccountSwitcher:
         report that account's usage — same lockstep signature, different
         cause.
         """
-        seen: dict[tuple, str] = {}
+        rows: list[tuple[str, object, float, object, float]] = []
         out: list[str] = []
         for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
             snum = str(num)
@@ -5442,22 +5454,32 @@ class ClaudeAccountSwitcher:
             d7 = usage.get("seven_day")
             if not isinstance(h5, dict) or not isinstance(d7, dict):
                 continue
-            key = (
-                h5.get("pct"), h5.get("resets_at"),
-                d7.get("pct"), d7.get("resets_at"),
-            )
-            if key[1] is None or key[3] is None or key[0] is None or key[2] is None:
+            h5_pct, d7_pct = h5.get("pct"), d7.get("pct")
+            h5_ts = poll_policy.parse_reset_ts(h5.get("resets_at"))
+            d7_ts = poll_policy.parse_reset_ts(d7.get("resets_at"))
+            if h5_pct is None or d7_pct is None or h5_ts is None or d7_ts is None:
                 continue
-            other = seen.get(key)
-            if other:
-                out.append(
-                    f"Account-{other} and Account-{snum} report identical "
-                    "usage and reset times — they may be the same account "
-                    "(issue #117). If it persists, log in with the missing "
-                    "account and re-add it: cswap add --slot N"
-                )
-            else:
-                seen[key] = snum
+            rows.append((snum, h5_pct, h5_ts, d7_pct, d7_ts))
+        # A tolerance is not an equality, so there is no key to hash on; the
+        # comparison is pairwise over the managed slots, of which there are
+        # single digits. The break keeps a slot to a single warning when
+        # several earlier slots match it, as the keyed lookup it replaces did.
+        for i, (snum, h5_pct, h5_ts, d7_pct, d7_ts) in enumerate(rows):
+            for other, o_h5_pct, o_h5_ts, o_d7_pct, o_d7_ts in rows[:i]:
+                if (
+                    h5_pct == o_h5_pct
+                    and d7_pct == o_d7_pct
+                    and abs(h5_ts - o_h5_ts) <= _LOCKSTEP_RESET_TOLERANCE_S
+                    and abs(d7_ts - o_d7_ts) <= _LOCKSTEP_RESET_TOLERANCE_S
+                ):
+                    out.append(
+                        f"Account-{other} and Account-{snum} report identical "
+                        "usage and matching reset times — they may be the "
+                        "same account (issue #117). If it persists, log in "
+                        "with the missing account and re-add it: "
+                        "cswap add --slot N"
+                    )
+                    break
         return out
 
     def _build_list_payload(
