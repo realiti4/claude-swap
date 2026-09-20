@@ -8,6 +8,7 @@ JSON envelope. No encryption is built in — users compose their own
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -22,6 +23,8 @@ from claude_swap.exceptions import (
     TransferError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
+from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -643,3 +646,105 @@ def import_accounts(
                 f"Note: {identity[0]} is your current live login — activate the "
                 f"imported credentials with: cswap --switch-to {live_slot} --force"
             )
+
+
+def import_usage(
+    switcher: ClaudeAccountSwitcher,
+    source: str,
+    hold_s: float = 0.0,
+) -> None:
+    """Adopt usage readings another machine took, from its ``cswap list --json``.
+
+    For machines that hold the same accounts: each one polling an account
+    spends the same usage-endpoint budget (see poll_policy), so a script can
+    let one machine poll and hand its readings to the rest.
+
+    Each row with decision-grade usage (``usageStatus`` "ok") is matched to a
+    local slot by (email, organizationUuid), the key ``import`` uses, and
+    handed to :meth:`UsageStore.adopt` with ``usageAgeSeconds`` as its age.
+    Rows without usage, and accounts not managed here, are skipped. With
+    ``hold_s``, no local collector fetches the matched accounts for that long
+    (bounded; see ``adopt``).
+
+    Args:
+        switcher: Initialized ClaudeAccountSwitcher.
+        source: File path, or "-" for stdin.
+        hold_s: Seconds no local collector may fetch the matched accounts.
+
+    Raises:
+        TransferError: malformed document or unsupported schema version.
+    """
+    if source == "-":
+        text = sys.stdin.read()
+    else:
+        in_path = Path(source).expanduser()
+        if not in_path.exists():
+            raise TransferError(f"usage file not found: {in_path}")
+        text = in_path.read_text(encoding="utf-8")
+
+    document = _parse_payload(text, "usage document")
+    version = document.get("schemaVersion")
+    if version != JSON_SCHEMA_VERSION:
+        raise TransferError(
+            f"unsupported usage document schemaVersion: {version!r} "
+            f"(expected {JSON_SCHEMA_VERSION}, as printed by 'cswap list --json')"
+        )
+    rows = document.get("accounts")
+    if not isinstance(rows, list):
+        raise TransferError("usage document has no accounts list")
+
+    # Validate every row before writing any, as import_accounts does: a
+    # malformed row later in the list must not leave earlier ones adopted.
+    local_data = switcher._get_sequence_data_migrated() or {}
+    readings: dict[str, tuple[dict, float]] = {}
+    identities: dict[str, tuple[str, str]] = {}
+    skipped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TransferError("each account row must be a JSON object")
+        email = row.get("email")
+        org_uuid = row.get("organizationUuid") or ""
+        if not isinstance(email, str) or not email or not isinstance(org_uuid, str):
+            raise TransferError("each account row needs an email and an organizationUuid")
+        if row.get("usageStatus") != "ok":
+            skipped += 1
+            continue
+        age_s = row.get("usageAgeSeconds")
+        if (
+            not isinstance(age_s, (int, float))
+            or isinstance(age_s, bool)
+            or not math.isfinite(age_s)
+            or age_s < 0
+        ):
+            raise TransferError(
+                f"usageAgeSeconds for {email} must be a non-negative number"
+            )
+        try:
+            usage = usage_from_json(row.get("usage"))
+        except ValueError as exc:
+            raise TransferError(f"usage for {email}: {exc}")
+        num = switcher._find_account_slot(local_data, email, org_uuid)
+        if num is None:
+            skipped += 1
+            continue
+        if num in readings:
+            raise TransferError(
+                f"duplicate account in usage document: {email} "
+                f"(org={org_uuid or 'personal'})"
+            )
+        readings[num] = (usage, float(age_s))
+        identities[num] = (email, org_uuid)
+
+    adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
+    for num, (email, _org_uuid) in identities.items():
+        if num in adopted:
+            _eprint(f"Adopted usage for {email} → slot {num}")
+        else:
+            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+    summary = (
+        f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
+        f"{skipped} skipped"
+    )
+    if hold_s > 0 and readings:
+        summary += f"; fetching held for up to {hold_s:.0f}s"
+    _eprint(summary)

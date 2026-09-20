@@ -5035,11 +5035,19 @@ class ClaudeAccountSwitcher:
         # state so the auto engine idle-holds instead of counting the gap
         # toward a spurious failover (Finding 2). When the gate lifts, the
         # fetch path refreshes the token and the sentinel clears itself.
+        now = store.clock()
         for num, info in info_by_num.items():
             if num in sentinels or not info[4]:  # info[4] = is_active
                 continue
             if num in claims:
                 continue  # the fetch path will handle (or sentinel) it now
+            if entries[num].held(now):
+                # Held for another machine's reading (``cswap import-usage``):
+                # that reading, not this token's refresh, is what the row is
+                # waiting on, and it stays decision-trusted, so there is no
+                # gap to idle-hold over. The fetch path refreshes the token
+                # once the hold lapses.
+                continue
             active_oauth = oauth.extract_oauth_data(info[5])
             if active_oauth and oauth.is_oauth_token_expired(
                 active_oauth.get("expiresAt")

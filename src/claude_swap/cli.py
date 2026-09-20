@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -60,6 +61,7 @@ _SUBCOMMAND_FLAGS = {
     "enable": "--enable-account",
     "export": "--export",
     "import": "--import",
+    "import-usage": "--import-usage",
     "purge": "--purge",
     "upgrade": "--upgrade",
     "update": "--upgrade",
@@ -1060,6 +1062,7 @@ Commands:
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
+  %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
@@ -1075,6 +1078,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
@@ -1169,6 +1173,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
     )
     parser.add_argument(
+        "--hold",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "With 'import-usage': keep this machine from fetching the "
+            "imported accounts for this many seconds"
+        ),
+    )
+    parser.add_argument(
         "--install-service",
         action="store_true",
         help=(
@@ -1254,6 +1267,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--import-usage",
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--tui",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1303,6 +1321,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
+        or args.import_usage is not None
         or args.add_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
@@ -1346,6 +1365,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
+
+    if args.hold is not None and args.import_usage is None:
+        parser.error("--hold can only be used with 'import-usage'")
+
+    if args.hold is not None and not (math.isfinite(args.hold) and args.hold >= 0):
+        parser.error("--hold must be a non-negative number of seconds")
 
     if (
         args.install_service or args.uninstall_service or args.service_status
@@ -1439,6 +1464,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.import_usage:
+            from claude_swap.transfer import import_usage
+
+            import_usage(switcher, args.import_usage, hold_s=args.hold or 0.0)
         elif args.tui:
             from claude_swap.tui import run as tui_run
 

@@ -1696,3 +1696,94 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestAdopt:
+    """Readings another machine took for the same account (``import-usage``)."""
+
+    def test_reading_is_backdated_by_its_age(self, store, clock):
+        assert store.adopt({"1": (USAGE, 40.0)}, IDENT) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.fetched_at == clock.now - 40.0
+        assert entry.age_s == 40.0
+
+    def test_never_downgrades_a_newer_local_reading(self, store, clock):
+        local = {"five_hour": {"pct": 60.0}}
+        store.record({"1": FetchRecord(usage=local)}, IDENT)
+        clock.advance(10)
+        # Measured 30s ago elsewhere: older than this machine's own fetch.
+        assert store.adopt({"1": (USAGE, 30.0)}, IDENT) == set()
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_fetch_state_is_left_alone(self, store, clock):
+        # Failures, backoff and the 429 marker describe this machine's own
+        # requests; a reading from elsewhere is no evidence about them.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        after = store.entries(IDENT)["1"]
+        assert after.last_good == USAGE
+        assert after.consecutive_failures == before.consecutive_failures == 1
+        assert after.last_error == "http-429"
+        assert after.backoff_until == before.backoff_until
+        assert after.last_429_at == before.last_429_at
+
+    def test_hold_keeps_every_mode_off_until_it_lapses(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        clock.advance(SERVE_TTL_S + 1)  # stale: every mode would fetch now
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        ) == {}
+        clock.advance(600.0)  # nobody renewed it
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_held_reading_stays_decision_trusted(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        clock.advance(STALE_OK_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held(clock.now)
+        assert entry.decision_value() == USAGE
+        clock.advance(900.0)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_hold_never_outlives_the_trust_ceiling(self, store, clock):
+        # A reading already 3000s old may be trusted for 600s more, so a 3600s
+        # hold is cut to that: a slot never sits unfetched on data too old to
+        # act on.
+        store.adopt({"1": (USAGE, 3000.0)}, IDENT, hold_s=3600.0)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held_until == pytest.approx(entry.fetched_at + TRUST_MAX_AGE_S)
+        clock.advance(TRUST_MAX_AGE_S - 3000.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_latest_hold_wins(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=60.0)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 60.0
+
+    def test_due_candidate_skips_a_held_slot(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0), "2": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        plan = (clock.now + 60.0, 60.0)
+        store.set_poll_plan({"1": plan, "2": plan}, IDENT)
+        clock.advance(61)  # both plans due
+        assert due_candidate(["1", "2"], store.entries(IDENT), clock.now) is None
+
+    def test_a_claimed_fetch_still_records(self, store, clock):
+        # A local collector already won the fetch when the reading arrives:
+        # its lease is untouched, and its own newer result lands normally.
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.adopt({"1": (USAGE, 5.0)}, IDENT, hold_s=600.0)
+        local = {"five_hour": {"pct": 61.0}}
+        assert store.record({"1": FetchRecord(usage=local)}, IDENT, claims) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_row_of_another_account_is_replaced(self, store):
+        store.record({"2": FetchRecord(usage=USAGE)}, {"2": ("old@x.com", "")})
+        store.adopt({"2": (USAGE, 0.0)}, IDENT)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
+        assert (row["email"], row["organizationUuid"]) == IDENT["2"]

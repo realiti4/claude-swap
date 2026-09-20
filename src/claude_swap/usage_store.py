@@ -310,12 +310,20 @@ class UsageEntry:
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # Until when a reading adopted from another machine (``cswap
+    # import-usage``) keeps every collector off this slot. Appended for the
+    # same positional compatibility as ``claim_until``.
+    held_until: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
+
+    def held(self, now: float) -> bool:
+        """Whether an adopted reading's hold still keeps collectors off."""
+        return self.held_until is not None and now < self.held_until
 
     def recent_429(self, now: float) -> bool:
         """Whether this token 429'd recently enough to keep the post-429 cadence.
@@ -433,7 +441,8 @@ def due_candidate(
 ) -> str | None:
     """The due candidate with the stalest data, or None.
 
-    Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
+    Due = past its ``nextPollAt``, not in failure backoff and not held for
+    another machine's reading (``UsageStore.adopt``). Sentinel
     accounts (api-key / no credentials) have nothing to fetch. A
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
@@ -455,6 +464,8 @@ def due_candidate(
         if entry.token_dead():
             continue  # dead refresh-token: quarantined, needs a re-login
         if entry.in_backoff(now):
+            continue
+        if entry.held(now):
             continue
         if (
             entry.next_poll_at is not None
@@ -902,6 +913,7 @@ class UsageStore:
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
+            held_until = _num_or_none(row.get("heldUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
@@ -924,12 +936,17 @@ class UsageStore:
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
             live_claim = _live_claim(claim_until, last_attempt_at, now)
+            # A live hold is deliberate staleness as well: another machine
+            # polls this account and hands its readings over, so between two
+            # hand-overs the last one is what decisions should run on.
+            held = held_until is not None and now < held_until
             trust_extended = (
                 within_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
                     or live_claim
+                    or held
                 )
             )
             out[num] = UsageEntry(
@@ -948,6 +965,7 @@ class UsageStore:
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
+                held_until=held_until,
             )
         return out
 
@@ -1004,8 +1022,9 @@ class UsageStore:
         Deciding eligibility on a lock-free :meth:`entries` read and then
         claiming separately lets two collectors both pass the check and both
         fetch; the re-check under the lock closes that window. Eligibility:
-        not quarantined (dead token), not in failure backoff, not claimed
-        within ``CLAIM_TTL_S``, and then by caller mode —
+        not quarantined (dead token), not in failure backoff, not held for
+        another machine's reading (:meth:`adopt`), not claimed within
+        ``CLAIM_TTL_S``, and then by caller mode —
 
         - ``respect_plans=True`` (on-demand callers: list/status/switch,
           dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
@@ -1149,6 +1168,55 @@ class UsageStore:
                 self._write_rows(rows)
         return accepted
 
+    def adopt(
+        self,
+        readings: dict[str, tuple[dict, float]],
+        identities: dict[str, Identity],
+        hold_s: float = 0.0,
+    ) -> set[str]:
+        """Merge measurements another machine took for the same accounts.
+
+        ``readings`` maps slot → ``(usage, age_s)``: the usage dict in the
+        shape :func:`oauth.build_usage_result` produces, and how old that
+        measurement was when it was handed over. An age rather than a
+        timestamp, so the two machines' clocks never have to agree:
+        ``fetchedAt`` becomes ``now - age_s`` on this store's clock.
+
+        A reading replaces ``lastGood`` only when it is newer than the stored
+        one, so a measurement this machine made itself is never downgraded.
+        Fetch state (failures, backoff, poll plan, claim) is left alone: it
+        describes this machine's own requests, and a fetch already in flight
+        still records normally when it lands.
+
+        ``hold_s`` > 0 stamps ``heldUntil``: no collector fetches the slot
+        before then (``_row_eligible``, ``due_candidate``), and its last-good
+        stays decision-trusted meanwhile. The hold never runs past
+        ``TRUST_MAX_AGE_S`` from the stored measurement, so a slot cannot sit
+        unfetched on data too old to act on, and a producer that stops
+        renewing it gets ordinary collection back when it lapses. The latest
+        hold replaces an earlier one. Returns the slots whose ``lastGood``
+        was replaced.
+        """
+        if not readings:
+            return set()
+        now = self.clock()
+        adopted: set[str] = set()
+
+        def apply(num: str, row: dict) -> None:
+            usage, age_s = readings[num]
+            fetched_at = now - max(0.0, age_s)
+            stored = _num_or_none(row.get("fetchedAt"))
+            if stored is None or fetched_at > stored:
+                row["lastGood"] = usage
+                row["fetchedAt"] = fetched_at
+                stored = fetched_at
+                adopted.add(num)
+            if hold_s > 0:
+                row["heldUntil"] = min(now + hold_s, stored + TRUST_MAX_AGE_S)
+
+        self._mutate(identities, readings.keys(), apply)
+        return adopted
+
     def set_poll_plan(
         self,
         plans: dict[str, tuple[float | None, float | None]],
@@ -1204,6 +1272,9 @@ def _row_eligible(
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
+        return False
+    held_until = _num_or_none(row.get("heldUntil"))
+    if held_until is not None and now < held_until:
         return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
