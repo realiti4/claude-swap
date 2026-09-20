@@ -40,6 +40,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from claude_swap.dirlock import directory_lock
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 from claude_swap.paths import get_claude_config_home, get_global_config_path
 
@@ -91,67 +92,28 @@ def proper_lockfile(
 ):
     """Acquire a proper-lockfile-compatible directory lock.
 
-    Blocks up to ``timeout`` seconds (default ``DEFAULT_TIMEOUT_S``, resolved
-    at call time so tests can shorten it), taking over locks whose mtime is
-    older than ``staleness``, touches the directory mtime while held so other
-    holders don't deem us stale, and removes it on exit.
+    The mechanism lives in :func:`claude_swap.dirlock.directory_lock` -- it is
+    a generic network-filesystem-safe mutex, not a Claude Code detail, and the
+    Codex side needs the same primitive. This wrapper supplies the two things
+    that ARE Claude Code details: the ``ClaudeCodeLockTimeout`` type its
+    callers catch, and a ``timeout`` resolved at CALL time (not as a default
+    argument) so tests can shorten ``DEFAULT_TIMEOUT_S`` by patching it.
 
     Raises:
         ClaudeCodeLockTimeout: The lock stayed held past ``timeout``.
     """
     if timeout is None:
         timeout = DEFAULT_TIMEOUT_S
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    start = time.monotonic()
-    while True:
-        try:
-            os.mkdir(lock_dir)
-            break
-        except FileExistsError:
-            pass
-        if time.monotonic() - start > timeout:
-            raise ClaudeCodeLockTimeout(
-                f"Could not acquire {lock_dir.name} — Claude Code appears "
-                "to be refreshing credentials. Retry in a few seconds."
-            )
-        try:
-            held_mtime = os.stat(lock_dir).st_mtime
-        except FileNotFoundError:
-            continue  # holder released between mkdir and stat; retry now
-        if time.time() - held_mtime > staleness:
-            # Dead holder per the protocol: remove and retake. Losing the
-            # rmdir/mkdir race to another waiter just means looping again.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
-            continue
-        time.sleep(0.25 + random.random() * 0.25)
-
-    stop_touching = threading.Event()
-
-    def _touch() -> None:
-        while not stop_touching.wait(TOUCH_INTERVAL_S):
-            try:
-                os.utime(lock_dir)
-            except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
-
-    toucher = threading.Thread(target=_touch, daemon=True)
-    toucher.start()
-    try:
+    with directory_lock(
+        lock_dir,
+        timeout=timeout,
+        staleness=staleness,
+        # Read HERE, at call time, so patching claude_locks.TOUCH_INTERVAL_S
+        # still reaches the toucher after the mechanism moved to dirlock.
+        touch_interval=TOUCH_INTERVAL_S,
+        timeout_error=ClaudeCodeLockTimeout,
+    ):
         yield
-    finally:
-        stop_touching.set()
-        toucher.join(timeout=1.0)
-        try:
-            os.rmdir(lock_dir)
-        except FileNotFoundError:
-            _logger.warning(
-                "Lock %s vanished while held (taken over as stale?)", lock_dir
-            )
-        except OSError as e:
-            _logger.warning("Failed to release lock %s: %s", lock_dir, e)
 
 
 @contextmanager
