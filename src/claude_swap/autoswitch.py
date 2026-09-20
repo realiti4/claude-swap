@@ -7,8 +7,11 @@ typed events handed to an ``on_event`` callback; the CLI renders them as
 human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
-Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
+Policy in one paragraph: when any of the active account's windows crosses
+its own ceiling (``settings.threshold``, or the per-window
+``threshold_5h``/``threshold_7d`` overrides when set. The 5h window is
+cheap to ride because it recovers within the session, weekly quota is not),
+switch to
 the candidate with the most headroom — proactively, so the old account is
 still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
@@ -20,7 +23,13 @@ activation the target's token is *freshened* (refreshed if it expires within
 under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+consecutive ticks, the engine fails over to any healthy candidate. The
+opt-in ``pace`` strategy keeps all of the above and adds one early
+rotation below the threshold: when the active account's weekly window is
+meaningfully ahead of pace (the same noise-gated signal as the UI's
+``(ahead)`` marker, see :mod:`claude_swap.pace`), it moves to the on-pace
+candidate with the most headroom, spreading a week's burn across the
+fleet before any threshold trips.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -42,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, pace, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -51,7 +60,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -314,6 +328,12 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Resolved per-window ceilings, emitted only when they differ from each
+    # other. `threshold` alone cannot describe a split policy, so a reader
+    # of the JSON stream would see "threshold: 88" while the engine was
+    # actually gating on 95/85 and be unable to explain any decision. Kept
+    # conditional so the default single-threshold output is byte-identical.
+    window_thresholds: dict[str, float] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -321,6 +341,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.window_thresholds:
+            fields["windowThresholds"] = self.window_thresholds
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -362,7 +384,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "pace"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -593,9 +615,8 @@ def _binding_recovery_ts(
 
 def _every_account_above_threshold(
     candidates: Sequence[str],
-    headroom: dict[str, float | None],
-    active_headroom: float | None,
-    threshold: float,
+    excess: dict[str, float | None],
+    active_excess: float | None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold — the state where "land somewhere healthy" has no answer.
@@ -606,12 +627,12 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_excess is None or active_excess < 0:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [excess.get(n) for n in candidates if excess.get(n) is not None]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(e >= 0 for e in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -628,6 +649,155 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def _thresholds_for(settings: AutoSwitchSettings) -> oauth.WindowThresholds:
+    """The per-window threshold policy this settings object describes."""
+    return oauth.WindowThresholds(
+        default=settings.threshold,
+        five_hour=settings.threshold_5h,
+        weekly=settings.threshold_7d,
+    )
+
+
+def policy_floor(settings: AutoSwitchSettings) -> float:
+    """The lowest ceiling this policy gates on, and what the bar tick shows."""
+    return _thresholds_for(settings).floor
+
+
+def shifted_to_floor(
+    settings: AutoSwitchSettings, target_floor: float
+) -> AutoSwitchSettings:
+    """``settings`` with its policy FLOOR moved to ``target_floor``.
+
+    The session control adjusts one number, but a split policy has two
+    ceilings, so "set the threshold to 72" has no single meaning. It moves
+    the floor instead, which is exactly what the bar tick renders, and
+    carries both ceilings by the same delta so the gap the user configured
+    survives the adjustment.
+
+    Under a UNIFORM policy the floor is the threshold, so this is the
+    original single-value update, unchanged. That is what keeps every
+    existing session-override behaviour identical.
+
+    Both ceilings clamp to the configured bounds, so a shift that would
+    push one out of range moves it to the bound instead of silently
+    inventing an out-of-policy value; the achieved floor is whatever the
+    clamped pair yields and may differ from ``target_floor``.
+    """
+    current = _thresholds_for(settings)
+    if current.uniform:
+        return replace(settings, threshold=target_floor)
+    spec = SETTING_SPECS["autoswitch.threshold5h"]
+
+    def _clamped(value: float) -> float:
+        return min(spec.hi, max(spec.lo, value))
+
+    delta = target_floor - current.floor
+    return replace(
+        settings,
+        threshold_5h=_clamped(current.for_label("5h") + delta),
+        threshold_7d=_clamped(current.for_label("7d") + delta),
+    )
+
+
+def _excess_by_account(
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    thresholds: oauth.WindowThresholds,
+) -> dict[str, float | None]:
+    """Per-account threshold excess derived from decision values.
+
+    The policy sibling of ``_headroom_by_account``: that one measures
+    distance to the hard 100% limit (what the at-limit escape and the
+    anti-flap margins are calibrated on), this one measures distance past
+    the configured per-window ceiling. Both are read every tick because they
+    answer different questions, and conflating them is what a single
+    threshold on ``max(pct)`` did.
+    """
+    return {
+        num: oauth.threshold_excess(
+            value if isinstance(value, dict) else None,
+            models,
+            thresholds=thresholds,
+        )
+        for num, value in usage.items()
+    }
+
+
+def _below_detail(
+    usage: dict | str | None,
+    models: tuple[str, ...],
+    thresholds: oauth.WindowThresholds,
+) -> str:
+    """``below-threshold`` detail: the window nearest its own ceiling.
+
+    Names the window only when the policy is non-uniform; with one
+    threshold there is nothing to disambiguate, and the bare
+    ``"<pct>% < <threshold>%"`` form is what every existing consumer reads.
+    Both sides go through ``pct_label`` for the same reason as before: a
+    ``.0f`` utilization could otherwise render an impossible
+    ``"100% < 99.9%"``.
+    """
+    windows = oauth.relevant_windows(
+        usage if isinstance(usage, dict) else None, models
+    )
+    if not windows:
+        return ""
+    label, pct, _ = max(
+        windows, key=lambda w: w[1] - thresholds.for_label(w[0])
+    )
+    limit = thresholds.for_label(label)
+    lead = "" if thresholds.uniform else f"{label} "
+    return f"{lead}{pct_label(pct)}% < {pct_label(limit)}%"
+
+
+def _weekly_ahead(
+    usage: dict | None, fetched_at: float | None, models: Sequence[str]
+) -> bool:
+    """Whether any weekly window is meaningfully ahead of pace.
+
+    Weekly means the 7-day window plus every configured scoped per-model
+    window, the same ``models`` filter every other decision reads (the 5h
+    window is excluded: pace is undefined there, see :mod:`claude_swap.pace`).
+    Windows come through :func:`oauth.relevant_windows`, the canonical window
+    source, so a window that binds a decision can never be invisible here.
+    ``compute_pace`` supplies the noise gates (24h post-reset suppression,
+    the 15-point ahead threshold); this helper adds no thresholds of its own,
+    so the engine's trigger and the UI's ``(ahead)`` marker can never
+    disagree about what "ahead" means.
+    """
+    if not isinstance(usage, dict):
+        return False
+    for label, pct, resets_at in oauth.relevant_windows(usage, models):
+        if label == "5h":
+            continue
+        result = pace.compute_pace(
+            {"pct": pct, "resets_at": resets_at}, fetched_at=fetched_at
+        )
+        if result is not None and result.ahead:
+            return True
+    return False
+
+
+def _pace_ahead_by_account(
+    usage: dict[str, dict | str | None], entries: dict, models: tuple[str, ...]
+) -> dict[str, bool]:
+    """Per-account weekly ahead-of-pace flags, from decision values.
+
+    ``fetched_at`` comes from each account's store entry rather than the
+    wall clock: a decision value served stale is evaluated against the clock
+    it was measured at (the rule every other pace consumer follows).
+    """
+    out: dict[str, bool] = {}
+    for num, value in usage.items():
+        entry = entries.get(num)
+        out[num] = _weekly_ahead(
+            value if isinstance(value, dict) else None,
+            entry.fetched_at if entry is not None else None,
+            models,
+        )
+    return out
 
 
 class AutoSwitchEngine:
@@ -659,7 +829,9 @@ class AutoSwitchEngine:
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(
+            _thresholds_for(settings).floor, self._models
+        )
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -934,14 +1106,24 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        thresholds = _thresholds_for(settings)
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, thresholds=thresholds
         )
+        excess = _excess_by_account(usage, self._models, thresholds)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                window_thresholds=(
+                    {}
+                    if thresholds.uniform
+                    else {
+                        "5h": thresholds.for_label("5h"),
+                        "7d": thresholds.for_label("7d"),
+                    }
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -973,29 +1155,48 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        active_excess = excess.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+            # Under policy when EVERY window is under its own ceiling. With a
+            # uniform policy this is the old `utilization < threshold` test,
+            # bit for bit; with a split one it is the whole point: a 5h
+            # window riding high does not evict an account whose weekly quota
+            # is barely touched, and a weekly window creeping up does not get
+            # a free pass because the 5h window happens to be idle.
+            if active_excess is not None and active_excess < 0:
+                active_entry = entries.get(current)
+                if settings.strategy == "pace" and _weekly_ahead(
+                    usage.get(current) if isinstance(usage.get(current), dict) else None,
+                    active_entry.fetched_at if active_entry is not None else None,
+                    self._models,
+                ):
+                    # pace: below the threshold, a weekly window meaningfully
+                    # ahead of pace (compute_pace's noise-gated marker) means
+                    # this account is projected to exhaust before its reset.
+                    # Rotate off it now, while every window still has room,
+                    # instead of riding it to the threshold cliff. Candidate
+                    # selection decides whether an on-pace account with room
+                    # actually exists.
+                    trigger = "pace"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=_below_detail(
+                                usage.get(current), self._models, thresholds
                             ),
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account
+                    # with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1046,7 +1247,9 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first", "pace") and self._in_cooldown(
+            state
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1084,9 +1287,8 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                    detail=_below_detail(
+                        usage.get(current), self._models, thresholds
                     ),
                 )
             )
@@ -1099,6 +1301,15 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        # Weekly ahead-of-pace flags for the pace strategy's landing gate,
+        # recomputed wherever usage/headroom are refetched so the three can
+        # never describe different snapshots. None for every other strategy:
+        # the ranking must not pay for a signal it never reads.
+        pace_ahead = (
+            _pace_ahead_by_account(usage, entries, self._models)
+            if settings.strategy == "pace"
+            else None
+        )
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1156,6 +1367,7 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["now"],
                 kw["current"],
+                excess=kw["excess"],
             )
             no_return = self._no_return_account(
                 trigger,
@@ -1165,6 +1377,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                excess=kw["excess"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1180,16 +1393,19 @@ class AutoSwitchEngine:
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
+            excess=excess,
             current=current,
             active_headroom=active_headroom,
+            active_excess=active_excess,
             settings=settings,
             now=decided_now,
+            pace_ahead=pace_ahead,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "pace") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
-            # decides below the threshold, where the collector only escalates
+            # and pace decide below the threshold, where the collector only escalates
             # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
             # A switch is imminent, so spend the fetches now and re-decide on
             # fresh data.
@@ -1203,7 +1419,11 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            excess = _excess_by_account(usage, self._models, thresholds)
             active_headroom = headroom.get(current)
+            active_excess = excess.get(current)
+            if pace_ahead is not None:
+                pace_ahead = _pace_ahead_by_account(usage, entries, self._models)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -1211,16 +1431,23 @@ class AutoSwitchEngine:
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
+                excess=excess,
                 current=current,
                 active_headroom=active_headroom,
+                active_excess=active_excess,
                 settings=settings,
                 now=decided_now,
+                pace_ahead=pace_ahead,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in (
+            "consume-first",
+            "pace",
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # or pace nudge: those are opportunistic moves, and an API-key
+            # account has no weekly window to consume or to pace.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1261,6 +1488,19 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == "pace":
+                # Below the threshold and healthy: staying put is a correct
+                # outcome, never a block (the consume-first contract). One
+                # reason covers every gate that emptied the list: candidates
+                # over the threshold, ahead of pace themselves, or unreadable
+                # this tick.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-on-pace-candidate",
+                        detail="no on-pace account with room to spare",
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -1313,11 +1553,11 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "pace"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
+                # and pace are opportunistic, not escapes; never act on stale data
                 # or slide to a worse-ranked target; hold and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
@@ -1390,6 +1630,8 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        *,
+        excess: dict[str, float | None],
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1467,7 +1709,7 @@ class AutoSwitchEngine:
         left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if trigger not in ("proactive", "consume-first", "pace") or came_from is None:
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -1491,10 +1733,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
                     return None               # beats us outright; not a flip
-            elif (
-                settings is not None
-                and left_headroom > 100.0 - settings.threshold
-            ):
+            elif excess.get(barred) is not None and excess[barred] < 0:
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
                 # `_left_account_recovered` uses when it, too, has no active
@@ -1511,6 +1750,8 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         current: str | None = None,
+        *,
+        excess: dict[str, float | None],
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -1537,7 +1778,7 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: `h > 100 - settings.threshold`, the same "would the ranking
+        to land: a negative threshold excess, the same "would the ranking
         accept this as a landing spot" test `_rank_candidates` already runs
         (`:1617`) on every candidate, reused rather than inventing a fresh
         constant; and (2), when the landing floor cannot answer, whether the
@@ -1552,7 +1793,7 @@ class AutoSwitchEngine:
         floor should land on: sweeping mutations of this same leg for the
         ordinary path showed an absolute floor is silently reintroducible
         with a green suite, so this is not free of that risk either — the
-        difference is this constant is `settings.threshold`, not a
+        difference is this bound is the threshold policy, not a
         hardcoded number, so a
         user's OWN policy decides how conservative the hold is, and it moves
         when they change it (pinned directly, below). Deliberately MORE
@@ -1651,7 +1892,7 @@ class AutoSwitchEngine:
             # that proved it. Two legs, both read-only against CURRENT state
             # (no departure baseline exists to diff against):
             #
-            #   landing   `h > 100 - settings.threshold` -- would the
+            #   landing   negative threshold excess -- would the
             #             ranking accept this peer as a landing spot right
             #             now (`_rank_candidates`, :1636)?
             #   recovery  the peer's binding reset is meaningfully sooner
@@ -1669,7 +1910,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if h is not None and (excess.get(barred) or 0.0) < 0:
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -1735,7 +1976,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif (excess.get(barred) or 0.0) < 0:
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1761,10 +2002,13 @@ class AutoSwitchEngine:
         no_return: str | None,
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
+        excess: dict[str, float | None],
         current: str,
         active_headroom: float | None,
+        active_excess: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        pace_ahead: dict[str, bool] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1791,7 +2035,7 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, excess, active_excess
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1823,6 +2067,11 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        # Room before the ACTIVE account trips its own policy: the
+        # reference the linear margins below are measured against. See
+        # `trip_room` in the loop for why these margins moved off headroom.
+        active_trip = None if active_excess is None else -active_excess
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -1835,6 +2084,21 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            # Room before THIS account trips its own policy. Equal to
+            # `h - (100 - threshold)` under a uniform policy, a constant
+            # offset, so every margin and ordering below is bit-identical to
+            # the headroom version it replaces. Under a SPLIT policy the two
+            # axes genuinely diverge: an account bound by a weekly window at
+            # 84 (headroom 16, one point of policy room) outranks one bound by
+            # a 5h window at 90 (headroom 10, five points) on headroom, while
+            # tripping five times sooner. The linear margins and sort keys
+            # therefore use this axis; the RATIO gates in the all_above branch
+            # stay on headroom, where distance to the real 100% (not to a
+            # policy line every account is already past) is what a ratio can
+            # mean. Assigned for every trigger: at-limit and failover skip the
+            # gate block below but still reach the sort keys.
+            candidate_excess = excess.get(num)
+            trip_room = None if candidate_excess is None else -candidate_excess
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
@@ -1843,12 +2107,16 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "pace"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (
+                    candidate_excess is not None
+                    and candidate_excess >= 0
+                    and not all_above
+                ):
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1907,11 +2175,29 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif trigger == "pace":
+                    # Only land where the weekly windows are themselves on
+                    # pace: another over-pace account trades one projected
+                    # exhaustion for the next, and the pair would ping-pong.
+                    # One-way by pace dynamics: a landed-on account's `ahead`
+                    # can only fire after real burn, and the account we left
+                    # stays ahead until expected catches its actual (hours at
+                    # minimum), during which the no-return bar holds anyway.
+                    # Unknown pace counts as on pace: compute_pace suppresses
+                    # the first day after a reset, which is exactly when a
+                    # window is freshest, and an unknowable pace cannot prove
+                    # a candidate hot. No headroom hysteresis on this branch,
+                    # deliberately: the point of the move is that raw headroom
+                    # misleads when burn rates differ, and an on-pace account
+                    # with less headroom than the over-pace active is still
+                    # the account that lasts the week.
+                    if pace_ahead is not None and pace_ahead.get(num):
+                        continue
+                elif active_trip is not None and trip_room is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    if trip_room - active_trip < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -1941,9 +2227,12 @@ class AutoSwitchEngine:
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+                key = (
+                    reset_ts if reset_ts is not None else float("inf"),
+                    -h if trip_room is None else -trip_room,
+                )
             else:
-                key = (-h,)
+                key = (-h if trip_room is None else -trip_room,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
@@ -1957,7 +2246,7 @@ class AutoSwitchEngine:
         current: str,
         quarantined: set[str] = frozenset(),
         *,
-        threshold: float | None = None,
+        thresholds: oauth.WindowThresholds | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -2055,15 +2344,23 @@ class AutoSwitchEngine:
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
-        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # The caller's tick-snapshotted policy, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
-        if threshold is None:
-            threshold = self.settings.threshold
+        if thresholds is None:
+            thresholds = _thresholds_for(self.settings)
+        # Excess, not utilization-vs-one-threshold: the band must open when
+        # ANY window comes within the margin of ITS OWN ceiling, which is
+        # exactly what a negative excess inside the margin says.
+        active_excess = oauth.threshold_excess(
+            active_value if isinstance(active_value, dict) else None,
+            self._models,
+            thresholds=thresholds,
+        )
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
-                active_headroom is not None
-                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
+                active_excess is not None
+                and active_excess >= -ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
@@ -2124,7 +2421,9 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first", "pace") and self._in_cooldown(
+            state
+        ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2275,13 +2574,24 @@ class AutoSwitchEngine:
         """Cut the current inter-tick sleep short and tick now."""
         self._wake.set()
 
-    def apply_threshold(self, threshold: float) -> None:
+    def apply_threshold(self, threshold: float) -> float:
         """Session override from the TUI: retarget the trigger and poll
         cadence mid-run. Threshold only — the model axes (and their derived
         state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
-        self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        and each tick snapshots ``self.settings`` once, so no locking.
+
+        ``threshold`` is the target policy FLOOR, and the achieved floor is
+        returned. Under a uniform policy those are the same number and this
+        behaves exactly as it always did. Under a SPLIT policy they are not:
+        writing ``settings.threshold`` alone would be inert, because
+        ``for_label`` reads the per-window overrides and ignores the
+        fallback, so the control would report a change that moved no policy
+        at all. See ``shifted_to_floor``.
+        """
+        self.settings = shifted_to_floor(self.settings, threshold)
+        achieved = _thresholds_for(self.settings).floor
+        self.switcher.set_poll_policy_inputs(achieved, self._models)
+        return achieved
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

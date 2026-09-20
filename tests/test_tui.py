@@ -1385,6 +1385,52 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
 
+    async def test_tick_shows_the_policy_floor_not_the_fallback(
+        self, tmp_path, fake_engine
+    ):
+        """One tick is drawn against bars for BOTH windows, so under a split
+        policy it must show the FLOOR (the earliest point some window trips),
+        not the account-wide fallback. Rendering 88 while the weekly ceiling
+        is 85 would put the tick above the real limit on the weekly bar, which
+        reads as "still fine" right up to a switch."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 88.0, "threshold5h": 95.0, "threshold7d": 85.0,
+            },
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            assert app.threshold_pct == 85.0, (
+                "the tick must be the policy floor (85), not the fallback "
+                f"threshold (88) or the 5h ceiling (95) - got "
+                f"{app.threshold_pct}"
+            )
+
+    async def test_tick_is_the_plain_threshold_when_policy_is_uniform(
+        self, tmp_path, fake_engine
+    ):
+        """Backward-compatibility pin: with no per-window overrides the floor
+        IS the threshold, so existing behavior is unchanged."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 82.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            assert app.threshold_pct == 82.0
+
     async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1710,3 +1756,73 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+@pytest.mark.asyncio
+class TestSessionOverrideUnderSplitPolicy:
+    """The session control must move real policy, not a fallback nobody reads.
+
+    Regression: with per-window ceilings set, `apply_threshold` wrote only
+    `settings.threshold`, which `for_label` never consults. The slider
+    displayed a new number, logged a session change, and moved no ceiling.
+    """
+
+    async def test_slider_moves_both_ceilings_and_reports_the_floor(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+        from claude_swap.autoswitch import policy_floor
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 88.0, "threshold5h": 95.0, "threshold7d": 85.0,
+            },
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert app.threshold_pct == 85.0  # floor, not the 88 fallback
+            await pilot.press("t", "left", "left", "left")
+            await pilot.pause()
+            s = screen._settings
+            assert (s.threshold_5h, s.threshold_7d) == (92.0, 82.0), (
+                "both ceilings must move together so the configured gap "
+                f"survives - got {s.threshold_5h}/{s.threshold_7d}"
+            )
+            assert policy_floor(s) == 82.0
+            assert app.threshold_pct == 82.0, (
+                "the tick must show the achieved floor, not a fallback value"
+            )
+
+    async def test_uniform_policy_session_override_is_unchanged(
+        self, tmp_path, fake_engine
+    ):
+        """Backward-compatibility pin: with no per-window ceilings the floor
+        is the threshold, so the control behaves exactly as it always did."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 90.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 92.0
+            assert screen._settings.threshold_5h is None
+            assert app.threshold_pct == 92.0
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
