@@ -606,6 +606,111 @@ class TestDecisionTable:
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
 
+class TestManualHold:
+    """``autoswitch.manualHoldSeconds``: a human's ``cswap switch`` pick is
+    respected for that long — proactive/consume-first moves off it are
+    suppressed, at-limit still escapes. Default 0 leaves the engine as before."""
+
+    OVER = {"1": _usage(95), "2": _usage(40), "3": _usage(20)}
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **{"manual_hold_seconds": 1800, **kw})
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_hold_suppresses_proactive_within_window(self, temp_home):
+        h = self._harness(temp_home)
+        with patch("claude_swap.switcher.time.time", return_value=h.clock() - 100):
+            h.switcher.note_manual_switch()
+        assert h.state()["manualSwitch"] == {"number": "1", "at": h.clock() - 100}
+
+        outcome = h.tick_with_usage(self.OVER)
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        hold = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert hold.reason == "manual-hold"
+        assert hold.detail == "1700s left on manual pick of account 1"
+        assert self._reasons(h) == ["manual-hold"]
+
+    def test_hold_suppresses_consume_first(self, temp_home):
+        h = self._harness(temp_home, strategy="consume-first")
+        with patch("claude_swap.switcher.time.time", return_value=h.clock()):
+            h.switcher.note_manual_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["manual-hold"]
+
+    def test_at_limit_still_switches_during_hold(self, temp_home):
+        h = self._harness(temp_home)
+        with patch("claude_swap.switcher.time.time", return_value=h.clock()):
+            h.switcher.note_manual_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(10), "3": _usage(50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert h.active_number() == 2
+        # The pick ended with the escape: the engine's landing is not a pick.
+        assert "manualSwitch" not in h.state()
+
+    def test_hold_expires_after_window(self, temp_home):
+        h = self._harness(temp_home, cooldown_seconds=0.0)
+        with patch("claude_swap.switcher.time.time", return_value=h.clock()):
+            h.switcher.note_manual_switch()
+        h.clock.advance(1799)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["manual-hold"]
+        h.events.clear()
+        h.clock.advance(1)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_hold_ignored_when_active_is_not_the_picked_account(self, temp_home):
+        h = self._harness(temp_home, cooldown_seconds=0.0)
+        h.engine._mutate_state(
+            lambda s: s.update(manualSwitch={"number": "2", "at": h.clock()})
+        )
+        outcome = h.tick_with_usage(self.OVER)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_default_zero_changes_nothing(self, temp_home):
+        h = self._harness(temp_home, manual_hold_seconds=0)
+        with patch("claude_swap.switcher.time.time", return_value=h.clock()):
+            h.switcher.note_manual_switch()
+        assert h.state()["manualSwitch"]["number"] == "1"
+        outcome = h.tick_with_usage(self.OVER)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert "manual-hold" not in self._reasons(h)
+
+    def test_engine_switch_never_records_a_pick(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        state = h.state()
+        assert state["lastSwitchTo"] == "3"
+        assert "manualSwitch" not in state
+
+    def test_note_manual_switch_without_a_live_login_is_a_no_op(self, temp_home):
+        h = EngineHarness(temp_home, manual_hold_seconds=1800)
+        h.seed(1, "a@example.com")
+        h.switcher.note_manual_switch()
+        assert h.state() == {}
+
+
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
 

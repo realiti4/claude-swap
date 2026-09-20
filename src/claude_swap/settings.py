@@ -50,6 +50,11 @@ class AutoSwitchSettings:
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Seconds after a human's ``cswap switch`` during which the engine will not
+    # proactively move off the chosen account (at-limit still switches). 0 =
+    # off: without it the loop can undo a deliberate pick within the same tick
+    # whenever the picked account already sits above the threshold.
+    manual_hold_seconds: int = 0
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -130,6 +135,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
+        ),
+        SettingSpec(
+            "autoswitch", "manualHoldSeconds", "manual_hold_seconds", "int", 0, 86400,
+            help="Seconds a manual 'cswap switch' pick blocks proactive switches (0 = off)",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
