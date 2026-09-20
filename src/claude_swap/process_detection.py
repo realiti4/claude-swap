@@ -246,14 +246,31 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
 
     So the count is returned rather than swallowed, and ``list_sessions``
     below is the scan-shaped view that drops it.
+
+    ``iterdir``, NOT ``glob`` behind an ``is_dir`` check: both of those
+    suppress the ``OSError`` they hit, so a sessions directory that cannot be
+    listed -- or one whose stat fails because the profile root cannot be
+    traversed -- arrived at the GUARD as an empty directory rather than an
+    unknown one. Such a directory contributes exactly 1, which makes the count
+    a lower bound on the records at stake rather than a tally of them; every
+    caller only asks whether it is zero.
+
+    A MISSING directory is the one scan failure that still counts 0: a profile
+    that has never been run holds no records, and refusing on it would block
+    every guarded step against it permanently.
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
-    if not sessions_dir.is_dir():
+    try:
+        paths = [p for p in sessions_dir.iterdir() if p.name.endswith(".json")]
+    except FileNotFoundError:
         return [], 0
+    except OSError as exc:
+        logger.debug("Cannot list session directory %s: %s", sessions_dir, exc)
+        return [], 1
 
     sessions = []
     unreadable = 0
-    for path in sessions_dir.glob("*.json"):
+    for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = data["pid"]
