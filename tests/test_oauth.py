@@ -1522,3 +1522,221 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestEffectivePct:
+    """effective_pct — a per-window limit expressed on the threshold scale.
+
+    Every consumer of relevant_windows compares the binding window against
+    one threshold, so a window carrying its own limit is restated rather than
+    each comparison being taught a second number.
+    """
+
+    LIMITS = {"7d": 97.0}
+    THRESHOLD = 90.0
+
+    def _pct(self, label, pct, limits=None):
+        limits = self.LIMITS if limits is None else limits
+        return oauth.effective_pct(label, pct, limits, self.THRESHOLD)
+
+    def test_window_without_a_limit_is_untouched(self):
+        assert self._pct("5h", 92.0) == 92.0
+
+    def test_below_its_limit_cannot_reach_the_threshold(self):
+        assert self._pct("7d", 95.0) < self.THRESHOLD
+
+    def test_at_its_limit_blocks(self):
+        assert self._pct("7d", 97.0) >= self.THRESHOLD
+
+    def test_just_under_its_limit_does_not_block(self):
+        assert self._pct("7d", 96.9) < self.THRESHOLD
+
+    def test_exhaustion_is_never_restated(self):
+        """100% means no request can be served, whatever limit was configured."""
+        assert self._pct("7d", 100.0) == oauth.WINDOW_EXHAUSTED_PCT
+
+    def test_a_limit_below_the_threshold_still_blocks(self):
+        assert self._pct("5h", 86.0, {"5h": 85.0}) >= self.THRESHOLD
+
+    def test_a_limit_below_the_threshold_leaves_lower_values_alone(self):
+        assert self._pct("5h", 40.0, {"5h": 85.0}) == 40.0
+
+    @pytest.mark.parametrize("pct", [0.0, 12.5, 70.0, 89.0, 98.0, 99.9])
+    def test_exact_outside_the_band_between_the_two_numbers(self, pct):
+        """Only [threshold, limit) is compressed; everything else reports true."""
+        restated = self._pct("7d", pct)
+        if self.THRESHOLD <= pct < self.LIMITS["7d"]:
+            pytest.skip("inside the compressed band")
+        assert restated == pct
+
+    def test_lookup_is_case_insensitive(self):
+        assert oauth.effective_pct("Fable", 96.0, {"fable": 95.0}, 90.0) >= 90.0
+
+    def test_monotonic_across_its_limit(self):
+        """Restating must not invert the order of two readings."""
+        series = [self._pct("7d", p) for p in (10.0, 50.0, 89.0, 95.0, 97.0, 99.0, 100.0)]
+        assert series == sorted(series)
+
+
+class TestRelevantWindowsHonoursWindowSettings:
+    """relevant_windows applies both settings at the single window funnel."""
+
+    USAGE = {
+        "five_hour": {"pct": 40.0, "resets_at": "2026-07-10T12:00:00Z"},
+        "seven_day": {"pct": 93.0, "resets_at": "2026-07-14T09:00:00Z"},
+    }
+
+    @staticmethod
+    def _labels(windows):
+        return {label: pct for label, pct, _ in windows}
+
+    def test_defaults_report_both_windows_unchanged(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({}, 90.0))
+        assert self._labels(oauth.relevant_windows(self.USAGE)) == {"5h": 40.0, "7d": 93.0}
+
+    def test_deselected_window_is_dropped(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({}, 90.0))
+        assert self._labels(oauth.relevant_windows(self.USAGE)) == {"5h": 40.0}
+
+    def test_deselected_window_is_kept_when_exhausted(self, monkeypatch):
+        """An account that cannot serve a call is never ranked as a target."""
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({}, 90.0))
+        usage = dict(self.USAGE, seven_day={"pct": 100.0})
+        assert self._labels(oauth.relevant_windows(usage))["7d"] == 100.0
+
+    def test_under_its_own_limit_the_window_does_not_block(self, monkeypatch):
+        """93% of a window limited at 97 must not rule the account out.
+
+        Asserted as the verdict rather than as a headroom figure: inside the
+        band between the threshold and the limit the reported percentage is a
+        restatement, and pinning its exact value would test the arithmetic
+        instead of the behaviour.
+        """
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+        assert 100.0 - oauth.account_headroom(self.USAGE) < 90.0
+
+    def test_the_same_window_blocks_without_a_per_window_limit(self, monkeypatch):
+        """The contrast that makes the previous test meaningful."""
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({}, 90.0))
+        assert 100.0 - oauth.account_headroom(self.USAGE) >= 90.0
+
+    def test_per_window_limit_binds_at_the_limit(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+        usage = dict(self.USAGE, seven_day={"pct": 97.0})
+        assert oauth.account_headroom(usage) == 3.0
+
+    def test_scoped_windows_take_their_own_limit(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"fable": 95.0}, 90.0))
+        usage = dict(self.USAGE, scoped=[{"name": "Fable", "pct": 96.0}])
+        assert self._labels(oauth.relevant_windows(usage, ["Fable"]))["Fable"] >= 90.0
+
+    def test_resets_at_survives_the_restatement(self, monkeypatch):
+        """The scheduler reads its reset from this same tuple."""
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+        resets = {label: ts for label, _pct, ts in oauth.relevant_windows(self.USAGE)}
+        assert resets["7d"] == "2026-07-14T09:00:00Z"
+
+
+class TestWindowSettingResolution:
+    """decision_windows / window_thresholds read settings.json and memoize."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_memos(self, monkeypatch):
+        monkeypatch.setattr(oauth, "_DECISION_WINDOWS_MEMO", None, raising=False)
+        monkeypatch.setattr(oauth, "_WINDOW_THRESHOLD_MEMO", None, raising=False)
+
+    @staticmethod
+    def _write(settings_module, root, **kwargs):
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings_module.save_settings(root, AutoSwitchSettings(**kwargs))
+
+    def test_reads_the_configured_values(self, temp_home, monkeypatch):
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        self._write(
+            settings_module, root, windows="5h", window_thresholds="5h:85,7d:97"
+        )
+        assert oauth.decision_windows() == frozenset({"5h"})
+        limits, threshold = oauth.window_thresholds()
+        assert limits == {"5h": 85.0, "7d": 97.0}
+        assert threshold == 90.0
+
+    def test_a_later_edit_is_picked_up(self, temp_home, monkeypatch):
+        """Keyed on the settings file, so a running engine needs no restart."""
+        import os
+
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        self._write(settings_module, root, window_thresholds="7d:97")
+        assert oauth.window_thresholds()[0] == {"7d": 97.0}
+
+        self._write(settings_module, root, window_thresholds="7d:99")
+        path = settings_module.settings_path(root)
+        stamp = path.stat().st_mtime_ns + 1_000_000
+        os.utime(path, ns=(stamp, stamp))  # defeat a same-tick mtime
+        assert oauth.window_thresholds()[0] == {"7d": 99.0}
+
+    def test_unreadable_settings_fall_back_to_the_documented_defaults(
+        self, temp_home
+    ):
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        settings_module.settings_path(root).write_text("{not json", encoding="utf-8")
+        assert oauth.decision_windows() == frozenset({"5h", "7d"})
+        assert oauth.window_thresholds()[0] == {}
+
+    def test_missing_settings_file_falls_back(self, temp_home):
+        assert oauth.decision_windows() == frozenset({"5h", "7d"})
+        assert oauth.window_thresholds() == ({}, 90.0)
+class TestThresholdAnchor:
+    """The restatement is anchored to the threshold the CALLER compares against.
+
+    Reported by yunjeongiya on PR #355. ``autoswitch.threshold`` in
+    settings.json is not necessarily the number in force: ``--threshold`` on
+    the command line overrides it for the engine, and a TUI session override
+    does the same. Anchoring the restatement to the file instead puts a window
+    that is below its own limit at just under the FILE's threshold, which a
+    lower effective threshold then reads as over the line.
+    """
+
+    USAGE = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0}}
+
+    @pytest.fixture(autouse=True)
+    def _policy(self, monkeypatch):
+        # settings.json says 90; the caller is running with something else.
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+
+    def test_the_file_anchor_is_the_default(self):
+        assert 100.0 - oauth.account_headroom(self.USAGE) < 90.0
+
+    def test_a_lower_effective_threshold_does_not_evict(self):
+        """95% of a window limited at 97 must not block, at any threshold."""
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), 85.0) < 85.0
+
+    def test_a_higher_effective_threshold_does_not_evict_either(self):
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), 95.0) < 95.0
+
+    @pytest.mark.parametrize("effective", [50.0, 70.0, 85.0, 90.0, 95.0, 99.0])
+    def test_under_its_limit_never_blocks_whatever_the_threshold(self, effective):
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), effective) < effective
+
+    @pytest.mark.parametrize("effective", [50.0, 85.0, 90.0])
+    def test_at_its_limit_always_blocks_whatever_the_threshold(self, effective):
+        usage = dict(self.USAGE, seven_day={"pct": 97.0})
+        assert 100.0 - oauth.account_headroom(usage, (), effective) >= effective

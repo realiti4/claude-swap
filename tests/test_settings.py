@@ -20,6 +20,8 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_window_labels,
+    parse_window_thresholds,
     save_settings,
     set_setting,
     settings_path,
@@ -355,3 +357,68 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestParseWindowLabels:
+    """autoswitch.windows -> the window labels the decision reads."""
+
+    def test_both_windows_by_default(self):
+        assert parse_window_labels("5h,7d") == frozenset({"5h", "7d"})
+
+    def test_single_window(self):
+        assert parse_window_labels("5h") == frozenset({"5h"})
+
+    def test_whitespace_and_case_are_tolerated(self):
+        assert parse_window_labels(" 7D , 5h ") == frozenset({"5h", "7d"})
+
+    @pytest.mark.parametrize("value", [None, "", "junk", "1h,30d"])
+    def test_unusable_values_fall_back_to_both(self, value):
+        """A bad hand edit must not silently narrow every switch decision."""
+        assert parse_window_labels(value) == frozenset({"5h", "7d"})
+
+    def test_unknown_label_alongside_a_known_one_is_dropped(self):
+        assert parse_window_labels("5h,90d") == frozenset({"5h"})
+
+
+class TestParseWindowThresholds:
+    """autoswitch.windowThresholds -> a switch limit per window."""
+
+    def test_pairs(self):
+        assert parse_window_thresholds("5h:85,7d:97") == {"5h": 85.0, "7d": 97.0}
+
+    def test_model_names_are_lowercased_for_lookup(self):
+        assert parse_window_thresholds("Fable:95") == {"fable": 95.0}
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_empty_means_no_per_window_limits(self, value):
+        assert parse_window_thresholds(value) == {}
+
+    @pytest.mark.parametrize(
+        "value", ["7d:nonsense", "7d", "7d:", ":90", "7d:0", "7d:101", "7d:-5"]
+    )
+    def test_unusable_pairs_are_dropped_not_raised(self, value):
+        """That window keeps ``threshold``; a typo never crashes the engine."""
+        assert parse_window_thresholds(value) == {}
+
+    def test_a_bad_pair_does_not_discard_the_good_ones(self):
+        assert parse_window_thresholds("5h:85,7d:nonsense") == {"5h": 85.0}
+
+    def test_last_spelling_of_a_repeated_window_wins(self):
+        assert parse_window_thresholds("7d:90,7d:97") == {"7d": 97.0}
+
+
+class TestWindowSettingsRoundTrip:
+    def test_defaults_preserve_upstream_behaviour(self):
+        """Both settings default to "every window, one threshold"."""
+        defaults = AutoSwitchSettings()
+        assert parse_window_labels(defaults.windows) == frozenset({"5h", "7d"})
+        assert parse_window_thresholds(defaults.window_thresholds) == {}
+
+    def test_saved_values_survive_a_reload(self, tmp_path: Path):
+        save_settings(
+            tmp_path,
+            AutoSwitchSettings(windows="5h", window_thresholds="5h:85,7d:97"),
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.windows == "5h"
+        assert loaded.window_thresholds == "5h:85,7d:97"

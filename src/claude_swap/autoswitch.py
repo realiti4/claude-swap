@@ -514,7 +514,9 @@ _refresh_fingerprint = oauth.credential_fingerprint
 
 
 def _window_pcts(
-    usage: dict | None, models: tuple[str, ...] = ()
+    usage: dict | None,
+    models: tuple[str, ...] = (),
+    threshold: float | None = None,
 ) -> dict[str, float]:
     """Ordered window label → pct: "5h", "7d", then configured scoped names.
 
@@ -524,7 +526,8 @@ def _window_pcts(
     correctly ignored it. Full per-model usage lives in ``cswap list``.
     """
     return {
-        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
+        name: pct
+        for name, pct, _ in oauth.relevant_windows(usage, models, threshold)
     }
 
 
@@ -558,7 +561,10 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
 
 
 def _binding_recovery_ts(
-    usage: dict | str | None, models: Sequence[str], now: float
+    usage: dict | str | None,
+    models: Sequence[str],
+    now: float,
+    threshold: float | None = None,
 ) -> float:
     """When this account's *binding* window comes back, as a sort key.
 
@@ -583,7 +589,7 @@ def _binding_recovery_ts(
     # at 40% resetting in an hour returned "back in an hour", which is the
     # opposite of what binds. An account whose binding window has no usable
     # reset is one we cannot schedule around, and inf sorts it last.
-    windows = list(oauth.relevant_windows(usage, models))
+    windows = list(oauth.relevant_windows(usage, models, threshold))
     if not windows:
         return float("inf")
     _label, _pct, resets_at = max(windows, key=lambda w: w[1])
@@ -619,12 +625,18 @@ def _ref(number: str, email: str) -> dict:
 
 
 def _headroom_by_account(
-    usage: dict[str, dict | str | None], models: tuple[str, ...]
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    threshold: float | None = None,
 ) -> dict[str, float | None]:
-    """Per-account headroom derived from decision values."""
+    """Per-account headroom derived from decision values.
+
+    ``threshold`` is the engine's effective value, so a per-window limit is
+    restated against the number the comparison actually uses.
+    """
     return {
         num: oauth.account_headroom(
-            value if isinstance(value, dict) else None, models
+            value if isinstance(value, dict) else None, models, threshold
         )
         for num, value in usage.items()
     }
@@ -951,7 +963,9 @@ class AutoSwitchEngine:
                     num: pcts
                     for num, value in usage.items()
                     if (pcts := _window_pcts(
-                        value if isinstance(value, dict) else None, self._models
+                        value if isinstance(value, dict) else None,
+                        self._models,
+                        settings.threshold,
                     ))
                 },
             )
@@ -1202,7 +1216,9 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models)
+            headroom = _headroom_by_account(
+                usage, self._models, settings.threshold
+            )
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1307,7 +1323,9 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now),
+            _binding_recovery_ts(
+                usage.get(current), self._models, decided_now, settings.threshold
+            ),
         )
         transient_failure = False
         systemic = ""
@@ -1671,8 +1689,12 @@ class AutoSwitchEngine:
             # dominance leg has, guarded directly in the mutation table.
             if h is not None and h > 100.0 - settings.threshold:
                 return True
-            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
-            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            peer_recovery_ts = _binding_recovery_ts(
+                usage.get(barred), self._models, now, settings.threshold
+            )
+            active_recovery_ts = _binding_recovery_ts(
+                usage.get(current), self._models, now, settings.threshold
+            )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
             # "never resets" and "we do not know" (no windows, no
@@ -1748,7 +1770,9 @@ class AutoSwitchEngine:
         # schedule around. Moving off it onto a real reset IS the improvement.
         was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
         return (
-            _binding_recovery_ts(usage.get(barred), self._models, now)
+            _binding_recovery_ts(
+                usage.get(barred), self._models, now, settings.threshold
+            )
             < was - RECOVERY_HYSTERESIS_S
         )
 
@@ -1818,7 +1842,9 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(
+                usage.get(current), self._models, now, settings.threshold
+            )
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -1839,7 +1865,9 @@ class AutoSwitchEngine:
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(
+                    usage.get(num), self._models, now, settings.threshold
+                )
                 if all_above
                 else 0.0
             )
@@ -2017,7 +2045,13 @@ class AutoSwitchEngine:
             and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            and (
+                binding_pct(
+                    active_pre.last_good, self._models, self.settings.threshold
+                )
+                or 0.0
+            )
+            < 100.0
         )
         overslept_plan = (
             active_pre is not None
@@ -2053,7 +2087,9 @@ class AutoSwitchEngine:
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None, self._models
+            active_value if isinstance(active_value, dict) else None,
+            self._models,
+            threshold if threshold is not None else self.settings.threshold,
         )
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
@@ -2076,7 +2112,9 @@ class AutoSwitchEngine:
                 entry = entries.get(num)
                 value = usage.get(num)
                 planned_headroom = oauth.account_headroom(
-                    value if isinstance(value, dict) else None, self._models
+                    value if isinstance(value, dict) else None,
+                    self._models,
+                    threshold if threshold is not None else self.settings.threshold,
                 )
                 if (
                     entry is not None
@@ -2093,7 +2131,11 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
-        headroom = _headroom_by_account(usage, self._models)
+        headroom = _headroom_by_account(
+            usage,
+            self._models,
+            threshold if threshold is not None else self.settings.threshold,
+        )
         return entries, usage, headroom
 
     def _perform(

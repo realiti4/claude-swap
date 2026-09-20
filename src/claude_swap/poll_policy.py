@@ -147,9 +147,17 @@ ESCALATION_MARGIN_PCT = 15.0
 RESET_SLACK_S = 60.0
 
 
-def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
-    """Utilization of the binding (worst) relevant window, or None."""
-    headroom = oauth.account_headroom(usage, models)
+def binding_pct(
+    usage: dict | None,
+    models: tuple[str, ...] = (),
+    threshold: float | None = None,
+) -> float | None:
+    """Utilization of the binding (worst) relevant window, or None.
+
+    ``threshold`` is the value the caller decides with, so cadence is planned
+    against the same limits the switch decision reads.
+    """
+    headroom = oauth.account_headroom(usage, models, threshold)
     return None if headroom is None else 100.0 - headroom
 
 
