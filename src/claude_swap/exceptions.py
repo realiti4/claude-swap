@@ -43,6 +43,12 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
+class DesktopError(ClaudeSwitchError):
+    """Error switching or reconciling Claude Desktop."""
+
+    pass
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 
