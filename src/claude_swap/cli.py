@@ -756,6 +756,16 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Minimum time between proactive switches (default 300)",
     )
     parser.add_argument(
+        "--failback-delay",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Seconds a recovered primary must stay eligible before a standby "
+            "account hands back to it (0-86400). 0 hands back on the first "
+            "fresh poll; unset follows --cooldown"
+        ),
+    )
+    parser.add_argument(
         "--model",
         metavar="NAMES",
         help=(

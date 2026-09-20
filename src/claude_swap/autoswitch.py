@@ -58,6 +58,11 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# The failback delay's arming timestamp: when the standby -> primary handback
+# first became actionable. Absent unless `autoswitch.failbackDelaySeconds` is
+# set, so a fleet that never opts in keeps a byte-identical state file.
+FAILBACK_ANCHOR_KEY = "failbackReadyAt"
+FAILBACK_DELAY_REASON = "failback-delay"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -707,6 +712,11 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # Failback-delay bookkeeping, both reset per tick: whether this tick
+        # touched the persisted arming anchor, and the `lastSwitchAt` this
+        # tick's snapshot was taken against.
+        self._failback_anchor_touched = False
+        self._failback_tick_epoch: float | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -911,6 +921,8 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._failback_anchor_touched = False
+        self._failback_tick_epoch = None
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -921,6 +933,60 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+        finally:
+            self._disarm_failback_if_untouched()
+
+    def _disarm_failback_if_untouched(self) -> None:
+        """Clear the arming anchor on any tick that did not touch it.
+
+        Totality by construction rather than by enumeration. `tick()` is the
+        one wrapper every path returns through — including the early returns
+        at the cooldown gate, `stale-usage` and `active-usage-unknown`, none of
+        which reach `_perform` or `_failback_hold`. Clearing inside the hold
+        closure instead leaves the anchor armed across an outage, so a primary
+        that recovers hours later is taken with a zero-second stability window:
+        precisely what the timer exists to prevent.
+
+        Never in dry-run. That mode promises to write no state, and a dry-run
+        tick returning early would otherwise delete a *real* engine's anchor
+        and silently restart its window.
+        """
+        if self.settings.failback_delay_seconds is None or self.dry_run:
+            return
+        if self._failback_anchor_touched:
+            return
+        try:
+            if FAILBACK_ANCHOR_KEY not in self._read_state():
+                return
+            self._mutate_state(lambda s: s.pop(FAILBACK_ANCHOR_KEY, None))
+        except Exception as e:  # never let bookkeeping break a tick's outcome
+            _logger.debug("could not clear %s: %r", FAILBACK_ANCHOR_KEY, e)
+
+    def _failback_anchor(self, state: dict) -> float | None:
+        """The stored arming timestamp, or None when it cannot be trusted.
+
+        `autoswitch_state.json` is documented as a file users may delete to
+        reset, so it is hand-editable by contract: a string, a bool, a NaN or
+        an infinity must read as "not armed" rather than raise inside the
+        elapsed arithmetic and turn the tick into `ERROR`.
+
+        An anchor at or before `lastSwitchAt` is a leftover from before the
+        move onto the reserve. Honouring it would hand back on the first tick
+        after the promotion, skipping the whole window the user configured.
+        """
+        value = state.get(FAILBACK_ANCHOR_KEY)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        last = state.get("lastSwitchAt")
+        if (
+            isinstance(last, (int, float))
+            and not isinstance(last, bool)
+            and value < last
+        ):
+            return None
+        return float(value)
 
     def _resolve_thresholds(
         self, settings: AutoSwitchSettings | None = None
@@ -1001,6 +1067,11 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         settings = self.settings
         state = self._read_state()
+        # The `lastSwitchAt` this tick's decisions are taken against, so
+        # `_perform`'s locked recheck can refuse to act on a snapshot another
+        # engine has already superseded. Cooldown supplied that refusal for
+        # `failback` until the delay exempted it; see `_perform`.
+        self._failback_tick_epoch = state.get("lastSwitchAt")
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
             # only released (state mutation) on real ticks.
@@ -1186,10 +1257,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if (
-            trigger in ("proactive", "consume-first", "failback")
-            and self._in_cooldown(state)
-        ):
+        if trigger in self._cooldown_triggers() and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -2421,7 +2489,27 @@ class AutoSwitchEngine:
         trigger: str,
         left: tuple[float | None, float],
     ) -> TickOutcome:
+        delay = self.settings.failback_delay_seconds
         if self.dry_run:
+            if trigger == "failback" and delay is not None:
+                # Read the timer, never arm it: dry-run writes no state. With
+                # nothing stored there is no elapsed time to measure, so the
+                # honest preview is the hold — never a switch the real engine
+                # would defer.
+                ready = self._failback_anchor(self._read_state())
+                if ready is None or self.clock() - ready < delay:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason=FAILBACK_DELAY_REASON,
+                            detail=(
+                                "timer not armed; --dry-run does not arm it"
+                                if ready is None
+                                else "primary steady "
+                                     f"{self.clock() - ready:.0f}s of {delay:.0f}s"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
             self._emit(
@@ -2442,11 +2530,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in (
-                "proactive",
-                "consume-first",
-                "failback",
-            ) and self._in_cooldown(state):
+            if trigger == "failback" and delay is not None:
+                outcome = self._failback_delay_gate(state, delay)
+                if outcome is not None:
+                    return outcome
+            if trigger in self._cooldown_triggers() and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2463,6 +2551,11 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # Any switch retires the arming anchor: the next handback cycle
+            # measures its own window from scratch. Removed, never stored as
+            # null — one spelling of "cleared", so a reader of the file and
+            # the next implementer cannot disagree.
+            state.pop(FAILBACK_ANCHOR_KEY, None)
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
@@ -2494,6 +2587,73 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _cooldown_triggers(self) -> tuple[str, ...]:
+        """Which triggers `cooldownSeconds` governs on this tick.
+
+        Once `failbackDelaySeconds` is set, the standby handback has its own
+        timer and ordinary rotation keeps the cooldown floor — that separation
+        IS the feature. Unset, the tuple is the pre-feature one, so nothing
+        about a fleet that does not opt in changes.
+        """
+        base = ("proactive", "consume-first", "failback")
+        if self.settings.failback_delay_seconds is None:
+            return base
+        return ("proactive", "consume-first")
+
+    def _failback_delay_gate(self, state: dict, delay: float) -> TickOutcome | None:
+        """The failback timer, evaluated under `_perform`'s own state lock.
+
+        Returns a `TickOutcome` to refuse the handback, or None to let it
+        proceed. Two refusals, in order:
+
+        1. **A superseded snapshot.** This tick ranked its target against
+           `lastSwitchAt` as it was at tick entry; if another engine (the loop
+           beside a cron `--once`, or the TUI) switched in between, acting now
+           would undo a move this engine never saw. Cooldown used to refuse
+           that for `failback` incidentally — with failback exempt, the locked
+           recheck has to refuse it directly, or opting in silently removes the
+           serialization for exactly the fleets that opted in.
+        2. **The delay has not elapsed.** Absence of an anchor means the
+           handback just became actionable, so it arms *and* measures in the
+           same pass: at `failbackDelaySeconds 0` the switch happens on this
+           tick, never the next one.
+
+        The write rides this region's own lock and `atomic_write_json`.
+        Routing it through `_mutate_state` would take the same non-reentrant
+        `FileLock` a second time and block until that lock's timeout.
+        """
+        now = self.clock()
+        if state.get("lastSwitchAt") != self._failback_tick_epoch:
+            self._emit(
+                NoSwitchEvent(
+                    reason=FAILBACK_DELAY_REASON,
+                    detail="another engine switched first",
+                )
+            )
+            return TickOutcome.NO_ACTION
+
+        ready = self._failback_anchor(state)
+        self._failback_anchor_touched = True
+        if ready is None:
+            ready = now
+        elapsed = now - ready
+        if elapsed >= delay:
+            return None
+        if state.get(FAILBACK_ANCHOR_KEY) != ready:
+            # Arm it. A held tick whose anchor is already stored writes
+            # nothing: re-stamping it every poll would reset the very window
+            # the user asked for, on every single tick.
+            state[FAILBACK_ANCHOR_KEY] = ready
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            atomic_write_json(self.state_path, state)
+        self._emit(
+            NoSwitchEvent(
+                reason=FAILBACK_DELAY_REASON,
+                detail=f"primary steady {elapsed:.0f}s of {delay:.0f}s",
+            )
+        )
+        return TickOutcome.NO_ACTION
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
