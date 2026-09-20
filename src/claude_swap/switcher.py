@@ -3672,8 +3672,19 @@ class ClaudeAccountSwitcher:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID and org fields
-        config_data = self._read_json(config_path)
+        # Get account UUID and org fields. Read strictly, because the ownership
+        # probe's network round-trip sits between the identity read this add was
+        # verified against and this one: a `.claude.json` caught mid-rewrite came
+        # back as None and the `.get` below died with a raw AttributeError, which
+        # `cli.py`'s `except ClaudeSwitchError` does not catch -- so `--json`
+        # emitted no envelope at all. Falling back to `{}` is not the answer
+        # either; it would blank the uuid and org fields of a slot whose live
+        # config carries real ones. `strict` speaks for a file that is THERE but
+        # unreadable, so None now means only that it was deleted in that same
+        # window, which is the refusal the read above already makes.
+        config_data = self._read_json(config_path, strict=True)
+        if config_data is None:
+            raise ConfigError("Claude config file not found")
         oauth_data = config_data.get("oauthAccount", {})
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
