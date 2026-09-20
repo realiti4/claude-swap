@@ -28,6 +28,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
+from claude_swap.settings import set_setting
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -8110,6 +8111,93 @@ class TestSharedOAuthCredentialPreservation:
 
         assert composed == {"claudeAiOauth": {"accessToken": "target"}}
 
+    def test_design_login_travels_with_the_slot_by_default(self, temp_home):
+        # designOauth is account-bound like trustedDeviceToken: at the
+        # swap.designLogin default the target slot's own copy activates.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "designOauth": {"refreshToken": "design-live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        }
+
+    def test_unswapped_design_login_stays_live(self, temp_home):
+        # With swap.designLogin off one /design-login serves every account:
+        # the live credential wins over the slot's snapshot, which may hold a
+        # generation Claude Code has since rotated or revoked.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-stale"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "designOauth": {"refreshToken": "design-current"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-current"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_unswapped_design_login_absent_from_live_is_not_resurrected(
+        self, temp_home
+    ):
+        # Claude Code revokes and deletes designOauth on /login and /logout;
+        # the slot's copy of that revoked grant must not come back.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-revoked"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+
+    def test_unswapped_design_login_without_live_oauth_activates_verbatim(
+        self, temp_home
+    ):
+        # No live OAuth object to compose from (a managed API key is active):
+        # the slot's own copy activates, as it does for every shared key.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+            == target
+        )
+
     def test_direct_activation_without_config_identity_composes_live_state(
         self, temp_home
     ):
@@ -8252,6 +8340,43 @@ class TestSharedOAuthCredentialPreservation:
             "server": {"refreshToken": "current"}
         }
 
+    def test_normal_switch_keeps_an_unswapped_design_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        set_setting(get_backup_root(), "swap.designLogin", "false")
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+            "designOauth": {"refreshToken": "design-current"},
+        })
+        target = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-target-2", "refreshToken": "rt-target-2",
+            },
+            "designOauth": {"refreshToken": "design-stale"},
+        })
+        creds_store[("1", "test@example.com")] = live
+        creds_store[("2", "account2@example.com")] = target
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        activated = json.loads(live_state["creds"])
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["designOauth"] == {"refreshToken": "design-current"}
+
     def test_direct_activation_preserves_live_shared_state(self, temp_home):
         switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
         live_path = temp_home / ".claude" / ".credentials.json"
@@ -8278,6 +8403,31 @@ class TestSharedOAuthCredentialPreservation:
         assert activated["mcpOAuth"] == {
             "server": {"refreshToken": "current"}
         }
+
+    def test_direct_activation_keeps_an_unswapped_design_login(self, temp_home):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live_path.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-unmanaged", "refreshToken": "rt-unmanaged",
+            },
+            "designOauth": {"refreshToken": "design-current"},
+        }))
+        target = json.loads(
+            switcher._read_account_credentials("1", "one@example.com")
+        )
+        target["designOauth"] = {"refreshToken": "design-stale"}
+        switcher._write_account_credentials(
+            "1", "one@example.com", json.dumps(target)
+        )
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        activated = json.loads(live_path.read_text())
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-one"
+        assert activated["designOauth"] == {"refreshToken": "design-current"}
 
 
 class TestUuidConflictClassification:

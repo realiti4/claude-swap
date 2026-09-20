@@ -50,6 +50,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
+    shared_credential_keys,
 )
 from claude_swap.fsutil import read_text_with_retry
 from claude_swap.locking import FileLock
@@ -85,7 +86,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_swap_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -754,14 +760,24 @@ class ClaudeAccountSwitcher:
         account-bound state such as ``trustedDeviceToken`` — and any field
         cswap does not recognize — must not leak across an account switch.
 
+        The one opt-in exception is the Claude Design credential
+        (``designOauth``): with ``swap.designLogin`` off it joins the
+        live-owned keys, so a single ``/design-login`` survives every switch
+        instead of each slot restoring its own copy.
+
         When there is no live JSON credential object to take shared fields
         from (fresh machine, or a managed API key is active), the stored
         blob activates unchanged, exactly as before.
         """
-        live_shared = shared_credential_fields(live_credentials)
+        keys = shared_credential_keys(
+            swap_design_login=load_swap_settings(self.backup_dir).design_login
+        )
+        live_shared = shared_credential_fields(live_credentials, keys)
         if live_shared is None:
             return target_credentials
-        return merge_shared_credential_fields(target_credentials, live_shared)
+        return merge_shared_credential_fields(
+            target_credentials, live_shared, keys
+        )
 
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()

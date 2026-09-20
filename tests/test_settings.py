@@ -15,9 +15,11 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    SwapSettings,
     UiSettings,
     effective_settings,
     load_settings,
+    load_swap_settings,
     load_ui_settings,
     merged_with_cli,
     save_settings,
@@ -152,6 +154,38 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestSwapSettings:
+    def test_missing_file_swaps_the_design_login(self, tmp_path: Path):
+        assert load_swap_settings(tmp_path) == SwapSettings(design_login=True)
+
+    def test_reads_false(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"swap": {"designLogin": False}})
+        )
+        assert load_swap_settings(tmp_path).design_login is False
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"swap": {"designLogin": "no"}})
+        )
+        assert load_swap_settings(tmp_path).design_login is True
+
+    def test_set_and_unset_swap_design_login(self, tmp_path: Path):
+        assert set_setting(tmp_path, "swap.designLogin", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "swap": {"designLogin": False}}
+        assert unset_setting(tmp_path, "swap.designLogin") is True
+        assert "swap" not in json.loads(settings_path(tmp_path).read_text())
+
+    def test_effective_settings_reports_the_swap_row(self, tmp_path: Path):
+        set_setting(tmp_path, "swap.designLogin", "false")
+        by_key = {
+            spec.dotted: (value, is_set)
+            for spec, value, is_set in effective_settings(tmp_path)
+        }
+        assert by_key["swap.designLogin"] == (False, True)
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -165,7 +199,11 @@ class TestSettingSpecs:
         }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "swap": SwapSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
