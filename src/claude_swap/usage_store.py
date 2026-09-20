@@ -28,6 +28,7 @@ batch, not one request.
 
 from __future__ import annotations
 
+import logging
 import json
 import time
 import uuid
@@ -47,6 +48,8 @@ from claude_swap.poll_policy import (
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
+
+_logger = logging.getLogger("claude-swap")
 
 SCHEMA_VERSION = 2
 
@@ -215,16 +218,73 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
-# only a re-login helps. One such answer is already definitive: the server
-# explicitly rejected the grant, which no transient 429/timeout/network blip
-# does, so there is nothing to gain by retrying (and each retry with a dead
-# token just draws a fresh 401/429). At this many strikes the account is
-# quarantined: no more fetches, and the collector surfaces "re-login needed".
-# A single success — or a credential refresh via login/add — resets the count
-# and lifts the quarantine. Raise to 2 if a buffer against a one-off
-# misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
+# though the ACCOUNT can, without a human, once the live client rotates to a
+# generation the strike did not condemn. One such answer is already
+# definitive: the server explicitly rejected the grant, which no transient
+# 429/timeout/network blip does, so there is nothing to gain by retrying (and
+# each retry with a dead token just draws a fresh 401/429). At this many
+# strikes the account is quarantined: no more fetches, and the collector
+# surfaces "re-login needed". A single success, a credential refresh via
+# login/add, or a rotation that moves the stored fingerprint off the condemned
+# generation resets the count and lifts the quarantine. Raise to 2 if a
+# buffer against a one-off misclassification is ever wanted; the trade-off
+# is a ~10-min-slower verdict
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
+
+
+def _strike_time(row: dict) -> float | None:
+    """When this row's strike landed.
+
+    Falls back to `lastAttemptAt` for a struck row written before `struckAt`
+    existed: that is the field the previous release measured, so this
+    reproduces its reading rather than re-condemning every row it was
+    doubting — which no later fetch could undo, the strike being what blocks
+    the fetch that would clear it.
+
+    The fallback only ever has to answer once. `reserve` migrates such a row
+    before it overwrites `lastAttemptAt`, so the value read here has not been
+    moved by an attempt.
+    """
+    at = _num_or_none(row.get("struckAt"))
+    return at if at is not None else _num_or_none(row.get("lastAttemptAt"))
+
+
+def _strike_is_suspected_race(
+    strikes: int, fetched_at: float | None, struck_at: float | None
+) -> bool:
+    """Whether to doubt this row's FIRST strike because a success preceded it.
+
+    Only a row at or below the threshold is doubted, so this permits one POST
+    THAT RETURNS A VERDICT: the retry either succeeds (`record` zeroes the
+    count) or lands a second strike no window can excuse. That keeps the
+    endless-401 loop away and makes the width non-critical -- erring either
+    way costs one fetch.
+
+    A TRANSIENT failure returns no verdict, and since it advances neither
+    `struckAt` nor the strike count the doubt survives it. That is deliberate:
+    a timeout is no evidence about the token, so a possibly-live one should
+    keep being retried -- paced by `backoffUntil`, which every RECORDED
+    failure sets (an outcome fenced out by a stale claim records nothing at
+    all, so it neither strikes nor paces).
+
+    THE STRIKE'S OWN TIME, not `lastAttemptAt`. That field advances on every
+    attempt -- `reserve` stamps it before the fetch and `record` stamps it for
+    any outcome -- so a timeout, or a collector killed mid-fetch, would widen
+    a doubted strike out of its window having learned nothing about the token.
+    One `invalid_grant` plus one network blip then quarantines a healthy
+    account permanently, which is the state this guard exists to prevent.
+
+    Missing either timestamp is "no evidence", not "a race", so rows struck
+    before `struckAt` existed read as they did. A negative gap is not one
+    either: there the success is the LATER event and already zeroed the strike.
+    """
+    if strikes > AUTH_DEAD_STRIKES:
+        return False
+    if fetched_at is None or struck_at is None:
+        return False
+    return struck_at >= fetched_at
+
 
 # Fetch errors that prove the stored credential is permanently unusable (vs.
 # transient 429/timeout/network). Only these advance the dead-token strike
@@ -299,6 +359,10 @@ class UsageEntry:
     # Fingerprint of the generation the strikes condemned (absent on legacy
     # rows → strikes bind unconditionally). See ``token_dead``.
     struck_fingerprint: str | None = None
+    # When the most recent strike landed (at AUTH_DEAD_STRIKES = 1, the only
+    # one). Populated by `entries`, which falls back to `lastAttemptAt` for
+    # rows written before this field existed — see `_strike_time`.
+    struck_at: float | None = None
     # The refused access token a live session's fetch stamped (see
     # ``FetchRecord.rejected_fp``); None once a fetch succeeds.
     rejected_fingerprint: str | None = None
@@ -373,6 +437,10 @@ class UsageEntry:
         """
         if self.auth_dead_strikes < threshold:
             return False
+        if _strike_is_suspected_race(
+            self.auth_dead_strikes, self.fetched_at, self.struck_at
+        ):
+            return False
         if (
             stored_fp is not None
             and self.struck_fingerprint is not None
@@ -381,13 +449,52 @@ class UsageEntry:
             return False
         return True
 
-    def decision_value(self) -> dict | str | None:
+    def decision_value(self, models: tuple[str, ...] = ()) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
         Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness) —
+        but the two arms disagree on what a rolled window means, because
+        only one of them has a fresh poll behind it.
+
+        A FRESH read (age ≤ ``STALE_OK_S``) has each window whose own
+        ``resets_at`` has already elapsed DROPPED from it — a fetch that
+        SUCCEEDED, inside its trust window, whose server-reported
+        ``resets_at`` has already elapsed describes a window that has
+        ended, and freshness alone is no evidence about the new one. The
+        rest of the reading (a window that has not rolled) is still a fact
+        in hand, so only the rolled window is removed, not the whole
+        reading (``_drop_rolled_windows``, reusing the same relevant-window
+        enumeration ``_earliest_reset`` sorts, rather than a second
+        predicate). A reading with nothing left once every relevant window
+        is dropped is None (unknown), same as before.
+
+        A ``trust_extended`` read past ``STALE_OK_S`` (consecutive
+        failures, a live claim, a scheduled next poll) has no such poll: a
+        rolled window there is not "reset, real headroom on the rest" but
+        "unmeasured since before the reset, and nothing has looked since" —
+        dropping it would manufacture headroom from data nobody has
+        reconfirmed. The whole reading nulls instead, same as pre-#325 (the
+        429 arm already enforces this itself, refusing ``trust_extended``
+        outright once any relevant window's reset has passed —
+        ``_rate_limited_trust_ok`` — so it never reaches this branch with a
+        rolled window in the first place; this is the non-429 arm, which
+        has no such reset test).
+
+        This CAN null a healthy account too — the scheduled-next-poll
+        disjunct (``now < next_poll_at``) is true for a row simply not due
+        yet, with zero failures. Bounded, though: ``poll_policy`` sets
+        ``nextPollAt`` at or before the earliest future reset plus
+        ``RESET_SLACK_S``, so once a reset passes the row is due within
+        about ``RESET_SLACK_S`` and that disjunct falls away; the
+        live-claim disjunct is capped at ``CLAIM_TTL_S`` (90s). A narrow,
+        deliberate re-opening of the failover-flapping window an earlier
+        pass closed, not a regression of it.
+
+        ``models`` selects the per-model scoped windows too, matching
+        ``_drop_rolled_windows``'s reuse. Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -396,6 +503,14 @@ class UsageEntry:
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
+            if self.fetched_at is None:
+                return self.last_good  # hand-built-entry fallback (entries() ties age_s to fetched_at)
+            now = self.fetched_at + self.age_s
+            if self.age_s <= STALE_OK_S:
+                return _drop_rolled_windows(self.last_good, now, models)
+            soonest = _earliest_reset(self.last_good, models)
+            if soonest is not None and soonest <= now:
+                return None
             return self.last_good
         return None
 
@@ -438,11 +553,23 @@ def due_candidate(
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
+    Used by the auto engine to pick the single alternate to poll per pass.
+    Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
+
+    THE STRIKE CHECK IS DELIBERATELY UNBOUND — it asks ``token_dead()`` with no
+    ``stored_fp``, so a strike condemning a generation the slot no longer holds
+    still refuses it. The bound verdict ranges over BOTH stored sources (see
+    ``switcher._entry_token_dead``) and this function can read neither. The
+    entries come from ``_collect_usage_entries``, which has already healed
+    every case it could decide and sentinelled every confirmed-dead one; what
+    reaches here is "could not determine", where that scan relies on this
+    refusal to keep the row out of a fetch. Binding it would not merely drop a
+    guard, it would WASTE the pass: ``_row_eligible`` refuses a struck row
+    under the write lock regardless, so ``reserve`` returns nothing and the one
+    alternate poll is spent on a row that cannot be fetched.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -453,7 +580,7 @@ def due_candidate(
         if entry.sentinel is not None:
             continue
         if entry.token_dead():
-            continue  # dead refresh-token: quarantined, needs a re-login
+            continue  # quarantined; what lifts it is the docstring's business
         if entry.in_backoff(now):
             continue
         if (
@@ -487,6 +614,44 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
+
+
+def _drop_rolled_windows(
+    last_good: dict, now: float, models: tuple[str, ...] = ()
+) -> dict | None:
+    """A copy of ``last_good`` with each RELEVANT window whose own
+    ``resets_at`` has already elapsed removed.
+
+    A rolled window describes a window that just ended and carries no
+    information about the new one — but the REST of the reading is not
+    stale just because one window rolled (an account reading ``5h 0% ·
+    7d 100%(rolled)`` is a healthy account with real 5h headroom, not an
+    unknown one). Reuses ``oauth.relevant_windows`` — the same enumeration
+    ``_earliest_reset`` sorts — rather than a second notion of which
+    windows matter. Returns ``None`` only when every relevant window has
+    rolled: the reading is then genuinely unusable, same as before.
+    """
+    rolled = {
+        label
+        for label, _pct, resets_at in oauth.relevant_windows(last_good, models)
+        if (ts := parse_reset_ts(resets_at)) is not None and ts <= now
+    }
+    if not rolled:
+        return last_good
+    result = dict(last_good)
+    if "5h" in rolled:
+        result.pop("five_hour", None)
+    if "7d" in rolled:
+        result.pop("seven_day", None)
+    scoped = result.get("scoped")
+    if isinstance(scoped, list):
+        kept = [
+            s for s in scoped
+            if not (isinstance(s, dict) and s.get("name") in rolled)
+        ]
+        if len(kept) != len(scoped):
+            result["scoped"] = kept
+    return result if oauth.relevant_windows(result, models) else None
 
 
 def _rate_limited_trust_ok(
@@ -945,6 +1110,7 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
+                struck_at=_strike_time(row),
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
@@ -1039,6 +1205,15 @@ class UsageStore:
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
+                # A row struck before `struckAt` existed carries its strike
+                # time in `lastAttemptAt`, and the stamp below is about to
+                # overwrite it. Migrate here, once, or the doubt such a row is
+                # owed survives exactly one retry and a timeout then condemns
+                # it forever.
+                if row.get("struckAt") is None and int(
+                    row.get("authDeadStrikes") or 0
+                ):
+                    row["struckAt"] = row.get("lastAttemptAt")
                 row["lastAttemptAt"] = now
                 row["claimId"] = claim_id
                 row["claimUntil"] = now + CLAIM_TTL_S
@@ -1094,6 +1269,7 @@ class UsageStore:
                 row["backoffUntil"] = None
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["struckAt"] = None
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -1112,6 +1288,78 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # The strike's own time. `lastAttemptAt` moves on every
+                    # attempt, so only this can bound the race doubt.
+                    row["struckAt"] = now
+                    # SAY SO. This is the only place that knows the slot, the
+                    # identity and the verdict at the moment it binds, and at
+                    # AUTH_DEAD_STRIKES=1 one line here is the whole
+                    # difference between a diagnosable quarantine and an
+                    # account that silently starts demanding a re-login.
+                    # Measured in a live incident: four accounts across two
+                    # machines quarantined, not one line about any of them.
+                    if int(row["authDeadStrikes"]) >= AUTH_DEAD_STRIKES:
+                        _ident = identities.get(num) if identities else None
+                        # WHAT LIFTS IT IS WHETHER THESE BYTES CAN ROTATE.
+                        # `sha256:` is minted only when a refresh token existed
+                        # (oauth.credential_fingerprint), and on the ACTIVE slot
+                        # the live client rotates it with no human — which is
+                        # why the line hedges rather than promises: an IDLE slot
+                        # needs an explicit write too, as do a `sha256-full:`
+                        # content hash (no_refresh_token) and an unbound strike.
+                        # Routing on the fingerprint rather than on `rec.error`
+                        # keeps a future PERMANENT_AUTH_ERRORS member correct
+                        # with no edit here.
+                        _lifted_by = (
+                            "a credential rotation clears it — automatic "
+                            "only on the active slot — so this may already be "
+                            "stale; a re-login is needed only if it persists"
+                            if (rec.struck_fp or "").startswith("sha256:")
+                            else "only a re-login replacing the stored "
+                                 "credential clears it"
+                        )
+                        # THE LINE MUST SAY WHAT THE VERDICT SAYS. It fired
+                        # on the RAW count while `token_dead` doubted the same
+                        # strike, so a slot that keeps being fetched was
+                        # announced as quarantined and the remedy named a
+                        # re-login nobody needed — the consume-gate race reads
+                        # exactly like an expired token in the one place a
+                        # person looks.
+                        _doubted = _strike_is_suspected_race(
+                            int(row["authDeadStrikes"]),
+                            _num_or_none(row.get("fetchedAt")),
+                            now,
+                        )
+                        if _doubted:
+                            _logger.info(
+                                "Account %s (%s): a refresh answered %s, but "
+                                "this lineage has succeeded before, so this "
+                                "first strike is DOUBTED as a race — the slot "
+                                "keeps being fetched and one retry settles it. "
+                                "No re-login is implied. Strike %s of %s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
+                        else:
+                            # NOT "the token endpoint answered":
+                            # no_refresh_token is decided before any request
+                            # is built.
+                            _logger.warning(
+                                "Account %s (%s) is quarantined: its stored "
+                                "credential's refresh failed with %s, so it is "
+                                "not fetched and reads "
+                                "\"re-login may be needed\" — %s. Strike %s of "
+                                "%s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                _lifted_by,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
                     # Additive field (absent/None = legacy unconditional
                     # binding). Always overwrite: a legacy writer's strike
                     # must bind unconditionally, not inherit a stale
@@ -1166,27 +1414,79 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        revoke_claim: bool = True,
+        strike_only: bool = False,
+        expected_fingerprints: dict[str, str | None] | None = None,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
-        strike count (and the failure/backoff state riding with it) no longer
-        reflects reality, and the account must become fetch-eligible again so the
-        next pass can prove the new token good. A no-op for rows with no strikes.
+        strike count (and, for the default full clear, the failure/backoff
+        state riding with it) no longer reflects reality, and the account
+        must become fetch-eligible again so the next pass can prove the new
+        token good. A no-op for rows with no strikes.
+
+        The defaults are for a caller that REWROTE the credential: that
+        lineage is dead, so its fetch lease and its whole failure history go
+        with it. The three keywords are the opposite caller — the collector,
+        which merely OBSERVES a strike heal from a lock-free ``fetch=set()``
+        read and has no credential change of its own to fence:
+
+        ``revoke_claim=False`` keeps ``claimId``, the field ``record()``
+        fences on, so a different collector's in-flight lease survives.
+        ``strike_only=True`` keeps ``consecutiveFailures``/``lastError``/
+        ``backoffUntil``: a fingerprint that stopped matching is no evidence
+        the server's 429 throttle lifted. ``expected_fingerprints`` re-checks
+        ``struckFingerprint`` UNDER THIS METHOD'S LOCK against what that
+        lock-free read saw, so a strike landing in the gap is not overwritten
+        by a stale decision; a row that no longer matches is left alone.
         """
         nums = list(nums)
         if not nums:
             return
 
-        def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+        def apply(num: str, row: dict) -> None:
+            if (
+                expected_fingerprints is not None
+                and row.get("struckFingerprint") != expected_fingerprints.get(num)
+            ):
+                return  # the row moved since the caller's lock-free read
+            # BOTH DIRECTIONS OR NEITHER: a transition log that speaks only
+            # on the way in reports every recovery as a permanent fault. Only
+            # a struck row speaks — every re-login and add calls this on
+            # unstruck rows, and a line per call would bury the transitions.
+            if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+                # STORE-FACT WORDING (transfer.py's own rule): this method
+                # never reads a credential and only the collector path passes a
+                # fingerprint, so a comparison claim is one it did not make —
+                # and false outright for a forced import of the byte-identical
+                # generation (`same_generation`).
+                _logger.info(
+                    "Account %s (%s) is out of quarantine: its dead-token "
+                    "strike was cleared, so it is fetched again.",
+                    num,
+                    identities[num][0],  # _mutate already indexed it
+                )
+            if revoke_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
-            row["consecutiveFailures"] = 0
-            row["lastError"] = None
-            row["backoffUntil"] = None
+            row["struckAt"] = None
+            if not strike_only:
+                # A strike heal is evidence the FINGERPRINT no longer matches,
+                # not evidence the server's own 429 throttle lifted:
+                # `backoffUntil`/`lastError` are the server's word, and erasing
+                # them re-opens a token still inside its own block. The
+                # unconditional copy of these three lines that the merge left
+                # below this guard defeated it entirely.
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 
@@ -1200,7 +1500,16 @@ def _row_eligible(
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    # A suspected race stays eligible ON PURPOSE: the strike blocks the fetch,
+    # and only a fetch can succeed, so vetoing here is what made one
+    # `invalid_grant` permanent. Backoff below still paces the single retry.
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES and not (
+        _strike_is_suspected_race(
+            int(row.get("authDeadStrikes") or 0),
+            _num_or_none(row.get("fetchedAt")),
+            _strike_time(row),
+        )
+    ):
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
@@ -1220,6 +1529,7 @@ def _row_eligible(
         _num_or_none(row.get("pollIntervalS")),
         now,
     )
+
     if respect_plans:
         return stale and (poll_due or next_poll_at is None or overslept)
     if repair_overslept:
