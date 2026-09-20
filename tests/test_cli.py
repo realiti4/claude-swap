@@ -1743,6 +1743,70 @@ class TestDisableEnableDispatch:
         assert excinfo.value.code == 2
 
 
+class TestEmptyValueArguments:
+    """A required value that arrives empty is a usage error, not a no-op.
+
+    ``cswap export "$DEST"`` with an unset DEST used to match no branch of the
+    dispatch chain and return from main() normally: exit 0, nothing printed,
+    no file written, and no way for the calling script to notice.
+    """
+
+    def _run(self, argv, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            code = 0
+            try:
+                cli.main()
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, capsys.readouterr(), switcher_cls
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["remove", ""],
+            ["disable", ""],
+            ["enable", ""],
+            ["switch", ""],
+            ["export", ""],
+            ["import", ""],
+            ["--remove-account", ""],
+            ["--disable-account", ""],
+            ["--enable-account", ""],
+            ["--switch-to", ""],
+            ["--export", ""],
+            ["--import", ""],
+        ],
+    )
+    def test_empty_value_is_rejected(self, argv, capsys):
+        code, captured, switcher_cls = self._run(argv, capsys)
+        assert code == 2, f"{argv} exited {code} having printed {captured.out!r}"
+        assert "requires a non-empty" in captured.err
+        switcher_cls.assert_not_called()
+
+    def test_empty_value_is_blamed_before_its_modifiers(self, capsys):
+        """The empty PATH is the error, not the --account that accompanied it."""
+        _, captured, _ = self._run(["export", "", "--account", "1"], capsys)
+        assert "'export' requires a non-empty PATH" in captured.err
+
+    def test_add_token_still_accepts_an_empty_value(self, capsys):
+        """``--add-token`` uses const="" to mean "prompt me", so it is exempt."""
+        code, captured, switcher_cls = self._run(["--add-token"], capsys)
+        assert code == 0, captured.err
+        switcher_cls.return_value.add_account_from_token.assert_called_once_with(
+            token="", email=None, slot=None
+        )
+
+    def test_a_whitespace_only_path_is_still_a_path(self, capsys):
+        """A filename of spaces is legal on POSIX; only an empty value is rejected."""
+        with patch("claude_swap.transfer.export_accounts") as export_accounts:
+            code, captured, _ = self._run(["export", " "], capsys)
+        assert code == 0, captured.err
+        assert export_accounts.call_args.args[1] == " "
+
+
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     """Import must allocate nothing; the fixture must allocate inside basetemp.
 

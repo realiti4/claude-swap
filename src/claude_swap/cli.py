@@ -1307,6 +1307,24 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
 
+    # An empty value satisfies the guard above (the option *is* set) but matches
+    # no truthiness-tested branch of the dispatch chain below, so cswap would
+    # fall out of it and exit 0 having done nothing: `cswap export "$DEST"` with
+    # an unset DEST must not look like a completed backup. Rejected here, ahead
+    # of the modifier guards, so the error names the empty value instead of
+    # blaming an --account/--force/--full that was used correctly. --add-token is
+    # exempt: its const="" means "prompt me for the token".
+    for subcommand, metavar, value in (
+        ("remove", "NUM|EMAIL", args.remove_account),
+        ("disable", "NUM|EMAIL", args.disable_account),
+        ("enable", "NUM|EMAIL", args.enable_account),
+        ("switch", "NUM|EMAIL", args.switch_to),
+        ("export", "PATH", args.export),
+        ("import", "PATH", args.import_),
+    ):
+        if value is not None and not value:
+            parser.error(f"'{subcommand}' requires a non-empty {metavar}")
+
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
