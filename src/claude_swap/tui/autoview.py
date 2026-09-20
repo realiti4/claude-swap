@@ -31,7 +31,12 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    load_settings,
+    parse_model_names,
+    set_setting,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -46,16 +51,24 @@ _EVENT_ROLES = {
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
 }
+_WARMUP_ACTION_ROLES = {
+    "warmed": "accent",
+    "would-warm": "accent",
+    "failed": "sev_warn",
+}
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
     role = _EVENT_ROLES.get(event.kind)
+    if event.kind == "warmup":
+        role = _WARMUP_ACTION_ROLES.get(getattr(event, "action", None))
     if role is not None:
         style = getattr(palette, role)
     else:
-        style = palette.muted if event.kind in _QUIET_KINDS else palette.foreground
+        is_quiet = event.kind in _QUIET_KINDS or event.kind == "warmup"
+        style = palette.muted if is_quiet else palette.foreground
     text = Text()
     text.append(f"{data.clock_stamp()}  ", style=palette.muted)
     text.append(event.human(), style=style)
@@ -65,6 +78,7 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("w", "toggle_warmup", "5h warm-up"),
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
@@ -200,9 +214,69 @@ class AutoScreen(Screen):
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        text.append(" · 5h warm-up ")
+        text.append(
+            "on" if self._settings.warmup_five_hour else "off",
+            style=palette.accent if self._settings.warmup_five_hour else palette.muted,
+        )
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
+
+    # -- five-hour warm-up -------------------------------------------------
+
+    def action_toggle_warmup(self) -> None:
+        if self._settings.warmup_five_hour:
+            self._set_warmup_enabled(False)
+            return
+        live = self._engine is not None and not self._engine.dry_run
+        mode_note = (
+            "Auto is LIVE, so eligible requests may begin immediately."
+            if live
+            else "This screen remains spend-free until you Go live."
+        )
+        self.app.push_screen(
+            ConfirmModal(
+                "Enable five-hour warm-up for `cswap auto`?\n\n"
+                "When live, it may send one minimal Haiku request after a "
+                "window expires or when usage remains unavailable. Successful "
+                "and uncertain attempts are protected against rapid repeats.\n\n"
+                f"{mode_note}",
+                title="Enable 5h warm-up",
+                yes_label="Enable",
+            ),
+            self._on_warmup_confirm,
+        )
+
+    def _on_warmup_confirm(self, confirmed: bool | None) -> None:
+        if confirmed:
+            self._set_warmup_enabled(True)
+
+    def _set_warmup_enabled(self, enabled: bool) -> None:
+        try:
+            set_setting(
+                self.app.switcher.backup_dir,
+                "autoswitch.warmupFiveHour",
+                "true" if enabled else "false",
+            )
+        except Exception as exc:
+            self.app.notify(
+                f"Could not save five-hour warm-up setting: {exc}",
+                severity="warning",
+            )
+            return
+        self._settings = replace(self._settings, warmup_five_hour=enabled)
+        if self._engine is not None:
+            self._engine.apply_warmup_enabled(enabled)
+        self._update_summary()
+        state = "enabled" if enabled else "disabled"
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— five-hour warm-up {state} for cswap auto —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+        self.app.notify(f"Five-hour warm-up {state}")
 
     # -- engine -------------------------------------------------------------
 

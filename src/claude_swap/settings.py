@@ -57,6 +57,9 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Opt-in: let `cswap auto` also keep OAuth accounts' five-hour windows
+    # started. The warmer keeps its own five-hour duplicate-spend guard.
+    warmup_five_hour: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "warmupFiveHour", "warmup_five_hour", "bool",
+            help="Let cswap auto start cold or unconfirmed five-hour windows",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -184,7 +191,12 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            if spec.field == "warmup_five_hour":
+                # This opt-in can spend quota; only a real JSON boolean may
+                # enable it. In particular, the string "false" is truthy.
+                kwargs[spec.field] = value if isinstance(value, bool) else spec.default
+            else:
+                kwargs[spec.field] = bool(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.

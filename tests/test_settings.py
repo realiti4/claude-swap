@@ -58,6 +58,22 @@ class TestLoadSettings:
         loaded = load_settings(tmp_path)
         assert loaded.threshold == 80.0
         assert loaded.interval_seconds == AutoSwitchSettings().interval_seconds
+        assert loaded.warmup_five_hour is False
+
+    def test_loads_five_hour_warmup_opt_in(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"warmupFiveHour": True}})
+        )
+
+        assert load_settings(tmp_path).warmup_five_hour is True
+
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0, None])
+    def test_five_hour_warmup_requires_a_json_boolean(self, tmp_path: Path, value):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"warmupFiveHour": value}})
+        )
+
+        assert load_settings(tmp_path).warmup_five_hour is False
 
     def test_values_are_clamped(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
