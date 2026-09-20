@@ -140,6 +140,10 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # When the stored login itself lapses (epoch ms; ``refreshTokenExpiresAt``),
+    # None when the login records no deadline. The TUI warns from it ahead of
+    # the ``login expired`` quarantine, the way ``cswap list`` does.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:

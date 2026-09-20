@@ -17,7 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, login_expiry_warning_from_ms
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -186,6 +186,16 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    # Same heads-up `cswap list` prints inside the login's last week: the
+    # deadline no refresh extends, so it is worth a line before the slot
+    # quarantines as "login expired" — and the ACTIVE slot only sees Claude
+    # Code's own nudge in an interactive session, never headless.
+    login_line = login_expiry_warning_from_ms(
+        acc.login_expires_at, acc.usage.sentinel, int(now * 1000)
+    )
+    if login_line is not None:
+        text.append("\n    ")
+        text.append(f"⚠ {login_line}", style=palette.sev_warn)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

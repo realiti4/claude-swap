@@ -12486,3 +12486,125 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestLoginExpiry:
+    """The ~30-day login deadline: warned ahead, and named when it lapses."""
+
+    DAY_MS = 24 * 3600 * 1000
+
+    @staticmethod
+    def _creds(deadline_ms=None, access="sk-backup", refresh="rt-backup"):
+        data = {"accessToken": access, "refreshToken": refresh,
+                "expiresAt": int(time.time() * 1000) + 3600 * 1000}
+        if deadline_ms is not None:
+            data["refreshTokenExpiresAt"] = deadline_ms
+        return json.dumps({"claudeAiOauth": data})
+
+    def test_dead_sentinel_is_named_by_the_verdict(self):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED
+        from claude_swap.switcher import dead_token_sentinel
+
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000)
+        live = self._creds(now_ms + 20 * self.DAY_MS)
+        assert dead_token_sentinel(UsageEntry(last_error="login_expired")) == USAGE_LOGIN_EXPIRED
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant")) == USAGE_RELOGIN_REQUIRED
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), live) == USAGE_RELOGIN_REQUIRED
+        # A legacy strike (written before the cause was named) still reads as
+        # the login lapsing when the stored deadline has passed.
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), lapsed) == USAGE_LOGIN_EXPIRED
+        assert dead_token_sentinel(UsageEntry(last_error="no_refresh_token"), lapsed) == USAGE_RELOGIN_REQUIRED
+        assert dead_token_sentinel(UsageEntry()) == USAGE_RELOGIN_REQUIRED
+
+    def test_warning_line_only_inside_the_last_week_and_never_over_a_quarantine(self):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED
+        from claude_swap.switcher import login_expiry_warning_from_ms
+
+        now = 1_800_000_000_000
+        soon = now + 2 * self.DAY_MS
+        assert login_expiry_warning_from_ms(None, None, now) is None
+        assert login_expiry_warning_from_ms(now + 20 * self.DAY_MS, None, now) is None
+        line = login_expiry_warning_from_ms(soon, None, now)
+        assert line.startswith("login expires ") and "re-login before then" in line
+        lapsed = login_expiry_warning_from_ms(now - 1000, None, now)
+        assert lapsed.startswith("login expired ") and "re-login needed" in lapsed
+        assert login_expiry_warning_from_ms(soon, USAGE_LOGIN_EXPIRED, now) is None
+        assert login_expiry_warning_from_ms(soon, USAGE_RELOGIN_REQUIRED, now) is None
+        assert login_expiry_warning_from_ms(soon, USAGE_TOKEN_EXPIRED, now) is not None
+
+    def test_list_warns_under_an_account_inside_its_last_week(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        now_ms = int(time.time() * 1000)
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        backup_creds = self._creds(now_ms + 2 * self.DAY_MS)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert output.count("login expires ") == 1
+        assert "re-login before then: log in with Claude Code, then run: cswap add" in output
+
+    def test_list_names_a_lapsed_login_when_the_server_refuses_it(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        now_ms = int(time.time() * 1000)
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        lapsed = self._creds(now_ms - 1000)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        refused = oauth.UsageOutcome(
+            None, error="login_expired", struck_fp=oauth.credential_fingerprint(lapsed)
+        )
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=lapsed), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=refused), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            switcher.list_accounts()
+            output = capsys.readouterr().out
+            assert "re-login needed — login expired (Claude Code logins expire about a month after login)" in output
+            assert "refresh token dead" not in output
+            # The quarantine holds on the next pass without another POST, and
+            # the heads-up line does not double up under the sentinel.
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[2]["usageStatus"] == "relogin_required"
+        assert by_num[2]["loginExpired"] is True
+        assert "loginExpired" not in by_num[1]
+
+    def test_snapshot_carries_the_login_deadline(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        deadline = int(time.time() * 1000) + 9 * self.DAY_MS
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        backup_creds = self._creds(deadline)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            snap = switcher.accounts_snapshot()
+
+        by_num = {a.number: a for a in snap.accounts}
+        assert by_num["1"].login_expires_at is None
+        assert by_num["2"].login_expires_at == deadline

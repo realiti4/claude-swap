@@ -70,26 +70,116 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def login_expires_at_iso(credentials: str) -> str | None:
-    """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
+# How far ahead of a stored login's expiry the human surfaces start warning.
+# Claude Code nudges its OWN session at 3 days ("Your login expires in N days ·
+# run /login to renew"), but only the active account ever sees that nudge: a
+# parked slot has no Claude Code session to show it in, and cswap keeps its
+# access token fresh right up to the deadline. So the parked accounts need
+# the runway here, and with a pool of them a week gives one sitting to renew
+# several at once instead of one surprise every few days.
+LOGIN_EXPIRY_WARN_MS = 7 * 24 * 3600 * 1000
 
-    Claude Code stores ``refreshTokenExpiresAt`` (epoch milliseconds) next to the
-    access token's ``expiresAt``. The two age differently: the access token is
-    renewed from the refresh token on its own, while the refresh token is only
-    ever replaced by a fresh ``/login``. Once it lapses the slot reports
-    ``relogin_required`` and nothing short of logging in again fixes it, so this
-    is the date worth showing *before* that happens. Logins issued before Claude
-    Code recorded the field carry nothing, which means "unknown", never "now".
+
+def login_expires_at_ms(credentials: str) -> int | None:
+    """When the stored *login* itself lapses, as epoch milliseconds, or ``None``.
+
+    Claude Code stores ``refreshTokenExpiresAt`` (epoch milliseconds, from the
+    token endpoint's ``refresh_token_expires_in``) next to the access token's
+    ``expiresAt``. The two age differently: the access token is renewed from
+    the refresh token on its own, while the refresh token lineage has a hard
+    deadline set at login that no refresh extends (Anthropic documents that
+    logins expire and warns three days out, but not the lifetime; measured
+    27–30 days across a dozen logins). Once it lapses
+    the token endpoint answers ``invalid_grant`` and nothing short of logging
+    in again fixes it. Logins issued before Claude Code recorded the field
+    carry nothing, which means "unknown", never "now".
     """
     data = extract_oauth_data(credentials)
     value = data.get("refreshTokenExpiresAt") if data else None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return int(value)
+
+
+def login_expires_at_iso(credentials: str) -> str | None:
+    """:func:`login_expires_at_ms` as ISO-8601 UTC (``2026-10-08T01:06:36Z``)."""
+    value = login_expires_at_ms(credentials)
+    if value is None:
         return None
     return (
         datetime.fromtimestamp(value / 1000, tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def is_login_expired(credentials: str, now_ms: int | None = None) -> bool:
+    """Whether the stored login's recorded deadline has already passed.
+
+    False when the credential records no deadline: "unknown" must never read
+    as "expired" — a login that predates the field is not evidence of a lapse.
+    """
+    deadline = login_expires_at_ms(credentials)
+    if deadline is None:
+        return False
+    return (now_ms if now_ms is not None else _now_ms()) >= deadline
+
+
+def login_expiring_soon_ms(
+    deadline_ms: float | None,
+    now_ms: int | None = None,
+    within_ms: int = LOGIN_EXPIRY_WARN_MS,
+) -> bool:
+    """Whether a login deadline falls within ``within_ms`` (already lapsed counts)."""
+    if deadline_ms is None:
+        return False
+    return deadline_ms - (now_ms if now_ms is not None else _now_ms()) <= within_ms
+
+
+def login_expiring_soon(
+    credentials: str,
+    now_ms: int | None = None,
+    within_ms: int = LOGIN_EXPIRY_WARN_MS,
+) -> bool:
+    """Whether the stored login lapses within ``within_ms`` (already lapsed counts)."""
+    return login_expiring_soon_ms(login_expires_at_ms(credentials), now_ms, within_ms)
+
+
+def login_expiry_note_ms(deadline_ms: float | None, now_ms: int | None = None) -> str | None:
+    """Human note on a login deadline, or ``None`` when unknown.
+
+    ``"login expires Sep 23 01:23 in 9d 12h"`` ahead of the deadline, and
+    ``"login expired Sep 12 10:56"`` once it has passed. Same clock/countdown
+    formatting as the access-token line so the two read together.
+    """
+    if deadline_ms is None:
+        return None
+    now = now_ms if now_ms is not None else _now_ms()
+    deadline_utc = datetime.fromtimestamp(deadline_ms / 1000, tz=timezone.utc)
+    now_utc = datetime.fromtimestamp(now / 1000, tz=timezone.utc)
+    clock = reset_clock_string(deadline_utc, now_utc)
+    if now >= deadline_ms:
+        return f"login expired {clock}"
+    remaining = max(0, int((deadline_ms - now) / 1000))
+    days, rest = divmod(remaining, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days > 0:
+        countdown = f"{days}d {hours}h"
+    elif hours > 0:
+        countdown = f"{hours}h {minutes}m"
+    else:
+        countdown = f"{minutes}m"
+    return f"login expires {clock} in {countdown}"
+
+
+def login_expiry_note(credentials: str, now_ms: int | None = None) -> str | None:
+    """:func:`login_expiry_note_ms` for a stored credential."""
+    return login_expiry_note_ms(login_expires_at_ms(credentials), now_ms)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -192,6 +282,18 @@ def try_refresh_oauth_credentials(
             oauth["refreshToken"] = resp_data["refresh_token"]
         if resp_data.get("scope"):
             oauth["scopes"] = resp_data["scope"].split()
+        # The login's own deadline, when the endpoint states it — kept in the
+        # same field Claude Code writes (``refreshTokenExpiresAt``) so the
+        # login-expiry display and verdict read one source. Absent in the
+        # response → the stored stamp stands (Claude Code keeps it the same
+        # way); the deadline is set at login and a refresh never extends it.
+        rt_expires_in = resp_data.get("refresh_token_expires_in")
+        if (
+            not isinstance(rt_expires_in, bool)
+            and isinstance(rt_expires_in, (int, float))
+            and rt_expires_in > 0
+        ):
+            oauth["refreshTokenExpiresAt"] = now_ms + int(rt_expires_in * 1000)
 
         data["claudeAiOauth"] = oauth
         return RefreshOutcome(
@@ -341,7 +443,11 @@ def build_token_status(credentials: str) -> str | None:
     expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
     state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
     countdown, clock = format_reset(expires_utc.isoformat())
-    return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
+    status = f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
+    login_note = login_expiry_note(credentials)
+    if login_note is not None:
+        status += f", {login_note}"
+    return status
 
 
 def format_reset(resets_at: str) -> tuple[str, str]:
@@ -636,6 +742,24 @@ _DETERMINISTIC_REFRESH_ERRORS = (
 )
 
 
+def permanent_refresh_kind(error: str | None, credentials: str) -> str | None:
+    """Name a server-rejected grant by its cause.
+
+    ``invalid_grant`` on a credential whose recorded login deadline has
+    already passed is the login lapsing on schedule (see
+    :func:`login_expires_at_ms`), not a stolen or torn refresh token — the
+    two need different remedies read the same way ("log in again"), but
+    only one of them is worth investigating. It is reported as
+    ``login_expired``: permanent for the strike count exactly like
+    ``invalid_grant``, distinct for the display. Every other kind passes
+    through unchanged. The verdict itself still comes from the server — a
+    passed deadline alone never strikes; it only names the rejection.
+    """
+    if error == "invalid_grant" and is_login_expired(credentials):
+        return "login_expired"
+    return error
+
+
 def try_fetch_usage_for_account(
     account_num: str,
     email: str,
@@ -686,7 +810,7 @@ def try_fetch_usage_for_account(
             # re-read for our snapshot) — fall back to the snapshot's
             # fingerprint only for the direct-POST path.
             return UsageOutcome(
-                None, error=refresh.error,
+                None, error=permanent_refresh_kind(refresh.error, working_credentials),
                 struck_fp=(
                     refresh.consumed_fp
                     or credential_fingerprint(working_credentials)
@@ -735,7 +859,10 @@ def try_fetch_usage_for_account(
             distinct = dead or refresh.error in _DETERMINISTIC_REFRESH_ERRORS
             return UsageOutcome(
                 None,
-                error=refresh.error if distinct else "refresh-failed",
+                error=(
+                    permanent_refresh_kind(refresh.error, working_credentials)
+                    if distinct else "refresh-failed"
+                ),
                 struck_fp=(
                     (refresh.consumed_fp
                      or credential_fingerprint(working_credentials))

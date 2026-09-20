@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -1522,3 +1523,137 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestLoginExpiry:
+    """The login's own deadline (``refreshTokenExpiresAt``): read, persist, classify."""
+
+    DAY_MS = 24 * 3600 * 1000
+
+    @staticmethod
+    def _creds(deadline_ms=None, access="sk-a", refresh="rt-a", expires_at=None):
+        oauth_data = {"accessToken": access, "refreshToken": refresh}
+        if expires_at is not None:
+            oauth_data["expiresAt"] = expires_at
+        if deadline_ms is not None:
+            oauth_data["refreshTokenExpiresAt"] = deadline_ms
+        return json.dumps({"claudeAiOauth": oauth_data})
+
+    def test_deadline_is_read_as_epoch_ms(self):
+        assert oauth.login_expires_at_ms(self._creds(1791421596865)) == 1791421596865
+
+    def test_unknown_deadline_is_never_expired(self):
+        assert oauth.login_expires_at_ms(self._creds()) is None
+        assert not oauth.is_login_expired(self._creds(), now_ms=10**15)
+        assert not oauth.login_expiring_soon(self._creds(), now_ms=10**15)
+        assert oauth.login_expiry_note(self._creds()) is None
+
+    def test_expired_and_expiring_soon_follow_the_deadline(self):
+        now = 1_800_000_000_000
+        past = self._creds(now - 1000)
+        soon = self._creds(now + 2 * self.DAY_MS)
+        later = self._creds(now + 20 * self.DAY_MS)
+        assert oauth.is_login_expired(past, now_ms=now)
+        assert not oauth.is_login_expired(soon, now_ms=now)
+        assert oauth.login_expiring_soon(past, now_ms=now)
+        assert oauth.login_expiring_soon(soon, now_ms=now)
+        assert not oauth.login_expiring_soon(later, now_ms=now)
+
+    def test_note_wording_before_and_after_the_deadline(self):
+        now = 1_800_000_000_000
+        before = oauth.login_expiry_note(
+            self._creds(now + 2 * self.DAY_MS + 3 * 3600 * 1000), now_ms=now
+        )
+        assert before.startswith("login expires ")
+        assert before.endswith(" in 2d 3h")
+        after = oauth.login_expiry_note(self._creds(now - 1000), now_ms=now)
+        assert after.startswith("login expired ")
+        assert " in " not in after
+
+    def test_refresh_persists_the_deadline_the_endpoint_states(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "refresh_token_expires_in": 30 * 24 * 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+            outcome = oauth.try_refresh_oauth_credentials(self._creds(1))
+        assert outcome.error is None
+        rotated = oauth.extract_oauth_data(outcome.credentials)
+        now_ms = int(time.time() * 1000)
+        assert abs(rotated["refreshTokenExpiresAt"] - (now_ms + 30 * self.DAY_MS)) < 60_000
+        assert rotated["expiresAt"] - now_ms > 3_500_000
+
+    @pytest.mark.parametrize("stated", [None, 0, -5, "30d", True])
+    def test_refresh_keeps_the_stored_deadline_when_the_endpoint_states_none(self, stated):
+        body = {"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600}
+        if stated is not None:
+            body["refresh_token_expires_in"] = stated
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(body).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+            outcome = oauth.try_refresh_oauth_credentials(self._creds(1791421596865))
+        assert oauth.extract_oauth_data(outcome.credentials)["refreshTokenExpiresAt"] == 1791421596865
+
+    def test_token_status_carries_the_login_deadline(self):
+        now_ms = int(time.time() * 1000)
+        status = oauth.build_token_status(
+            self._creds(now_ms + 9 * self.DAY_MS, expires_at=now_ms + 3600 * 1000)
+        )
+        assert "refresh token yes" in status
+        assert "login expires " in status
+        assert oauth.build_token_status(self._creds(expires_at=now_ms + 3600 * 1000)).count("login") == 0
+
+    def test_invalid_grant_after_the_deadline_is_named_login_expired(self):
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000, expires_at=now_ms - 1000)
+        assert oauth.permanent_refresh_kind("invalid_grant", lapsed) == "login_expired"
+
+    @pytest.mark.parametrize("error", ["invalid_grant", "no_refresh_token", "transient", None])
+    def test_other_rejections_keep_their_kind(self, error):
+        now_ms = int(time.time() * 1000)
+        live = self._creds(now_ms + 20 * self.DAY_MS, expires_at=now_ms - 1000)
+        unknown = self._creds(expires_at=now_ms - 1000)
+        assert oauth.permanent_refresh_kind(error, live) == error
+        assert oauth.permanent_refresh_kind(error, unknown) == error
+
+    def test_proactive_refresh_after_the_deadline_reports_login_expired(self):
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000, expires_at=now_ms - 1000)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            outcome = oauth.try_fetch_usage_for_account("1", "a@b.c", lapsed, is_active=False)
+        assert outcome.error == "login_expired"
+        assert outcome.struck_fp == oauth.credential_fingerprint(lapsed)
+        usage.assert_not_called()
+
+    def test_401_retry_after_the_deadline_reports_login_expired(self):
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000, expires_at=now_ms + 3600 * 1000)
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")):
+            outcome = oauth.try_fetch_usage_for_account("1", "a@b.c", lapsed, is_active=False)
+        assert outcome.error == "login_expired"
+        assert outcome.struck_fp == oauth.credential_fingerprint(lapsed)
+
+    def test_login_expired_is_a_permanent_strike(self):
+        from claude_swap.usage_store import PERMANENT_AUTH_ERRORS
+
+        assert "login_expired" in PERMANENT_AUTH_ERRORS
+
+    def test_login_expired_has_a_remedy_note(self):
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "cswap add" in ERROR_NOTES["login_expired"]

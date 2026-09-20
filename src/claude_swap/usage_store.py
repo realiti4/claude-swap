@@ -231,7 +231,10 @@ AUTH_DEAD_STRIKES = 1
 # count; everything else leaves it untouched (a transient error is no evidence
 # the token is alive *or* dead). "no_refresh_token" is equally unretryable:
 # a credential with no refresh token cannot be healed by any retry.
-PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token"})
+# "login_expired" is ``invalid_grant`` named by its cause — the stored login's
+# recorded deadline had passed when the server rejected the grant (see
+# ``oauth.permanent_refresh_kind``) — and strikes exactly the same way.
+PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token", "login_expired"})
 
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]

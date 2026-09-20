@@ -32,6 +32,13 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # replaces the credential; distinct from "token expired" (which Claude Code can
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
+# Same quarantine, named by its cause: the server rejected the refresh grant
+# AFTER the login's recorded deadline (``refreshTokenExpiresAt``) had passed —
+# a Claude Code login reaching its deadline, not a refresh token lost to a race
+# or another machine. Projects to the same ``relogin_required`` status (the
+# remedy is identical, and scripts key on that) while the human note stops
+# sending anyone hunting for a thief.
+USAGE_LOGIN_EXPIRED = "login expired"
 # The profile oracle proved the live credential belongs to a DIFFERENT account
 # than the slot's identity (foreign credential under a stale config — partial
 # cross-machine sync or a mid-``/login`` poll). Its quota is not this slot's, so
@@ -146,7 +153,10 @@ def usage_fields(
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
-    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
+    ``USAGE_NO_CREDENTIALS`` sentinel, the ``USAGE_RELOGIN_REQUIRED`` /
+    ``USAGE_LOGIN_EXPIRED`` sentinels (dead refresh-token lineage — the second
+    names the cause: the login's recorded deadline had passed; both project to
+    ``relogin_required``), or ``None`` (fetch failed). ``fetched_at``
     is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
     if isinstance(entry, dict):
@@ -157,7 +167,7 @@ def usage_fields(
         return "api_key", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
-    if entry == USAGE_RELOGIN_REQUIRED:
+    if entry in (USAGE_RELOGIN_REQUIRED, USAGE_LOGIN_EXPIRED):
         return "relogin_required", None
     if entry == USAGE_FOREIGN_CREDENTIAL:
         return "foreign_credential", None
@@ -243,6 +253,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    login_expired: bool = False,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -268,6 +279,12 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive: the recorded deadline has passed. Derived from the stored
+    # stamp, not from a server verdict — a slot can still fetch usage on its
+    # last access token for a few hours after this flips, but its next
+    # refresh will be refused, so a script should treat it as due now.
+    if login_expired:
+        row["loginExpired"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
