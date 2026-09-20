@@ -1710,3 +1710,21 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+def test_paid_overflow_availability_in_watch_rows():
+    from claude_swap.tui.widgets import usage_rows
+    for enabled, reason, label in (
+        (True, None, "available"),
+        (False, "out_of_credits", "out of credits"),
+        (False, "spend_limit_reached", "spending cap reached"),
+        (False, "unrecognized-reason", "disabled"),
+    ):
+        row = usage_rows({"spend": {
+            "used": 12.5, "limit": 100, "pct": 12.5,
+            "enabled": enabled, "disabled_reason": reason,
+        }}, time.time())[0]
+        assert row[0] == "$$"
+        for suffix in row[2:]:
+            assert "$12.50 / $100.00" in suffix
+            assert f"paid overflow · {label}" in suffix

@@ -6894,3 +6894,29 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+def test_paid_overflow_switch_hold_and_return(harness):
+    h = harness
+    h.engine.settings = replace(h.settings, paid_overflow_account="b@example.com", paid_overflow_max_monthly_usd=100)
+    usage = {n: _usage(100) for n in ("1", "2", "3")}
+    usage["2"]["spend"] = {"enabled": True, "used": 5, "limit": 100, "currency": "USD"}
+    with patch.object(h.engine, "_freshen_target", return_value="ok"):
+        assert h.tick_with_usage(usage) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.tick_with_usage(usage) == TickOutcome.NO_ACTION
+        assert h.events[-1].reason == "paid-overflow"
+        usage["3"] = _usage(0)
+        assert h.tick_with_usage(usage) == TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+def test_paid_overflow_dry_run_does_not_switch(harness):
+    h = harness
+    h.engine.settings = replace(h.settings, paid_overflow_account="b@example.com", paid_overflow_max_monthly_usd=100)
+    h.engine.dry_run = True
+    usage = {n: _usage(100) for n in ("1", "2", "3")}
+    usage["2"]["spend"] = {"enabled": True, "used": 5, "limit": 100, "currency": "USD"}
+    assert h.tick_with_usage(usage) == TickOutcome.SWITCHED
+    assert h.active_number() == 1
+    assert h.events[-1].dry_run is True
