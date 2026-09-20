@@ -57,6 +57,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Desktop notification when the headless `cswap auto` loop switches,
+    # quarantines, or finds everything exhausted (menubar.py already
+    # notifies for menu-bar users; this serves the CLI-only ones).
+    notify: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "notify", "notify", "bool",
+            help="Desktop notification when cswap auto switches/quarantines/exhausts",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +439,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("notify", "notify"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
