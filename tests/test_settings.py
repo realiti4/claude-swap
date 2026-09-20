@@ -82,6 +82,24 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
+    def test_quoted_false_does_not_enable_api_key_accounts(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "false"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is False
+
+    def test_quoted_bool_words_are_read_by_their_word(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "TRUE"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is True
+
+    def test_unparseable_bool_falls_back_to_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": "maybe"}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is False
+
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})

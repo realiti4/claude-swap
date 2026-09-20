@@ -184,7 +184,22 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            if isinstance(value, str):
+                # Never bool(str): bool("false") is True, so a hand-edited
+                # quoted "false" would switch the flag on rather than off. A
+                # quoted boolean is read by the same words `cswap config set`
+                # accepts; anything else is a bad type and reverts to the
+                # default like the other kinds do.
+                parsed = _BOOL_WORDS.get(value.strip().lower())
+                if parsed is None:
+                    _logger.warning(
+                        "settings.json: %s expects a boolean, got %r; using %r",
+                        spec.dotted, value, spec.default,
+                    )
+                    parsed = spec.default
+                kwargs[spec.field] = parsed
+            else:
+                kwargs[spec.field] = bool(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
