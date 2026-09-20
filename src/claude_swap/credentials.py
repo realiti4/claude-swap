@@ -23,12 +23,14 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
+    ClaudeSwitchError,
     CredentialError,
     CredentialReadError,
     CredentialWriteError,
@@ -131,6 +133,37 @@ CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
 # a sleep papering over an internal race.
 _ACTIVE_READ_ATTEMPTS = 2
 _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
+
+# The server re-mints refreshTokenExpiresAt on every refresh of the SAME
+# lineage, with sub-second jitter — a stamp later by less than this is a
+# rotation, not a newer login.
+LINEAGE_STAMP_JITTER_MS = 5_000
+
+
+def newer_login(a_at: "int | float | None", b_at: "int | float | None") -> bool:
+    """Whether ``a_at`` is a NEWER LOGIN than ``b_at``, not a same-lineage rotation.
+
+    Both are ``refreshTokenExpiresAt`` stamps. The server re-mints this field on
+    every refresh of the same lineage, with sub-second jitter (sign arbitrary),
+    so a stamp later by no more than ``LINEAGE_STAMP_JITTER_MS`` is that jitter,
+    not a later login. Undated on either side is no evidence.
+    """
+    return (
+        a_at is not None
+        and b_at is not None
+        and a_at - b_at > LINEAGE_STAMP_JITTER_MS
+    )
+
+
+def _credential_stamp(blob: str, field: str) -> "int | float | None":
+    """Read one numeric field off a credential's ``claudeAiOauth`` payload."""
+    try:
+        obj = json.loads(blob)
+        obj = obj.get("claudeAiOauth") or obj
+        v = obj.get(field)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, (int, float)) else None
 
 # After a Keychain failure the store drops to file mode so one CLI invocation
 # can't split-brain between backends. A long-running daemon (menu bar / TUI)
@@ -314,6 +347,18 @@ class CredentialStore:
         # stick, but only the failure means the file may be behind Claude
         # Code's own writes — see _read_active_credentials.
         self._file_mode_is_ours: bool = False
+        # Set by the MANAGED-KEY read when THAT read could not reach the
+        # Keychain. The two credential axes fail asymmetrically — an API-key
+        # account has no OAuth item to deny, so the OAuth flag cannot stand in
+        # for this one. Cleared at the top of each active read.
+        # PER THREAD. The TUI's two refresh lanes, the auto engine's worker
+        # and the fetch pool share one store, and this verdict lives across
+        # several statements inside one read. As a plain attribute a sibling
+        # entering `_read_active_credentials` reset it mid-flight, and the
+        # first reader then returned ('', False, False) — a live, billing
+        # managed key reported as a genuinely empty slot, which is the exact
+        # lie this flag was added to stop.
+        self._managed_read_tls = threading.local()
         # Whether any Keychain op has actually FAILED this process. Distinct
         # from _keychain_usable_cache, which is where ops should be ROUTED and
         # which _pin_file_mode sets deliberately: a routing choice must not
@@ -563,6 +608,49 @@ class CredentialStore:
         )
         return None, True
 
+    def _fresher_plaintext_login(
+        self, keychain_value: str, *, same_lineage_only: bool = False,
+    ) -> "str | None":
+        """The plaintext file's credential when it is a NEWER login, else None.
+
+        Compared on ``refreshTokenExpiresAt``, which only a fresh login moves.
+        A stamp later by more than the lineage jitter is a newer login. Within
+        that jitter the two stamps name the SAME login, and ``expiresAt`` (which
+        moves forward on every rotation) tells which is the newer generation of
+        it. Any read or parse failure answers None: this decides which of two
+        readable credentials to serve, and an unreadable one is not a claim.
+
+        ``same_lineage_only`` restricts the verdict to the within-jitter arm —
+        a later GENERATION of the same login — and never answers on a later
+        ``refreshTokenExpiresAt`` that names a DIFFERENT login. A caller that
+        means "is the file a newer generation of what I'm about to write"
+        must not read "the file holds someone else's later login" as that.
+        """
+        try:
+            cred_file = get_credentials_path()
+            if not cred_file.exists():
+                return None
+            text = cred_file.read_text(encoding="utf-8")
+        except Exception:      # noqa: BLE001 — the Keychain value still stands
+            return None
+        if not text.strip():
+            return None
+
+        kc_at = _credential_stamp(keychain_value, "refreshTokenExpiresAt")
+        file_at = _credential_stamp(text, "refreshTokenExpiresAt")
+        if not same_lineage_only and newer_login(file_at, kc_at):
+            return text
+        if (
+            kc_at is not None
+            and file_at is not None
+            and abs(file_at - kc_at) <= LINEAGE_STAMP_JITTER_MS
+        ):
+            kc_exp = _credential_stamp(keychain_value, "expiresAt")
+            file_exp = _credential_stamp(text, "expiresAt")
+            if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
+                return text
+        return None
+
     def _read_active_credentials(self) -> ActiveCredentials:
         """Read Claude Code's active credential, classifying the outcome.
 
@@ -582,6 +670,7 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
+        self._managed_read_tls.failed = False
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         #
         # READ THE ITEM FOR *THIS* PROFILE, NOT THE FIXED NAME.
@@ -610,6 +699,25 @@ class CredentialStore:
             # which is what makes it self-heal without being erasable.
             self._active_read_failed = keychain_failed
             if val:
+                # EITHER STORE CAN BE THE NEWER ONE. Taking the Keychain and
+                # stopping is right only while the two agree, and they come
+                # apart: one failed Keychain WRITE sends Claude Code to the
+                # plaintext file while later Keychain READS keep succeeding
+                # with the older item. Measured on a host where every login
+                # appeared to vanish — file 09-26, Keychain 09-06, and the
+                # read took the Keychain, after which cswap wrote what it had
+                # read back over both stores.
+                #
+                # `refreshTokenExpiresAt` and NOT `expiresAt`: a refresh moves
+                # the access token every poll without extending the refresh
+                # lifetime, so comparing access expiry would flip backends on
+                # ordinary rotation. The server re-mints this stamp on every
+                # refresh of the SAME lineage, to within seconds of jitter, so
+                # only a stamp later by more than that jitter is a newer
+                # login. Undated is no evidence and keeps the Keychain.
+                fresher = self._fresher_plaintext_login(val)
+                if fresher is not None:
+                    return ActiveCredentials(fresher, False)
                 return ActiveCredentials(val, False)
         elif self._residual_verdict is False or (
             self._active_read_failed or self._keychain_unreadable
@@ -644,9 +752,12 @@ class CredentialStore:
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
-        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
-        # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed, keychain_failed)
+        # Nothing anywhere — but "nothing" from a DENIED read is not the same
+        # claim as "nothing" from a clean one, on EITHER axis. Folding the
+        # managed read's own failure in is what stops an API-key account's live
+        # key reading as a genuinely empty slot.
+        unreachable = keychain_failed or self._managed_read_tls.failed
+        return ActiveCredentials("", unreachable, unreachable)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -680,6 +791,14 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
+                # The caller needs this, not just the log. An API-key
+                # account has NO OAuth Keychain item, so the OAuth read
+                # answers rc-44 without decrypting and never raises —
+                # only this one is denied. Swallowing it made
+                # `_read_active_credentials` return ('', False, False),
+                # indistinguishable from an empty slot, while the key kept
+                # authenticating and billing per token.
+                self._managed_read_tls.failed = True
                 self._host._logger.warning(f"Managed-key Keychain read failed: {e}")
                 val = None
             if val:
@@ -782,17 +901,28 @@ class CredentialStore:
         Returns whether no active item can shadow the file. ``delete_password``
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
-        to discard. Off macOS there is no Keychain item, hence ``True``.
+        to discard. Callers that must VERIFY a clear need this: a read cannot
+        answer for them once file mode is pinned, because then nothing asks the
+        Keychain at all. Off macOS there is no Keychain item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
             return True
-        try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
-        except Exception:
-            return False  # best-effort; a down Keychain can't be cleaned now
-        return True
+        # THE SAME SET THE READ WALKS. `_read_active_oauth_keychain` iterates
+        # `_active_oauth_keychain_services()`; deleting only the unsuffixed
+        # service left the item a custom profile actually uses in place, and
+        # a clean rc-44 on the one we did touch returned True -- so the
+        # landing believed the live store was empty while the read would
+        # still have found a token. The verdict must be about the same items
+        # the read is about.
+        cleared = True
+        for service in _active_oauth_keychain_services():
+            try:
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
+            except Exception:
+                cleared = False  # best-effort; a down Keychain can't be cleaned
+        return cleared
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
@@ -891,7 +1021,7 @@ class CredentialStore:
             "keychain" if wrote_to_keychain else "file"
         )
 
-    def _clear_managed_key(self) -> None:
+    def _clear_managed_key(self) -> bool:
         """Clear any active managed API key (Claude Code ``removeApiKey`` semantics).
 
         Deletes the macOS Keychain "Claude Code" item (best-effort) and drops
@@ -900,17 +1030,24 @@ class CredentialStore:
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
 
-        I-2 (round 9): ``_read_global_config`` collapses ABSENT and UNREADABLE
-        into the same ``None`` — without the distinction below, an unreadable
-        config (permissions, mid-unmount) reads exactly like a genuinely
-        keyless profile, so the clear is silently skipped. Best-effort stays
+        Returns whether no managed item can still shadow the config, the same
+        verdict :meth:`_delete_active_keychain_entry` reports for OAuth. Claude
+        Code reads the "Claude Code" Keychain item BEFORE ``primaryApiKey``, so
+        a survivor keeps authenticating; and under a pinned file mode a
+        post-clear READ never asks the Keychain, so nothing else can see it.
+
+        ``_read_global_config`` collapses ABSENT and UNREADABLE into the same
+        ``None`` — without the distinction below, an unreadable config
+        (permissions, mid-unmount) reads exactly like a genuinely keyless
+        profile, so the clear is silently skipped. Best-effort stays
         best-effort here (never raises — the write path this feeds must not
-        block on a transient read glitch), but a distinguishing warning
-        matters: a stale ``primaryApiKey`` surviving alongside a freshly
-        activated OAuth credential is a live cross-account key that bills
-        per token while it lies, and a caller/log reader must be able to
-        tell "nothing to clear" from "could not check".
+        block on a transient read glitch), but the two must not report the
+        same: a stale ``primaryApiKey`` surviving alongside a freshly
+        activated OAuth credential is a live cross-account key that bills per
+        token while it lies, and a caller must be able to tell "nothing to
+        clear" from "could not check".
         """
+        cleared = True
         if self._host.platform == Platform.MACOS:
             try:
                 macos_keychain.delete_password(
@@ -918,15 +1055,20 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except Exception:
-                pass  # best-effort; a down Keychain can't be cleaned now
+                cleared = False  # best-effort; a down Keychain can't be cleaned
         cfg = self._read_global_config()
         if cfg is None and get_global_config_path().exists():
+            # UNREADABLE, not absent — the same distinction this branch keeps
+            # having to make. The re-read is no help: `_read_managed_key` goes
+            # through the same reader and answers "", so every refusal term
+            # passed over a live `primaryApiKey`. An ABSENT config has nothing
+            # to clear and is a genuine success. The config is left in place
+            # rather than overwritten unread.
             self._host._logger.warning(
-                "Could not clear primaryApiKey: the global config exists "
-                "but could not be read (unreadable, not absent) — leaving "
-                "it in place rather than overwriting it unread"
+                "Cannot confirm the managed key was cleared: "
+                f"{get_global_config_path()} is unreadable"
             )
-            return
+            return False
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
@@ -935,21 +1077,27 @@ class CredentialStore:
                 self._update_global_config(_drop)
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
+                cleared = False
+        return cleared
 
-    def _clear_oauth_credential(self) -> None:
+    def _clear_oauth_credential(self) -> bool:
         """Clear the active OAuth credential — Keychain item and plaintext file.
 
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        Returns the Keychain half's own verdict — see
+        :meth:`_delete_active_keychain_entry` for why a caller needs it.
         """
-        self._delete_active_keychain_entry()
+        cleared = self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
             if cred_file.exists():
                 cred_file.unlink()
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
+        return cleared
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
@@ -1036,6 +1184,119 @@ class CredentialStore:
                 f"Could not refresh .credentials.json after Keychain write ({e}); "
                 "a running session may not hot-reload until restart"
             )
+
+    def _sync_active_credentials_file_to_adopted_login(
+        self, credentials: str, slot: str,
+    ) -> None:
+        """After an ``add_account`` adopt, bring an existing plaintext file to
+        the adopted generation.
+
+        macOS only: ``add_account`` reads the credential from the Keychain
+        and stores it into a slot backup — never into ``.credentials.json``.
+        A file left behind by a PREVIOUS login then keeps naming that
+        superseded account until an unrelated switch happens to write both
+        stores, and a reader that falls back to the file (no GUI Keychain
+        access) serves it.
+
+        Skipped when ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names a profile
+        other than ``get_claude_config_home()``'s: ``credentials`` was
+        captured from THAT profile (``_read_capture_credentials``), and this
+        file belongs to a different one — the cross-profile write
+        ``_read_capture_credentials`` itself refuses to make.
+
+        Skipped when the file already holds a NEWER GENERATION of this same
+        login (:meth:`_fresher_plaintext_login`, ``same_lineage_only``):
+        ``_read_capture_credentials`` routes through
+        ``session.read_config_dir_credentials`` when either env var is
+        defined, which is Keychain-first with no freshness arbitration —
+        unlike :meth:`_read_active_credentials`, which does call
+        ``_fresher_plaintext_login``. Without this, an older Keychain
+        generation (one failed Keychain write, later reads still serving the
+        stale item) would overwrite a newer file generation's live refresh
+        token with a spent one, and the write has no backup. Restricted to
+        the same-lineage arm: a file left on a DIFFERENT login by a failed
+        switch-time refresh is not a reason to keep it — that login is
+        superseded by the one just adopted, and belongs to nobody's
+        "fresher".
+
+        Skipped when the file already carries these bytes, so a routine
+        adopt of an unchanged login causes no rewrite. An unreadable file
+        answers "cannot compare" the same way; an unparseable one (valid
+        JSON that is not the expected shape) falls through to the write
+        rather than raising out of ``add_account``. The write itself is
+        :meth:`_refresh_stale_credentials_file`: rewrite-when-present /
+        never-create, same writer, same warning on failure.
+
+        The write can still be about to discard a DIFFERENT login's only
+        copy — e.g. the split above, read the other way: the file names a
+        newer login than the Keychain that is about to be captured, and no
+        slot backup holds it either. The file's current bytes are stashed as
+        unclaimed before that write; a successful stash is the license to
+        overwrite (the same rule :meth:`_stash_live_credential` uses), so on
+        failure the write is skipped and the file is left as is. Every
+        caller reaches this arm — including a fingerprint-pinned resync,
+        which compares the Keychain generation to ``credentials``, never to
+        the file — so ``slot`` is required, not optional.
+        """
+        if self._host.platform != Platform.MACOS:
+            return
+        secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        if secure_env is not None:
+            secure_dir = Path(secure_env) if secure_env else get_default_claude_config_home()
+            if secure_dir.resolve() != get_claude_config_home().resolve():
+                return
+        current = None
+        try:
+            if self._fresher_plaintext_login(
+                credentials, same_lineage_only=True
+            ) is not None:
+                return
+            from claude_swap import oauth
+            current = get_credentials_path().read_text(encoding="utf-8")
+            if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
+                return
+        except OSError:
+            return  # absent or unreadable: never-create posture, nothing to sync
+        except Exception:
+            pass  # unparseable content: cannot compare, write through below
+        if current is not None:
+            try:
+                # The fingerprint is a generation, the stamp is the lineage:
+                # a refresh rotates the refresh token same as a new login
+                # does, so credential_fingerprint alone can't tell a rotation
+                # predecessor from a different login. Where both sides carry
+                # refreshTokenExpiresAt, the jitter rule decides; fingerprint
+                # only when a stamp is missing (unknown lineage, preserve).
+                current_at = _credential_stamp(current, "refreshTokenExpiresAt")
+                new_at = _credential_stamp(credentials, "refreshTokenExpiresAt")
+                if current_at is not None and new_at is not None:
+                    different_lineage = (
+                        abs(current_at - new_at) > LINEAGE_STAMP_JITTER_MS
+                    )
+                else:
+                    different_lineage = (
+                        oauth.credential_fingerprint(current)
+                        != oauth.credential_fingerprint(credentials)
+                    )
+            except Exception:
+                different_lineage = False  # unparseable: no lineage to preserve
+            if different_lineage:
+                try:
+                    self._write_unclaimed_credential(
+                        current,
+                        {
+                            "reason": "displaced-live-login",
+                            "configSlot": slot,
+                            "fingerprint": oauth.credential_fingerprint(current),
+                        },
+                    )
+                except (ClaudeSwitchError, OSError, TypeError, AttributeError) as e:
+                    self._host._logger.warning(
+                        f"Could not stash the plaintext file's login before syncing it "
+                        f"to the adopted one ({e}); the file was left as is"
+                    )
+                    return  # failed stash is not a license to overwrite: leave the file
+        self._refresh_stale_credentials_file(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup *writes* go to files vs. the Keychain.
@@ -1821,8 +2082,14 @@ class CredentialStore:
         nothing a retry could ever adopt either way.
         """
         path = self._stash_entry_path(entry_id)
+        # BYTES, then decode -- same split as `_read_stash_manifest_ex`.
+        # `read_text` decodes inside the read, and `UnicodeDecodeError` is a
+        # `ValueError`, not an `OSError`: a stash entry holding non-UTF-8
+        # bytes would raise straight out of an OSError-only split, past
+        # every caller's containment. The bytes were readable; their content
+        # is garbage -- that reaches no verdict here, same as bad base64.
         try:
-            encoded = path.read_text(encoding="utf-8").strip()
+            raw = path.read_bytes()
         except FileNotFoundError:
             return "", False
         except OSError as e:
@@ -1831,6 +2098,7 @@ class CredentialStore:
             )
             return "", True
         try:
+            encoded = raw.decode("utf-8").strip()
             return base64.b64decode(encoded, validate=True).decode("utf-8"), False
         except Exception as e:
             self._host._logger.warning(
