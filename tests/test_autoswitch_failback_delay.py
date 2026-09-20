@@ -436,7 +436,12 @@ class TestALostDisarmFailsClosed:
         assert outcome is TickOutcome.NO_ACTION, "the tick's own outcome stands"
         assert _anchor(h) == armed, "the stale value really is still on disk"
 
-        h.clock.advance(3_600)
+        # +60s, so the stale anchor is 60s old: the delay has elapsed, but the
+        # value is still inside the 120s (delay + interval) durable bound. Only
+        # the in-memory flag can refuse it here, which is what makes this
+        # oracle discriminate that guard rather than the bound.
+        h.clock.advance(60)
+        assert h.clock() - armed < 60.0 + h.settings.interval_seconds
         h.events.clear()
         outcome, _ = _tick(h, [_healthy(h)])
         assert outcome is TickOutcome.NO_ACTION
