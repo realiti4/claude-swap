@@ -91,14 +91,17 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --strategy weekly-first    # same target, but only move at the threshold
 ```
 
 <details>
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
-- A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
-- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: under `best`, a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. (`weekly-first` ranks by reset rather than headroom, so it has no headroom margin; the landing caps below are its margin.) When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `weekly-first` picks the same target (soonest weekly reset) but only moves once the active account reaches the threshold, so you drain one account at a time instead of hopping between them. Use it with the landing caps below — without them the soonest-resetting account can be one that is nearly spent itself. Its at-limit and failover escapes rank by headroom, not reset.
+- **Per-window thresholds** (`autoswitch.threshold5h`, `autoswitch.threshold7d`): the 5-hour and 7-day windows behave differently — the 5-hour one can climb a point a minute under heavy use and refills in hours, while the 7-day one climbs slowly and is the quota that expires unused. One threshold has to compromise between them. Set a lower line for the 5-hour window (say 95) and a higher one for the weekly window (say 99); each falls back to `autoswitch.threshold` when unset. A switch fires when either window reaches its own line.
+- **Landing caps** (`autoswitch.landingMax5hPct`, `autoswitch.landingMax7dPct`): never switch *onto* an account whose own 5-hour window is above the first cap, or whose 7-day window (or any per-model window named in `autoswitch.model`) is above the second — whatever the strategy, and on every trigger except failover (when the active account is dead or unreadable, any account with room is better than none). Without them, an account at 97% on its 5-hour window is a legal target if it is under the threshold — and a running session that lands there hits its limit minutes later. With nothing under the caps, the engine waits for a reset rather than moving the problem to another account; the log says how many candidates the caps held back. Both default to 100 (off).
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -274,6 +277,9 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.threshold5h 95      # leave the 5h window earlier than the weekly one
+cswap config set autoswitch.threshold7d 99      # ...and run the weekly window closer to the wall
+cswap config set autoswitch.landingMax5hPct 90  # never switch onto an account past 90% of its 5h window
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

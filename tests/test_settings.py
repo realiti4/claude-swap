@@ -98,6 +98,41 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_weekly_first_is_a_valid_strategy(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "weekly-first")
+        assert load_settings(tmp_path).strategy == "weekly-first"
+
+    def test_per_window_thresholds_default_to_unset(self, tmp_path: Path):
+        s = load_settings(tmp_path)
+        assert s.threshold_5h is None
+        assert s.threshold_7d is None
+
+    def test_per_window_thresholds_round_trip_and_clamp(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold5h", "95")
+        assert load_settings(tmp_path).threshold_5h == 95.0
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"autoswitch": {"threshold7d": 120, "threshold5h": "x"}})
+        )
+        s = load_settings(tmp_path)
+        assert s.threshold_7d == 99.9      # clamped to the spec's hi
+        assert s.threshold_5h is None      # garbage -> default (unset)
+
+    def test_unset_per_window_threshold_returns_to_account_wide(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold5h", "95")
+        unset_setting(tmp_path, "autoswitch.threshold5h")
+        assert load_settings(tmp_path).threshold_5h is None
+
+    def test_landing_caps_default_off_and_clamp(self, tmp_path: Path):
+        s = load_settings(tmp_path)
+        assert s.landing_max_5h_pct == 100.0
+        assert s.landing_max_7d_pct == 100.0
+        set_setting(tmp_path, "autoswitch.landingMax5hPct", "90")
+        set_setting(tmp_path, "autoswitch.landingMax7dPct", "97")
+        s = load_settings(tmp_path)
+        assert (s.landing_max_5h_pct, s.landing_max_7d_pct) == (90.0, 97.0)
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.landingMax5hPct", "101")
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
