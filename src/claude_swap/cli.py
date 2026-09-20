@@ -605,6 +605,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --model Fable --model-mode prefer   # ...and land on the account with the most Fable left
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -651,6 +652,19 @@ Defaults live in settings.json in the backup root; flags override them.
             "account-wide 5h/7d windows. One name or a comma-separated list "
             "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
             "for every per-model window an account reports"
+        ),
+    )
+    parser.add_argument(
+        "--model-mode",
+        dest="model_mode",
+        choices=("gate", "prefer"),
+        default=None,
+        help=(
+            "How the --model windows count. 'gate' (default): a spent model "
+            "quota also rules an account out as a target, like a spent 5h/7d "
+            "window. 'prefer': a spent model still makes the engine leave, "
+            "but only the 5h/7d windows can rule a target out. Among "
+            "targets with room there, the most model quota left wins"
         ),
     )
     parser.add_argument(
@@ -1129,6 +1143,18 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--model-mode",
+        dest="model_mode",
+        choices=("gate", "prefer"),
+        default=None,
+        help=(
+            "With 'switch --strategy': how the --model windows count. 'gate' "
+            "rules an account out on a spent model quota; 'prefer' lets only "
+            "the 5h/7d windows rule one out and ranks by model quota left. "
+            "Defaults to the autoswitch.modelMode setting"
+        ),
+    )
+    parser.add_argument(
         "--slot",
         type=int,
         metavar="NUM",
@@ -1329,6 +1355,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "'switch --strategy next-available'"
         )
 
+    if args.model_mode is not None and args.strategy is None:
+        parser.error(
+            "--model-mode can only be used with 'switch --strategy best' or "
+            "'switch --strategy next-available'"
+        )
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -1408,21 +1440,26 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             # otherwise the persistent autoswitch.model setting applies
             # (announced by switch(), never silently).
             if args.strategy is None:
-                models, model_source = (), None
-            elif args.model is not None:
-                models, model_source = parse_model_names(args.model), "cli"
+                models, model_source, model_mode = (), None, "gate"
             else:
-                models = parse_model_names(load_settings(switcher.backup_dir).model)
-                model_source = "autoswitch.model" if models else None
+                configured = load_settings(switcher.backup_dir)
+                if args.model is not None:
+                    models, model_source = parse_model_names(args.model), "cli"
+                else:
+                    models = parse_model_names(configured.model)
+                    model_source = "autoswitch.model" if models else None
+                model_mode = args.model_mode or configured.model_mode
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                model_mode=model_mode,
             )
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
+                payload["modelMode"] = model_mode
         elif args.switch_to:
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force

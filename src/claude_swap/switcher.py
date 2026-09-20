@@ -5286,6 +5286,7 @@ class ClaudeAccountSwitcher:
         current_num: str | None,
         models: tuple[str, ...] = (),
         usage: dict | None = None,
+        model_mode: str = "gate",
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -5296,7 +5297,9 @@ class ClaudeAccountSwitcher:
         can't be proven beneficial, it stays put; bare ``cswap --switch``
         remains the way to force a plain rotation. ``models`` folds the named
         per-model weekly windows into every headroom comparison (see
-        ``oauth.account_headroom``). Returns ``(target, note)``:
+        ``oauth.account_headroom``); ``model_mode="prefer"`` hands the pick to
+        :meth:`_select_best_by_model_preference` instead. Returns
+        ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -5325,6 +5328,10 @@ class ClaudeAccountSwitcher:
 
         if usage is None:
             usage = self._usage_by_account()
+        if models and model_mode == "prefer":
+            return self._select_best_by_model_preference(
+                current_num, others, models, usage
+            )
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
@@ -5349,6 +5356,61 @@ class ClaudeAccountSwitcher:
         if any(h is None for h, _ in scored):
             return None, "incomplete-comparison"
         if current_headroom <= 0:
+            return None, "exhausted"
+        return None, "stay"
+
+    def _select_best_by_model_preference(
+        self,
+        current_num: str | None,
+        others: list[str],
+        models: tuple[str, ...],
+        usage: dict,
+    ) -> tuple[str | None, str]:
+        """The ``best`` pick under ``autoswitch.modelMode = prefer``.
+
+        A 5h/7d limit must win over any model quota, so accounts fall into
+        three tiers on their 5h/7d windows against the auto-switch threshold:
+        below it, at or over it, and spent. In the healthy tier the most model
+        headroom wins and the 5h/7d headroom breaks the ties. In the other two
+        tiers the 5h/7d headroom decides first. Accounts that report no such
+        window sort after the ones that do. The notes are the same as in
+        :meth:`_select_best_switchable`.
+        """
+        threshold, _ = self._poll_policy_inputs()
+
+        def rank(num: str) -> tuple[tuple, float] | None:
+            core = oauth.account_headroom(usage.get(num), ())
+            if core is None:
+                return None
+            model = oauth.model_headroom(usage.get(num), models)
+            model_key = (
+                0 if model is not None else 1,
+                -(model if model is not None else 0.0),
+            )
+            if core <= 0:
+                tier = 2
+            elif (100.0 - core) >= threshold:
+                tier = 1
+            else:
+                tier = 0
+            key = (tier, *model_key, -core) if tier == 0 else (tier, -core, *model_key)
+            return key, core
+
+        current = rank(str(current_num))
+        if current is None:
+            return None, "current-unavailable"
+        ranked = [(rank(num), num) for num in others]
+        known = [(r, num) for r, num in ranked if r is not None]
+        if not known:
+            return None, "no-comparison"
+        # min() keeps the first minimal element. `known` preserves rotation
+        # order, so ties resolve to the earliest slot.
+        (best_key, best_core), best_num = min(known, key=lambda t: t[0][0])
+        if best_key < current[0] and best_core > 0:
+            return best_num, ""
+        if any(r is None for r, _ in ranked):
+            return None, "incomplete-comparison"
+        if current[1] <= 0:
             return None, "exhausted"
         return None, "stay"
 
@@ -5810,6 +5872,7 @@ class ClaudeAccountSwitcher:
         json_output: bool = False,
         models: tuple[str, ...] = (),
         model_source: str | None = None,
+        model_mode: str = "gate",
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -5826,6 +5889,11 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            model_mode: How ``models`` take part. ``"gate"`` folds them into
+                  every headroom comparison, so a spent model quota rules an
+                  account out. ``"prefer"`` lets only the 5h/7d windows rule
+                  an account out; ``best`` then ranks the candidates by model
+                  headroom first (see ``autoswitch.modelMode``).
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -5839,11 +5907,15 @@ class ClaudeAccountSwitcher:
         warnings: list[str] = []
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
+        prefer = bool(models) and model_mode == "prefer"
+        # In prefer mode only the 5h/7d windows can rule an account out.
+        gate_models = () if prefer else models
         if models and not json_output:
             source = "--model" if model_source == "cli" else model_source
             print(dimmed(
                 f"Using configured model limits: {', '.join(models)}"
                 + (f" (from {source})" if source else "")
+                + (", prefer mode" if prefer else "")
             ))
 
         if not self.sequence_file.exists():
@@ -5966,7 +6038,7 @@ class ClaudeAccountSwitcher:
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage
+                current_num, models, best_usage, model_mode=model_mode
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
@@ -6100,17 +6172,17 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
+                headroom = oauth.account_headroom(usage.get(candidate), gate_models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
                     label = "5h/7d"
-                    if models:
+                    if gate_models:
                         # Name what actually binds ("Fable", "5h/Fable", ...)
                         # so a config-driven skip is never mysterious.
                         at = [
                             name
                             for name, pct, _ in oauth.relevant_windows(
-                                usage.get(candidate), models
+                                usage.get(candidate), gate_models
                             )
                             if pct >= 100.0
                         ]

@@ -5976,6 +5976,159 @@ class TestUsageAwareSwitch:
         assert "Using configured model limits: Fable (from --model)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
+    def _switch_with_usage(self, s, usage, **kwargs):
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(**kwargs)
+
+    def test_prefer_best_takes_a_session_limit_over_a_spent_model(
+        self, temp_home: Path, capsys
+    ):
+        """#1 is at its 5h wall; #2 has 5h room but no Fable left. In gate
+        mode #2 folds to zero headroom and nothing moves; prefer moves."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._model_usage(100, 50), "2": self._model_usage(20, 100)}
+
+        self._switch_with_usage(
+            s, usage, strategy="best", models=("Fable",), model_source="cli",
+            model_mode="prefer",
+        )
+
+        out = capsys.readouterr().out
+        assert "Using configured model limits: Fable (from --model), prefer mode" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_gate_best_stays_on_the_same_usage(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._model_usage(100, 50), "2": self._model_usage(20, 100)}
+
+        self._switch_with_usage(
+            s, usage, strategy="best", models=("Fable",), model_source="cli",
+        )
+
+        assert "prefer mode" not in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_prefer_best_ranks_healthy_accounts_by_model_headroom(
+        self, temp_home: Path
+    ):
+        """Every account is below the threshold, so the most Fable left wins:
+        #2, although #3 has the most 5h/7d room (gate mode's pick)."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {
+            "1": self._model_usage(5, 90),
+            "2": self._model_usage(60, 20),
+            "3": self._model_usage(10, 40),
+        }
+
+        self._switch_with_usage(
+            s, usage, strategy="best", models=("Fable",), model_mode="prefer",
+        )
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_prefer_best_stays_when_current_has_the_most_model_left(
+        self, temp_home: Path, capsys
+    ):
+        """Gate mode would move to #2 for its 5h room; prefer stays on the
+        account with more Fable left."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._model_usage(60, 20), "2": self._model_usage(5, 50)}
+
+        self._switch_with_usage(
+            s, usage, strategy="best", models=("Fable",), model_mode="prefer",
+        )
+
+        assert "Already on the account with the most remaining quota" in (
+            capsys.readouterr().out
+        )
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_prefer_best_puts_session_room_before_model_room(
+        self, temp_home: Path
+    ):
+        """#1 and #2 are over the threshold on 5h; #3 has 5h room and no
+        Fable at all. Session room wins, so #3 is the pick."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {
+            "1": self._model_usage(92, 10),
+            "2": self._model_usage(95, 80),
+            "3": self._model_usage(20, 100),
+        }
+
+        self._switch_with_usage(
+            s, usage, strategy="best", models=("Fable",), model_mode="prefer",
+        )
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_prefer_next_available_skips_only_session_limits(
+        self, temp_home: Path, capsys
+    ):
+        """The Fable-exhausted #2 that gate mode skips is a valid target."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {
+            "1": self._model_usage(0, 10),
+            "2": self._model_usage(5, 100),
+            "3": self._model_usage(20, 20),
+        }
+
+        self._switch_with_usage(
+            s, usage, strategy="next-available", models=("Fable",),
+            model_source="autoswitch.model", model_mode="prefer",
+        )
+
+        out = capsys.readouterr().out
+        assert (
+            "Using configured model limits: Fable (from autoswitch.model), prefer mode"
+            in out
+        )
+        assert "Skipping" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_prefer_next_available_still_skips_a_spent_session_window(
+        self, temp_home: Path, capsys
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {
+            "1": self._model_usage(0, 10),
+            "2": self._model_usage(100, 10),
+            "3": self._model_usage(20, 20),
+        }
+
+        self._switch_with_usage(
+            s, usage, strategy="next-available", models=("Fable",),
+            model_mode="prefer",
+        )
+
+        assert "Skipping Account-2 (at 5h/7d limit)" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
     def test_skip_exhausted_all_limited_stays_put(self, temp_home: Path, capsys):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")

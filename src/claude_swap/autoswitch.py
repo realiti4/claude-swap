@@ -22,6 +22,13 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
+``autoswitch.model`` folds named per-model weekly windows into the binding
+window. With ``autoswitch.modelMode`` = ``gate`` (default) they bind like the
+5h/7d windows on both sides of a move. With ``prefer`` they still make the
+engine leave an account whose model quota is spent, but never rule a target
+out: only the 5h/7d windows gate a landing, and among accounts with room
+there the one with the most model quota left wins.
+
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
@@ -656,6 +663,13 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # In ``prefer`` mode the model windows rank the targets and the 5h/7d
+        # windows alone gate a landing. The combined headroom still triggers
+        # the departure. In ``gate`` mode both tuples are the same.
+        self._prefer_models = (
+            self._models if settings.model_mode == "prefer" else ()
+        )
+        self._gate_models = () if self._prefer_models else self._models
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -684,6 +698,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # ``autoswitch.modelMode = prefer`` with no model configured changes
+        # nothing. Warn once, so the user hears it.
+        self._model_mode_check_done = False
 
     # -- state file ---------------------------------------------------------
 
@@ -937,6 +954,7 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        gate_headroom = self._gate_headroom_by_account(usage, headroom)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -957,6 +975,18 @@ class AutoSwitchEngine:
             )
         )
 
+        if not self._model_mode_check_done:
+            self._model_mode_check_done = True
+            if settings.model_mode == "prefer" and not self._models:
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            "autoswitch.modelMode is prefer but autoswitch.model "
+                            "is not set — no model window is watched; set "
+                            "autoswitch.model (e.g. Fable) or unset modelMode"
+                        )
+                    )
+                )
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
@@ -997,7 +1027,14 @@ class AutoSwitchEngine:
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                # A spent model window with 5h/7d room is not a hard limit,
+                # because the account can still work on other models. That
+                # case keeps the cooldown, the hysteresis and the no-return
+                # bar of a proactive move.
+                hard = gate_headroom.get(current)
+                if hard is None:
+                    hard = active_headroom
+                trigger = "at-limit" if hard <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1180,6 +1217,7 @@ class AutoSwitchEngine:
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
+            gate_headroom=gate_headroom,
             current=current,
             active_headroom=active_headroom,
             settings=settings,
@@ -1203,6 +1241,7 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            gate_headroom = self._gate_headroom_by_account(usage, headroom)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1211,6 +1250,7 @@ class AutoSwitchEngine:
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
+                gate_headroom=gate_headroom,
                 current=current,
                 active_headroom=active_headroom,
                 settings=settings,
@@ -1270,7 +1310,7 @@ class AutoSwitchEngine:
             # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
+            candidate_headrooms = [gate_headroom.get(n) for n in oauth_candidates]
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
@@ -1752,6 +1792,20 @@ class AutoSwitchEngine:
             < was - RECOVERY_HYSTERESIS_S
         )
 
+    def _gate_headroom_by_account(
+        self,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+    ) -> dict[str, float | None]:
+        """Headroom on the windows that can rule an account out as a target.
+
+        That is ``headroom`` itself, except in ``prefer`` mode, where the
+        model windows only rank and the 5h/7d windows alone decide.
+        """
+        if not self._prefer_models:
+            return headroom
+        return _headroom_by_account(usage, ())
+
     def _rank_candidates(
         self,
         *,
@@ -1765,6 +1819,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        gate_headroom: dict[str, float | None] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1773,6 +1828,25 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
+        # Every gate below reads ``gate``. In ``gate`` mode that is the
+        # combined headroom. In ``prefer`` mode it is the 5h/7d headroom
+        # alone, because the model windows only rank. ``core_triggered``
+        # records the axis that started this move, because the hysteresis
+        # margin is measured on that axis.
+        gate = gate_headroom if gate_headroom is not None else headroom
+        active_gate = gate.get(current)
+        prefer = self._prefer_models
+        model_h: dict[str, float | None] = {}
+        core_triggered = True
+        if prefer:
+            model_h = {
+                num: oauth.model_headroom(usage.get(num), prefer)
+                for num in (current, *oauth_candidates)
+            }
+            core_triggered = (
+                active_gate is not None
+                and (100.0 - active_gate) >= settings.threshold
+            )
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -1791,7 +1865,7 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, gate, active_gate, settings.threshold
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1814,11 +1888,11 @@ class AutoSwitchEngine:
         # to sit here too and inverted monotonicity; removing it is what let
         # the fallback do the job.
         best_candidate_headroom = max(
-            (h for h in map(headroom.get, oauth_candidates) if h is not None),
+            (h for h in map(gate.get, oauth_candidates) if h is not None),
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(usage.get(current), self._gate_models, now)
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -1827,7 +1901,7 @@ class AutoSwitchEngine:
         fallback: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
-            h = headroom.get(num)
+            h = gate.get(num)
             if h is None:
                 continue
             any_known = True          # it EXISTS and is readable either way
@@ -1839,7 +1913,7 @@ class AutoSwitchEngine:
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(usage.get(num), self._gate_models, now)
                 if all_above
                 else 0.0
             )
@@ -1870,7 +1944,7 @@ class AutoSwitchEngine:
                     by_recovery = _recovery_is_useful(
                         recovery_ts,
                         active_recovery_ts,
-                        active_headroom or 0.0,
+                        active_gate or 0.0,
                         best_candidate_headroom,
                         now,
                     )
@@ -1887,10 +1961,10 @@ class AutoSwitchEngine:
                         # burns down to a quarter of what it beat can qualify
                         # in reverse. That takes a 4x relative burn instead of
                         # the one point a strictly-greater test would need.
-                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                        if h < (active_gate or 0.0) * HORIZON_HEADROOM_RATIO:
                             if (
-                                (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
-                                and h >= (active_headroom or 0.0)
+                                (active_gate or 0.0) <= SPENT_HEADROOM_PCT
+                                and h >= (active_gate or 0.0)
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
@@ -1907,11 +1981,25 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif prefer and not core_triggered:
+                    # The model window started this move and the 5h/7d
+                    # windows still have room. The target must then offer
+                    # more of that model by the full margin. An account that
+                    # reports no such window gives no proof of more quota,
+                    # so the engine skips it.
+                    own_model = model_h.get(current)
+                    cand_model = model_h.get(num)
+                    if (
+                        own_model is None
+                        or cand_model is None
+                        or cand_model - own_model < settings.hysteresis_pct
+                    ):
+                        continue
+                elif active_gate is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    if h - active_gate < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -1942,6 +2030,16 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif prefer:
+                # Most model quota left first. Accounts that report no such
+                # window sort after every account that does. The 5h/7d
+                # headroom breaks the ties.
+                cand_model = model_h.get(num)
+                key = (
+                    0 if cand_model is not None else 1,
+                    -(cand_model if cand_model is not None else 0.0),
+                    -h,
+                )
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -2076,7 +2174,7 @@ class AutoSwitchEngine:
                 entry = entries.get(num)
                 value = usage.get(num)
                 planned_headroom = oauth.account_headroom(
-                    value if isinstance(value, dict) else None, self._models
+                    value if isinstance(value, dict) else None, self._gate_models
                 )
                 if (
                     entry is not None

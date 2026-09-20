@@ -355,3 +355,23 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestModelMode:
+    def test_defaults_to_gate(self, tmp_path: Path):
+        assert load_settings(tmp_path).model_mode == "gate"
+
+    def test_prefer_is_a_valid_mode(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.modelMode", "prefer")
+        assert load_settings(tmp_path).model_mode == "prefer"
+
+    def test_unsupported_mode_falls_back_to_gate(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"modelMode": "maybe"}})
+        )
+        assert load_settings(tmp_path).model_mode == "gate"
+
+    def test_cli_flag_overrides_the_file(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.modelMode", "gate")
+        merged = merged_with_cli(load_settings(tmp_path), _args(model_mode="prefer"))
+        assert merged.model_mode == "prefer"
