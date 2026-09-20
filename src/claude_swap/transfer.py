@@ -329,15 +329,41 @@ def import_accounts(
             (auto-heal, issue #136).
 
     Raises:
-        TransferError: malformed file, version mismatch, encrypted payload.
+        TransferError: unreadable source, malformed file, version mismatch,
+            encrypted payload.
     """
     if source == "-":
-        text = sys.stdin.read()
+        try:
+            text = sys.stdin.read()
+        except UnicodeDecodeError as e:
+            # ``cswap --export - | gpg -c > backup.gpg`` is a documented
+            # recipe, so the bytes on stdin are quite possibly that backup
+            # piped straight back in without being decrypted first.
+            raise TransferError(
+                "piped input is not UTF-8 text — decrypt an encrypted backup "
+                "first (e.g. gpg -d backup.gpg | cswap --import -)"
+            ) from e
     else:
         in_path = Path(source).expanduser()
         if not in_path.exists():
             raise TransferError(f"import file not found: {in_path}")
-        text = in_path.read_text(encoding="utf-8")
+        # A directory satisfies exists(), and letting the read discover it
+        # raises IsADirectoryError on POSIX but PermissionError on Windows;
+        # checking up front gives one message on both, and mirrors the
+        # destination guard in ``_atomic_write_file``.
+        if in_path.is_dir():
+            raise TransferError(
+                f"import source must be a file path, not a directory: {in_path}"
+            )
+        try:
+            text = in_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            raise TransferError(
+                f"{in_path} is not UTF-8 text — if it is an encrypted backup, "
+                "decrypt it first (e.g. gpg -d backup.gpg | cswap --import -)"
+            ) from e
+        except OSError as e:
+            raise TransferError(f"could not read {in_path}: {e}") from e
 
     try:
         envelope = json.loads(text)
