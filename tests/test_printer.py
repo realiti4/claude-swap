@@ -53,6 +53,71 @@ class TestColorDetection:
         assert printer.colors_enabled() is True
 
 
+class TestWindowsVtEnable:
+    """``_enable_windows_vt`` is the whole Windows answer in
+    ``_detect_color_support``, so whatever it returns is what the CLI believes
+    about ANSI support. Both kernel32 calls report failure by returning 0
+    rather than by raising, which is why the helper's ``except Exception`` arm
+    cannot stand in for checking them.
+
+    kernel32 is faked so these run on any host: ``printer`` does its
+    ``import ctypes`` inside the function, so the attribute it resolves is the
+    one on the real module.
+    """
+
+    @staticmethod
+    def _fake_kernel32(monkeypatch, calls: list, *, get_ok: int, set_ok: int) -> None:
+        import ctypes
+
+        class FakeKernel32:
+            def GetStdHandle(self, which):
+                calls.append(("GetStdHandle", which))
+                return 7
+
+            def GetConsoleMode(self, handle, ref):
+                calls.append(("GetConsoleMode", handle))
+                if get_ok:
+                    # ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT, the
+                    # bits a real console already has and must keep.
+                    ref._obj.value = 0x0003
+                return get_ok
+
+            def SetConsoleMode(self, handle, mode):
+                calls.append(("SetConsoleMode", handle, mode))
+                return set_ok
+
+        class FakeWindll:
+            kernel32 = FakeKernel32()
+
+        monkeypatch.setattr("claude_swap.printer.sys.platform", "win32")
+        monkeypatch.setattr(ctypes, "windll", FakeWindll(), raising=False)
+
+    def test_refused_mode_change_means_no_color(self, monkeypatch):
+        """A console that will not take ENABLE_VIRTUAL_TERMINAL_PROCESSING --
+        legacy conhost, Windows 10 before 1511 -- makes SetConsoleMode return
+        0. Reporting success there prints literal escapes on every line."""
+        calls: list = []
+        self._fake_kernel32(monkeypatch, calls, get_ok=1, set_ok=0)
+        assert printer._enable_windows_vt() is False
+
+    def test_unreadable_mode_is_not_written_back(self, monkeypatch):
+        """With the read refused there is no mode to OR the flag into, so
+        there is nothing to write; whether the write would be refused too is
+        the OS's business, not something to rely on."""
+        calls: list = []
+        self._fake_kernel32(monkeypatch, calls, get_ok=0, set_ok=1)
+        assert printer._enable_windows_vt() is False
+        assert [c for c in calls if c[0] == "SetConsoleMode"] == []
+
+    def test_accepted_mode_change_keeps_color(self, monkeypatch):
+        """The ordinary modern console, and the half that already worked: the
+        flag is added to the mode that was read, not written over it."""
+        calls: list = []
+        self._fake_kernel32(monkeypatch, calls, get_ok=1, set_ok=1)
+        assert printer._enable_windows_vt() is True
+        assert ("SetConsoleMode", 7, 0x0003 | 0x0004) in calls
+
+
 class TestStyling:
     """Tests for styling functions."""
 
