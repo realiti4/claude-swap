@@ -7,6 +7,7 @@ the paths/models/usage_store import cycle.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -60,6 +61,26 @@ def read_text_with_retry(
             time.sleep(delay)
             delay = min(delay * 2, 0.25)
     raise AssertionError("unreachable")  # pragma: no cover - loop always exits
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, or raise.
+
+    ``os.write`` is write(2) and may accept fewer bytes than it is given. The
+    callers here publish credentials with a rename that succeeds either way,
+    so a short write does not surface as a failed write -- it surfaces as a
+    corrupt account, and the discarded count was the only thing that said
+    which happened.
+
+    The zero-progress guard is not for a case anyone has seen: it is because
+    the alternative to raising there is spinning inside a credential writer.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "short write made no progress")
+        view = view[written:]
 
 
 def replace_with_retry(

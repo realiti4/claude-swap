@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-import tempfile
+import secrets
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -33,7 +33,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -731,21 +731,40 @@ class CredentialStore:
         data = data or {}
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        # NAME FIRST, THEN THE FILE. `mkstemp` mints the name INSIDE the
+        # syscall, so a signal between the create and the return strands a file
+        # no handler can name. The random suffix keeps what mkstemp gave in
+        # exchange: a pid alone is recycled, and `O_EXCL` on a recycled name can
+        # only fail -- or unlink a predecessor's file on the way out.
+        tmp_path = str(
+            path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = -1
         try:
-            os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+            try:
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+                # the name, so the cleanup below must not unlink their file.
+                tmp_path = None
+                raise
+            write_all(fd, json.dumps(data, indent=2).encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(path))
-            if sys.platform != "win32":
-                os.chmod(str(path), 0o600)
+            tmp_path = None  # consumed by the publish; the name is not ours
         except BaseException:
             if fd >= 0:
                 os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             raise
 
     def _write_active_credentials_file(self, credentials: str) -> None:
@@ -753,22 +772,40 @@ class CredentialStore:
         cred_dir = get_claude_config_home()
         cred_dir.mkdir(parents=True, exist_ok=True)
         cred_file = cred_dir / ".credentials.json"
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
+        # NAME FIRST, THEN THE FILE. `mkstemp` mints the name INSIDE the
+        # syscall, so a signal between the create and the return strands a file
+        # no handler can name. The random suffix keeps what mkstemp gave in
+        # exchange: a pid alone is recycled, and `O_EXCL` on a recycled name can
+        # only fail -- or unlink a predecessor's file on the way out.
+        tmp_path = str(
+            cred_dir / f".{cred_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = -1
         try:
-            os.write(fd, credentials.encode("utf-8"))
+            try:
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+                # the name, so the cleanup below must not unlink their file.
+                tmp_path = None
+                raise
+            write_all(fd, credentials.encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(cred_file))
-            if sys.platform != "win32":
-                os.chmod(str(cred_file), 0o600)
+            tmp_path = None  # consumed by the publish; the name is not ours
         except BaseException:
             if fd >= 0:
                 os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             raise
 
     def _delete_active_keychain_entry(self) -> bool:
@@ -1119,22 +1156,41 @@ class CredentialStore:
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         enc_file = target
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
+        # NAME FIRST, THEN THE FILE. `mkstemp` mints the name INSIDE the
+        # syscall, so a signal between the create and the return strands a file
+        # no handler can name. The random suffix keeps what mkstemp gave in
+        # exchange: a pid alone is recycled, and `O_EXCL` on a recycled name can
+        # only fail -- or unlink a predecessor's file on the way out.
+        tmp_path = str(
+            self._host.credentials_dir
+            / f".{enc_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = -1
         try:
-            os.write(fd, encoded.encode("utf-8"))
+            try:
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+                # the name, so the cleanup below must not unlink their file.
+                tmp_path = None
+                raise
+            write_all(fd, encoded.encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(enc_file))
-            if sys.platform != "win32":
-                os.chmod(str(enc_file), 0o600)
+            tmp_path = None  # consumed by the publish; the name is not ours
         except BaseException:
             if fd >= 0:
                 os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             raise
 
     def _reconcile_enc_after_keychain_write(
@@ -1775,7 +1831,6 @@ class CredentialStore:
         is recoverable; a manifest row without bytes is not.
         """
         import hashlib
-        import secrets
         from datetime import datetime, timezone
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")

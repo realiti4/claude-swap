@@ -747,7 +747,7 @@ class TestFilePermissions:
         """The export payload carries a live OAuth refresh token, so the temp
         file backing it must be 0600 from the instant it is created — never a
         write-then-chmod sequence that leaves it at the umask-derived default
-        (typically world-readable) for any window. Spies on tempfile.mkstemp
+        (typically world-readable) for any window. Spies on `os.open`
         (rather than just checking the final path) so this fails loudly if the
         implementation ever regresses to Path.write_text + a later chmod: a
         permissive umask that would produce 0o644 under that pattern must
@@ -757,15 +757,21 @@ class TestFilePermissions:
         _seed_account(s, 1, "alice@example.com")
         out = temp_home / "x.cswap"
 
-        real_mkstemp = tempfile.mkstemp
+        from claude_swap import transfer as _t
+
+        real_open = os.open
         modes_at_creation = []
 
-        def spying_mkstemp(*args, **kwargs):
-            fd, path = real_mkstemp(*args, **kwargs)
-            modes_at_creation.append(os.fstat(fd).st_mode & 0o777)
-            return fd, path
+        def spying_open(path, flags, *a, **kw):
+            fd = real_open(path, flags, *a, **kw)
+            if str(path).endswith(".tmp"):
+                modes_at_creation.append(os.fstat(fd).st_mode & 0o777)
+            return fd
 
-        monkeypatch.setattr(tempfile, "mkstemp", spying_mkstemp)
+        # `os.open`, not `tempfile.mkstemp`: the writer computes its name
+        # before creating the file now, so the mode argument on THAT call is
+        # the only thing narrowing it.
+        monkeypatch.setattr(_t.os, "open", spying_open)
         old_umask = os.umask(0o022)  # permissive: 0o644 if write_text created it
         try:
             export_accounts(s, str(out))
