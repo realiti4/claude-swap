@@ -2804,6 +2804,24 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "consume-first"
         assert sw.to_ref == {"number": 2, "email": "b@example.com"}
 
+    def test_carried_reset_on_a_zero_pct_account_still_ranks_soonest(self, temp_home):
+        # usage_store._carry_weekly_reset pins a carried-forward resets_at
+        # onto a 0%-utilization weekly window (Anthropic omits resets_at for
+        # some tokens while utilization is 0). Once carried it is an
+        # ordinary resets_at value by the time it reaches the ranking, so
+        # this only pins that consume-first picks the SOONEST reset even
+        # when that account reports 0% usage — not "reset unknown -> last".
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),   # active resets later
+            "2": _usage7(0, 0, _R_SOON),      # 0% but carried reset is soonest
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
