@@ -1,6 +1,6 @@
 """MEU-FBD-01 - the opt-in failback delay (``autoswitch.failbackDelaySeconds``).
 
-Covers AC-6..AC-14, AC-17 and AC-18.
+Covers AC-6..AC-14 and AC-17..AC-19.
 
 The feature answers ivan-andreyev on #318: keep ``cooldownSeconds`` governing
 ordinary rotation, and give the standby -> primary handback its own timer, the
@@ -9,7 +9,7 @@ timer is anchored on the moment the failback becomes **actionable** (a viable
 primary exists), not on the last switch, so every value in the range measures
 the recovered primary's steadiness rather than the reserve's dwell.
 
-Four properties are easy to get wrong and each has its own class here:
+Five properties are easy to get wrong and each has its own class here:
 
 - **Unset is today.** No new reason string, no new state key, cooldown still
   gates failback. `TestUnsetIsUnchanged`.
@@ -21,6 +21,9 @@ Four properties are easy to get wrong and each has its own class here:
 - **The locked recheck is authoritative.** Two engines must make one
   serialized decision even when the delay has elapsed for both.
   `TestTheLockedRecheckIsAuthoritative`.
+- **A lost disarm fails closed.** The clear is a write, and writes fail; a
+  stale anchor that could not be removed must never be measured from.
+  `TestALostDisarmFailsClosed`.
 
 Every oracle drives a **real tick** (`engine.tick()` -> `_tick_inner` ->
 `_rank` -> `_perform`) and asserts on the emitted reason string and the
@@ -34,12 +37,14 @@ import math
 
 import pytest
 
+from unittest.mock import patch
+
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.settings import AutoSwitchSettings
 
-from tests.test_autoswitch import EngineHarness
+from tests.test_autoswitch import EngineHarness, _entry_for
 from tests.test_autoswitch_standby_accounts import (
-    _EMAILS,
+    _details,
     _fleet,
     _reasons,
     _stale,
@@ -363,19 +368,109 @@ class TestTheLockedRecheckIsAuthoritative:
     """
 
     def test_a_second_engine_cannot_act_on_a_pre_switch_snapshot(self, temp_home):
+        """A real interleaving, not a direct call into the private method.
+
+        `other` is the cron `--once` tick; `h.engine` is the loop. `other`
+        enters its tick and captures `lastSwitchAt` as it then stands, and the
+        loop engine completes a whole real tick — and a real switch — while
+        `other` is still collecting usage. `other` then walks the rest of its
+        own tick on that superseded snapshot and must refuse at the lock.
+        """
         h = _fleet(temp_home, n=3, failback_delay_seconds=0.0)
         _standby(h, 1)
         h.engine = h._make_engine()
-        outcome, _ = _tick(h, [{"1": _u(20.0), "2": _u(10.0), "3": _u(10.0)}])
-        assert outcome is TickOutcome.SWITCHED
+        other = h._make_engine()
+        snapshot = {"1": _u(20.0), "2": _u(10.0), "3": _u(10.0)}
+        interleaved = {"done": False}
+
+        def _fetch(**_kwargs):
+            entries = {
+                num: _entry_for(value, h.clock.now)
+                for num, value in snapshot.items()
+            }
+            if not interleaved["done"]:
+                # Re-entrancy is bounded by the flag: the loop engine's own
+                # tick calls this same patched collector, and by then the
+                # switch has already been triggered.
+                interleaved["done"] = True
+                assert h.engine.tick() is TickOutcome.SWITCHED
+            return entries
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=_fetch
+        ):
+            result = other.tick()
+
+        assert interleaved["done"], "the interleaving never happened"
+        assert result is TickOutcome.NO_ACTION
+        assert DELAY_REASON in _reasons(h)
+        assert "another engine switched first" in _details(h)
+        assert len(_switches(h)) == 1, "exactly one engine may switch"
         assert h.active_number() == 2
 
-        other = h._make_engine()
+
+class TestALostDisarmFailsClosed:
+    """AC-19 - a disarm that cannot be written must not license a handback.
+
+    Execution review F1. The `finally` disarm swallows its exception so that
+    bookkeeping never rewrites an outcome the tick already emitted — but the
+    anchor is load-bearing timer state, not bookkeeping. Left trusted, a
+    window that was lost hours ago authorises an instant handback, which is
+    the one thing the timer exists to prevent. Two independent guards, because
+    they cover different processes.
+    """
+
+    def test_a_failed_clear_is_not_trusted_by_the_same_engine(self, temp_home):
+        """In-process: the engine that saw the write fail refuses the value."""
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 10)
+        _tick(h, [_healthy(h)])
+        armed = _anchor(h)
+        assert armed is not None
+
+        with patch(
+            "claude_swap.autoswitch.atomic_write_json",
+            side_effect=OSError("disk full"),
+        ):
+            outcome, _ = _tick(h, [_exhausted(h)])
+        assert outcome is TickOutcome.NO_ACTION, "the tick's own outcome stands"
+        assert _anchor(h) == armed, "the stale value really is still on disk"
+
+        h.clock.advance(3_600)
         h.events.clear()
-        result = other._perform("3", _EMAILS[3], "failback", (80.0, 0.0))
-        assert result is TickOutcome.NO_ACTION
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.NO_ACTION
         assert _reasons(h) == [DELAY_REASON]
-        assert h.active_number() == 2
+        assert _anchor(h) == h.clock(), "re-armed from now, not measured from T"
+
+    def test_a_stale_anchor_is_not_trusted_by_a_fresh_process(self, temp_home):
+        """Out of process: `cswap auto --once` never sees the in-memory flag.
+
+        An anchor older than the window plus one poll cannot describe a
+        handback that stayed actionable — that would already have fired — so
+        it is a lost window whose clear never landed.
+        """
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 4_000)
+        _set_anchor(h, h.clock() - 3_600)
+        fresh = h._make_engine()
+        assert fresh._failback_anchor_untrusted is False
+        h.engine = fresh
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.NO_ACTION
+        assert _reasons(h) == [DELAY_REASON]
+        assert _anchor(h) == h.clock()
+
+    def test_an_anchor_inside_the_window_plus_one_poll_is_still_honoured(
+        self, temp_home
+    ):
+        """The identity half: the bound rejects lost windows, not live ones."""
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 4_000)
+        _set_anchor(h, h.clock() - 90)  # 60s delay + 60s interval = 120s bound
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.SWITCHED
+        assert _triggers(h) == ["failback"]
 
 
 class TestDryRunReadsButNeverWrites:

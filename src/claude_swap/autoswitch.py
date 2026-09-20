@@ -717,6 +717,10 @@ class AutoSwitchEngine:
         # tick's snapshot was taken against.
         self._failback_anchor_touched = False
         self._failback_tick_epoch: float | None = None
+        # Set when a disarm write fails. The stored anchor is then known to be
+        # stale but could not be removed, so it must not be trusted again
+        # until a write succeeds. See `_disarm_failback_if_untouched`.
+        self._failback_anchor_untrusted = False
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -957,10 +961,22 @@ class AutoSwitchEngine:
             return
         try:
             if FAILBACK_ANCHOR_KEY not in self._read_state():
+                self._failback_anchor_untrusted = False
                 return
             self._mutate_state(lambda s: s.pop(FAILBACK_ANCHOR_KEY, None))
-        except Exception as e:  # never let bookkeeping break a tick's outcome
-            _logger.debug("could not clear %s: %r", FAILBACK_ANCHOR_KEY, e)
+            self._failback_anchor_untrusted = False
+        except Exception as e:
+            # The outcome this tick already emitted stands — bookkeeping never
+            # rewrites a decision. But this is load-bearing timer state, not
+            # expendable bookkeeping: the anchor on disk is now known stale and
+            # still there, so trusting it later would hand back with no window
+            # at all. Fail closed instead, and say so at warning level.
+            self._failback_anchor_untrusted = True
+            _logger.warning(
+                "could not clear %s (%r); the failback timer will re-arm "
+                "rather than trust the stale value",
+                FAILBACK_ANCHOR_KEY, e,
+            )
 
     def _failback_anchor(self, state: dict) -> float | None:
         """The stored arming timestamp, or None when it cannot be trusted.
@@ -974,10 +990,28 @@ class AutoSwitchEngine:
         move onto the reserve. Honouring it would hand back on the first tick
         after the promotion, skipping the whole window the user configured.
         """
+        if self._failback_anchor_untrusted:
+            # A disarm write failed in this process; the value on disk is known
+            # stale. Re-arm rather than measure from it.
+            return None
         value = state.get(FAILBACK_ANCHOR_KEY)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         if not math.isfinite(value):
+            return None
+        delay = self.settings.failback_delay_seconds
+        if delay is not None and (
+            self.clock() - value > delay + self.settings.interval_seconds
+        ):
+            # Older than the window plus one poll. Had the handback stayed
+            # actionable that whole time, it would already have happened on the
+            # tick where the delay elapsed — so this anchor belongs to a window
+            # that was lost and whose clear never landed (a crashed process, a
+            # failed write, a hand-edited file). The in-memory flag above only
+            # covers the process that saw the failure; this covers the cron
+            # `--once` case, where that process is already gone. Fails closed:
+            # it can only ever make the engine wait a fresh window, never a
+            # shorter one.
             return None
         last = state.get("lastSwitchAt")
         if (
