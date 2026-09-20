@@ -29,11 +29,13 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
     _recovery_is_useful,
     pct_label,
+    pressure as autoswitch_pressure,
+    window_threshold as autoswitch_window_threshold,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -3207,7 +3209,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 
     def test_the_null_snapshot_answers_differently_by_recorded_trigger(self):
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3256,7 +3258,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         existed has no such key. Must fall back to the old two-null
         inference (failover) rather than crash or silently misclassify."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3292,7 +3294,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         more permissive failover landing floor, regardless of whether some
         future change makes the failover branch unconditional."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -4626,7 +4628,7 @@ class TestHorizonAxisDoesNotFlap:
         combinations, every one identical. The ranking is the only place the
         bar's effect is observable in isolation.
         """
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, load_settings
 
         args = dict(
             trigger="proactive",
@@ -6894,3 +6896,184 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestPerWindowThresholds:
+    """`autoswitch.thresholdFiveHour` / `thresholdWeekly`: one line per window.
+
+    The two windows want opposite values and a single scalar compared against
+    `max(pct)` cannot express that — quota not spent before a WEEKLY reset is
+    gone for good, so that window wants an aggressive line, while overshooting
+    the 5h window costs one interrupted turn and the window recycles in hours.
+    """
+
+    def _harness(self, temp_home: Path, **settings_kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, **settings_kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize("base", [90.0, 95.0])
+    @pytest.mark.parametrize("window", ["5h", "7d"])
+    @pytest.mark.parametrize(
+        "offset,expected",
+        [(-0.1, TickOutcome.NO_ACTION), (0.0, TickOutcome.SWITCHED)],
+    )
+    def test_a_config_that_sets_neither_key_triggers_where_the_scalar_did(
+        self, temp_home, base, window, offset, expected
+    ):
+        """THE BACKWARD-COMPATIBILITY CONTROL: on the boundary, on both
+        windows, and on a non-default `threshold`.
+
+        With both keys unset every window's line IS `threshold`, so
+        `pressure >= 1.0` collapses to the old `max(pct) >= threshold` — the
+        ratio reaches 1.0 exactly where the scalar comparison flipped, not a
+        step either side of it. The 95 rows are there because the fallback
+        must read the user's own `threshold` and not the field's default.
+        """
+        h = self._harness(temp_home, threshold=base)
+        pct = base + offset
+        active = _usage7(pct, 0) if window == "5h" else _usage7(0, pct)
+        assert h.tick_with_usage({"1": active, "2": _usage7(0, 0)}) is expected
+
+    @pytest.mark.parametrize(
+        "keys,pcts,expected",
+        [
+            # Nothing has crossed. max(pct) = 94 against the STRICTEST line
+            # (the 5h one, 90) fires, though the window carrying 94 answers
+            # to 95: a false positive, one interrupted turn for nothing.
+            ({"threshold_five_hour": 90.0, "threshold_weekly": 95.0},
+             (89.5, 94.0), TickOutcome.NO_ACTION),
+            # The 5h window HAS crossed. max(pct) = 95 against the line of the
+            # window that CARRIES it (the weekly one, 99) holds: a false
+            # negative, and the one the fork's own worked example misses.
+            ({"threshold_five_hour": 90.0, "threshold_weekly": 99.0},
+             (92.0, 95.0), TickOutcome.SWITCHED),
+        ],
+    )
+    def test_a_single_binding_line_disagrees_with_the_ratio_in_both_directions(
+        self, temp_home, keys, pcts, expected
+    ):
+        """Why this is a RATIO and not `max(pct)` against one line.
+
+        `max(pct)` throws away which window carried the maximum, and there is
+        no single line to compare it against that survives both rows: the
+        strictest line fires on row 1 where nothing has crossed, and the
+        carrying window's own line holds on row 2 where the 5h window is two
+        points past its. Dividing each window by its own line and taking the
+        maximum answers both, and collapses to the old scalar comparison
+        exactly when the lines are equal.
+        """
+        h = self._harness(temp_home, **keys)
+        assert h.tick_with_usage(
+            {"1": _usage7(*pcts), "2": _usage7(0, 0)}
+        ) is expected
+
+    @pytest.mark.parametrize(
+        "keys,usage,expected",
+        [
+            # A weekly line above the base holds where the base would fire...
+            ({"threshold_weekly": 95.0}, (0, 93.0), TickOutcome.NO_ACTION),
+            # ...and fires once its own line is reached.
+            ({"threshold_weekly": 95.0}, (0, 95.0), TickOutcome.SWITCHED),
+            # The 5h key moves the 5h line only: the 7d window keeps the base.
+            ({"threshold_five_hour": 99.0}, (93.0, 0), TickOutcome.NO_ACTION),
+            ({"threshold_five_hour": 99.0}, (0, 93.0), TickOutcome.SWITCHED),
+        ],
+    )
+    def test_each_window_answers_to_its_own_line(
+        self, temp_home, keys, usage, expected
+    ):
+        """A key moves exactly one window's line and leaves the other on
+        `threshold`. The last two rows are the label routing: the same 93 pct
+        holds on 5h (line 99) and fires on 7d (line 90, untouched)."""
+        h = self._harness(temp_home, **keys)
+        assert h.tick_with_usage(
+            {"1": _usage7(*usage), "2": _usage7(0, 0)}
+        ) is expected
+
+    @pytest.mark.parametrize("written", ["-3", "0", "10"])
+    def test_the_clamp_already_makes_a_too_low_window_key_impossible(
+        self, tmp_path, written
+    ):
+        """There is no guard for a zero or negative override because
+        load_settings cannot produce one: _clamped holds every float to its
+        spec range and this spec's floor is 50.0. Measured rather than
+        assumed, because the guard that used to sit in window_threshold was
+        justified by the opposite claim."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"autoswitch": {"thresholdFiveHour": float(written)}})
+        )
+        assert load_settings(tmp_path).threshold_five_hour == 50.0
+
+    def test_the_below_threshold_line_quotes_the_window_it_measured(
+        self, temp_home
+    ):
+        """The log line must state the comparison the engine actually made.
+        Against the base threshold it prints "93% < 90%" — an arithmetically
+        false claim — the moment the lines differ."""
+        h = self._harness(temp_home, threshold_weekly=95.0)
+        h.tick_with_usage({"1": _usage7(0, 93.0), "2": _usage7(0, 0)})
+        detail = next(
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "below-threshold"
+        )
+        assert detail == "93% < 95%", f"printed {detail!r}"
+
+    def test_a_candidate_its_own_config_calls_landable_is_not_skipped(
+        self, temp_home
+    ):
+        """The landing gate reads the SAME ratio as the trigger.
+
+        Measured against the base threshold instead, a 90/95 config strands
+        the engine: the active is over its 5h line and must move, slot 2 sits
+        at 92 on a weekly window whose line is 95 — landable by the user's own
+        configuration — yet `(100 - h) >= 90` calls it unlandable and empties
+        the ranking. Same reading in `_every_account_above_threshold`, so the
+        all-spent escape cannot open on a fleet that is not all spent either.
+        """
+        h = self._harness(
+            temp_home, threshold_weekly=95.0, hysteresis_pct=0.0
+        )
+        h.seed(3, "c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage7(94.0, 0),     # active: 94/90 on 5h -> must move
+            "2": _usage7(0, 92.0),     # 92/95 on 7d -> landable
+            "3": _usage7(93.0, 0),     # 93/90 on 5h -> NOT landable
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            "slot 3 is over its own 5h line and slot 2 is under its own "
+            "weekly line; only the per-window reading can tell them apart"
+        )
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"lastSwitchFrom": "2", "leftHeadroom": 8.0, "leftRecoveryAt": None},
+            {"lastSwitchFrom": "2", "leftHeadroom": None,
+             "leftRecoveryAt": None, "leftTrigger": "failover"},
+        ],
+    )
+    def test_the_no_return_release_reads_the_peers_own_window_lines(
+        self, temp_home, state
+    ):
+        """Both landing floors in the no-return release, on the same peer.
+
+        `h > 100 - settings.threshold` is quoted in that function as "the same
+        test `_rank_candidates` runs on every candidate" — so when the ranking
+        starts reading per-window lines and this does not, the bar holds a peer
+        the ranking would happily land on, and a fleet with nowhere else to go
+        stays BLOCKED. The peer sits at 92 on a weekly window whose line is 95.
+        """
+        h = self._harness(temp_home, threshold_weekly=95.0)
+        released = h.engine._left_account_recovered(
+            state, {"2": _usage7(0, 92.0)}, {"2": 8.0}, None,
+            h.settings, h.clock(), "1",
+        )
+        assert released is True, (
+            "8 pts is not > 100 - 90, but 92 IS under the weekly line of 95 "
+            "this configuration set — the release must read the same lines "
+            "the ranking does"
+        )
