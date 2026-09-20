@@ -15,6 +15,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -576,3 +577,47 @@ class TestMoveUnreadableSourceIsNotAbsent:
         assert (num_src, num_target, swapped) == ("2", "5", False)
         data = switcher._get_sequence_data()
         assert data["accounts"]["5"]["email"] == "account2@example.com"
+
+
+class TestMoveSessionProfileKeychain:
+    """A relocated session profile must not strand its keychain entry.
+
+    On macOS the profile's credential lives in a keychain item whose service
+    name is the hash of the profile DIR PATH
+    (``session.keychain_service_name``), so ``os.replace`` on the dir leaves
+    the item behind at the old name. Nothing in cswap ever names that service
+    again -- ``purge`` enumerates the profile dirs that still exist -- so an
+    entry missed here is permanent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def as_macos(self, monkeypatch):
+        """Take the keychain arm of the session helpers on any host."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_move_deletes_the_old_paths_session_keychain_entry(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        email = "account2@example.com"
+        old_dir = switcher._session_dir("2", email)
+        old_dir.mkdir(parents=True)
+        (old_dir / ".credentials.json").write_text("plaintext-seed")
+        old_service = keychain_service_name(old_dir)
+        account = macos_keychain.keychain_account_name()
+        # The rotated generation claude wrote back into the profile: the
+        # newest tokens this account ever had, and what is left exposed.
+        macos_keychain.set_password(old_service, account, "rotated-generation")
+
+        switcher.move_account("2", "5")
+
+        assert not old_dir.exists()
+        assert switcher._session_dir("5", email).exists()
+        assert macos_keychain.get_password(old_service, account) is None

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -14,6 +15,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -540,3 +542,50 @@ class TestSwapUnreadableSourceIsNotAbsent:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "account2@example.com"
         assert data["accounts"]["2"]["email"] == "account1@example.com"
+
+
+class TestSwapSessionProfileKeychain:
+    """A swapped session profile must not strand its keychain entry.
+
+    On macOS the profile's credential lives in a keychain item whose service
+    name is the hash of the profile DIR PATH
+    (``session.keychain_service_name``), so ``os.replace`` on the dir leaves
+    the item behind at the old name. Nothing in cswap ever names that service
+    again -- ``purge`` enumerates the profile dirs that still exist -- so an
+    entry missed here is permanent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def as_macos(self, monkeypatch):
+        """Take the keychain arm of the session helpers on any host."""
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_swap_deletes_both_old_paths_session_keychain_entries(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        account = macos_keychain.keychain_account_name()
+        services = {}
+        slots = (("1", "account1@example.com"), ("2", "account2@example.com"))
+        for num, email in slots:
+            old_dir = switcher._session_dir(num, email)
+            old_dir.mkdir(parents=True)
+            (old_dir / ".credentials.json").write_text("plaintext-seed")
+            services[num] = keychain_service_name(old_dir)
+            # The rotated generation claude wrote back into the profile: the
+            # newest tokens this account ever had, and what is left exposed.
+            macos_keychain.set_password(services[num], account, f"rotated-{num}")
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher._session_dir("2", "account1@example.com").exists()
+        assert switcher._session_dir("1", "account2@example.com").exists()
+        assert macos_keychain.get_password(services["1"], account) is None
+        assert macos_keychain.get_password(services["2"], account) is None
