@@ -416,8 +416,15 @@ class TestALostDisarmFailsClosed:
     bookkeeping never rewrites an outcome the tick already emitted — but the
     anchor is load-bearing timer state, not bookkeeping. Left trusted, a
     window that was lost hours ago authorises an instant handback, which is
-    the one thing the timer exists to prevent. Two independent guards, because
-    they cover different processes.
+    the one thing the timer exists to prevent.
+
+    The guard is **in-process only**, and its lifecycle is half the contract:
+    round 2 of execution review found that a distrust flag which never clears
+    blocks the handback forever, and that the durable age bound which was
+    supposed to extend the guard across processes instead broke `cswap auto
+    --once` on every cron invocation. So: distrust until a write succeeds, then
+    stop; and never infer staleness from elapsed time, because only the polling
+    loop controls its own cadence.
     """
 
     def test_a_failed_clear_is_not_trusted_by_the_same_engine(self, temp_home):
@@ -446,36 +453,56 @@ class TestALostDisarmFailsClosed:
         outcome, _ = _tick(h, [_healthy(h)])
         assert outcome is TickOutcome.NO_ACTION
         assert _reasons(h) == [DELAY_REASON]
-        assert _anchor(h) == h.clock(), "re-armed from now, not measured from T"
+        rearmed = _anchor(h)
+        assert rearmed == h.clock(), "re-armed from now, not measured from T"
 
-    def test_a_stale_anchor_is_not_trusted_by_a_fresh_process(self, temp_home):
-        """Out of process: `cswap auto --once` never sees the in-memory flag.
-
-        An anchor older than the window plus one poll cannot describe a
-        handback that stayed actionable — that would already have fired — so
-        it is a lost window whose clear never landed.
-        """
-        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
-        _switched_at(h, 4_000)
-        _set_anchor(h, h.clock() - 3_600)
-        fresh = h._make_engine()
-        assert fresh._failback_anchor_untrusted is False
-        h.engine = fresh
-        outcome, _ = _tick(h, [_healthy(h)])
-        assert outcome is TickOutcome.NO_ACTION
-        assert _reasons(h) == [DELAY_REASON]
-        assert _anchor(h) == h.clock()
-
-    def test_an_anchor_inside_the_window_plus_one_poll_is_still_honoured(
-        self, temp_home
-    ):
-        """The identity half: the bound rejects lost windows, not live ones."""
-        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
-        _switched_at(h, 4_000)
-        _set_anchor(h, h.clock() - 90)  # 60s delay + 60s interval = 120s bound
+        # And the distrust must not outlive the problem. The re-arm above was a
+        # successful write, so the value on disk is this engine's own: the next
+        # full window has to actually elapse into a handback. Without clearing
+        # the flag the engine re-arms on every tick forever and the timer never
+        # fires at all - a worse failure than the staleness it guarded against.
+        assert h.engine._failback_anchor_untrusted is False
+        h.clock.advance(60)
+        h.events.clear()
         outcome, _ = _tick(h, [_healthy(h)])
         assert outcome is TickOutcome.SWITCHED
         assert _triggers(h) == ["failback"]
+        assert ANCHOR not in h.state()
+
+    def test_a_cron_scheduler_gap_does_not_invalidate_the_anchor(self, temp_home):
+        """Out of process, and the reason the anchor is persisted at all.
+
+        `cswap auto --once` is a cron mode whose cadence is external - the
+        README documents a five-minute schedule. A fresh process must measure
+        from the anchor its predecessor wrote, however long ago that was. An
+        earlier revision rejected anything older than `delay + intervalSeconds`
+        on the theory that a still-eligible handback would already have fired;
+        under a five-minute cron that is false on every single invocation, and
+        the timer never elapsed at all.
+        """
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 4_000)
+        _set_anchor(h, h.clock() - 300)  # one five-minute cron gap
+        fresh = h._make_engine()
+        assert fresh._failback_anchor_untrusted is False, "a new process is clean"
+        h.engine = fresh
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.SWITCHED
+        assert _triggers(h) == ["failback"]
+
+    def test_a_fresh_process_measures_from_the_stored_anchor_not_from_now(
+        self, temp_home
+    ):
+        """The identity half: it is the stored value being honoured, not the
+        gap being ignored. 30s of a 60s window has run, so this one holds."""
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 4_000)
+        _set_anchor(h, h.clock() - 30)
+        h.engine = h._make_engine()
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.NO_ACTION
+        assert _reasons(h) == [DELAY_REASON]
+        assert _anchor(h) == h.clock() - 30, "the window kept running"
 
 
 class TestDryRunReadsButNeverWrites:

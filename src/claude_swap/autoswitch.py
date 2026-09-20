@@ -999,20 +999,19 @@ class AutoSwitchEngine:
             return None
         if not math.isfinite(value):
             return None
-        delay = self.settings.failback_delay_seconds
-        if delay is not None and (
-            self.clock() - value > delay + self.settings.interval_seconds
-        ):
-            # Older than the window plus one poll. Had the handback stayed
-            # actionable that whole time, it would already have happened on the
-            # tick where the delay elapsed — so this anchor belongs to a window
-            # that was lost and whose clear never landed (a crashed process, a
-            # failed write, a hand-edited file). The in-memory flag above only
-            # covers the process that saw the failure; this covers the cron
-            # `--once` case, where that process is already gone. Fails closed:
-            # it can only ever make the engine wait a fresh window, never a
-            # shorter one.
-            return None
+        # NO age bound here, deliberately. An earlier revision rejected any
+        # anchor older than `delay + interval_seconds`, reasoning that a
+        # handback which stayed actionable that long would already have fired.
+        # That holds only for the polling loop. `cswap auto --once` is a cron
+        # mode whose cadence is external — the README documents a five-minute
+        # schedule — so under it the gap between two observations of the same
+        # continuously-eligible primary routinely exceeds that bound, and the
+        # rule rejected a perfectly valid anchor on every invocation. The timer
+        # then never elapsed at all, which is worse than the staleness it was
+        # guarding against, and it broke the one mode the anchor is persisted
+        # for. Cross-process staleness after a failed clear is handled by the
+        # next tick that finds the handback non-actionable, and is recorded as
+        # a residual risk rather than papered over with a cadence assumption.
         last = state.get("lastSwitchAt")
         if (
             isinstance(last, (int, float))
@@ -2609,6 +2608,9 @@ class AutoSwitchEngine:
             # reader never has to guess.
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
+            # The anchor is gone from disk, so the distrust flag has nothing
+            # left to protect (see `_failback_delay_gate`).
+            self._failback_anchor_untrusted = False
 
         self._emit(
             SwitchEvent(
@@ -2681,6 +2683,12 @@ class AutoSwitchEngine:
             state[FAILBACK_ANCHOR_KEY] = ready
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             atomic_write_json(self.state_path, state)
+            # ANCHOR-TRUST-RESTORED (mutation point M-13). The value on disk is
+            # this tick's own, so whatever went wrong earlier is resolved: stop
+            # distrusting it. Without this the engine re-arms on every tick
+            # forever and the handback never happens — the guard would outlive
+            # the problem it was protecting against.
+            self._failback_anchor_untrusted = False
         self._emit(
             NoSwitchEvent(
                 reason=FAILBACK_DELAY_REASON,
