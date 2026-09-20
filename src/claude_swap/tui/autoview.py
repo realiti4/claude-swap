@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 _EVENT_ROLES = {
     "switch": "accent",
+    "warm-ping": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
@@ -69,6 +70,7 @@ class AutoScreen(Screen):
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
+        Binding("w", "toggle_warm_on_reset", "Warm-on-reset"),
         Binding("escape,q", "back", "Back"),
     ]
 
@@ -86,6 +88,10 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Mount-time file value, so the summary can flag a session-only
+        # toggle the same way it flags a session-only threshold — neither
+        # is ever written to settings.json from here.
+        self._configured_warm_on_reset: bool | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -107,6 +113,7 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_warm_on_reset = self._settings.warm_on_reset
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -189,6 +196,27 @@ class AutoScreen(Screen):
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
+    def action_toggle_warm_on_reset(self) -> None:
+        """Session-only flip, same precedent as the threshold override —
+        never written to settings.json. Only meaningful for this screen's
+        own running engine (an idle terminal, or a screen elsewhere in the
+        TUI, has no engine to hand the setting to) — the ping it enables
+        never touches the active credential either way, so toggling it has
+        no effect on what account this or any other screen shows active."""
+        if self._engine is None or self._settings is None:
+            return
+        enabled = not self._settings.warm_on_reset
+        self._settings = replace(self._settings, warm_on_reset=enabled)
+        self._engine.apply_warm_on_reset(enabled)
+        self._update_summary()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— warm-on-reset {'enabled' if enabled else 'disabled'} "
+                "for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
@@ -200,6 +228,13 @@ class AutoScreen(Screen):
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        warm_is_session = self._settings.warm_on_reset != self._configured_warm_on_reset
+        if self._settings.warm_on_reset:
+            text.append(" · warm-on-reset", style=palette.accent)
+            if warm_is_session:
+                text.append(" (session)", style=palette.muted)
+        elif warm_is_session:
+            text.append(" · warm-on-reset off (session)", style=palette.muted)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
