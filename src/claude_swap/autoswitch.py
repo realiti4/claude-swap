@@ -51,7 +51,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    parse_preferred,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -656,6 +661,9 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Accounts to land on first when a switch happens (emails and/or slot
+        # numbers, lowercased); resolved against the candidates per tick.
+        self._preferred = parse_preferred(settings.preferred)
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -1823,6 +1831,8 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        preferred = self._preferred_numbers(oauth_candidates)
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -1944,11 +1954,33 @@ class AutoSwitchEngine:
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
+            # autoswitch.preferred: a listed account beats an unlisted one
+            # among the candidates that qualified above. The gates decide
+            # WHETHER a move is sound; the preference only picks which sound
+            # target to take, so it can never land somewhere that re-triggers.
+            # The recovery-tier keys are left alone on purpose: when every
+            # account is spent, soonest-back is the whole point, listed or not.
+            if preferred and not (
+                all_above and trigger in ("proactive", "consume-first")
+            ):
+                key = (0 if num in preferred else 1, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _preferred_numbers(self, candidates: list[str]) -> frozenset[str]:
+        """Candidates named by ``autoswitch.preferred``, by slot number or
+        email (case-insensitive). Names matching nothing are ignored."""
+        if not self._preferred:
+            return frozenset()
+        return frozenset(
+            n
+            for n in candidates
+            if n in self._preferred
+            or self.switcher.account_email(n).lower() in self._preferred
+        )
 
     # -- adaptive usage scheduling ---------------------------------------------
 

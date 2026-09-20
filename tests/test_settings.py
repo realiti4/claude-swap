@@ -20,6 +20,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_preferred,
     save_settings,
     set_setting,
     settings_path,
@@ -201,6 +202,22 @@ class TestSetUnsetSetting:
         with pytest.raises(ConfigError, match="unset"):
             set_setting(tmp_path, "autoswitch.model", "   ")
         assert not settings_path(tmp_path).exists()
+
+    def test_set_preferred_round_trips(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.preferred", "A@x.io, 2") == "A@x.io, 2"
+        assert load_settings(tmp_path).preferred == "A@x.io, 2"
+        assert parse_preferred(load_settings(tmp_path).preferred) == {"a@x.io", "2"}
+
+    def test_parse_preferred_trims_lowercases_and_skips_blanks(self):
+        assert parse_preferred(" B@X.io ,,3, ") == {"b@x.io", "3"}
+        assert parse_preferred(None) == frozenset()
+        assert parse_preferred("") == frozenset()
+
+    def test_garbage_preferred_value_falls_back_to_none(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"preferred": ["a@x.io"]}})
+        )
+        assert load_settings(tmp_path).preferred is None
 
     def test_garbage_model_value_falls_back_to_none(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
