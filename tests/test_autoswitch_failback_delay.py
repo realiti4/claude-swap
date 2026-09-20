@@ -34,6 +34,7 @@ Every oracle drives a **real tick** (`engine.tick()` -> `_tick_inner` ->
 from __future__ import annotations
 
 import math
+import pathlib
 
 import pytest
 
@@ -468,6 +469,44 @@ class TestALostDisarmFailsClosed:
         assert outcome is TickOutcome.SWITCHED
         assert _triggers(h) == ["failback"]
         assert ANCHOR not in h.state()
+
+    def test_an_unreadable_state_file_is_not_read_as_an_absent_anchor(
+        self, temp_home
+    ):
+        """AC-19(d) - "no anchor" and "could not read the anchor" differ.
+
+        Execution review R3-F1. `_read_state` answers `{}` for a missing file,
+        a corrupt one and an I/O error alike. The disarm treating that as
+        confirmed absence is a silent no-op that leaves the anchor armed *and*
+        restores trust in it - so the next recovery hands back with no window
+        at all, which is the failure this whole guard exists to stop.
+        """
+        h = _reserve_active(temp_home, failback_delay_seconds=60.0)
+        _switched_at(h, 10)
+        _tick(h, [_healthy(h)])
+        armed = _anchor(h)
+        assert armed is not None
+
+        real_read_text = pathlib.Path.read_text
+        state_path = h.engine.state_path
+
+        def _unreadable(self, *args, **kwargs):
+            if self == state_path:
+                raise OSError("transient I/O error")
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(pathlib.Path, "read_text", _unreadable):
+            outcome, _ = _tick(h, [_exhausted(h)])
+        assert outcome is TickOutcome.NO_ACTION
+        assert _anchor(h) == armed, "the anchor really is still armed on disk"
+        assert h.engine._failback_anchor_untrusted is True
+
+        h.clock.advance(60)
+        h.events.clear()
+        outcome, _ = _tick(h, [_healthy(h)])
+        assert outcome is TickOutcome.NO_ACTION, "a stale window must not fire"
+        assert _reasons(h) == [DELAY_REASON]
+        assert _anchor(h) == h.clock()
 
     def test_a_cron_scheduler_gap_does_not_invalidate_the_anchor(self, temp_home):
         """Out of process, and the reason the anchor is persisted at all.

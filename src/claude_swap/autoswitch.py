@@ -960,9 +960,17 @@ class AutoSwitchEngine:
         if self._failback_anchor_touched:
             return
         try:
-            if FAILBACK_ANCHOR_KEY not in self._read_state():
-                self._failback_anchor_untrusted = False
-                return
+            readable, state = self._state_readable()
+            if not readable:
+                # `_read_state` answers "`failbackReadyAt`" for both "no anchor" and "could not
+                # read it", and those must not be the same answer here: the
+                # second one means the anchor may still be on disk, unclearable
+                # and now unobserved. Reading it as absence leaves a live stale
+                # window AND restores trust in it, which is how a lost disarm
+                # shortens the next handback to nothing.
+                raise OSError(f"{self.state_path} is unreadable")
+            if FAILBACK_ANCHOR_KEY not in state:
+                return  # confirmed absent; nothing to distrust
             self._mutate_state(lambda s: s.pop(FAILBACK_ANCHOR_KEY, None))
             self._failback_anchor_untrusted = False
         except Exception as e:
@@ -977,6 +985,22 @@ class AutoSwitchEngine:
                 "rather than trust the stale value",
                 FAILBACK_ANCHOR_KEY, e,
             )
+
+    def _state_readable(self) -> tuple[bool, dict]:
+        """`(could we read it?, the state)` — unlike `_read_state`, which
+        conflates a missing file, a corrupt one and an I/O error into `{}`.
+
+        The failback disarm is the one caller that must tell those apart: a
+        missing file genuinely means no anchor, while an unreadable one means
+        an anchor may still be there, uncleared and now unobserved.
+        """
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return True, {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False, {}
+        return (True, raw) if isinstance(raw, dict) else (False, {})
 
     def _failback_anchor(self, state: dict) -> float | None:
         """The stored arming timestamp, or None when it cannot be trusted.
