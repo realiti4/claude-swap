@@ -3632,9 +3632,15 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        # Capture any alias to carry forward before destructive cleanup below
-        # deletes the old record (same account moving slots, or refreshing in place).
+        # Capture the state the slot already holds before destructive cleanup
+        # below deletes the old record (same account moving slots, or refreshing
+        # in place). The alias and the disabled flag are settings the user put on
+        # the account, not part of the login being refreshed, so losing them here
+        # would silently return a parked account to automatic rotation. Only a
+        # record belonging to the SAME account is read: a displaced occupant's
+        # lineage ends with it, and the newcomer must not inherit its state.
         existing_alias = None
+        existing_disabled = False
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
@@ -3642,8 +3648,11 @@ class ClaudeAccountSwitcher:
                 and prior.get("organizationUuid", "") == current_org_uuid
             ):
                 existing_alias = prior.get("alias")
+                existing_disabled = bool(prior.get("disabled"))
             if migrate_from:
-                existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
+                migrated = data["accounts"][migrate_from]
+                existing_alias = migrated.get("alias") or existing_alias
+                existing_disabled = bool(migrated.get("disabled")) or existing_disabled
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -3720,6 +3729,8 @@ class ClaudeAccountSwitcher:
         carried_alias = alias if alias is not None else existing_alias
         if carried_alias:
             data["accounts"][account_num]["alias"] = carried_alias
+        if existing_disabled:
+            data["accounts"][account_num]["disabled"] = True
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
@@ -3888,6 +3899,25 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        # Same carry-forward as ``add_account``, and for the same reason: a
+        # slot-pinned token account is refreshed by re-running this with --slot,
+        # which rebuilds the record wholesale, and the alias and the disabled
+        # flag belong to the account rather than to the token being replaced.
+        existing_alias = None
+        existing_disabled = False
+        if slot is not None:
+            prior = data.get("accounts", {}).get(account_num) or {}
+            if (
+                prior.get("email") == email
+                and prior.get("organizationUuid", "") == ""
+            ):
+                existing_alias = prior.get("alias")
+                existing_disabled = bool(prior.get("disabled"))
+            if migrate_from:
+                migrated = data["accounts"][migrate_from]
+                existing_alias = migrated.get("alias") or existing_alias
+                existing_disabled = bool(migrated.get("disabled")) or existing_disabled
+
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -3925,6 +3955,10 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        if existing_alias:
+            record["alias"] = existing_alias
+        if existing_disabled:
+            record["disabled"] = True
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
