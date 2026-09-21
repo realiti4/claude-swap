@@ -533,6 +533,9 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+# Moved to poll_policy so the pure balance policy can rank by it without
+# importing the engine; aliased for the engine and the test suite.
+_binding_recovery_ts = poll_policy.binding_recovery_ts
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -555,40 +558,6 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
-
-
-def _binding_recovery_ts(
-    usage: dict | str | None, models: Sequence[str], now: float
-) -> float:
-    """When this account's *binding* window comes back, as a sort key.
-
-    The binding window is the one holding the account back — the highest
-    utilization among the windows that gate it (the same set
-    ``account_headroom`` measures, so ranking and headroom can never disagree
-    about which window matters). Its reset is the moment the account becomes
-    useful again.
-
-    Not the weekly window: with every account in the 90s the thing that
-    decides where to go is which 5-hour window rolls over first, and that is
-    routinely minutes away while the weekly one is days away.
-
-    Returns ``inf`` when unknown or already past, so such accounts sort last
-    rather than masquerading as "back immediately" — a stale ``resets_at``
-    would otherwise rank a snapshot nobody has refreshed above a measured,
-    genuinely imminent one.
-    """
-    # Pick the BINDING window first, then ask for its reset. Filtering on the
-    # reset before the max lets a lower window win whenever the binding one's
-    # reset is unknown or past — measured: 7d at 95% with no resets_at and 5h
-    # at 40% resetting in an hour returned "back in an hour", which is the
-    # opposite of what binds. An account whose binding window has no usable
-    # reset is one we cannot schedule around, and inf sorts it last.
-    windows = list(oauth.relevant_windows(usage, models))
-    if not windows:
-        return float("inf")
-    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
-    ts = _parse_reset_ts(resets_at)
-    return ts if ts is not None and ts > now else float("inf")
 
 
 def _every_account_above_threshold(
