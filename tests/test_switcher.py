@@ -416,6 +416,40 @@ class TestAliasCommand:
         data = switcher._get_sequence_data()
         assert data["accounts"]["2"]["alias"] == "dev"
 
+    def test_set_alias_preserve_case_keeps_typed_spelling(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        _, stored = switcher.set_alias("2", "DevBox", preserve_case=True)
+
+        assert stored == "DevBox"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["alias"] == "DevBox"
+
+    def test_preserved_case_alias_still_resolves_case_insensitively(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A capitalized alias must stay usable as an identifier in any case."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("2", "DevBox", preserve_case=True)
+
+        for spelling in ("devbox", "DEVBOX", "DevBox"):
+            assert switcher._resolve_account_identifier(spelling) == "2"
+
+    def test_set_alias_preserve_case_still_rejects_duplicates(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Uniqueness is case-insensitive, so case alone can't dodge a clash."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        with pytest.raises(ConfigError):
+            switcher.set_alias("2", "DEV", preserve_case=True)
+
     def test_set_alias_by_email(self, temp_home: Path, sample_sequence_data: dict):
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
