@@ -57,6 +57,19 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Model display name(s) to fall back to once EVERY rotatable account's
+    # ``model`` window is at or over the threshold — the state where rotating
+    # accounts can no longer help, but the accounts still have quota for a
+    # different model. While the fallback is engaged the engine decides on
+    # these windows (plus 5h/7d) instead of ``model``'s, so rotation keeps
+    # working. Requires ``model``; None = never fall back (default).
+    fallback_model: str | None = None
+    # Command run (through the shell) whenever the fallback engages or
+    # releases, so running sessions can be moved to the other model — cswap
+    # swaps credentials, it cannot change a session's model itself. Receives
+    # CSWAP_MODEL_EVENT / CSWAP_MODEL / CSWAP_PRIMARY_MODEL /
+    # CSWAP_FALLBACK_MODEL in its environment. None = emit the event only.
+    on_model_change: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +147,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "fallbackModel", "fallback_model", "string",
+            help="Model to fall back to once every account's autoswitch.model limit is hit (e.g. Opus)",
+        ),
+        SettingSpec(
+            "autoswitch", "onModelChange", "on_model_change", "string",
+            help="Shell command run when the model fallback engages or releases",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -430,6 +451,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
+        ("fallback_model", "fallback_model"),
+        ("on_model_change", "on_model_change"),
         ("strategy", "strategy"),
     ):
         value = getattr(args, attr, None)
