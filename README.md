@@ -38,7 +38,13 @@ pipx upgrade claude-swap
 
 ### Add your first account
 
-Log into Claude Code with your first account, then:
+Log into Claude Code with your first account
+
+```bash 
+claude auth login
+```
+
+Then add it to claude-swpap:
 
 ```bash
 cswap add
@@ -46,13 +52,7 @@ cswap add
 
 ### Add more accounts
 
-Log in with another account, then:
-
-```bash
-cswap add
-```
-
-Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+Repeat the steps above - Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
 
 ### Switch accounts
 
