@@ -402,13 +402,16 @@ class ManagedSessionRegistry:
         """
         return self._load(warn=False)[1]
 
-    def _lock(self) -> FileLock:
+    def _lock(self, timeout: float | None = None) -> FileLock:
         # Private up front: FileLock.acquire() also mkdirs the lock file's
         # parent, but at the default (group/other-readable) mode, and a
         # declined allocate or a remove/update of a missing id never
         # reaches _write to correct it afterwards.
         _mkdir_private(self.root)
-        return FileLock(self._lock_path, timeout=self._lock_timeout)
+        return FileLock(
+            self._lock_path,
+            timeout=self._lock_timeout if timeout is None else timeout,
+        )
 
     def _load(
         self, *, warn: bool = True
@@ -532,6 +535,24 @@ class ManagedSessionRegistry:
 
     def get(self, session_id: str) -> ManagedEntry | None:
         return self._read().get(session_id)
+
+    def get_locked(
+        self, session_id: str, *, timeout: float | None = None
+    ) -> ManagedEntry | None:
+        """:meth:`get`, serialized with every mutator and :meth:`sweep`.
+
+        For a check that orders a profile write against the sweep (see its
+        docstring): when the row is present here, any sweep that drops it
+        takes the lock after this read, so its profile deletion comes after
+        this read as well. The lock is held for one file read and no
+        liveness check, keeping the hold short. ``timeout`` overrides the
+        registry's lock wait for callers already holding other locks.
+
+        Raises:
+            LockError: The registry lock stayed held past the timeout.
+        """
+        with self._lock(timeout):
+            return self._read().get(session_id)
 
     def live_entries(self) -> list[ManagedEntry]:
         return [e for e in self._read().values() if entry_is_live(e)]

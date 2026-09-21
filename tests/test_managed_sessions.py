@@ -202,6 +202,22 @@ class TestRegistry:
         finally:
             blocker.release()
 
+    def test_get_locked_reads_under_the_lock_and_times_out(self, registry):
+        entry = registry.allocate(
+            "auto-0000beef", _always(B), pid=os.getpid(), proc_start=None
+        )
+        assert registry.get_locked("auto-0000beef") == entry
+        assert registry.get_locked("auto-00000000") is None
+        blocker = FileLock(registry.root / ms.REGISTRY_LOCK_FILENAME)
+        assert blocker.acquire()
+        try:
+            started = time.monotonic()
+            with pytest.raises(LockError):
+                registry.get_locked("auto-0000beef", timeout=0.2)
+            assert time.monotonic() - started < 5
+        finally:
+            blocker.release()
+
     def test_duplicate_or_foreign_id_is_refused(self, registry):
         registry.allocate("auto-0000beef", _always(B), pid=os.getpid(), proc_start=None)
         with pytest.raises(ValueError):

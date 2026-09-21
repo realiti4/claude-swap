@@ -11,9 +11,15 @@ into its keychain service name, so each profile gets its own keychain entry.
 Profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
 including on macOS: the plaintext fallback is Claude's only credential
 mechanism on Linux (a stable contract), and Claude migrates it into its
-hashed keychain entry on first write. Writing that keychain entry ourselves
-would couple us to Claude's internal storage format and naming, where a
-mismatch is a hard "logged out" failure instead of a harmless stale entry.
+hashed keychain entry on first write. For these ``cswap run N`` profiles
+cswap never writes that keychain entry: doing so would couple us to Claude's
+internal storage format and naming, where a mismatch is a hard "logged out"
+failure instead of a harmless stale entry. The one exception is managed
+``auto-*`` profiles (``cswap run --auto``), which hold no refresh token and so
+cannot rotate their own credential: for those,
+``session_credentials.write_session_credential`` writes both the hashed entry
+and the plaintext file under Claude's own storage locks and verifies the
+read-back.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, and ``agents/`` follow them into
@@ -277,10 +283,11 @@ def read_session_credentials(session_dir: Path) -> str | None:
     in place, and nothing syncs them back to backup. On macOS the rotated
     credential lives in the profile's hashed keychain entry (which shadows
     the plaintext seed from the moment claude first writes it), elsewhere in
-    the profile's ``.credentials.json``. Read-only by design: writing either
-    location stays claude's job (see the module docstring on why cswap never
-    writes the hashed entry). Returns ``None`` when the profile has no
-    readable credential material.
+    the profile's ``.credentials.json``. Read-only by design: for ``cswap run
+    N`` profiles writing either location stays claude's job (see the module
+    docstring); only managed ``auto-*`` profiles are written by cswap, through
+    ``session_credentials.write_session_credential``. Returns ``None`` when
+    the profile has no readable credential material.
     """
     return read_config_dir_credentials(str(session_dir))
 
