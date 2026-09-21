@@ -35,6 +35,7 @@ import json
 import logging
 import re
 import secrets
+import shutil
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -49,7 +50,11 @@ from claude_swap.process_detection import (
     process_start_ticks,
     process_started_at,
 )
-from claude_swap.session import _mkdir_private
+from claude_swap.session import (
+    _mkdir_private,
+    delete_macos_keychain_entry,
+    profile_is_quiescent,
+)
 from claude_swap.settings import atomic_write_json
 
 _logger = logging.getLogger("claude-swap")
@@ -108,6 +113,97 @@ def utc_now_iso(clock: Callable[[], float] = time.time) -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+# An auto-* dir with no registry entry is either a crash leftover or a
+# launch between `allocate` and its own registry write becoming visible to
+# a sweeper that read the registry a moment earlier. Only the former is
+# old; the grace keeps the sweeper off the latter.
+ORPHAN_GRACE_S = 300
+
+HOOKS_FILENAME = "cswap-hooks.json"
+
+
+def create_managed_profile(session_dir: Path, *, theme: str = "dark") -> None:
+    """Create a fresh, onboarded, 0700 managed profile.
+
+    Raises ``FileExistsError`` if ``session_dir`` already exists. Managed
+    ids are freshly minted per launch (see ``new_session_id``), so a
+    collision means something else already put data there; silently
+    reusing it — keeping whatever mode or contents it already had —
+    would break the fresh-0700-profile promise this makes instead of
+    surfacing the problem.
+
+    The keychain item is deleted once ``session_dir`` is ours, before the
+    plaintext file is written, for the same reason ``_bootstrap`` deletes it
+    early: Claude reads the keychain before the plaintext file.
+    """
+    _mkdir_private(session_dir.parent)
+    session_dir.mkdir(mode=0o700)
+    delete_macos_keychain_entry(session_dir)
+    atomic_write_json(
+        session_dir / ".claude.json",
+        {"hasCompletedOnboarding": True, "theme": theme},
+    )
+
+
+def remove_managed_profile(session_dir: Path) -> bool:
+    """Delete a managed profile's keychain item and directory.
+
+    Returns whether ``session_dir`` is gone once this returns. Already
+    being gone counts as success rather than a failure to log — a
+    registry entry whose owning process died before it ever created the
+    profile (``allocate`` writes the reservation before the profile
+    exists) is a normal case, not an error.
+
+    Refuses, loudly, a path whose name is not a managed session id: every
+    caller derives the path from a session id it owns
+    (``registry.session_dir``, the orphan pass, a rolled-back launch), so
+    anything else is a bug about to ``rmtree`` a directory this module was
+    never told it owns — the per-account ``<num>-<slug>`` profiles and the
+    sessions root itself sit right beside these.
+
+    ``shutil.rmtree`` unlinks symlinks without following them, so the
+    shared ``projects/`` / ``history.jsonl`` links never take ``~/.claude``
+    data with them. Unlike the old ``ignore_errors=True``, a genuine
+    per-path removal failure (a file a concurrent writer still has open, a
+    permission problem) is logged once via ``onexc`` rather than swallowed
+    silently forever; the caller reads the return value to find out
+    whether anything survived, and a directory left behind is picked up
+    again by the next sweep.
+    """
+    if not is_managed_session_id(session_dir.name):
+        _logger.warning(
+            f"Refusing to remove {session_dir}: not a managed session profile."
+        )
+        return False
+    delete_macos_keychain_entry(session_dir)
+    if not session_dir.exists():
+        return True
+
+    def _log_and_skip(function: object, path: str, exc: BaseException) -> None:
+        _logger.warning(
+            f"Could not remove {path!r} while removing managed profile "
+            f"{session_dir}: {exc}"
+        )
+
+    shutil.rmtree(session_dir, onexc=_log_and_skip)
+    return not session_dir.exists()
+
+
+def write_hooks_file(session_dir: Path) -> Path:
+    """Write the ``--settings`` document a managed session is launched with.
+
+    Empty (``{"hooks": {}}``) today. Passing it is still a no-op for the
+    user's own configuration: ``--settings`` sits above the user, project
+    and local settings files, but hook entries merge across those levels
+    instead of replacing each other, so an empty map contributes nothing
+    and suppresses nothing. The file and the ``--settings`` argument stay
+    because the launch that needs a hook should only have to fill this in.
+    """
+    path = session_dir / HOOKS_FILENAME
+    atomic_write_json(path, {"hooks": {}})
+    return path
 
 
 def _valid_pid(pid: object) -> bool:
@@ -216,6 +312,28 @@ _UPDATABLE = frozenset({
     "account", "source", "pid", "proc_start",
     "last_assigned_at", "last_reason", "access_fingerprint",
 })
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    """What one :meth:`ManagedSessionRegistry.sweep` pass found: the dead
+    entries dropped from the registry, and the live entries from that same
+    registry read.
+
+    ``removed`` reflects the registry row being gone, not whether the
+    profile directory was actually deleted — a dead entry whose profile
+    isn't ``profile_is_quiescent`` still loses its row (it is dead) but
+    keeps its directory (see :meth:`ManagedSessionRegistry.sweep`), and
+    still appears here.
+
+    Liveness (``entry_is_live``) shells out to ``ps`` on macOS, so a caller
+    that needs both sets — a later push-refresh pass, say — takes ``.live``
+    from here instead of re-deriving it with a second ``live_entries()``
+    call, which would repeat the check per entry.
+    """
+
+    removed: list[ManagedEntry]
+    live: list[ManagedEntry]
 
 
 class ManagedSessionRegistry:
@@ -520,3 +638,122 @@ class ManagedSessionRegistry:
             if entry is not None:
                 self._write(entries)
             return entry
+
+    def sweep(self) -> SweepResult:
+        """Drop dead entries, then remove their profiles and stale orphan
+        dirs.
+
+        Only entry removal happens under the lock: dead entries are read,
+        partitioned from the live ones, dropped from the registry, and the
+        file rewritten (or unlinked, once nothing is left) — all before
+        the lock is released — so no writer can pass its liveness
+        pre-check against an entry that is about to disappear. Liveness
+        (``entry_is_live``) also runs under the lock — each check is a
+        ``ps`` call on macOS — so lock hold time scales with the number of
+        registry entries; it is checked once per entry, partitioning into
+        ``dead``/``live`` in that single pass rather than two, so the live
+        set can be handed back alongside the removed one instead of
+        costing a second pass later.
+
+        Removing the profile DIRECTORIES happens after the lock is
+        released, not under it: a writer that reads the registry, finds
+        this entry still live, and starts writing to the profile just
+        before the lock above is taken can still be mid-write when this
+        deletes the directory out from under it. The credential writer
+        closes this by re-checking the registry entry under the registry
+        lock both immediately before and immediately after it writes,
+        discarding what it just wrote if the entry it stamped is gone by
+        the time it checks again.
+
+        A dead entry's PID being gone does not mean nothing is using its
+        profile any more — a child process the dead PID spawned (the Bash
+        tool, a detached tmux pane, a nohup'd process) can inherit
+        CLAUDE_CONFIG_DIR and keep writing there after the parent that
+        owned the registry entry exits. So the profile directory is only
+        removed once ``profile_is_quiescent`` agrees nothing is reading or
+        writing it; otherwise the entry is still dropped (it is dead, and
+        a stale reservation must not linger), but the directory is left
+        alone. With no registry entry any more it is now an untracked
+        orphan, reclaimed by the orphan pass below once it actually goes
+        quiescent and ages past ``ORPHAN_GRACE_S``. Either way the entry
+        is in ``.removed`` — that reflects the registry row being gone,
+        not whether the directory was deleted (see ``SweepResult``).
+
+        A registry this build cannot read in full is not swept at all: an
+        empty result, one log line, nothing deleted. ``_read`` folds
+        "absent" and "unreadable" into an empty dict — right for the
+        polling callers, wrong for this one, which turns "not in the
+        registry" into an rmtree. Reading a truncated ``managed.json`` as
+        empty would drop no rows (there are none to drop) but would hand
+        ``_sweep_orphans`` an empty ``known`` set, and every live session's
+        profile is then an untracked orphan: directory and keychain item
+        deleted out from under a running Claude, with only the orphan
+        grace window and ``profile_is_quiescent`` in the way — neither of
+        which holds for a session that has not written a readable record
+        yet (the reservation-to-startup gap a trust prompt holds open, a
+        long ``claude -p`` run).
+        """
+        with self._lock():
+            entries, unreadable = self._load()
+            if entries is None:
+                _logger.warning(
+                    f"Managed session registry {self.path} cannot be read "
+                    f"({unreadable}); skipping this sweep. No rows are "
+                    "dropped and no profile is reclaimed until it can be "
+                    "read again."
+                )
+                return SweepResult(removed=[], live=[])
+            dead: list[ManagedEntry] = []
+            live: list[ManagedEntry] = []
+            for entry in entries.values():
+                (live if entry_is_live(entry) else dead).append(entry)
+            for entry in dead:
+                del entries[entry.session_id]
+            if dead:
+                self._write(entries)
+            known = set(entries)
+        for entry in dead:
+            profile_dir = self.session_dir(entry.session_id)
+            if profile_is_quiescent(profile_dir):
+                remove_managed_profile(profile_dir)
+        self._sweep_orphans(known)
+        return SweepResult(removed=dead, live=live)
+
+    def _sweep_orphans(self, known: set[str]) -> list[str]:
+        """Reclaim ``auto-*`` directories no registry row names.
+
+        ``known`` has to come from a registry read that SUCCEEDED. An empty
+        set from a readable registry with no rows is fine — every ``auto-*``
+        directory really is untracked. An empty set from a failed read is
+        not: it makes every live session's profile look untracked. This is
+        the one place "not in ``known``" becomes an rmtree, so it re-checks
+        that the registry is readable here rather than trusting its caller
+        to have done it.
+        """
+        if self._load(warn=False)[0] is None:
+            _logger.warning(
+                f"Managed session registry {self.path} cannot be read; "
+                "leaving untracked managed profiles alone."
+            )
+            return []
+        if not self.root.is_dir():
+            return []
+        removed: list[str] = []
+        now = self._clock()
+        for path in self.root.iterdir():
+            if (
+                not path.is_dir()
+                or path.is_symlink()
+                or not is_managed_session_id(path.name)
+                or path.name in known
+            ):
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < ORPHAN_GRACE_S or not profile_is_quiescent(path):
+                continue
+            if remove_managed_profile(path):
+                removed.append(path.name)
+        return removed
