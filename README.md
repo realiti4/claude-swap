@@ -88,6 +88,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
+cswap auto --model Fable --fallback-model Opus   # ...and fall back to Opus once every account's Fable is spent
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
@@ -105,6 +106,19 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+- **Model fallback.** With `--model Fable` alone, once *every* account's Fable window is at the threshold there is nowhere left to rotate to, and auto-switch reports itself blocked — even though those same accounts would still run another model. Add `--fallback-model Opus` (or `cswap config set autoswitch.fallbackModel Opus`) and it instead keeps rotating on Opus's window plus 5h/7d, until any account's Fable window drops back under the threshold by the hysteresis margin.
+  - It engages only on proof — every account in rotation has readable usage and each one's `--model` window is at or over the threshold — and the state is persisted, so a restart or a cron `--once` run carries on where the last one left off. A full 5h/7d window never engages it: that binds every model alike.
+  - claude-swap swaps credentials; it **cannot change the model a running session uses** — only a `/model` typed into that session can. So each change is announced as a `model-change` event (`"change": "fallback"` or `"restored"`), and `--on-model-change COMMAND` (or `autoswitch.onModelChange`) runs a command of yours with `CSWAP_MODEL_EVENT` (`fallback`/`restored`), `CSWAP_MODEL`, `CSWAP_PRIMARY_MODEL` and `CSWAP_FALLBACK_MODEL` in its environment. It runs inside the check with a 60s budget, so have it start anything long-running in the background; a failing command is reported and never stops rotation.
+  - [`examples/tmux-model-change.sh`](examples/tmux-model-change.sh) is a ready-made command for sessions living in **tmux**: it types `/model` into every pane running `claude`, answers the *Switch model?* confirmation, leaves alone any pane whose prompt holds text you are writing (retrying it in the background) and any session you started with an explicit `--model`, and can nudge a session that had already stalled on the limit. Unattended, end to end:
+
+    ```bash
+    cswap config set autoswitch.model Fable
+    cswap config set autoswitch.fallbackModel Opus
+    cswap config set autoswitch.onModelChange ~/bin/tmux-model-change.sh
+    cswap auto
+    ```
+
+    Note that `/model` also saves the model as Claude Code's default, so sessions you start during a fallback begin on the fallback model too — and go back with everything else when it releases.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -274,6 +288,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.fallbackModel Opus   # model to fall back to once every account's autoswitch.model is spent
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -336,7 +351,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `model-change`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 
