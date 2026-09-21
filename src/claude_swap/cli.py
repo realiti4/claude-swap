@@ -605,6 +605,8 @@ Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --model Fable --fallback-model Opus
+                                   # ...then fall back to Opus once every account's Fable is spent
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -651,6 +653,25 @@ Defaults live in settings.json in the backup root; flags override them.
             "account-wide 5h/7d windows. One name or a comma-separated list "
             "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
             "for every per-model window an account reports"
+        ),
+    )
+    parser.add_argument(
+        "--fallback-model",
+        metavar="NAMES",
+        help=(
+            "With --model: once every account's --model limit is hit, keep "
+            "rotating on this model's limits instead (e.g. Opus) and announce "
+            "the change, until a --model window frees up again"
+        ),
+    )
+    parser.add_argument(
+        "--on-model-change",
+        metavar="COMMAND",
+        help=(
+            "Shell command run when the model fallback engages or releases, "
+            "e.g. a script that sends /model to your running sessions. Gets "
+            "CSWAP_MODEL_EVENT (fallback|restored) and CSWAP_MODEL in its "
+            "environment"
         ),
     )
     parser.add_argument(
