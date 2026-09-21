@@ -6894,3 +6894,375 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+# --- balance strategy ------------------------------------------------------
+
+
+class TestBalanceStrategy:
+    """Lane-0 ``autoswitch.strategy = balance`` (issue #382).
+
+    Triggers are `best`'s — nothing moves below the threshold — and only the
+    target ORDER changes: the candidate furthest behind its weekly schedule
+    (balance.rank_accounts) wins over the one with merely the most headroom.
+    """
+
+    DAY = 86400.0
+
+    def _harness(self, temp_home: Path, strategy: str = "balance") -> EngineHarness:
+        h = EngineHarness(temp_home, strategy=strategy)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _behind_vs_roomy(self, h: EngineHarness) -> dict:
+        now = h.clock.now
+        return {
+            # Active over the threshold on its 5h window -> proactive move.
+            "1": _usage7(95, 20, _iso_at(now + 3 * self.DAY)),
+            # Weekly resets in 1 day: target 100 (24h lead), used 60 ->
+            # slack 40, score 40 - 0.5 * 10 = 35. Headroom 40.
+            "2": _usage7(10, 60, _iso_at(now + self.DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
+            # score 11.7. Headroom 95 — `best` would pick this one.
+            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+        }
+
+    def test_fixture_discriminates_best_picks_most_headroom(self, temp_home):
+        h = self._harness(temp_home, strategy="best")
+        assert h.tick_with_usage(self._behind_vs_roomy(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_picks_behind_schedule_over_most_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._behind_vs_roomy(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_never_moves_below_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 5, _iso_at(now + 6 * self.DAY)),   # active well below the threshold
+            "2": _usage7(0, 10, _iso_at(now + self.DAY / 2)),   # far behind
+            "3": _usage7(0, 0, _iso_at(now + self.DAY)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_none_eligible_falls_back_to_soonest_recovery(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 3 * 3600)},
+                "seven_day": {"pct": 20.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+            },
+            # Both over the 85% five-hour ceiling (ineligible), both below the
+            # 90% threshold and clear of the 10-pt hysteresis margin (valid
+            # landings). #2 has more headroom, #3's binding 5h window comes
+            # back sooner -> the policy's fallback picks #3.
+            "2": {
+                "five_hour": {"pct": 86.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+            },
+            "3": {
+                "five_hour": {"pct": 87.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_omitted_candidate_still_serves_when_it_is_the_only_landing(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage7(99, 20, _iso_at(now + 3 * self.DAY)),
+            # Eligible under balance (5h 80 < 85, 7d 89.5 < 90) and first in
+            # its order, but headroom 10.5 vs the active's 1 misses the 10-pt
+            # hysteresis margin -> not a landing.
+            "2": _usage7(80, 89.5, _iso_at(now + self.DAY)),
+            # Over the five-hour ceiling -> omitted by the policy while an
+            # eligible account exists; still a valid, healthy landing.
+            "3": _usage7(86, 10, _iso_at(now + 3 * self.DAY)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_above_threshold_path_still_moves_to_soonest_back(self, temp_home):
+        """TestEveryAccountAboveThreshold's measured shape, under balance."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage(99, _iso_at(now + 3600 * 2)),   # active, back in 2h
+            "2": _usage(100, _iso_at(now + 600)),       # at limit
+            "3": _usage(95, _iso_at(now + 480)),        # back in 8 minutes
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_escape_ranks_by_balance(self, temp_home):
+        h = self._harness(temp_home)
+        usage = self._behind_vs_roomy(h)
+        usage["1"] = _usage7(100, 20, _iso_at(h.clock.now + 3 * self.DAY))
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._behind_vs_roomy(h))
+        assert h.active_number() == 2
+        h.events.clear()
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "2": _usage7(95, 60, _iso_at(now + self.DAY)),
+            "1": _usage7(0, 0, _iso_at(now + self.DAY)),
+            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def _four_account_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.seed(4, "d@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _survivors_only_fixture(self, h: EngineHarness, account_2: dict) -> dict:
+        now = h.clock.now
+        return {
+            "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 20.0}},
+            "2": account_2,
+            # Over balance's own five-hour ceiling (85) -> ineligible under
+            # balance.py's rules, but the engine's landing gate and
+            # hysteresis margin both pass (86 < 90 threshold; headroom 14
+            # clears the active's 1 pt by more than the 10-pt margin) -> a
+            # gate survivor. Its binding (5h) window returns in 4h.
+            "3": {
+                "five_hour": {"pct": 86.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 10.0},
+            },
+            # Same shape, but back in 1h -> once #3 and #4 are the only
+            # candidates balance ranks, its soonest-recovery fallback must
+            # prefer this one.
+            "4": {
+                "five_hour": {"pct": 88.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0},
+            },
+        }
+
+    def test_ranks_only_gate_survivors_when_the_omitted_candidate_is_eligible(
+        self, temp_home
+    ):
+        """balance ranks the SURVIVORS of the engine's gates, not the raw
+        candidate list: when none of them is eligible under balance's own
+        rules, its soonest-recovery fallback must go by soonest recovery
+        among the candidates the engine can actually land on, not by
+        whichever account merely happens to sort last among the raw fleet.
+        #2 is eligible under balance.py's own rules (5h 80 < 85 ceiling, 7d
+        89.5 < 90 threshold) but fails the ENGINE's hysteresis margin
+        (headroom 10.5 vs the active's 1 misses the 10-pt bar) -> excluded
+        before ranking ever runs. Scoping to the gate survivors keeps #2
+        from satisfying balance's "eligible" branch on its own (#3 and #4
+        are both over the five-hour ceiling) and leaves #3 and #4 tied at
+        ``len(order)``, broken by headroom -> #3. Ranking only the gate
+        survivors {#3, #4} instead falls through to balance's
+        soonest-recovery fallback between just those two -> #4 (back in 1h
+        beats #3's 4h).
+        """
+        h = self._four_account_harness(temp_home)
+        usage = self._survivors_only_fixture(
+            h, {"five_hour": {"pct": 80.0}, "seven_day": {"pct": 89.5}}
+        )
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_ranks_only_gate_survivors_when_the_omitted_candidate_is_ineligible(
+        self, temp_home
+    ):
+        """Same shape as above, but #2 is ineligible outright (7d 95 over
+        the weekly threshold), which also fails the engine's own
+        landing-health gate (100 - headroom 5 = 95 >= 90). Only #3 and #4
+        ever reach balance.rank_accounts. This pins the shape -- #2
+        omitted, #4 wins by soonest recovery -- but does not by itself
+        discriminate a raw-fleet ranking from the correct gate-survivor
+        one: with no eligible account, balance.rank_accounts falls back
+        to a total recovery-ts sort, and adding an already-ineligible #2
+        to that sort cannot reorder #3 and #4 relative to each other.
+        The sibling test above (``..._is_eligible``) is the one that
+        actually discriminates, since there #2 IS eligible under
+        balance's own rules and its inclusion changes which branch
+        rank_accounts takes.
+        """
+        h = self._four_account_harness(temp_home)
+        usage = self._survivors_only_fixture(
+            h, {"five_hour": {"pct": 80.0}, "seven_day": {"pct": 95.0}}
+        )
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_no_return_bar_removes_the_account_from_balance_ranking(
+        self, temp_home
+    ):
+        """At default settings, hysteresis_pct / (HORIZON_HEADROOM_RATIO -
+        1) == 100 - threshold, so any candidate clearing the ordinary
+        hysteresis margin against an over-threshold active already clears
+        the no-return bar's own release ratio too -- an end-to-end
+        `tick()` fixture cannot isolate the bar here, the way
+        `TestHorizonAxisDoesNotFlap` cannot for `best`, so this drives
+        `_rank_candidates` directly (`no_return` passed explicitly); see
+        `test_no_return_bar_is_sole_exclusion_at_non_default_threshold`
+        for the non-default case, isolated end-to-end. #1 (score ~90)
+        beats #3 (score ~-38) unbarred; barred, #1 is gone and only #3
+        remains.
+        """
+        h = self._harness(temp_home)
+        now = h.clock.now
+        args = dict(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["1", "3"],
+            usage={
+                # Weekly resets in 1 day (24h lead -> target 100): used 5 ->
+                # slack 95, score 95 - 0.5*10 = 90. Headroom 90.
+                "1": {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {
+                        "pct": 5.0, "resets_at": _iso_at(now + self.DAY)
+                    },
+                },
+                "2": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}},
+                # Weekly resets in 6 days: target 16.7, used 50 -> slack
+                # -33.3 (already ahead of schedule), score -38.3. Headroom
+                # 50 -- still clears the active's hysteresis margin easily.
+                "3": {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {
+                        "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                    },
+                },
+            },
+            headroom={"1": 90.0, "2": 4.0, "3": 50.0},
+            current="2",
+            active_headroom=4.0,
+            settings=AutoSwitchSettings(strategy="balance"),
+            now=now,
+        )
+        unbarred, _, _ = h.engine._rank_candidates(no_return=None, **args)
+        barred, _, _ = h.engine._rank_candidates(no_return="1", **args)
+
+        assert list(unbarred) == ["1", "3"], (
+            f"premise: balance ranks #1 (score ~90, far behind schedule) "
+            f"ahead of #3 (score ~-38, ahead of schedule) when nothing "
+            f"bars it — got {list(unbarred)}"
+        )
+        assert list(barred) == ["3"], (
+            f"the bar did not remove account 1 from balance's ranking: "
+            f"{list(barred)}"
+        )
+
+    def test_no_return_bar_is_sole_exclusion_at_non_default_threshold(
+        self, temp_home
+    ):
+        """The sibling test above's "unreachable end-to-end" finding
+        holds only at DEFAULT settings — see its docstring for why. At
+        ``threshold=80`` (hysteresis_pct stays the default 10,
+        HORIZON_HEADROOM_RATIO is a fixed 2x, not a setting) the two gates
+        decouple, and a full `tick()` fixture CAN isolate the bar:
+
+        Tick 2's active (#2) sits at headroom 15 (85% used, over the 80%
+        threshold -> proactive fires). #1 (barred, just left in tick 1) is
+        at headroom 26 (74% used): the ordinary landing gate passes
+        (74 < 80) and the hysteresis margin passes (26 - 15 = 11 >= the
+        default 10-pt ``hysteresis_pct``) — by every gate `_rank_candidates`
+        runs on its own, #1 is a fully valid, and balance-favourite
+        (score ~58 vs #3's ~-43), landing spot. Only
+        `_no_return_account`'s release ratio fails: 26 < 15 * 2 = 30, so
+        the bar holds regardless of whether `_left_account_recovered` says
+        "recovered" (the ratio check runs unconditionally once recovered is
+        true, and returns the bar unconditionally when it is false) — the
+        bar, and nothing else, is why the engine lands on #3 instead of
+        returning to #1.
+        """
+        h = EngineHarness(temp_home, strategy="balance", threshold=80.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        now = h.clock.now
+        # Tick 1: switch 1 -> 2. #1 active at 90% (over the 80% threshold)
+        # -> proactive. #2 is healthy and balance's clear favourite (far
+        # behind schedule); #3 is healthy but far less attractive.
+        assert h.tick_with_usage({
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 10.0}},
+            "2": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + self.DAY)},
+            },
+            "3": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                },
+            },
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now = h.clock.now
+
+        outcome = h.tick_with_usage({
+            # Headroom 26 (74% used): clears the landing gate and the
+            # hysteresis margin against #2's headroom 15, and is balance's
+            # top score (~58) -- everything but the no-return bar would
+            # pick this.
+            "1": {
+                "five_hour": {"pct": 74.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + self.DAY)},
+            },
+            "2": {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}},
+            "3": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                },
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "the no-return bar should have excluded #1 (headroom 26, "
+            "clears every ordinary gate) and landed on #3 instead"
+        )
+
+    def test_failover_ranks_by_balance(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        usage = {
+            "1": None,
+            # Weekly resets in 1 day: target 100, used 60 -> slack 40,
+            # score 40 - 0.5*10 = 35. Headroom 40.
+            "2": _usage7(10, 60, _iso_at(now + self.DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
+            # score 11.7. Headroom 95 -- most headroom, but less behind
+            # schedule than #2.
+            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() == 2
