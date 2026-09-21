@@ -47,7 +47,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset), or
+    # "balance" (the account furthest behind its weekly schedule; balance.py).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +59,18 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Balance strategy knobs (balance.py; read only when strategy == "balance").
+    # lead: finish each weekly window this many hours before it resets, so
+    # the on-schedule target reaches 100% a little early rather than exactly
+    # at the reset. ceiling: skip an account whose projected 5h utilization
+    # (its 5h pct plus load_per_session for each busy session on it) would
+    # reach this. weight: score penalty per projected 5h point, so of two
+    # equally behind-schedule accounts the one with the emptier 5h window
+    # wins.
+    balance_lead_hours: float = 24.0
+    balance_five_hour_ceiling: float = 85.0
+    balance_five_hour_weight: float = 0.5
+    balance_load_per_session: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -120,7 +134,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "balance"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -134,6 +148,28 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        # Upper lead bound 96h keeps the effective schedule at >= 3 days of
+        # the 7-day window; a ceiling below 10% would exclude nearly every
+        # account; a weight above 5 lets the 5h term swamp weekly slack.
+        SettingSpec(
+            "autoswitch", "balanceLeadHours", "balance_lead_hours", "float", 0.0, 96.0,
+            help="balance: aim to finish each weekly window this many hours before reset",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceFiveHourCeiling", "balance_five_hour_ceiling", "float",
+            10.0, 100.0,
+            help="balance: skip accounts whose projected 5h pct reaches this",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceFiveHourWeight", "balance_five_hour_weight", "float",
+            0.0, 5.0,
+            help="balance: score penalty per projected 5h pct",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceLoadPerSession", "balance_load_per_session", "float",
+            0.0, 100.0,
+            help="balance: 5h pct each busy session is assumed to add",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

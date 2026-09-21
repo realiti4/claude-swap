@@ -99,6 +99,86 @@ class TestLoadSettings:
         assert load_settings(tmp_path).strategy == "consume-first"
 
 
+class TestBalanceSettings:
+    def test_balance_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "balance"}})
+        )
+        assert load_settings(tmp_path).strategy == "balance"
+
+    def test_set_strategy_balance(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "balance")
+        assert load_settings(tmp_path).strategy == "balance"
+
+    def test_balance_defaults(self):
+        s = AutoSwitchSettings()
+        assert s.balance_lead_hours == 24.0
+        assert s.balance_five_hour_ceiling == 85.0
+        assert s.balance_five_hour_weight == 0.5
+        assert s.balance_load_per_session == 15.0
+
+    def test_balance_keys_load_from_camel_case(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {
+                "balanceLeadHours": 12,
+                "balanceFiveHourCeiling": 70,
+                "balanceFiveHourWeight": 1.5,
+                "balanceLoadPerSession": 20,
+            }
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.balance_lead_hours == 12.0
+        assert loaded.balance_five_hour_ceiling == 70.0
+        assert loaded.balance_five_hour_weight == 1.5
+        assert loaded.balance_load_per_session == 20.0
+
+    def test_balance_values_are_clamped_on_load(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {
+                "balanceLeadHours": 500,
+                "balanceFiveHourCeiling": 1,
+                "balanceFiveHourWeight": -2,
+                "balanceLoadPerSession": 250,
+            }
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.balance_lead_hours == 96.0
+        assert loaded.balance_five_hour_ceiling == 10.0
+        assert loaded.balance_five_hour_weight == 0.0
+        assert loaded.balance_load_per_session == 100.0
+
+    def test_balance_bad_types_fall_back_to_defaults(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {"balanceLeadHours": "soon", "balanceFiveHourWeight": True}
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.balance_lead_hours == 24.0
+        assert loaded.balance_five_hour_weight == 0.5
+
+    @pytest.mark.parametrize(
+        ("key", "value", "bounds"),
+        [
+            ("autoswitch.balanceLeadHours", "97", "between 0 and 96"),
+            ("autoswitch.balanceLeadHours", "-1", "between 0 and 96"),
+            ("autoswitch.balanceFiveHourCeiling", "9", "between 10 and 100"),
+            ("autoswitch.balanceFiveHourCeiling", "101", "between 10 and 100"),
+            ("autoswitch.balanceFiveHourWeight", "5.5", "between 0 and 5"),
+            ("autoswitch.balanceLoadPerSession", "100.1", "between 0 and 100"),
+        ],
+    )
+    def test_set_rejects_out_of_range(self, tmp_path: Path, key, value, bounds):
+        with pytest.raises(ConfigError, match=bounds):
+            set_setting(tmp_path, key, value)
+        assert not settings_path(tmp_path).exists()
+
+    def test_set_accepts_boundaries(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.balanceLeadHours", "0")
+        set_setting(tmp_path, "autoswitch.balanceFiveHourCeiling", "100")
+        loaded = load_settings(tmp_path)
+        assert loaded.balance_lead_hours == 0.0
+        assert loaded.balance_five_hour_ceiling == 100.0
+
+
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
         custom = AutoSwitchSettings(threshold=85.0, cooldown_seconds=60.0)
@@ -280,6 +360,10 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+    def test_balance_strategy_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="balance"))
+        assert merged.strategy == "balance"
 
 
 class TestAtomicWriteThroughSymlink:
