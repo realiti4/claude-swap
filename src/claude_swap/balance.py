@@ -33,7 +33,7 @@ placement and reassignment targets.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from claude_swap import oauth, pace, poll_policy
@@ -178,4 +178,40 @@ def score_account(
         headroom=headroom,
         recovery_ts=poll_policy.binding_recovery_ts(usage, models, now),
         reason=reason,
+    )
+
+
+def rank_accounts(
+    usage_by_account: Mapping[str, dict | None],
+    *,
+    now: float,
+    models: Sequence[str],
+    busy_sessions: Mapping[str, int],
+    params: BalanceParams,
+) -> list[AccountScore]:
+    """Eligible accounts by score desc (ties: input/sequence order); if none
+    eligible, accounts with headroom > 0 by recovery_ts asc (eligible=False);
+    accounts with unknown usage or headroom <= 0 are omitted."""
+    scores = [
+        score_account(
+            account,
+            usage,
+            now=now,
+            models=models,
+            busy_sessions=busy_sessions.get(account, 0),
+            params=params,
+        )
+        for account, usage in usage_by_account.items()
+    ]
+    eligible = [s for s in scores if s.eligible]
+    if eligible:
+        # sorted() is stable: equal scores keep input (sequence) order.
+        return sorted(eligible, key=lambda s: -s.score)
+    # Nobody is on-schedule and healthy. Never refuse while any account can
+    # still serve a request: go where the binding window comes back first —
+    # the same key the engine uses when every account is above the threshold
+    # (poll_policy.binding_recovery_ts).
+    return sorted(
+        (s for s in scores if s.headroom is not None and s.headroom > 0),
+        key=lambda s: s.recovery_ts,
     )

@@ -251,3 +251,92 @@ class TestScoreAccount:
 
     def test_default_params_match_default_settings(self):
         assert balance.params_from_settings(AutoSwitchSettings()) == BalanceParams()
+
+
+def _rank(usage_by_account: dict, busy: dict | None = None, models=()) -> list[str]:
+    return [
+        s.account
+        for s in balance.rank_accounts(
+            usage_by_account,
+            now=NOW,
+            models=models,
+            busy_sessions=busy or {},
+            params=PARAMS,
+        )
+    ]
+
+
+class TestRankAccounts:
+    def test_behind_schedule_beats_most_headroom(self):
+        # "2": reset in 1d -> target 100, used 60 -> slack 40, score 35.
+        # "3": reset in 6d -> target 16.7, used 5 -> slack 11.7, score 11.7.
+        # "3" has far more headroom (95 vs 40) but is ahead of where "2" is.
+        assert _rank({
+            "2": _usage(10, 60, reset7_in=DAY),
+            "3": _usage(0, 5, reset7_in=6 * DAY),
+        }) == ["2", "3"]
+
+    def test_score_ties_keep_input_order(self):
+        same = _usage(10, 20)
+        assert _rank({"1": same, "2": same, "3": same}) == ["1", "2", "3"]
+        assert _rank({"3": same, "1": same, "2": same}) == ["3", "1", "2"]
+
+    def test_busy_sessions_lower_the_score(self):
+        same = _usage(10, 20)
+        assert _rank({"1": same, "2": same}, busy={"1": 1}) == ["2", "1"]
+
+    def test_ineligible_omitted_when_any_is_eligible(self):
+        assert _rank({
+            "1": _usage(90, 10),           # five-hour-ceiling
+            "2": _usage(10, 95),           # weekly-threshold
+            "3": _usage(10, 50),           # eligible
+        }) == ["3"]
+
+    def test_unknown_and_at_limit_are_always_omitted(self):
+        assert _rank({
+            "1": None,
+            "2": "token-expired",
+            "3": _usage(100, 10),
+            "4": _usage(10, 100),
+        }) == []
+
+    def test_fallback_orders_by_soonest_recovery_when_none_eligible(self):
+        ranked = balance.rank_accounts(
+            {
+                # 5h binds for all three (90+ > 7d); recoveries 3h / 1h / 2h.
+                "1": _usage(95, 10, reset5_in=3 * HOUR),
+                "2": _usage(97, 10, reset5_in=HOUR),
+                "3": _usage(90, 10, reset5_in=2 * HOUR),
+                "4": _usage(100, 10, reset5_in=10.0),   # at-limit: omitted
+                "5": None,                              # unknown: omitted
+            },
+            now=NOW,
+            models=(),
+            busy_sessions={},
+            params=PARAMS,
+        )
+        assert [s.account for s in ranked] == ["2", "3", "1"]
+        assert all(not s.eligible for s in ranked)
+        assert [s.reason for s in ranked] == ["five-hour-ceiling"] * 3
+
+    def test_fallback_never_refuses_while_headroom_remains(self):
+        # One account, over every gate but not at its limit: still offered.
+        assert _rank({"1": _usage(99, 99)}) == ["1"]
+
+    def test_fallback_unknown_recovery_sorts_last(self):
+        assert _rank({
+            "1": _usage(95, 10, reset5_in=None),
+            "2": _usage(95, 10, reset5_in=4 * HOUR),
+        }) == ["2", "1"]
+
+    def test_eligible_list_carries_scores(self):
+        ranked = balance.rank_accounts(
+            {"1": _usage(10, 20, reset7_in=4 * DAY)},
+            now=NOW,
+            models=(),
+            busy_sessions={},
+            params=PARAMS,
+        )
+        assert len(ranked) == 1
+        assert ranked[0].eligible
+        assert ranked[0].score == pytest.approx(30.0 - 0.5 * 10.0)
