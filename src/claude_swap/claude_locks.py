@@ -51,6 +51,13 @@ CREDENTIALS_STALENESS_S = 60.0
 # The config lock (~/.claude.json.lock) keeps the older proper-lockfile
 # defaults: stale after 10s, touched every 5s.
 CONFIG_STALENESS_S = 10.0
+# Claude Code's secure-storage write lock (2.1.278): proper-lockfile on
+# ``<config-home>/.storage-write`` with ``realpath: false, stale: 15000`` —
+# so the artifact is the directory ``<config-home>/.storage-write.lock``.
+# Every storage ``update()``/``mutate()`` (credential saves, MCP OAuth)
+# runs under it, which is what a writer of a managed profile's keychain
+# item + plaintext pair must exclude.
+STORAGE_WRITE_STALENESS_S = 15.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
@@ -70,10 +77,37 @@ def credentials_lock_dir() -> Path:
     return home.parent / (home.name + ".lock")
 
 
-def oauth_refresh_lock_dir() -> Path:
+def oauth_refresh_lock_dir(config_dir: Path | None = None) -> Path:
     """Claude Code's primary OAuth refresh lock
-    (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
-    return get_claude_config_home() / ".oauth_refresh.lock"
+    (``<config-home>/.oauth_refresh.lock``, 2.1.218+).
+
+    ``config_dir`` names a specific profile (a managed session's
+    ``CLAUDE_CONFIG_DIR``); ``None`` is the invoking environment's.
+    """
+    base = config_dir if config_dir is not None else get_claude_config_home()
+    return base / ".oauth_refresh.lock"
+
+
+def storage_write_lock_dir(config_dir: Path | None = None) -> Path:
+    """Claude Code's secure-storage write lock (``<cfg>/.storage-write.lock``)."""
+    base = config_dir if config_dir is not None else get_claude_config_home()
+    return base / ".storage-write.lock"
+
+
+def claude_json_lock_dir(config_dir: Path) -> Path:
+    """The ``.claude.json`` lock of an explicit profile. With
+    ``CLAUDE_CONFIG_DIR`` set, Claude keeps ``.claude.json`` inside the
+    config dir, so its lock is ``<cfg>/.claude.json.lock``.
+
+    Where this lock sits relative to ``.storage-write.lock`` is inferred,
+    not read out of a bundle the way the refresh/storage pair above is:
+    nothing observed says which of the two Claude Code takes first.
+    Callers that need both nest this one innermost, because a config
+    splice accompanies a credential write. If Claude nests them the other
+    way the two orders invert, and the cost is bounded by the acquire
+    timeout: both sides give up and retry rather than wait on each other.
+    """
+    return config_dir / ".claude.json.lock"
 
 
 def config_lock_dir() -> Path:
@@ -185,3 +219,26 @@ def claude_config_lock(*, timeout: float | None = None):
     """Hold Claude Code's global-config write lock (``~/.claude.json.lock``)."""
     with proper_lockfile(config_lock_dir(), timeout=timeout):
         yield
+
+
+@contextmanager
+def session_credential_locks(config_dir: Path, *, timeout: float | None = None):
+    """Both locks Claude Code takes around a credential write in one profile.
+
+    Order mirrors Claude's own nesting (a refresh holds the refresh lock and
+    saves through storage, which takes the storage-write lock inside it), so
+    a waiting cswap and a waiting Claude can never deadlock. Managed
+    profiles hold no refresh token, so Claude never takes the refresh lock
+    there today; holding it anyway keeps a future refresh from interleaving.
+    """
+    with proper_lockfile(
+        oauth_refresh_lock_dir(config_dir),
+        timeout=timeout,
+        staleness=CREDENTIALS_STALENESS_S,
+    ):
+        with proper_lockfile(
+            storage_write_lock_dir(config_dir),
+            timeout=timeout,
+            staleness=STORAGE_WRITE_STALENESS_S,
+        ):
+            yield
