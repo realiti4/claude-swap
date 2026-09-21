@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import balance, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -1792,6 +1792,19 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        # balance ranks by how far each candidate is behind its weekly
+        # schedule (balance.py). Only the ORDER changes: the trigger, the
+        # landing gate, the hysteresis margin, the no-return bar and the
+        # all-above recovery path above are exactly `best`'s, so balance can
+        # never move while the active account is below the threshold, and a
+        # proactive move never lands somewhere that re-triggers next tick
+        # (at-limit/failover escapes skip the landing gate, as for best). No
+        # managed sessions exist yet, so busy_sessions is empty throughout.
+        # The ranking call itself sits below the gate loop — see the comment
+        # there for why it must run on the gates' SURVIVORS, not this raw
+        # candidate list.
+        is_balance = settings.strategy == "balance"
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -1804,11 +1817,12 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            num_usage = usage.get(num)
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(num_usage, now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(num_usage, self._models, now)
                 if all_above
                 else 0.0
             )
@@ -1877,9 +1891,9 @@ class AutoSwitchEngine:
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
+                    # best and balance: the candidate must beat the active
+                    # account by the full hysteresis margin (a one-way move
+                    # like 99%→89% qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
@@ -1911,9 +1925,49 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif is_balance:
+                # Placeholder — every candidate that reaches this line has
+                # already cleared the gates above, and the real key is
+                # rebuilt below from balance.rank_accounts run over exactly
+                # that survivor set. `num` alone keeps the interim ordering
+                # stable and irrelevant: it is never returned.
+                key = (num,)
             else:
                 key = (-h,)
             qualifying.append((key, num))
+        if is_balance and qualifying and not (
+            all_above and trigger in ("proactive", "consume-first")
+        ):
+            # Rank the SURVIVORS of the gates above, not the raw candidate
+            # list. When none of the landable accounts is eligible under
+            # balance's own rules, the policy falls back to soonest
+            # recovery — and that fallback must see the same gated set the
+            # engine actually has to choose from: an account the engine
+            # already rejected (barred by no-return, failing the landing
+            # gate, inside the hysteresis margin) has no business shaping
+            # it. Ranking is scoped to the gate survivors so that an
+            # account the engine already excluded cannot satisfy balance's
+            # eligible branch and suppress the soonest-recovery fallback
+            # among the accounts still in play.
+            #
+            # Skipped on an all-above tick: that path above already carries
+            # its own recovery-based tiered key, shared with best, and
+            # balance does not re-rank it.
+            ranked_by_balance = balance.rank_accounts(
+                {
+                    num: usage.get(num) if isinstance(usage.get(num), dict) else None
+                    for _, num in qualifying
+                },
+                now=now,
+                models=self._models,
+                busy_sessions={},
+                params=balance.params_from_settings(settings),
+            )
+            order = {s.account: rank for rank, s in enumerate(ranked_by_balance)}
+            qualifying = [
+                ((order.get(num, len(order)), -headroom[num]), num)
+                for _, num in qualifying
+            ]
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
