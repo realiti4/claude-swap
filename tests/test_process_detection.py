@@ -13,8 +13,7 @@ import pytest
 
 from claude_swap.process_detection import (
     PID_REUSE_SLACK_S,
-    ClaudeSession,
-    IdeInstance,
+    _epoch_ms,
     _lstart_seconds,
     _stat_start_ticks,
     get_claude_dir,
@@ -26,6 +25,7 @@ from claude_swap.process_detection import (
     process_is_claude,
     process_start_ticks,
     process_started_at,
+    scan_sessions,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -648,3 +648,25 @@ class TestFormatAge:
     def test_days(self):
         ms = int((time.time() - 172800) * 1000)  # 2 days ago
         assert format_age(ms) == "2d ago"
+
+
+class TestSessionStatus:
+    def test_status_is_parsed(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 4242, status="idle")
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True):
+            sessions, unreadable = scan_sessions(tmp_path)
+        assert unreadable == 0
+        [session] = sessions
+        assert session.status == "idle"
+
+    def test_an_epoch_ms_field_survives_as_an_int(self):
+        assert _epoch_ms(1_758_000_000_000) == 1_758_000_000_000
+        assert _epoch_ms(1_758_000_000_000.9) == 1_758_000_000_000
+
+    @pytest.mark.parametrize(
+        "raw", ["123", True, False, -5, 0, None, float("inf"), float("nan")]
+    )
+    def test_a_malformed_epoch_ms_field_is_none(self, raw):
+        assert _epoch_ms(raw) is None

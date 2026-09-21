@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -44,6 +45,20 @@ class ClaudeSession:
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
+
+
+def _epoch_ms(value: object) -> int | None:
+    """A positive, finite epoch-ms number from a session record, else None.
+
+    Anything else — a string, a bool (an int subclass, never a timestamp),
+    a non-positive number, inf or nan — reads as None rather than as a
+    bogus instant.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(value) if value > 0 else None
 
 
 @dataclass
