@@ -26,6 +26,7 @@ from claude_swap import (
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 from claude_swap.exceptions import LockError
 from claude_swap.managed_sessions import (
+    MANAGED_HOOKS,
     SOURCE_LANE0,
     AccountRef,
     ManagedSessionRegistry,
@@ -681,6 +682,137 @@ class TestEnsureMovePassInterval:
         session_hooks.run_ensure(env=_env(session_dir))
         assert len(calls) == 2
         assert not (session_dir / session_hooks.MOVE_SENTINEL).exists()
+
+
+class TestHookBudgets:
+    """Both verbs run inside a budget Claude Code enforces by killing them,
+    so every wait they can reach has to be one they chose."""
+
+    def test_a_write_from_a_hook_does_not_sit_out_claudes_locks(self, session):
+        """Three of Claude's own locks at the 9s a command line gets is 27s
+        of a 30s prompt."""
+        switcher, _registry, _entry, session_dir = session
+        _seed_usage(switcher, pct=10.0)
+        (session_dir / ".credentials.json").unlink()
+        with patch(
+            "claude_swap.session_hooks.write_session_credential",
+            return_value=WriteResult(True, "ok", fingerprint="fp"),
+        ) as writer:
+            assert session_hooks.run_ensure(env=_env(session_dir)) == "refreshed"
+        assert writer.call_args.kwargs["lock_timeout"] == (
+            session_hooks._HOOK_LOCK_TIMEOUT_S
+        )
+
+    def test_a_hook_does_not_sit_out_the_registrys_own_wait(
+        self, session, monkeypatch
+    ):
+        """The registry's 10s default is sized for a command somebody is
+        watching, not for a prompt."""
+        seen = []
+        real = session_hooks.ManagedSessionRegistry
+
+        def spy(backup_dir, **kw):
+            seen.append(kw.get("lock_timeout"))
+            return real(backup_dir, **kw)
+
+        monkeypatch.setattr(session_hooks, "ManagedSessionRegistry", spy)
+        _switcher, _registry, _entry, session_dir = session
+        session_hooks.run_ensure(env=_env(session_dir))
+        session_hooks.run_release(env=_env(session_dir))
+        assert seen == [session_hooks._HOOK_LOCK_TIMEOUT_S] * 2
+
+    def test_the_ancestry_walk_bounds_every_ps_it_runs(self, monkeypatch):
+        """`_ANCESTRY_DEPTH` calls at the module default would be 20s of a
+        SessionEnd budget of 20."""
+        seen = []
+
+        def spy(pid, *, timeout=None):
+            seen.append(timeout)
+            return pid + 1
+
+        monkeypatch.setattr(session_hooks, "parent_pid", spy)
+        assert session_hooks._this_session_is(10_000_000) is False
+        assert seen == [session_hooks._HOOK_PS_TIMEOUT_S] * (
+            session_hooks._ANCESTRY_DEPTH
+        )
+
+    def test_every_wait_one_release_can_reach_fits_the_declared_budget(
+        self, managed_switcher, session_end, monkeypatch
+    ):
+        """The SessionEnd number is declared in one file and spent in
+        another, and overrunning it is not quiet: Claude Code kills the hook
+        there, and what is lost is a profile nobody reclaims until the next
+        sweep.
+
+        So the terms are counted off a run rather than off a list. A
+        subprocess this path grows later enters the sum whether or not
+        anybody remembers this test, which is how the two `ps` calls behind
+        `entry_is_live` and the profile scan came to be missing from the
+        arithmetic in the first place.
+        """
+        entry, session_dir = self._worst_case(managed_switcher)
+        spawned: list[tuple[str, float]] = []
+
+        def fake_run(argv, **kw):
+            spawned.append((argv[0], kw["timeout"]))
+            if argv[0] != "ps":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            # A process that reads as a claude that started after the stamp
+            # is the answer that costs the most: the first `ps` cannot
+            # settle it, so a second one runs, and the row stays live so the
+            # verb goes on down its long path instead of stopping early.
+            out = (
+                "claude /usr/local/bin/claude"
+                if "comm=" in argv[2]
+                else "Wed Sep  2 20:35:59 2026"
+            )
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+
+        probes = [t for command, t in spawned if command == "ps"]
+        assert probes == [session_hooks._HOOK_PS_TIMEOUT_S] * 4
+        # The keychain item is a macOS thing, and its 5s is the one term
+        # cswap does not get to shorten. Adding it from the constant where
+        # the platform never spends it keeps the bound the same everywhere.
+        keychain = (
+            0.0
+            if any(command == "security" for command, _t in spawned)
+            else macos_keychain._TIMEOUT
+        )
+        worst = (
+            sum(t for _command, t in spawned)
+            + keychain
+            # The walk this run does not take: the row names the process
+            # running the hook, so it answers without a `ps`. Its own bound
+            # is the test above.
+            + session_hooks._ANCESTRY_DEPTH * session_hooks._HOOK_PS_TIMEOUT_S
+            + session_hooks._STDIN_WAIT_S       # the SessionEnd event
+            + session_hooks._HOOK_LOCK_TIMEOUT_S  # dropping the row
+        )
+        declared = next(
+            spec.timeout_s for spec in MANAGED_HOOKS if spec.event == "SessionEnd"
+        )
+        assert worst <= declared
+
+    def _worst_case(self, switcher):
+        """A managed session whose every identity probe takes its long
+        branch: a stamp old enough that the live pid reads as a stranger,
+        and a record of its own in the profile to scan."""
+        registry = ManagedSessionRegistry(switcher.backup_dir)
+        stamp = "Wed Sep  2 20:35:59 2020"
+        entry = registry.allocate(
+            "auto-aaaaaaaa", lambda _busy: (B, "backup"),
+            pid=os.getpid(), proc_start=stamp,
+        )
+        session_dir = registry.session_dir(entry.session_id)
+        create_managed_profile(session_dir)
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / f"{entry.pid}.json").write_text(json.dumps({
+            "pid": entry.pid, "cwd": "/work", "procStart": stamp,
+        }))
+        return entry, session_dir
 
 
 class TestLane0Probe:

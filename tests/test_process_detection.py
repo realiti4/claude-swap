@@ -365,7 +365,7 @@ class TestListSessions:
         _write_session(sessions_dir, 1001, procStart=LSTART)
         _write_session(sessions_dir, 1002, procStart=LSTART)
 
-        def started(pid):
+        def started(pid, **_kw):
             return LSTART_S if pid == 1002 else LSTART_S + 86400
 
         with patch("claude_swap.process_detection.is_pid_alive", return_value=True), \

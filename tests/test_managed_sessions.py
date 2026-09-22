@@ -424,7 +424,9 @@ class TestLivenessAndBusy:
             "auto-00000001", _always(B), pid=os.getpid(),
             proc_start="Mon Sep  1 00:00:00 2025",
         )
-        monkeypatch.setattr(ms, "pid_matches_record", lambda pid, stamp: False)
+        monkeypatch.setattr(
+            ms, "pid_matches_record", lambda pid, stamp, **_kw: False
+        )
         assert not entry_is_live(registry.get("auto-00000001"))
         assert registry.live_entries() == []
 
@@ -764,15 +766,15 @@ class TestProfileAndHooks:
         finally:
             locked.chmod(0o700)
 
-    def test_hooks_file_is_an_empty_settings_document(self, registry):
-        """Empty, and harmless to pass: `--settings` outranks the user's own
-        settings file, but Claude Code merges hook entries across settings
-        levels instead of replacing them, so an empty map registers nothing
-        and suppresses none of the user's own hooks."""
+    def test_the_hooks_file_registers_both_hooks(self, registry):
+        """What a managed session is launched with. `--settings` outranks the
+        user's own settings file, but Claude Code merges hook entries across
+        settings levels instead of replacing them, so this adds cswap's two
+        hooks and suppresses none of the user's own."""
         d = _make_profile(registry, "auto-00000001")
         path = ms.write_hooks_file(d)
         assert path == d / "cswap-hooks.json"
-        assert json.loads(path.read_text()) == {"hooks": {}}
+        assert json.loads(path.read_text()) == ms.hooks_settings()
 
     def test_remove_profile_refuses_a_path_it_was_not_told_it_owns(
         self, registry, caplog
@@ -790,6 +792,163 @@ class TestProfileAndHooks:
 
         assert (per_account / "keep.txt").read_text() == "not ours"
         assert any("Refusing to remove" in r.getMessage() for r in caplog.records)
+
+
+def _in_a_clean_child(argv, home) -> subprocess.CompletedProcess:
+    """Run `argv` in a fresh interpreter that can reach nothing of the
+    user's.
+
+    A subprocess is outside every fixture this suite relies on — the autouse
+    `block_real_keychain` fake patches THIS interpreter, and the login
+    keychain is per-user, not per-HOME — so anything run here must be argv
+    that cannot reach a credential. `--version` and the hook verbs with no
+    `CLAUDE_CONFIG_DIR` (which both answer "not-managed" before they read
+    anything) qualify; nothing that resolves, refreshes or writes a token
+    does.
+
+    `HOME` and `XDG_DATA_HOME` both point at a tmp dir because
+    `paths.get_backup_root()` derives from one or the other depending on the
+    platform, and `PATH` is deliberately broken so nothing can be found by
+    name. The timeout is hard: a regression that hangs fails the test.
+    """
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "PATH": "/nonexistent",
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+
+
+class TestHooksFile:
+    """The `--settings` document every managed session is launched with.
+
+    Its shape is Claude Code's, not ours: a `hooks` map keyed by event, each
+    event holding a list of groups, each group a list of handlers with a
+    `type`, a `command` and a `timeout` in seconds. A document that is
+    subtly the wrong shape is ignored without a word, which for this feature
+    is the worst failure available — so the shape is pinned here.
+    """
+
+    def test_both_hooks_are_rendered(self):
+        doc = ms.hooks_settings(invocation=["/usr/bin/cswap"])
+        assert set(doc["hooks"]) == {"UserPromptSubmit", "SessionEnd"}
+        submit = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        assert submit["type"] == "command"
+        assert submit["command"] == "/usr/bin/cswap session ensure"
+        end = doc["hooks"]["SessionEnd"][0]["hooks"][0]
+        assert end["type"] == "command"
+        assert end["command"] == "/usr/bin/cswap session release"
+
+    def test_each_hook_declares_the_time_it_is_allowed(self):
+        """Both numbers are load-bearing, and neither is a default. A prompt
+        hook Claude Code kills mid-pass is worse than one that never ran, and
+        the SessionEnd budget is shared and short (1.5s) unless a hook asks
+        for more — what `release` declares is what the user waits for on the
+        way out, so it covers that verb's own bounds and nothing beyond
+        them (see the arithmetic beside MANAGED_HOOKS)."""
+        doc = ms.hooks_settings(invocation=["cswap"])
+        assert doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 30
+        assert doc["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] == 20
+
+    def test_no_matcher_is_emitted(self):
+        """Neither event is tool-scoped. `UserPromptSubmit` has no matcher at
+        all; `SessionEnd`'s selects why the session ended (`clear`, `logout`,
+        `prompt_input_exit`, …), and the reasons that must not release are
+        judged by `release` itself, off the payload it is handed, rather than
+        by a document written once at launch — omitting the key is what makes
+        a group fire on every occurrence."""
+        doc = ms.hooks_settings(invocation=["cswap"])
+        for entries in doc["hooks"].values():
+            assert "matcher" not in entries[0]
+
+    def test_a_path_with_spaces_is_quoted(self):
+        """The command is a shell string, and the interpreter path comes from
+        wherever cswap was installed — `~/Library/Application Support/...` on
+        a Mac, a venv under a directory the user named."""
+        doc = ms.hooks_settings(
+            invocation=["/opt/my tools/python", "-m", "claude_swap"]
+        )
+        command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        assert command == "'/opt/my tools/python' -m claude_swap session ensure"
+
+    def test_the_default_invocation_does_not_need_a_path_or_a_venv(
+        self, tmp_path
+    ):
+        """The property that matters, not the spelling: the hook runs from
+        inside Claude Code with whatever environment the user's shell had, so
+        it cannot rely on `cswap` being on PATH or on a venv being active.
+        An absolute interpreter and `-m claude_swap` is one way to get that;
+        this asserts it holds by running it with neither."""
+        argv = ms.cswap_invocation()
+        assert Path(argv[0]).is_absolute()
+        result = _in_a_clean_child([*argv, "--version"], tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith("cswap ")
+
+    @pytest.mark.parametrize("spec", ms.MANAGED_HOOKS, ids=lambda s: s.event)
+    def test_every_rendered_command_is_one_the_cli_answers(self, spec, tmp_path):
+        """The rendering and the CLI that has to answer it are two files
+        apart, and every other test here asserts the string this module
+        renders against itself — so a verb renamed or moved on the CLI side
+        would leave all of them green while every managed session ran a
+        command that falls through to the usage error. On UserPromptSubmit
+        that is worse than doing nothing: a hook's stdout on exit 0 is
+        injected into the model's context, so the usage line would end up in
+        every prompt. Hence exit 0 AND nothing on stdout, from the command as
+        shipped, with no CLAUDE_CONFIG_DIR — so both verbs answer
+        "not-managed" and come straight back."""
+        result = _in_a_clean_child(
+            [*ms.cswap_invocation(), *spec.cswap_args], tmp_path
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+
+    def test_an_empty_hook_list_writes_an_empty_map(self, tmp_path):
+        """The shape a caller gets if it asks for no hooks at all, which is
+        also what this file held before there were any to register."""
+        path = ms.write_hooks_file(tmp_path, ())
+        assert json.loads(path.read_text()) == {"hooks": {}}
+
+    def test_an_invocation_with_nothing_in_it_is_refused(self):
+        """It would render the right shape around `session ensure`, which is
+        not a command: a document that looks perfect and fails every
+        prompt."""
+        with pytest.raises(ValueError):
+            ms.hooks_settings(invocation=[])
+
+    @pytest.mark.parametrize("executable", ["", "python3"])
+    def test_an_interpreter_that_cannot_name_itself_is_refused(
+        self, monkeypatch, executable
+    ):
+        """An embedded or frozen host leaves `sys.executable` empty or
+        relative. Rendering it would register a hook that cannot run for the
+        life of every session launched there, with nothing to say so; the
+        launch rolls back on this instead."""
+        monkeypatch.setattr(ms.sys, "executable", executable)
+        with pytest.raises(SessionError):
+            ms.cswap_invocation()
+
+    def test_two_hooks_on_one_event_are_two_groups(self):
+        """Claude Code runs every group an event has, so the rendering must
+        not collapse them: a second hook on an event is another entry, not a
+        replacement for the first."""
+        doc = ms.hooks_settings(
+            [
+                ms.HookSpec("SessionEnd", ("session", "release"), timeout_s=5),
+                ms.HookSpec("SessionEnd", ("sessions",), timeout_s=5),
+            ],
+            invocation=["cswap"],
+        )
+        assert [g["hooks"][0]["command"] for g in doc["hooks"]["SessionEnd"]] == [
+            "cswap session release",
+            "cswap sessions",
+        ]
 
 
 class TestDescribeSessions:

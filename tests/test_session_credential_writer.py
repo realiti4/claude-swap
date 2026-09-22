@@ -180,7 +180,9 @@ class TestWriter:
         assert not (session_dir / ".credentials.json").exists()
 
     def test_aborts_when_pid_was_recycled(self, session_dir, registry, monkeypatch):
-        monkeypatch.setattr(ms, "pid_matches_record", lambda pid, stamp: False)
+        monkeypatch.setattr(
+            ms, "pid_matches_record", lambda pid, stamp, **_kw: False
+        )
         assert _write(session_dir, registry).reason == "session-ended"
         assert not (session_dir / ".credentials.json").exists()
 

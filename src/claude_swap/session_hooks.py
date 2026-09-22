@@ -176,6 +176,25 @@ _REASON_ABSENT = ""
 # shell sits between them; anything deeper is somebody else's business.
 _ANCESTRY_DEPTH = 4
 
+# What a hook waits for something else to let go of. Both verbs run inside
+# a budget Claude Code enforces by killing them, so a wait sized for a
+# command line — the registry's own 10s, `claude_locks.DEFAULT_TIMEOUT_S`
+# at 9s for each of the three locks a credential write takes — is the wrong
+# wait here: three of those alone are 27s of a 30s prompt budget. A hook
+# that cannot get a lock in two seconds has a contended profile, and the
+# answer to that is to leave this prompt alone and let the next one (or the
+# engine's tick) do the work, not to spend the budget waiting.
+_HOOK_LOCK_TIMEOUT_S = 2.0
+
+# The same reasoning for every `ps` either verb can reach, and there are
+# more of them than the ancestry walk: the walk is `_ANCESTRY_DEPTH` calls,
+# the row's own identity probe is one or two, and the profile scan is one or
+# two per record it finds. At `process_detection.PS_TIMEOUT_S` that is most
+# of a SessionEnd budget spent on a process table. Every call site `release`
+# reaches passes this instead, and the budget beside `MANAGED_HOOKS` adds
+# them up.
+_HOOK_PS_TIMEOUT_S = 1.0
+
 # Stamped in the session's own profile when the authoritative resolve last
 # confirmed its borrowed token. Empty by design: the mtime is the payload.
 LANE0_SENTINEL = ".lane0-checked"
@@ -471,7 +490,9 @@ def run_ensure(
         return "not-managed"
     session_dir = Path(environ["CLAUDE_CONFIG_DIR"])
 
-    registry = ManagedSessionRegistry(backup_dir)
+    registry = ManagedSessionRegistry(
+        backup_dir, lock_timeout=_HOOK_LOCK_TIMEOUT_S
+    )
     # Read quietly: `_read`'s warning is sized for a command somebody is
     # watching, and this runs on every prompt of every managed session. A
     # registry that cannot be parsed would otherwise write the same WARNING
@@ -629,6 +650,7 @@ def _refresh(
     result = write_session_credential(
         session_dir, entry.account, resolution.credential,
         resolution.oauth_account, registry=registry,
+        lock_timeout=_HOOK_LOCK_TIMEOUT_S,
     )
     if not result.ok:
         return f"refresh-failed:{result.reason}"
@@ -736,6 +758,7 @@ def _maybe_reassign(
     result = apply_reassignment(
         switcher, registry, entry, decision,
         now_ms=now * 1000.0, buffer_ms=FRESHEN_BUFFER_MS,
+        lock_timeout=_HOOK_LOCK_TIMEOUT_S,
     )
     if result.ok:
         return f"reassigned:{result.reason}"
@@ -764,7 +787,7 @@ def _this_session_is(pid: int) -> bool:
         return True
     ancestor: int | None = os.getppid()
     for _ in range(_ANCESTRY_DEPTH):
-        ancestor = parent_pid(ancestor)
+        ancestor = parent_pid(ancestor, timeout=_HOOK_PS_TIMEOUT_S)
         if ancestor is None or ancestor <= 1:
             return False
         if ancestor == pid:
@@ -918,7 +941,9 @@ def run_release(*, env: Mapping[str, str] | None = None) -> str:
     if session_id is None:
         return "not-managed"
 
-    registry = ManagedSessionRegistry(backup_dir)
+    registry = ManagedSessionRegistry(
+        backup_dir, lock_timeout=_HOOK_LOCK_TIMEOUT_S
+    )
     unreadable = registry.unreadable_reason()
     if unreadable is not None:
         # `get` folds "cannot read" into "no such row", which is the right
@@ -931,7 +956,7 @@ def run_release(*, env: Mapping[str, str] | None = None) -> str:
     entry = registry.get(session_id)
     if entry is None:
         return "no-entry"
-    if entry_is_live(entry):
+    if entry_is_live(entry, timeout=_HOOK_PS_TIMEOUT_S):
         if not _this_session_is(entry.pid):
             _logger.warning(
                 f"Managed session {session_id}: its process {entry.pid} is "
@@ -963,7 +988,9 @@ def run_release(*, env: Mapping[str, str] | None = None) -> str:
         # under the same rules this would have.
         return "no-entry"
     session_dir = registry.session_dir(session_id)
-    sessions, unreadable_records = scan_live_sessions(session_dir)
+    sessions, unreadable_records = scan_live_sessions(
+        session_dir, timeout=_HOOK_PS_TIMEOUT_S
+    )
     if unreadable_records or any(s.pid != entry.pid for s in sessions):
         return "left-in-use"
     if not remove_managed_profile(session_dir):

@@ -51,6 +51,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -66,7 +67,11 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_detection import (
+    PS_TIMEOUT_S,
+    ClaudeSession,
+    scan_sessions,
+)
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -485,7 +490,9 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     return bool(profile_org and org_uuid and profile_org != org_uuid)
 
 
-def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
+def scan_live_sessions(
+    session_dir: Path, *, timeout: float = PS_TIMEOUT_S
+) -> tuple[list[ClaudeSession], int]:
     """Live Claude instances for a profile, and records that could not be read.
 
     Every caller of this gates a destructive step, so the unreadable count
@@ -493,10 +500,13 @@ def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
     nothing is running. Renamed from ``live_sessions_for`` deliberately -- the
     old name returned a bare list, and a call site left on it would read a
     tuple as unconditionally truthy.
+
+    ``timeout`` bounds the per-record identity probe, for the caller that
+    runs inside a session that is ending and has a budget of its own.
     """
     if not session_dir.exists():
         return [], 0
-    return scan_sessions(claude_dir=session_dir)
+    return scan_sessions(claude_dir=session_dir, timeout=timeout)
 
 
 def profile_is_quiescent(session_dir: Path) -> bool:
@@ -576,6 +586,25 @@ def warn_auth_override_env() -> None:
         warning(
             f"Ignoring {', '.join(scrubbed)} for this session — it would "
             "override the selected account inside Claude Code."
+        )
+
+
+def warn_settings_override(claude_args: Sequence[str]) -> None:
+    """Warn that the user's own ``--settings`` displaces this session's hooks.
+
+    A managed session is launched with ``--settings`` pointing at a document
+    holding its ``UserPromptSubmit`` and ``SessionEnd`` hooks, and Claude
+    Code takes the last ``--settings`` on the command line. So a user who
+    passes their own gets a session that looks managed, is registered like
+    one, and keeps none of itself current: both hooks are simply not there,
+    and nothing else says so. The engine's sweep still covers it, which is
+    what makes this a warning rather than a refusal.
+    """
+    if any(a == "--settings" or a.startswith("--settings=") for a in claude_args):
+        warning(
+            "Your own --settings replaces this session's: Claude Code takes "
+            "the last one given, so the hooks that keep this session's token "
+            "current will not be registered. `cswap auto` still maintains it."
         )
 
 

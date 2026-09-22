@@ -5,15 +5,18 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shlex
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import managed_launch as ml
+from claude_swap import managed_sessions as ms
 from claude_swap import oauth
 from claude_swap import session as session_mod
 from claude_swap import session_credentials
@@ -190,8 +193,85 @@ class TestRunAuto:
         assert (config["theme"], config["hasCompletedOnboarding"]) == ("light", True)
         assert (session_dir / "projects").is_symlink()
         assert (session_dir / "history.jsonl").is_symlink()
-        assert json.loads((session_dir / "cswap-hooks.json").read_text()) == {"hooks": {}}
+        assert set(
+            json.loads((session_dir / "cswap-hooks.json").read_text())["hooks"]
+        ) == {"UserPromptSubmit", "SessionEnd"}
         assert calls == [set()]
+
+    def test_the_launch_registers_the_hooks(
+        self, managed_switcher, capture_exec, shared_history, monkeypatch
+    ):
+        """The settings file Claude is actually handed is the one that turns
+        the two hook verbs from commands nobody runs into the thing that
+        keeps a session current and hands its account back."""
+        _serve_usage(monkeypatch, managed_switcher, {"1": True, "2": True, "3": True})
+        call = _launch(managed_switcher)
+
+        assert call.argv[1] == "--settings"
+        doc = json.loads(Path(call.argv[2]).read_text())
+        assert [
+            group["hooks"][0]["command"]
+            for event in ("UserPromptSubmit", "SessionEnd")
+            for group in doc["hooks"][event]
+        ] == [
+            shlex.join([sys.executable, "-m", "claude_swap", "session", verb])
+            for verb in ("ensure", "release")
+        ]
+        # And nothing else: the handler types, the timeouts and the absence
+        # of a matcher are as much of the document as the commands are, and
+        # this is the only test that reads the file Claude is handed.
+        assert doc == ms.hooks_settings()
+
+    @pytest.mark.parametrize(
+        "args", [["--settings", "/tmp/mine.json"], ["--settings=/tmp/mine.json"]]
+    )
+    def test_a_settings_argument_of_their_own_is_warned_about(
+        self, managed_switcher, capture_exec, shared_history, monkeypatch,
+        capsys, args,
+    ):
+        """Claude Code takes the LAST --settings on the command line, so the
+        user's replaces this session's -- and with it both hooks. The session
+        then looks managed, is registered like one, and keeps none of itself
+        current, with nothing anywhere saying so. The launch still happens:
+        the engine's sweep covers such a session, which is what makes this a
+        warning rather than a refusal."""
+        _serve_usage(monkeypatch, managed_switcher, {"1": True, "2": True, "3": True})
+        call = _launch(managed_switcher, args)
+
+        out = capsys.readouterr().out
+        assert "--settings" in out and "cswap auto" in out
+        # Both are still passed, theirs last, which is what makes it theirs.
+        assert call.argv[1] == "--settings"
+        assert call.argv[-2:] == ["--settings", "/tmp/mine.json"] or (
+            call.argv[-1] == "--settings=/tmp/mine.json"
+        )
+
+    def test_a_launch_without_one_says_nothing_about_settings(
+        self, managed_switcher, capture_exec, shared_history, monkeypatch, capsys
+    ):
+        _serve_usage(monkeypatch, managed_switcher, {"1": True, "2": True, "3": True})
+        _launch(managed_switcher, ["--resume"])
+        assert "--settings" not in capsys.readouterr().out
+
+    def test_an_interpreter_that_cannot_name_itself_refuses_up_front(
+        self, managed_switcher, capture_exec, shared_history, monkeypatch
+    ):
+        """The session's hooks are rendered from this interpreter's path, and
+        that rendering happens after the credential has been resolved — which
+        can rotate a refresh token in the slot store. An interpreter that
+        cannot name itself is a static fact, so finding it out down there
+        would burn one refresh per attempt and roll back, every time. It is
+        asked before anything stateful happens instead."""
+        # A placement that would otherwise succeed, so the refusal under
+        # test is the only reason this launch stops.
+        _serve_usage(monkeypatch, managed_switcher, {"1": True, "2": True, "3": True})
+        resolve = Mock(side_effect=AssertionError("resolved a credential"))
+        monkeypatch.setattr(ml, "resolve_access_credential", resolve)
+        monkeypatch.setattr(ms.sys, "executable", "")
+        with pytest.raises(SessionError):
+            ml.run_auto(managed_switcher, [])
+        resolve.assert_not_called()
+        assert _auto_dirs(managed_switcher) == []
 
     def test_second_launch_spreads_to_another_account(
         self, managed_switcher, capture_exec, shared_history, monkeypatch

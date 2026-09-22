@@ -36,9 +36,11 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
+import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,7 @@ from pathlib import Path
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.process_detection import (
+    PS_TIMEOUT_S,
     is_pid_alive,
     pid_matches_record,
     process_start_ticks,
@@ -228,18 +231,185 @@ def remove_managed_profile(session_dir: Path) -> bool:
     return not session_dir.exists()
 
 
-def write_hooks_file(session_dir: Path) -> Path:
+@dataclass(frozen=True)
+class HookSpec:
+    """One hook a managed session runs, as cswap describes it.
+
+    ``cswap_args`` is the cswap command line, not a shell string: the
+    rendering quotes it, so an interpreter path with a space in it survives.
+    """
+
+    event: str
+    cswap_args: tuple[str, ...]
+    timeout_s: int
+
+
+MANAGED_HOOKS: tuple[HookSpec, ...] = (
+    # Every prompt: make sure the session's access token is current, and move
+    # it off an account that has hit a limit. That is what keeps a managed
+    # session going with no `cswap auto` running -- WHEN it runs at all.
+    # Three switches stop it, and somebody chose each of them: safe mode
+    # (`--safe-mode` or CLAUDE_CODE_SAFE_MODE), `disableAllHooks` in
+    # whichever settings file wins precedence, and an organization's managed
+    # `allowManagedHooksOnly`. A session behind one of those never runs this
+    # and falls back to the engine's sweep, which is slower but is the
+    # backstop for all of it.
+    #
+    # 30s is what Claude Code allows a UserPromptSubmit command hook by
+    # default, and asking for more time than the platform thinks a prompt
+    # hook deserves would be the wrong way to make this safe. The common
+    # prompt reaches none of what follows: it reads a handful of small JSON
+    # files and returns.
+    #
+    # The slow path is a prompt that finds the token stale, refreshes it and
+    # writes it back. Its terms are each a timeout on a different resource,
+    # and all of them are sequential. What the hook sets: the registry's own
+    # lock at `session_hooks._HOOK_LOCK_TIMEOUT_S` (2s, not the 10s a
+    # command line gets); three of Claude's own locks at that same 2s rather
+    # than the 9s of `claude_locks.DEFAULT_TIMEOUT_S`, around the credential
+    # write; and the writer's two registry re-checks at
+    # `session_credentials.REGISTRY_CHECK_TIMEOUT_S` (2s each). What it
+    # cannot set: `security` at 5s a call, and this path makes five of them
+    # -- the account's credential resolved, the profile's own item read with
+    # one retry on a fresh budget, the item written, and the result read
+    # back; the writer's own liveness probe, up to two `ps` at
+    # `process_detection.PS_TIMEOUT_S` (5s each, deliberately not shortened
+    # -- `write_session_credential` is the engine's path too, and the engine
+    # has no 30s over it); and the refresh POST at 10s. Summed: about 55s,
+    # against a 30s budget.
+    #
+    # That sum is deliberately left standing rather than bought off with a
+    # bigger number. Reaching it means the keychain is wedged AND the
+    # network is hanging AND a lock is held, and the cost of Claude Code
+    # cancelling the hook there is a prompt that waited, not a prompt that
+    # broke: a timed-out UserPromptSubmit hook does not block the turn, and
+    # everything this verb does is something the next prompt does anyway.
+    #
+    # The 2s on the three credential locks is the one term that costs
+    # something of its own. Claude holds that lock across its own refresh
+    # POST, which can take longer than two seconds, so a write that would
+    # have waited out the 9s default and landed now returns `lock-timeout`
+    # instead. That loses a pass, not a session -- the next prompt takes it
+    # again -- and 27s of a 30s budget spent waiting is the worse trade.
+    HookSpec("UserPromptSubmit", ("session", "ensure"), timeout_s=30),
+    # On exit: drop the registry row and reclaim the profile immediately,
+    # instead of leaving it for the next sweep.
+    #
+    # Claude Code gives all SessionEnd hooks together 1.5s and raises that
+    # budget to the longest timeout any of them declares (to a ceiling of
+    # 60s), so this number is what the user waits for at the end of a
+    # session, not just what this hook is allowed. 1.5s is too tight to be
+    # sure of, and so was the 5s this asked for before the terms were added
+    # up. What one release can spend, in order, on the normal path where the
+    # session's process is still up as it ends -- every `ps` of it shortened
+    # to `session_hooks._HOOK_PS_TIMEOUT_S` (1s) from the module's 5s: up to
+    # two `ps` establishing that the row's process is still the one that
+    # wrote the row; up to `session_hooks._ANCESTRY_DEPTH` (4) more
+    # establishing that this hook runs underneath it; up to
+    # `session_hooks._STDIN_WAIT_S` (2s) for the SessionEnd event on stdin
+    # when the payload is slow; the registry lock at
+    # `session_hooks._HOOK_LOCK_TIMEOUT_S` (2s) to drop the row; up to two
+    # more `ps` per record in the profile -- one record, this session's own,
+    # unless a claude was launched from inside it -- checking that nothing
+    # else is still reading the credential; a `security` subprocess deleting
+    # the keychain item, which cswap does not get to shorten (5s); and an
+    # `rmtree`. Seventeen seconds, so 20 covers it.
+    #
+    # Every one of those is normally milliseconds, and the budget is not a
+    # delay -- it is what the user waits only when something is wedged. Being
+    # killed part-way is not dangerous either -- the row goes first, so what
+    # is left is an orphan directory the sweep already collects -- but it is
+    # a reclaim that silently did not happen, and a budget the hook's own
+    # bounds overshoot would make that the ordinary outcome of a slow exit.
+    HookSpec("SessionEnd", ("session", "release"), timeout_s=20),
+)
+
+
+def cswap_invocation() -> list[str]:
+    """How a managed session runs cswap.
+
+    ``sys.executable -m claude_swap`` rather than the ``cswap`` console
+    script: the hook inherits the user's PATH, where the script may not be at
+    all (a uv tool install, a venv the session was not started from), and
+    where a ``claude`` shim may sit ahead of things. The interpreter that
+    launched the session is the one cswap is installed into, by construction.
+
+    Raises :class:`SessionError` when that interpreter cannot be named. An
+    embedded or frozen host leaves ``sys.executable`` empty or relative, and
+    rendering it anyway would write a document that is perfectly well formed
+    and inert — every prompt of every session launched that way running a
+    command that cannot exist, with nothing to say so. A launch that fails
+    here rolls back; a launch that succeeds has hooks that work.
+    """
+    if not sys.executable or not Path(sys.executable).is_absolute():
+        raise SessionError(
+            "Cannot work out how to run cswap from inside a managed session: "
+            f"this interpreter does not name itself ({sys.executable!r}). "
+            "Managed sessions need an interpreter cswap can be invoked "
+            "through by absolute path."
+        )
+    return [sys.executable, "-m", "claude_swap"]
+
+
+def hooks_settings(
+    hooks: Sequence[HookSpec] | None = None,
+    *,
+    invocation: Sequence[str] | None = None,
+) -> dict:
+    """The ``--settings`` document for a managed session.
+
+    Claude merges hook entries across settings levels rather than replacing
+    them, so this ADDS to whatever the user configured; it can never suppress
+    a hook of theirs. Raises ``ValueError`` for an invocation with nothing in
+    it, and :class:`SessionError` (from :func:`cswap_invocation`) when there
+    is no interpreter to name.
+
+    No ``matcher`` key, for a different reason per event. ``UserPromptSubmit``
+    has no matcher support at all — it fires on every prompt — so a matcher
+    there would be a claim about a field it does not carry. ``SessionEnd``
+    does have one, and it selects WHY the session ended: ``clear``,
+    ``resume``, ``logout``, ``prompt_input_exit`` or ``other``. Two of them
+    — ``clear`` and ``resume`` — leave the session running, and ``release``
+    must not act on those. Deciding that here as well would put the rule in two places, and
+    this is the weaker of the two. This document is written once, at launch,
+    and lives for the whole session: a reason Claude Code adds later reaches
+    a matcher written today as an event this hook never sees, whereas
+    ``release`` reads the reason off the payload every time it runs and
+    refuses anything it does not recognise. The payload check is also the
+    only one that covers a ``cswap session release`` typed by hand inside a
+    live session, which no matcher is in the path of. So the group fires on
+    every occurrence and the verb decides.
+    """
+    specs = MANAGED_HOOKS if hooks is None else hooks
+    argv = list(invocation if invocation is not None else cswap_invocation())
+    if not argv:
+        # Rendering this would produce a well-formed document whose command
+        # is "session ensure" — a hook that fails on every prompt, with the
+        # settings file looking exactly right.
+        raise ValueError("a hook invocation needs something to run")
+    by_event: dict[str, list] = {}
+    for spec in specs:
+        by_event.setdefault(spec.event, []).append({
+            "hooks": [{
+                "type": "command",
+                "command": shlex.join([*argv, *spec.cswap_args]),
+                "timeout": spec.timeout_s,
+            }],
+        })
+    return {"hooks": by_event}
+
+
+def write_hooks_file(
+    session_dir: Path, hooks: Sequence[HookSpec] | None = None
+) -> Path:
     """Write the ``--settings`` document a managed session is launched with.
 
-    Empty (``{"hooks": {}}``) today. Passing it is still a no-op for the
-    user's own configuration: ``--settings`` sits above the user, project
-    and local settings files, but hook entries merge across those levels
-    instead of replacing each other, so an empty map contributes nothing
-    and suppresses nothing. The file and the ``--settings`` argument stay
-    because the launch that needs a hook should only have to fill this in.
+    ``--settings`` outranks the user's own settings files, but hook entries
+    merge across levels instead of replacing each other, so what this adds
+    is additional to the user's own hooks and takes none of them away.
     """
     path = session_dir / HOOKS_FILENAME
-    atomic_write_json(path, {"hooks": {}})
+    atomic_write_json(path, hooks_settings(hooks))
     return path
 
 
@@ -322,9 +492,17 @@ class ManagedEntry:
         )
 
 
-def entry_is_live(entry: ManagedEntry) -> bool:
-    """The entry's process is running and is the one we stamped."""
-    return is_pid_alive(entry.pid) and pid_matches_record(entry.pid, entry.proc_start)
+def entry_is_live(entry: ManagedEntry, *, timeout: float = PS_TIMEOUT_S) -> bool:
+    """The entry's process is running and is the one we stamped.
+
+    ``timeout`` is the identity probe's ``ps`` budget. It is a parameter
+    because this is reached from inside a session that is ending, where the
+    hook's own declared budget is the one that has to hold and the module
+    default would eat most of it.
+    """
+    return is_pid_alive(entry.pid) and pid_matches_record(
+        entry.pid, entry.proc_start, timeout=timeout
+    )
 
 
 # Claude's own status for a session: "busy" while it is working, "idle" once

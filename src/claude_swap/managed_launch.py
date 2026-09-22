@@ -44,6 +44,7 @@ from claude_swap.managed_sessions import (
     ManagedEntry,
     ManagedSessionRegistry,
     create_managed_profile,
+    cswap_invocation,
     new_session_id,
     process_stamp,
     remove_managed_profile,
@@ -58,6 +59,7 @@ from claude_swap.session import (
     session_profile_env,
     warn_auth_override_env,
     warn_config_dir_override,
+    warn_settings_override,
 )
 from claude_swap.session_credentials import write_session_credential
 from claude_swap.settings import load_settings, parse_model_names
@@ -261,8 +263,10 @@ def _prepare_profile(
 
     Raises:
         _ProfileCollision: The profile directory already existed.
-        SessionError: No usable token, or the credential could not be
-            written.
+        SessionError: No usable token, the credential could not be
+            written, or this interpreter cannot name itself for the hook
+            commands (``run_auto`` refuses that before any of this runs;
+            the check lives with the rendering as well).
     """
     session_dir = registry.session_dir(entry.session_id)
     resolution = resolve_access_credential(
@@ -328,20 +332,29 @@ def run_auto(
     """Place, prepare and exec a managed session. Never returns on success.
 
     Raises:
-        SessionError: Windows, no claude on PATH, no account with room, or
-            the profile could not be seeded. Anything that fails after the
+        SessionError: Windows, no claude on PATH, no interpreter to run
+            this session's hooks through, no account with room, or the
+            profile could not be seeded. Anything that fails after the
             account is reserved takes the reservation and the half-built
             profile back down with it.
     """
     if switcher.platform == Platform.WINDOWS:
         raise SessionError(WINDOWS_REFUSAL)
     claude_bin = resolve_claude_binary()
+    # For the refusal, not the value: the session's hooks are rendered from
+    # this interpreter's own path, deep inside `_prepare_profile`, and an
+    # interpreter that cannot name itself is a static fact about this
+    # process. Finding it out down there would mean resolving a credential
+    # first — which can rotate a refresh token — and then rolling back, once
+    # per attempt, forever. It costs nothing to ask now.
+    cswap_invocation()
     manager = manager or SessionManager(switcher)
 
     preset = os.environ.get("CLAUDE_CONFIG_DIR")
     if preset:
         warn_config_dir_override(preset)
     warn_auth_override_env()
+    warn_settings_override(claude_args)
 
     # The launch path waits longer for the registry lock than the pollers
     # do: `allocate` holds it across a `ps` per entry and a record read per
