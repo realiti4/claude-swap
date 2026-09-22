@@ -903,3 +903,48 @@ class TestReadSessionState:
         self._write_record(tmp_path, 4242, {"pid": 4242, "status": 7})
         state = ms.read_session_state(tmp_path, 4242)
         assert (state.has_record, state.status) == (True, None)
+
+
+class TestManagedSessionIdFor:
+    def test_a_managed_profile_resolves(self, tmp_path):
+        root = ms.sessions_root(tmp_path)
+        (root / "auto-0123abcd").mkdir(parents=True)
+        assert ms.managed_session_id_for(
+            str(root / "auto-0123abcd"), tmp_path
+        ) == "auto-0123abcd"
+
+    def test_a_trailing_slash_still_resolves(self, tmp_path):
+        root = ms.sessions_root(tmp_path)
+        (root / "auto-0123abcd").mkdir(parents=True)
+        assert ms.managed_session_id_for(
+            f"{root / 'auto-0123abcd'}/", tmp_path
+        ) == "auto-0123abcd"
+
+    def test_a_run_profile_does_not(self, tmp_path):
+        root = ms.sessions_root(tmp_path)
+        (root / "2-work").mkdir(parents=True)
+        assert ms.managed_session_id_for(str(root / "2-work"), tmp_path) is None
+
+    def test_a_managed_name_outside_the_sessions_root_does_not(self, tmp_path):
+        elsewhere = tmp_path / "elsewhere" / "auto-0123abcd"
+        elsewhere.mkdir(parents=True)
+        assert ms.managed_session_id_for(str(elsewhere), tmp_path) is None
+
+    def test_the_default_login_does_not(self, tmp_path):
+        assert ms.managed_session_id_for(str(tmp_path / ".claude"), tmp_path) is None
+
+    def test_a_symlinked_backup_root_still_resolves(self, tmp_path):
+        """The launched-with string is what identifies a session, so a config
+        dir reached through a symlinked backup root is the same session —
+        which only ``samefile`` can tell, since the two paths differ."""
+        real = tmp_path / "real"
+        (ms.sessions_root(real) / "auto-0123abcd").mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        assert ms.managed_session_id_for(
+            str(ms.sessions_root(link) / "auto-0123abcd"), real
+        ) == "auto-0123abcd"
+
+    def test_unset_config_dir_does_not(self, tmp_path):
+        assert ms.managed_session_id_for(None, tmp_path) is None
+        assert ms.managed_session_id_for("", tmp_path) is None

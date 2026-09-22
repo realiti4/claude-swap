@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -93,6 +94,41 @@ def new_session_id() -> str:
 
 def is_managed_session_id(name: str) -> bool:
     return bool(_SESSION_ID_RE.match(name))
+
+
+def managed_session_id_for(
+    config_dir: str | Path | None, backup_dir: Path
+) -> str | None:
+    """The managed session id ``config_dir`` names, or None for anything else.
+
+    The one question the prompt hooks ask before doing any work at all, so it
+    must be cheap and must never guess: a per-account ``cswap run N`` profile
+    and the default login both live one directory away from a managed
+    profile, and writing a managed session's credential into either would
+    hand a Claude that owns its own lineage an access-only copy of it.
+
+    Matched on the directory NAME plus its parent. The parent is compared by
+    path first and only then with ``samefile``, which resolves symlinks:
+    Claude hashes the raw ``CLAUDE_CONFIG_DIR`` string into the profile's
+    keychain item name, so the string the session was launched with is what
+    identifies it, while a symlinked backup root must still resolve.
+    """
+    if not config_dir:
+        return None
+    path = Path(config_dir)
+    if not is_managed_session_id(path.name):
+        return None
+    root = sessions_root(backup_dir)
+    if path.parent == root:
+        return path.name
+    try:
+        if os.path.samefile(path.parent, root):
+            return path.name
+    except OSError:
+        # One of the two is missing or unreadable: not a managed profile as
+        # far as anything here can tell.
+        return None
+    return None
 
 
 def process_stamp(pid: int) -> str | None:
