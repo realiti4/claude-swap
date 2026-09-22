@@ -51,6 +51,17 @@ _logger = logging.getLogger("claude-swap")
 # profile). UnicodeDecodeError is a byte-corrupt file read as text.
 _STORE_FAILURES = (ClaudeSwitchError, OSError, UnicodeDecodeError)
 
+# Freshen targets whose access token expires within this window: twice Claude
+# Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
+# expired" re-read holds with margin after our swap.
+#
+# It lives here, beside the `buffer_ms` parameter every function in this
+# module takes, rather than in `autoswitch` where it started. The session
+# hook reads it on every prompt and importing `autoswitch` for it cost about
+# 9ms of an 81ms module import; this module was already on that path.
+# `autoswitch` re-exports it, so its own callers are unchanged.
+FRESHEN_BUFFER_MS = 10 * 60 * 1000
+
 
 def slot_for_account(switcher: ClaudeAccountSwitcher, account: AccountRef) -> str | None:
     data = switcher._get_sequence_data() or {}

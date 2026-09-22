@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, paths, printer, tls
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, error_envelope
 from claude_swap.printer import (
@@ -263,6 +263,82 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _session_command(argv: list[str]) -> None:
+    """Handle `cswap session ensure`: the hooks a managed session runs,
+    dispatched ahead of every other CLI setup.
+
+    These run inside somebody's Claude Code session on every prompt, so
+    this path does no theme detection (its terminal query would go into
+    Claude's pipe), builds no parser, and prints nothing on the hook verb.
+    Anything else is a person typing, so that one does print, in the ASCII
+    it is written in: this runs above the output setup, so the message
+    cannot assume the console can render anything else.
+
+    `cswap session` is a character away from `cswap sessions`, and neither
+    it nor its verb appears in any help output, so the likeliest reader of
+    that message is somebody who meant the other command. It says so, and
+    says what this one is for, rather than offering a verb nobody should
+    run by hand.
+
+    The exit code is the other half of that. 2 is what Claude Code reads as
+    a blocking hook decision, and every other path here exits 0 by
+    construction; this branch is reachable from a stale or hand-edited
+    ``--settings`` document naming a verb this build no longer has. So the
+    usage error is for a terminal: with stdout attached to one it prints and
+    exits 2 like any other misuse, and otherwise it exits 0 without a word,
+    because the only other caller is a hook whose turn must not be blocked
+    over a spelling.
+
+    The verb body — its import included — is what carries the hook's
+    fail-open promise here. ``session_hooks.ensure`` swallows everything
+    it can reach, but it cannot swallow its own import, and this dispatch
+    runs above ``main``'s try. A broken install (a half-written module, a
+    dependency the interpreter cannot load) would otherwise exit non-zero
+    from a ``UserPromptSubmit`` hook, which blocks the user's turn — the
+    one outcome the hook exists to make impossible.
+    """
+    verb = argv[0] if argv else ""
+    # `len(argv) == 1`: the verb takes nothing, and quietly running the hook
+    # while dropping the rest would hide a typo in a flag somebody adds
+    # later. An argument it does not know is a usage error like any other.
+    if verb == "ensure" and len(argv) == 1:
+        try:
+            from claude_swap import session_hooks
+
+            code = session_hooks.ensure()
+        except BaseException:  # noqa: BLE001 - fail open, unconditionally
+            code = 0
+        sys.exit(code)
+    if not _stdout_is_a_terminal():
+        sys.exit(0)
+    # A literal, not `_prog_name()`: that is `sys.argv[0]`, which can hold
+    # anything, and this runs above `force_utf8_output()` — so a console
+    # that cannot encode it would turn this message into a traceback. The
+    # verb is ASCII by construction, and so is the rest of this.
+    error(
+        "Usage: cswap session ensure\n"
+        "`cswap session` is internal: `cswap run --auto` registers this "
+        "verb as a Claude Code\nhook inside each managed session, and it "
+        "takes no arguments of its own.\nDid you mean `cswap sessions`, "
+        "which lists the managed sessions you have running?"
+    )
+    sys.exit(2)
+
+
+def _stdout_is_a_terminal() -> bool:
+    """Whether stdout is attached to a terminal, without ever raising.
+
+    A detached or closed stdout answers by raising rather than returning
+    False, and this decides an exit code on a path whose whole promise is
+    that it does not fail — so anything but a clear yes counts as "not a
+    person", which is the side that exits 0.
+    """
+    try:
+        return bool(sys.stdout is not None and sys.stdout.isatty())
+    except Exception:  # noqa: BLE001 - a stdout that cannot answer is a no
+        return False
 
 
 def _sessions_command(argv: list[str]) -> None:
@@ -1006,31 +1082,6 @@ Examples:
         sys.exit(130)
 
 
-def _use_native_tls() -> None:
-    """Route TLS trust decisions through the OS-native verifier.
-
-    Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
-    chain. Python's stdlib ``ssl`` uses OpenSSL, which on Windows loads the
-    system cert store as a flat set and matches CA certs by *subject name*, so a
-    stale, expired duplicate of an intermediate (e.g. an old ``ISRG Root X2``
-    left in the user's store) can shadow the valid path and fail verification
-    with "certificate has expired" even though the served chain is valid — which
-    silently breaks inactive-account token refresh. The OS-native verifiers
-    (SChannel on Windows, SecureTransport on macOS) build the chain correctly
-    and don't trip on the expired duplicate — the same reason Claude Code (Node,
-    with its own bundled roots) is unaffected. ``truststore`` delegates to them.
-
-    Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety.
-    """
-    try:
-        import truststore
-
-        truststore.inject_into_ssl()
-    except Exception:
-        pass
-
-
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -1091,9 +1142,22 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
-    force_utf8_output()
-    _use_native_tls()
     argv = sys.argv[1:]
+    # First, before anything else in this function: the managed-session
+    # hooks run on every prompt of every managed session, and the theme
+    # probe below can write a terminal query that would land in Claude
+    # Code's pipe. Dispatching here skips the shared setup underneath as
+    # well, which is the one place in this CLI where that happens. The
+    # hook verbs print nothing, so the output setup buys them nothing
+    # (the unknown-verb usage error underneath does print, and is ASCII
+    # by construction); and the native TLS verifier is installed by
+    # `session_hooks.run_ensure` itself, on the far side of its gate,
+    # where the one path that can open a connection lives.
+    if argv and argv[0] == "session":
+        _session_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    force_utf8_output()
+    tls.use_native_tls()
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`

@@ -47,6 +47,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.managed_refresh import (
+    FRESHEN_BUFFER_MS,
     PUSH_LOCK_TIMEOUT_S,
     AccessResolution,
     PushResult,
@@ -156,11 +157,6 @@ _SESSION_REFRESH_REMEDIES: dict[str, str] = {
     "transient": "store or network trouble — cswap retries every tick",
 }
 
-
-# Freshen targets whose access token expires within this window: twice Claude
-# Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
-# expired" re-read holds with margin after our swap.
-FRESHEN_BUFFER_MS = 10 * 60 * 1000
 
 # Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
 # with the rest of the cadence numbers). Recheck at the exhausted-account poll

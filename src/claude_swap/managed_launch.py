@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap.autoswitch import FRESHEN_BUFFER_MS, quarantined_numbers
+from claude_swap.autoswitch import quarantined_numbers
 from claude_swap.balance import (
     AccountScore,
     BalanceParams,
@@ -31,6 +31,7 @@ from claude_swap.balance import (
 )
 from claude_swap.exceptions import SessionError
 from claude_swap.managed_refresh import (
+    FRESHEN_BUFFER_MS,
     account_config,
     busy_by_slot,
     resolve_access_credential,

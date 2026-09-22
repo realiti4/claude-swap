@@ -675,8 +675,17 @@ class ManagedSessionRegistry:
     def entries(self) -> dict[str, ManagedEntry]:
         return self._read()
 
-    def get(self, session_id: str) -> ManagedEntry | None:
-        return self._read().get(session_id)
+    def get(self, session_id: str, *, warn: bool = True) -> ManagedEntry | None:
+        """One row, with "absent" and "unreadable" folded together.
+
+        ``warn=False`` for a caller that runs often enough for the warning
+        to be the problem — a hook on every prompt would write the same
+        line several times a minute for as long as the file stayed corrupt,
+        which is how the engine's own history gets pushed out of the log.
+        Such a caller asks :meth:`unreadable_reason` once it has a None, so
+        the two cases are still told apart where it matters.
+        """
+        return self._read(warn=warn).get(session_id)
 
     def get_locked(
         self, session_id: str, *, timeout: float | None = None

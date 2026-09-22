@@ -1805,6 +1805,180 @@ class TestDisableEnableDispatch:
         assert excinfo.value.code == 2
 
 
+class TestSessionCommand:
+    """`cswap session ensure`: the hook a managed session runs per prompt."""
+
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def test_ensure_dispatches_and_exits_zero(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0) as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        hook.assert_called_once()
+        out = capsys.readouterr()
+        assert out.out == ""
+
+    def test_the_hook_dispatch_never_probes_the_terminal(self):
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0),
+            patch("claude_swap.appearance.cli_should_probe") as probe,
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        probe.assert_not_called()
+
+    def test_the_hook_dispatch_skips_the_shared_cli_setup(self):
+        """The one path in this CLI that runs neither piece of the shared
+        setup. Skipping the output setup is the point (the hook verbs print
+        nothing, and this runs on every prompt of every managed session);
+        skipping the verifier is not, so the hook installs it itself past
+        its own gate — see
+        ``test_session_hooks.py::test_the_slow_path_installs_the_native_tls_verifier``.
+        """
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0),
+            patch("claude_swap.cli.force_utf8_output") as utf8,
+            patch("claude_swap.tls.use_native_tls") as tls,
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        utf8.assert_not_called()
+        tls.assert_not_called()
+
+    def test_a_hook_that_cannot_even_be_imported_still_exits_zero(
+        self, monkeypatch, capsys
+    ):
+        """The fail-open promise has to cover the import too. This dispatch
+        runs above main()'s own guard, and `ensure` cannot swallow the
+        failure to load the module that defines it — so a half-installed
+        cswap would block every prompt of every managed session."""
+        import claude_swap
+
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name == "claude_swap.session_hooks":
+                    raise ImportError("half-installed")
+                return None
+
+        monkeypatch.delattr(claude_swap, "session_hooks", raising=False)
+        monkeypatch.delitem(sys.modules, "claude_swap.session_hooks", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [Blocker(), *sys.meta_path])
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_an_unknown_verb_is_a_usage_error(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "nope"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        assert "cswap session ensure" in capsys.readouterr().err
+
+    def test_the_usage_error_points_at_the_command_they_probably_wanted(
+        self, capsys
+    ):
+        """`cswap session` is one character from `cswap sessions`, is hidden,
+        and appears in no help output, so whoever reads this message almost
+        certainly meant the other command. Saying only "usage: session
+        {ensure|release}" answers them with two verbs they must not run and
+        a command they have never heard of."""
+        with (
+            patch("sys.argv", ["cswap", "session"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        err = capsys.readouterr().err
+        assert "cswap sessions" in err
+        assert "cswap run --auto" in err and "hook" in err
+
+    @pytest.mark.parametrize("extra", ["--json", "-x", "release"])
+    def test_a_verb_with_arguments_of_its_own_is_a_usage_error(
+        self, capsys, extra
+    ):
+        """The verbs take nothing. Running the hook anyway and dropping the
+        rest would make a typo in a flag somebody adds later invisible: the
+        hook does its work, the flag does nothing, and the exit code says
+        everything went fine."""
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure", extra]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            patch("claude_swap.session_hooks.ensure") as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        hook.assert_not_called()
+        assert "cswap session" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [["nope"], [], ["ensure", "--json"]])
+    def test_a_misuse_nobody_is_watching_exits_zero_and_says_nothing(
+        self, capsys, argv
+    ):
+        """Exit 2 is the one code Claude Code reads as a blocking hook
+        decision, and every other path here exits 0 by construction. This
+        branch is reachable without a person: a stale or hand-edited
+        `--settings` document naming a verb this build no longer has would
+        otherwise block every prompt of that session. So the usage error is
+        for a terminal, and anything else gets the silence a hook expects."""
+        with (
+            patch("sys.argv", ["cswap", "session", *argv]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=False),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_a_stdout_that_cannot_say_whether_it_is_a_terminal_is_not_one(self):
+        """`isatty` raises on a detached or closed stdout, and this decides
+        an exit code on the path whose whole promise is that it does not
+        fail. Anything but a clear yes is the side that exits 0."""
+        class Detached:
+            def isatty(self):
+                raise ValueError("I/O operation on closed file")
+
+        with patch("sys.stdout", Detached()):
+            assert cli._stdout_is_a_terminal() is False
+        with patch("sys.stdout", None):
+            assert cli._stdout_is_a_terminal() is False
+
+    def test_the_usage_error_says_nothing_it_cannot_encode(self, capsys):
+        """This branch runs above the output setup, so the console may still
+        be on an encoding that cannot render whatever `argv[0]` holds — a
+        path with an accent in it, a shim someone named in Cyrillic. Spelling
+        the program name out of `argv[0]` here would turn a usage error into
+        a traceback on exactly the consoles least able to show one, so the
+        message is a literal and stays ASCII whatever it was invoked as."""
+        with (
+            patch("sys.argv", ["/Users/josé/bin/cswäp", "session", "nope"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert err.strip() != ""
+        assert err.isascii()
+
+
 class TestSessionsCommand:
     pytestmark = pytest.mark.skipif(
         sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
