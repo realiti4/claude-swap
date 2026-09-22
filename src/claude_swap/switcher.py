@@ -1840,9 +1840,27 @@ class ClaudeAccountSwitcher:
 
     @staticmethod
     def _disabled_from_data(data: dict, account_num: str) -> bool:
-        """Whether a slot is flagged out of rotation in already-loaded data."""
-        record = data.get("accounts", {}).get(str(account_num))
-        return bool(record and record.get("disabled"))
+        """Whether a slot is flagged out of rotation in already-loaded data.
+
+        Total by construction. Anything the payload does not actually supply
+        — no ``accounts`` map, a map that is not a JSON object, no record for
+        this slot, a record that is not a JSON object — reads as "not
+        disabled", which is the permissive answer: the slot stays in
+        rotation and the caller carries on.
+
+        The guard was already half here (a missing record answered False via
+        ``record and``); a hand-edited or pre-schema ``sequence.json`` simply
+        took the same path with a value of the wrong type and raised a bare
+        ``AttributeError`` instead. That escapes ``ClaudeSwitchError``, so
+        ``cli.py`` renders it as a traceback and ``--json`` emits no envelope
+        at all — the failure mode ``_read_json``'s own isinstance check
+        exists to prevent one level up.
+        """
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            return False
+        record = accounts.get(str(account_num))
+        return isinstance(record, dict) and bool(record.get("disabled"))
 
     def is_account_disabled(self, account_num: str) -> bool:
         """Whether a slot is currently held out of rotation."""
