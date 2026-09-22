@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -57,7 +57,40 @@ def slot_for_account(switcher: ClaudeAccountSwitcher, account: AccountRef) -> st
     return switcher._find_account_slot(data, account.email, account.organization_uuid)
 
 
-def _account_config(switcher: ClaudeAccountSwitcher, number: str, email: str) -> dict:
+def busy_by_slot(
+    switcher: ClaudeAccountSwitcher, counts: Mapping[AccountRef, int]
+) -> dict[str, int]:
+    """``ManagedSessionRegistry.busy_counts`` re-keyed from account identity
+    to slot number, for the balance policy's ``busy_sessions``.
+
+    The registry counts by ``AccountRef`` because that is what a managed
+    session row carries; both callers of the balance policy — the launch
+    path's placement and the engine's lane-0 ranking — want the same counts
+    per slot. They used to arrive there by opposite routes (the engine
+    looking each account's slot up, the launch path walking its candidate
+    identities), which is two places for the same mapping to drift. One
+    roster read serves the whole mapping here, so it is also one read
+    rather than one per account. Accounts no slot holds any more are
+    dropped, and a slot with no busy session is simply absent — both
+    callers' ``busy`` reads default to 0.
+
+    Raises:
+        ClaudeSwitchError/OSError/UnicodeDecodeError: The roster could not
+            be read. Nothing is known about any account's slot then, so the
+            caller decides what an uncounted load costs it.
+    """
+    data = switcher._get_sequence_data() or {}
+    by_slot: dict[str, int] = {}
+    for account, count in counts.items():
+        number = switcher._find_account_slot(
+            data, account.email, account.organization_uuid
+        )
+        if number is not None:
+            by_slot[number] = by_slot.get(number, 0) + count
+    return by_slot
+
+
+def account_config(switcher: ClaudeAccountSwitcher, number: str, email: str) -> dict:
     """A slot's stored ``.claude.json`` snapshot; ``{}`` when missing or unusable."""
     text = switcher.read_account_config(number, email)
     try:
@@ -68,7 +101,7 @@ def _account_config(switcher: ClaudeAccountSwitcher, number: str, email: str) ->
 
 
 def _oauth_account_for(switcher: ClaudeAccountSwitcher, number: str, email: str) -> dict | None:
-    oauth_account = _account_config(switcher, number, email).get("oauthAccount")
+    oauth_account = account_config(switcher, number, email).get("oauthAccount")
     if isinstance(oauth_account, dict) and oauth_account.get("emailAddress"):
         return oauth_account
     return None

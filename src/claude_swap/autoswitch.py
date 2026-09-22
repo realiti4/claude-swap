@@ -46,7 +46,7 @@ from claude_swap import balance, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.managed_refresh import PushResult, push_refresh, slot_for_account
+from claude_swap.managed_refresh import PushResult, busy_by_slot, push_refresh
 from claude_swap.managed_sessions import (
     AccountRef,
     ManagedEntry,
@@ -1083,27 +1083,23 @@ class AutoSwitchEngine:
         The busy definition (an idle or waiting session holds a profile but
         is not burning its account's 5h window; a reservation with no
         Claude record yet does count) lives in ``registry.busy_counts``,
-        shared with placement (``managed_launch.choose_placement``'s
-        caller) so the two can never disagree about what "busy" means. This
-        only maps that result from account identity to slot number.
+        and re-keying that count to slot numbers in
+        ``managed_refresh.busy_by_slot``, shared with the launch path's
+        placement, so neither what "busy" means nor where it lands can
+        disagree between the two.
         """
-        counts: dict[str, int] = {}
-        for account, count in registry.busy_counts(entries).items():
-            try:
-                number = slot_for_account(self.switcher, account)
-            except (ClaudeSwitchError, OSError, UnicodeDecodeError) as e:
-                # Unreadable sequence data: rank without this account's load
-                # rather than lose the whole tick's counts over it — but say
-                # so, or lane 0 ranks as if the account carried no session
-                # load at all and nothing anywhere names the reason.
-                _logger.warning(
-                    f"Managed-session load on {account.email} not counted "
-                    f"this tick: the account roster could not be read ({e})"
-                )
-                continue
-            if number is not None:
-                counts[number] = counts.get(number, 0) + count
-        return counts
+        try:
+            return busy_by_slot(self.switcher, registry.busy_counts(entries))
+        except (ClaudeSwitchError, OSError, UnicodeDecodeError) as e:
+            # Unreadable sequence data: rank without the managed load rather
+            # than lose the whole tick over it — but say so, or lane 0 ranks
+            # as if no account carried a session and nothing anywhere names
+            # the reason.
+            _logger.warning(
+                f"Managed-session load not counted this tick: the account "
+                f"roster could not be read ({e})"
+            )
+            return {}
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None

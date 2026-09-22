@@ -7865,10 +7865,10 @@ class TestManagedSessionUpkeep:
     ):
         b1 = self._add(harness, self.SID_B1, "b@example.com")
 
-        def torn(switcher, account):
+        def torn(switcher, counts):
             raise ClaudeSwitchError("sequence.json is unreadable")
 
-        monkeypatch.setattr(autoswitch_mod, "slot_for_account", torn)
+        monkeypatch.setattr(autoswitch_mod, "busy_by_slot", torn)
         with caplog.at_level("WARNING", logger="claude-swap"):
             outcome = harness.tick_with_usage(self._usage_all())
 
@@ -7880,8 +7880,8 @@ class TestManagedSessionUpkeep:
             r.getMessage() for r in caplog.records
             if "Managed-session load" in r.getMessage()
         ] == [
-            "Managed-session load on b@example.com not counted this tick: "
-            "the account roster could not be read (sequence.json is unreadable)"
+            "Managed-session load not counted this tick: the account roster "
+            "could not be read (sequence.json is unreadable)"
         ]
         # The push looks the slot up on its own account by account, so it is
         # untouched by the count giving up on one.
