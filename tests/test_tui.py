@@ -1543,6 +1543,22 @@ class TestEventText:
 
         assert event.human() in event_text(event).plain
 
+    def test_a_session_move_reads_as_an_action_not_a_warning(self):
+        """A move is something the engine DID, like a switch — rendered in
+        the log's neutral foreground it would be indistinguishable from the
+        poll lines it sits between."""
+        from claude_swap.autoswitch import SessionReassignedEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
+
+        event = SessionReassignedEvent(
+            session_id="auto-aaaaaaaa", number="3",
+            from_email="b@x.com", to_email="c@x.com", reason="idle",
+        )
+        text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
+        assert event.human() in text.plain
+        assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
+
     def test_event_text_uses_light_accent_for_switch(self):
         from claude_swap.tui.autoview import event_text
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette

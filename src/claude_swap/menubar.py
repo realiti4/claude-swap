@@ -516,6 +516,39 @@ def framework_build_warning(
     )
 
 
+def notification_for(event) -> tuple[str, str] | None:
+    """Title and body for an auto-switch event worth a macOS notification,
+    or None for one the menu bar stays quiet about.
+
+    Out here rather than inside ``run``'s drain loop so it can be read and
+    tested without rumps: which engine events interrupt the user is a
+    product decision, and the loop that delivers them cannot be imported off
+    macOS. A dry-run switch is silent: nothing here can produce one today —
+    the menu bar builds its engine with ``dry_run=False`` and the TUI's
+    preview runs in another process — so the guard is there for the day
+    something does, on the principle that a notification about a switch
+    that never happened is worse than no notification. Every unlisted kind
+    (polls, sleeps, per-account refreshes) belongs in the log, not on
+    screen.
+    """
+    kind = event.kind
+    if kind == "switch":
+        if getattr(event, "dry_run", False):
+            return None
+        return ("Auto-switched account", event.human())
+    titles = {
+        "account-quarantined": "Account quarantined",
+        "session-reassigned": "Managed session moved",
+        "all-exhausted": "All accounts exhausted",
+        # e.g. an autoswitch.model name no account reports — the engine emits
+        # it once per run; dropping it would leave a menu-bar user with a
+        # silently inert filter.
+        "config-warning": "Configuration warning",
+    }
+    title = titles.get(kind)
+    return (title, event.human()) if title is not None else None
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -711,18 +744,11 @@ def run(switcher) -> int:
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             for ev in events:
+                note = notification_for(ev)
+                if note is not None:
+                    rumps.notification("claude-swap", *note)
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
                     self.refresh_async()  # reflect the switch promptly
-                elif ev.kind == "account-quarantined":
-                    rumps.notification("claude-swap", "Account quarantined", ev.human())
-                elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
-                elif ev.kind == "config-warning":
-                    # e.g. an autoswitch.model name no account reports — the
-                    # engine emits it once per run; dropping it would leave a
-                    # menu-bar user with a silently inert filter.
-                    rumps.notification("claude-swap", "Configuration warning", ev.human())
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""

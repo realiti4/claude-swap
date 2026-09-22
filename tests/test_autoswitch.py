@@ -13,7 +13,9 @@ from unittest.mock import patch
 import pytest
 
 import claude_swap.autoswitch as autoswitch_mod
+from claude_swap import managed_launch as managed_launch_mod
 from claude_swap import managed_sessions as managed_sessions_mod
+from claude_swap import session_reassign as session_reassign_mod
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
@@ -28,6 +30,7 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SessionReassignedEvent,
     SessionReleasedEvent,
     SwitchEvent,
     TickOutcome,
@@ -38,6 +41,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.managed_refresh import PUSH_LOCK_TIMEOUT_S
 from claude_swap.managed_sessions import (
     AccountRef,
     ManagedSessionRegistry,
@@ -45,7 +49,7 @@ from claude_swap.managed_sessions import (
 )
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, SessionsSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -7905,3 +7909,701 @@ class TestManagedSessionUpkeep:
         assert any(isinstance(e, UnquarantineEvent) for e in harness.events)
         blob = json.loads((b1 / ".credentials.json").read_text())["claudeAiOauth"]
         assert blob["accessToken"] == "sk-2b" and "refreshToken" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Moving a live managed session to another account
+# ---------------------------------------------------------------------------
+
+
+def _ok_result(entry, decision):
+    from claude_swap.session_reassign import ReassignResult
+
+    return ReassignResult(
+        entry.session_id, decision.reason, decision.placement.number,
+        entry.account, decision.placement.account, True, "moved",
+    )
+
+
+def _failed_result(entry, decision):
+    from claude_swap.session_reassign import ReassignResult
+
+    return ReassignResult(
+        entry.session_id, decision.reason, decision.placement.number,
+        entry.account, decision.placement.account, False, "lock-timeout",
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestManagedSessionReassignment:
+    """Engine-side moves, run at the end of the managed-session upkeep pass.
+
+    A session whose account has no headroom left, or one idle long enough
+    that its prompt cache is worthless anyway, is pointed at a better
+    account without anything happening inside the session itself.
+    """
+
+    SID_A, SID_B = "auto-000000b1", "auto-000000b2"
+
+    @staticmethod
+    def _registry(harness) -> ManagedSessionRegistry:
+        return ManagedSessionRegistry(harness.switcher.backup_dir)
+
+    def _place(self, harness, email, *, session_id=None):
+        sid = session_id or self.SID_A
+        registry = self._registry(harness)
+        entry = registry.allocate(
+            sid, lambda _busy: (AccountRef(email, ""), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        create_managed_profile(registry.session_dir(sid))
+        return registry, entry
+
+    @staticmethod
+    def _record(registry, entry, status, *, idle_since_ms=None) -> None:
+        session_dir = registry.session_dir(entry.session_id)
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        payload: dict = {"pid": entry.pid, "status": status, "cwd": "/work"}
+        if idle_since_ms is not None:
+            payload["statusUpdatedAt"] = idle_since_ms
+        (session_dir / "sessions" / f"{entry.pid}.json").write_text(json.dumps(payload))
+
+    @staticmethod
+    def _moves(harness) -> list:
+        return [e for e in harness.events if isinstance(e, SessionReassignedEvent)]
+
+    # -- the two triggers -----------------------------------------------------
+
+    def test_an_at_limit_session_moves(self, harness):
+        """End to end: the session's profile ends the tick holding the target
+        account's token, not the one the push wrote into it minutes earlier."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert [
+            (e.session_id, e.number, e.from_email, e.to_email, e.reason)
+            for e in self._moves(harness)
+        ] == [(self.SID_A, "3", "b@example.com", "c@example.com", "at-limit")]
+        blob = json.loads(
+            (registry.session_dir(self.SID_A) / ".credentials.json").read_text()
+        )["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-3" and "refreshToken" not in blob
+        assert registry.entries()[self.SID_A].account == AccountRef("c@example.com", "")
+
+    def test_an_idle_session_past_the_margin_moves(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(
+            registry, entry, "idle",
+            idle_since_ms=(harness.clock.now - 2 * 3600) * 1000,
+        )
+        moved = []
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: moved.append(a[3]) or _ok_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(80.0), "3": _usage(1.0),
+            })
+
+        assert [(d.reason, d.placement.number) for d in moved] == [("idle", "3")]
+
+    @pytest.mark.parametrize(
+        "sessions",
+        [
+            # The session has been idle two hours; three is the bar.
+            SessionsSettings(idle_reassign_minutes=180.0),
+            # The target is 39.5 points better; a hundred is the bar.
+            SessionsSettings(reassign_margin=100.0),
+        ],
+        ids=["idle-delay", "margin"],
+    )
+    def test_the_sessions_settings_govern_an_idle_move(self, harness, sessions):
+        """Both knobs reach the decision — the engine is the only thing that
+        reads the ``sessions`` section on a session's behalf."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(
+            registry, entry, "idle",
+            idle_since_ms=(harness.clock.now - 2 * 3600) * 1000,
+        )
+        harness.engine = harness._make_engine(sessions=sessions)
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(80.0), "3": _usage(1.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_session_on_a_quarantined_account_moves(self, harness):
+        """The push has stopped refreshing that account, so nothing renews
+        this session's token — and its usage says nothing at all about that,
+        because a quarantined slot stops being fetched too."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0),
+        })
+
+        assert [
+            (e.session_id, e.to_email, e.reason) for e in self._moves(harness)
+        ] == [(self.SID_A, "c@example.com", "quarantined")]
+        assert registry.entries()[self.SID_A].account == AccountRef(
+            "c@example.com", ""
+        )
+
+    def test_the_move_pass_judges_the_row_the_push_left_behind(self, harness):
+        """The entries this pass is handed were read before the push rewrote
+        them in place. Rolling a failed move back from those would restore a
+        `source` the push had just corrected, and `source` is the only thing
+        that tells the session's own hook its token is borrowed from lane 0
+        and has to be watched for rotation."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        seen = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def push_then_rewrite(*a, **kw):
+            registry.update(self.SID_A, source="lane0")
+            return []
+
+        def spy(switcher, planned, **kwargs):
+            seen.append(planned.source)
+            return real_plan(switcher, planned, **kwargs)
+
+        with (
+            patch("claude_swap.autoswitch.push_refresh", push_then_rewrite),
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert entry.source == "backup"
+        assert seen == ["lane0"]
+
+    def test_a_row_the_sweep_dropped_between_the_passes_is_not_moved(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        def push_then_drop(*a, **kw):
+            registry.remove(self.SID_A)
+            return []
+
+        with (
+            patch("claude_swap.autoswitch.push_refresh", push_then_drop),
+            patch("claude_swap.session_reassign.apply_reassignment") as apply_mock,
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_busy_session_below_its_limit_stays(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(50.0), "3": _usage(1.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_move_waits_no_longer_for_a_lock_than_the_push_does(self, harness):
+        """A wedged profile lock must cost the move, never the daemon: the
+        generic registry budget this call would otherwise default to is far
+        longer than a tick can afford to sit still."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+        ) as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        assert apply_mock.call_args.kwargs["lock_timeout"] == PUSH_LOCK_TIMEOUT_S
+
+    # -- one account must not collect every session it rescues -----------------
+
+    def test_a_rescued_account_carries_its_new_load_into_the_same_pass(self, harness):
+        """Both sessions are at limit on the same account and both are busy.
+        Ranked on the load the tick started with, the second one would follow
+        the first onto #3 and put the account it was rescued onto straight
+        over its own 5h ceiling."""
+        harness.seed(4, "d@example.com")
+        # Registered in the opposite order to the one they are judged in.
+        registry, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        _, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        moved = []
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: moved.append((a[2], a[3])) or _ok_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0),
+                "3": _usage(5.0), "4": _usage(10.0),
+            })
+
+        assert [
+            (entry.session_id, decision.placement.number) for entry, decision in moved
+        ] == [(self.SID_A, "3"), (self.SID_B, "4")]
+
+    def test_the_source_slot_is_decremented_even_outside_the_candidate_pool(
+        self, harness
+    ):
+        """The count being corrected was keyed over every slot, so the source
+        has to be resolved over every slot too. Looked up in the candidate
+        pool instead, a quarantined source — or one running its own ``cswap
+        run N`` — would keep the load of a session that has left it."""
+        registry, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        # Out of the candidate pool, still on the roster and still carrying
+        # both sessions' load.
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        seen: list[dict] = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def spy(switcher, entry, **kwargs):
+            seen.append(dict(kwargs["busy"]))
+            return real_plan(switcher, entry, **kwargs)
+
+        with (
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert seen == [{"2": 2}, {"2": 1, "3": 1}]
+
+    def test_a_source_no_longer_on_the_roster_costs_the_pass_nothing(
+        self, harness
+    ):
+        """A session can outlive the account it runs on: the slot is removed
+        while its Claude is still up. The load then belongs to no slot, so
+        there is nothing to take it off — and nothing to raise about."""
+        registry, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        seen: list[dict] = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def spy(switcher, entry, **kwargs):
+            seen.append(dict(kwargs["busy"]))
+            return real_plan(switcher, entry, **kwargs)
+
+        with (
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch("claude_swap.autoswitch.slot_for_account", return_value=None),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        # The first move's load lands on its target; nothing comes off the
+        # account that is no longer there to take it off.
+        assert seen == [{"2": 2}, {"2": 2, "3": 1}]
+
+    def test_a_successful_move_leaves_the_tick_s_own_load_alone(self, harness):
+        """Characterization. ``_managed_busy`` is what the balance ranking
+        below reads, so a move that changed it would make a reassignment
+        outcome change a lane-0 decision. It stays the count this tick's
+        sweep measured, and the next tick recounts."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+
+        assert [e.number for e in self._moves(harness)] == ["3"]
+        assert harness.engine._managed_busy == {"2": 1}
+
+    # -- cooldown -------------------------------------------------------------
+
+    def test_one_target_is_resolved_once_for_the_whole_pass(self, harness):
+        """`push_refresh` promises one resolution and at most one grant
+        consumption per account; a pass rescuing a fleet onto one target was
+        paying it once per SESSION. Resolving reads the roster, reads the
+        account's credential (the keychain included) and can POST a refresh,
+        and none of that depends on which session is moving -- so a
+        `transient` answer meant one retry of the same POST per session
+        inside one tick."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, second, "busy")
+        resolved = []
+        real = autoswitch_mod.resolve_access_credential
+
+        def counting(switcher, account, **kw):
+            resolved.append(account.email)
+            return real(switcher, account, **kw)
+
+        with patch.object(autoswitch_mod, "resolve_access_credential", counting):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert len(self._moves(harness)) == 2
+        assert resolved == ["c@example.com"]
+
+    def test_the_stamps_are_claimed_before_anything_is_planned(self, harness):
+        """The stamps are in a shared file so a loop engine and a cron
+        `--once` engine can agree about when a session was last moved.
+        Deciding `due` from an unlocked read was the one place that
+        agreement was not asked for: both engines see no stamp, both plan,
+        and the second either moves the session again or has the first's
+        committed move reverted."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        seen = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def watching(*a, **kw):
+            seen.append(harness.state().get("sessionClaim", {}).copy())
+            return real_plan(*a, **kw)
+
+        with patch.object(session_reassign_mod, "plan_for_entry", watching):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert seen == [{self.SID_A: harness.clock.now}]
+
+    def test_a_claim_the_pass_did_not_use_is_released(self, harness):
+        """The claim is a lease for the length of the pass, not an attempt.
+        Keeping it would suppress a healthy session for a whole cooldown and
+        make the daemon's response to a limit as slow as that window; the
+        session's own hook would still cover it, but the engine is the
+        backstop for sessions whose hooks never run."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "sessionCooldown" not in harness.state()
+        assert "sessionClaim" not in harness.state()
+
+    def test_a_claim_nobody_came_back_for_expires_on_its_own(self, harness):
+        """A pass killed between claiming and giving back leaves its claims
+        behind, and nothing is coming to clear them. They are kept apart
+        from the move stamps for exactly that: a claim aged like one would
+        hold its session for `cooldownSeconds`, which the user sets and may
+        set to a day, on a pass that never so much as planned a move."""
+        # The lease spelled out rather than read off the module: a test that
+        # ages a claim by the very constant it is testing shrinks with it,
+        # and a lease retuned to a day would still look right.
+        assert autoswitch_mod._CLAIM_LEASE_S == 120.0
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        (harness.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"sessionClaim": {self.SID_A: harness.clock.now - 10.0}})
+        )
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert self._moves(harness) == []
+
+        harness.clock.now += 120.0
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert len(self._moves(harness)) == 1
+
+    def test_a_claim_for_a_session_nobody_sees_is_not_kept_forever(self, harness):
+        """Managed session ids are minted per launch and never reused, so a
+        claim a killed pass left behind has nothing but its own age to
+        clear it -- and the pass that finds it may never see that session
+        again."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        (harness.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"sessionClaim": {
+                "auto-0000beef": harness.clock.now - 10.0,
+                "auto-0000dead": harness.clock.now - 1000.0,
+            }})
+        )
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0),
+        })
+
+        claims = harness.state().get("sessionClaim", {})
+        assert "auto-0000dead" not in claims
+        assert "auto-0000beef" in claims
+
+    def test_a_pass_with_nowhere_to_move_a_session_writes_no_state(
+        self, harness, monkeypatch
+    ):
+        """Claiming costs the state lock and a write, and giving the claims
+        back costs another. A pass that could not have planned a move --
+        every other slot quarantined, a roster that will not read -- pays
+        neither, because the pool it would rank against is read first."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        monkeypatch.setattr(
+            managed_launch_mod, "_candidate_identities", lambda _switcher: {}
+        )
+        writes = []
+        real = autoswitch_mod.atomic_write_json
+
+        def counting(path, payload):
+            writes.append(path)
+            return real(path, payload)
+
+        monkeypatch.setattr(autoswitch_mod, "atomic_write_json", counting)
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert [p for p in writes if p == harness.engine.state_path] == []
+
+    def test_a_hand_edited_true_is_not_a_timestamp(self, harness):
+        """`bool` is an `int` in Python, so a `true` in a hand-edited state
+        file would otherwise pass every type check these stamps have and be
+        carried through the merge as a stamp. Asserted on the predicate
+        rather than on a tick: at today's clock a `true` reads as the epoch
+        second 1, which is long spent whichever way the check goes, so
+        nothing observable separates the two. The guard is the type contract
+        for a value read off disk, and this is where it is stated."""
+        assert autoswitch_mod._is_stamp(harness.clock.now) is True
+        assert autoswitch_mod._is_stamp(1) is True
+        assert autoswitch_mod._is_stamp(True) is False
+        assert autoswitch_mod._is_stamp(False) is False
+        assert autoswitch_mod._is_stamp("now") is False
+        assert autoswitch_mod._is_stamp(None) is False
+
+    def test_a_second_move_waits_out_the_cooldown(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+        ) as apply_mock:
+            usage = {"1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0)}
+            harness.tick_with_usage(usage)
+            harness.clock.advance(10)
+            harness.tick_with_usage(usage)
+
+        assert apply_mock.call_count == 1
+        assert harness.state()["sessionCooldown"] == {self.SID_A: harness.clock.now - 10}
+
+    def test_a_failed_move_still_takes_the_cooldown(self, harness):
+        """A wedged profile lock or an unresolvable target would otherwise be
+        retried on every single tick for as long as it stays broken."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _failed_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert self.SID_A in harness.state()["sessionCooldown"]
+        assert self._moves(harness) == []
+
+    def test_cooldown_stamps_are_pruned_with_their_sessions(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "auto-deadbeef" not in harness.state().get("sessionCooldown", {})
+
+    def test_a_stamp_written_by_another_engine_survives_this_pass(self, harness):
+        """A cron ``--once`` engine and the loop share the state file, which
+        is the whole reason the stamps are in it. A pass that read the key
+        before the other engine wrote and then replaced it wholesale would
+        drop that stamp, and the session it belongs to would be moved twice
+        inside one cooldown."""
+        engine = harness.engine
+        real_lock, raced = engine._state_lock, []
+
+        def racing_lock():
+            if not raced:
+                raced.append(True)
+                # The other engine's own locked write, landing between this
+                # pass's read and its write.
+                engine._mutate_state(
+                    lambda s: s.setdefault("sessionCooldown", {}).update(
+                        {self.SID_B: harness.clock.now}
+                    )
+                )
+            return real_lock()
+
+        with patch.object(engine, "_state_lock", racing_lock):
+            engine._prune_session_cooldowns(
+                {self.SID_A, self.SID_B}, {self.SID_A: harness.clock.now}
+            )
+
+        assert harness.state()["sessionCooldown"] == {
+            self.SID_A: harness.clock.now, self.SID_B: harness.clock.now,
+        }
+
+    def test_a_stranger_stamp_is_kept_until_its_cooldown_is_spent(self, harness):
+        """A session another engine registered and stamped after this pass
+        read its entries is not in this pass's live set, and dropping its
+        stamp for that is exactly the double move the stamp prevents."""
+        engine = harness.engine
+        engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update(
+                {"auto-cafebabe": harness.clock.now}
+            )
+        )
+
+        engine._prune_session_cooldowns(set())
+        assert harness.state()["sessionCooldown"] == {
+            "auto-cafebabe": harness.clock.now
+        }
+
+        # Spent: it can no longer suppress anything, so it goes.
+        harness.clock.advance(harness.settings.cooldown_seconds + 1)
+        engine._prune_session_cooldowns(set())
+        assert "sessionCooldown" not in harness.state()
+
+    def test_the_last_session_to_exit_takes_its_stamp_with_it(self, harness):
+        """Once nothing is registered the pass returns before it reaches any
+        session, and a stamp nothing can ever match again would sit in the
+        state file for the life of the install."""
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "sessionCooldown" not in harness.state()
+
+    # -- containment ----------------------------------------------------------
+
+    def test_dry_run_never_moves(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine = harness._make_engine(dry_run=True)
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        apply_mock.assert_not_called()
+        assert registry.entries()[self.SID_A].account == AccountRef("b@example.com", "")
+
+    def test_dry_run_never_writes_the_cooldown(self, harness):
+        """The pruning pass is still a write, and a preview writes nothing —
+        including on the path an installation with no session takes."""
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+        harness.engine = harness._make_engine(dry_run=True)
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert harness.state()["sessionCooldown"] == {"auto-deadbeef": 1.0}
+
+    def test_a_move_that_raises_costs_neither_the_push_nor_lane_0(self, temp_home):
+        """The move pass is contained apart from the push it follows and from
+        the decision it precedes: lane 0 still ranks on the managed load this
+        tick measured, and still switches to the account that load points at."""
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        registry, entry = self._place(h, "b@example.com")
+        self._record(registry, entry, "busy")
+        now = h.clock.now
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk on fire")
+
+        with patch("claude_swap.session_reassign.plan_for_entry", boom):
+            outcome = h.tick_with_usage({
+                # Over the threshold on 5h: the tick wants to move off #1.
+                "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+                # Wins by 1.3 points with no load; one busy managed session
+                # projects its 5h window to 25 and hands the tick to #3.
+                "2": _usage7(10, 82, _iso_at(now + DAY)),
+                "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine._managed_busy == {"2": 1}
+        assert [e.message for e in h.events if isinstance(e, ErrorEvent)] == [
+            "Managed session moves: RuntimeError: disk on fire"
+        ]
+        # ...and the push that ran before it still landed.
+        assert json.loads(
+            (registry.session_dir(self.SID_A) / ".credentials.json").read_text()
+        )["claudeAiOauth"]["accessToken"] == "sk-2"
+
+    def test_an_unreadable_candidate_pool_costs_the_pass_only(self, harness, caplog):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        def torn(switcher):
+            raise ClaudeSwitchError("sequence.json is unreadable")
+
+        with (
+            patch("claude_swap.managed_launch._candidate_identities", torn),
+            caplog.at_level("WARNING", logger="claude-swap"),
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._moves(harness) == []
+        assert [
+            r.getMessage() for r in caplog.records
+            if "considered for a move" in r.getMessage()
+        ] == [
+            "Managed sessions not considered for a move "
+            "(sequence.json is unreadable)"
+        ]
+
+    # -- the event ------------------------------------------------------------
+
+    def test_the_event_serializes(self):
+        event = SessionReassignedEvent(
+            session_id="auto-aaaaaaaa", number="3",
+            from_email="b@example.com", to_email="c@example.com", reason="idle",
+        )
+        payload = event.to_json()
+
+        assert payload["event"] == "session-reassigned"
+        assert {
+            k: payload[k] for k in ("session", "number", "from", "to", "reason")
+        } == {
+            "session": "auto-aaaaaaaa", "number": "3",
+            "from": "b@example.com", "to": "c@example.com", "reason": "idle",
+        }
+        assert "auto-aaaaaaaa" in event.human()
+        assert "c@example.com" in event.human()

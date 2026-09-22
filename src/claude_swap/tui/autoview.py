@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 _EVENT_ROLES = {
     "switch": "accent",
+    "session-reassigned": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",

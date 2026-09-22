@@ -617,3 +617,81 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- engine notifications --------------------------------------------------
+
+class TestNotificationFor:
+    """Which engine events interrupt the user, and what they say.
+
+    ``run``'s drain loop hands the result straight to ``rumps.notification``,
+    so everything about that decision that can be tested off macOS lives
+    here.
+    """
+
+    @staticmethod
+    def _switch(dry_run: bool = False):
+        from claude_swap.autoswitch import SwitchEvent
+
+        return SwitchEvent(
+            trigger="proactive",
+            from_ref={"number": 1, "email": "a@example.com"},
+            to_ref={"number": 2, "email": "b@example.com"},
+            dry_run=dry_run,
+        )
+
+    def test_a_reassignment_names_the_session_and_the_new_account(self):
+        from claude_swap.autoswitch import SessionReassignedEvent
+
+        event = SessionReassignedEvent(
+            session_id="auto-aaaaaaaa", number="3",
+            from_email="b@example.com", to_email="c@example.com", reason="idle",
+        )
+
+        title, body = menubar.notification_for(event)
+        assert title == "Managed session moved"
+        assert "auto-aaaaaaaa" in body and "c@example.com" in body
+
+    def test_the_other_reported_kinds_keep_their_titles(self):
+        from claude_swap.autoswitch import (
+            AllExhaustedEvent,
+            ConfigWarningEvent,
+            QuarantineEvent,
+        )
+
+        events = [
+            self._switch(),
+            QuarantineEvent(number="2", email="b@example.com", reason="invalid_grant"),
+            AllExhaustedEvent(earliest_reset_at=None),
+            ConfigWarningEvent(message="no account reports model 'Fabel'"),
+        ]
+
+        assert [menubar.notification_for(e)[0] for e in events] == [
+            "Auto-switched account",
+            "Account quarantined",
+            "All accounts exhausted",
+            "Configuration warning",
+        ]
+        assert all(menubar.notification_for(e)[1] == e.human() for e in events)
+
+    def test_a_previewed_switch_stays_quiet(self):
+        # The TUI runs the engine dry; notifying would announce a switch that
+        # never happened.
+        assert menubar.notification_for(self._switch(dry_run=True)) is None
+
+    def test_the_log_only_kinds_stay_quiet(self):
+        from claude_swap.autoswitch import (
+            ManagedSessionsRefreshedEvent,
+            NoSwitchEvent,
+            SleepEvent,
+        )
+
+        quiet = [
+            NoSwitchEvent(reason="below threshold", detail=""),
+            SleepEvent(seconds=30.0, until="2024-01-01T00:00:30Z"),
+            ManagedSessionsRefreshedEvent(
+                number="2", email="b@example.com", source="backup",
+                sessions=("auto-000000b1",),
+            ),
+        ]
+        assert [menubar.notification_for(e) for e in quiet] == [None, None, None]

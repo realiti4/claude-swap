@@ -46,23 +46,47 @@ from claude_swap import balance, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.managed_refresh import PushResult, busy_by_slot, push_refresh
+from claude_swap.managed_refresh import (
+    PUSH_LOCK_TIMEOUT_S,
+    AccessResolution,
+    PushResult,
+    busy_by_slot,
+    push_refresh,
+    resolve_access_credential,
+    slot_for_account,
+)
 from claude_swap.managed_sessions import (
     AccountRef,
     ManagedEntry,
     ManagedSessionRegistry,
+    read_session_state,
+    state_is_busy,
 )
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    SessionsSettings,
+    atomic_write_json,
+    load_session_settings,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+# How long a managed-session move claim stays believed after the pass that
+# took it. The claim is written before anything is planned and given back as
+# the pass ends, so the only way one outlives its pass is a kill in between
+# -- and then nothing is coming back to clear it. This is what bounds that,
+# and it is sized for a pass rather than for a policy: one tick's moves take
+# seconds, while `cooldownSeconds` is the user's to set and may be a day.
+_CLAIM_LEASE_S = 120.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -131,6 +155,7 @@ _SESSION_REFRESH_REMEDIES: dict[str, str] = {
                          "account — re-add the account",
     "transient": "store or network trouble — cswap retries every tick",
 }
+
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -578,6 +603,38 @@ class SessionReleasedEvent(AutoSwitchEvent):
         return f"Managed session {self.session_id} ({self.email}) released: {self.reason}."
 
 
+@dataclass(frozen=True)
+class SessionReassignedEvent(AutoSwitchEvent):
+    """A running managed session was pointed at a different account.
+
+    Nothing appears inside the session itself: Claude picks the new token up
+    on its next request and its account display follows within a second. This
+    line, ``cswap sessions`` and the menu bar are where the move is visible.
+    """
+
+    kind: ClassVar[str] = "session-reassigned"
+    session_id: str
+    number: str
+    from_email: str
+    to_email: str
+    reason: str  # "at-limit" or "idle"
+
+    def _fields(self) -> dict:
+        return {
+            "session": self.session_id,
+            "number": self.number,
+            "from": self.from_email,
+            "to": self.to_email,
+            "reason": self.reason,
+        }
+
+    def human(self) -> str:
+        return (
+            f"Managed session {self.session_id} moved from {self.from_email} "
+            f"to Account-{self.number} ({self.to_email}): {self.reason}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -633,6 +690,20 @@ def _read_state_file(path: Path) -> dict:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _is_stamp(value: object) -> bool:
+    """Whether a stored cooldown or claim entry is a timestamp.
+
+    ``bool`` is an ``int`` in Python, so a hand-edited state file holding
+    ``true`` would otherwise read as the epoch second 1 everywhere both maps
+    are read: as a cooldown a moment ago spent, as a lease a moment ago
+    expired, and -- since a live session's entry is carried forward whatever
+    it says -- as an entry that stays in the file for as long as the session
+    does. Asked at every one of those readings rather than relied on to fall
+    out of one of them.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _quarantined_from_state(state: Mapping[str, object]) -> set[str]:
@@ -730,6 +801,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        sessions: SessionsSettings | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -793,6 +865,14 @@ class AutoSwitchEngine:
         # burying this exists to prevent. Rebuilt per pass, so an account
         # with no managed sessions left drops out with it.
         self._session_health: dict[AccountRef, tuple[str, tuple[str, ...]]] = {}
+        # Managed-session policy (the ``sessions`` settings section). Read
+        # once per engine like the autoswitch settings, and injectable so a
+        # host that already loaded them does not read the file twice.
+        self._sessions = sessions or load_session_settings(switcher.backup_dir)
+        # Per-session move stamps live in the state file (``sessionCooldown``)
+        # rather than on the engine: a cron ``--once`` engine and a running
+        # loop must agree about when a session was last moved, and a session
+        # outlives the process that moved it.
 
     # -- state file ---------------------------------------------------------
 
@@ -943,7 +1023,8 @@ class AutoSwitchEngine:
 
     def _service_managed_sessions(self) -> None:
         """Sweep exited managed sessions and read the survivors' status,
-        then push fresh access tokens to them.
+        push fresh access tokens to them, and finally consider each survivor
+        for a move to a better account.
 
         Managed profiles hold no refresh token and are not slots, so nothing
         here evaluates them for ``no_refresh_token``: the only refresh is the
@@ -963,6 +1044,14 @@ class AutoSwitchEngine:
         self._managed_busy = {}
         registry = ManagedSessionRegistry(self.switcher.backup_dir)
         if not registry.has_state():
+            if not self.dry_run:
+                # This is the return an installation with no managed session
+                # takes from here on, including every tick after the last one
+                # exited. Nothing can ever match the per-session move stamps
+                # again, so they are dropped here as well as at the end of the
+                # pass below — a stamp left behind would sit in the state file
+                # for the life of the install.
+                self._prune_session_cooldowns(set())
             return
         if self.dry_run:
             self._managed_busy = self._busy_by_slot(registry.live_entries(), registry)
@@ -1011,6 +1100,329 @@ class AutoSwitchEngine:
         # Accounts this pass said nothing about (their last session exited,
         # the account is gone from the registry) leave with the old dict.
         self._session_health = health
+        try:
+            self._reassign_managed_sessions(registry, swept.live)
+        except Exception as e:
+            # Contained on its own, inside the containment ``tick`` already
+            # puts around this pass: a move that blows up must cost neither
+            # the push above nor the lane-0 decision below. That decision
+            # ranks on ``self._managed_busy``, which the move pass only ever
+            # copies, so lane 0 sees the same load whether a move lands,
+            # fails, or raises on the way.
+            self._emit(ErrorEvent(
+                message=f"Managed session moves: {type(e).__name__}: {e}",
+                transient=True,
+            ))
+
+    def _reassign_managed_sessions(
+        self, registry: ManagedSessionRegistry, live: Iterable[ManagedEntry]
+    ) -> None:
+        """Move each live managed session that should not stay where it is.
+
+        Runs after the push, on the same liveness pass, so a session that was
+        just brought up to date is judged on the account it actually holds —
+        which is why each row is read again here rather than taken from the
+        entries the sweep handed in: the push rewrites them in place.
+        Usage comes from the store WITHOUT a fetch: the lane-0 decision below
+        owns this tick's fetch budget, and a move decided on data one tick old
+        is decided on data that decision is about to refresh anyway.
+
+        Only a session this pass ATTEMPTED to move is stamped, so the
+        cooldown filter suppresses recently attempted sessions and nothing
+        else: a healthy session that never triggers a move is due on every
+        tick for its whole life, and so is every session when
+        ``cooldownSeconds`` is 0. The common tick therefore does build the
+        candidate pool, which walks each account's profile looking for live
+        ``cswap run N`` sessions. That is modest next to the per-entry
+        liveness sweep this pass already follows, and the filter still earns
+        its keep on the tick after a move, which is the one where a second
+        attempt would be actively wrong.
+        """
+        # Imported here, not at module scope: managed_launch reads this
+        # module's freshen buffer and quarantine view, so a top-level import
+        # would close the cycle.
+        from claude_swap.managed_launch import _candidate_identities, _decision_usage
+        from claude_swap.session_reassign import apply_reassignment, plan_for_entry
+
+        entries = sorted(live, key=lambda e: e.session_id)
+        if not entries:
+            return
+        # The pool is read BEFORE anything is claimed, and it costs neither
+        # a lock nor a write. A pass with nowhere to move a session -- a
+        # single-account install, every other slot quarantined, a roster
+        # that cannot be read -- would otherwise take the state lock and
+        # rewrite the file twice on every tick, claiming and giving back
+        # sessions it was never going to plan for.
+        try:
+            identities = _candidate_identities(self.switcher)
+            usage = _decision_usage(self.switcher, fetch=set())
+        except (ClaudeSwitchError, OSError, UnicodeDecodeError) as e:
+            _logger.warning(f"Managed sessions not considered for a move ({e})")
+            return
+        if not identities:
+            return
+        # Stamped on every ATTEMPT, not on every success: a move that keeps
+        # failing (a wedged profile lock, a target whose token cannot be
+        # resolved) then retries at the cooldown rate instead of on every tick.
+        stamped: dict[str, float] = {}
+        # Claimed for the duration of this pass and released at the end of
+        # it: see `_claim` below.
+        claimed: dict[str, float] = {}
+        due: list[ManagedEntry] = []
+        quarantined: set[str] = set()
+        try:
+            now = self.clock()
+
+            def _claim(state: dict) -> None:
+                # Reading the stamps and claiming them has to be ONE locked
+                # operation. Two engines ticking together -- a loop and a
+                # cron `--once` -- otherwise both read no stamp for the same
+                # session, both plan a move for it, and the second either
+                # moves it a second time or has its own move reverted by the
+                # first through `apply_reassignment`'s compare-and-set. The
+                # stamps are in a file precisely so the two can agree, and
+                # deciding `due` outside the lock was the one place that
+                # agreement was not being asked for.
+                #
+                # A claim is a lease, not an attempt: it says "this pass is
+                # considering this session", and every claim the pass does
+                # not convert into a real attempt is given back by
+                # `_prune_session_cooldowns` when it finishes. So the other
+                # engine is held off for the length of this pass and no
+                # longer, and a healthy session stays due on the next tick,
+                # which is what keeps the daemon's at-limit response as
+                # quick as its cadence.
+                #
+                # Which is why the leases live in a map of their own rather
+                # than among the cooldown stamps they are read beside. A
+                # pass killed between claiming and giving back leaves its
+                # claims behind with nothing coming to clear them, and a
+                # claim that aged like a cooldown stamp would hold its
+                # session for `cooldownSeconds` -- a number the user sets,
+                # and may set to a day. `_CLAIM_LEASE_S` is sized for the
+                # pass instead of for the policy.
+                nonlocal quarantined
+                section = state.get("sessionCooldown")
+                cooldowns = section if isinstance(section, dict) else {}
+                held = state.get("sessionClaim")
+                leases = held if isinstance(held, dict) else {}
+                # One read for all three: the cooldown stamps, the leases,
+                # and the slots the push above may just have quarantined.
+                quarantined = _quarantined_from_state(state)
+                for entry in entries:
+                    last = cooldowns.get(entry.session_id)
+                    if (
+                        _is_stamp(last)
+                        and now - last < self.settings.cooldown_seconds
+                    ):
+                        continue
+                    lease = leases.get(entry.session_id)
+                    if _is_stamp(lease) and now - lease < _CLAIM_LEASE_S:
+                        # Another engine is considering this session right
+                        # now. Its pass will stamp it or give it back within
+                        # the lease, and either answer is better than two
+                        # passes planning the same move at once.
+                        continue
+                    due.append(entry)
+                    claimed[entry.session_id] = now
+                if claimed:
+                    # Carried forward whole. Dropping the expired ones is
+                    # the giving-back pass's job, and it runs on the way out
+                    # of every pass that reaches this one -- filtering here
+                    # as well would be a second copy of the same rule with
+                    # nothing able to tell the two apart.
+                    state["sessionClaim"] = {**leases, **claimed}
+
+            self._mutate_state(_claim)
+            if not due:
+                return
+            params = balance.params_from_settings(self.settings)
+            lane0 = self.switcher.current_account_number()
+            # A COPY, kept current within the pass and thrown away with it:
+            # ``self._managed_busy`` stays the count this tick measured, so a
+            # move cannot change what lane 0 decides. The price is a reader
+            # that sees stale counts in the same tick — the balance ranking
+            # below (``_rank_candidates`` → ``balance.rank_accounts``,
+            # ``busy_sessions=self._managed_busy``). Move a busy session from
+            # #2 to #3 and that ranking still charges the load to #2 and
+            # reads #3 as carrying none, so lane 0 may switch onto #3 and
+            # share its 5h window with the session just put there; the stale
+            # ``lane0`` read above reaches the same collision from the other
+            # side. Both close on the next tick, when the sweep recounts.
+            busy = dict(self._managed_busy)
+            # One resolution per TARGET ACCOUNT for the whole pass, which is
+            # the guarantee `push_refresh` already makes and this pass was
+            # quietly breaking. Resolving is a roster read, a credential read
+            # and possibly a refresh POST, and it does not depend on which
+            # session is moving -- so a fleet rescued onto one account paid it
+            # once per session, and a `transient` answer meant one retry of
+            # the same POST per session inside one tick.
+            resolved: dict[AccountRef, AccessResolution] = {}
+
+            def resolve_once(switcher, account, **kw):
+                if account not in resolved:
+                    resolved[account] = resolve_access_credential(
+                        switcher, account, **kw
+                    )
+                return resolved[account]
+
+            for planned in due:
+                # Re-read, rather than judging from what the sweep handed
+                # this pass: the push above rewrote these rows in place
+                # (the fingerprint it wrote, the holder its resolve settled
+                # on) without rebinding the objects captured before it ran,
+                # and a session the hook moved in the meantime is on another
+                # account entirely. A row that went away belongs to the
+                # sweep now.
+                entry = registry.get(planned.session_id)
+                if entry is None:
+                    continue
+                state = read_session_state(
+                    registry.session_dir(entry.session_id), entry.pid
+                )
+                decision = plan_for_entry(
+                    self.switcher, entry,
+                    state=state, usage=usage, busy=busy,
+                    identities=identities, lane0=lane0, now=now,
+                    models=self._models, params=params,
+                    sessions_settings=self._sessions,
+                    quarantined=quarantined,
+                )
+                if decision is None:
+                    continue
+                stamped[entry.session_id] = now
+                result = apply_reassignment(
+                    self.switcher, registry, entry, decision,
+                    now_ms=now * 1000.0, buffer_ms=FRESHEN_BUFFER_MS,
+                    # The push-sized budget, not the generic one this call
+                    # would otherwise default to: a move waiting out a wedged
+                    # profile lock must not stall the whole daemon.
+                    lock_timeout=PUSH_LOCK_TIMEOUT_S,
+                    resolver=resolve_once,
+                )
+                if not result.ok:
+                    continue
+                # Keep the load honest for the sessions still to be judged,
+                # for the BUSY ones only: `busy` is a count of busy sessions,
+                # so that is all it can be corrected for. Idle at-limit
+                # sessions therefore do all pile onto one target in a single
+                # pass, and are meant to — they add no measured load to it,
+                # and the next tick recounts. The `state` this reads is the
+                # record this pass read before the move, while the move
+                # itself re-read the row: a session that went idle between
+                # the two is charged (or not charged) by the older of the
+                # two answers, for one tick.
+                #
+                # The source slot is resolved the way the decision itself
+                # resolves it, over the whole roster — the candidate pool
+                # this pass ranks against has quarantined slots and accounts
+                # running their own ``cswap run N`` taken out of it, but the
+                # count being corrected here was keyed over every slot, so
+                # looking the source up in the pool would silently skip the
+                # decrement for exactly those accounts.
+                if state_is_busy(state):
+                    source = slot_for_account(self.switcher, result.from_account)
+                    if source is not None and busy.get(source):
+                        busy[source] -= 1
+                    busy[result.number] = busy.get(result.number, 0) + 1
+                self._emit(SessionReassignedEvent(
+                    session_id=result.session_id,
+                    number=result.number,
+                    from_email=result.from_account.email,
+                    to_email=result.to_account.email,
+                    reason=result.reason,
+                ))
+        finally:
+            # Every exit — nothing due, a pool that could not be read, a move
+            # that raised — persists what this pass stamped and drops the
+            # stamps of sessions that are gone.
+            self._prune_session_cooldowns(
+                {e.session_id for e in entries}, stamped, release=set(claimed),
+            )
+
+    def _prune_session_cooldowns(
+        self,
+        live_ids: set[str],
+        stamped: dict[str, float] | None = None,
+        *,
+        release: set[str] | None = None,
+    ) -> None:
+        """Persist this pass's move stamps, give back the claims it did not
+        use, and drop what belongs to no session any more -- in one state
+        write.
+
+        A stamp for a session nobody can move any more would otherwise keep
+        the state file growing for the life of the install: managed session
+        ids are minted per launch and never reused. A claim outlives its
+        pass only when the pass was killed, and is dropped here on age.
+
+        The read, the filter and the merge all happen INSIDE the mutator,
+        under the state lock, for the reason these stamps are in a file at
+        all: a cron ``--once`` engine and a running loop have to agree about
+        when a session was last moved. Reading the keys outside the lock and
+        then replacing them wholesale inside would let each engine overwrite
+        the other's stamps with a picture taken before they existed, and the
+        session whose stamp was lost gets moved again well inside its own
+        cooldown -- the double move the cooldown exists to prevent. The
+        unlocked read below is only a short-circuit for the pass that has
+        nothing to change, which is almost every pass; a pass carrying
+        stamps or claims of its own never takes it.
+
+        A stamp for a session this pass did not see is kept until its own
+        cooldown has run out, rather than dropped for being unrecognised:
+        the other engine may have registered and stamped that session after
+        this one read its entries, and by then the stamp is all that stops
+        the two of them from moving it twice. Once it is spent it cannot
+        suppress anything, so it goes. A claim of the other engine's is kept
+        on exactly the same terms, for its own shorter life.
+        """
+        stamped = stamped or {}
+        release = release or set()
+
+        def _section(state: Mapping[str, object], key: str) -> dict:
+            section = state.get(key)
+            return section if isinstance(section, dict) else {}
+
+        stored = self._read_state()
+        current = _section(stored, "sessionCooldown")
+        leases = _section(stored, "sessionClaim")
+        if not current and not leases and not stamped:
+            # Nothing stored and nothing to store -- every tick of an
+            # installation that has never moved a session. Out before the
+            # lock, and before the clock: this runs on every tick.
+            return
+        now = self.clock()
+        spent_before = now - self.settings.cooldown_seconds
+        expired_before = now - _CLAIM_LEASE_S
+
+        def _merge(current: Mapping[str, object]) -> dict[str, float]:
+            merged = {
+                sid: ts for sid, ts in current.items()
+                if _is_stamp(ts) and (sid in live_ids or ts > spent_before)
+            }
+            merged.update(stamped)
+            return merged
+
+        def _held(leases: Mapping[str, object]) -> dict[str, float]:
+            return {
+                sid: ts for sid, ts in leases.items()
+                if _is_stamp(ts) and sid not in release and ts > expired_before
+            }
+
+        if not stamped and _merge(current) == current and _held(leases) == leases:
+            return
+
+        def _write(state: dict) -> None:
+            for key, kept in (
+                ("sessionCooldown", _merge(_section(state, "sessionCooldown"))),
+                ("sessionClaim", _held(_section(state, "sessionClaim"))),
+            ):
+                if kept:
+                    state[key] = kept
+                else:
+                    state.pop(key, None)
+
+        self._mutate_state(_write)
 
     def _report_session_health(
         self,
