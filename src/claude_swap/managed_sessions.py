@@ -409,7 +409,7 @@ def session_status(session_dir: Path, pid: int) -> str | None:
     return read_session_state(session_dir, pid).status
 
 
-def entry_is_busy(session_dir: Path, entry: ManagedEntry) -> bool:
+def state_is_busy(state: SessionState) -> bool:
     """Whether a live managed session counts toward its account's 5h load.
 
     True when Claude reports the session busy, and also when there is no
@@ -417,8 +417,18 @@ def entry_is_busy(session_dir: Path, entry: ManagedEntry) -> bool:
     Claude has not created its record yet is a live reservation that counts
     alongside the busy ones, and reading it as idle would let a launch and
     the lane-0 ranking pile onto one account in the same window.
+
+    Takes the state rather than the profile so a caller that has already
+    read Claude's record — the engine's reassignment pass reads it to judge
+    idleness — asks this question of the record it has instead of reading it
+    a second time, and cannot grow a second spelling of "busy" doing so.
     """
-    return session_status(session_dir, entry.pid) in (None, BUSY_STATUS)
+    return state.status in (None, BUSY_STATUS)
+
+
+def entry_is_busy(session_dir: Path, entry: ManagedEntry) -> bool:
+    """:func:`state_is_busy` for a session whose record has not been read."""
+    return state_is_busy(read_session_state(session_dir, entry.pid))
 
 
 def _validate_row(account: AccountRef, pid: object, source: object) -> None:
