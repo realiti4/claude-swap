@@ -96,6 +96,7 @@ REGISTRY_CHECK_TIMEOUT_S = 2.0
 WriteReason = Literal[
     "ok",
     "keychain-write-failed",
+    "keychain-not-cleared",
     "invalid-credential",
     "refresh-token-refused",
     "identity-mismatch",
@@ -124,19 +125,25 @@ class WriteResult:
     The one thing worth knowing beyond ``ok``: a success can carry a reason
     other than ``"ok"``. The two plaintext-only outcomes,
     ``"keychain-write-failed"`` and ``"keychain-unreadable"``, are
-    successes exactly when the caller asked for them with
-    ``require_keychain=False``, and ``keychain_written`` is then False.
-    A caller deciding what to do about a plaintext-only write reads that
-    flag, not the reason.
+    successes — the profile's keychain item was removed, so the plaintext
+    this call wrote is the credential Claude reads — and
+    ``keychain_written`` is then False. A caller deciding what to tell the
+    user about a plaintext-only write reads that flag, not the reason.
+    ``"keychain-not-cleared"`` is the failing half of that pair: an item
+    that could neither be replaced nor removed goes on shadowing the
+    plaintext, so the session keeps serving whatever that item holds and
+    the caller has to retry. What this call wrote under that item is put
+    back to what it was — see :func:`write_session_credential` on why the
+    clear comes second, and why a newer plaintext must not be left there
+    naming one account under an item serving another.
 
     ``fingerprint`` names the credential this call may have left live in
     the profile: set whenever a store was written, which includes the
-    failures that write before failing (``post-check-mismatch``, the two
-    plaintext-only outcomes under ``require_keychain``, and
-    ``write-failed`` / ``registry-unverifiable`` when a store landed
-    first); None when nothing of this call's can be live. The keychain
-    item is read first, so the plaintext is live whenever there is no
-    readable item.
+    failures that write before failing (``post-check-mismatch``,
+    ``keychain-not-cleared``, and ``write-failed`` /
+    ``registry-unverifiable`` when a store landed first); None when
+    nothing of this call's can be live. The keychain item is read first,
+    so the plaintext is live whenever there is no readable item.
     """
 
     ok: bool
@@ -154,6 +161,34 @@ def _read_keychain(session_dir: Path) -> str | None:
     return macos_keychain.get_password(
         keychain_service_name(session_dir), _keychain_account_name()
     )
+
+
+def _restore_plaintext(session_dir: Path, before: str | None) -> bool:
+    """Put ``.credentials.json`` back the way it was, for a write whose
+    keychain item survived to shadow it. True when the profile is back to
+    what it held; False when it still holds this call's credential.
+
+    ``before`` of None means there was no readable file to begin with —
+    either absent, or unreadable, which cannot be told apart here and is
+    treated the same way: the file this call created goes, and a file that
+    was there but unreadable is replaced by nothing rather than by a guess.
+    Best effort by construction: nothing here can raise into a write that
+    has already failed for another reason.
+    """
+    path = session_dir / ".credentials.json"
+    try:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_plaintext(path, before)
+    except OSError as e:
+        _logger.warning(
+            f"Managed session {session_dir.name}: an item that could not be "
+            f"cleared still shadows the credential, and the one written under "
+            f"it could not be taken back ({e})."
+        )
+        return False
+    return True
 
 
 def _read_plaintext(session_dir: Path) -> str | None:
@@ -199,7 +234,17 @@ def _compose(
         try:
             keychain = _read_keychain(session_dir)
         except macos_keychain.KEYCHAIN_ERRORS:
-            readable = False
+            try:
+                # One retry on a fresh budget, as the registry re-read
+                # below gets. A `security` spawn that times out says
+                # nothing about the item, and the verdict here is not
+                # cheap to be wrong about: "unreadable" makes the write
+                # DELETE the item, taking the profile's own mcpOAuth
+                # grants with it. One transient timeout must not cost
+                # those.
+                keychain = _read_keychain(session_dir)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                readable = False
     shared = shared_credential_fields(keychain or _read_plaintext(session_dir))
     if not shared:
         return access_credential, readable
@@ -207,21 +252,45 @@ def _compose(
 
 
 def _write_keychain(session_dir: Path, payload: str) -> bool:
-    service = keychain_service_name(session_dir)
-    account = _keychain_account_name()
     try:
-        macos_keychain.set_password(service, account, payload)
+        macos_keychain.set_password(
+            keychain_service_name(session_dir), _keychain_account_name(), payload
+        )
         return True
     except macos_keychain.KEYCHAIN_ERRORS as e:
-        # Plaintext-only from here. A surviving older item would shadow the
-        # plaintext (Claude reads the keychain first), so try to clear it;
-        # the post-check reports a failure if it survived.
         _logger.warning(
             f"Keychain write for managed session {session_dir.name} failed "
             f"({e}); writing the plaintext credential only."
         )
-        with suppress(*macos_keychain.KEYCHAIN_ERRORS):
-            macos_keychain.delete_password(service, account)
+        return False
+
+
+def _clear_keychain(session_dir: Path) -> bool:
+    """Remove the profile's keychain item, so Claude reads the plaintext.
+
+    The degrade for a login keychain this process cannot use: Claude reads
+    the item BEFORE ``.credentials.json``, so an item left behind would go
+    on serving whatever token it already holds. Deleting it is what makes
+    the plaintext written next to it authoritative — a locked or
+    unreadable keychain then costs the profile its stored ``mcpOAuth``
+    (which could not be read anyway) instead of costing the session its
+    ability to work at all.
+
+    True when the item is gone, deletion and "there was none" alike (the
+    wrapper folds ``errSecItemNotFound`` into success). False only when
+    the item may still be there, which is the one genuine failure.
+    """
+    try:
+        macos_keychain.delete_password(
+            keychain_service_name(session_dir), _keychain_account_name()
+        )
+        return True
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        _logger.warning(
+            f"Managed session {session_dir.name}: its keychain item could "
+            f"neither be replaced nor removed ({e}); it would go on serving "
+            "an older token, so nothing was written."
+        )
         return False
 
 
@@ -322,7 +391,6 @@ def _write_locked(
     oauth_account: dict,
     registry: ManagedSessionRegistry,
     platform: Platform,
-    require_keychain: bool,
 ) -> WriteResult:
     """Steps 2-6 of :func:`write_session_credential`; every lock is held."""
     session_id = session_dir.name
@@ -354,6 +422,7 @@ def _write_locked(
     expected = oauth.access_token_fingerprint(payload)
     keychain_written = False
     plaintext_written = False
+    not_cleared = False
     failure: OSError | None = None
     try:
         if platform == Platform.MACOS:
@@ -362,16 +431,50 @@ def _write_locked(
                 if not keychain_written:
                     plaintext_only = "keychain-write-failed"
             else:
+                # An item this process cannot READ it almost certainly
+                # cannot write either, and a write that fails leaves the
+                # old token in place still shadowing the plaintext. So the
+                # item is not written -- it is deleted, which is the only
+                # way to stop it shadowing. That costs the profile the
+                # mcpOAuth the item held, which is the same thing writing
+                # over it would have cost and is what `_clear_keychain`'s
+                # own docstring says; the alternative is a session Claude
+                # cannot log in to at all.
                 _logger.warning(
                     f"Managed session {session_id}: its keychain item could not "
-                    "be read; leaving it untouched and writing the plaintext "
-                    "credential only."
+                    "be read; removing it and writing the plaintext credential "
+                    "only."
                 )
                 plaintext_only = "keychain-unreadable"
+        # The order is plaintext, then the item, then the config, and each
+        # step only runs once the one before it has landed. Clearing before
+        # the plaintext would leave a profile whose write then failed with
+        # no item, a stale plaintext and the item's mcpOAuth gone — strictly
+        # weaker than not having run. Splicing the config before the item is
+        # gone would be worse still: a surviving item goes on serving the
+        # account this call is moving away FROM, while .claude.json would
+        # already name the new one, so Claude would read one account's token
+        # under another's name. This way the worst intermediate state is the
+        # one this call started from: a write that cannot finish puts the
+        # plaintext back the way it found it.
+        before = _read_plaintext(session_dir)
         _write_plaintext(session_dir / ".credentials.json", payload)
         plaintext_written = True
-        config["oauthAccount"] = oauth_account
-        atomic_write_json(config_path, config)
+        if plaintext_only is not None:
+            not_cleared = not _clear_keychain(session_dir)
+        if not_cleared:
+            # The item survived and goes on shadowing the plaintext, so what
+            # this call wrote underneath it is never read — until the item is
+            # replaced, cleared, or the profile is moved to a keychain-less
+            # platform, any of which would hand Claude a token for a DIFFERENT
+            # account than the one .claude.json names (the splice below is
+            # skipped for exactly that reason). Putting the old bytes back
+            # costs nothing while the item shadows them and leaves the profile
+            # as internally consistent as it was before the call.
+            plaintext_written = not _restore_plaintext(session_dir, before)
+        else:
+            config["oauthAccount"] = oauth_account
+            atomic_write_json(config_path, config)
     except OSError as e:
         # Falls through to the registry re-check first: a sweep deleting
         # the profile mid-write is the likeliest cause, and the keychain
@@ -416,22 +519,30 @@ def _write_locked(
         return WriteResult(
             False, "write-failed", expected if written else None, keychain_written
         )
+    if not_cleared:
+        # Ahead of the post-check, which would report the surviving item
+        # as a plain mismatch (or, when it cannot be read back either, not
+        # notice it at all) and lose the one detail worth acting on: the
+        # item is what the session is still serving from. Its account is
+        # also still the one .claude.json names, the splice having been
+        # skipped and the plaintext put back, so the profile is left as
+        # Claude already read it and the caller can simply try again. The
+        # fingerprint rides along only when the restore itself failed,
+        # which is the one case where this call's credential is still down
+        # there under the item.
+        return WriteResult(
+            False, "keychain-not-cleared",
+            expected if plaintext_written else None, keychain_written,
+        )
     if not _post_check(session_dir, expected, account, platform, keychain_written):
         _logger.warning(
             f"Managed session {session_id}: stores did not read back "
             "as written; leaving the session as is."
         )
         return WriteResult(False, "post-check-mismatch", expected, keychain_written)
-    if plaintext_only is not None and require_keychain:
-        # No item of this call's in the keychain, and the caller said one is
-        # part of a successful write. Claude reads the item before the
-        # plaintext, so an item that could not be read — or one that could
-        # not be overwritten and could not be cleared either — may go on
-        # serving an older access token. Reported as a failure so the caller
-        # retries rather than recording a fingerprint the session may not be
-        # serving, which would make every later pass skip it until the
-        # account's token rotates again.
-        return WriteResult(False, plaintext_only, expected, keychain_written)
+    # A plaintext-only outcome is a success: getting this far means the item
+    # that would have shadowed this write was cleared (a clear that failed
+    # returns above), so the plaintext is what Claude reads.
     return WriteResult(True, plaintext_only or "ok", expected, keychain_written)
 
 
@@ -472,7 +583,6 @@ def write_session_credential(
     registry: ManagedSessionRegistry,
     platform: Platform | None = None,
     lock_timeout: float | None = None,
-    require_keychain: bool = True,
 ) -> WriteResult:
     """Install ``access_credential`` for ``account`` into a managed profile.
 
@@ -481,10 +591,22 @@ def write_session_credential(
     written so a timeout on any of them leaves every store untouched;
     (2) pre-check: ``.claude.json`` is readable, and under the registry
     lock the entry exists and its PID is still the stamped process;
-    (3) keychain item ``keychain_service_name(session_dir)`` on macOS,
-    skipped when that item cannot be read (falls back to plaintext only);
+    (3) keychain item ``keychain_service_name(session_dir)`` on macOS;
     (4) atomic plaintext with a guaranteed mtime change (Claude re-reads
-    both stores on the next request); (5) ``oauthAccount`` splice;
+    both stores on the next request), and then — for an item that could
+    not be written, or could not be read and so must not be written over
+    — a DELETE of that item, so Claude falls through to the plaintext
+    just written (see :func:`_clear_keychain`); a deletion that fails is
+    the one keychain outcome that fails the whole write. The plaintext
+    leads deliberately: clearing first and then failing to write would
+    leave the profile with no item, a stale plaintext and the item's
+    ``mcpOAuth`` gone, which is worse than the call never having run,
+    while this order's worst intermediate state is the starting one plus
+    a newer plaintext the surviving item still shadows;
+    (5) ``oauthAccount`` splice, but only once (4) has left the profile
+    with nothing shadowing the plaintext: a ``keychain-not-cleared`` write
+    leaves ``.claude.json`` naming the account it named before the call,
+    which is the account the surviving item still serves;
     (6) re-check the registry entry under its lock — if it went away or
     now names another account, take back what this call wrote; if it
     cannot be read at all, retry the read once and then leave the stores
@@ -506,16 +628,12 @@ def write_session_credential(
     session was launched with: Claude hashes it, unresolved, into the
     keychain service name.
 
-    ``require_keychain`` says whether a keychain item of this call's is
-    part of a successful write on macOS, and it is the caller's judgement
-    because the answer depends on what was there before. Refreshing an
-    existing profile requires it: the item Claude reads first already holds
-    the previous access token, so failing to replace it leaves the session
-    serving that one, and the write has to be retried. Seeding a new
-    profile does not: there is no item to shadow anything, Claude finds
-    none and reads the plaintext, so a locked login keychain (an ssh or
-    headless session) still yields a working profile. A permissive caller
-    reads ``keychain_written`` to tell the user the token is plaintext-only.
+    A keychain this process cannot use is therefore a degrade, not a hard
+    failure: the profile ends up plaintext-only (``keychain_written`` is
+    False, and the reason names which way it got there) and goes on
+    working. That matters most for the per-prompt hook, which would
+    otherwise re-fail on a locked login keychain — an ssh or headless
+    session — on every prompt with no way out.
 
     Never raises for expected failures; apart from the ``registry-changed``
     take-back, a failure leaves the session as is and reports the reason.
@@ -563,7 +681,7 @@ def write_session_credential(
                 return WriteResult(False, "no-session-dir")
             return _write_locked(
                 session_dir, account, access_credential, oauth_account,
-                registry, platform, require_keychain,
+                registry, platform,
             )
     except ClaudeCodeLockTimeout:
         return WriteResult(False, "lock-timeout")

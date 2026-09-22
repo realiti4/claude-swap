@@ -408,15 +408,12 @@ def push_refresh(
                 registry.session_dir(entry.session_id), account, res.credential,
                 res.oauth_account, registry=registry,
                 lock_timeout=PUSH_LOCK_TIMEOUT_S,
-                # These profiles already hold an access token, and Claude
-                # reads the keychain item before the plaintext: an item this
-                # push could not replace goes on serving the old token, so
-                # it is a failure to retry, not a plaintext-only success.
-                require_keychain=True,
             )
             # A WriteResult can be ok=True with a reason other than "ok"
-            # (the plaintext-only success): that is still a successful
-            # push, so callers branch on .ok, never on the reason string.
+            # (the plaintext-only success, where the writer removed the
+            # keychain item it could not replace so the plaintext serves):
+            # that is still a successful push, so callers branch on .ok,
+            # never on the reason string.
             if not outcome.ok:
                 _logger.warning(
                     f"Managed session {entry.session_id}: token push failed "

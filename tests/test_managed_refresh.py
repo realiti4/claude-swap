@@ -581,23 +581,22 @@ class TestPushRefresh:
         assert seen == [mr.PUSH_LOCK_TIMEOUT_S]
         assert 0 < mr.PUSH_LOCK_TIMEOUT_S < claude_locks.DEFAULT_TIMEOUT_S
 
-    def test_pushed_writes_require_the_keychain_item(self, managed_switcher):
-        """These profiles already hold a token and claude reads the keychain
-        item before the plaintext, so an item this push could not replace
-        goes on serving the old one. Unlike a launch into a fresh profile,
-        that is a failure to retry, not a plaintext-only success."""
-        registry, _ = _add(managed_switcher, "auto-000000b1", B)
-        seen: list = []
+    def test_a_plaintext_only_write_still_counts_as_pushed(self, managed_switcher):
+        """The writer reports a keychain it could not use as a success with
+        a reason of its own, having removed the item that would have
+        shadowed the plaintext. The push branches on ``ok`` alone, so the
+        session is written, recorded, and not retried next pass."""
+        registry, _dir = _add(managed_switcher, "auto-000000b1", B)
 
-        def spy_writer(*args, **kwargs):
-            seen.append(kwargs.get("require_keychain"))
-            return WriteResult(True, "ok", fingerprint="fp")
+        def plaintext_only(*_args, **_kwargs):
+            return WriteResult(True, "keychain-unreadable", fingerprint="fp")
 
-        mr.push_refresh(
+        [result] = mr.push_refresh(
             managed_switcher, registry, now_ms=_now_ms(), buffer_ms=BUFFER_MS,
-            writer=spy_writer,
+            writer=plaintext_only,
         )
-        assert seen == [True]
+        assert (result.written, result.failed) == (("auto-000000b1",), ())
+        assert registry.get("auto-000000b1").access_fingerprint == "fp"
 
     # -- a failing registry.update for one session must not abort the --
     # -- whole fan-out.                                                --

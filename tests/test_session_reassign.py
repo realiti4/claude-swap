@@ -633,13 +633,13 @@ class TestApply:
         assert row.account == C3 and row.access_fingerprint is None
         assert registry.get(entry.session_id) == row
 
-    def test_the_move_is_refused_unless_the_keychain_item_moves_too(
+    def test_a_move_falls_through_to_plaintext_when_the_item_is_unreadable(
         self, seeded, monkeypatch
     ):
         # Claude reads the item before the plaintext, so an item this move
-        # could not replace would go on serving the OLD account's token. The
-        # real writer decides that on require_keychain, and a move over a
-        # profile that already holds a token cannot settle for plaintext.
+        # could not replace would go on serving the OLD account's token.
+        # The writer removes it instead, which leaves the plaintext — the
+        # target's token — as the one the session reads, so the move lands.
         _, registry, entry = seeded
         profile_service = keychain_service_name(registry.session_dir(entry.session_id))
         readable = macos_keychain.get_password
@@ -651,10 +651,33 @@ class TestApply:
 
         monkeypatch.setattr(macos_keychain, "get_password", unreadable)
         result = self._apply(seeded)
-        assert not result.ok and result.detail == "keychain-unreadable"
+        assert result.ok and result.detail == "moved"
+        assert registry.get(entry.session_id).account == C3
+
+    def test_a_move_is_refused_when_the_item_cannot_be_cleared(
+        self, seeded, monkeypatch
+    ):
+        # The other half: an item that can be neither replaced nor removed
+        # keeps serving the old account's token, so the row goes back and
+        # the session stays where it is.
+        _, registry, entry = seeded
+        profile_service = keychain_service_name(registry.session_dir(entry.session_id))
+        readable = macos_keychain.get_password
+
+        def unreadable(service, account):
+            if service == profile_service:
+                raise macos_keychain.KeychainError("timed out")
+            return readable(service, account)
+
+        def undeletable(service, account):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", unreadable)
+        monkeypatch.setattr(macos_keychain, "delete_password", undeletable)
+        result = self._apply(seeded)
+        assert not result.ok and result.detail == "keychain-not-cleared"
         row = registry.get(entry.session_id)
-        assert row.account == B2
-        assert row.access_fingerprint is None
+        assert row.account == B2 and row.access_fingerprint is None
 
     def test_the_callers_lock_budget_reaches_the_writer(self, seeded):
         calls, writer = _spy_writer()

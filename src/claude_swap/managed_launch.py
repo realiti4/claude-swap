@@ -291,12 +291,6 @@ def _prepare_profile(
     result = write_session_credential(
         session_dir, entry.account, resolution.credential,
         resolution.oauth_account, registry=registry,
-        # The profile was created moments ago, so nothing is in the keychain
-        # to shadow what is written here: claude finds no item and reads the
-        # plaintext, which holds the right token. Refusing over a keychain
-        # that cannot be read or written would block a launch that works —
-        # an ssh session, a Mac whose login keychain is not unlocked.
-        require_keychain=False,
     )
     # `ok` is the whole test; a plaintext-only success has a reason that is
     # not "ok", and `keychain_written` is what says the token is unprotected.

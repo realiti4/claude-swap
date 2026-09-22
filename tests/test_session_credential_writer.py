@@ -198,15 +198,12 @@ class TestWriter:
         assert (result.ok, result.reason) == (False, "post-check-mismatch")
         assert _plaintext_token(session_dir) == "at-2"
 
-    @pytest.mark.parametrize("require_keychain, ok", [(True, False), (False, True)])
     def test_keychain_failure_writes_plaintext_and_clears_stale_item(
-        self, session_dir, registry, block_real_keychain, monkeypatch,
-        require_keychain, ok,
+        self, session_dir, registry, block_real_keychain, monkeypatch
     ):
         """A stale item left behind would shadow the plaintext, so it is
-        cleared either way. Whether a profile carrying no item of this
-        call's counts as written is the caller's call: a refresh over an
-        existing profile requires the item, seeding a new one does not."""
+        removed — and once it is gone the plaintext IS what Claude reads,
+        which is a working profile, not a failure to retry on every pass."""
         block_real_keychain.data[_kc_key(session_dir)] = json.dumps(
             {"claudeAiOauth": {"accessToken": "stale"}}
         )
@@ -215,12 +212,169 @@ class TestWriter:
             raise macos_keychain.KeychainError("locked")
 
         monkeypatch.setattr(macos_keychain, "set_password", locked)
-        result = _write(session_dir, registry, require_keychain=require_keychain)
+        result = _write(session_dir, registry)
         assert (result.ok, result.reason, result.keychain_written) == (
-            ok, "keychain-write-failed", False,
+            True, "keychain-write-failed", False,
         )
         assert _kc_key(session_dir) not in block_real_keychain.data
         assert _plaintext_token(session_dir) == "at-2"
+
+    def test_one_failed_keychain_read_is_retried_before_giving_up(
+        self, session_dir, registry, block_real_keychain, monkeypatch
+    ):
+        """A `security` spawn that times out says nothing about the item,
+        and the verdict is expensive to get wrong: "unreadable" makes the
+        write DELETE the item, mcpOAuth and all. One transient timeout must
+        not cost the user those."""
+        stored = json.dumps({
+            "claudeAiOauth": {"accessToken": "old"},
+            "mcpOAuth": {"srv": {"accessToken": "mcp"}},
+        })
+        block_real_keychain.data[_kc_key(session_dir)] = stored
+        readable = macos_keychain.get_password
+        attempts: list = []
+
+        def flaky(service, account):
+            attempts.append(service)
+            if len(attempts) == 1:
+                raise macos_keychain.KeychainError("timed out")
+            return readable(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason, result.keychain_written) == (
+            True, "ok", True,
+        )
+        stored_back = json.loads(block_real_keychain.data[_kc_key(session_dir)])
+        assert stored_back["mcpOAuth"] == {"srv": {"accessToken": "mcp"}}
+        assert stored_back["claudeAiOauth"]["accessToken"] == "at-2"
+
+    def test_the_item_is_only_cleared_once_the_plaintext_has_landed(
+        self, session_dir, registry, block_real_keychain, monkeypatch
+    ):
+        """Order, not outcome: clearing first and then failing to write
+        would leave the profile with no item, a stale plaintext and the
+        item's mcpOAuth gone — worse than never having run. Writing first
+        means a failure leaves exactly what was there before."""
+        stored = json.dumps({
+            "claudeAiOauth": {"accessToken": "old"},
+            "mcpOAuth": {"srv": {"accessToken": "mcp"}},
+        })
+        block_real_keychain.data[_kc_key(session_dir)] = stored
+
+        def unreadable(service, account):
+            raise macos_keychain.KeychainError("timed out")
+
+        def no_disk(*_a, **_kw):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(macos_keychain, "get_password", unreadable)
+        monkeypatch.setattr(sc, "_write_plaintext", no_disk)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason) == (False, "write-failed")
+        assert block_real_keychain.data[_kc_key(session_dir)] == stored
+
+    @pytest.mark.parametrize("failing", ["set_password", "get_password"])
+    def test_an_item_that_cannot_be_cleared_stops_the_write(
+        self, session_dir, registry, block_real_keychain, monkeypatch, failing
+    ):
+        """The one genuine keychain failure: an item that can be neither
+        replaced nor removed goes on serving its own token whatever the
+        plaintext says, so writing the plaintext would only claim a token
+        the session is not using."""
+        stale = json.dumps({"claudeAiOauth": {"accessToken": "stale"}})
+        block_real_keychain.data[_kc_key(session_dir)] = stale
+
+        def broken(*_a, **_kw):
+            raise macos_keychain.KeychainError("locked")
+
+        (session_dir / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-1"}}
+        ))
+        monkeypatch.setattr(macos_keychain, failing, broken)
+        monkeypatch.setattr(macos_keychain, "delete_password", broken)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason) == (False, "keychain-not-cleared")
+        assert block_real_keychain.data[_kc_key(session_dir)] == stale
+        # The plaintext leads the clear, so it is written first — and put
+        # back when the clear fails. Leaving the new token there would leave
+        # the profile holding one account's token under an item serving
+        # another's, with .claude.json naming a third state; the moment
+        # anything replaced or dropped that item, Claude would read the
+        # wrong account's credential under the name of the old one.
+        assert _plaintext_token(session_dir) == "at-1"
+        assert result.fingerprint is None
+
+    def test_a_profile_with_no_plaintext_keeps_none_when_the_clear_fails(
+        self, session_dir, registry, block_real_keychain, monkeypatch
+    ):
+        """The other starting state: an item and no file at all. What this
+        call created has to go too, or the profile ends up with a credential
+        it never had."""
+        block_real_keychain.data[_kc_key(session_dir)] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "stale"}}
+        )
+        (session_dir / ".credentials.json").unlink(missing_ok=True)
+
+        def broken(*_a, **_kw):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "set_password", broken)
+        monkeypatch.setattr(macos_keychain, "delete_password", broken)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason) == (False, "keychain-not-cleared")
+        assert not (session_dir / ".credentials.json").exists()
+        assert result.fingerprint is None
+
+    def test_a_restore_that_fails_reports_the_token_it_left_behind(
+        self, session_dir, registry, block_real_keychain, monkeypatch
+    ):
+        """The fingerprint says what of this call may be live in the
+        profile. A restore that could not run leaves the new credential
+        under the surviving item, and the caller is told so."""
+        block_real_keychain.data[_kc_key(session_dir)] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "stale"}}
+        )
+
+        def broken(*_a, **_kw):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "set_password", broken)
+        monkeypatch.setattr(macos_keychain, "delete_password", broken)
+        monkeypatch.setattr(sc, "_restore_plaintext", lambda *_a: False)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason) == (False, "keychain-not-cleared")
+        assert result.fingerprint == oauth.access_token_fingerprint(
+            (session_dir / ".credentials.json").read_text()
+        )
+
+    def test_an_item_that_cannot_be_cleared_leaves_the_config_alone(
+        self, session_dir, registry, block_real_keychain, monkeypatch
+    ):
+        """A move writes the new account's token; the surviving item goes on
+        serving the old one. Naming the new account in .claude.json while
+        that is true would have Claude read one account's token under
+        another's name, so the splice waits for the clear."""
+        prior = {
+            "emailAddress": "a@example.com", "accountUuid": "uuid-1",
+            "organizationUuid": "org-1",
+        }
+        config_path = session_dir / ".claude.json"
+        config = json.loads(config_path.read_text())
+        config["oauthAccount"] = prior
+        config_path.write_text(json.dumps(config))
+        block_real_keychain.data[_kc_key(session_dir)] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-1"}}
+        )
+
+        def broken(*_a, **_kw):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "set_password", broken)
+        monkeypatch.setattr(macos_keychain, "delete_password", broken)
+        result = _write(session_dir, registry)
+        assert (result.ok, result.reason) == (False, "keychain-not-cleared")
+        assert json.loads(config_path.read_text())["oauthAccount"] == prior
 
     def test_session_owned_mcp_oauth_survives(self, session_dir, registry, block_real_keychain):
         block_real_keychain.data[_kc_key(session_dir)] = json.dumps({
@@ -476,20 +630,19 @@ class TestWriterHardening:
         assert json.loads(block_real_keychain.data[_kc_key(session_dir)]) == expected
         assert json.loads((session_dir / ".credentials.json").read_text()) == expected
 
-    @pytest.mark.parametrize("require_keychain, ok", [(True, False), (False, True)])
-    def test_unreadable_keychain_is_left_alone_and_the_caller_judges_it(
-        self, session_dir, registry, block_real_keychain, monkeypatch,
-        require_keychain, ok,
+    def test_an_unreadable_keychain_item_is_removed_so_the_plaintext_serves(
+        self, session_dir, registry, block_real_keychain, monkeypatch
     ):
         """A read error is not an empty item: writing over it would drop the
-        profile's own mcpOAuth, so the item is not touched at all, and the
+        profile's own mcpOAuth, so it is never written over, and the
         plaintext's shared fields come from the plaintext alone.
 
-        Whether that counts as a success is the caller's call, because it
-        turns on what was in the item already. Claude reads it BEFORE the
-        plaintext, so a refresh over an existing profile requires it
-        (ok=False, retry next pass) while seeding a brand-new profile does
-        not (ok=True, plaintext-only)."""
+        It is removed instead. Claude reads the item BEFORE the plaintext,
+        so leaving one this process cannot see would let it go on serving
+        an older token — on a locked login keychain (an ssh or headless
+        session) that is a session broken for good, re-failing on every
+        pass. Deleting it costs the profile the mcpOAuth nobody could read
+        and leaves a session that works."""
         stored = json.dumps({
             "claudeAiOauth": {"accessToken": "old"},
             "mcpOAuth": {"srv": {"accessToken": "mcp"}},
@@ -504,11 +657,11 @@ class TestWriterHardening:
             raise macos_keychain.KeychainError("timed out")
 
         monkeypatch.setattr(macos_keychain, "get_password", unreadable)
-        result = _write(session_dir, registry, require_keychain=require_keychain)
+        result = _write(session_dir, registry)
         assert (result.ok, result.reason, result.keychain_written) == (
-            ok, "keychain-unreadable", False,
+            True, "keychain-unreadable", False,
         )
-        assert block_real_keychain.data[_kc_key(session_dir)] == stored
+        assert _kc_key(session_dir) not in block_real_keychain.data
         raw = (session_dir / ".credentials.json").read_text()
         plaintext = json.loads(raw)
         assert plaintext["claudeAiOauth"] == json.loads(
