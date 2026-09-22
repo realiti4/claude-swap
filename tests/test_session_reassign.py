@@ -73,6 +73,31 @@ class TestIdleSeconds:
         assert sr.idle_seconds(_state("idle", 90), NOW_MS) == 90 * 60.0
 
 
+class TestMeetsIdleFloor:
+    def test_no_reading_never_clears_it(self):
+        assert sr.meets_idle_floor(None, 60.0) is False
+
+    def test_short_of_the_floor_fails(self):
+        assert sr.meets_idle_floor(59 * 60.0, 60.0) is False
+
+    def test_exactly_the_floor_passes(self):
+        assert sr.meets_idle_floor(60 * 60.0, 60.0) is True
+
+    def test_past_the_floor_passes(self):
+        assert sr.meets_idle_floor(61 * 60.0, 60.0) is True
+
+
+class TestMeetsScoreMargin:
+    def test_short_of_the_margin_fails(self):
+        assert sr.meets_score_margin(0.0, 14.9, 15.0) is False
+
+    def test_exactly_the_margin_passes(self):
+        assert sr.meets_score_margin(0.0, 15.0, 15.0) is True
+
+    def test_past_the_margin_passes(self):
+        assert sr.meets_score_margin(0.0, 15.1, 15.0) is True
+
+
 class TestDecide:
     def _decide(self, **kw):
         base = dict(

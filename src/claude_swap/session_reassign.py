@@ -104,6 +104,29 @@ def idle_seconds(state: SessionState, now_ms: float) -> float | None:
     return max(0.0, (now_ms - state.idle_since_ms) / 1000.0)
 
 
+def meets_idle_floor(idle_s: float | None, idle_minutes: float) -> bool:
+    """Whether an elapsed-idle reading clears the ``idle_minutes`` floor.
+
+    Takes the reading rather than the record it was taken from, so anything
+    carrying an idle-since stamp can be judged by it — here,
+    :func:`idle_seconds` on a managed session's ``SessionState``. ``None``
+    — not idle, or no usable stamp — never clears any floor.
+    """
+    return idle_s is not None and idle_s >= idle_minutes * 60.0
+
+
+def meets_score_margin(
+    current_score: float, candidate_score: float, margin: float
+) -> bool:
+    """Whether ``candidate_score`` beats ``current_score`` by at least
+    ``margin`` points.
+
+    The score gap an otherwise-idle session has to see before it is worth
+    moving off an account that is not at its limit.
+    """
+    return candidate_score - current_score >= margin
+
+
 def _escape(reason: str, placement: Placement) -> ReassignDecision | None:
     """A move off an account that cannot serve this session, or None when the
     target cannot either.
@@ -169,14 +192,13 @@ def decide_reassignment(
         return None
     if current_score.reason == balance.REASON_AT_LIMIT:
         return _escape(REASON_AT_LIMIT, placement)
-    idle_s = idle_seconds(state, now_ms)
-    if idle_s is None or idle_s < idle_minutes * 60.0:
+    if not meets_idle_floor(idle_seconds(state, now_ms), idle_minutes):
         return None
     if not placement.score.eligible or placement.score.score is None:
         # An eligible score always carries one; the second half keeps this
         # total for a caller holding a placement balance did not rank.
         return None
-    if placement.score.score - current_score.score < margin:
+    if not meets_score_margin(current_score.score, placement.score.score, margin):
         return None
     return ReassignDecision(REASON_IDLE, placement)
 
