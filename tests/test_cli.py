@@ -1806,7 +1806,8 @@ class TestDisableEnableDispatch:
 
 
 class TestSessionCommand:
-    """`cswap session ensure`: the hook a managed session runs per prompt."""
+    """`cswap session ensure|release`: the hooks a managed session runs, one
+    per prompt and one when the session ends."""
 
     pytestmark = pytest.mark.skipif(
         sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
@@ -1853,13 +1854,19 @@ class TestSessionCommand:
         utf8.assert_not_called()
         tls.assert_not_called()
 
+    @pytest.mark.parametrize("verb", ["ensure", "release"])
     def test_a_hook_that_cannot_even_be_imported_still_exits_zero(
-        self, monkeypatch, capsys
+        self, monkeypatch, capsys, verb
     ):
         """The fail-open promise has to cover the import too. This dispatch
-        runs above main()'s own guard, and `ensure` cannot swallow the
-        failure to load the module that defines it — so a half-installed
-        cswap would block every prompt of every managed session."""
+        runs above main()'s own guard, and neither verb can swallow the
+        failure to load the module that defines it, so a half-installed
+        cswap would hand Claude its exit code: on `ensure`'s
+        UserPromptSubmit that blocks the turn the user just started, and on
+        `release`'s SessionEnd it reports a failure nobody asked about in a
+        session that has already ended. Both verbs, because a second one is
+        exactly the kind of thing that gets added beside the guard rather
+        than inside it."""
         import claude_swap
 
         class Blocker:
@@ -1872,11 +1879,23 @@ class TestSessionCommand:
         monkeypatch.delitem(sys.modules, "claude_swap.session_hooks", raising=False)
         monkeypatch.setattr(sys, "meta_path", [Blocker(), *sys.meta_path])
         with (
-            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("sys.argv", ["cswap", "session", verb]),
             pytest.raises(SystemExit) as exit_info,
         ):
             cli.main()
         assert exit_info.value.code == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_release_dispatches_and_exits_zero(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "release"]),
+            patch("claude_swap.session_hooks.release", return_value=0) as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        hook.assert_called_once()
         out = capsys.readouterr()
         assert out.out == "" and out.err == ""
 
@@ -1888,7 +1907,8 @@ class TestSessionCommand:
         ):
             cli.main()
         assert exit_info.value.code == 2
-        assert "cswap session ensure" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "cswap session" in err and "ensure" in err and "release" in err
 
     def test_the_usage_error_points_at_the_command_they_probably_wanted(
         self, capsys

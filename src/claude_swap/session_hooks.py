@@ -1,4 +1,4 @@
-"""The hooks a managed session runs: ``cswap session ensure``.
+"""The hooks a managed session runs: ``ensure`` and ``release``.
 
 It fails open, unconditionally. It runs inside somebody's Claude Code
 session, so the failure mode that matters is not "the hook did nothing" but
@@ -12,8 +12,8 @@ announces a legacy-to-XDG state-directory migration there, once, on the
 Linux and WSL hosts that still have one. It does not reach the prompt.
 
 Silent is not the same as invisible: a hook nobody is watching is exactly
-the one whose failures have to be written down, so :func:`ensure`
-configures the log itself rather than relying on a switcher it may never
+the one whose failures have to be written down, so both verbs configure
+the log themselves rather than relying on a switcher they may never
 build.
 
 ``ensure`` is what lets a managed session keep itself current with no
@@ -69,13 +69,27 @@ engine's to act on first — an account can be quarantined and still look
 comfortable, and this hook never gets past the gate to notice. Nothing but
 the engine quarantines a slot, so such a session always has a daemon whose
 next tick moves it.
+
+``release`` is the other end of the same life: a ``SessionEnd`` hook that
+hands the account back, so the next launch can place onto it without
+waiting for the engine's sweep to notice the process is gone. It runs once
+per session rather than once per prompt, so it has no gate and needs none.
+What it does have is the opposite constraint: it deletes, and everything
+it deletes belongs to somebody. So nothing goes until this session is
+established to be over, and every question it cannot answer — an
+unreadable registry, an unreadable session record — stops it rather than
+being rounded down to "nothing is there". Refusing is a named outcome, not
+a failure: the sweep reclaims later whatever this pass declines to.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import select
+import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -93,9 +107,13 @@ from claude_swap.managed_sessions import (
     AccountRef,
     ManagedEntry,
     ManagedSessionRegistry,
+    entry_is_live,
     managed_session_id_for,
     read_session_state,
+    remove_managed_profile,
 )
+from claude_swap.process_detection import parent_pid
+from claude_swap.session import scan_live_sessions
 from claude_swap.session_credentials import write_session_credential
 from claude_swap.settings import (
     AutoSwitchSettings,
@@ -112,6 +130,51 @@ _logger = logging.getLogger("claude-swap")
 # the mover each name it: cswap's own errors plus plain I/O from files read
 # without a guard.
 _STORE_FAILURES = (ClaudeSwitchError, OSError, UnicodeDecodeError)
+
+# What Claude calls the event `release` is the hook for, and how long the
+# verb is willing to wait for that event to arrive on stdin. The payload is
+# written before the hook is spawned, so the wait only ever covers a slow
+# pipe. `isatty` is the cheap first answer, not the whole one: it settles a
+# release typed at a terminal without reading anything, while one typed
+# into a Bash tool inside a session inherits that session's stdin and is
+# answered by the deadline or by the end of the stream instead.
+_SESSION_END_EVENT = "SessionEnd"
+_STDIN_WAIT_S = 2.0
+_STDIN_CHUNK = 65536
+# How much of stdin is worth accumulating before giving up on it. A
+# SessionEnd payload is a few hundred bytes; a megabyte is four orders of
+# magnitude of slack and still small enough to reparse harmlessly. Past it
+# the stream is not this event -- an inherited pipe somebody else is
+# writing to, most likely -- and the cost of pretending otherwise is
+# quadratic: every chunk re-parses everything accumulated so far, so an
+# uncapped firehose burns CPU and memory for the whole budget and then
+# answers None anyway.
+_STDIN_MAX = 1024 * 1024
+
+# The SessionEnd reasons that mean the process this hook runs under is on
+# its way out. Claude Code fires SessionEnd for five reasons, and only
+# three of them end the process: `logout`, `prompt_input_exit` and `other`
+# are the reason the shutdown path passes to its own hook runner (`other`
+# is that path's default), while `clear` and `resume` are fired from the
+# handlers for `/clear` and `/resume` in a session that goes on running
+# afterwards with the same pid, the same profile and the same credential.
+# Releasing on those two would delete the account, the keychain item and
+# the profile out from under somebody who is still typing.
+#
+# The list is an ALLOWLIST on purpose: a reason nothing here recognises,
+# and a SessionEnd carrying no reason at all, are both refusals. A new
+# mid-session reason would otherwise arrive as a deletion.
+_ENDING_REASONS = frozenset({"logout", "prompt_input_exit", "other"})
+
+# What `_session_end_reason` returns for a SessionEnd whose `reason` is
+# missing or is not a string. Distinct from None, which means no SessionEnd
+# reached the hook at all; both refuse, with different warnings.
+_REASON_ABSENT = ""
+
+# How far up the process tree `release` looks for the session it belongs
+# to. A hook is a child of the Claude that ran it, or a grandchild when a
+# shell sits between them; anything deeper is somebody else's business.
+_ANCESTRY_DEPTH = 4
 
 # Stamped in the session's own profile when the authoritative resolve last
 # confirmed its borrowed token. Empty by design: the mtime is the payload.
@@ -145,14 +208,15 @@ _MOVE_RECHECK_S = 60.0
 # to be told again that there is nowhere to go.
 MOVE_SENTINEL = ".move-checked"
 
-# Outcomes of a pass that changed nothing. They are the common case — one
-# per prompt per session — so they are logged at DEBUG, leaving the default
-# level to say only what a reader of the log would want to know happened.
-# A registry nobody can read is one of them for the same reason it is read
-# without a warning: on this path it would repeat for every prompt of every
-# session until somebody fixed the file.
+# Outcomes of a pass that changed nothing, logged at DEBUG so the default
+# level says only what a reader of the log would want to know happened.
+# `ensure`'s healthy prompt is the common case, one per prompt per session;
+# `release`'s refusals are rarer but each already writes a WARNING of its
+# own, which says the same thing better than a second line at INFO would.
 _QUIET_OUTCOMES = frozenset({
-    "not-managed", "no-entry", "fresh", "registry-unreadable",
+    "not-managed", "no-entry", "fresh",
+    "registry-unreadable", "still-running", "not-a-session-end",
+    "session-continues",
 })
 
 
@@ -678,6 +742,235 @@ def _maybe_reassign(
     return f"reassign-failed:{result.detail}"
 
 
+def _this_session_is(pid: int) -> bool:
+    """Whether ``pid`` is this process or one of the processes that started
+    it, within a few generations.
+
+    ``release`` runs from inside the session it is releasing, so the row it
+    is about to drop names a process that is very much alive: this one's
+    parent, or its parent's parent when a shell ran the hook. The usual
+    liveness question ("has it gone?") therefore has to be joined by this
+    one ("is it us?"), and only the two together mean the session is over.
+
+    Bounded, and generous about stopping. The walk costs a ``ps`` per
+    generation past the first, and two different things end it early: an
+    answer nobody can give (Windows, a parent already reaped and so absent
+    from ``ps``, a ``ps`` that would not run), and an answer of 1, which
+    means the chain has been reparented to init and the process that
+    started this one is gone. Both are "no", which leaves the profile for
+    the sweep instead of removing it here.
+    """
+    if pid in (os.getpid(), os.getppid()):
+        return True
+    ancestor: int | None = os.getppid()
+    for _ in range(_ANCESTRY_DEPTH):
+        ancestor = parent_pid(ancestor)
+        if ancestor is None or ancestor <= 1:
+            return False
+        if ancestor == pid:
+            return True
+    return False
+
+
+def _session_end_reason() -> str | None:
+    """Why Claude says this session is ending, or ``None`` when it does not
+    say that at all.
+
+    Claude hands a hook its event on stdin as a JSON object; ``release``
+    reads it for two fields. The event name is what tells a ``SessionEnd``
+    hook apart from somebody running the same command inside the session it
+    would delete — a Bash tool, a subshell, a person in a split pane — all
+    of which have exactly the ancestry the hook has. The reason is what
+    tells an ending session apart from one that carries on afterwards; the
+    caller judges it against ``_ENDING_REASONS``.
+
+    Returns ``_REASON_ABSENT`` for a ``SessionEnd`` that names no reason,
+    which the caller refuses like any reason it does not recognise.
+
+    Every uncertainty is "no", and nothing here is allowed to raise or to
+    wait: a terminal on stdin is answered without reading it at all, and
+    everything else is read under one deadline. The cost of a wrong "no" is
+    a profile left for the sweep, which is the state the sweep already
+    exists for; the cost of a wrong "yes" is a live session losing its
+    credential mid-turn.
+    """
+    try:
+        payload = _hook_event()
+    except Exception:  # noqa: BLE001 - any answer but a clean one is "no"
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("hook_event_name") != _SESSION_END_EVENT
+    ):
+        return None
+    reason = payload.get("reason")
+    return reason if isinstance(reason, str) else _REASON_ABSENT
+
+
+def _hook_event() -> object | None:
+    """Whatever Claude wrote on stdin, or ``None`` inside ``_STDIN_WAIT_S``.
+
+    One deadline governs the whole read, not just its first byte. ``select``
+    answers for that first byte only, and a plain ``read()`` answers at EOF
+    — which on a pipe means when the write end closes, and nothing promises
+    that ever happens: a wrapper script, a fifo, or a shell holding the
+    write end open in a sibling would leave the hook blocked until Claude
+    killed it, stalling the teardown it is part of.
+
+    So the budget is spent in a loop: wait on what is left of it, take the
+    chunk that arrived, and try to parse everything that has accumulated —
+    stopping the moment it parses, which is usually the first pass. The
+    accumulation is what makes a payload delivered in pieces readable; a
+    single read would truncate it into a parse failure.
+
+    A deadline that passes, a stream that ends with nothing parseable,
+    bytes that never parse, and more than ``_STDIN_MAX`` of them all answer
+    ``None``, which the caller reads as "not a SessionEnd" — the direction
+    that keeps a session's credential.
+    """
+    stream = sys.stdin
+    if stream is None or stream.isatty():
+        return None
+    # What to read from: a real stream's raw half, so that a read takes
+    # what has arrived rather than waiting for the end of the stream. An
+    # in-memory one (tests, an embedding host) has no such half and cannot
+    # block, so it is read whole in a single pass instead.
+    raw = getattr(stream, "buffer", None)
+    deadline = time.monotonic() + _STDIN_WAIT_S
+    payload = b""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready = bool(select.select([stream], [], [], remaining)[0])
+        except (OSError, ValueError, io.UnsupportedOperation):
+            # An in-memory stream has nothing to wait on and cannot block,
+            # so reading it anyway is safe and is the only way it is ever
+            # read. A descriptor that could not be waited on is the other
+            # way round: reading it is the one thing that might never come
+            # back, and there is no budget left to enforce once `select`
+            # is out of the picture, so it answers "no" instead.
+            if raw is not None:
+                return None
+            ready = True
+        if not ready:
+            return None
+        chunk = raw.read1(_STDIN_CHUNK) if raw is not None else stream.read()
+        if not chunk:
+            return None
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", "surrogatepass")
+        payload += chunk
+        if len(payload) > _STDIN_MAX:
+            return None
+        try:
+            return json.loads(payload)
+        except ValueError:
+            continue
+
+
+def run_release(*, env: Mapping[str, str] | None = None) -> str:
+    """One release pass: hand this session's account back.
+
+    The row goes first and the profile second, exactly as the sweep does
+    it: a row pointing at a directory that is already gone would keep an
+    account looking occupied and would make the next writer for that id
+    fail in a way nothing reclaims, while a directory left behind with no
+    row is an orphan the sweep knows how to collect.
+
+    Nothing is removed until this session is established to be over, which
+    takes one of two answers. Either the process the row names has exited —
+    proof on its own, whoever is asking — or it is still running, it is the
+    process this hook runs under, AND this really is that session ending:
+    a ``SessionEnd`` payload on stdin, carrying a reason that means the
+    process is going away (``_ENDING_REASONS``). Ancestry alone is not
+    enough, because a shell inside a running Claude has the very same
+    ancestry, and a person or an agent typing this there would otherwise
+    delete the credential out from under the session they are typing in.
+    The reason is not ceremony either: ``/clear`` and ``/resume`` fire
+    SessionEnd at a session that goes straight on running, and a release
+    there would take the account, the keychain item and the profile away
+    from somebody mid-conversation. Ending the session is the
+    deliberate way to release it — there is no command that takes one down
+    from inside it, and ``cswap purge``, which removes everything cswap
+    owns, refuses outright while any managed session is live.
+
+    A ``CLAUDE_CONFIG_DIR`` naming somebody else's live profile is not a
+    session ending either; a registry nobody can read is not evidence of
+    anything at all; and both stop the pass rather than being guessed past.
+    The reservation exists before the profile does and a Claude writes its
+    own record only once it is up, so "no record yet" must never be read as
+    "nothing is using this".
+
+    The directory itself only goes when nothing OTHER than this session's
+    own process has a live record in the profile: a Bash-tool child or a
+    detached process that inherited ``CLAUDE_CONFIG_DIR`` goes on reading
+    it, and deleting the credential under it would break work the user did
+    not end. ``session.profile_is_quiescent`` cannot be used as-is for that
+    — this hook runs inside the exiting Claude, whose own record is still
+    there — but its rule about unreadable records is kept: not knowing is
+    not the same as knowing nothing is there.
+    """
+    environ = os.environ if env is None else env
+    backup_dir = paths.get_backup_root()
+    session_id = managed_session_id_for(environ.get("CLAUDE_CONFIG_DIR"), backup_dir)
+    if session_id is None:
+        return "not-managed"
+
+    registry = ManagedSessionRegistry(backup_dir)
+    unreadable = registry.unreadable_reason()
+    if unreadable is not None:
+        # `get` folds "cannot read" into "no such row", which is the right
+        # trade for a poller and the wrong one for the two deletions below.
+        _logger.warning(
+            f"Managed session {session_id}: the registry cannot be read "
+            f"({unreadable}); releasing nothing."
+        )
+        return "registry-unreadable"
+    entry = registry.get(session_id)
+    if entry is None:
+        return "no-entry"
+    if entry_is_live(entry):
+        if not _this_session_is(entry.pid):
+            _logger.warning(
+                f"Managed session {session_id}: its process {entry.pid} is "
+                "running and is not the one asking; releasing nothing."
+            )
+            return "still-running"
+        reason = _session_end_reason()
+        if reason is None:
+            _logger.warning(
+                f"Managed session {session_id}: its process {entry.pid} is "
+                "still running and no SessionEnd reached this hook on stdin "
+                "— either it is not that hook, or the event did not arrive "
+                f"within {_STDIN_WAIT_S:g}s; releasing nothing. Ending the "
+                "session is what releases it."
+            )
+            return "not-a-session-end"
+        if reason not in _ENDING_REASONS:
+            shown = reason or "none given"
+            _logger.warning(
+                f"Managed session {session_id}: SessionEnd ({shown}) leaves "
+                f"its process {entry.pid} running, so its account is still "
+                "in use; releasing nothing."
+            )
+            return "session-continues"
+
+    if registry.remove(session_id) is None:
+        # The sweep got there between the read and the write. It owns the
+        # profile from here: it drops the row and reclaims the directory
+        # under the same rules this would have.
+        return "no-entry"
+    session_dir = registry.session_dir(session_id)
+    sessions, unreadable_records = scan_live_sessions(session_dir)
+    if unreadable_records or any(s.pid != entry.pid for s in sessions):
+        return "left-in-use"
+    if not remove_managed_profile(session_dir):
+        return "left-behind"
+    return "released"
+
+
 def ensure() -> int:
     """``cswap session ensure``. Always 0, never a word on stdout.
 
@@ -694,11 +987,31 @@ def ensure() -> int:
     ``BaseException`` on purpose: a ``KeyboardInterrupt`` landing in the hook
     while it waits on a lock must end the hook, not the user's prompt.
     """
+    return _report("ensure", run_ensure)
+
+
+def release() -> int:
+    """``cswap session release``. Always 0, never a word on stdout.
+
+    The same discipline as :func:`ensure`, for the same reason: this one
+    runs from ``SessionEnd``, where a non-zero exit is less dangerous than
+    it is on a prompt but is still a hook reporting a failure nobody asked
+    it about. What it did is worth a line; finding nothing to do is not.
+    """
+    return _report("release", run_release)
+
+
+def _report(verb: str, run: Callable[[], str]) -> int:
+    """Run one hook pass, write down what came of it, and exit 0 regardless.
+
+    Shared by both verbs so neither can drift from the other on the part
+    that matters when something goes wrong.
+    """
     configured = False
     try:
         setup_logging(paths.get_backup_root())
         configured = True
-        outcome = run_ensure()
+        outcome = run()
     except BaseException as e:  # noqa: BLE001 - fail open, unconditionally
         if not configured:
             # The setup itself is what failed, and it clears the handlers
@@ -710,8 +1023,8 @@ def ensure() -> int:
             # start writing to a UserPromptSubmit hook's terminal.
             _logger.addHandler(logging.NullHandler())
             _logger.propagate = False
-        _logger.warning(f"session ensure failed: {type(e).__name__}: {e}")
+        _logger.warning(f"session {verb} failed: {type(e).__name__}: {e}")
         return 0
     level = logging.DEBUG if outcome in _QUIET_OUTCOMES else logging.INFO
-    _logger.log(level, f"session ensure: {outcome}")
+    _logger.log(level, f"session {verb}: {outcome}")
     return 0

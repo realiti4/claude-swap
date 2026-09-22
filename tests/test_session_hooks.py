@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import select
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -17,6 +20,7 @@ from claude_swap import (
     macos_keychain,
     oauth,
     paths,
+    process_detection,
     session_hooks,
 )
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
@@ -94,14 +98,14 @@ def _moved(entry, decision):
 
 def _register(
     switcher, account, *, source="backup", expires_in_ms=6 * 3600 * 1000,
-    status="busy", idle_minutes=0.0,
+    status="busy", idle_minutes=0.0, pid=None,
 ):
     """A live managed session on ``account`` whose profile holds a token."""
     registry = ManagedSessionRegistry(switcher.backup_dir)
     session_id = "auto-aaaaaaaa"
     entry = registry.allocate(
         session_id, lambda _busy: (account, source),
-        pid=os.getpid(), proc_start=None,
+        pid=os.getpid() if pid is None else pid, proc_start=None,
     )
     session_dir = registry.session_dir(session_id)
     create_managed_profile(session_dir)
@@ -109,8 +113,8 @@ def _register(
     # refuse, since a session Claude has not registered may still be
     # reading the credential its launch wrote.
     (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
-    (session_dir / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
-        "pid": os.getpid(), "status": status, "cwd": "/work",
+    (session_dir / "sessions" / f"{entry.pid}.json").write_text(json.dumps({
+        "pid": entry.pid, "status": status, "cwd": "/work",
         "statusUpdatedAt": int((time.time() - idle_minutes * 60.0) * 1000),
     }))
     (session_dir / ".credentials.json").write_text(json.dumps({
@@ -1017,3 +1021,551 @@ class TestEnsureFailsOpen:
         assert session_hooks.ensure() == 0
         out = capsys.readouterr()
         assert out.out == "" and out.err == ""
+
+
+class _Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+# A child that answers the one question and says how long it took. It runs
+# in a process of its own because the pipe it is asked over is the point:
+# a version of the check that waits for EOF would hang whatever asks it.
+_PIPE_PROBE = """
+import json, sys, time
+from claude_swap import session_hooks
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+start = time.monotonic()
+answer = session_hooks._session_end_reason()
+sys.stdout.write(
+    json.dumps({"answer": answer, "elapsed": time.monotonic() - start}) + "\\n"
+)
+sys.stdout.flush()
+"""
+_PROBE_TIMEOUT_S = 15.0
+# Long enough that the child has taken the first chunk before the second is
+# written — the point of the split — and short enough to leave the rest of
+# the budget for it.
+_PROBE_PAUSE_S = 0.25
+
+
+def _ask_over_a_pipe(chunks, *, pause=0.0, close=False):
+    """Ask the stdin check over a pipe whose write end is never closed.
+
+    That is the shape a wrapper script, a fifo or a shell holding the write
+    end open in a sibling gives a hook, and the one where "read to EOF"
+    means "read forever". The child says when it is about to ask, so a
+    chunk written after that is one the read has to wait for rather than
+    one already sitting in the pipe. It is given a hard timeout and is
+    reaped either way, so a check that blocks fails this test rather than
+    hanging the suite.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _PIPE_PROBE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Bounded like everything else here: an import that fails closes
+        # stdout and answers at once, but one that HANGS would otherwise
+        # hang the suite before the timeout below ever applied.
+        if not select.select([proc.stdout], [], [], _PROBE_TIMEOUT_S)[0]:
+            pytest.fail("the probe never got as far as asking")
+        assert proc.stdout.readline().strip() == "ready"
+        for index, chunk in enumerate(chunks):
+            if index:
+                time.sleep(pause)
+            proc.stdin.write(chunk)
+            proc.stdin.flush()
+        if close:
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=_PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pytest.fail("the stdin read never came back: it waits for an EOF")
+        return json.loads(proc.stdout.readline())
+    finally:
+        proc.kill()
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                pipe.close()
+            except OSError:  # the child is gone; nothing left to flush into
+                pass
+        proc.wait()
+
+
+@pytest.fixture
+def session_end(monkeypatch):
+    """stdin as Claude hands it to a hook for a session that is ending.
+
+    A live row is only released to the process that owns it AND can show
+    this, so every test standing in for a real SessionEnd has to say so —
+    with a reason that means the process is going away. `prompt_input_exit`
+    is the one an ordinary Ctrl-D or /exit produces; `clear` and `resume`
+    are SessionEnds too and deliberately do NOT release (see
+    TestReleaseReasons).
+    """
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "session_id": "s-1",
+        "hook_event_name": "SessionEnd",
+        "reason": "prompt_input_exit",
+    })))
+
+
+def _item(session_dir):
+    from claude_swap.session import _keychain_account_name, keychain_service_name
+
+    return keychain_service_name(session_dir), _keychain_account_name()
+
+
+class TestRelease:
+    """`cswap session release`: handing the account back at SessionEnd."""
+
+    def test_it_removes_the_row_and_the_profile(self, session, session_end):
+        _switcher, registry, entry, session_dir = session
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert registry.get(entry.session_id) is None
+        assert not session_dir.exists()
+
+    def test_it_deletes_the_keychain_item(
+        self, session, session_end, block_real_keychain
+    ):
+        _switcher, _registry, _entry, session_dir = session
+        macos_keychain.set_password(*_item(session_dir), "secret")
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert macos_keychain.get_password(*_item(session_dir)) is None
+
+    def test_an_unmanaged_config_dir_is_a_no_op(self, managed_switcher, tmp_path):
+        assert session_hooks.run_release(
+            env={"CLAUDE_CONFIG_DIR": str(tmp_path)}
+        ) == "not-managed"
+        assert tmp_path.exists()
+
+    def test_a_row_already_gone_leaves_the_directory_to_the_sweep(self, session):
+        """Nothing to hand back, and nothing here knows whether the directory
+        is still being read — which is the orphan pass's question, under its
+        own grace period."""
+        _switcher, registry, entry, session_dir = session
+        registry.remove(entry.session_id)
+        assert session_hooks.run_release(env=_env(session_dir)) == "no-entry"
+        assert session_dir.exists()
+
+    def test_a_registry_nobody_can_read_releases_nothing(self, session):
+        """"Cannot read" is folded into "no such row" by the reader every
+        poller uses, and two deletions hang off that answer here. Asked the
+        explicit way instead, and refused."""
+        _switcher, _registry, entry, session_dir = session
+        (session_dir.parent / "managed.json").write_text("{ not json")
+        assert session_hooks.run_release(env=_env(session_dir)) == (
+            "registry-unreadable"
+        )
+        assert session_dir.exists()
+
+    def test_a_session_still_running_under_somebody_else_is_left_alone(
+        self, managed_switcher
+    ):
+        """The reservation exists before the profile does and a Claude writes
+        its own record only once it is up, so a live row whose process is not
+        the one asking must keep both its row and its directory — this is the
+        window a profile used to be removed in."""
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            _switcher, registry, entry, session_dir = _register(
+                managed_switcher, B, pid=child.pid
+            )
+            assert session_hooks.run_release(env=_env(session_dir)) == "still-running"
+            assert registry.get(entry.session_id) is not None
+            assert session_dir.exists()
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_a_row_whose_process_has_gone_is_released_by_anyone(
+        self, managed_switcher
+    ):
+        """The other half of the same rule: a session that has already ended
+        does not have to prove who is asking — no payload on stdin, and
+        released anyway. A hook outliving the Claude that spawned it, or a
+        hand-run release for a crashed one, still hands the account back."""
+        child = subprocess.Popen(["true"])
+        child.wait()
+        if process_detection.is_pid_alive(child.pid):
+            pytest.skip("pid recycled between wait() and the check")
+        _switcher, registry, entry, session_dir = _register(
+            managed_switcher, B, pid=child.pid
+        )
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert registry.get(entry.session_id) is None
+        assert not session_dir.exists()
+
+    def test_it_looks_past_the_shell_that_ran_the_hook(self):
+        """Claude runs a hook through a shell, so the process asking is a
+        grandchild of the session it belongs to as often as a child. Asked
+        from one generation further down, with a real shell in between."""
+        script = (
+            "from claude_swap.session_hooks import _this_session_is;"
+            f"print(_this_session_is({os.getpid()}))"
+        )
+        # `; true` keeps the shell from exec'ing python into its own pid,
+        # which is what puts a generation between this process and the ask.
+        proc = subprocess.run(
+            ["sh", "-c", f"{sys.executable} -c '{script}'; true"],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.stdout.strip() == "True", proc.stderr
+
+    def test_a_profile_another_claude_still_uses_keeps_its_directory(
+        self, session, session_end
+    ):
+        _switcher, registry, entry, session_dir = session
+        other = 4243
+        (session_dir / "sessions" / f"{other}.json").write_text(json.dumps({
+            "pid": other, "status": "busy", "cwd": "/work",
+        }))
+        with (
+            patch("claude_swap.process_detection.is_pid_alive", return_value=True),
+            patch(
+                "claude_swap.process_detection.pid_matches_record", return_value=True
+            ),
+        ):
+            assert session_hooks.run_release(env=_env(session_dir)) == "left-in-use"
+        assert registry.get(entry.session_id) is None
+        assert session_dir.exists()
+
+    def test_a_refused_removal_leaves_the_keychain_item_alone(
+        self, session, session_end, block_real_keychain
+    ):
+        """The item goes with the directory and never before it: a profile
+        kept because something is still reading it would otherwise keep a
+        credential file the item no longer shadows, which is the one state
+        the writer's degrade exists to avoid creating."""
+        _switcher, _registry, entry, session_dir = session
+        macos_keychain.set_password(*_item(session_dir), "secret")
+        other = 4243
+        (session_dir / "sessions" / f"{other}.json").write_text(json.dumps({
+            "pid": other, "status": "busy", "cwd": "/work",
+        }))
+        with (
+            patch("claude_swap.process_detection.is_pid_alive", return_value=True),
+            patch(
+                "claude_swap.process_detection.pid_matches_record", return_value=True
+            ),
+        ):
+            assert session_hooks.run_release(env=_env(session_dir)) == "left-in-use"
+        assert macos_keychain.get_password(*_item(session_dir)) == "secret"
+
+    def test_an_unreadable_record_keeps_the_directory(self, session, session_end):
+        """Not knowing what is running is not knowing that nothing is."""
+        _switcher, _registry, _entry, session_dir = session
+        (session_dir / "sessions" / "77.json").write_text("{ not json")
+        assert session_hooks.run_release(env=_env(session_dir)) == "left-in-use"
+        assert session_dir.exists()
+
+    def test_a_live_session_that_is_ours_and_ending_is_released(
+        self, managed_switcher, session_end
+    ):
+        """The normal case, and the only one where anything live is deleted:
+        the row names a process this one is running under — a generation up,
+        as it is when Claude spawns the hook — and stdin says that session is
+        ending. Its own record is in the profile and does not hold it, which
+        is why the sweep's quiescence test cannot be used as it stands."""
+        _switcher, registry, entry, session_dir = _register(
+            managed_switcher, B, pid=os.getppid()
+        )
+        assert entry.pid != os.getpid()
+        assert (session_dir / "sessions" / f"{entry.pid}.json").exists()
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert registry.get(entry.session_id) is None
+        assert not session_dir.exists()
+
+    @pytest.mark.parametrize("stream, text", [
+        (_Tty, json.dumps({                                     # a terminal
+            "hook_event_name": "SessionEnd", "reason": "logout",
+        })),
+        (io.StringIO, ""),                                      # nothing at all
+        (io.StringIO, "not json"),
+        (io.StringIO, json.dumps({"hook_event_name": "PreToolUse"})),
+        (io.StringIO, json.dumps(["SessionEnd"])),              # not an object
+    ])
+    def test_a_live_session_is_not_released_by_anything_but_its_own_end(
+        self, session, monkeypatch, block_real_keychain, stream, text
+    ):
+        """A Bash tool, a subshell, a person in a split pane: all of them run
+        under the very ancestry the hook runs under, so ancestry alone would
+        delete a running session's credential out from under it. Only the
+        event Claude hands the hook on stdin tells the two apart."""
+        _switcher, registry, entry, session_dir = session
+        macos_keychain.set_password(*_item(session_dir), "secret")
+        monkeypatch.setattr(sys, "stdin", stream(text))
+        assert session_hooks.run_release(env=_env(session_dir)) == (
+            "not-a-session-end"
+        )
+        assert registry.get(entry.session_id) is not None
+        assert session_dir.exists()
+        assert macos_keychain.get_password(*_item(session_dir)) == "secret"
+
+    @pytest.mark.parametrize("chunks, answer", [
+        ([json.dumps({"hook_event_name": "SessionEnd", "reason": "logout"})],
+         "logout"),
+        (['{"hook_event_name": "SessionEnd", "rea', 'son": "logout"}'],
+         "logout"),
+        (['{"hook_event_name": "SessionEnd", "rea'], None),
+    ], ids=["whole", "in-pieces", "truncated"])
+    def test_the_event_is_read_under_a_deadline_not_to_an_eof(
+        self, chunks, answer
+    ):
+        """Claude writes the event and moves on; nothing says the write end
+        is ever closed, and on a pipe "read to EOF" then means "read until
+        the hook timeout kills me", with the session's teardown waiting on
+        it. Whole, in pieces, or cut off: the answer comes back inside the
+        budget, and a payload split across writes is still read as one."""
+        result = _ask_over_a_pipe(chunks, pause=_PROBE_PAUSE_S)
+        assert result["answer"] == answer
+        assert result["elapsed"] < session_hooks._STDIN_WAIT_S * 2
+
+    def test_a_descriptor_it_cannot_wait_on_is_not_read(self, monkeypatch):
+        """The wait is what bounds the read: reading a real descriptor with
+        no budget behind it is the one move that might never come back. Out
+        of reach in practice — a hook's stdin is fd 0 and `select` does not
+        fail on that — but the answer when it cannot be waited on is "no
+        SessionEnd", not "read it anyway and hope"."""
+        reads = []
+
+        class Stream:
+            class buffer:  # noqa: N801 - stands in for `sys.stdin.buffer`
+                @staticmethod
+                def read1(size):
+                    reads.append(size)
+                    return json.dumps({"hook_event_name": "SessionEnd"}).encode()
+
+            def isatty(self):
+                return False
+
+            def fileno(self):
+                return 0
+
+        def no_select(*_args):
+            raise OSError("fd out of range")
+
+        monkeypatch.setattr(sys, "stdin", Stream())
+        monkeypatch.setattr(session_hooks.select, "select", no_select)
+        assert session_hooks._session_end_reason() is None
+        assert reads == []
+
+    def test_a_stream_that_never_stops_is_given_up_on(self, monkeypatch):
+        """Stdin is inherited, and a release run under something writing a
+        lot to it -- a build log, another tool's output -- would otherwise
+        accumulate the whole of it for the budget and reparse everything
+        accumulated after every chunk, which is quadratic. The event is a
+        few hundred bytes; past a megabyte this stream is not it."""
+        reads = []
+
+        class Firehose:
+            class buffer:  # noqa: N801 - stands in for `sys.stdin.buffer`
+                @staticmethod
+                def read1(size):
+                    reads.append(size)
+                    return b"x" * size
+
+            def isatty(self):
+                return False
+
+            def fileno(self):
+                return 0
+
+        monkeypatch.setattr(sys, "stdin", Firehose())
+        monkeypatch.setattr(
+            session_hooks.select, "select", lambda *_a: ([sys.stdin], [], [])
+        )
+        assert session_hooks._session_end_reason() is None
+        # Bounded by the cap, not by the deadline: one chunk past it is all
+        # it takes, and it never went back for more.
+        assert sum(reads) <= session_hooks._STDIN_MAX + session_hooks._STDIN_CHUNK
+
+    def test_a_payload_just_under_the_cap_is_still_read(self, monkeypatch):
+        """The cap is generous on purpose, so it must not be what answers a
+        real event that happens to arrive behind some padding."""
+        # A literal half-megabyte, not a fraction of the cap: sized against
+        # the cap, this test would shrink with it and a cap tightened to a
+        # kilobyte would still look right.
+        assert session_hooks._STDIN_MAX == 1024 * 1024
+        event = json.dumps({
+            "hook_event_name": "SessionEnd",
+            "reason": "logout",
+            "pad": "p" * 512 * 1024,
+        }).encode()
+        chunks = [
+            event[i:i + session_hooks._STDIN_CHUNK]
+            for i in range(0, len(event), session_hooks._STDIN_CHUNK)
+        ]
+
+        class Stream:
+            class buffer:  # noqa: N801 - stands in for `sys.stdin.buffer`
+                @staticmethod
+                def read1(_size):
+                    return chunks.pop(0) if chunks else b""
+
+            def isatty(self):
+                return False
+
+            def fileno(self):
+                return 0
+
+        monkeypatch.setattr(sys, "stdin", Stream())
+        monkeypatch.setattr(
+            session_hooks.select, "select", lambda *_a: ([sys.stdin], [], [])
+        )
+        assert session_hooks._session_end_reason() == "logout"
+
+    def test_a_stream_that_ends_is_not_waited_out(self):
+        """EOF is an answer, not a reason to sit out the rest of the budget:
+        whatever was going to arrive has arrived, and a session teardown is
+        waiting on this."""
+        result = _ask_over_a_pipe(['{"hook_event_name": "Sess'], close=True)
+        assert result["answer"] is None
+        assert result["elapsed"] < session_hooks._STDIN_WAIT_S / 2
+
+    def test_a_directory_that_would_not_go_is_reported(self, session, session_end):
+        _switcher, registry, entry, session_dir = session
+        with patch(
+            "claude_swap.session_hooks.remove_managed_profile", return_value=False
+        ):
+            assert session_hooks.run_release(env=_env(session_dir)) == "left-behind"
+        assert registry.get(entry.session_id) is None
+        assert session_dir.exists()
+
+    def test_it_fails_open(self, capsys):
+        with patch(
+            "claude_swap.session_hooks.run_release", side_effect=RuntimeError("boom")
+        ):
+            assert session_hooks.release() == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_what_it_did_is_written_to_the_log(self, unconfigured_logger):
+        """Once per session, so a line at the default level costs nothing and
+        answers "did the account ever come back?"."""
+        with patch("claude_swap.session_hooks.run_release", return_value="released"):
+            assert session_hooks.release() == 0
+        assert "session release: released" in _log_text()
+
+    def test_a_refusal_is_written_down_once(self, session, unconfigured_logger):
+        """Each refusal already explains itself in a warning that names what
+        was refused and why. Repeating the bare outcome at INFO underneath it
+        would put the same story in the shared log twice."""
+        _switcher, _registry, _entry, session_dir = session
+        (session_dir.parent / "managed.json").write_text("{ not json")
+        with patch("claude_swap.session_hooks.os.environ", _env(session_dir)):
+            assert session_hooks.release() == 0
+        log = _log_text()
+        assert "the registry cannot be read" in log
+        assert "session release: registry-unreadable" not in log
+
+    def test_a_missing_event_reads_as_missing_not_as_a_hand_run(
+        self, session, monkeypatch, unconfigured_logger
+    ):
+        """The same refusal covers two different stories: somebody ran the
+        verb by hand inside a live session, and a real SessionEnd whose
+        payload was merely slow. The warning has to leave room for the
+        second, or a reader chasing a release that did not happen goes
+        looking for a command nobody typed."""
+        _switcher, _registry, _entry, session_dir = session
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        with patch("claude_swap.session_hooks.os.environ", _env(session_dir)):
+            assert session_hooks.release() == 0
+        log = _log_text()
+        assert "no SessionEnd reached this hook" in log
+        assert "did not arrive within" in log
+        assert "Ending the session is what releases it" in log
+
+    def test_a_pass_with_nothing_to_do_does_not_touch_the_log(
+        self, unconfigured_logger
+    ):
+        with patch("claude_swap.session_hooks.run_release", return_value="no-entry"):
+            assert session_hooks.release() == 0
+        assert not (paths.get_backup_root() / "claude-swap.log").exists()
+
+
+# The SessionEnd reasons Claude Code's shutdown path passes to its hook
+# runner, written out rather than imported: see the test below.
+_ENDING_REASONS = ("logout", "prompt_input_exit", "other")
+
+
+class TestReleaseReasons:
+    """Which SessionEnd reasons take a LIVE session's account away.
+
+    Claude Code fires SessionEnd five ways. Three of them run from its
+    shutdown path and the process is gone moments later; two of them —
+    `/clear` and `/resume` — leave the session running with the same pid,
+    the same profile and the same credential. Releasing on those would
+    delete the account, the keychain item and the whole profile out from
+    under somebody mid-conversation, silently, because both verbs are
+    silent by design.
+    """
+
+    def _stdin(self, monkeypatch, payload):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    def test_the_allowlist_is_exactly_the_reasons_that_end_the_process(self):
+        """Spelled out here rather than read off the constant: a test that
+        parametrises over the set under test says nothing about what is in
+        it, and shrinking the set would silently shrink the test with it."""
+        assert session_hooks._ENDING_REASONS == frozenset(_ENDING_REASONS)
+
+    @pytest.mark.parametrize("reason", _ENDING_REASONS)
+    def test_a_reason_that_ends_the_process_releases(
+        self, session, monkeypatch, block_real_keychain, reason
+    ):
+        _switcher, registry, entry, session_dir = session
+        macos_keychain.set_password(*_item(session_dir), "secret")
+        self._stdin(monkeypatch, {"hook_event_name": "SessionEnd", "reason": reason})
+        assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert registry.get(entry.session_id) is None
+        assert not session_dir.exists()
+        assert macos_keychain.get_password(*_item(session_dir)) is None
+
+    @pytest.mark.parametrize("payload, shown", [
+        ({"hook_event_name": "SessionEnd", "reason": "clear"}, "clear"),
+        ({"hook_event_name": "SessionEnd", "reason": "resume"}, "resume"),
+        ({"hook_event_name": "SessionEnd", "reason": "hibernate"}, "hibernate"),
+        ({"hook_event_name": "SessionEnd"}, "none given"),
+        ({"hook_event_name": "SessionEnd", "reason": 7}, "none given"),
+    ], ids=["clear", "resume", "unknown", "absent", "not-a-string"])
+    def test_a_session_that_carries_on_keeps_everything(
+        self, session, monkeypatch, block_real_keychain, unconfigured_logger,
+        payload, shown,
+    ):
+        """/clear is the one that matters most: the row is live, the hook is
+        that Claude's own child, and stdin really does say SessionEnd. Only
+        the reason says the session is still there."""
+        _switcher, registry, entry, session_dir = session
+        macos_keychain.set_password(*_item(session_dir), "secret")
+        self._stdin(monkeypatch, payload)
+        with patch("claude_swap.session_hooks.os.environ", _env(session_dir)):
+            assert session_hooks.release() == 0
+        assert registry.get(entry.session_id) == entry
+        assert session_dir.exists()
+        assert (session_dir / ".credentials.json").exists()
+        assert macos_keychain.get_password(*_item(session_dir)) == "secret"
+        log = _log_text()
+        assert f"SessionEnd ({shown})" in log
+        assert "releasing nothing" in log
+
+    def test_a_dead_row_is_released_whatever_the_reason_says(
+        self, managed_switcher, monkeypatch
+    ):
+        """A process that has exited settles it on its own: the reason gate
+        exists to protect a session that is still running, and there is none
+        here to protect."""
+        _switcher, registry, entry, session_dir = _register(
+            managed_switcher, B, pid=999_999
+        )
+        self._stdin(monkeypatch, {"hook_event_name": "SessionEnd", "reason": "clear"})
+        with patch(
+            "claude_swap.process_detection.is_pid_alive", return_value=False
+        ):
+            assert session_hooks.run_release(env=_env(session_dir)) == "released"
+        assert registry.get(entry.session_id) is None
+        assert not session_dir.exists()

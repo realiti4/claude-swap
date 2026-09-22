@@ -221,6 +221,27 @@ def _stat_start_ticks(text: str) -> str | None:
     return fields[19]
 
 
+def parent_pid(pid: int) -> int | None:
+    """The process that started ``pid``, or None when unknowable.
+
+    For asking "am I running underneath that process?" — a hook wanting to
+    know whether the session it was handed is the one that spawned it, when
+    the shell that ran the hook sits between the two. Like every reader
+    here, not knowing answers None rather than a number a caller might act
+    on: a process that has already been reaped is absent from ``ps``
+    entirely, which is that None. A parent of 1 is a different answer and a
+    real one — the chain has been reparented to init — and callers that are
+    walking upwards stop there, since init started nothing they care about.
+    """
+    text = _ps(pid, "ppid")
+    if text is None:
+        return None
+    try:
+        return int(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
 def process_is_claude(pid: int) -> bool | None:
     """Does the process at ``pid`` look like a claude, or None when unknowable.
 

@@ -265,21 +265,26 @@ Examples:
         sys.exit(130)
 
 
-def _session_command(argv: list[str]) -> None:
-    """Handle `cswap session ensure`: the hooks a managed session runs,
-    dispatched ahead of every other CLI setup.
+# The verbs `cswap session` dispatches before any other CLI setup. A tuple
+# rather than an if-chain so the usage line and the dispatch cannot drift.
+_HOOK_VERBS = ("ensure", "release")
 
-    These run inside somebody's Claude Code session on every prompt, so
-    this path does no theme detection (its terminal query would go into
-    Claude's pipe), builds no parser, and prints nothing on the hook verb.
-    Anything else is a person typing, so that one does print, in the ASCII
-    it is written in: this runs above the output setup, so the message
+
+def _session_command(argv: list[str]) -> None:
+    """Handle `cswap session ensure|release`: the hooks a managed session
+    runs, dispatched ahead of every other CLI setup.
+
+    These run inside somebody's Claude Code session — `ensure` on every
+    prompt — so this path does no theme detection (its terminal query would
+    go into Claude's pipe), builds no parser, and prints nothing on the hook
+    verbs. Anything else is a person typing, so that one does print, in the
+    ASCII it is written in: this runs above the output setup, so the message
     cannot assume the console can render anything else.
 
     `cswap session` is a character away from `cswap sessions`, and neither
-    it nor its verb appears in any help output, so the likeliest reader of
+    it nor its verbs appear in any help output, so the likeliest reader of
     that message is somebody who meant the other command. It says so, and
-    says what this one is for, rather than offering a verb nobody should
+    says what this one is for, rather than offering two verbs nobody should
     run by hand.
 
     The exit code is the other half of that. 2 is what Claude Code reads as
@@ -291,23 +296,27 @@ def _session_command(argv: list[str]) -> None:
     because the only other caller is a hook whose turn must not be blocked
     over a spelling.
 
-    The verb body — its import included — is what carries the hook's
-    fail-open promise here. ``session_hooks.ensure`` swallows everything
-    it can reach, but it cannot swallow its own import, and this dispatch
-    runs above ``main``'s try. A broken install (a half-written module, a
-    dependency the interpreter cannot load) would otherwise exit non-zero
-    from a ``UserPromptSubmit`` hook, which blocks the user's turn — the
-    one outcome the hook exists to make impossible.
+    The verb body — its import included — is what carries the hooks'
+    fail-open promise here. Each of them swallows everything it can reach,
+    but neither can swallow its own import, and this dispatch runs above
+    ``main``'s try. A broken install — a half-written module, a dependency
+    the interpreter cannot load — would otherwise take that exit code
+    straight back to Claude, and what that costs depends on the event:
+    ``ensure`` runs on ``UserPromptSubmit``, where a non-zero exit blocks
+    the turn the user just started, and ``release`` on ``SessionEnd``,
+    where it reports a failure nobody asked about in a session that is
+    already over. Neither is acceptable, so both verbs go through the same
+    guard; neither is dispatched outside it.
     """
     verb = argv[0] if argv else ""
-    # `len(argv) == 1`: the verb takes nothing, and quietly running the hook
+    # `len(argv) == 1`: the verbs take nothing, and quietly running the hook
     # while dropping the rest would hide a typo in a flag somebody adds
-    # later. An argument it does not know is a usage error like any other.
-    if verb == "ensure" and len(argv) == 1:
+    # later. An argument they do not know is a usage error like any other.
+    if verb in _HOOK_VERBS and len(argv) == 1:
         try:
             from claude_swap import session_hooks
 
-            code = session_hooks.ensure()
+            code = getattr(session_hooks, verb)()
         except BaseException:  # noqa: BLE001 - fail open, unconditionally
             code = 0
         sys.exit(code)
@@ -316,12 +325,12 @@ def _session_command(argv: list[str]) -> None:
     # A literal, not `_prog_name()`: that is `sys.argv[0]`, which can hold
     # anything, and this runs above `force_utf8_output()` — so a console
     # that cannot encode it would turn this message into a traceback. The
-    # verb is ASCII by construction, and so is the rest of this.
+    # verbs are ASCII by construction, and so is the rest of this.
     error(
-        "Usage: cswap session ensure\n"
-        "`cswap session` is internal: `cswap run --auto` registers this "
-        "verb as a Claude Code\nhook inside each managed session, and it "
-        "takes no arguments of its own.\nDid you mean `cswap sessions`, "
+        "Usage: cswap session {" + "|".join(_HOOK_VERBS) + "}\n"
+        "`cswap session` is internal: `cswap run --auto` registers these "
+        "verbs as Claude Code\nhooks inside each managed session, and they "
+        "take no arguments of their own.\nDid you mean `cswap sessions`, "
         "which lists the managed sessions you have running?"
     )
     sys.exit(2)
@@ -1152,7 +1161,8 @@ def main() -> None:
     # (the unknown-verb usage error underneath does print, and is ASCII
     # by construction); and the native TLS verifier is installed by
     # `session_hooks.run_ensure` itself, on the far side of its gate,
-    # where the one path that can open a connection lives.
+    # where the one path that can open a connection lives — `release`
+    # opens none.
     if argv and argv[0] == "session":
         _session_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
