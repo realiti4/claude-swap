@@ -7424,35 +7424,67 @@ class ClaudeAccountSwitcher:
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
-        sessions_root = self.backup_dir / "sessions"
-        session_dirs = (
-            [d for d in sessions_root.iterdir() if d.is_dir()]
-            if sessions_root.is_dir()
-            else []
+        from claude_swap.managed_sessions import (
+            ManagedSessionRegistry,
+            is_managed_session_id,
+            sessions_root,
         )
         from claude_swap.session import scan_live_sessions
 
-        live = {}
-        unreadable = {}
+        root = sessions_root(self.backup_dir)
+        session_dirs = (
+            [d for d in root.iterdir() if d.is_dir()] if root.is_dir() else []
+        )
+
+        live: dict[str, list[int]] = {}
+        unreadable: dict[str, int] = {}
         for d in session_dirs:
             sessions, bad = scan_live_sessions(d)
             if sessions:
                 live[d.name] = [s.pid for s in sessions]
             elif bad:
                 unreadable[d.name] = bad
+        # A managed session is live from the moment its registry entry is
+        # written -- BEFORE exec, let alone before Claude writes its first
+        # `sessions/<pid>.json` record -- so `scan_live_sessions` above sees
+        # nothing for the gap between them. Fold the registry's own liveness
+        # signal in too, or that gap is a window where purge deletes a
+        # profile whose process is running.
+        registry = ManagedSessionRegistry(self.backup_dir)
+        for entry in registry.live_entries():
+            pids = live.setdefault(entry.session_id, [])
+            if entry.pid not in pids:
+                pids.append(entry.pid)
         if live:
             details = "; ".join(
                 f"{name} (PID {', '.join(map(str, pids))})"
                 for name, pids in live.items()
             )
+            hint = (
+                " Run `cswap sessions` to see each managed session's cwd."
+                if any(is_managed_session_id(name) for name in live)
+                else ""
+            )
             raise SessionError(
                 f"Live session-mode Claude instance(s) found: {details}. "
-                "Exit them first, then retry --purge."
+                f"Exit them first, then retry --purge.{hint}"
             )
-        if unreadable:
-            details = "; ".join(
+        # A corrupt or unreadable managed.json degrades to "no managed
+        # sessions" for the registry's polling callers -- right for them,
+        # wrong here: it would read a live managed session as absent and
+        # purge would then rmtree its profile and Keychain item out from
+        # under it, same hazard as an unreadable per-session record below.
+        registry_unreadable = registry.unreadable_reason()
+        if unreadable or registry_unreadable is not None:
+            details_parts = [
                 f"{name} ({n} record(s))" for name, n in unreadable.items()
-            )
+            ]
+            if registry_unreadable is not None:
+                details_parts.append(
+                    f"the managed session registry {registry.path} "
+                    f"({registry_unreadable})"
+                )
+            details = "; ".join(details_parts)
             raise SessionError(
                 f"Session records that could not be read: {details}. Whether a "
                 "Claude instance is live cannot be determined, and purging "

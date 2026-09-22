@@ -61,7 +61,7 @@ from claude_swap.settings import atomic_write_json
 _logger = logging.getLogger("claude-swap")
 
 MANAGED_PREFIX = "auto-"
-_SESSION_ID_RE = re.compile(r"^auto-[0-9a-f]{8}$")
+_SESSION_ID_RE = re.compile(r"\Aauto-[0-9a-f]{8}\Z")
 REGISTRY_FILENAME = "managed.json"
 REGISTRY_LOCK_FILENAME = ".managed.lock"
 REGISTRY_SCHEMA_VERSION = 1
@@ -448,12 +448,13 @@ class ManagedSessionRegistry:
         upkeep pass, ``managed_refresh``), which must not be taken down by
         one bad file and treat "no entries" and "can't tell" the same way
         either way. A caller about to do something destructive cannot make
-        that trade: reading "can't tell" as "empty" and proceeding would
-        delete a live managed session's profile out from under it, since
-        an unreadable registry means that session's liveness can't be
-        determined either, not that there isn't one. This is the narrow,
-        explicit way to ask; the registry's own mutators ask it through
-        ``_read_for_write``.
+        that trade: reading "can't tell" as "empty" and proceeding is the
+        same failure mode ``purge()`` already refuses on for an unreadable
+        per-session record, just one level up -- an unreadable registry
+        means a managed session's liveness can't be determined either, not
+        that there isn't one. This is the narrow, explicit way to ask; the
+        registry's own mutators ask it through ``_read_for_write``, and
+        ``sweep`` through ``_load``.
 
         "Unreadable" is ``_load``'s definition, so it covers a
         ``schemaVersion`` this build cannot model as well as a file it

@@ -1856,6 +1856,203 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestPurgeGuardsManagedSessionProfiles:
+    """purge()'s live/unreadable scan over sessions/ treats every
+    subdirectory as an opaque profile (no name decoding), so a managed
+    auto-* dir is covered the same way a per-account one is: a live or
+    unreadable record inside it blocks purge, and a quiescent one is swept
+    along with everything else."""
+
+    # Vanishingly unlikely to exist, mirroring make_live's own dead-pid
+    # convention -- used where the registry entry itself must NOT read as
+    # live, so a test can isolate a different liveness signal.
+    _DEAD_PID = 2**22 + 12345
+
+    def _managed_profile(self, switcher, *, pid: int | None = None) -> Path:
+        from claude_swap.managed_sessions import (
+            AccountRef,
+            ManagedSessionRegistry,
+            create_managed_profile,
+        )
+
+        registry = ManagedSessionRegistry(switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef",
+            lambda busy: (AccountRef("nobody@example.com", "org-x"), "backup"),
+            pid=pid if pid is not None else os.getpid(), proc_start=None,
+        )
+        session_dir = registry.session_dir("auto-0000beef")
+        create_managed_profile(session_dir)
+        return session_dir
+
+    def test_purge_refuses_while_managed_session_is_live(
+        self, seeded_switcher, monkeypatch
+    ):
+        managed = self._managed_profile(seeded_switcher)
+        make_live(managed)
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        with pytest.raises(SessionError, match="Exit them first") as exc:
+            seeded_switcher.purge()
+        assert seeded_switcher.backup_dir.exists()
+        # The bare dir name (`auto-0000beef`) does not tell a user which
+        # terminal it is; point them at the listing that shows each
+        # session's cwd.
+        assert "cswap sessions" in str(exc.value)
+
+    def test_purge_refusal_omits_the_managed_hint_for_a_named_profile(
+        self, seeded_switcher, monkeypatch
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        make_live(session_dir)
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        with pytest.raises(SessionError, match="Exit them first") as exc:
+            seeded_switcher.purge()
+        assert "cswap sessions" not in str(exc.value)
+
+    def test_purge_refuses_for_a_reservation_with_no_session_record_yet(
+        self, seeded_switcher, monkeypatch
+    ):
+        """A managed session is live from the moment its registry entry is
+        written -- before exec, let alone before Claude writes its first
+        `sessions/<pid>.json` record. `_managed_profile` reserves the entry
+        and creates the (empty) profile dir but never calls `make_live`, so
+        the only liveness signal here is the registry's."""
+        self._managed_profile(seeded_switcher)
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        with pytest.raises(SessionError, match="Exit them first"):
+            seeded_switcher.purge()
+        assert seeded_switcher.backup_dir.exists()
+
+    def test_purge_refuses_when_managed_session_record_is_unreadable(
+        self, seeded_switcher, monkeypatch
+    ):
+        # A dead pid keeps the registry's OWN liveness signal out of this,
+        # isolating the file-based scan's unreadable-record path.
+        managed = self._managed_profile(seeded_switcher, pid=self._DEAD_PID)
+        pid_dir = managed / "sessions"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "9999.json").write_text("not json{{{", encoding="utf-8")
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        with pytest.raises(SessionError, match="could not be read"):
+            seeded_switcher.purge()
+        assert seeded_switcher.backup_dir.exists()
+
+    def test_purge_removes_quiescent_managed_session_profile(
+        self, seeded_switcher, monkeypatch, block_real_keychain
+    ):
+        # A dead pid: the registry must not itself call this live, or the
+        # profile could never reach the "safe to sweep" branch being tested.
+        managed = self._managed_profile(seeded_switcher, pid=self._DEAD_PID)
+        service = keychain_service_name(managed)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, "creds")
+
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        seeded_switcher.purge()
+
+        assert block_real_keychain.get_password(service, account) is None
+        assert not seeded_switcher.backup_dir.exists()
+
+    def test_purge_refuses_with_a_corrupt_managed_registry(
+        self, seeded_switcher, monkeypatch
+    ):
+        """A registry that fails to parse must not degrade to "no managed
+        sessions" here -- that reading is right for the registry's own
+        polling callers, but purge would then rmtree a live managed
+        session's profile right out from under it."""
+        registry_path = seeded_switcher.backup_dir / "sessions" / "managed.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text("not json{{{", encoding="utf-8")
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        with pytest.raises(SessionError, match="could not be read") as exc:
+            seeded_switcher.purge()
+        assert "managed session registry" in str(exc.value)
+        assert str(registry_path) in str(exc.value)
+        assert seeded_switcher.backup_dir.exists()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_purge_refuses_with_an_unreadable_managed_registry(
+        self, seeded_switcher, monkeypatch
+    ):
+        registry_path = seeded_switcher.backup_dir / "sessions" / "managed.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text("{}", encoding="utf-8")
+        registry_path.chmod(0o000)
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("prompt must not be reached")
+        )
+        try:
+            with pytest.raises(SessionError, match="could not be read") as exc:
+                seeded_switcher.purge()
+        finally:
+            registry_path.chmod(0o600)
+        assert "managed session registry" in str(exc.value)
+        assert seeded_switcher.backup_dir.exists()
+
+    def test_purge_proceeds_normally_without_a_managed_registry(
+        self, seeded_switcher, monkeypatch
+    ):
+        """The common case: no managed.json at all must not become a
+        refusal -- `unreadable_reason` reads `FileNotFoundError` as
+        `None`, same as `_read`'s own "absent" branch."""
+        registry_path = seeded_switcher.backup_dir / "sessions" / "managed.json"
+        assert not registry_path.exists()
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        seeded_switcher.purge()
+        assert not seeded_switcher.backup_dir.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestRunUnaffectedByManagedSessions:
+    def test_run_n_is_unchanged_and_managed_profile_untouched(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        from claude_swap.managed_sessions import (
+            AccountRef,
+            ManagedSessionRegistry,
+            create_managed_profile,
+        )
+
+        registry = ManagedSessionRegistry(manager.switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef(ACCOUNT_EMAIL, ORG_UUID), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        managed = registry.session_dir("auto-0000beef")
+        create_managed_profile(managed)
+        before = sorted(p.name for p in managed.iterdir())
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", ["--resume"])
+
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(
+            session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )
+        assert sorted(p.name for p in managed.iterdir()) == before
+        assert registry.get("auto-0000beef") is not None
+
+
 # ---------------------------------------------------------------------------
 # history sharing (--share-history)
 # ---------------------------------------------------------------------------
