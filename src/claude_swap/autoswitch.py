@@ -84,6 +84,21 @@ _SYSTEMIC_MESSAGES = {
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
 
+# Freshen statuses the tick has a branch for. Anything else is the unknown
+# kind its fall-through refuses to switch on and warns about once per slot;
+# a slot answering with one of these again re-arms that warning, so a kind
+# that resolves and comes back later is reported rather than staying at
+# debug for the life of the process. A status this set forgets costs only
+# that re-arming, never a wrong decision: the branches below, not this set,
+# decide what the tick does.
+_KNOWN_FRESHEN_STATUSES = frozenset(_SYSTEMIC_STATUSES) | {
+    "ok",
+    "transient",
+    "invalid_grant",
+    "identity-conflict",
+    "skip-live-session",
+}
+
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
 # expired" re-read holds with margin after our swap.
@@ -653,6 +668,13 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # (slot, status) pairs already warned about as unrecognised freshen
+        # statuses: the tick meets them again every pass, so later sightings
+        # go to debug instead of repeating the warning. A slot's pairs are
+        # dropped again as soon as its freshen answers with a status the
+        # tick knows (_KNOWN_FRESHEN_STATUSES), so the warning re-arms on
+        # recovery instead of being spent for the life of the process.
+        self._warned_freshen_statuses: set[tuple[str, str]] = set()
 
     # -- state file ---------------------------------------------------------
 
@@ -741,8 +763,10 @@ class AutoSwitchEngine:
 
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
-        account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
+        account — quarantine, do not activate), one of
+        ``_SYSTEMIC_STATUSES`` (a deterministic refusal naming its cause),
+        ``"transient"`` (network trouble — try again next tick) or
+        ``"skip-live-session"``. Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -756,92 +780,13 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
-        creds = self.switcher.read_account_credentials(number, email)
-        if not creds:
-            return "transient"
-        data = oauth.extract_oauth_data(creds)
-        if not data:
-            return "invalid_grant"
-        expires_at = data.get("expiresAt")
-        now_ms = self.clock() * 1000
-        near_expiry = (
-            isinstance(expires_at, (int, float))
-            and now_ms + FRESHEN_BUFFER_MS >= expires_at
+        status, _ = self.switcher.freshen_backup_credential(
+            number, email,
+            now_ms=self.clock() * 1000, buffer_ms=FRESHEN_BUFFER_MS,
         )
-        if not near_expiry:
-            return "ok"
-        # The consume gate serializes every backup-rt POST (the recovery
-        # branch in `_fetch_active_usage` is a second call site, under the
-        # same per-slot consume lock):
-        # it re-reads under the slot lock (our snapshot may be superseded),
-        # consults the session profile for a newer generation, and persists
-        # via fingerprint CAS — so a freshen racing the collector (or a
-        # sibling surface) can no longer double-consume one grant.
-        outcome = self.switcher.consume_backup_grant(number, email, creds)
-        if outcome.error is None and outcome.credentials:
-            # The gate already persisted the successor (or adopted a racing
-            # writer's newer lineage) under its own lock.
-            if self._note_token_identity(number, outcome.token_account):
-                # The slot's stored credential authenticates as a *different*
-                # account — activating it would put the user on the wrong
-                # account with every gauge reading normal. Not a viable
-                # target; the caller quarantines it (released automatically
-                # once the credential is replaced by a re-add).
-                return "identity-conflict"
-            return "ok"
-        if outcome.error in ("invalid_grant", "no_refresh_token"):
-            return "invalid_grant"
-        if outcome.error in _SYSTEMIC_STATUSES:
-            # Deterministic conditions, not network trouble: every candidate
-            # refuses identically and keeps refusing until something outside
-            # this process changes — the shell for store-unmirrored (an
-            # inherited CLAUDE_SECURESTORAGE_CONFIG_DIR), our OAuth client
-            # registration for invalid_client. Reported distinctly so the tick
-            # error names the real cause instead of "(network?)", which would
-            # send the user to check a connection that is fine.
-            return outcome.error
-        return "transient"
-
-    def _note_token_identity(
-        self, number: str, token_account: dict | None
-    ) -> bool:
-        """Use the token endpoint's free identity to verify/backfill a slot.
-
-        The refresh grant just ran against the slot's own stored credential,
-        so ``token_account`` (when the server includes it) names who that
-        credential really is. Returns True on a *conflict*: the credential
-        authenticates under a different organization than the slot records
-        (org compared first, whenever both sides record one), or as a
-        different account uuid. An empty slot uuid (blank-uuid records from
-        older versions, add-token placeholders) is backfilled — but only
-        when no org conflict exists: a wrong-org credential is evidence the
-        slot holds the wrong account, and backfilling *its* uuid would
-        poison the slot's identity record (backfill never rewrites a
-        non-empty uuid, so that corruption would be sticky).
-
-        ``_parse_token_account`` already enforces a strict boundary, but this
-        identity is opportunistic — re-check types here so malformed data can
-        never break the freshen that carried it (the successor credential is
-        already persisted by the time this runs).
-        """
-        if not isinstance(token_account, dict):
-            return False
-        ta_uuid = token_account.get("uuid")
-        if not isinstance(ta_uuid, str) or not ta_uuid.strip():
-            return False
-        ta_uuid = ta_uuid.strip()
-        slot_identity = self.switcher.account_identity(number)
-        ta_org = token_account.get("organizationUuid")
-        slot_org = slot_identity.get("organizationUuid") or ""
-        if isinstance(ta_org, str) and ta_org and slot_org and ta_org != slot_org:
-            return True
-        if not slot_identity.get("uuid"):
-            try:
-                self.switcher.backfill_account_uuid(number, ta_uuid)
-            except Exception as e:  # never let bookkeeping break a freshen
-                _logger.debug("uuid backfill failed for account %s: %r", number, e)
-            return False
-        return slot_identity["uuid"] != ta_uuid
+        # The engine skips a candidate with nothing stored for this tick
+        # rather than quarantining it — there is no lineage to call dead.
+        return "transient" if status == "no-backup" else status
 
     # -- tick -----------------------------------------------------------------
 
@@ -1306,6 +1251,14 @@ class AutoSwitchEngine:
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger, left_snapshot)
             status = self._freshen_target(num, email)
+            if status in _KNOWN_FRESHEN_STATUSES:
+                # This slot's freshen is answering with a status the tick
+                # acts on again, so forget whatever unknown kind it was last
+                # warned about: one that resolves and recurs days later is
+                # news, not the repeat the debug demotion exists for.
+                self._warned_freshen_statuses = {
+                    pair for pair in self._warned_freshen_statuses if pair[0] != num
+                }
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
                 # account — switching onto it would silently run the wrong
@@ -1335,7 +1288,19 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            if status == "ok":
+                return self._perform(num, email, trigger, left_snapshot)
+            # Fail safe: a status this loop does not know (a new kind from the
+            # shared freshen, say) must never read as a green light. Treat it
+            # as trouble to retry, like "transient".
+            first = (num, status) not in self._warned_freshen_statuses
+            self._warned_freshen_statuses.add((num, status))
+            _logger.log(
+                logging.WARNING if first else logging.DEBUG,
+                "unrecognised freshen status %r for account %s; not switching",
+                status, num,
+            )
+            transient_failure = True
 
         if systemic or transient_failure:
             self._emit(

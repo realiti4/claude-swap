@@ -6851,6 +6851,128 @@ class TestFreshenRoutesThroughGate:
             f"got {msg!r}: the self-clearing cause hid the one needing a human"
         )
 
+    def test_systemic_statuses_match_what_the_shared_freshen_passes_through(self):
+        """The shared freshen passes ``oauth._DETERMINISTIC_REFRESH_ERRORS``
+        through verbatim and the tick ranks them by ``_SYSTEMIC_STATUSES``: a
+        kind in one set but not the other would either read as "(network?)"
+        or reach the tick with no message to render."""
+        from claude_swap import autoswitch as autoswitch_mod
+        from claude_swap import oauth as oauth_mod
+
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert set(autoswitch_mod._SYSTEMIC_STATUSES) == set(
+            oauth_mod._DETERMINISTIC_REFRESH_ERRORS
+        )
+        # And the usage surfaces render a remedy for each of them.
+        assert set(ERROR_NOTES) >= set(oauth_mod._DETERMINISTIC_REFRESH_ERRORS)
+
+    def test_a_slot_without_a_stored_credential_reads_transient(self, temp_home):
+        """The shared freshen reports an empty slot as ``no-backup``; the
+        engine keeps treating it as retryable, without touching the gate."""
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        harness.switcher._delete_account_credentials("2", "b@example.com")
+        gate_calls: list = []
+
+        def gate(*a, **k):
+            gate_calls.append(a)
+            raise AssertionError("gate must not run for an empty slot")
+
+        with patch.object(harness.switcher, "consume_backup_grant", side_effect=gate):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "transient"
+        assert gate_calls == []
+
+    def test_an_unknown_freshen_status_never_switches(self, temp_home):
+        """Only ``ok`` may perform: a status the tick does not recognise is
+        treated as a transient failure, never as a green light."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        with patch.object(h.engine, "_freshen_target", return_value="no-backup"):
+            outcome = h.tick_with_usage({
+                "1": _usage7(95, 95, _R_LATER),   # active, over threshold
+                "2": _usage7(10, 10, _R_SOON),
+            })
+
+        assert h.active_number() == 1
+        assert outcome == TickOutcome.ERROR
+        errors = [e for e in h.events if getattr(e, "message", None)]
+        assert errors and "(network?)" in errors[-1].message
+
+    @pytest.mark.parametrize("access", [None, ""], ids=["missing", "empty"])
+    def test_a_slot_without_an_access_token_is_refreshed_first(self, temp_home, access):
+        """No access token means nothing to activate: with no expiresAt either
+        the slot never looked near expiry and went live tokenless. It goes
+        through the gate like any expiring slot."""
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com")
+        blob: dict = {"refreshToken": "rt-2"}
+        if access is not None:
+            blob["accessToken"] = access
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com", json.dumps({"claudeAiOauth": blob})
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 9_999_999_999_000,
+        }})
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(fresh, None),
+        ) as gate:
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "ok"
+        assert gate.call_count == 1
+
+    def test_an_unknown_freshen_status_is_warned_once(self, temp_home, caplog):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {
+            "1": _usage7(95, 95, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        }
+        with caplog.at_level("DEBUG", logger="claude-swap"), patch.object(
+            h.engine, "_freshen_target", return_value="mystery"
+        ):
+            for _ in range(3):
+                h.tick_with_usage(usage)
+        records = [
+            r for r in caplog.records if "unrecognised freshen status" in r.getMessage()
+        ]
+        assert [r.levelname for r in records] == ["WARNING", "DEBUG", "DEBUG"]
+
+    def test_a_known_status_re_arms_the_unknown_warning(self, temp_home, caplog):
+        """The same surprise days later is news again. A slot whose freshen
+        goes back to a status the tick acts on must re-arm the warning, or
+        one unknown kind buries every later sighting of it at debug for the
+        life of the process."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {
+            "1": _usage7(95, 95, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        }
+        statuses = ["mystery", "mystery", "transient", "mystery"]
+        with caplog.at_level("DEBUG", logger="claude-swap"), patch.object(
+            h.engine, "_freshen_target", side_effect=statuses
+        ):
+            for _ in statuses:
+                h.tick_with_usage(usage)
+        records = [
+            r for r in caplog.records if "unrecognised freshen status" in r.getMessage()
+        ]
+        assert [r.levelname for r in records] == ["WARNING", "DEBUG", "WARNING"]
+
     def test_a_real_transient_still_reads_transient(self, temp_home):
         from claude_swap import oauth as oauth_mod
 
