@@ -31,7 +31,7 @@ from claude_swap.session import (
     MCP_MIRROR_MARKER,
     SHARE_MANIFEST,
     SessionManager,
-    _probe_env,
+    session_profile_env,
     keychain_service_name,
     profile_is_quiescent,
     read_session_identity,
@@ -227,13 +227,26 @@ class TestHelpers:
         assert str(nfc) != str(nfd)  # sanity: inputs genuinely differ
         assert keychain_service_name(nfc) == keychain_service_name(nfd)
 
-    def test_probe_env_drops_auth_overrides(self, monkeypatch, tmp_path):
+    def test_session_profile_env_drops_auth_overrides(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-key")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-tok")
-        env = _probe_env(tmp_path)
+        env = session_profile_env(tmp_path)
         assert "ANTHROPIC_API_KEY" not in env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_session_profile_env_keeps_the_path_unresolved(self, tmp_path):
+        """Claude hashes the raw CLAUDE_CONFIG_DIR into the profile's keychain
+        item name, so the path is exported exactly as given -- resolving a
+        symlinked profile path would name a different item than the seeded one."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        env = session_profile_env(link)
+        assert env["CLAUDE_CONFIG_DIR"] == str(link)
+        assert keychain_service_name(env["CLAUDE_CONFIG_DIR"]) != keychain_service_name(real)
 
     def test_scan_live_sessions_missing_dir(self, tmp_path):
         assert scan_live_sessions(tmp_path / "nope") == ([], 0)

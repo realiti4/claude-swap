@@ -526,8 +526,76 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
+# -- launch helpers ------------------------------------------------------
+# Shared by `cswap run N` (SessionManager.run) and `cswap run --auto`
+# (managed_launch.run_auto): both resolve the binary, warn about the
+# environment they are about to override, announce the account and build
+# the profile env the same way, and the two must not drift apart.
+#
+# Two SessionManager methods belong to that same shared contract even
+# though they stay private to this module's own callers:
+# `_sync_sharing` (both paths mirror ~/.claude into the profile before the
+# handover) and `_exec` (both hand the terminal over through it, and both
+# depend on exec keeping the pid). `managed_launch` calls them directly —
+# changing either one changes both launch paths, so treat them as part of
+# this section.
+
+
+def resolve_claude_binary() -> str:
+    """Absolute path to the ``claude`` executable.
+
+    Raises:
+        SessionError: claude is not on PATH.
+    """
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise SessionError(
+            "'claude' was not found on PATH. Install Claude Code first."
+        )
+    return claude_bin
+
+
+def warn_config_dir_override(preset: str) -> None:
+    """Tell the user an inherited ``CLAUDE_CONFIG_DIR`` is being replaced."""
+    warning(
+        f"CLAUDE_CONFIG_DIR is already set ({preset}); "
+        "overriding it for this launch."
+    )
+
+
+def warn_auth_override_env() -> None:
+    """Warn about the exported auth overrides this launch drops.
+
+    Naming an account — explicitly, or through placement — is a request for
+    that account, so an exported API key silently hijacking the session
+    would defeat the command; but the user has to be told it is being
+    ignored.
+    """
+    scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+    if scrubbed:
+        warning(
+            f"Ignoring {', '.join(scrubbed)} for this session — it would "
+            "override the selected account inside Claude Code."
+        )
+
+
+def announce_launch(account_num: str, email: str, detail: str) -> None:
+    """The one line a launch prints before handing over the terminal."""
+    print(f"{accent('Launching')} Account-{account_num} ({email}) {muted(detail)}")
+
+
+def session_profile_env(session_dir: Path) -> dict[str, str]:
+    """Env for running claude against a session profile: the current
+    environment with the auth overrides dropped and ``CLAUDE_CONFIG_DIR``
+    pointed at the profile. Used for the auth-status probe and for the
+    launch itself, which must agree on what claude sees.
+
+    The exported value is exactly ``str(session_dir)``: claude derives the
+    profile's keychain item name by hashing that raw string (see
+    :func:`keychain_service_name`), so a trailing slash or a
+    symlink-resolved variant would send claude to a different item than the
+    one cswap seeded.
+    """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return env
@@ -559,11 +627,7 @@ class SessionManager:
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
         """
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = resolve_claude_binary()
         if share_history and self.switcher.platform == Platform.WINDOWS:
             raise SessionError(
                 "--share-history is not supported on Windows yet: sharing uses "
@@ -581,10 +645,7 @@ class SessionManager:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
             # meaningless (we may already be inside a session terminal), so
             # the same-account fast path below must not trigger.
-            warning(
-                f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
-                "overriding it for this launch."
-            )
+            warn_config_dir_override(config_dir_preset)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
@@ -609,26 +670,14 @@ class SessionManager:
                 )
                 self._exec(claude_bin, claude_args, env=dict(os.environ))
 
-        scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
-        if scrubbed:
-            warning(
-                f"Ignoring {', '.join(scrubbed)} for this session — it would "
-                f"override the selected account inside Claude Code."
-            )
+        warn_auth_override_env()
 
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
 
-        print(
-            f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
-        )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
-        env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        announce_launch(account_num, email, "[session mode]")
+        self._exec(claude_bin, claude_args, env=session_profile_env(session_dir))
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -639,12 +688,7 @@ class SessionManager:
         profile, no auth-override scrubbing), so whatever the default login
         resolves to is what runs.
         """
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        self._exec(resolve_claude_binary(), claude_args, env=dict(os.environ))
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -989,7 +1033,7 @@ class SessionManager:
         try:
             result = subprocess.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                env=session_profile_env(session_dir),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
