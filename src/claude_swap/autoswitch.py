@@ -51,7 +51,6 @@ from claude_swap.managed_sessions import (
     AccountRef,
     ManagedEntry,
     ManagedSessionRegistry,
-    entry_is_busy,
 )
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -1081,20 +1080,15 @@ class AutoSwitchEngine:
         """Busy managed sessions per slot number — the count that feeds
         balance's projected 5h-window load.
 
-        Only sessions Claude reports busy count (``entry_is_busy`` also
-        counts a session that has not written its status yet, a live
-        reservation): an idle session holds a profile but is not burning its
-        account's 5h window, and counting it would keep lane 0 off an
-        account nobody is actually working on. Status is read from the
-        record inside each profile, so this adds no liveness check of its
-        own to the one the caller already ran.
+        The busy definition (an idle or waiting session holds a profile but
+        is not burning its account's 5h window; a reservation with no
+        Claude record yet does count) lives in ``registry.busy_counts``,
+        shared with placement (``managed_launch.choose_placement``'s
+        caller) so the two can never disagree about what "busy" means. This
+        only maps that result from account identity to slot number.
         """
-        busy: dict[AccountRef, int] = {}
-        for entry in entries:
-            if entry_is_busy(registry.session_dir(entry.session_id), entry):
-                busy[entry.account] = busy.get(entry.account, 0) + 1
         counts: dict[str, int] = {}
-        for account, count in busy.items():
+        for account, count in registry.busy_counts(entries).items():
             try:
                 number = slot_for_account(self.switcher, account)
             except (ClaudeSwitchError, OSError, UnicodeDecodeError) as e:

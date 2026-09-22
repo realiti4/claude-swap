@@ -603,11 +603,18 @@ class ManagedSessionRegistry:
     def live_entries(self) -> list[ManagedEntry]:
         return [e for e in self._read().values() if entry_is_live(e)]
 
-    @staticmethod
-    def busy_counts(entries: Iterable[ManagedEntry]) -> dict[AccountRef, int]:
+    def busy_counts(self, entries: Iterable[ManagedEntry]) -> dict[AccountRef, int]:
+        """Busy sessions per account (``entry_is_busy``): a reservation with
+        no Claude record yet counts, an idle or waiting one does not. This
+        is the sole busy definition managed sessions use — the count that
+        feeds balance's projected 5h-window load — shared by placement
+        (``allocate``'s ``choose``) and the engine's lane-0 ranking
+        (``autoswitch._busy_by_slot``, which delegates here rather than
+        re-filtering the same entries a second time)."""
         counts: dict[AccountRef, int] = {}
         for entry in entries:
-            counts[entry.account] = counts.get(entry.account, 0) + 1
+            if entry_is_busy(self.session_dir(entry.session_id), entry):
+                counts[entry.account] = counts.get(entry.account, 0) + 1
         return counts
 
     def allocate(

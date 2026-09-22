@@ -398,7 +398,21 @@ class TestLivenessAndBusy:
 
         registry.allocate("auto-00000003", choose, pid=os.getpid(), proc_start=None)
         assert seen == {B: 2}
-        assert ManagedSessionRegistry.busy_counts(registry.live_entries()) == {B: 2, A: 1}
+        assert registry.busy_counts(registry.live_entries()) == {B: 2, A: 1}
+
+    def test_idle_session_does_not_count_as_busy(self, registry):
+        """The busy count that feeds balance's projected 5h-window load is
+        about busy sessions: an idle one holds a profile but is not
+        spending its account's 5h window, so ``busy_counts`` — the
+        definition placement and the lane-0 ranking both use — must not
+        count it even though it is live."""
+        registry.allocate("auto-00000001", _always(B), pid=os.getpid(), proc_start=None)
+        session_dir = registry.session_dir("auto-00000001")
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / f"{os.getpid()}.json").write_text(
+            json.dumps({"pid": os.getpid(), "status": "idle"})
+        )
+        assert registry.busy_counts(registry.live_entries()) == {}
 
     def test_dead_pid_is_not_busy(self, registry, monkeypatch):
         registry.allocate("auto-00000001", _always(B), pid=DEAD_PID, proc_start=None)
