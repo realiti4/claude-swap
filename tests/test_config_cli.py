@@ -48,10 +48,16 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.balanceLeadHours",
+            "autoswitch.balanceFiveHourCeiling",
+            "autoswitch.balanceFiveHourWeight",
+            "autoswitch.balanceLoadPerSession",
             "ui.theme",
+            "sessions.idleReassignMinutes",
+            "sessions.reassignMargin",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 15
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,9 +84,10 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 15
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
+        assert by_key["autoswitch.balanceLeadHours"]["value"] == 24.0
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
 
@@ -175,6 +182,18 @@ class TestConfigValidation:
         code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
         assert code == 1
         assert "must be one of: best" in err
+
+    def test_balance_strategy_accepted(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.strategy", "balance"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.strategy"], capsys)
+        assert code == 0
+        assert out.strip() == "balance"
+
+    def test_balance_key_out_of_range_exits_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "autoswitch.balanceLeadHours", "200"], capsys)
+        assert code == 1
+        assert "between 0 and 96" in err
 
     def test_unknown_key_json_error_envelope(self, temp_home, capsys):
         code, out, _ = _run(["--json", "get", "autoswitch.bogus"], capsys)

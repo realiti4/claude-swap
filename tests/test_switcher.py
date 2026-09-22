@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
+from claude_swap.process_detection import is_pid_alive
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
@@ -12486,3 +12488,156 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestSnapshotSessionCounts:
+    """Per-account managed-session counts, as the display surfaces see them."""
+
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    @staticmethod
+    def _register(switcher, session_ids, *, account="2", pid=None, proc_start=None):
+        from claude_swap.managed_sessions import AccountRef, ManagedSessionRegistry
+
+        registry = ManagedSessionRegistry(switcher.backup_dir)
+        ref = AccountRef(f"{'abc'[int(account) - 1]}@example.com", f"org-{account}")
+        for sid in session_ids:
+            registry.allocate(
+                sid,
+                lambda _busy, ref=ref: (ref, "backup"),
+                pid=os.getpid() if pid is None else pid,
+                proc_start=proc_start,
+            )
+        return registry
+
+    @staticmethod
+    def _counts(switcher):
+        snap = switcher.accounts_snapshot(fetch=set())
+        return {a.number: a.managed_sessions for a in snap.accounts}
+
+    def test_live_sessions_are_counted_per_account(self, managed_switcher):
+        self._register(managed_switcher, ("auto-aaaaaaaa", "auto-bbbbbbbb"))
+        self._register(managed_switcher, ("auto-cccccccc",), account="3")
+        assert self._counts(managed_switcher) == {"1": 0, "2": 2, "3": 1}
+
+    def test_a_session_whose_process_has_gone_is_not_counted(self, managed_switcher):
+        done = subprocess.Popen(["true"])
+        done.wait()
+        self._register(managed_switcher, ("auto-dddddddd",), pid=done.pid)
+        if is_pid_alive(done.pid):  # pragma: no cover - the pid came back round
+            pytest.skip("the pid was recycled between the exit and the check")
+        assert self._counts(managed_switcher) == {"1": 0, "2": 0, "3": 0}
+
+    def test_an_unreadable_registry_leaves_every_count_at_zero(
+        self, managed_switcher
+    ):
+        """Zero, not a failure and not a guess: the snapshot the TUI, the
+        watch page and the menu bar are all built from must survive a
+        registry nobody can parse. The count itself proves little — it
+        defaults to 0 — so what is asserted is that the snapshot is intact
+        and that nothing downstream turns "could not tell" into a stated
+        zero on any of the three surfaces."""
+        from claude_swap.managed_sessions import sessions_root
+        from claude_swap.menubar import format_account_label
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        root = sessions_root(managed_switcher.backup_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "managed.json").write_text("{ not json")
+        snap = managed_switcher.accounts_snapshot(fetch=set())
+        assert len(snap.accounts) == 3
+        assert all(a.managed_sessions == 0 for a in snap.accounts)
+        for acc in snap.accounts:
+            assert "session" not in account_card_text(acc, 100).plain
+            assert "session" not in mini_account_text(acc, now=1_000_000.0).plain
+            assert "session" not in format_account_label(
+                acc.number, acc.email, None, sessions=acc.managed_sessions
+            )
+
+    def test_a_session_on_an_account_that_is_gone_is_ignored(self, managed_switcher):
+        """A row can outlive the slot it names — `cswap remove` takes an
+        account away while its sessions keep running — and a count that
+        cannot be attributed belongs to nobody, not to slot 1."""
+        from claude_swap.managed_sessions import AccountRef, ManagedSessionRegistry
+
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-eeeeeeee",
+            lambda _busy: (AccountRef("stranger@example.com", "org-9"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        assert self._counts(managed_switcher) == {"1": 0, "2": 0, "3": 0}
+
+    def test_counting_does_not_re_probe_process_identity(
+        self, managed_switcher, monkeypatch
+    ):
+        """This runs inside a snapshot the TUI and `cswap watch` rebuild on a
+        timer. The strict liveness test re-derives each row's process
+        identity, which costs a `ps` per row on macOS — per row, per repaint
+        — to tell a recycled PID from a live one, and that is not a question
+        a decoration on a screen gets to spend subprocesses on. The rows here
+        carry a real stamp, so a strict pass would have to go and look.
+        """
+        from claude_swap import managed_sessions, process_detection
+
+        def forbidden(*_a, **_k):
+            pytest.fail("the session count re-probed process identity")
+
+        self._register(
+            managed_switcher, ("auto-ffffffff", "auto-99999999"),
+            proc_start=process_detection.process_start_ticks(os.getpid()) or "stamp",
+        )
+        # After the rows exist: `allocate` runs the strict pass itself, and
+        # legitimately — it is deciding a placement, not drawing a screen.
+        monkeypatch.setattr(process_detection, "_ps", forbidden)
+        monkeypatch.setattr(managed_sessions, "pid_matches_record", forbidden)
+        assert self._counts(managed_switcher) == {"1": 0, "2": 2, "3": 0}
+
+    def test_a_registry_that_raises_still_yields_a_snapshot(
+        self, managed_switcher, monkeypatch
+    ):
+        """The count is a decoration; the snapshot behind it is what three
+        surfaces are built from. Whatever the registry does — a lock error, a
+        permission the profile lost, a shape from a future version — the
+        snapshot is still taken, without the counts."""
+        from claude_swap import managed_sessions
+
+        def boom(*_a, **_k):
+            raise RuntimeError("registry on fire")
+
+        monkeypatch.setattr(managed_sessions, "ManagedSessionRegistry", boom)
+        assert self._counts(managed_switcher) == {"1": 0, "2": 0, "3": 0}
+
+    def test_a_registry_it_cannot_read_is_not_warned_about_on_every_repaint(
+        self, managed_switcher, caplog
+    ):
+        """The snapshot behind this is rebuilt every few seconds for as long
+        as a dashboard is open. A count that has already decided it does not
+        mind an unreadable registry must not put the same warning in the
+        rotating log a thousand times an hour and push real diagnostics out
+        of it."""
+        from claude_swap.managed_sessions import sessions_root
+
+        root = sessions_root(managed_switcher.backup_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "managed.json").write_text("{ not json")
+        with caplog.at_level("WARNING", logger="claude-swap"):
+            self._counts(managed_switcher)
+        assert not [
+            record for record in caplog.records
+            if "unreadable" in record.getMessage()
+        ]
+
+    def test_a_sequence_file_of_another_shape_costs_only_the_counts(
+        self, managed_switcher
+    ):
+        """The slot lookup walks a file this process did not write, and its
+        shape is an assumption: `accounts` as a list — hand-edited, or
+        written by a version that reshaped it — makes `.items()` raise. That
+        must cost the counts, not the snapshot three displays are built
+        from, which is why the lookup is inside the guard and not beside
+        it."""
+        self._register(managed_switcher, ("auto-12121212",))
+        assert managed_switcher._managed_session_counts({"accounts": []}) == {}

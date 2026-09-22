@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -44,6 +45,49 @@ class ClaudeSession:
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
+    # Epoch ms of the last status change. With status == "idle" this is
+    # Claude's own idle-since; see idle_since_ms below.
+    status_updated_at: int | None = None
+
+
+def _epoch_ms(value: object) -> int | None:
+    """A positive, finite epoch-ms number from a session record, else None.
+
+    Anything else — a string, a bool (an int subclass, never a timestamp),
+    a non-positive number, inf or nan — reads as None rather than as a
+    bogus instant.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(value) if value > 0 else None
+
+
+# 10000-01-01T00:00:00Z in epoch ms — one millisecond-grid step past
+# datetime.max (9999-12-31T23:59:59.999999Z), so it is an EXCLUSIVE ceiling.
+MAX_EPOCH_MS = 253_402_300_800_000
+
+
+def status_stamp_ms(value: object) -> int | None:
+    """A session record's ``statusUpdatedAt`` as epoch ms, or None.
+
+    ``_epoch_ms`` only rejects non-numeric/NaN/<=0 values, so a unit bug
+    elsewhere (nanoseconds where milliseconds belong) can still hand back a
+    number ``datetime.fromtimestamp`` cannot hold. Bound it here, where the
+    value enters the program, rather than at each consumer.
+    """
+    ms = _epoch_ms(value)
+    return ms if ms is not None and ms < MAX_EPOCH_MS else None
+
+
+def idle_since_ms(session: ClaudeSession) -> int | None:
+    """When ``session`` went idle, in epoch ms, or None when it is not idle
+    (or carried no usable stamp). Claude restamps the record on every status
+    change, so with status "idle" the stamp IS the idle-since."""
+    if session.status != "idle":
+        return None
+    return session.status_updated_at
 
 
 @dataclass
@@ -100,12 +144,18 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
-def _ps(pid: int, *columns: str) -> str | None:
+# What a `ps` is given before it counts as unknowable. Generous for a local
+# process table; a caller on somebody's prompt or session teardown passes
+# less, because there its own budget is the thing that has to hold.
+PS_TIMEOUT_S = 5.0
+
+
+def _ps(pid: int, *columns: str, timeout: float = PS_TIMEOUT_S) -> str | None:
     """``ps -o`` ``columns`` for ``pid``, or None when unknowable.
 
     POSIX only, under ``LC_ALL=C TZ=UTC`` like claude's own reading. Windows
     and every failure answer None: not knowing must never be read as "not
-    the recorded process".
+    the recorded process" — a ``timeout`` a caller shortened included.
     """
     if sys.platform == "win32":
         return None
@@ -114,7 +164,7 @@ def _ps(pid: int, *columns: str) -> str | None:
             ["ps", "-o", ",".join(f"{c}=" for c in columns), "-p", str(pid)],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -125,14 +175,14 @@ def _ps(pid: int, *columns: str) -> str | None:
     return text
 
 
-def process_started_at(pid: int) -> int | None:
+def process_started_at(pid: int, *, timeout: float = PS_TIMEOUT_S) -> int | None:
     """Epoch seconds at which ``pid`` started, or None when unknowable.
 
     Read the way claude stamps ``procStart`` into its record, ``ps -o
     lstart=`` under ``LC_ALL=C TZ=UTC``, so the two agree to the second for
     the same process.
     """
-    text = _ps(pid, "lstart")
+    text = _ps(pid, "lstart", timeout=timeout)
     if text is None:
         return None
     try:
@@ -177,20 +227,47 @@ def _stat_start_ticks(text: str) -> str | None:
     return fields[19]
 
 
-def process_is_claude(pid: int) -> bool | None:
+def parent_pid(pid: int, *, timeout: float = PS_TIMEOUT_S) -> int | None:
+    """The process that started ``pid``, or None when unknowable.
+
+    For asking "am I running underneath that process?" — a hook wanting to
+    know whether the session it was handed is the one that spawned it, when
+    the shell that ran the hook sits between the two. Like every reader
+    here, not knowing answers None rather than a number a caller might act
+    on: a process that has already been reaped is absent from ``ps``
+    entirely, which is that None. A parent of 1 is a different answer and a
+    real one — the chain has been reparented to init — and callers that are
+    walking upwards stop there, since init started nothing they care about.
+
+    ``timeout`` is for a caller walking several generations inside a budget
+    of its own: each step is a ``ps``, and the default is a per-call bound,
+    not a total.
+    """
+    text = _ps(pid, "ppid", timeout=timeout)
+    if text is None:
+        return None
+    try:
+        return int(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_is_claude(pid: int, *, timeout: float = PS_TIMEOUT_S) -> bool | None:
     """Does the process at ``pid`` look like a claude, or None when unknowable.
 
     Judged from ``ps -o comm=,args=``: the native binary and the symlink to
     it are named ``claude``, and an npm install runs ``cli.js`` out of a
     ``claude-code`` package directory.
     """
-    text = _ps(pid, "comm", "args")
+    text = _ps(pid, "comm", "args", timeout=timeout)
     if text is None:
         return None
     return "claude" in text.lower()
 
 
-def pid_matches_record(pid: int, proc_start: str | None) -> bool:
+def pid_matches_record(
+    pid: int, proc_start: str | None, *, timeout: float = PS_TIMEOUT_S
+) -> bool:
     """Is the live process at ``pid`` the one that wrote a record stamped
     ``proc_start``, claude's reading of its own start?
 
@@ -209,6 +286,11 @@ def pid_matches_record(pid: int, proc_start: str | None) -> bool:
     is a FILETIME with no ``/proc`` to check it against, ``ps`` unavailable,
     an unstamped or unparseable record) passes, because "cannot tell" must
     never turn a live session into "nobody there".
+
+    ``timeout`` is what each ``ps`` here is given. A caller running on
+    somebody's prompt or session teardown passes less than the module
+    default, because there its own budget is what has to hold; a probe cut
+    short is one more unknowable, and keeps the session.
     """
     if not proc_start:
         return True
@@ -219,13 +301,15 @@ def pid_matches_record(pid: int, proc_start: str | None) -> bool:
         recorded = _lstart_seconds(proc_start)
     except ValueError:
         return True
-    started = process_started_at(pid)
+    started = process_started_at(pid, timeout=timeout)
     if started is None or started <= recorded + PID_REUSE_SLACK_S:
         return True
-    return process_is_claude(pid) is not False
+    return process_is_claude(pid, timeout=timeout) is not False
 
 
-def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], int]:
+def scan_sessions(
+    claude_dir: Path | None = None, *, timeout: float = PS_TIMEOUT_S
+) -> tuple[list[ClaudeSession], int]:
     """Live sessions, and how many records could NOT be read.
 
     A record counts as live only when its pid is alive AND still belongs to
@@ -246,6 +330,10 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
 
     So the count is returned rather than swallowed, and ``list_sessions``
     below is the scan-shaped view that drops it.
+
+    ``timeout`` travels down to each record's identity probe. One directory
+    can hold several records, so a caller with a budget of its own has to be
+    able to shorten a cost that is paid per record rather than per call.
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
     if not sessions_dir.is_dir():
@@ -259,7 +347,7 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
             pid = data["pid"]
             if not is_pid_alive(pid):
                 continue
-            if not pid_matches_record(pid, data.get("procStart")):
+            if not pid_matches_record(pid, data.get("procStart"), timeout=timeout):
                 logger.debug(
                     "Skipping session file %s: pid %s was recycled", path, pid
                 )
@@ -272,6 +360,7 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                status_updated_at=status_stamp_ms(data.get("statusUpdatedAt")),
             ))
         except (
             json.JSONDecodeError,   # malformed JSON

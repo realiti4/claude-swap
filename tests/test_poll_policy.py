@@ -313,3 +313,29 @@ class TestBudgetInvariants:
         # (which absorbs any overshoot) is considered.
         polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
         assert polls < 27
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class TestBindingRecoveryTs:
+    """Moved from autoswitch (still aliased there) so balance.py can use it."""
+
+    def test_engine_alias_is_the_shared_function(self):
+        from claude_swap import autoswitch
+
+        assert autoswitch._binding_recovery_ts is poll_policy.binding_recovery_ts
+
+    def test_reads_the_binding_windows_reset(self):
+        usage = {
+            "five_hour": {"pct": 40.0, "resets_at": _iso(NOW + 3600)},
+            "seven_day": {"pct": 95.0, "resets_at": _iso(NOW + 86400)},
+        }
+        assert poll_policy.binding_recovery_ts(usage, (), NOW) == NOW + 86400
+
+    def test_unknown_or_past_reset_is_inf(self):
+        past = {"five_hour": {"pct": 95.0, "resets_at": _iso(NOW - 60)}}
+        assert poll_policy.binding_recovery_ts(past, (), NOW) == float("inf")
+        assert poll_policy.binding_recovery_ts(None, (), NOW) == float("inf")
+        assert poll_policy.binding_recovery_ts("token-expired", (), NOW) == float("inf")

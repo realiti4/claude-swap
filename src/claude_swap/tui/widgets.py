@@ -16,7 +16,7 @@ from textual.widgets import ListItem, Static
 
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
-from claude_swap.models import AccountSnapshot
+from claude_swap.models import AccountSnapshot, session_count_label
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -183,6 +183,9 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    sessions = session_count_label(acc.managed_sessions)
+    if sessions:
+        text.append(f"   {sessions}", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -260,6 +263,9 @@ def mini_account_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    sessions = session_count_label(acc.managed_sessions)
+    if sessions:
+        text.append(f"  {sessions}", style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel

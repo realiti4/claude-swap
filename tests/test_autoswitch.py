@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,10 @@ from unittest.mock import patch
 
 import pytest
 
+import claude_swap.autoswitch as autoswitch_mod
+from claude_swap import managed_launch as managed_launch_mod
+from claude_swap import managed_sessions as managed_sessions_mod
+from claude_swap import session_reassign as session_reassign_mod
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
@@ -21,20 +26,34 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    ManagedSessionsRefreshedEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SessionReassignedEvent,
+    SessionReleasedEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
     pct_label,
+    quarantined_numbers,
 )
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.managed_refresh import PUSH_LOCK_TIMEOUT_S
+from claude_swap.managed_sessions import (
+    AccountRef,
+    ManagedSessionRegistry,
+    create_managed_profile,
+)
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, SessionsSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+
+
+DAY = 86400.0
 
 
 class FakeClock:
@@ -1919,6 +1938,20 @@ class TestQuarantineLifecycle:
         assert state["lastSwitchAt"] == 123.0
         assert "3" in state["quarantine"]
 
+    def test_quarantined_numbers_reads_the_state_file(self, harness):
+        """The view callers outside the engine (``cswap run --auto``) get."""
+        backup_dir = harness.switcher.backup_dir
+        assert quarantined_numbers(backup_dir) == set()  # no state file yet
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        assert quarantined_numbers(backup_dir) == {"2"}
+
+    def test_quarantined_numbers_survives_an_unusable_state_file(self, harness):
+        backup_dir = harness.switcher.backup_dir
+        (backup_dir / "autoswitch_state.json").write_text("{not json")
+        assert quarantined_numbers(backup_dir) == set()
+        (backup_dir / "autoswitch_state.json").write_text(json.dumps({"quarantine": []}))
+        assert quarantined_numbers(backup_dir) == set()
+
 
 class TestDryRunAndNoOp:
     def test_dry_run_mutates_nothing(self, temp_home):
@@ -3479,8 +3512,10 @@ class TestEveryAccountAboveThreshold:
         then trade places forever.
         """
         h = EngineHarness(temp_home, strategy="consume-first")
-        h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
-        h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
         a = self._at(h, 600)
         b = self._at(h, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
         outcome = h.tick_with_usage({
@@ -3584,7 +3619,7 @@ class TestRecoveryHorizon:
     def test_a_days_away_reset_does_not_buy_headroom(self, harness):
         """The measured live shape. Every reset is days out, so ranking falls
         back to headroom and the account with 9 points left keeps the work."""
-        outcome = harness.tick_with_usage({
+        harness.tick_with_usage({
             "1": _usage(91, self._at(harness, 109 * 3600)),  # active, 9 left
             "2": _usage(94, self._at(harness, 80 * 3600)),
             "3": _usage(98, self._at(harness, 50 * 3600)),   # 2 left, soonest
@@ -6851,6 +6886,128 @@ class TestFreshenRoutesThroughGate:
             f"got {msg!r}: the self-clearing cause hid the one needing a human"
         )
 
+    def test_systemic_statuses_match_what_the_shared_freshen_passes_through(self):
+        """The shared freshen passes ``oauth._DETERMINISTIC_REFRESH_ERRORS``
+        through verbatim and the tick ranks them by ``_SYSTEMIC_STATUSES``: a
+        kind in one set but not the other would either read as "(network?)"
+        or reach the tick with no message to render."""
+        from claude_swap import autoswitch as autoswitch_mod
+        from claude_swap import oauth as oauth_mod
+
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert set(autoswitch_mod._SYSTEMIC_STATUSES) == set(
+            oauth_mod._DETERMINISTIC_REFRESH_ERRORS
+        )
+        # And the usage surfaces render a remedy for each of them.
+        assert set(ERROR_NOTES) >= set(oauth_mod._DETERMINISTIC_REFRESH_ERRORS)
+
+    def test_a_slot_without_a_stored_credential_reads_transient(self, temp_home):
+        """The shared freshen reports an empty slot as ``no-backup``; the
+        engine keeps treating it as retryable, without touching the gate."""
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        harness.switcher._delete_account_credentials("2", "b@example.com")
+        gate_calls: list = []
+
+        def gate(*a, **k):
+            gate_calls.append(a)
+            raise AssertionError("gate must not run for an empty slot")
+
+        with patch.object(harness.switcher, "consume_backup_grant", side_effect=gate):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "transient"
+        assert gate_calls == []
+
+    def test_an_unknown_freshen_status_never_switches(self, temp_home):
+        """Only ``ok`` may perform: a status the tick does not recognise is
+        treated as a transient failure, never as a green light."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        with patch.object(h.engine, "_freshen_target", return_value="no-backup"):
+            outcome = h.tick_with_usage({
+                "1": _usage7(95, 95, _R_LATER),   # active, over threshold
+                "2": _usage7(10, 10, _R_SOON),
+            })
+
+        assert h.active_number() == 1
+        assert outcome == TickOutcome.ERROR
+        errors = [e for e in h.events if getattr(e, "message", None)]
+        assert errors and "(network?)" in errors[-1].message
+
+    @pytest.mark.parametrize("access", [None, ""], ids=["missing", "empty"])
+    def test_a_slot_without_an_access_token_is_refreshed_first(self, temp_home, access):
+        """No access token means nothing to activate: with no expiresAt either
+        the slot never looked near expiry and went live tokenless. It goes
+        through the gate like any expiring slot."""
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com")
+        blob: dict = {"refreshToken": "rt-2"}
+        if access is not None:
+            blob["accessToken"] = access
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com", json.dumps({"claudeAiOauth": blob})
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 9_999_999_999_000,
+        }})
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(fresh, None),
+        ) as gate:
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "ok"
+        assert gate.call_count == 1
+
+    def test_an_unknown_freshen_status_is_warned_once(self, temp_home, caplog):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {
+            "1": _usage7(95, 95, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        }
+        with caplog.at_level("DEBUG", logger="claude-swap"), patch.object(
+            h.engine, "_freshen_target", return_value="mystery"
+        ):
+            for _ in range(3):
+                h.tick_with_usage(usage)
+        records = [
+            r for r in caplog.records if "unrecognised freshen status" in r.getMessage()
+        ]
+        assert [r.levelname for r in records] == ["WARNING", "DEBUG", "DEBUG"]
+
+    def test_a_known_status_re_arms_the_unknown_warning(self, temp_home, caplog):
+        """The same surprise days later is news again. A slot whose freshen
+        goes back to a status the tick acts on must re-arm the warning, or
+        one unknown kind buries every later sighting of it at debug for the
+        life of the process."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {
+            "1": _usage7(95, 95, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        }
+        statuses = ["mystery", "mystery", "transient", "mystery"]
+        with caplog.at_level("DEBUG", logger="claude-swap"), patch.object(
+            h.engine, "_freshen_target", side_effect=statuses
+        ):
+            for _ in statuses:
+                h.tick_with_usage(usage)
+        records = [
+            r for r in caplog.records if "unrecognised freshen status" in r.getMessage()
+        ]
+        assert [r.levelname for r in records] == ["WARNING", "DEBUG", "WARNING"]
+
     def test_a_real_transient_still_reads_transient(self, temp_home):
         from claude_swap import oauth as oauth_mod
 
@@ -6894,3 +7051,2022 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+# --- balance strategy ------------------------------------------------------
+
+
+class TestBalanceStrategy:
+    """Lane-0 ``autoswitch.strategy = balance`` (issue #382).
+
+    Triggers are `best`'s — nothing moves below the threshold — and only the
+    target ORDER changes: the candidate furthest behind its weekly schedule
+    (balance.rank_accounts) wins over the one with merely the most headroom.
+    The one carve-out (lane 0 wholly idle) is TestLaneZeroIdleSwitch's own
+    territory, so every fixture below that stays below the threshold pins
+    ``lane0_all_idle`` to ``False`` explicitly rather than relying on the
+    default (idle) read an empty sessions directory gives it.
+    """
+
+    def _harness(self, temp_home: Path, strategy: str = "balance") -> EngineHarness:
+        h = EngineHarness(temp_home, strategy=strategy)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _behind_vs_roomy(self, h: EngineHarness) -> dict:
+        now = h.clock.now
+        return {
+            # Active over the threshold on its 5h window -> proactive move.
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+            # Weekly resets in 1 day: target 100 (24h lead), used 60 ->
+            # slack 40, score 40 - 0.5 * 10 = 35. Headroom 40.
+            "2": _usage7(10, 60, _iso_at(now + DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
+            # score 11.7. Headroom 95 — `best` would pick this one.
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+        }
+
+    def test_fixture_discriminates_best_picks_most_headroom(self, temp_home):
+        h = self._harness(temp_home, strategy="best")
+        assert h.tick_with_usage(self._behind_vs_roomy(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_picks_behind_schedule_over_most_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._behind_vs_roomy(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_never_moves_below_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        # Lane 0 is not idle here — that carve-out is TestLaneZeroIdleSwitch's
+        # territory. Pinned explicitly rather than relying on the empty
+        # sessions directory's own (idle) default, so this test keeps
+        # meaning "balance's own ranking never moves below the threshold"
+        # regardless of what that default is.
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=False):
+            outcome = h.tick_with_usage({
+                "1": _usage7(20, 5, _iso_at(now + 6 * DAY)),   # active well below the threshold
+                "2": _usage7(0, 10, _iso_at(now + DAY / 2)),   # far behind
+                "3": _usage7(0, 0, _iso_at(now + DAY)),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_none_eligible_falls_back_to_soonest_recovery(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 3 * 3600)},
+                "seven_day": {"pct": 20.0, "resets_at": _iso_at(now + 3 * DAY)},
+            },
+            # Both over the 85% five-hour ceiling (ineligible), both below the
+            # 90% threshold and clear of the 10-pt hysteresis margin (valid
+            # landings). #2 has more headroom, #3's binding 5h window comes
+            # back sooner -> the policy's fallback picks #3.
+            "2": {
+                "five_hour": {"pct": 86.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * DAY)},
+            },
+            "3": {
+                "five_hour": {"pct": 87.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * DAY)},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_omitted_candidate_still_serves_when_it_is_the_only_landing(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage7(99, 20, _iso_at(now + 3 * DAY)),
+            # Eligible under balance (5h 80 < 85, 7d 89.5 < 90) and first in
+            # its order, but headroom 10.5 vs the active's 1 misses the 10-pt
+            # hysteresis margin -> not a landing.
+            "2": _usage7(80, 89.5, _iso_at(now + DAY)),
+            # Over the five-hour ceiling -> omitted by the policy while an
+            # eligible account exists; still a valid, healthy landing.
+            "3": _usage7(86, 10, _iso_at(now + 3 * DAY)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_above_threshold_path_still_moves_to_soonest_back(self, temp_home):
+        """TestEveryAccountAboveThreshold's measured shape, under balance."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage(99, _iso_at(now + 3600 * 2)),   # active, back in 2h
+            "2": _usage(100, _iso_at(now + 600)),       # at limit
+            "3": _usage(95, _iso_at(now + 480)),        # back in 8 minutes
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_escape_ranks_by_balance(self, temp_home):
+        h = self._harness(temp_home)
+        usage = self._behind_vs_roomy(h)
+        usage["1"] = _usage7(100, 20, _iso_at(h.clock.now + 3 * DAY))
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_respects_cooldown(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._behind_vs_roomy(h))
+        assert h.active_number() == 2
+        h.events.clear()
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "2": _usage7(95, 60, _iso_at(now + DAY)),
+            "1": _usage7(0, 0, _iso_at(now + DAY)),
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def _four_account_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.seed(4, "d@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _survivors_only_fixture(self, h: EngineHarness, account_2: dict) -> dict:
+        now = h.clock.now
+        return {
+            "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 20.0}},
+            "2": account_2,
+            # Over balance's own five-hour ceiling (85) -> ineligible under
+            # balance.py's rules, but the engine's landing gate and
+            # hysteresis margin both pass (86 < 90 threshold; headroom 14
+            # clears the active's 1 pt by more than the 10-pt margin) -> a
+            # gate survivor. Its binding (5h) window returns in 4h.
+            "3": {
+                "five_hour": {"pct": 86.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 10.0},
+            },
+            # Same shape, but back in 1h -> once #3 and #4 are the only
+            # candidates balance ranks, its soonest-recovery fallback must
+            # prefer this one.
+            "4": {
+                "five_hour": {"pct": 88.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0},
+            },
+        }
+
+    def test_ranks_only_gate_survivors_when_the_omitted_candidate_is_eligible(
+        self, temp_home
+    ):
+        """balance ranks the SURVIVORS of the engine's gates, not the raw
+        candidate list: when none of them is eligible under balance's own
+        rules, its soonest-recovery fallback must go by soonest recovery
+        among the candidates the engine can actually land on, not by
+        whichever account merely happens to sort last among the raw fleet.
+        #2 is eligible under balance.py's own rules (5h 80 < 85 ceiling, 7d
+        89.5 < 90 threshold) but fails the ENGINE's hysteresis margin
+        (headroom 10.5 vs the active's 1 misses the 10-pt bar) -> excluded
+        before ranking ever runs. Scoping to the gate survivors keeps #2
+        from satisfying balance's "eligible" branch on its own (#3 and #4
+        are both over the five-hour ceiling) and leaves #3 and #4 tied at
+        ``len(order)``, broken by headroom -> #3. Ranking only the gate
+        survivors {#3, #4} instead falls through to balance's
+        soonest-recovery fallback between just those two -> #4 (back in 1h
+        beats #3's 4h).
+        """
+        h = self._four_account_harness(temp_home)
+        usage = self._survivors_only_fixture(
+            h, {"five_hour": {"pct": 80.0}, "seven_day": {"pct": 89.5}}
+        )
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_ranks_only_gate_survivors_when_the_omitted_candidate_is_ineligible(
+        self, temp_home
+    ):
+        """Same shape as above, but #2 is ineligible outright (7d 95 over
+        the weekly threshold), which also fails the engine's own
+        landing-health gate (100 - headroom 5 = 95 >= 90). Only #3 and #4
+        ever reach balance.rank_accounts. This pins the shape -- #2
+        omitted, #4 wins by soonest recovery -- but does not by itself
+        discriminate a raw-fleet ranking from the correct gate-survivor
+        one: with no eligible account, balance.rank_accounts falls back
+        to a total recovery-ts sort, and adding an already-ineligible #2
+        to that sort cannot reorder #3 and #4 relative to each other.
+        The sibling test above (``..._is_eligible``) is the one that
+        actually discriminates, since there #2 IS eligible under
+        balance's own rules and its inclusion changes which branch
+        rank_accounts takes.
+        """
+        h = self._four_account_harness(temp_home)
+        usage = self._survivors_only_fixture(
+            h, {"five_hour": {"pct": 80.0}, "seven_day": {"pct": 95.0}}
+        )
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_no_return_bar_removes_the_account_from_balance_ranking(
+        self, temp_home
+    ):
+        """At default settings, hysteresis_pct / (HORIZON_HEADROOM_RATIO -
+        1) == 100 - threshold, so any candidate clearing the ordinary
+        hysteresis margin against an over-threshold active already clears
+        the no-return bar's own release ratio too -- an end-to-end
+        `tick()` fixture cannot isolate the bar here, the way
+        `TestHorizonAxisDoesNotFlap` cannot for `best`, so this drives
+        `_rank_candidates` directly (`no_return` passed explicitly); see
+        `test_no_return_bar_is_sole_exclusion_at_non_default_threshold`
+        for the non-default case, isolated end-to-end. #1 (score ~90)
+        beats #3 (score ~-38) unbarred; barred, #1 is gone and only #3
+        remains.
+        """
+        h = self._harness(temp_home)
+        now = h.clock.now
+        args = dict(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["1", "3"],
+            usage={
+                # Weekly resets in 1 day (24h lead -> target 100): used 5 ->
+                # slack 95, score 95 - 0.5*10 = 90. Headroom 90.
+                "1": {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {
+                        "pct": 5.0, "resets_at": _iso_at(now + DAY)
+                    },
+                },
+                "2": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}},
+                # Weekly resets in 6 days: target 16.7, used 50 -> slack
+                # -33.3 (already ahead of schedule), score -38.3. Headroom
+                # 50 -- still clears the active's hysteresis margin easily.
+                "3": {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {
+                        "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
+                    },
+                },
+            },
+            headroom={"1": 90.0, "2": 4.0, "3": 50.0},
+            current="2",
+            active_headroom=4.0,
+            settings=AutoSwitchSettings(strategy="balance"),
+            now=now,
+        )
+        unbarred, _, _ = h.engine._rank_candidates(no_return=None, **args)
+        barred, _, _ = h.engine._rank_candidates(no_return="1", **args)
+
+        assert list(unbarred) == ["1", "3"], (
+            f"premise: balance ranks #1 (score ~90, far behind schedule) "
+            f"ahead of #3 (score ~-38, ahead of schedule) when nothing "
+            f"bars it — got {list(unbarred)}"
+        )
+        assert list(barred) == ["3"], (
+            f"the bar did not remove account 1 from balance's ranking: "
+            f"{list(barred)}"
+        )
+
+    def test_no_return_bar_is_sole_exclusion_at_non_default_threshold(
+        self, temp_home
+    ):
+        """The sibling test above's "unreachable end-to-end" finding
+        holds only at DEFAULT settings — see its docstring for why. At
+        ``threshold=80`` (hysteresis_pct stays the default 10,
+        HORIZON_HEADROOM_RATIO is a fixed 2x, not a setting) the two gates
+        decouple, and a full `tick()` fixture CAN isolate the bar:
+
+        Tick 2's active (#2) sits at headroom 15 (85% used, over the 80%
+        threshold -> proactive fires). #1 (barred, just left in tick 1) is
+        at headroom 26 (74% used): the ordinary landing gate passes
+        (74 < 80) and the hysteresis margin passes (26 - 15 = 11 >= the
+        default 10-pt ``hysteresis_pct``) — by every gate `_rank_candidates`
+        runs on its own, #1 is a fully valid, and balance-favourite
+        (score ~58 vs #3's ~-43), landing spot. Only
+        `_no_return_account`'s release ratio fails: 26 < 15 * 2 = 30, so
+        the bar holds regardless of whether `_left_account_recovered` says
+        "recovered" (the ratio check runs unconditionally once recovered is
+        true, and returns the bar unconditionally when it is false) — the
+        bar, and nothing else, is why the engine lands on #3 instead of
+        returning to #1.
+        """
+        h = EngineHarness(temp_home, strategy="balance", threshold=80.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        now = h.clock.now
+        # Tick 1: switch 1 -> 2. #1 active at 90% (over the 80% threshold)
+        # -> proactive. #2 is healthy and balance's clear favourite (far
+        # behind schedule); #3 is healthy but far less attractive.
+        assert h.tick_with_usage({
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 10.0}},
+            "2": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + DAY)},
+            },
+            "3": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
+                },
+            },
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now = h.clock.now
+
+        outcome = h.tick_with_usage({
+            # Headroom 26 (74% used): clears the landing gate and the
+            # hysteresis margin against #2's headroom 15, and is balance's
+            # top score (~58) -- everything but the no-return bar would
+            # pick this.
+            "1": {
+                "five_hour": {"pct": 74.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + DAY)},
+            },
+            "2": {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}},
+            "3": {
+                "five_hour": {"pct": 20.0},
+                "seven_day": {
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
+                },
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "the no-return bar should have excluded #1 (headroom 26, "
+            "clears every ordinary gate) and landed on #3 instead"
+        )
+
+    def test_failover_ranks_by_balance(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        usage = {
+            "1": None,
+            # Weekly resets in 1 day: target 100, used 60 -> slack 40,
+            # score 40 - 0.5*10 = 35. Headroom 40.
+            "2": _usage7(10, 60, _iso_at(now + DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
+            # score 11.7. Headroom 95 -- most headroom, but less behind
+            # schedule than #2.
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() == 2
+
+
+MANAGED_DEAD_PID = 999_999
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestManagedSessionUpkeep:
+    """Managed-session upkeep, run at the top of every tick (issue #382).
+
+    Exited managed sessions are released, the survivors' load feeds the
+    balance ranking, and every live session of an account gets the token its
+    slot currently holds.
+    """
+
+    SID_B1, SID_B2, SID_C1 = "auto-000000b1", "auto-000000b2", "auto-000000c1"
+
+    @staticmethod
+    def _registry(harness) -> ManagedSessionRegistry:
+        return ManagedSessionRegistry(harness.switcher.backup_dir)
+
+    def _add(
+        self, harness, sid, email, *, pid=None, fingerprint=None, profile=True, org=""
+    ) -> Path:
+        registry = self._registry(harness)
+        registry.allocate(
+            sid, lambda busy: (AccountRef(email, org), "backup"),
+            pid=pid or os.getpid(), proc_start=None,
+        )
+        if profile:
+            # ``allocate`` writes the reservation BEFORE the profile exists,
+            # so a row without a directory is a state the engine really meets.
+            create_managed_profile(registry.session_dir(sid))
+        if fingerprint:
+            registry.update(sid, access_fingerprint=fingerprint)
+        return registry.session_dir(sid)
+
+    @staticmethod
+    def _record(session_dir: Path, status: str | None, *, pid: int | None = None) -> None:
+        """The record Claude keeps for its own instance inside the profile."""
+        pid = os.getpid() if pid is None else pid
+        (session_dir / "sessions").mkdir(exist_ok=True)
+        payload: dict = {"pid": pid}
+        if status is not None:
+            payload["status"] = status
+        (session_dir / "sessions" / f"{pid}.json").write_text(json.dumps(payload))
+
+    @staticmethod
+    def _usage_all() -> dict:
+        return {"1": _usage(10), "2": _usage(10), "3": _usage(10)}
+
+    def _balance_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _two_beats_three_unless_loaded(self, h: EngineHarness) -> dict:
+        """Usage where #2 wins on balance by 1.3 points — one busy managed
+        session (15 points of projected 5h load, halved by the weight) is
+        enough to hand the tick to #3."""
+        now = h.clock.now
+        return {
+            # Active over the threshold on its 5h window -> proactive move.
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+            # Weekly resets in 1 day: target 100 (24 h lead), used 82 ->
+            # slack 18, score 18 - 0.5 * 10 = 13. One busy session projects
+            # the 5h window to 25 and the score to 5.5.
+            "2": _usage7(10, 82, _iso_at(now + DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> score 11.7.
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+        }
+
+    def test_no_managed_state_is_a_no_op(self, harness, monkeypatch):
+        checked: list = []
+        monkeypatch.setattr(
+            managed_sessions_mod, "entry_is_live", lambda entry: checked.append(entry)
+        )
+        harness.tick_with_usage(self._usage_all())
+        # Nothing read, nothing created, and above all no liveness check: the
+        # no-state path must cost a stat, not a `ps` (nor a sessions/ tree
+        # every tick on an installation that has never launched one).
+        assert checked == []
+        assert not (harness.switcher.backup_dir / "sessions").exists()
+        assert "managed-sessions-refreshed" not in harness.kinds()
+        assert "session-released" not in harness.kinds()
+
+    def test_push_reaches_every_session_of_the_account_only(self, harness, monkeypatch):
+        now_ms = int(harness.clock.now * 1000)
+        harness.seed(2, "b@example.com", expires_at=now_ms + 60_000)
+        harness.seed(3, "c@example.com", expires_at=now_ms + 3_600_000)
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        b2 = self._add(harness, self.SID_B2, "b@example.com")
+        c_fp = oauth.access_token_fingerprint(json.dumps({"claudeAiOauth": {"accessToken": "sk-3"}}))
+        c1 = self._add(harness, self.SID_C1, "c@example.com", fingerprint=c_fp)
+        (c1 / ".credentials.json").write_text("untouched")
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-new", "refreshToken": "rt-2-new", "expiresAt": now_ms + 3_600_000,
+        }})
+        calls: list[str] = []
+
+        def gate(number, email, snapshot):
+            calls.append(number)
+            return oauth.RefreshOutcome(rotated, None)
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", gate)
+        harness.tick_with_usage(self._usage_all())
+
+        assert calls == ["2"]
+        for d in (b1, b2):
+            blob = json.loads((d / ".credentials.json").read_text())["claudeAiOauth"]
+            assert blob["accessToken"] == "sk-2-new" and "refreshToken" not in blob
+        assert (c1 / ".credentials.json").read_text() == "untouched"
+        refreshed = [e for e in harness.events if isinstance(e, ManagedSessionsRefreshedEvent)]
+        assert [(e.number, sorted(e.sessions)) for e in refreshed] == [
+            ("2", [self.SID_B1, self.SID_B2])
+        ]
+
+    def test_dead_grant_quarantines_once_and_leaves_sessions(self, harness, monkeypatch):
+        now_ms = int(harness.clock.now * 1000)
+        harness.seed(2, "b@example.com", expires_at=now_ms + 60_000)
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        calls: list[str] = []
+
+        def gate(number, email, snapshot):
+            calls.append(number)
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", gate)
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        quarantines = [e for e in harness.events if isinstance(e, QuarantineEvent)]
+        assert [(e.number, e.reason) for e in quarantines] == [("2", "invalid_grant")]
+        assert calls == ["2"]
+        assert not (b1 / ".credentials.json").exists()
+
+    def test_access_only_sessions_never_trigger_quarantine(self, harness, monkeypatch):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        # What a managed profile always holds: an access token, no refresh
+        # token, and (here) an expiry inside the freshen buffer. Anything that
+        # evaluated the SESSION's credential for a refresh would read a dead
+        # lineage off it and quarantine the slot; only the slot's own backup
+        # may ever be refreshed.
+        (b1 / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-session-old",
+            "expiresAt": int(harness.clock.now * 1000) + 1_000,
+        }}))
+
+        def no_refresh(*args):
+            raise AssertionError("no refresh expected")
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", no_refresh)
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        assert "account-quarantined" not in harness.kinds()
+        # The push itself landed: the session holds the slot's current access
+        # token, still without a refresh token, and only the first tick wrote.
+        blob = json.loads((b1 / ".credentials.json").read_text())["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-2" and "refreshToken" not in blob
+        refreshed = [e for e in harness.events if isinstance(e, ManagedSessionsRefreshedEvent)]
+        assert [(e.number, e.source, e.sessions) for e in refreshed] == [
+            ("2", "backup", (self.SID_B1,))
+        ]
+
+    def test_dead_session_is_swept_with_event(self, harness, monkeypatch):
+        dead = self._add(harness, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        harness.tick_with_usage(self._usage_all())
+        assert not dead.exists()
+        released = [e for e in harness.events if isinstance(e, SessionReleasedEvent)]
+        assert [(e.session_id, e.reason) for e in released] == [(self.SID_B1, "process-exited")]
+        assert released[0].to_json()["session"] == self.SID_B1
+        assert self._registry(harness).entries() == {}
+
+    def test_dry_run_touches_nothing(self, harness, monkeypatch):
+        dead = self._add(harness, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        harness.engine = harness._make_engine(dry_run=True)
+        harness.tick_with_usage(self._usage_all())
+        assert dead.exists()
+        assert self.SID_B1 in self._registry(harness).entries()
+
+    def test_upkeep_failure_does_not_block_the_lane0_decision(self, harness, monkeypatch):
+        self._add(harness, self.SID_B1, "b@example.com")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(autoswitch_mod, "push_refresh", boom)
+        outcome = harness.tick_with_usage(self._usage_all())
+        assert outcome is TickOutcome.NO_ACTION
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "Managed sessions: RuntimeError: disk on fire"
+        ]
+        # ...and the load this tick counted survives the push that failed
+        # after it: the ranking below runs on THIS tick's count, never on a
+        # previous one, so the count has to be taken before the push.
+        assert harness.engine._managed_busy == {"2": 1}
+
+    # One liveness pass per tick, shared by the sweep and the push.
+
+    def test_liveness_is_checked_once_per_entry_per_tick(self, harness, monkeypatch):
+        """``entry_is_live`` shells out to ``ps`` per entry on macOS, so the
+        sweep's live set is what the push must run on."""
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        self._add(harness, self.SID_B2, "b@example.com")
+        real = managed_sessions_mod.entry_is_live
+        checked: list[str] = []
+
+        def counting(entry):
+            checked.append(entry.session_id)
+            return real(entry)
+
+        monkeypatch.setattr(managed_sessions_mod, "entry_is_live", counting)
+        harness.tick_with_usage(self._usage_all())
+
+        assert sorted(checked) == [self.SID_B1, self.SID_B2]
+        # ...and the push still reached them, i.e. the live set was used.
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    # Busy managed sessions count as load when balance ranks lane 0.
+
+    def test_a_busy_managed_session_ranks_lane0_off_that_account(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_an_idle_managed_session_is_not_load(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "idle")
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_reservation_with_no_record_yet_counts_as_load(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._add(h, self.SID_B1, "b@example.com")  # launched, no status written
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_swept_session_is_not_load_on_the_tick_that_sweeps_it(
+        self, temp_home, monkeypatch
+    ):
+        h = self._balance_harness(temp_home)
+        dead = self._add(h, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        self._record(dead, "busy", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_load_over_the_ceiling_still_lands_on_a_candidate(self, temp_home):
+        """The count is added to the 5h window before the ceiling gate, so
+        enough managed sessions push every qualifying account over it and
+        leave the ranking with nothing eligible. It must still hand back the
+        accounts that can work — soonest binding recovery first — instead of
+        blocking the tick or ranking on an axis of its own: #3 recovers in an
+        hour, #2 not for four, and #2 has the larger headroom that any other
+        key would pick."""
+        h = self._balance_harness(temp_home)
+        now = h.clock.now
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        self._record(self._add(h, self.SID_C1, "c@example.com"), "busy")
+        usage = {
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+            # 75 + 15 = 90, over the 85 ceiling; headroom 25, recovers in 4h.
+            "2": {
+                "five_hour": {"pct": 75.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 40.0, "resets_at": _iso_at(now + 6 * DAY)},
+            },
+            # 80 + 15 = 95, over it too; headroom 20, but back in an hour.
+            "3": {
+                "five_hour": {"pct": 80.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 6 * DAY)},
+            },
+        }
+
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_dry_run_ranks_with_the_same_load(self, temp_home):
+        """A preview that ignored the load would not preview what runs."""
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        h.engine = h._make_engine(dry_run=True)
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.dry_run is True
+        assert switch.to_ref == {"number": 3, "email": "c@example.com"}
+        assert h.active_number() == 1
+
+    # -- failure paths of the upkeep pass -------------------------------------
+
+    def test_an_unreadable_status_record_never_stops_the_push(self, harness):
+        """A status record ``json.loads`` cannot survive — pathological
+        nesting raises ``RecursionError`` on one machine and parses on the
+        next — must be inert either way. Unhandled, it escaped the busy count
+        and took every tick's push with it."""
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        (b1 / "sessions").mkdir()
+        # Deep enough that the parser gives up on any ordinary stack (it
+        # still parses at 20k here); a machine that does parse it reads a
+        # list, not an object, which is just as inert.
+        nested = "[" * 100_000 + "]" * 100_000
+        (b1 / "sessions" / f"{os.getpid()}.json").write_text(nested)
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert [e.message for e in harness.events if isinstance(e, ErrorEvent)] == []
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_failed_push_is_reported_once_while_it_persists(self, harness):
+        # A registry row whose profile directory is not there: the writer
+        # refuses it (no-session-dir) on this and every later pass.
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B1}"
+        ]
+        assert errors[0].transient is True
+
+    def test_a_push_that_recovers_re_arms_the_report(self, harness):
+        session_dir = self._registry(harness).session_dir(self.SID_B1)
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        harness.tick_with_usage(self._usage_all())
+        create_managed_profile(session_dir)
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert harness.engine._session_health == {}
+        assert json.loads((session_dir / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_removed_account_is_reported_once_and_re_armed(self, harness):
+        """The session keeps running on a token nobody can refresh any more.
+        `cswap sessions` still lists it as healthy, so the daemon saying
+        nothing is the user's only warning that Claude is about to start
+        failing to authenticate there."""
+        self._add(harness, self.SID_B1, "b@example.com")
+        data = harness.switcher._get_sequence_data()
+        del data["accounts"]["2"]
+        data["sequence"].remove(2)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "Could not refresh 1 managed session(s) on b@example.com "
+            "(account-gone): no slot holds that account any more — re-add it "
+            "with `cswap add`, or stop the session. Their access token stops "
+            f"working within the hour — {self.SID_B1}"
+        ]
+        assert errors[0].transient is True
+
+        harness.seed(2, "b@example.com")
+        harness.tick_with_usage(self._usage_all())
+        assert harness.engine._session_health == {}
+        assert [e.message for e in harness.events if isinstance(e, ErrorEvent)] == [
+            errors[0].message
+        ]
+
+    def test_a_quarantined_slot_strands_its_sessions_with_its_own_report(
+        self, harness
+    ):
+        """Distinct from a refusal to resolve: the account is fine, cswap is
+        deliberately not touching the slot, and the user can lift it."""
+        self._add(harness, self.SID_B1, "b@example.com")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        harness.events.clear()
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "1 managed session(s) on b@example.com are stranded on "
+            "quarantined Account-2: their access token is no longer refreshed "
+            "and stops working within the hour. Repair the slot (re-add the "
+            f"account) or stop the session — {self.SID_B1}"
+        ]
+
+    def test_two_slots_sharing_an_email_report_independently(self, harness):
+        """One Claude login in two organizations occupies two slots, and
+        cswap's account identity is the (email, organizationUuid) pair. Keyed
+        on the address alone, each pass would overwrite what the other left
+        and both would report again on every tick — the log-burying the
+        dedupe exists to prevent."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["3"] = dict(data["accounts"]["2"], organizationUuid="org-2")
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.switcher._write_account_credentials(
+            "3", "b@example.com",
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-3", "refreshToken": "rt-3"}}),
+        )
+        harness.switcher._write_account_config(
+            "3", "b@example.com",
+            json.dumps({"oauthAccount": {
+                "emailAddress": "b@example.com", "organizationUuid": "org-2",
+            }}),
+        )
+        # Neither profile exists, so the writer refuses both pushes for good.
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        self._add(harness, self.SID_B2, "b@example.com", org="org-2", profile=False)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert sorted(e.message for e in errors) == [
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B1}",
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B2}",
+        ]
+
+    def test_an_account_without_sessions_loses_its_key(self, harness, monkeypatch):
+        """Otherwise the dict grows for the life of the daemon, one key per
+        account that ever had a session in trouble."""
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        harness.tick_with_usage(self._usage_all())
+        assert list(harness.engine._session_health) == [AccountRef("b@example.com", "")]
+
+        # The session's process exited: the sweep takes its row, and this
+        # pass's results say nothing about the account at all.
+        monkeypatch.setattr(managed_sessions_mod, "entry_is_live", lambda entry: False)
+        harness.tick_with_usage(self._usage_all())
+
+        assert harness.engine._session_health == {}
+
+    def test_an_unreadable_roster_costs_the_load_not_the_tick(
+        self, harness, monkeypatch, caplog
+    ):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+
+        def torn(switcher, counts):
+            raise ClaudeSwitchError("sequence.json is unreadable")
+
+        monkeypatch.setattr(autoswitch_mod, "busy_by_slot", torn)
+        with caplog.at_level("WARNING", logger="claude-swap"):
+            outcome = harness.tick_with_usage(self._usage_all())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.engine._managed_busy == {}
+        # Ranking as if the account carried no session load is a decision the
+        # user cannot see anywhere else, so it must not be silent.
+        assert [
+            r.getMessage() for r in caplog.records
+            if "Managed-session load" in r.getMessage()
+        ] == [
+            "Managed-session load not counted this tick: the account roster "
+            "could not be read (sequence.json is unreadable)"
+        ]
+        # The push looks the slot up on its own account by account, so it is
+        # untouched by the count giving up on one.
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_released_quarantine_resumes_the_push_on_the_same_tick(self, harness):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        # The user re-logged in and re-captured the slot: a new lineage, so
+        # the quarantine lifts on the next tick — and the push must not wait
+        # one further tick behind it.
+        harness.switcher._write_account_credentials("2", "b@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"}}
+        ))
+        harness.events.clear()
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert any(isinstance(e, UnquarantineEvent) for e in harness.events)
+        blob = json.loads((b1 / ".credentials.json").read_text())["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-2b" and "refreshToken" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Moving a live managed session to another account
+# ---------------------------------------------------------------------------
+
+
+def _ok_result(entry, decision):
+    from claude_swap.session_reassign import ReassignResult
+
+    return ReassignResult(
+        entry.session_id, decision.reason, decision.placement.number,
+        entry.account, decision.placement.account, True, "moved",
+    )
+
+
+def _failed_result(entry, decision):
+    from claude_swap.session_reassign import ReassignResult
+
+    return ReassignResult(
+        entry.session_id, decision.reason, decision.placement.number,
+        entry.account, decision.placement.account, False, "lock-timeout",
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestManagedSessionReassignment:
+    """Engine-side moves, run at the end of the managed-session upkeep pass.
+
+    A session whose account has no headroom left, or one idle long enough
+    that its prompt cache is worthless anyway, is pointed at a better
+    account without anything happening inside the session itself.
+    """
+
+    SID_A, SID_B = "auto-000000b1", "auto-000000b2"
+
+    @staticmethod
+    def _registry(harness) -> ManagedSessionRegistry:
+        return ManagedSessionRegistry(harness.switcher.backup_dir)
+
+    def _place(self, harness, email, *, session_id=None):
+        sid = session_id or self.SID_A
+        registry = self._registry(harness)
+        entry = registry.allocate(
+            sid, lambda _busy: (AccountRef(email, ""), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        create_managed_profile(registry.session_dir(sid))
+        return registry, entry
+
+    @staticmethod
+    def _record(registry, entry, status, *, idle_since_ms=None) -> None:
+        session_dir = registry.session_dir(entry.session_id)
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        payload: dict = {"pid": entry.pid, "status": status, "cwd": "/work"}
+        if idle_since_ms is not None:
+            payload["statusUpdatedAt"] = idle_since_ms
+        (session_dir / "sessions" / f"{entry.pid}.json").write_text(json.dumps(payload))
+
+    @staticmethod
+    def _moves(harness) -> list:
+        return [e for e in harness.events if isinstance(e, SessionReassignedEvent)]
+
+    # -- the two triggers -----------------------------------------------------
+
+    def test_an_at_limit_session_moves(self, harness):
+        """End to end: the session's profile ends the tick holding the target
+        account's token, not the one the push wrote into it minutes earlier."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert [
+            (e.session_id, e.number, e.from_email, e.to_email, e.reason)
+            for e in self._moves(harness)
+        ] == [(self.SID_A, "3", "b@example.com", "c@example.com", "at-limit")]
+        blob = json.loads(
+            (registry.session_dir(self.SID_A) / ".credentials.json").read_text()
+        )["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-3" and "refreshToken" not in blob
+        assert registry.entries()[self.SID_A].account == AccountRef("c@example.com", "")
+
+    def test_an_idle_session_past_the_margin_moves(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(
+            registry, entry, "idle",
+            idle_since_ms=(harness.clock.now - 2 * 3600) * 1000,
+        )
+        moved = []
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: moved.append(a[3]) or _ok_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(80.0), "3": _usage(1.0),
+            })
+
+        assert [(d.reason, d.placement.number) for d in moved] == [("idle", "3")]
+
+    @pytest.mark.parametrize(
+        "sessions",
+        [
+            # The session has been idle two hours; three is the bar.
+            SessionsSettings(idle_reassign_minutes=180.0),
+            # The target is 39.5 points better; a hundred is the bar.
+            SessionsSettings(reassign_margin=100.0),
+        ],
+        ids=["idle-delay", "margin"],
+    )
+    def test_the_sessions_settings_govern_an_idle_move(self, harness, sessions):
+        """Both knobs reach the decision — the engine is the only thing that
+        reads the ``sessions`` section on a session's behalf."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(
+            registry, entry, "idle",
+            idle_since_ms=(harness.clock.now - 2 * 3600) * 1000,
+        )
+        harness.engine = harness._make_engine(sessions=sessions)
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(80.0), "3": _usage(1.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_session_on_a_quarantined_account_moves(self, harness):
+        """The push has stopped refreshing that account, so nothing renews
+        this session's token — and its usage says nothing at all about that,
+        because a quarantined slot stops being fetched too."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0),
+        })
+
+        assert [
+            (e.session_id, e.to_email, e.reason) for e in self._moves(harness)
+        ] == [(self.SID_A, "c@example.com", "quarantined")]
+        assert registry.entries()[self.SID_A].account == AccountRef(
+            "c@example.com", ""
+        )
+
+    def test_the_move_pass_judges_the_row_the_push_left_behind(self, harness):
+        """The entries this pass is handed were read before the push rewrote
+        them in place. Rolling a failed move back from those would restore a
+        `source` the push had just corrected, and `source` is the only thing
+        that tells the session's own hook its token is borrowed from lane 0
+        and has to be watched for rotation."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        seen = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def push_then_rewrite(*a, **kw):
+            registry.update(self.SID_A, source="lane0")
+            return []
+
+        def spy(switcher, planned, **kwargs):
+            seen.append(planned.source)
+            return real_plan(switcher, planned, **kwargs)
+
+        with (
+            patch("claude_swap.autoswitch.push_refresh", push_then_rewrite),
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert entry.source == "backup"
+        assert seen == ["lane0"]
+
+    def test_a_row_the_sweep_dropped_between_the_passes_is_not_moved(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        def push_then_drop(*a, **kw):
+            registry.remove(self.SID_A)
+            return []
+
+        with (
+            patch("claude_swap.autoswitch.push_refresh", push_then_drop),
+            patch("claude_swap.session_reassign.apply_reassignment") as apply_mock,
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_busy_session_below_its_limit_stays(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(50.0), "3": _usage(1.0),
+            })
+        apply_mock.assert_not_called()
+
+    def test_a_move_waits_no_longer_for_a_lock_than_the_push_does(self, harness):
+        """A wedged profile lock must cost the move, never the daemon: the
+        generic registry budget this call would otherwise default to is far
+        longer than a tick can afford to sit still."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+        ) as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        assert apply_mock.call_args.kwargs["lock_timeout"] == PUSH_LOCK_TIMEOUT_S
+
+    # -- one account must not collect every session it rescues -----------------
+
+    def test_a_rescued_account_carries_its_new_load_into_the_same_pass(self, harness):
+        """Both sessions are at limit on the same account and both are busy.
+        Ranked on the load the tick started with, the second one would follow
+        the first onto #3 and put the account it was rescued onto straight
+        over its own 5h ceiling."""
+        harness.seed(4, "d@example.com")
+        # Registered in the opposite order to the one they are judged in.
+        registry, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        _, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        moved = []
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: moved.append((a[2], a[3])) or _ok_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0),
+                "3": _usage(5.0), "4": _usage(10.0),
+            })
+
+        assert [
+            (entry.session_id, decision.placement.number) for entry, decision in moved
+        ] == [(self.SID_A, "3"), (self.SID_B, "4")]
+
+    def test_the_source_slot_is_decremented_even_outside_the_candidate_pool(
+        self, harness
+    ):
+        """The count being corrected was keyed over every slot, so the source
+        has to be resolved over every slot too. Looked up in the candidate
+        pool instead, a quarantined source — or one running its own ``cswap
+        run N`` — would keep the load of a session that has left it."""
+        registry, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        # Out of the candidate pool, still on the roster and still carrying
+        # both sessions' load.
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        seen: list[dict] = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def spy(switcher, entry, **kwargs):
+            seen.append(dict(kwargs["busy"]))
+            return real_plan(switcher, entry, **kwargs)
+
+        with (
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert seen == [{"2": 2}, {"2": 1, "3": 1}]
+
+    def test_a_source_no_longer_on_the_roster_costs_the_pass_nothing(
+        self, harness
+    ):
+        """A session can outlive the account it runs on: the slot is removed
+        while its Claude is still up. The load then belongs to no slot, so
+        there is nothing to take it off — and nothing to raise about."""
+        registry, first = self._place(harness, "b@example.com", session_id=self.SID_A)
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, first, "busy")
+        self._record(registry, second, "busy")
+        seen: list[dict] = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def spy(switcher, entry, **kwargs):
+            seen.append(dict(kwargs["busy"]))
+            return real_plan(switcher, entry, **kwargs)
+
+        with (
+            patch("claude_swap.session_reassign.plan_for_entry", spy),
+            patch("claude_swap.autoswitch.slot_for_account", return_value=None),
+            patch(
+                "claude_swap.session_reassign.apply_reassignment",
+                side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+            ),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(40.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        # The first move's load lands on its target; nothing comes off the
+        # account that is no longer there to take it off.
+        assert seen == [{"2": 2}, {"2": 2, "3": 1}]
+
+    def test_a_successful_move_leaves_the_tick_s_own_load_alone(self, harness):
+        """Characterization. ``_managed_busy`` is what the balance ranking
+        below reads, so a move that changed it would make a reassignment
+        outcome change a lane-0 decision. It stays the count this tick's
+        sweep measured, and the next tick recounts."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+
+        assert [e.number for e in self._moves(harness)] == ["3"]
+        assert harness.engine._managed_busy == {"2": 1}
+
+    # -- cooldown -------------------------------------------------------------
+
+    def test_one_target_is_resolved_once_for_the_whole_pass(self, harness):
+        """`push_refresh` promises one resolution and at most one grant
+        consumption per account; a pass rescuing a fleet onto one target was
+        paying it once per SESSION. Resolving reads the roster, reads the
+        account's credential (the keychain included) and can POST a refresh,
+        and none of that depends on which session is moving -- so a
+        `transient` answer meant one retry of the same POST per session
+        inside one tick."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        _, second = self._place(harness, "b@example.com", session_id=self.SID_B)
+        self._record(registry, second, "busy")
+        resolved = []
+        real = autoswitch_mod.resolve_access_credential
+
+        def counting(switcher, account, **kw):
+            resolved.append(account.email)
+            return real(switcher, account, **kw)
+
+        with patch.object(autoswitch_mod, "resolve_access_credential", counting):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert len(self._moves(harness)) == 2
+        assert resolved == ["c@example.com"]
+
+    def test_the_stamps_are_claimed_before_anything_is_planned(self, harness):
+        """The stamps are in a shared file so a loop engine and a cron
+        `--once` engine can agree about when a session was last moved.
+        Deciding `due` from an unlocked read was the one place that
+        agreement was not asked for: both engines see no stamp, both plan,
+        and the second either moves the session again or has the first's
+        committed move reverted."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        seen = []
+        real_plan = session_reassign_mod.plan_for_entry
+
+        def watching(*a, **kw):
+            seen.append(harness.state().get("sessionClaim", {}).copy())
+            return real_plan(*a, **kw)
+
+        with patch.object(session_reassign_mod, "plan_for_entry", watching):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert seen == [{self.SID_A: harness.clock.now}]
+
+    def test_a_claim_the_pass_did_not_use_is_released(self, harness):
+        """The claim is a lease for the length of the pass, not an attempt.
+        Keeping it would suppress a healthy session for a whole cooldown and
+        make the daemon's response to a limit as slow as that window; the
+        session's own hook would still cover it, but the engine is the
+        backstop for sessions whose hooks never run."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "sessionCooldown" not in harness.state()
+        assert "sessionClaim" not in harness.state()
+
+    def test_a_claim_nobody_came_back_for_expires_on_its_own(self, harness):
+        """A pass killed between claiming and giving back leaves its claims
+        behind, and nothing is coming to clear them. They are kept apart
+        from the move stamps for exactly that: a claim aged like one would
+        hold its session for `cooldownSeconds`, which the user sets and may
+        set to a day, on a pass that never so much as planned a move."""
+        # The lease spelled out rather than read off the module: a test that
+        # ages a claim by the very constant it is testing shrinks with it,
+        # and a lease retuned to a day would still look right.
+        assert autoswitch_mod._CLAIM_LEASE_S == 120.0
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        (harness.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"sessionClaim": {self.SID_A: harness.clock.now - 10.0}})
+        )
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert self._moves(harness) == []
+
+        harness.clock.now += 120.0
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert len(self._moves(harness)) == 1
+
+    def test_a_claim_for_a_session_nobody_sees_is_not_kept_forever(self, harness):
+        """Managed session ids are minted per launch and never reused, so a
+        claim a killed pass left behind has nothing but its own age to
+        clear it -- and the pass that finds it may never see that session
+        again."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        (harness.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"sessionClaim": {
+                "auto-0000beef": harness.clock.now - 10.0,
+                "auto-0000dead": harness.clock.now - 1000.0,
+            }})
+        )
+
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0),
+        })
+
+        claims = harness.state().get("sessionClaim", {})
+        assert "auto-0000dead" not in claims
+        assert "auto-0000beef" in claims
+
+    def test_a_pass_with_nowhere_to_move_a_session_writes_no_state(
+        self, harness, monkeypatch
+    ):
+        """Claiming costs the state lock and a write, and giving the claims
+        back costs another. A pass that could not have planned a move --
+        every other slot quarantined, a roster that will not read -- pays
+        neither, because the pool it would rank against is read first."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        monkeypatch.setattr(
+            managed_launch_mod, "_candidate_identities", lambda _switcher: {}
+        )
+        writes = []
+        real = autoswitch_mod.atomic_write_json
+
+        def counting(path, payload):
+            writes.append(path)
+            return real(path, payload)
+
+        monkeypatch.setattr(autoswitch_mod, "atomic_write_json", counting)
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+        })
+        assert [p for p in writes if p == harness.engine.state_path] == []
+
+    def test_a_hand_edited_true_is_not_a_timestamp(self, harness):
+        """`bool` is an `int` in Python, so a `true` in a hand-edited state
+        file would otherwise pass every type check these stamps have and be
+        carried through the merge as a stamp. Asserted on the predicate
+        rather than on a tick: at today's clock a `true` reads as the epoch
+        second 1, which is long spent whichever way the check goes, so
+        nothing observable separates the two. The guard is the type contract
+        for a value read off disk, and this is where it is stated."""
+        assert autoswitch_mod._is_stamp(harness.clock.now) is True
+        assert autoswitch_mod._is_stamp(1) is True
+        assert autoswitch_mod._is_stamp(True) is False
+        assert autoswitch_mod._is_stamp(False) is False
+        assert autoswitch_mod._is_stamp("now") is False
+        assert autoswitch_mod._is_stamp(None) is False
+
+    def test_a_second_move_waits_out_the_cooldown(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _ok_result(a[2], a[3]),
+        ) as apply_mock:
+            usage = {"1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0)}
+            harness.tick_with_usage(usage)
+            harness.clock.advance(10)
+            harness.tick_with_usage(usage)
+
+        assert apply_mock.call_count == 1
+        assert harness.state()["sessionCooldown"] == {self.SID_A: harness.clock.now - 10}
+
+    def test_a_failed_move_still_takes_the_cooldown(self, harness):
+        """A wedged profile lock or an unresolvable target would otherwise be
+        retried on every single tick for as long as it stays broken."""
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        with patch(
+            "claude_swap.session_reassign.apply_reassignment",
+            side_effect=lambda *a, **k: _failed_result(a[2], a[3]),
+        ):
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert self.SID_A in harness.state()["sessionCooldown"]
+        assert self._moves(harness) == []
+
+    def test_cooldown_stamps_are_pruned_with_their_sessions(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "auto-deadbeef" not in harness.state().get("sessionCooldown", {})
+
+    def test_a_stamp_written_by_another_engine_survives_this_pass(self, harness):
+        """A cron ``--once`` engine and the loop share the state file, which
+        is the whole reason the stamps are in it. A pass that read the key
+        before the other engine wrote and then replaced it wholesale would
+        drop that stamp, and the session it belongs to would be moved twice
+        inside one cooldown."""
+        engine = harness.engine
+        real_lock, raced = engine._state_lock, []
+
+        def racing_lock():
+            if not raced:
+                raced.append(True)
+                # The other engine's own locked write, landing between this
+                # pass's read and its write.
+                engine._mutate_state(
+                    lambda s: s.setdefault("sessionCooldown", {}).update(
+                        {self.SID_B: harness.clock.now}
+                    )
+                )
+            return real_lock()
+
+        with patch.object(engine, "_state_lock", racing_lock):
+            engine._prune_session_cooldowns(
+                {self.SID_A, self.SID_B}, {self.SID_A: harness.clock.now}
+            )
+
+        assert harness.state()["sessionCooldown"] == {
+            self.SID_A: harness.clock.now, self.SID_B: harness.clock.now,
+        }
+
+    def test_a_stranger_stamp_is_kept_until_its_cooldown_is_spent(self, harness):
+        """A session another engine registered and stamped after this pass
+        read its entries is not in this pass's live set, and dropping its
+        stamp for that is exactly the double move the stamp prevents."""
+        engine = harness.engine
+        engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update(
+                {"auto-cafebabe": harness.clock.now}
+            )
+        )
+
+        engine._prune_session_cooldowns(set())
+        assert harness.state()["sessionCooldown"] == {
+            "auto-cafebabe": harness.clock.now
+        }
+
+        # Spent: it can no longer suppress anything, so it goes.
+        harness.clock.advance(harness.settings.cooldown_seconds + 1)
+        engine._prune_session_cooldowns(set())
+        assert "sessionCooldown" not in harness.state()
+
+    def test_the_last_session_to_exit_takes_its_stamp_with_it(self, harness):
+        """Once nothing is registered the pass returns before it reaches any
+        session, and a stamp nothing can ever match again would sit in the
+        state file for the life of the install."""
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert "sessionCooldown" not in harness.state()
+
+    # -- containment ----------------------------------------------------------
+
+    def test_dry_run_never_moves(self, harness):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+        harness.engine = harness._make_engine(dry_run=True)
+        with patch("claude_swap.session_reassign.apply_reassignment") as apply_mock:
+            harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+        apply_mock.assert_not_called()
+        assert registry.entries()[self.SID_A].account == AccountRef("b@example.com", "")
+
+    def test_dry_run_never_writes_the_cooldown(self, harness):
+        """The pruning pass is still a write, and a preview writes nothing —
+        including on the path an installation with no session takes."""
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("sessionCooldown", {}).update({"auto-deadbeef": 1.0})
+        )
+        harness.engine = harness._make_engine(dry_run=True)
+
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(5.0), "3": _usage(5.0)})
+
+        assert harness.state()["sessionCooldown"] == {"auto-deadbeef": 1.0}
+
+    def test_a_move_that_raises_costs_neither_the_push_nor_lane_0(self, temp_home):
+        """The move pass is contained apart from the push it follows and from
+        the decision it precedes: lane 0 still ranks on the managed load this
+        tick measured, and still switches to the account that load points at."""
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        registry, entry = self._place(h, "b@example.com")
+        self._record(registry, entry, "busy")
+        now = h.clock.now
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk on fire")
+
+        with patch("claude_swap.session_reassign.plan_for_entry", boom):
+            outcome = h.tick_with_usage({
+                # Over the threshold on 5h: the tick wants to move off #1.
+                "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+                # Wins by 1.3 points with no load; one busy managed session
+                # projects its 5h window to 25 and hands the tick to #3.
+                "2": _usage7(10, 82, _iso_at(now + DAY)),
+                "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine._managed_busy == {"2": 1}
+        assert [e.message for e in h.events if isinstance(e, ErrorEvent)] == [
+            "Managed session moves: RuntimeError: disk on fire"
+        ]
+        # ...and the push that ran before it still landed.
+        assert json.loads(
+            (registry.session_dir(self.SID_A) / ".credentials.json").read_text()
+        )["claudeAiOauth"]["accessToken"] == "sk-2"
+
+    def test_an_unreadable_candidate_pool_costs_the_pass_only(self, harness, caplog):
+        registry, entry = self._place(harness, "b@example.com")
+        self._record(registry, entry, "busy")
+
+        def torn(switcher):
+            raise ClaudeSwitchError("sequence.json is unreadable")
+
+        with (
+            patch("claude_swap.managed_launch._candidate_identities", torn),
+            caplog.at_level("WARNING", logger="claude-swap"),
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(10.0), "2": _usage(100.0), "3": _usage(5.0),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._moves(harness) == []
+        assert [
+            r.getMessage() for r in caplog.records
+            if "considered for a move" in r.getMessage()
+        ] == [
+            "Managed sessions not considered for a move "
+            "(sequence.json is unreadable)"
+        ]
+
+    # -- the event ------------------------------------------------------------
+
+    def test_the_event_serializes(self):
+        event = SessionReassignedEvent(
+            session_id="auto-aaaaaaaa", number="3",
+            from_email="b@example.com", to_email="c@example.com", reason="idle",
+        )
+        payload = event.to_json()
+
+        assert payload["event"] == "session-reassigned"
+        assert {
+            k: payload[k] for k in ("session", "number", "from", "to", "reason")
+        } == {
+            "session": "auto-aaaaaaaa", "number": "3",
+            "from": "b@example.com", "to": "c@example.com", "reason": "idle",
+        }
+        assert "auto-aaaaaaaa" in event.human()
+        assert "c@example.com" in event.human()
+
+
+class TestLaneZeroAllIdle:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _record(self, temp_home, pid, status, *, status_updated_at=None):
+        sessions = temp_home / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        payload = {"pid": pid, "status": status, "cwd": "/work"}
+        if status_updated_at is not None:
+            payload["statusUpdatedAt"] = status_updated_at
+        (sessions / f"{pid}.json").write_text(json.dumps(payload))
+
+    @pytest.fixture(autouse=True)
+    def _own_pid_is_live(self, monkeypatch):
+        monkeypatch.setattr(
+            "claude_swap.process_detection.pid_matches_record",
+            lambda pid, stamp, **_kw: True,
+        )
+
+    def _use_temp_home(self, temp_home, monkeypatch):
+        monkeypatch.setattr(
+            "claude_swap.paths.get_default_claude_config_home",
+            lambda: temp_home / ".claude",
+        )
+
+    def test_no_sessions_counts_as_idle(self, temp_home, monkeypatch):
+        # scan_sessions drops a record the instant its pid dies, so an
+        # empty directory is the ordinary state of "nobody has a live
+        # Claude open right now" -- and the other three triggers already
+        # repoint lane 0's credentials with no session check at all, so
+        # this, the strictly more conservative trigger, has no case for
+        # holding out where they would not.
+        self._use_temp_home(temp_home, monkeypatch)
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is True
+
+    def test_a_busy_session_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        self._record(temp_home, os.getpid(), "busy")
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is False
+
+    def test_a_freshly_idle_session_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 600) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+    def test_a_long_idle_session_passes(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is True
+
+    def test_an_unreadable_record_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        sessions = temp_home / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / "77.json").write_text("{ not json")
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is False
+
+    def test_an_unreadable_record_blocks_beside_a_long_idle_one(
+        self, temp_home, monkeypatch
+    ):
+        # Distinguishes "some record is unreadable" from "no live sessions
+        # at all": one session here genuinely clears the floor, so only the
+        # unreadable-count check can be what blocks this.
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        sessions = temp_home / ".claude" / "sessions"
+        (sessions / "77.json").write_text("{ not json")
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+    def test_all_idle_across_several_live_sessions_passes(
+        self, temp_home, monkeypatch
+    ):
+        # ~/.claude/sessions/ can hold more than one live record at once;
+        # every one of them has to clear the floor, not just the first one
+        # found.
+        self._use_temp_home(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.is_pid_alive", lambda pid: True
+        )
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        self._record(
+            temp_home, os.getpid() + 1, "idle",
+            status_updated_at=(now - 9000) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is True
+
+    def test_one_busy_session_among_several_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.is_pid_alive", lambda pid: True
+        )
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        self._record(temp_home, os.getpid() + 1, "busy")
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+
+class TestLaneZeroIdleSwitch:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _harness(self, temp_home, **settings_kwargs):
+        kwargs = {"strategy": "balance", "hysteresis_pct": 10.0, **settings_kwargs}
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _weekly(self, pct, resets_in_s, now):
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": pct, "resets_at": _iso_at(now + resets_in_s)},
+        }
+
+    def test_an_all_idle_lane_zero_moves_on_the_balance_margin(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 2
+
+    def test_a_working_lane_zero_stays(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=False):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 1
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+
+    def test_the_rule_is_balance_only(self, temp_home):
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert h.active_number() == 1
+
+    def test_the_rule_never_fires_under_consume_first(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                # Same reset time on both sides, so consume-first's own
+                # soonest-reset ordering finds nothing to move to either --
+                # any move here can only be the idle rule firing where it
+                # must not.
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert h.active_number() == 1
+
+    def test_too_small_a_score_gap_stays(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(40.0, 3 * DAY, now),
+                "2": self._weekly(35.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_at_limit_precedence_holds(self, temp_home):
+        # Active is at its own hard limit -- that always wins "at-limit",
+        # never the idle rule, however clear the idle read and however far
+        # ahead a peer scores. The two live in disjoint branches (below vs
+        # at/over threshold) so this is a structural invariant, pinned here
+        # against a regression that merges the branches.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(100.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_cooldown_still_blocks_an_idle_move(self, temp_home):
+        # _tick_inner's cooldown check runs BEFORE candidate selection and
+        # freshening; _perform's own recheck runs AFTER _freshen_target. The
+        # two emit the identical NoSwitchEvent(reason="cooldown") /
+        # NO_ACTION, so that assertion alone cannot tell them apart -- a
+        # spy on _freshen_target pins the FIRST site specifically: it must
+        # never even be reached.
+        h = self._harness(temp_home)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        now = h.clock.now
+        with (
+            patch("claude_swap.autoswitch.lane0_all_idle", return_value=True),
+            patch.object(h.engine, "_freshen_target") as freshen_spy,
+        ):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert freshen_spy.call_count == 0
+        assert h.active_number() == 1
+        assert "cooldown" in [getattr(e, "reason", "") for e in h.events]
+
+    def test_the_no_return_bar_still_holds(self, temp_home):
+        # Equal headroom on 1 and 2 (50 vs 50) keeps _no_return_account's own
+        # dominance release from firing (50 is not >= 50 * HORIZON_HEADROOM_
+        # RATIO), and a third, worse-but-available account keeps the ranking
+        # non-empty so the separate "recovered and nothing left" release
+        # (_left_account_recovered) cannot fire either -- isolating the bar
+        # itself as the only thing standing between the idle rule and 2.
+        h = self._harness(temp_home)
+        h.seed(3, "c@example.com")
+        # As if we just switched 2 -> 1 by hand: account 2 is barred from an
+        # immediate return even though it would otherwise be the idle rule's
+        # first choice (same headroom as 1, but far less used against its
+        # own schedule).
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchFrom="2", lastSwitchTo="1")
+        )
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(50.0, 6 * DAY, now),
+                "2": self._weekly(50.0, 1 * DAY, now),
+                "3": self._weekly(25.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 3
+
+    def test_the_headroom_hysteresis_is_exempted_for_the_score_margin(
+        self, temp_home
+    ):
+        # Identical headroom on both sides -- a 0-point gap the ordinary
+        # hysteresis_pct=10 landing gate would never clear -- but very
+        # different schedule positions (one resets in a day, the other in
+        # six): the idle rule ranks on that gap instead, guarded by its own
+        # margin rather than the headroom one.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(50.0, 6 * DAY, now),
+                "2": self._weekly(50.0, 1 * DAY, now),
+            })
+        assert h.active_number() == 2
+
+    def test_no_eligible_candidate_leaves_lane_zero_alone(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(50.0, 3 * DAY, now),
+                "2": self._weekly(100.0, 3 * DAY, now),  # at its own limit
+            })
+        # Not just "stayed on 1" -- a crash on the way (e.g. ranking a
+        # missing candidate) would also leave 1 active, via ErrorEvent
+        # rather than a clean refusal. Pin the refusal itself.
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_unreadable_active_usage_leaves_lane_zero_alone(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {"five_hour": {"pct": 50.0}},  # no seven_day window
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_idle_balance_below_threshold_is_no_action_not_blocked(
+        self, temp_home
+    ):
+        """`_lane0_idle_move_allowed` finds its candidate through its own
+        ranking, which does not know about the no-return bar -- so the
+        bar can still empty `_rank_candidates`' oauth ranking afterwards,
+        on the very account the idle rule just chose. With only one oauth
+        peer, barring it empties the ranking outright. That is a correct
+        "nothing to do" this tick, exactly like consume-first's own
+        below-threshold exit just above -- never a block.
+
+        Tick 1 performs a real proactive departure (account 2 crosses the
+        threshold) so the bar's baseline (``leftHeadroom`` / recovery) is
+        the real snapshot `_perform` records, not a hand-mutated one.
+        Tick 2 holds account 2's own reset time fixed and lets its
+        headroom move by only a tenth of a point (10.0 -> 10.1) -- past
+        `_left_account_recovered`'s three "did it get better" legs
+        (dominance against the active, headroom against the departure
+        baseline, recovery time against the departure baseline) but
+        nowhere near clearing any of them -- while account 2 still beats
+        account 1's balance score by far more than the idle rule's own
+        margin.
+        """
+        h = EngineHarness(temp_home, strategy="balance", hysteresis_pct=10.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        now1 = h.clock.now
+        reset_iso = _iso_at(now1 + DAY)
+
+        assert h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now1 + 6 * DAY)},
+            },
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 90.0, "resets_at": reset_iso},
+            },
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, "premise: tick 1 landed on account 1"
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now2 = h.clock.now
+
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {
+                        "pct": 40.0, "resets_at": _iso_at(now2 + 6 * DAY)
+                    },
+                },
+                # Same resets_at as the departure snapshot and headroom
+                # barely moved (10.0 -> 10.1): none of the three recovery
+                # legs clears, so the bar holds and empties the ranking.
+                "2": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 89.9, "resets_at": reset_iso},
+                },
+            })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"an empty idle-balance ranking must be a no-harm hold, not a "
+            f"block — got {outcome}"
+        )
+        assert h.active_number() == 1
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+
+    def test_idle_balance_never_falls_back_to_an_api_key_account(
+        self, temp_home
+    ):
+        """Same no-return-bar setup as the test above, plus an included
+        API-key account (3) that would otherwise be the "last resort"
+        candidate once the oauth ranking comes back empty. Idle-balance is
+        an optimisation on an already-healthy account, not an escape, so
+        it must take the same below-threshold exit as above rather than
+        ever landing on a billed, unmetered account.
+        """
+        h = EngineHarness(
+            temp_home,
+            strategy="balance",
+            hysteresis_pct=10.0,
+            include_api_key_accounts=True,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "key@token.local")
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        now1 = h.clock.now
+        reset_iso = _iso_at(now1 + DAY)
+
+        assert h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now1 + 6 * DAY)},
+            },
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 90.0, "resets_at": reset_iso},
+            },
+            "3": "api key",
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, "premise: tick 1 landed on account 1"
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now2 = h.clock.now
+
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {
+                        "pct": 40.0, "resets_at": _iso_at(now2 + 6 * DAY)
+                    },
+                },
+                "2": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 89.9, "resets_at": reset_iso},
+                },
+                "3": "api key",
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1, (
+            "idle-balance must never land on the api-key account just "
+            "because the no-return bar emptied the oauth ranking"
+        )
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]

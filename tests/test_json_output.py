@@ -17,10 +17,12 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
     account_row,
     error_envelope,
+    managed_session_row,
     usage_fields,
     usage_to_json,
 )
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.managed_sessions import AccountRef, ManagedEntry, ManagedSessionView
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -752,3 +754,51 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+def test_managed_session_row_shape():
+    entry = ManagedEntry(
+        session_id="auto-0000beef", account=AccountRef("b@example.com", "org-2"),
+        pid=4242, proc_start=None, source="backup",
+        created_at="2026-09-21T10:00:00Z", last_assigned_at="2026-09-21T10:00:00Z",
+        last_reason="launch",
+    )
+    view = ManagedSessionView(
+        entry=entry, number="2", status="idle", cwd="/work/app",
+        idle_since_ms=1_758_000_000_000,
+    )
+    assert managed_session_row(view) == {
+        "id": "auto-0000beef",
+        "pid": 4242,
+        "account": {"number": 2, "email": "b@example.com"},
+        "organizationUuid": "org-2",
+        "source": "backup",
+        "status": "idle",
+        "cwd": "/work/app",
+        "idleSince": "2025-09-16T05:20:00Z",
+        "createdAt": "2026-09-21T10:00:00Z",
+        "lastAssignedAt": "2026-09-21T10:00:00Z",
+        "lastReason": "launch",
+    }
+    unknown = ManagedSessionView(entry=entry, number=None, status="starting", cwd="", idle_since_ms=None)
+    row = managed_session_row(unknown)
+    assert row["account"] == {"number": None, "email": "b@example.com"}
+    assert row["idleSince"] is None
+    assert row["cwd"] is None
+
+
+def test_managed_session_row_non_numeric_slot_is_not_raised():
+    """A hand-edited sequence.json with a non-numeric account key must not
+    raise past managed_session_row -- int() on that key belongs here, not
+    in a bare try/except at the CLI layer."""
+    entry = ManagedEntry(
+        session_id="auto-0000beef", account=AccountRef("b@example.com", "org-2"),
+        pid=4242, proc_start=None, source="backup",
+        created_at="2026-09-21T10:00:00Z", last_assigned_at="2026-09-21T10:00:00Z",
+        last_reason="launch",
+    )
+    view = ManagedSessionView(
+        entry=entry, number="primary", status="idle", cwd="", idle_since_ms=None,
+    )
+    row = managed_session_row(view)
+    assert row["account"] == {"number": None, "email": "b@example.com"}

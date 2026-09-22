@@ -27,9 +27,11 @@ import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.models import session_count_label
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -283,11 +285,48 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    sessions: int = 0,
 ) -> str:
-    """Build one account row's menu label."""
+    """Build one account row's menu label.
+
+    The session count is the same string the TUI shows, from the same
+    renderer — a menu row and a dashboard row disagreeing about how to say
+    "2 sessions" is the kind of difference nobody decides on purpose.
+    """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
+    count = session_count_label(sessions)
+    if count:
+        marker += f"  {count}"
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+
+
+def usage_log_lines(rows, already_logged: dict) -> list[str]:
+    """The log lines a refresh should write, and the de-dupe that decides.
+
+    Runs on every refresh (background thread; the logger is thread-safe) but
+    de-dupes per account on the (5h, 7d) percentages, so an idle machine
+    does not churn the rotating log with identical lines. ``already_logged``
+    is read AND updated: it is the caller's per-account memory of what it
+    last wrote.
+
+    Module level, not a method, for one reason: it reads the account rows,
+    and everything that reads them used to live inside the rumps app glue
+    that the suite cannot import. A row shape that no longer matched broke
+    this before any menu was drawn — the refresh worker assigns the
+    snapshot AFTER logging it, so a raise here left the menu bar on its
+    empty snapshot permanently. Out here it is ordinary tested code.
+    """
+    lines = []
+    for row in rows:
+        key = _usage_log_key(row.last_good)
+        if key == (None, None) or already_logged.get(row.num) == key:
+            continue
+        line = format_usage_log(row.email, row.last_good)
+        if line:
+            lines.append(line)
+            already_logged[row.num] = key
+    return lines
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -400,6 +439,34 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
+class AccountRow(NamedTuple):
+    """One account as the menu renders it.
+
+    A NamedTuple rather than a bare tuple because four consumers take this
+    apart — the usage log, the account list, the remove menu and the disable
+    menu — and all four live inside the rumps app glue, which cannot be
+    imported without rumps and so is never exercised by the suite.
+    Positionally, the field added here for session counts turned every one
+    of them into a ``ValueError`` at the first refresh, found only by
+    reading them. By name, a tenth field costs them nothing; the row still
+    unpacks and compares as the plain tuple it used to be.
+
+    The row's own consumers are pinned by
+    ``test_menubar.py::test_no_row_is_taken_apart_by_position``, which reads
+    this module's source because it cannot import that glue.
+    """
+
+    num: str
+    email: str
+    is_active: bool
+    display_usage: dict | str | None
+    last_good: dict | None
+    alias: str
+    disabled: bool
+    fetched_at: float | None
+    sessions: int
+
+
 EMPTY_SNAPSHOT: dict = {
     "accounts": [],
     "active_email": None,
@@ -411,9 +478,10 @@ EMPTY_SNAPSHOT: dict = {
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
-    "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    Shape: ``{"accounts": [AccountRow, ...], "active_email": str | None,
+    "active_usage": dict | str | None, "active_alias": str | None}``, where
+    an :class:`AccountRow` is a NamedTuple and still compares equal to the
+    plain tuple it used to be. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
@@ -425,9 +493,9 @@ def _adapt_snapshot(snap) -> dict:
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append(
-            (
+            AccountRow(
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
-                acc.alias, acc.disabled, acc.usage.fetched_at,
+                acc.alias, acc.disabled, acc.usage.fetched_at, acc.managed_sessions,
             )
         )
         if acc.is_active:
@@ -514,6 +582,39 @@ def framework_build_warning(
         "observed not to draw the menu bar icon: the process runs and logs "
         "nothing, but no status item appears.\n" + remedy
     )
+
+
+def notification_for(event) -> tuple[str, str] | None:
+    """Title and body for an auto-switch event worth a macOS notification,
+    or None for one the menu bar stays quiet about.
+
+    Out here rather than inside ``run``'s drain loop so it can be read and
+    tested without rumps: which engine events interrupt the user is a
+    product decision, and the loop that delivers them cannot be imported off
+    macOS. A dry-run switch is silent: nothing here can produce one today —
+    the menu bar builds its engine with ``dry_run=False`` and the TUI's
+    preview runs in another process — so the guard is there for the day
+    something does, on the principle that a notification about a switch
+    that never happened is worse than no notification. Every unlisted kind
+    (polls, sleeps, per-account refreshes) belongs in the log, not on
+    screen.
+    """
+    kind = event.kind
+    if kind == "switch":
+        if getattr(event, "dry_run", False):
+            return None
+        return ("Auto-switched account", event.human())
+    titles = {
+        "account-quarantined": "Account quarantined",
+        "session-reassigned": "Managed session moved",
+        "all-exhausted": "All accounts exhausted",
+        # e.g. an autoswitch.model name no account reports — the engine emits
+        # it once per run; dropping it would leave a menu-bar user with a
+        # silently inert filter.
+        "config-warning": "Configuration warning",
+    }
+    title = titles.get(kind)
+    return (title, event.human()) if title is not None else None
 
 
 def run(switcher) -> int:
@@ -618,20 +719,9 @@ def run(switcher) -> int:
                 self._refreshing = False
 
         def _log_usage(self, snap):
-            """Log each account's session/weekly limits when they change.
-
-            Runs on every refresh (background thread; the logger is thread-safe)
-            but de-dupes per account on the (5h, 7d) percentages so an idle
-            machine doesn't churn the rotating log with identical lines.
-            """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
-                key = _usage_log_key(last_good)
-                if key == (None, None) or self._last_usage_log.get(num) == key:
-                    continue
-                line = format_usage_log(email, last_good)
-                if line:
-                    self.switcher._logger.info(line)
-                    self._last_usage_log[num] = key
+            """Log each account's session/weekly limits when they change."""
+            for line in usage_log_lines(snap["accounts"], self._last_usage_log):
+                self.switcher._logger.info(line)
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
@@ -711,18 +801,11 @@ def run(switcher) -> int:
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             for ev in events:
+                note = notification_for(ev)
+                if note is not None:
+                    rumps.notification("claude-swap", *note)
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
                     self.refresh_async()  # reflect the switch promptly
-                elif ev.kind == "account-quarantined":
-                    rumps.notification("claude-swap", "Account quarantined", ev.human())
-                elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
-                elif ev.kind == "config-warning":
-                    # e.g. an autoswitch.model name no account reports — the
-                    # engine emits it once per run; dropping it would leave a
-                    # menu-bar user with a silently inert filter.
-                    rumps.notification("claude-swap", "Configuration warning", ev.human())
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""
@@ -760,14 +843,16 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            for row in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        row.num, row.email, row.display_usage, alias=row.alias,
+                        disabled=row.disabled, fetched_at=row.fetched_at,
+                        sessions=row.sessions,
                     ),
-                    callback=self._make_switch_to(num),
+                    callback=self._make_switch_to(row.num),
                 )
-                item.state = 1 if is_active else 0
+                item.state = 1 if row.is_active else 0
                 account_items.append(item)
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
@@ -802,9 +887,13 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
-                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
+            for row in accounts:
+                label = (
+                    f"{row.num}  {row.alias}  ({row.email})"
+                    if row.alias
+                    else f"{row.num}  {row.email}"
+                )
+                menu.add(rumps.MenuItem(label, callback=self._make_remove(row.num)))
             return menu
 
         def _disable_menu(self, rumps):
@@ -812,14 +901,15 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
+            for row in accounts:
+                name = f"{row.alias}  ({row.email})" if row.alias else row.email
                 item = rumps.MenuItem(
-                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
+                    f"{row.num}  {name}",
+                    callback=self._make_toggle_disabled(row.num, row.disabled),
                 )
                 # A check-mark reads as "held out of rotation" — same glyph the
                 # active row uses, but here it means disabled, not selected.
-                item.state = 1 if disabled else 0
+                item.state = 1 if row.disabled else 0
                 menu.add(item)
             return menu
 

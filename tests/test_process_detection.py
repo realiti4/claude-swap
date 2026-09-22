@@ -11,10 +11,10 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import process_detection
 from claude_swap.process_detection import (
     PID_REUSE_SLACK_S,
-    ClaudeSession,
-    IdeInstance,
+    _epoch_ms,
     _lstart_seconds,
     _stat_start_ticks,
     get_claude_dir,
@@ -26,6 +26,7 @@ from claude_swap.process_detection import (
     process_is_claude,
     process_start_ticks,
     process_started_at,
+    scan_sessions,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -364,7 +365,7 @@ class TestListSessions:
         _write_session(sessions_dir, 1001, procStart=LSTART)
         _write_session(sessions_dir, 1002, procStart=LSTART)
 
-        def started(pid):
+        def started(pid, **_kw):
             return LSTART_S if pid == 1002 else LSTART_S + 86400
 
         with patch("claude_swap.process_detection.is_pid_alive", return_value=True), \
@@ -648,3 +649,74 @@ class TestFormatAge:
     def test_days(self):
         ms = int((time.time() - 172800) * 1000)  # 2 days ago
         assert format_age(ms) == "2d ago"
+
+
+class TestSessionStatus:
+    def test_status_is_parsed(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 4242, status="idle")
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True):
+            sessions, unreadable = scan_sessions(tmp_path)
+        assert unreadable == 0
+        [session] = sessions
+        assert session.status == "idle"
+
+    def test_an_epoch_ms_field_survives_as_an_int(self):
+        assert _epoch_ms(1_758_000_000_000) == 1_758_000_000_000
+        assert _epoch_ms(1_758_000_000_000.9) == 1_758_000_000_000
+
+    @pytest.mark.parametrize(
+        "raw", ["123", True, False, -5, 0, None, float("inf"), float("nan")]
+    )
+    def test_a_malformed_epoch_ms_field_is_none(self, raw):
+        assert _epoch_ms(raw) is None
+
+
+class TestIdleSince:
+    """statusUpdatedAt on a scanned session record."""
+
+    def _record(self, tmp_path, pid, **extra):
+        sessions = tmp_path / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": pid,
+            "sessionId": "s1",
+            "cwd": "/work",
+            "startedAt": 1_758_000_000_000,
+            "kind": "interactive",
+            "entrypoint": "cli",
+            **extra,
+        }
+        (sessions / f"{pid}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_idle_record_reports_its_stamp(self, tmp_path):
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="idle", statusUpdatedAt=1_758_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, unreadable = process_detection.scan_sessions(tmp_path)
+        assert unreadable == 0
+        assert process_detection.idle_since_ms(sessions[0]) == 1_758_000_000_000
+
+    def test_busy_record_has_no_idle_since(self, tmp_path):
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="busy", statusUpdatedAt=1_758_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, _ = process_detection.scan_sessions(tmp_path)
+        assert process_detection.idle_since_ms(sessions[0]) is None
+
+    def test_out_of_range_stamp_is_dropped(self, tmp_path):
+        """A unit bug (nanoseconds where milliseconds belong) must not reach a
+        consumer as an instant datetime cannot hold."""
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="idle", statusUpdatedAt=1_758_000_000_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, _ = process_detection.scan_sessions(tmp_path)
+        assert sessions[0].status_updated_at is None
+        assert process_detection.idle_since_ms(sessions[0]) is None

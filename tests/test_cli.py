@@ -14,6 +14,7 @@ import pytest
 from claude_swap import __version__
 from claude_swap import cli
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.managed_sessions import AccountRef, ManagedSessionRegistry, create_managed_profile
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -850,6 +851,43 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestRunAutoFlag:
+    """`cswap run --auto`: dispatch to the managed-launch path, and its
+    mutual exclusivity with the plain `run` options."""
+
+    def _dispatch(self, argv):
+        calls = []
+
+        def fake_run_auto(switcher, claude_args):
+            calls.append(("auto", switcher, claude_args))
+
+        switcher = object()
+        with patch("claude_swap.managed_launch.run_auto", fake_run_auto), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls, switcher
+
+    def test_auto_dispatches_with_forwarded_args(self):
+        calls, switcher = self._dispatch(["run", "--auto", "--", "--resume"])
+        assert calls == [("auto", switcher, ["--resume"])]
+
+    @pytest.mark.parametrize("extra", [
+        ["2"], ["--no-share"], ["--require-session"], ["--no-share-history"],
+    ])
+    def test_auto_rejects_conflicting_options(self, extra, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--auto", *extra]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--auto cannot be combined" in capsys.readouterr().err
+
+    def test_auto_accepts_explicit_share_history(self):
+        calls, _ = self._dispatch(["run", "--auto", "--share-history"])
+        assert calls and calls[0][0] == "auto"
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 
@@ -1125,6 +1163,30 @@ class TestAutoCommand:
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+
+    def test_strategy_balance_accepted(self, temp_home):
+        assert self._run(["--once", "--strategy", "balance"], temp_home) == 2
+        assert self.FakeEngine.instances[-1].settings.strategy == "balance"
+
+    def test_strategy_balance_from_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "balance", "balanceLeadHours": 12},
+        }))
+        self._run(["--once"], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.strategy == "balance"
+        assert settings.balance_lead_hours == 12.0
+
+    def test_auto_help_lists_balance(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "balance" in capsys.readouterr().out
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
@@ -1741,6 +1803,269 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestSessionCommand:
+    """`cswap session ensure|release`: the hooks a managed session runs, one
+    per prompt and one when the session ends."""
+
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def test_ensure_dispatches_and_exits_zero(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0) as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        hook.assert_called_once()
+        out = capsys.readouterr()
+        assert out.out == ""
+
+    def test_the_hook_dispatch_never_probes_the_terminal(self):
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0),
+            patch("claude_swap.appearance.cli_should_probe") as probe,
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        probe.assert_not_called()
+
+    def test_the_hook_dispatch_skips_the_shared_cli_setup(self):
+        """The one path in this CLI that runs neither piece of the shared
+        setup. Skipping the output setup is the point (the hook verbs print
+        nothing, and this runs on every prompt of every managed session);
+        skipping the verifier is not, so the hook installs it itself past
+        its own gate — see
+        ``test_session_hooks.py::test_the_slow_path_installs_the_native_tls_verifier``.
+        """
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure"]),
+            patch("claude_swap.session_hooks.ensure", return_value=0),
+            patch("claude_swap.cli.force_utf8_output") as utf8,
+            patch("claude_swap.tls.use_native_tls") as tls,
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        utf8.assert_not_called()
+        tls.assert_not_called()
+
+    @pytest.mark.parametrize("verb", ["ensure", "release"])
+    def test_a_hook_that_cannot_even_be_imported_still_exits_zero(
+        self, monkeypatch, capsys, verb
+    ):
+        """The fail-open promise has to cover the import too. This dispatch
+        runs above main()'s own guard, and neither verb can swallow the
+        failure to load the module that defines it, so a half-installed
+        cswap would hand Claude its exit code: on `ensure`'s
+        UserPromptSubmit that blocks the turn the user just started, and on
+        `release`'s SessionEnd it reports a failure nobody asked about in a
+        session that has already ended. Both verbs, because a second one is
+        exactly the kind of thing that gets added beside the guard rather
+        than inside it."""
+        import claude_swap
+
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name == "claude_swap.session_hooks":
+                    raise ImportError("half-installed")
+                return None
+
+        monkeypatch.delattr(claude_swap, "session_hooks", raising=False)
+        monkeypatch.delitem(sys.modules, "claude_swap.session_hooks", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [Blocker(), *sys.meta_path])
+        with (
+            patch("sys.argv", ["cswap", "session", verb]),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_release_dispatches_and_exits_zero(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "release"]),
+            patch("claude_swap.session_hooks.release", return_value=0) as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        hook.assert_called_once()
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_an_unknown_verb_is_a_usage_error(self, capsys):
+        with (
+            patch("sys.argv", ["cswap", "session", "nope"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "cswap session" in err and "ensure" in err and "release" in err
+
+    def test_the_usage_error_points_at_the_command_they_probably_wanted(
+        self, capsys
+    ):
+        """`cswap session` is one character from `cswap sessions`, is hidden,
+        and appears in no help output, so whoever reads this message almost
+        certainly meant the other command. Saying only "usage: session
+        {ensure|release}" answers them with two verbs they must not run and
+        a command they have never heard of."""
+        with (
+            patch("sys.argv", ["cswap", "session"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit),
+        ):
+            cli.main()
+        err = capsys.readouterr().err
+        assert "cswap sessions" in err
+        assert "cswap run --auto" in err and "hook" in err
+
+    @pytest.mark.parametrize("extra", ["--json", "-x", "release"])
+    def test_a_verb_with_arguments_of_its_own_is_a_usage_error(
+        self, capsys, extra
+    ):
+        """The verbs take nothing. Running the hook anyway and dropping the
+        rest would make a typo in a flag somebody adds later invisible: the
+        hook does its work, the flag does nothing, and the exit code says
+        everything went fine."""
+        with (
+            patch("sys.argv", ["cswap", "session", "ensure", extra]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            patch("claude_swap.session_hooks.ensure") as hook,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        hook.assert_not_called()
+        assert "cswap session" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [["nope"], [], ["ensure", "--json"]])
+    def test_a_misuse_nobody_is_watching_exits_zero_and_says_nothing(
+        self, capsys, argv
+    ):
+        """Exit 2 is the one code Claude Code reads as a blocking hook
+        decision, and every other path here exits 0 by construction. This
+        branch is reachable without a person: a stale or hand-edited
+        `--settings` document naming a verb this build no longer has would
+        otherwise block every prompt of that session. So the usage error is
+        for a terminal, and anything else gets the silence a hook expects."""
+        with (
+            patch("sys.argv", ["cswap", "session", *argv]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=False),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+    def test_a_stdout_that_cannot_say_whether_it_is_a_terminal_is_not_one(self):
+        """`isatty` raises on a detached or closed stdout, and this decides
+        an exit code on the path whose whole promise is that it does not
+        fail. Anything but a clear yes is the side that exits 0."""
+        class Detached:
+            def isatty(self):
+                raise ValueError("I/O operation on closed file")
+
+        with patch("sys.stdout", Detached()):
+            assert cli._stdout_is_a_terminal() is False
+        with patch("sys.stdout", None):
+            assert cli._stdout_is_a_terminal() is False
+
+    def test_the_usage_error_says_nothing_it_cannot_encode(self, capsys):
+        """This branch runs above the output setup, so the console may still
+        be on an encoding that cannot render whatever `argv[0]` holds — a
+        path with an accent in it, a shim someone named in Cyrillic. Spelling
+        the program name out of `argv[0]` here would turn a usage error into
+        a traceback on exactly the consoles least able to show one, so the
+        message is a literal and stays ASCII whatever it was invoked as."""
+        with (
+            patch("sys.argv", ["/Users/josé/bin/cswäp", "session", "nope"]),
+            patch("claude_swap.cli._stdout_is_a_terminal", return_value=True),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cli.main()
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert err.strip() != ""
+        assert err.isascii()
+
+
+class TestSessionsCommand:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _run(self, managed_switcher, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=managed_switcher), \
+             patch.object(sys, "argv", ["claude-swap", "sessions", *argv]):
+            cli.main()
+
+    def test_json_lists_live_sessions(self, managed_switcher, capsys):
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        d = registry.session_dir("auto-0000beef")
+        create_managed_profile(d)
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "cwd": "/work/app", "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000,
+        }))
+        self._run(managed_switcher, ["--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schemaVersion"] == 1
+        [row] = payload["sessions"]
+        assert (row["id"], row["pid"]) == ("auto-0000beef", os.getpid())
+        assert row["account"] == {"number": 2, "email": "b@example.com"}
+        assert (row["status"], row["cwd"], row["idleSince"]) == ("idle", "/work/app", "2025-09-16T05:20:00Z")
+
+    def test_human_output_when_empty(self, managed_switcher, capsys):
+        self._run(managed_switcher, [])
+        assert "No managed sessions running" in capsys.readouterr().out
+
+    def test_human_output_lists_a_session(self, managed_switcher, capsys):
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        create_managed_profile(registry.session_dir("auto-0000beef"))
+        self._run(managed_switcher, [])
+        out = capsys.readouterr().out
+        assert "auto-0000beef" in out and "Account-2" in out and "starting" in out
+
+    def test_out_of_range_status_updated_at_does_not_raise(self, managed_switcher, capsys):
+        """A record with a nanosecond-scale statusUpdatedAt (Claude's own
+        unit bug, not cswap's) must not traceback the command -- the
+        session is still listed, just without an idle time."""
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        d = registry.session_dir("auto-0000beef")
+        create_managed_profile(d)
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "cwd": "/work/app", "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000_000_000,
+        }))
+        self._run(managed_switcher, ["--json"])
+        payload = json.loads(capsys.readouterr().out)
+        [row] = payload["sessions"]
+        assert row["id"] == "auto-0000beef"
+        assert row["idleSince"] is None
 
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
