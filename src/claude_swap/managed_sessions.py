@@ -45,11 +45,11 @@ from pathlib import Path
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.process_detection import (
-    _epoch_ms,
     is_pid_alive,
     pid_matches_record,
     process_start_ticks,
     process_started_at,
+    status_stamp_ms,
 )
 from claude_swap.session import (
     _mkdir_private,
@@ -327,14 +327,50 @@ def _read_session_record(session_dir: Path, pid: int) -> dict | None:
     return raw
 
 
+@dataclass(frozen=True)
+class SessionState:
+    """What Claude's own record says about one managed session.
+
+    ``has_record`` and ``status`` are deliberately separate: a record whose
+    ``status`` is not a string still proves Claude registered, which is what
+    ``entry_is_busy`` distinguishes from "no record yet", and what
+    ``describe_sessions`` renders as "unknown" rather than "starting".
+    """
+
+    has_record: bool
+    status: str | None
+    idle_since_ms: int | None
+    cwd: str
+
+
+def read_session_state(session_dir: Path, pid: int) -> SessionState:
+    """Claude's status, idle-since and cwd for ``pid``, in one record read.
+
+    The single reader for every consumer of a managed session's live state:
+    the busy count, ``cswap sessions``, the engine's reassignment pass and
+    the prompt hook all go through here, so none of them can grow its own
+    idea of what "idle" means.
+    """
+    raw = _read_session_record(session_dir, pid)
+    if raw is None:
+        return SessionState(False, None, None, "")
+    status = raw.get("status")
+    status = status if isinstance(status, str) else None
+    cwd = raw.get("cwd")
+    return SessionState(
+        has_record=True,
+        status=status,
+        idle_since_ms=(
+            status_stamp_ms(raw.get("statusUpdatedAt")) if status == "idle" else None
+        ),
+        cwd=cwd if isinstance(cwd, str) else "",
+    )
+
+
 def session_status(session_dir: Path, pid: int) -> str | None:
     """Claude's status for the instance ``pid`` inside a managed profile, or
     None when it has not written a record yet or the record is unusable."""
-    raw = _read_session_record(session_dir, pid)
-    if raw is None:
-        return None
-    status = raw.get("status")
-    return status if isinstance(status, str) else None
+    return read_session_state(session_dir, pid).status
 
 
 def entry_is_busy(session_dir: Path, entry: ManagedEntry) -> bool:
@@ -847,13 +883,6 @@ class ManagedSessionRegistry:
         return removed
 
 
-# 10000-01-01T00:00:00Z in epoch ms — one millisecond-grid step past
-# datetime.max (9999-12-31T23:59:59.999999Z), so it is an exclusive
-# ceiling: describe_sessions below bounds a record's statusUpdatedAt with
-# `<`, never `<=`.
-_MAX_EPOCH_MS = 253_402_300_800_000
-
-
 @dataclass(frozen=True)
 class ManagedSessionView:
     """One row of ``cswap sessions``: a live managed entry joined with
@@ -886,29 +915,15 @@ def describe_sessions(
 
     views: list[ManagedSessionView] = []
     for entry in sorted(registry.live_entries(), key=lambda e: e.created_at):
-        raw = _read_session_record(registry.session_dir(entry.session_id), entry.pid)
+        state = read_session_state(registry.session_dir(entry.session_id), entry.pid)
         number = ClaudeAccountSwitcher._find_account_slot(
             sequence_data, entry.account.email, entry.account.organization_uuid
         )
-        if raw is None:
-            status, cwd, idle_since_ms = "starting", "", None
-        else:
-            status_raw = raw.get("status")
-            status = status_raw if isinstance(status_raw, str) else "unknown"
-            cwd_raw = raw.get("cwd")
-            cwd = cwd_raw if isinstance(cwd_raw, str) else ""
-            idle_since_ms = None
-            if status == "idle":
-                candidate = _epoch_ms(raw.get("statusUpdatedAt"))
-                # _epoch_ms only rejects non-numeric/NaN/<=0 — a unit bug
-                # elsewhere (e.g. nanoseconds instead of milliseconds) can
-                # still hand back a number datetime.fromtimestamp cannot
-                # hold, so bound it here, where the value is produced,
-                # rather than let it reach every consumer downstream.
-                if candidate is not None and candidate < _MAX_EPOCH_MS:
-                    idle_since_ms = candidate
         views.append(ManagedSessionView(
-            entry=entry, number=number, status=status, cwd=cwd,
-            idle_since_ms=idle_since_ms,
+            entry=entry,
+            number=number,
+            status="starting" if not state.has_record else (state.status or "unknown"),
+            cwd=state.cwd,
+            idle_since_ms=state.idle_since_ms,
         ))
     return views

@@ -865,3 +865,41 @@ class TestDescribeSessions:
 
         assert view.status == "idle"
         assert view.idle_since_ms is None
+
+
+class TestReadSessionState:
+    def _write_record(self, session_dir, pid, payload):
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / f"{pid}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def test_no_record_yet(self, tmp_path):
+        state = ms.read_session_state(tmp_path, 4242)
+        assert (state.has_record, state.status, state.idle_since_ms, state.cwd) == (
+            False, None, None, "",
+        )
+
+    def test_idle_record(self, tmp_path):
+        self._write_record(tmp_path, 4242, {
+            "pid": 4242, "status": "idle", "cwd": "/work",
+            "statusUpdatedAt": 1_758_000_000_000,
+        })
+        state = ms.read_session_state(tmp_path, 4242)
+        assert (state.has_record, state.status, state.idle_since_ms, state.cwd) == (
+            True, "idle", 1_758_000_000_000, "/work",
+        )
+
+    def test_busy_record_has_no_idle_since(self, tmp_path):
+        self._write_record(tmp_path, 4242, {
+            "pid": 4242, "status": "busy", "statusUpdatedAt": 1_758_000_000_000,
+        })
+        state = ms.read_session_state(tmp_path, 4242)
+        assert (state.status, state.idle_since_ms) == ("busy", None)
+
+    def test_unusable_status_keeps_the_record_flag(self, tmp_path):
+        """A record with a non-string status still proves Claude registered:
+        entry_is_busy must keep counting it, exactly as before."""
+        self._write_record(tmp_path, 4242, {"pid": 4242, "status": 7})
+        state = ms.read_session_state(tmp_path, 4242)
+        assert (state.has_record, state.status) == (True, None)

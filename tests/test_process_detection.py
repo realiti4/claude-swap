@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import process_detection
 from claude_swap.process_detection import (
     PID_REUSE_SLACK_S,
     _epoch_ms,
@@ -670,3 +671,52 @@ class TestSessionStatus:
     )
     def test_a_malformed_epoch_ms_field_is_none(self, raw):
         assert _epoch_ms(raw) is None
+
+
+class TestIdleSince:
+    """statusUpdatedAt on a scanned session record."""
+
+    def _record(self, tmp_path, pid, **extra):
+        sessions = tmp_path / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": pid,
+            "sessionId": "s1",
+            "cwd": "/work",
+            "startedAt": 1_758_000_000_000,
+            "kind": "interactive",
+            "entrypoint": "cli",
+            **extra,
+        }
+        (sessions / f"{pid}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_idle_record_reports_its_stamp(self, tmp_path):
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="idle", statusUpdatedAt=1_758_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, unreadable = process_detection.scan_sessions(tmp_path)
+        assert unreadable == 0
+        assert process_detection.idle_since_ms(sessions[0]) == 1_758_000_000_000
+
+    def test_busy_record_has_no_idle_since(self, tmp_path):
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="busy", statusUpdatedAt=1_758_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, _ = process_detection.scan_sessions(tmp_path)
+        assert process_detection.idle_since_ms(sessions[0]) is None
+
+    def test_out_of_range_stamp_is_dropped(self, tmp_path):
+        """A unit bug (nanoseconds where milliseconds belong) must not reach a
+        consumer as an instant datetime cannot hold."""
+        pid = os.getpid()
+        self._record(
+            tmp_path, pid, status="idle", statusUpdatedAt=1_758_000_000_000_000_000
+        )
+        with patch("claude_swap.process_detection.pid_matches_record", return_value=True):
+            sessions, _ = process_detection.scan_sessions(tmp_path)
+        assert sessions[0].status_updated_at is None
+        assert process_detection.idle_since_ms(sessions[0]) is None

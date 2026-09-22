@@ -45,6 +45,9 @@ class ClaudeSession:
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
     status: str | None = None  # "busy", "idle", "waiting"
+    # Epoch ms of the last status change. With status == "idle" this is
+    # Claude's own idle-since; see idle_since_ms below.
+    status_updated_at: int | None = None
 
 
 def _epoch_ms(value: object) -> int | None:
@@ -59,6 +62,32 @@ def _epoch_ms(value: object) -> int | None:
     if not math.isfinite(value):
         return None
     return int(value) if value > 0 else None
+
+
+# 10000-01-01T00:00:00Z in epoch ms — one millisecond-grid step past
+# datetime.max (9999-12-31T23:59:59.999999Z), so it is an EXCLUSIVE ceiling.
+MAX_EPOCH_MS = 253_402_300_800_000
+
+
+def status_stamp_ms(value: object) -> int | None:
+    """A session record's ``statusUpdatedAt`` as epoch ms, or None.
+
+    ``_epoch_ms`` only rejects non-numeric/NaN/<=0 values, so a unit bug
+    elsewhere (nanoseconds where milliseconds belong) can still hand back a
+    number ``datetime.fromtimestamp`` cannot hold. Bound it here, where the
+    value enters the program, rather than at each consumer.
+    """
+    ms = _epoch_ms(value)
+    return ms if ms is not None and ms < MAX_EPOCH_MS else None
+
+
+def idle_since_ms(session: ClaudeSession) -> int | None:
+    """When ``session`` went idle, in epoch ms, or None when it is not idle
+    (or carried no usable stamp). Claude restamps the record on every status
+    change, so with status "idle" the stamp IS the idle-since."""
+    if session.status != "idle":
+        return None
+    return session.status_updated_at
 
 
 @dataclass
@@ -287,6 +316,7 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                status_updated_at=status_stamp_ms(data.get("statusUpdatedAt")),
             ))
         except (
             json.JSONDecodeError,   # malformed JSON
