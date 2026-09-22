@@ -98,7 +98,7 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
 
 
 def _run_command(argv: list[str]) -> None:
-    """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
+    """Handle `cswap run NUM|EMAIL|--auto [--no-share] [-- <claude args>]`.
 
     Pre-dispatched before the main parser is built: a positional subcommand
     can't coexist with main()'s mutually-exclusive flag group, and this keeps
@@ -133,6 +133,8 @@ Examples:
   cswap run 2 --share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
+  cswap run --auto
+  cswap run --auto -- --resume
         """,
     )
     parser.add_argument(
@@ -154,7 +156,7 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
@@ -173,15 +175,47 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Pick the account automatically (balance policy) and launch a "
+            "managed session: cswap keeps its token fresh centrally and "
+            "history is always shared with ~/.claude. Not supported on Windows."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
 
+    if args.auto:
+        conflicts = [
+            name
+            for name, present in (
+                ("NUM|EMAIL", args.account is not None),
+                ("--no-share", args.no_share),
+                ("--require-session", args.require_session),
+                ("--no-share-history", args.share_history is False),
+            )
+            if present
+        ]
+        if conflicts:
+            parser.error(
+                f"--auto cannot be combined with {', '.join(conflicts)}; "
+                "use `cswap run NUM` instead"
+            )
+
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
+
+        if args.auto:
+            from claude_swap.managed_launch import run_auto
+
+            run_auto(switcher, tail)
+            return  # only reachable in tests where exec is mocked
 
         from claude_swap.session import SessionManager
 
@@ -192,7 +226,7 @@ Examples:
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=bool(args.share_history),
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -204,7 +238,7 @@ Examples:
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=bool(args.share_history),
                 require_session=args.require_session,
             )
             return  # only reachable in tests

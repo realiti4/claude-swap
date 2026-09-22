@@ -850,6 +850,43 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestRunAutoFlag:
+    """`cswap run --auto`: dispatch to the managed-launch path, and its
+    mutual exclusivity with the plain `run` options."""
+
+    def _dispatch(self, argv):
+        calls = []
+
+        def fake_run_auto(switcher, claude_args):
+            calls.append(("auto", switcher, claude_args))
+
+        switcher = object()
+        with patch("claude_swap.managed_launch.run_auto", fake_run_auto), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls, switcher
+
+    def test_auto_dispatches_with_forwarded_args(self):
+        calls, switcher = self._dispatch(["run", "--auto", "--", "--resume"])
+        assert calls == [("auto", switcher, ["--resume"])]
+
+    @pytest.mark.parametrize("extra", [
+        ["2"], ["--no-share"], ["--require-session"], ["--no-share-history"],
+    ])
+    def test_auto_rejects_conflicting_options(self, extra, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--auto", *extra]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--auto cannot be combined" in capsys.readouterr().err
+
+    def test_auto_accepts_explicit_share_history(self):
+        calls, _ = self._dispatch(["run", "--auto", "--share-history"])
+        assert calls and calls[0][0] == "auto"
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 
