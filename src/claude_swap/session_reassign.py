@@ -107,10 +107,13 @@ def idle_seconds(state: SessionState, now_ms: float) -> float | None:
 def meets_idle_floor(idle_s: float | None, idle_minutes: float) -> bool:
     """Whether an elapsed-idle reading clears the ``idle_minutes`` floor.
 
-    Takes the reading rather than the record it was taken from, so anything
-    carrying an idle-since stamp can be judged by it — here,
-    :func:`idle_seconds` on a managed session's ``SessionState``. ``None``
-    — not idle, or no usable stamp — never clears any floor.
+    The one comparison both idle rules make once each has its own "how long
+    has this been idle" reading: :func:`decide_reassignment` below, from
+    :func:`idle_seconds` on a managed session's ``SessionState``, and lane
+    0's ``autoswitch.lane0_all_idle``, from
+    ``process_detection.idle_since_ms`` on the default login's own session
+    records — a different record shape carrying the same idle-since stamp.
+    ``None`` — not idle, or no usable stamp — never clears any floor.
     """
     return idle_s is not None and idle_s >= idle_minutes * 60.0
 
@@ -121,8 +124,11 @@ def meets_score_margin(
     """Whether ``candidate_score`` beats ``current_score`` by at least
     ``margin`` points.
 
-    The score gap an otherwise-idle session has to see before it is worth
-    moving off an account that is not at its limit.
+    The score-gap rule both idle rules apply before an otherwise-idle
+    session, or an otherwise-idle default login, is worth moving off an
+    account that is not at its limit: :func:`decide_reassignment` below for
+    a managed session, and ``autoswitch._lane0_idle_move_allowed`` for lane
+    0.
     """
     return candidate_score - current_score >= margin
 

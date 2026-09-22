@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import balance, oauth, poll_policy
+from claude_swap import balance, oauth, paths, poll_policy, process_detection
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -156,6 +156,64 @@ _SESSION_REFRESH_REMEDIES: dict[str, str] = {
                          "account — re-add the account",
     "transient": "store or network trouble — cswap retries every tick",
 }
+
+
+# A lane-0 move asked for by the idle rule rather than by the threshold:
+# every live Claude on the default login has been idle past the prompt-cache
+# lifetime, and some account is meaningfully further behind its weekly
+# schedule. Handled exactly like a proactive move everywhere except the
+# admission margin — see _rank_candidates.
+TRIGGER_IDLE_BALANCE = "idle-balance"
+
+# Triggers that are a CHOICE rather than an escape: they take the cooldown,
+# the landing gate, the no-return bar and the all-above recovery ranking.
+# at-limit and failover skip all four deliberately.
+PROACTIVE_TRIGGERS = ("proactive", "consume-first", TRIGGER_IDLE_BALANCE)
+
+
+def lane0_all_idle(idle_minutes: float, now: float) -> bool:
+    """Whether every live Claude on the DEFAULT login has been idle at
+    least ``idle_minutes``. True when there are none: with nothing running
+    there, there is no conversation for a move to disturb — and the other
+    three triggers (``proactive``, ``at-limit``, ``failover``) already
+    repoint lane 0's credentials at any instant with no session check at
+    all, so this, the strictly more conservative trigger, has no case for
+    holding out where they would not.
+
+    False when any record could not be read — "cannot tell" must never
+    read as "nobody is working", the same rule
+    ``pid_matches_record``/``scan_sessions`` already follow one level down
+    — but that is the only thing that blocks it: ``scan_sessions`` drops a
+    record the instant its pid dies, so an empty directory is the ordinary,
+    frequent state of "nobody has a live Claude open right now" rather than
+    a signal to distrust.
+
+    Deliberately ``get_default_claude_config_home`` and not
+    ``process_detection.get_claude_dir``: the engine's own process may have
+    ``CLAUDE_CONFIG_DIR`` set (a menu-bar host started from a session), and
+    this is a question about the default login specifically.
+
+    The idle-floor comparison itself is not re-derived here — each session's
+    reading is handed to ``session_reassign.meets_idle_floor``, the same
+    rule a managed session's own idle move applies.
+    """
+    # Imported here, not at module scope: session_reassign reaches
+    # managed_launch, which reads this module's freshen buffer and
+    # quarantine view, so a top-level import would close the cycle.
+    from claude_swap import session_reassign
+
+    sessions, unreadable = process_detection.scan_sessions(
+        paths.get_default_claude_config_home()
+    )
+    if unreadable:
+        return False
+    now_ms = now * 1000.0
+    for claude_session in sessions:
+        since_ms = process_detection.idle_since_ms(claude_session)
+        idle_s = None if since_ms is None else (now_ms - since_ms) / 1000.0
+        if not session_reassign.meets_idle_floor(idle_s, idle_minutes):
+            return False
+    return True
 
 
 # Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
@@ -431,7 +489,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive"|"at-limit"|"failover"|"consume-first"|"idle-balance"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1586,13 +1644,22 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        # One reading for this whole decision: _lane0_idle_move_allowed's
+        # idle/margin check below and the ranking's own `decided_now`
+        # (candidate selection, further down) must agree on "now" rather
+        # than each taking an independent clock read moments apart.
+        now = self.clock()
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy == "balance" and self._lane0_idle_move_allowed(
+                    current, usage, quarantined, now=now
+                ):
+                    trigger = TRIGGER_IDLE_BALANCE
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1605,11 +1672,13 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets
+                    # soonest, to burn the most-perishable quota first.
+                    # Candidate selection decides whether a sooner-resetting
+                    # account with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1660,7 +1729,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in PROACTIVE_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1787,7 +1856,7 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
-        decided_now = self.clock()
+        decided_now = now
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
@@ -1831,10 +1900,17 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in ("consume-first", TRIGGER_IDLE_BALANCE)
+        ):
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # (unmeasurable headroom). Never for a below-threshold
+            # consume-first or idle-balance nudge — both are optimisations
+            # on a healthy account, not an escape, and neither has any
+            # business landing a login on a billed, unmetered account just
+            # because the oauth ranking came back empty.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1875,6 +1951,22 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == TRIGGER_IDLE_BALANCE:
+                # Same no-harm exit as consume-first just above: a healthy,
+                # below-threshold account that nothing beats right now is a
+                # correct outcome, never a block. Unlike at-limit/failover,
+                # which are escapes with nowhere else to go, this trigger is
+                # an optimisation that simply declined to fire this tick.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        detail=(
+                            f"{pct_label(utilization)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -2101,7 +2193,7 @@ class AutoSwitchEngine:
         left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if trigger not in PROACTIVE_TRIGGERS or came_from is None:
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2493,7 +2585,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in PROACTIVE_TRIGGERS:
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -2557,13 +2649,16 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif active_headroom is not None and trigger != TRIGGER_IDLE_BALANCE:
                     # best and balance: the candidate must beat the active
                     # account by the full hysteresis margin (a one-way move
                     # like 99%→89% qualifies; near-line pairs can't flap back).
+                    # The idle trigger arrives having already cleared a
+                    # margin of its own, on the axis it ranks by — see
+                    # _lane0_idle_move_allowed.
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and trigger in PROACTIVE_TRIGGERS:
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -2603,7 +2698,7 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         if is_balance and qualifying and not (
-            all_above and trigger in ("proactive", "consume-first")
+            all_above and trigger in PROACTIVE_TRIGGERS
         ):
             # Rank the SURVIVORS of the gates above, not the raw candidate
             # list. When none of the landable accounts is eligible under
@@ -2814,7 +2909,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in PROACTIVE_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2868,6 +2963,67 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _lane0_idle_move_allowed(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        quarantined: set[str],
+        *,
+        now: float,
+    ) -> bool:
+        """The idle rule for lane 0: nothing is working on the default
+        login, and the best eligible account beats the active one by the
+        balance margin.
+
+        The margin is the anti-flap here. A lane 0 that has been wholly idle
+        past the cache lifetime has no conversation whose cache a move
+        would cost, so the headroom hysteresis — which asks a different
+        question, "does the target have more room right now" — is not the
+        guard this move needs; the score gap, the cooldown and the landing
+        gate are (see ``_rank_candidates``).
+        """
+        # Imported here, not at module scope: session_reassign reaches
+        # managed_launch, which reads this module's freshen buffer and
+        # quarantine view, so a top-level import would close the cycle.
+        from claude_swap import session_reassign
+
+        if not lane0_all_idle(self._sessions.idle_reassign_minutes, now):
+            return False
+        pool = {
+            num: (usage.get(num) if isinstance(usage.get(num), dict) else None)
+            for num in self.switcher.switchable_account_numbers()
+            if num not in quarantined
+            and self.switcher.account_kind_for(num) != "api_key"
+        }
+        if current not in pool:
+            # Short-circuit, not a correctness gate: a current excluded here
+            # (quarantined or api_key) is also absent from `pool`, so
+            # `pool.get(current)` below is None regardless, and
+            # `balance.score_account` already turns that into an unknown
+            # score — `active.score is None` refuses it a few lines down
+            # either way. This just skips the ranking call for a current
+            # that could never pass it.
+            return False
+        params = balance.params_from_settings(self.settings)
+        ranked = balance.rank_accounts(
+            pool, now=now, models=self._models,
+            busy_sessions=self._managed_busy, params=params,
+        )
+        best = next(
+            (s for s in ranked if s.eligible and s.account != current), None
+        )
+        if best is None or best.score is None:
+            return False
+        active = balance.score_account(
+            current, pool.get(current), now=now, models=self._models,
+            busy_sessions=self._managed_busy.get(current, 0), params=params,
+        )
+        if active.score is None:
+            return False
+        return session_reassign.meets_score_margin(
+            active.score, best.score, self._sessions.reassign_margin
+        )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]

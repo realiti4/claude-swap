@@ -7061,6 +7061,10 @@ class TestBalanceStrategy:
     Triggers are `best`'s — nothing moves below the threshold — and only the
     target ORDER changes: the candidate furthest behind its weekly schedule
     (balance.rank_accounts) wins over the one with merely the most headroom.
+    The one carve-out (lane 0 wholly idle) is TestLaneZeroIdleSwitch's own
+    territory, so every fixture below that stays below the threshold pins
+    ``lane0_all_idle`` to ``False`` explicitly rather than relying on the
+    default (idle) read an empty sessions directory gives it.
     """
 
     def _harness(self, temp_home: Path, strategy: str = "balance") -> EngineHarness:
@@ -7100,11 +7104,17 @@ class TestBalanceStrategy:
     def test_never_moves_below_threshold(self, temp_home):
         h = self._harness(temp_home)
         now = h.clock.now
-        outcome = h.tick_with_usage({
-            "1": _usage7(20, 5, _iso_at(now + 6 * DAY)),   # active well below the threshold
-            "2": _usage7(0, 10, _iso_at(now + DAY / 2)),   # far behind
-            "3": _usage7(0, 0, _iso_at(now + DAY)),
-        })
+        # Lane 0 is not idle here — that carve-out is TestLaneZeroIdleSwitch's
+        # territory. Pinned explicitly rather than relying on the empty
+        # sessions directory's own (idle) default, so this test keeps
+        # meaning "balance's own ranking never moves below the threshold"
+        # regardless of what that default is.
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=False):
+            outcome = h.tick_with_usage({
+                "1": _usage7(20, 5, _iso_at(now + 6 * DAY)),   # active well below the threshold
+                "2": _usage7(0, 10, _iso_at(now + DAY / 2)),   # far behind
+                "3": _usage7(0, 0, _iso_at(now + DAY)),
+            })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -8607,3 +8617,456 @@ class TestManagedSessionReassignment:
         }
         assert "auto-aaaaaaaa" in event.human()
         assert "c@example.com" in event.human()
+
+
+class TestLaneZeroAllIdle:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _record(self, temp_home, pid, status, *, status_updated_at=None):
+        sessions = temp_home / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        payload = {"pid": pid, "status": status, "cwd": "/work"}
+        if status_updated_at is not None:
+            payload["statusUpdatedAt"] = status_updated_at
+        (sessions / f"{pid}.json").write_text(json.dumps(payload))
+
+    @pytest.fixture(autouse=True)
+    def _own_pid_is_live(self, monkeypatch):
+        monkeypatch.setattr(
+            "claude_swap.process_detection.pid_matches_record",
+            lambda pid, stamp, **_kw: True,
+        )
+
+    def _use_temp_home(self, temp_home, monkeypatch):
+        monkeypatch.setattr(
+            "claude_swap.paths.get_default_claude_config_home",
+            lambda: temp_home / ".claude",
+        )
+
+    def test_no_sessions_counts_as_idle(self, temp_home, monkeypatch):
+        # scan_sessions drops a record the instant its pid dies, so an
+        # empty directory is the ordinary state of "nobody has a live
+        # Claude open right now" -- and the other three triggers already
+        # repoint lane 0's credentials with no session check at all, so
+        # this, the strictly more conservative trigger, has no case for
+        # holding out where they would not.
+        self._use_temp_home(temp_home, monkeypatch)
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is True
+
+    def test_a_busy_session_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        self._record(temp_home, os.getpid(), "busy")
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is False
+
+    def test_a_freshly_idle_session_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 600) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+    def test_a_long_idle_session_passes(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is True
+
+    def test_an_unreadable_record_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        sessions = temp_home / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / "77.json").write_text("{ not json")
+        assert autoswitch_mod.lane0_all_idle(60.0, 1_000_000.0) is False
+
+    def test_an_unreadable_record_blocks_beside_a_long_idle_one(
+        self, temp_home, monkeypatch
+    ):
+        # Distinguishes "some record is unreadable" from "no live sessions
+        # at all": one session here genuinely clears the floor, so only the
+        # unreadable-count check can be what blocks this.
+        self._use_temp_home(temp_home, monkeypatch)
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        sessions = temp_home / ".claude" / "sessions"
+        (sessions / "77.json").write_text("{ not json")
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+    def test_all_idle_across_several_live_sessions_passes(
+        self, temp_home, monkeypatch
+    ):
+        # ~/.claude/sessions/ can hold more than one live record at once;
+        # every one of them has to clear the floor, not just the first one
+        # found.
+        self._use_temp_home(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.is_pid_alive", lambda pid: True
+        )
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        self._record(
+            temp_home, os.getpid() + 1, "idle",
+            status_updated_at=(now - 9000) * 1000,
+        )
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is True
+
+    def test_one_busy_session_among_several_blocks(self, temp_home, monkeypatch):
+        self._use_temp_home(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.is_pid_alive", lambda pid: True
+        )
+        now = 1_000_000.0
+        self._record(
+            temp_home, os.getpid(), "idle",
+            status_updated_at=(now - 7200) * 1000,
+        )
+        self._record(temp_home, os.getpid() + 1, "busy")
+        assert autoswitch_mod.lane0_all_idle(60.0, now) is False
+
+
+class TestLaneZeroIdleSwitch:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _harness(self, temp_home, **settings_kwargs):
+        kwargs = {"strategy": "balance", "hysteresis_pct": 10.0, **settings_kwargs}
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _weekly(self, pct, resets_in_s, now):
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": pct, "resets_at": _iso_at(now + resets_in_s)},
+        }
+
+    def test_an_all_idle_lane_zero_moves_on_the_balance_margin(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 2
+
+    def test_a_working_lane_zero_stays(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=False):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 1
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+
+    def test_the_rule_is_balance_only(self, temp_home):
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert h.active_number() == 1
+
+    def test_the_rule_never_fires_under_consume_first(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                # Same reset time on both sides, so consume-first's own
+                # soonest-reset ordering finds nothing to move to either --
+                # any move here can only be the idle rule firing where it
+                # must not.
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert h.active_number() == 1
+
+    def test_too_small_a_score_gap_stays(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(40.0, 3 * DAY, now),
+                "2": self._weekly(35.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_at_limit_precedence_holds(self, temp_home):
+        # Active is at its own hard limit -- that always wins "at-limit",
+        # never the idle rule, however clear the idle read and however far
+        # ahead a peer scores. The two live in disjoint branches (below vs
+        # at/over threshold) so this is a structural invariant, pinned here
+        # against a regression that merges the branches.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(100.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_cooldown_still_blocks_an_idle_move(self, temp_home):
+        # _tick_inner's cooldown check runs BEFORE candidate selection and
+        # freshening; _perform's own recheck runs AFTER _freshen_target. The
+        # two emit the identical NoSwitchEvent(reason="cooldown") /
+        # NO_ACTION, so that assertion alone cannot tell them apart -- a
+        # spy on _freshen_target pins the FIRST site specifically: it must
+        # never even be reached.
+        h = self._harness(temp_home)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        now = h.clock.now
+        with (
+            patch("claude_swap.autoswitch.lane0_all_idle", return_value=True),
+            patch.object(h.engine, "_freshen_target") as freshen_spy,
+        ):
+            h.tick_with_usage({
+                "1": self._weekly(70.0, 3 * DAY, now),
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert freshen_spy.call_count == 0
+        assert h.active_number() == 1
+        assert "cooldown" in [getattr(e, "reason", "") for e in h.events]
+
+    def test_the_no_return_bar_still_holds(self, temp_home):
+        # Equal headroom on 1 and 2 (50 vs 50) keeps _no_return_account's own
+        # dominance release from firing (50 is not >= 50 * HORIZON_HEADROOM_
+        # RATIO), and a third, worse-but-available account keeps the ranking
+        # non-empty so the separate "recovered and nothing left" release
+        # (_left_account_recovered) cannot fire either -- isolating the bar
+        # itself as the only thing standing between the idle rule and 2.
+        h = self._harness(temp_home)
+        h.seed(3, "c@example.com")
+        # As if we just switched 2 -> 1 by hand: account 2 is barred from an
+        # immediate return even though it would otherwise be the idle rule's
+        # first choice (same headroom as 1, but far less used against its
+        # own schedule).
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchFrom="2", lastSwitchTo="1")
+        )
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(50.0, 6 * DAY, now),
+                "2": self._weekly(50.0, 1 * DAY, now),
+                "3": self._weekly(25.0, 3 * DAY, now),
+            })
+        assert h.active_number() == 3
+
+    def test_the_headroom_hysteresis_is_exempted_for_the_score_margin(
+        self, temp_home
+    ):
+        # Identical headroom on both sides -- a 0-point gap the ordinary
+        # hysteresis_pct=10 landing gate would never clear -- but very
+        # different schedule positions (one resets in a day, the other in
+        # six): the idle rule ranks on that gap instead, guarded by its own
+        # margin rather than the headroom one.
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            h.tick_with_usage({
+                "1": self._weekly(50.0, 6 * DAY, now),
+                "2": self._weekly(50.0, 1 * DAY, now),
+            })
+        assert h.active_number() == 2
+
+    def test_no_eligible_candidate_leaves_lane_zero_alone(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": self._weekly(50.0, 3 * DAY, now),
+                "2": self._weekly(100.0, 3 * DAY, now),  # at its own limit
+            })
+        # Not just "stayed on 1" -- a crash on the way (e.g. ranking a
+        # missing candidate) would also leave 1 active, via ErrorEvent
+        # rather than a clean refusal. Pin the refusal itself.
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_unreadable_active_usage_leaves_lane_zero_alone(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {"five_hour": {"pct": 50.0}},  # no seven_day window
+                "2": self._weekly(5.0, 3 * DAY, now),
+            })
+        assert outcome is not TickOutcome.ERROR
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+        assert h.active_number() == 1
+
+    def test_idle_balance_below_threshold_is_no_action_not_blocked(
+        self, temp_home
+    ):
+        """`_lane0_idle_move_allowed` finds its candidate through its own
+        ranking, which does not know about the no-return bar -- so the
+        bar can still empty `_rank_candidates`' oauth ranking afterwards,
+        on the very account the idle rule just chose. With only one oauth
+        peer, barring it empties the ranking outright. That is a correct
+        "nothing to do" this tick, exactly like consume-first's own
+        below-threshold exit just above -- never a block.
+
+        Tick 1 performs a real proactive departure (account 2 crosses the
+        threshold) so the bar's baseline (``leftHeadroom`` / recovery) is
+        the real snapshot `_perform` records, not a hand-mutated one.
+        Tick 2 holds account 2's own reset time fixed and lets its
+        headroom move by only a tenth of a point (10.0 -> 10.1) -- past
+        `_left_account_recovered`'s three "did it get better" legs
+        (dominance against the active, headroom against the departure
+        baseline, recovery time against the departure baseline) but
+        nowhere near clearing any of them -- while account 2 still beats
+        account 1's balance score by far more than the idle rule's own
+        margin.
+        """
+        h = EngineHarness(temp_home, strategy="balance", hysteresis_pct=10.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        now1 = h.clock.now
+        reset_iso = _iso_at(now1 + DAY)
+
+        assert h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now1 + 6 * DAY)},
+            },
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 90.0, "resets_at": reset_iso},
+            },
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, "premise: tick 1 landed on account 1"
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now2 = h.clock.now
+
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {
+                        "pct": 40.0, "resets_at": _iso_at(now2 + 6 * DAY)
+                    },
+                },
+                # Same resets_at as the departure snapshot and headroom
+                # barely moved (10.0 -> 10.1): none of the three recovery
+                # legs clears, so the bar holds and empties the ranking.
+                "2": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 89.9, "resets_at": reset_iso},
+                },
+            })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"an empty idle-balance ranking must be a no-harm hold, not a "
+            f"block — got {outcome}"
+        )
+        assert h.active_number() == 1
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
+
+    def test_idle_balance_never_falls_back_to_an_api_key_account(
+        self, temp_home
+    ):
+        """Same no-return-bar setup as the test above, plus an included
+        API-key account (3) that would otherwise be the "last resort"
+        candidate once the oauth ranking comes back empty. Idle-balance is
+        an optimisation on an already-healthy account, not an escape, so
+        it must take the same below-threshold exit as above rather than
+        ever landing on a billed, unmetered account.
+        """
+        h = EngineHarness(
+            temp_home,
+            strategy="balance",
+            hysteresis_pct=10.0,
+            include_api_key_accounts=True,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "key@token.local")
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        now1 = h.clock.now
+        reset_iso = _iso_at(now1 + DAY)
+
+        assert h.tick_with_usage({
+            "1": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now1 + 6 * DAY)},
+            },
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 90.0, "resets_at": reset_iso},
+            },
+            "3": "api key",
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, "premise: tick 1 landed on account 1"
+        h.events.clear()
+        h.clock.advance(301.0)  # past the default 300s cooldown
+        now2 = h.clock.now
+
+        with patch("claude_swap.autoswitch.lane0_all_idle", return_value=True):
+            outcome = h.tick_with_usage({
+                "1": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {
+                        "pct": 40.0, "resets_at": _iso_at(now2 + 6 * DAY)
+                    },
+                },
+                "2": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 89.9, "resets_at": reset_iso},
+                },
+                "3": "api key",
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1, (
+            "idle-balance must never land on the api-key account just "
+            "because the no-return bar emptied the oauth ranking"
+        )
+        assert "below-threshold" in [
+            getattr(e, "reason", "") for e in h.events
+        ]
