@@ -15,25 +15,36 @@ elsewhere:
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.managed_sessions import (
     SOURCE_BACKUP,
     SOURCE_LANE0,
     SOURCE_RUN_PROFILE,
     AccountRef,
+    ManagedEntry,
+    ManagedSessionRegistry,
 )
 from claude_swap.session import (
     read_session_credentials,
     session_dir_for,
     session_identity_drifted,
 )
-from claude_swap.session_credentials import build_access_credential
+from claude_swap.session_credentials import (
+    WriteResult,
+    build_access_credential,
+    write_session_credential,
+)
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
+
+_logger = logging.getLogger("claude-swap")
 
 # What a store or lock read can raise on the way: cswap's own errors, and
 # plain I/O failures from files read without a guard (a stored config, a
@@ -164,12 +175,28 @@ def resolve_access_credential(
     *,
     now_ms: float,
     buffer_ms: int,
+    number: str | None = None,
+    number_known: bool = False,
 ) -> AccessResolution:
-    """The access-only credential ``account``'s managed sessions should hold now."""
-    try:
-        number = slot_for_account(switcher, account)
-    except _STORE_FAILURES:
-        return AccessResolution(account, None, "transient")
+    """The access-only credential ``account``'s managed sessions should hold now.
+
+    ``number``/``number_known`` let a caller that already looked up the
+    account's slot (push_refresh, ahead of its ``skip_numbers`` check)
+    pass that result straight through instead of this repeating the same
+    sequence-data lookup. ``number_known=True`` must be paired with the
+    looked-up value, a genuine ``None`` included — a caller that found no
+    slot for the account reports that as ``number=None,
+    number_known=True``, so this trusts it as "account-gone" rather than
+    re-deriving the same answer with a second lookup. The default
+    ``number_known=False`` means "not looked up yet" (``number`` is then
+    ignored) and triggers the lookup here, exactly as before a caller
+    could pass either one through.
+    """
+    if not number_known:
+        try:
+            number = slot_for_account(switcher, account)
+        except _STORE_FAILURES:
+            return AccessResolution(account, None, "transient")
     if number is None:
         return AccessResolution(account, None, "account-gone")
     try:
@@ -228,3 +255,171 @@ def _resolve_for_slot(
     except ValueError:
         return AccessResolution(account, number, "unavailable", source)
     return AccessResolution(account, number, "ok", source, access, oauth_account)
+
+
+# AccessResolution statuses whose lineage another pass cannot fix by itself:
+# the backup grant is dead (invalid_grant) or now authenticates as a
+# different account (identity-conflict). Every other non-ok status —
+# a missing config, an account no slot holds any more, a lane-0/run-profile
+# holder with nothing to copy, a transient store or lock failure, any of the
+# systemic consume-gate refusals — is left for a later pass instead: retrying
+# can still produce a usable token, or nothing about this account's own
+# lineage is known to be broken.
+QUARANTINE_STATUSES = frozenset({"invalid_grant", "identity-conflict"})
+
+# Per-lock budget for a pushed write. :func:`push_refresh` walks the live
+# sessions serially inside one auto-switch tick, and each write takes three
+# of Claude's locks in sequence, so the default 9 s budget would let a
+# single wedged profile hold the tick — lane-0 rate-limit switching
+# included — for 27 s, and N of them for N times that. A push has nobody
+# waiting on it and repeats every tick, so it gives up early and retries.
+# The interactive launch path keeps the generous default: a person who
+# asked for a session would rather wait than be told to try again.
+PUSH_LOCK_TIMEOUT_S = 3.0
+
+
+@dataclass(frozen=True)
+class PushResult:
+    """The outcome of one account's push-refresh pass.
+
+    ``status`` is ``"skipped"`` (the account's slot number is in
+    ``skip_numbers`` — already quarantined, so this pass does not touch it)
+    or any :class:`AccessResolution` status (``"ok"`` on success).
+
+    ``quarantine`` is the engine's cue to act on this account now rather
+    than just wait for the next pass: True exactly when ``status`` is in
+    :data:`QUARANTINE_STATUSES`, False for ``"ok"``, ``"skipped"``, and
+    every other refusal (see :data:`QUARANTINE_STATUSES` for why those are
+    left alone).
+
+    ``written``/``failed`` are only meaningful when ``status == "ok"``: the
+    managed session ids whose stored token differed from the resolved one
+    and were pushed successfully, and those a push was attempted for but
+    either the writer refused it or its token landed while the registry
+    update recording it did not — the latter is still reported failed, so
+    a stuck lock or a rewrite error retries on the next pass instead of the
+    registry silently drifting from what the session actually holds.
+    """
+
+    account: AccountRef
+    number: str | None
+    status: str
+    source: str = ""
+    written: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+    quarantine: bool = False
+
+
+def push_refresh(
+    switcher: ClaudeAccountSwitcher,
+    registry: ManagedSessionRegistry,
+    *,
+    now_ms: float,
+    buffer_ms: int,
+    skip_numbers: Collection[str] = (),
+    writer: Callable[..., WriteResult] = write_session_credential,
+    entries: Iterable[ManagedEntry] | None = None,
+) -> list[PushResult]:
+    """Bring every live managed session's token up to its holder's current one.
+
+    One resolution (and at most one grant consumption) per account; only
+    sessions whose recorded fingerprint differs are written, so a steady
+    state costs a credential read per account and no writes. Each write
+    waits at most :data:`PUSH_LOCK_TIMEOUT_S` per lock, so the sessions
+    this walks serially cannot hold the caller's tick open.
+
+    ``entries`` is the already-known live set (e.g. a prior
+    :meth:`ManagedSessionRegistry.sweep`'s ``.live``); passing it means this
+    call performs no liveness check of its own. When omitted, it defaults to
+    ``registry.live_entries()`` — a fresh liveness pass — for callers (tests,
+    one-off tooling) that have not already done one.
+    """
+    live = list(registry.live_entries() if entries is None else entries)
+    grouped: dict[AccountRef, list[ManagedEntry]] = {}
+    for entry in live:
+        grouped.setdefault(entry.account, []).append(entry)
+    results: list[PushResult] = []
+    for account, group in grouped.items():
+        try:
+            number = slot_for_account(switcher, account)
+            number_known = True
+        except _STORE_FAILURES:
+            # Unreadable sequence data for this account only. number_known
+            # stays False (rather than treating this as a known "no slot"),
+            # so resolve_access_credential retries the same lookup itself
+            # and reports it as "transient" — an unresolved store failure,
+            # not "account-gone" — instead of this call aborting every
+            # other account's push over it.
+            number = None
+            number_known = False
+        if number is not None and number in skip_numbers:
+            results.append(PushResult(account, number, "skipped"))
+            continue
+        res = resolve_access_credential(
+            switcher, account, now_ms=now_ms, buffer_ms=buffer_ms,
+            number=number, number_known=number_known,
+        )
+        if res.status != "ok" or res.credential is None or res.oauth_account is None:
+            results.append(PushResult(
+                account, res.number, res.status, res.source,
+                quarantine=res.status in QUARANTINE_STATUSES,
+            ))
+            continue
+        fingerprint = oauth.access_token_fingerprint(res.credential)
+        written: list[str] = []
+        failed: list[str] = []
+        for entry in group:
+            if entry.access_fingerprint == fingerprint:
+                continue
+            outcome = writer(
+                registry.session_dir(entry.session_id), account, res.credential,
+                res.oauth_account, registry=registry,
+                lock_timeout=PUSH_LOCK_TIMEOUT_S,
+                # These profiles already hold an access token, and Claude
+                # reads the keychain item before the plaintext: an item this
+                # push could not replace goes on serving the old token, so
+                # it is a failure to retry, not a plaintext-only success.
+                require_keychain=True,
+            )
+            # A WriteResult can be ok=True with a reason other than "ok"
+            # (the plaintext-only success): that is still a successful
+            # push, so callers branch on .ok, never on the reason string.
+            if not outcome.ok:
+                _logger.warning(
+                    f"Managed session {entry.session_id}: token push failed "
+                    f"({outcome.reason})"
+                )
+                failed.append(entry.session_id)
+                continue
+            try:
+                registry.update(
+                    entry.session_id,
+                    access_fingerprint=outcome.fingerprint,
+                    source=res.source,
+                )
+            except _STORE_FAILURES as e:
+                # The token is already live in the session; only recording
+                # it in the registry failed (a lock timeout, a rewrite
+                # error). Reported as failed, not written, so the next pass
+                # retries it instead of the registry silently drifting from
+                # what the session actually holds — comparing against the
+                # still-unrecorded old fingerprint makes that retry a
+                # harmless repeat of this same write, not a skip.
+                #
+                # update() can also raise ValueError, from its own row
+                # validation, but never for this call: source is always
+                # one of the SOURCE_* constants, and the entry's account
+                # and pid are untouched fields already valid on its own
+                # row. Not caught here — that would be a caller bug, not a
+                # store or lock failure worth retrying.
+                _logger.warning(
+                    f"Managed session {entry.session_id}: pushed a new token "
+                    f"but could not record it in the registry ({e})"
+                )
+                failed.append(entry.session_id)
+                continue
+            written.append(entry.session_id)
+        results.append(PushResult(
+            account, res.number, "ok", res.source, tuple(written), tuple(failed)
+        ))
+    return results
