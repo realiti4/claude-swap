@@ -30,6 +30,33 @@ class TestExtractAccessToken:
         assert oauth.extract_access_token("") is None
 
 
+class TestExtractOauthData:
+    """Test extract_oauth_data."""
+
+    def test_valid_credentials(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "at"}})
+        assert oauth.extract_oauth_data(creds) == {"accessToken": "at"}
+
+    @pytest.mark.parametrize("raw", ["", "not-json", "{unterminated"])
+    def test_unparseable_is_none(self, raw):
+        assert oauth.extract_oauth_data(raw) is None
+
+    @pytest.mark.parametrize(
+        "raw", ["null", "[]", '["a"]', '"a string"', "3", "true"],
+        ids=["null", "empty-list", "list", "string", "number", "bool"],
+    )
+    def test_a_non_object_top_level_is_none_not_an_exception(self, raw):
+        """Parseable JSON that is not an object carries no OAuth data, and
+        says so the same way an unparseable blob does. Raising here would
+        escape into every caller — a single such backup store would abort a
+        whole fan-out rather than refusing one account."""
+        assert oauth.extract_oauth_data(raw) is None
+
+    @pytest.mark.parametrize("value", [None, "not-a-dict", [], 3])
+    def test_a_non_object_oauth_payload_is_none(self, value):
+        assert oauth.extract_oauth_data(json.dumps({"claudeAiOauth": value})) is None
+
+
 class TestAccountHeadroom:
     """Test account_headroom."""
 

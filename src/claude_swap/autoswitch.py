@@ -36,16 +36,22 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import balance, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.managed_refresh import PushResult, busy_by_slot, push_refresh
+from claude_swap.managed_sessions import (
+    AccountRef,
+    ManagedEntry,
+    ManagedSessionRegistry,
+)
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -83,6 +89,48 @@ _SYSTEMIC_MESSAGES = {
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
+
+# Freshen statuses the tick has a branch for. Anything else is the unknown
+# kind its fall-through refuses to switch on and warns about once per slot;
+# a slot answering with one of these again re-arms that warning, so a kind
+# that resolves and comes back later is reported rather than staying at
+# debug for the life of the process. A status this set forgets costs only
+# that re-arming, never a wrong decision: the branches below, not this set,
+# decide what the tick does.
+_KNOWN_FRESHEN_STATUSES = frozenset(_SYSTEMIC_STATUSES) | {
+    "ok",
+    "transient",
+    "invalid_grant",
+    "identity-conflict",
+    "skip-live-session",
+}
+
+# What the user can do about a refusal to resolve an account's access token
+# for its managed sessions (managed_refresh.AccessResolution.status). Those
+# sessions hold no refresh token of their own, so a refusal that lasts leaves
+# them on an access token that expires within the hour and then fails to
+# authenticate with nothing on screen saying why — which is why every one of
+# these is reported rather than only the writer's own failures, and why the
+# report names a remedy instead of a status nobody outside cswap can read.
+# The systemic refusals keep the wording the lane-0 report uses for them.
+_SESSION_REFRESH_REMEDIES: dict[str, str] = {
+    **_SYSTEMIC_MESSAGES,
+    "account-gone": "no slot holds that account any more — re-add it with "
+                    "`cswap add`, or stop the session",
+    "no-config": "the slot has no stored .claude.json — re-add the account",
+    "stored-config-mismatch": "the slot's stored .claude.json names another "
+                              "account — re-add the account",
+    "unavailable": "the Claude that owns this account's token has none to "
+                   "copy — check `cswap list`",
+    "no-backup": "the slot has no stored credential — re-add the account",
+    "no-access-token": "the slot's stored credential carries no access token "
+                       "— re-add the account",
+    "invalid_grant": "the slot's stored credential is dead — re-add the "
+                     "account",
+    "identity-conflict": "the slot's stored credential belongs to another "
+                         "account — re-add the account",
+    "transient": "store or network trouble — cswap retries every tick",
+}
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -491,6 +539,45 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class ManagedSessionsRefreshedEvent(AutoSwitchEvent):
+    """A fresh access token was pushed into managed sessions of one account."""
+
+    kind: ClassVar[str] = "managed-sessions-refreshed"
+    number: str
+    email: str
+    source: str
+    sessions: tuple[str, ...]
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number, "email": self.email,
+            "source": self.source, "sessions": list(self.sessions),
+        }
+
+    def human(self) -> str:
+        return (
+            f"Pushed a fresh Account-{self.number} ({self.email}) token to "
+            f"{len(self.sessions)} managed session(s)."
+        )
+
+
+@dataclass(frozen=True)
+class SessionReleasedEvent(AutoSwitchEvent):
+    """A managed session's profile, keychain item and registry entry are gone."""
+
+    kind: ClassVar[str] = "session-released"
+    session_id: str
+    email: str
+    reason: str  # why it was released; "process-exited" from the sweep
+
+    def _fields(self) -> dict:
+        return {"session": self.session_id, "email": self.email, "reason": self.reason}
+
+    def human(self) -> str:
+        return f"Managed session {self.session_id} ({self.email}) released: {self.reason}."
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -533,6 +620,36 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+# Moved to poll_policy so the pure balance policy can rank by it without
+# importing the engine; aliased for the engine and the test suite.
+_binding_recovery_ts = poll_policy.binding_recovery_ts
+
+
+def _read_state_file(path: Path) -> dict:
+    """The engine's state document at ``path``; ``{}`` when it is missing,
+    unreadable or not a JSON object."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _quarantined_from_state(state: Mapping[str, object]) -> set[str]:
+    """The slot numbers a state document has quarantined.
+
+    One reading of the ``quarantine`` map for every caller that needs the
+    bare set of slots: the tick's own decision, the managed-session upkeep
+    pass, and :func:`quarantined_numbers` for callers outside the engine.
+    """
+    quarantine = state.get("quarantine")
+    return set(quarantine) if isinstance(quarantine, dict) else set()
+
+
+def quarantined_numbers(backup_dir: Path) -> set[str]:
+    """Slots the engine has quarantined (read-only view of its state file),
+    for callers outside the engine such as ``cswap run --auto``."""
+    return _quarantined_from_state(_read_state_file(backup_dir / STATE_FILENAME))
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -555,40 +672,6 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
-
-
-def _binding_recovery_ts(
-    usage: dict | str | None, models: Sequence[str], now: float
-) -> float:
-    """When this account's *binding* window comes back, as a sort key.
-
-    The binding window is the one holding the account back — the highest
-    utilization among the windows that gate it (the same set
-    ``account_headroom`` measures, so ranking and headroom can never disagree
-    about which window matters). Its reset is the moment the account becomes
-    useful again.
-
-    Not the weekly window: with every account in the 90s the thing that
-    decides where to go is which 5-hour window rolls over first, and that is
-    routinely minutes away while the weekly one is days away.
-
-    Returns ``inf`` when unknown or already past, so such accounts sort last
-    rather than masquerading as "back immediately" — a stale ``resets_at``
-    would otherwise rank a snapshot nobody has refreshed above a measured,
-    genuinely imminent one.
-    """
-    # Pick the BINDING window first, then ask for its reset. Filtering on the
-    # reset before the max lets a lower window win whenever the binding one's
-    # reset is unknown or past — measured: 7d at 95% with no resets_at and 5h
-    # at 40% resetting in an hour returned "back in an hour", which is the
-    # opposite of what binds. An account whose binding window has no usable
-    # reset is one we cannot schedule around, and inf sorts it last.
-    windows = list(oauth.relevant_windows(usage, models))
-    if not windows:
-        return float("inf")
-    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
-    ts = _parse_reset_ts(resets_at)
-    return ts if ts is not None and ts > now else float("inf")
 
 
 def _every_account_above_threshold(
@@ -684,6 +767,32 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # (slot, status) pairs already warned about as unrecognised freshen
+        # statuses: the tick meets them again every pass, so later sightings
+        # go to debug instead of repeating the warning. A slot's pairs are
+        # dropped again as soon as its freshen answers with a status the
+        # tick knows (_KNOWN_FRESHEN_STATUSES), so the warning re-arms on
+        # recovery instead of being spent for the life of the process.
+        self._warned_freshen_statuses: set[tuple[str, str]] = set()
+        # Busy managed sessions per slot (feeds balance's projected 5h-window load),
+        # recomputed by the upkeep pass at the top of every tick from the
+        # liveness it already established, and read by the balance ranking.
+        # Empty when there is no managed state and when the sweep itself
+        # fails; a push that fails afterwards still leaves this tick's own
+        # count, never a previous tick's.
+        self._managed_busy: dict[str, int] = {}
+        # What each account's managed sessions were last reported to be
+        # suffering: a refusal to resolve their token, a quarantined slot,
+        # or the sessions a push could not write. The same stuck lock,
+        # removed account or quarantine meets every tick, and one error
+        # event per tick would bury the log it belongs in; a repeat of the
+        # SAME trouble goes to debug instead. Keyed on the AccountRef, not
+        # the address alone: one login in two organizations occupies two
+        # slots, and one key for both would have each pass overwrite what
+        # the other left and report it again every tick — exactly the
+        # burying this exists to prevent. Rebuilt per pass, so an account
+        # with no managed sessions left drops out with it.
+        self._session_health: dict[AccountRef, tuple[str, tuple[str, ...]]] = {}
 
     # -- state file ---------------------------------------------------------
 
@@ -691,11 +800,7 @@ class AutoSwitchEngine:
         return FileLock(self.state_path.parent / ".autoswitch_state.lock")
 
     def _read_state(self) -> dict:
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return _read_state_file(self.state_path)
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -772,8 +877,10 @@ class AutoSwitchEngine:
 
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
-        account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
+        account — quarantine, do not activate), one of
+        ``_SYSTEMIC_STATUSES`` (a deterministic refusal naming its cause),
+        ``"transient"`` (network trouble — try again next tick) or
+        ``"skip-live-session"``. Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -787,123 +894,222 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
-        creds = self.switcher.read_account_credentials(number, email)
-        if not creds:
-            return "transient"
-        data = oauth.extract_oauth_data(creds)
-        if not data:
-            return "invalid_grant"
-        expires_at = data.get("expiresAt")
-        now_ms = self.clock() * 1000
-        near_expiry = (
-            isinstance(expires_at, (int, float))
-            and now_ms + FRESHEN_BUFFER_MS >= expires_at
+        status, _ = self.switcher.freshen_backup_credential(
+            number, email,
+            now_ms=self.clock() * 1000, buffer_ms=FRESHEN_BUFFER_MS,
         )
-        if not near_expiry:
-            return "ok"
-        # The consume gate serializes every backup-rt POST (the recovery
-        # branch in `_fetch_active_usage` is a second call site, under the
-        # same per-slot consume lock):
-        # it re-reads under the slot lock (our snapshot may be superseded),
-        # consults the session profile for a newer generation, and persists
-        # via fingerprint CAS — so a freshen racing the collector (or a
-        # sibling surface) can no longer double-consume one grant.
-        outcome = self.switcher.consume_backup_grant(number, email, creds)
-        if outcome.error is None and outcome.credentials:
-            # The gate already persisted the successor (or adopted a racing
-            # writer's newer lineage) under its own lock.
-            if self._note_token_identity(number, outcome.token_account):
-                # The slot's stored credential authenticates as a *different*
-                # account — activating it would put the user on the wrong
-                # account with every gauge reading normal. Not a viable
-                # target; the caller quarantines it (released automatically
-                # once the credential is replaced by a re-add).
-                return "identity-conflict"
-            return "ok"
-        if outcome.error in ("invalid_grant", "no_refresh_token"):
-            return "invalid_grant"
-        if outcome.error in _SYSTEMIC_STATUSES:
-            # Deterministic conditions, not network trouble: every candidate
-            # refuses identically and keeps refusing until something outside
-            # this process changes — the shell for store-unmirrored (an
-            # inherited CLAUDE_SECURESTORAGE_CONFIG_DIR), our OAuth client
-            # registration for invalid_client. Reported distinctly so the tick
-            # error names the real cause instead of "(network?)", which would
-            # send the user to check a connection that is fine.
-            return outcome.error
-        return "transient"
-
-    def _note_token_identity(
-        self, number: str, token_account: dict | None
-    ) -> bool:
-        """Use the token endpoint's free identity to verify/backfill a slot.
-
-        The refresh grant just ran against the slot's own stored credential,
-        so ``token_account`` (when the server includes it) names who that
-        credential really is. Returns True on a *conflict*: the credential
-        authenticates under a different organization than the slot records
-        (org compared first, whenever both sides record one), or as a
-        different account uuid. An empty slot uuid (blank-uuid records from
-        older versions, add-token placeholders) is backfilled — but only
-        when no org conflict exists: a wrong-org credential is evidence the
-        slot holds the wrong account, and backfilling *its* uuid would
-        poison the slot's identity record (backfill never rewrites a
-        non-empty uuid, so that corruption would be sticky).
-
-        ``_parse_token_account`` already enforces a strict boundary, but this
-        identity is opportunistic — re-check types here so malformed data can
-        never break the freshen that carried it (the successor credential is
-        already persisted by the time this runs).
-        """
-        if not isinstance(token_account, dict):
-            return False
-        ta_uuid = token_account.get("uuid")
-        if not isinstance(ta_uuid, str) or not ta_uuid.strip():
-            return False
-        ta_uuid = ta_uuid.strip()
-        slot_identity = self.switcher.account_identity(number)
-        ta_org = token_account.get("organizationUuid")
-        slot_org = slot_identity.get("organizationUuid") or ""
-        if isinstance(ta_org, str) and ta_org and slot_org and ta_org != slot_org:
-            return True
-        if not slot_identity.get("uuid"):
-            try:
-                self.switcher.backfill_account_uuid(number, ta_uuid)
-            except Exception as e:  # never let bookkeeping break a freshen
-                _logger.debug("uuid backfill failed for account %s: %r", number, e)
-            return False
-        return slot_identity["uuid"] != ta_uuid
+        # The engine skips a candidate with nothing stored for this tick
+        # rather than quarantining it — there is no lineage to call dead.
+        return "transient" if status == "no-backup" else status
 
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
+            if not self.dry_run:
+                # Ahead of BOTH readers of the quarantine set — the managed
+                # push below skips quarantined slots just as the lane-0
+                # decision does — so a slot whose credential the user
+                # replaced comes back on this tick rather than the next.
+                # Dry-run must not write anything, so it reads the stored
+                # set as it stands.
+                self._release_recovered_quarantines(self._read_state())
+        except Exception as e:
+            return self._tick_failed(e)
+        try:
+            self._service_managed_sessions()
+        except Exception as e:
+            # Upkeep of managed sessions must never cost lane 0 its decision.
+            self._emit(ErrorEvent(
+                message=f"Managed sessions: {type(e).__name__}: {e}", transient=True
+            ))
+        try:
             return self._tick_inner()
-        except ClaudeSwitchError as e:
-            self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
-        except Exception as e:  # pragma: no cover - safety net
-            self._emit(
-                ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
+        except Exception as e:
+            return self._tick_failed(e)
+
+    def _tick_failed(self, error: Exception) -> TickOutcome:
+        """Report a failed tick and let the next one retry. A
+        ``ClaudeSwitchError`` already names its own cause; anything else is
+        reported with its type, since its message alone rarely says where it
+        came from."""
+        self._emit(ErrorEvent(
+            message=str(error) if isinstance(error, ClaudeSwitchError)
+            else f"{type(error).__name__}: {error}",
+            transient=True,
+        ))
+        return TickOutcome.ERROR
+
+    def _service_managed_sessions(self) -> None:
+        """Sweep exited managed sessions and read the survivors' status,
+        then push fresh access tokens to them.
+
+        Managed profiles hold no refresh token and are not slots, so nothing
+        here evaluates them for ``no_refresh_token``: the only refresh is the
+        slot backup's own, through ``consume_backup_grant``, and a dead grant
+        there quarantines the SLOT exactly as ``_freshen_target`` would.
+
+        One liveness pass per tick: ``sweep`` checks every entry once (a
+        ``ps`` call each on macOS) and hands back both the entries it dropped
+        and the live ones, which go straight to the push and the busy count
+        instead of being re-derived.
+
+        Dry-run must not write, so it neither sweeps nor pushes. It does
+        still count the busy sessions: that count only reads, and a preview
+        that ranked without it would not be a preview of what the engine
+        does.
+        """
+        self._managed_busy = {}
+        registry = ManagedSessionRegistry(self.switcher.backup_dir)
+        if not registry.has_state():
+            return
+        if self.dry_run:
+            self._managed_busy = self._busy_by_slot(registry.live_entries(), registry)
+            return
+        swept = registry.sweep()
+        for entry in swept.removed:
+            self._emit(SessionReleasedEvent(
+                session_id=entry.session_id,
+                email=entry.account.email,
+                reason="process-exited",
+            ))
+        self._managed_busy = self._busy_by_slot(swept.live, registry)
+        live_ids: dict[AccountRef, list[str]] = {}
+        for entry in swept.live:
+            live_ids.setdefault(entry.account, []).append(entry.session_id)
+        results = push_refresh(
+            self.switcher,
+            registry,
+            now_ms=self.clock() * 1000,
+            buffer_ms=FRESHEN_BUFFER_MS,
+            skip_numbers=_quarantined_from_state(self._read_state()),
+            entries=swept.live,
+        )
+        health: dict[AccountRef, tuple[str, tuple[str, ...]]] = {}
+        for result in results:
+            if result.quarantine and result.number is not None:
+                # A dead or foreign backup lineage: the SLOT is quarantined,
+                # exactly as the lane-0 freshen does it. Every other refusal
+                # (see managed_refresh.QUARANTINE_STATUSES) is left for the
+                # next pass.
+                self._quarantine(result.number, result.account.email, result.status)
+            if result.written:
+                # Sessions are only ever written on an "ok" resolution, and
+                # that one names the slot it resolved through: a push with
+                # no slot number behind it cannot happen.
+                assert result.number is not None
+                self._emit(ManagedSessionsRefreshedEvent(
+                    number=result.number,
+                    email=result.account.email,
+                    source=result.source,
+                    sessions=result.written,
+                ))
+            self._report_session_health(
+                result, tuple(sorted(live_ids.get(result.account, ()))), health
             )
-            return TickOutcome.ERROR
+        # Accounts this pass said nothing about (their last session exited,
+        # the account is gone from the registry) leave with the old dict.
+        self._session_health = health
+
+    def _report_session_health(
+        self,
+        result: PushResult,
+        sessions: tuple[str, ...],
+        health: dict[AccountRef, tuple[str, tuple[str, ...]]],
+    ) -> None:
+        """Report what one account's push-refresh pass leaves its managed
+        sessions holding — once per run of the same trouble.
+
+        Only an ``"ok"`` resolution that wrote everything it had to is
+        healthy and says nothing. Every other outcome leaves live sessions
+        on the access token they already hold, which expires within the
+        hour: a refusal to resolve the account's token at all, a slot the
+        lane-0 decision has quarantined (reported apart, because a session
+        stranded on one is something the user can repair), and the sessions
+        an otherwise fine push could not write. ``cswap sessions`` cannot
+        say any of it — it lists the row, not the refresh — so this is the
+        only place the user hears about it while there is still time to act.
+
+        The same stuck lock, removed account or quarantine is met again on
+        every tick, so a repeat of the same trouble for the same account
+        goes to debug; a different trouble, or a recovery, re-arms the
+        report. ``health`` collects this pass's keys and replaces the
+        remembered dict, so an account that drops out of the results drops
+        its key with it.
+        """
+        email = result.account.email
+        if result.status == "ok":
+            failed = tuple(sorted(result.failed))
+            if not failed:
+                return
+            key = ("push-failed", failed)
+            message = (
+                f"Could not update {len(failed)} managed session(s) on "
+                f"{email}: {', '.join(failed)}"
+            )
+        elif result.status == "skipped":
+            key = (result.status, sessions)
+            message = (
+                f"{len(sessions)} managed session(s) on {email} are stranded "
+                f"on quarantined Account-{result.number}: their access token "
+                "is no longer refreshed and stops working within the hour. "
+                "Repair the slot (re-add the account) or stop the session — "
+                f"{', '.join(sessions)}"
+            )
+        else:
+            key = (result.status, sessions)
+            remedy = _SESSION_REFRESH_REMEDIES.get(
+                result.status, "check `cswap list`, or stop the session"
+            )
+            message = (
+                f"Could not refresh {len(sessions)} managed session(s) on "
+                f"{email} ({result.status}): {remedy}. Their access token "
+                "stops working within the hour — "
+                f"{', '.join(sessions)}"
+            )
+        health[result.account] = key
+        if self._session_health.get(result.account) == key:
+            _logger.debug(message)
+            return
+        self._emit(ErrorEvent(message=message, transient=True))
+
+    def _busy_by_slot(
+        self, entries: Iterable[ManagedEntry], registry: ManagedSessionRegistry
+    ) -> dict[str, int]:
+        """Busy managed sessions per slot number — the count that feeds
+        balance's projected 5h-window load.
+
+        The busy definition (an idle or waiting session holds a profile but
+        is not burning its account's 5h window; a reservation with no
+        Claude record yet does count) lives in ``registry.busy_counts``,
+        and re-keying that count to slot numbers in
+        ``managed_refresh.busy_by_slot``, shared with the launch path's
+        placement, so neither what "busy" means nor where it lands can
+        disagree between the two.
+        """
+        try:
+            return busy_by_slot(self.switcher, registry.busy_counts(entries))
+        except (ClaudeSwitchError, OSError, UnicodeDecodeError) as e:
+            # Unreadable sequence data: rank without the managed load rather
+            # than lose the whole tick over it — but say so, or lane 0 ranks
+            # as if no account carried a session and nothing anywhere names
+            # the reason.
+            _logger.warning(
+                f"Managed-session load not counted this tick: the account "
+                f"roster could not be read ({e})"
+            )
+            return {}
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        # Recovered quarantines were already released by ``tick`` (dry-run
+        # excepted, which writes nothing), so this reads the current set.
         state = self._read_state()
-        if not self.dry_run:
-            # Dry-run must not write anything, so recovered quarantines are
-            # only released (state mutation) on real ticks.
-            state = self._release_recovered_quarantines(state)
-        quarantined = set(
-            state.get("quarantine", {})
-            if isinstance(state.get("quarantine"), dict)
-            else {}
-        )
+        quarantined = _quarantined_from_state(state)
 
         current = self.switcher.current_account_number()
         if current is None:
@@ -1337,6 +1543,14 @@ class AutoSwitchEngine:
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger, left_snapshot)
             status = self._freshen_target(num, email)
+            if status in _KNOWN_FRESHEN_STATUSES:
+                # This slot's freshen is answering with a status the tick
+                # acts on again, so forget whatever unknown kind it was last
+                # warned about: one that resolves and recurs days later is
+                # news, not the repeat the debug demotion exists for.
+                self._warned_freshen_statuses = {
+                    pair for pair in self._warned_freshen_statuses if pair[0] != num
+                }
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
                 # account — switching onto it would silently run the wrong
@@ -1366,7 +1580,19 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            if status == "ok":
+                return self._perform(num, email, trigger, left_snapshot)
+            # Fail safe: a status this loop does not know (a new kind from the
+            # shared freshen, say) must never read as a green light. Treat it
+            # as trouble to retry, like "transient".
+            first = (num, status) not in self._warned_freshen_statuses
+            self._warned_freshen_statuses.add((num, status))
+            _logger.log(
+                logging.WARNING if first else logging.DEBUG,
+                "unrecognised freshen status %r for account %s; not switching",
+                status, num,
+            )
+            transient_failure = True
 
         if systemic or transient_failure:
             self._emit(
@@ -1823,6 +2049,21 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        # balance ranks by how far each candidate is behind its weekly
+        # schedule (balance.py). Only the ORDER changes: the trigger, the
+        # landing gate, the hysteresis margin, the no-return bar and the
+        # all-above recovery path above are exactly `best`'s, so balance can
+        # never move while the active account is below the threshold, and a
+        # proactive move never lands somewhere that re-triggers next tick
+        # (at-limit/failover escapes skip the landing gate, as for best).
+        # busy_sessions is the managed-session load this tick's upkeep pass
+        # counted (``_busy_by_slot``), so lane 0 ranks an account down while
+        # managed sessions are burning its 5h window.
+        # The ranking call itself sits below the gate loop — see the comment
+        # there for why it must run on the gates' SURVIVORS, not this raw
+        # candidate list.
+        is_balance = settings.strategy == "balance"
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -1835,11 +2076,12 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            num_usage = usage.get(num)
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(num_usage, now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(num_usage, self._models, now)
                 if all_above
                 else 0.0
             )
@@ -1908,9 +2150,9 @@ class AutoSwitchEngine:
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
+                    # best and balance: the candidate must beat the active
+                    # account by the full hysteresis margin (a one-way move
+                    # like 99%→89% qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
@@ -1942,9 +2184,49 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif is_balance:
+                # Placeholder — every candidate that reaches this line has
+                # already cleared the gates above, and the real key is
+                # rebuilt below from balance.rank_accounts run over exactly
+                # that survivor set. `num` alone keeps the interim ordering
+                # stable and irrelevant: it is never returned.
+                key = (num,)
             else:
                 key = (-h,)
             qualifying.append((key, num))
+        if is_balance and qualifying and not (
+            all_above and trigger in ("proactive", "consume-first")
+        ):
+            # Rank the SURVIVORS of the gates above, not the raw candidate
+            # list. When none of the landable accounts is eligible under
+            # balance's own rules, the policy falls back to soonest
+            # recovery — and that fallback must see the same gated set the
+            # engine actually has to choose from: an account the engine
+            # already rejected (barred by no-return, failing the landing
+            # gate, inside the hysteresis margin) has no business shaping
+            # it. Ranking is scoped to the gate survivors so that an
+            # account the engine already excluded cannot satisfy balance's
+            # eligible branch and suppress the soonest-recovery fallback
+            # among the accounts still in play.
+            #
+            # Skipped on an all-above tick: that path above already carries
+            # its own recovery-based tiered key, shared with best, and
+            # balance does not re-rank it.
+            ranked_by_balance = balance.rank_accounts(
+                {
+                    num: usage.get(num) if isinstance(usage.get(num), dict) else None
+                    for _, num in qualifying
+                },
+                now=now,
+                models=self._models,
+                busy_sessions=self._managed_busy,
+                params=balance.params_from_settings(settings),
+            )
+            order = {s.account: rank for rank, s in enumerate(ranked_by_balance)}
+            qualifying = [
+                ((order.get(num, len(order)), -headroom[num]), num)
+                for _, num in qualifying
+            ]
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])

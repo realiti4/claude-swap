@@ -167,3 +167,32 @@ class TestAheadVsWillLastRelationship:
         assert result is not None
         assert result.ahead is False
         assert pace.will_last_to_reset(result) is False
+
+
+class TestWindowElapsed:
+    """The window-start derivation shared with balance.weekly_target_pct."""
+
+    def test_one_day_into_the_week(self):
+        assert pace.window_elapsed_s(NOW + 6 * DAY, NOW) == DAY
+
+    def test_exactly_on_the_reset_boundary_is_a_fresh_window(self):
+        assert pace.window_elapsed_s(NOW + WEEK, NOW) == 0.0
+        assert pace.window_elapsed_s(NOW, NOW) == 0.0
+
+    def test_stale_reset_rolls_forward_whole_cycles(self):
+        # Reset reported 2 weeks + 1 day in the past -> started 1 day ago.
+        assert pace.window_elapsed_s(NOW - 2 * WEEK - DAY, NOW) == DAY
+
+    def test_reset_several_cycles_ahead_folds_back(self):
+        assert pace.window_elapsed_s(NOW + 3 * WEEK - DAY, NOW) == DAY
+
+    def test_custom_period(self):
+        five_hours = 5 * 3600.0
+        assert pace.window_elapsed_s(NOW + 3600.0, NOW, five_hours) == 4 * 3600.0
+
+    def test_compute_pace_reads_the_same_elapsed(self):
+        # No behaviour change: compute_pace's elapsed IS the shared helper's.
+        for reset in (NOW + 5 * DAY, NOW - 2 * DAY, NOW + 2 * WEEK - 3 * DAY):
+            result = pace.compute_pace(_window(40.0, reset), fetched_at=NOW)
+            assert result is not None
+            assert result.elapsed_s == pace.window_elapsed_s(reset, NOW)

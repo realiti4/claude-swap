@@ -32,10 +32,18 @@ def extract_access_token(credentials: str) -> str | None:
 
 
 def extract_oauth_data(credentials: str) -> dict | None:
-    """Extract the Claude AI OAuth payload from a credentials JSON string."""
+    """Extract the Claude AI OAuth payload from a credentials JSON string.
+
+    None for anything that is not an object carrying an object under
+    ``claudeAiOauth`` — a top-level ``null``, list, string or number
+    included. Every shape of "no OAuth data here" answers the same way, so
+    no caller has to guard the call itself against an exception.
+    """
     try:
         data = json.loads(credentials)
     except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
     oauth = data.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None

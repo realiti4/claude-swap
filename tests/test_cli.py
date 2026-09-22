@@ -14,6 +14,7 @@ import pytest
 from claude_swap import __version__
 from claude_swap import cli
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.managed_sessions import AccountRef, ManagedSessionRegistry, create_managed_profile
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -850,6 +851,43 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestRunAutoFlag:
+    """`cswap run --auto`: dispatch to the managed-launch path, and its
+    mutual exclusivity with the plain `run` options."""
+
+    def _dispatch(self, argv):
+        calls = []
+
+        def fake_run_auto(switcher, claude_args):
+            calls.append(("auto", switcher, claude_args))
+
+        switcher = object()
+        with patch("claude_swap.managed_launch.run_auto", fake_run_auto), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls, switcher
+
+    def test_auto_dispatches_with_forwarded_args(self):
+        calls, switcher = self._dispatch(["run", "--auto", "--", "--resume"])
+        assert calls == [("auto", switcher, ["--resume"])]
+
+    @pytest.mark.parametrize("extra", [
+        ["2"], ["--no-share"], ["--require-session"], ["--no-share-history"],
+    ])
+    def test_auto_rejects_conflicting_options(self, extra, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--auto", *extra]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--auto cannot be combined" in capsys.readouterr().err
+
+    def test_auto_accepts_explicit_share_history(self):
+        calls, _ = self._dispatch(["run", "--auto", "--share-history"])
+        assert calls and calls[0][0] == "auto"
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 
@@ -1125,6 +1163,30 @@ class TestAutoCommand:
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+
+    def test_strategy_balance_accepted(self, temp_home):
+        assert self._run(["--once", "--strategy", "balance"], temp_home) == 2
+        assert self.FakeEngine.instances[-1].settings.strategy == "balance"
+
+    def test_strategy_balance_from_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "balance", "balanceLeadHours": 12},
+        }))
+        self._run(["--once"], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.strategy == "balance"
+        assert settings.balance_lead_hours == 12.0
+
+    def test_auto_help_lists_balance(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "balance" in capsys.readouterr().out
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
@@ -1741,6 +1803,75 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestSessionsCommand:
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+    )
+
+    def _run(self, managed_switcher, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=managed_switcher), \
+             patch.object(sys, "argv", ["claude-swap", "sessions", *argv]):
+            cli.main()
+
+    def test_json_lists_live_sessions(self, managed_switcher, capsys):
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        d = registry.session_dir("auto-0000beef")
+        create_managed_profile(d)
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "cwd": "/work/app", "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000,
+        }))
+        self._run(managed_switcher, ["--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schemaVersion"] == 1
+        [row] = payload["sessions"]
+        assert (row["id"], row["pid"]) == ("auto-0000beef", os.getpid())
+        assert row["account"] == {"number": 2, "email": "b@example.com"}
+        assert (row["status"], row["cwd"], row["idleSince"]) == ("idle", "/work/app", "2025-09-16T05:20:00Z")
+
+    def test_human_output_when_empty(self, managed_switcher, capsys):
+        self._run(managed_switcher, [])
+        assert "No managed sessions running" in capsys.readouterr().out
+
+    def test_human_output_lists_a_session(self, managed_switcher, capsys):
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        create_managed_profile(registry.session_dir("auto-0000beef"))
+        self._run(managed_switcher, [])
+        out = capsys.readouterr().out
+        assert "auto-0000beef" in out and "Account-2" in out and "starting" in out
+
+    def test_out_of_range_status_updated_at_does_not_raise(self, managed_switcher, capsys):
+        """A record with a nanosecond-scale statusUpdatedAt (Claude's own
+        unit bug, not cswap's) must not traceback the command -- the
+        session is still listed, just without an idle time."""
+        registry = ManagedSessionRegistry(managed_switcher.backup_dir)
+        registry.allocate(
+            "auto-0000beef", lambda busy: (AccountRef("b@example.com", "org-2"), "backup"),
+            pid=os.getpid(), proc_start=None,
+        )
+        d = registry.session_dir("auto-0000beef")
+        create_managed_profile(d)
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "cwd": "/work/app", "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000_000_000,
+        }))
+        self._run(managed_switcher, ["--json"])
+        payload = json.loads(capsys.readouterr().out)
+        [row] = payload["sessions"]
+        assert row["id"] == "auto-0000beef"
+        assert row["idleSince"] is None
 
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):

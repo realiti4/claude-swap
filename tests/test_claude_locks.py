@@ -10,11 +10,16 @@ import pytest
 
 from claude_swap import claude_locks
 from claude_swap.claude_locks import (
+    STORAGE_WRITE_STALENESS_S,
     claude_config_lock,
     claude_credentials_lock,
+    claude_json_lock_dir,
     config_lock_dir,
     credentials_lock_dir,
+    oauth_refresh_lock_dir,
     proper_lockfile,
+    session_credential_locks,
+    storage_write_lock_dir,
 )
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 
@@ -197,3 +202,37 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
+
+
+class TestExplicitConfigDirLocks:
+    def test_helpers_accept_an_explicit_config_dir(self, tmp_path):
+        cfg = tmp_path / "auto-0000beef"
+        assert oauth_refresh_lock_dir(cfg) == cfg / ".oauth_refresh.lock"
+        assert storage_write_lock_dir(cfg) == cfg / ".storage-write.lock"
+        assert claude_json_lock_dir(cfg) == cfg / ".claude.json.lock"
+
+    def test_default_refresh_lock_is_unchanged(self, temp_home, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        assert oauth_refresh_lock_dir() == temp_home / ".claude" / ".oauth_refresh.lock"
+        assert storage_write_lock_dir() == temp_home / ".claude" / ".storage-write.lock"
+
+    def test_session_credential_locks_take_both_and_release(self, tmp_path):
+        cfg = tmp_path / "auto-0000beef"
+        cfg.mkdir()
+        with session_credential_locks(cfg):
+            assert (cfg / ".oauth_refresh.lock").is_dir()
+            assert (cfg / ".storage-write.lock").is_dir()
+        assert not (cfg / ".oauth_refresh.lock").exists()
+        assert not (cfg / ".storage-write.lock").exists()
+
+    def test_held_storage_lock_times_out_and_releases_refresh_lock(self, tmp_path):
+        cfg = tmp_path / "auto-0000beef"
+        (cfg / ".storage-write.lock").mkdir(parents=True)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with session_credential_locks(cfg, timeout=0.2):
+                pass
+        assert not (cfg / ".oauth_refresh.lock").exists()
+        assert (cfg / ".storage-write.lock").is_dir()
+
+    def test_storage_write_staleness_matches_claude(self):
+        assert STORAGE_WRITE_STALENESS_S == 15.0

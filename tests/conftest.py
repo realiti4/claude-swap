@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -878,3 +879,56 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+MANAGED_ACCOUNTS = {"1": "lane0@example.com", "2": "b@example.com", "3": "c@example.com"}
+
+
+def managed_backup_creds(num: str, *, expires_at: int, access: str | None = None) -> str:
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": access or f"at-{num}",
+        "refreshToken": f"rt-{num}",
+        "expiresAt": expires_at,
+        "scopes": ["user:inference", "user:profile"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    }})
+
+
+@pytest.fixture
+def managed_switcher(temp_home, monkeypatch):
+    """Three OAuth accounts (org-N), lane 0 = account 1, macOS platform,
+    backups in the in-memory keychain fake. All paths live under temp_home."""
+    from claude_swap.models import Platform
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+    switcher = ClaudeAccountSwitcher(debug=True)
+    switcher._setup_directories()
+    far = int(time.time() * 1000) + 6 * 3600 * 1000
+    accounts = {}
+    for num, email in MANAGED_ACCOUNTS.items():
+        accounts[num] = {
+            "email": email, "uuid": f"uuid-{num}", "organizationUuid": f"org-{num}",
+            "organizationName": "", "added": "2026-01-01T00:00:00Z",
+        }
+        switcher._write_account_credentials(num, email, managed_backup_creds(num, expires_at=far))
+        switcher._write_account_config(num, email, json.dumps({
+            "oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}",
+                "organizationUuid": f"org-{num}",
+            },
+            "theme": "light",
+        }))
+    switcher._write_json(switcher.sequence_file, {
+        "activeAccountNumber": 1, "lastUpdated": "2026-01-01T00:00:00Z",
+        "sequence": [1, 2, 3], "accounts": accounts,
+    })
+    (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "at-live-1", "refreshToken": "rt-live-1", "expiresAt": far,
+    }}))
+    (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "lane0@example.com", "accountUuid": "uuid-1",
+        "organizationUuid": "org-1",
+    }}))
+    return switcher
