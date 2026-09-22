@@ -9,13 +9,15 @@ import sys
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import error_envelope
+from claude_swap.json_output import SCHEMA_VERSION, error_envelope
 from claude_swap.printer import (
+    abbreviate_path,
     accent,
     bolded,
     dimmed,
     error,
     force_utf8_output,
+    format_age,
     muted,
     warning,
 )
@@ -261,6 +263,85 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _sessions_command(argv: list[str]) -> None:
+    """Handle `cswap sessions [--json]`: list live managed sessions
+    (started with `cswap run --auto`).
+
+    Read-only: never sweeps dead entries or reaps their profiles (that is
+    the engine's tick and the next `run --auto`'s job) — this only reads
+    the registry and each session's own status record.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} sessions",
+        description="List live managed sessions started with `cswap run --auto`.",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON to stdout"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.json_output import managed_session_row
+    from claude_swap.managed_sessions import ManagedSessionRegistry, describe_sessions
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        views = describe_sessions(
+            ManagedSessionRegistry(switcher.backup_dir),
+            # Not _get_sequence_data_migrated(): that reader writes
+            # sequence.json back out when it migrates an old shape, and a
+            # listing command must never write anything the user did not
+            # ask it to change (the same read-only rule describe_sessions
+            # itself follows for the registry).
+            switcher._get_sequence_data() or {},
+        )
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+    if args.json:
+        print(json.dumps(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "sessions": [managed_session_row(v) for v in views],
+            },
+            indent=2,
+        ))
+        return
+    if not views:
+        print(dimmed("No managed sessions running. Start one with `cswap run --auto`."))
+        return
+
+    def _account_label(view) -> str:
+        return f"Account-{view.number}" if view.number else "Account-?"
+
+    print(bolded("Managed sessions:"))
+    id_w = max(len(v.entry.session_id) for v in views)
+    pid_w = max(len(str(v.entry.pid)) for v in views)
+    account_w = max(len(_account_label(v)) for v in views)
+    for view in views:
+        state = view.status
+        if view.idle_since_ms is not None:
+            state = f"idle since {format_age(view.idle_since_ms)}"
+        cwd = abbreviate_path(view.cwd) if view.cwd else "-"
+        print(
+            f"  {accent(f'{view.entry.session_id:<{id_w}}')}  "
+            f"PID {view.entry.pid:<{pid_w}}  "
+            f"{_account_label(view):<{account_w}} ({view.entry.account.email})  "
+            f"{state}  {cwd}  "
+            f"{muted(f'reason={view.entry.last_reason} assigned={view.entry.last_assigned_at}')}"
+        )
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1028,6 +1109,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "sessions":
+        _sessions_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1082,6 +1166,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s sessions                   list live managed sessions
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

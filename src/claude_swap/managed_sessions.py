@@ -45,6 +45,7 @@ from pathlib import Path
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.process_detection import (
+    _epoch_ms,
     is_pid_alive,
     pid_matches_record,
     process_start_ticks,
@@ -296,17 +297,20 @@ def entry_is_live(entry: ManagedEntry) -> bool:
 BUSY_STATUS = "busy"
 
 
-def session_status(session_dir: Path, pid: int) -> str | None:
-    """Claude's status for the instance ``pid`` inside a managed profile, or
-    None when it has not written a record yet or the record is unusable.
+def _read_session_record(session_dir: Path, pid: int) -> dict | None:
+    """The raw Claude session record for ``pid``, or None when it has not
+    been written yet or the record is unusable.
 
     Claude keeps one record per instance at ``<config>/sessions/<pid>.json``
-    and restamps ``status`` on every change. This reads the one record the
-    registry entry names rather than scanning the directory
-    (``process_detection.scan_sessions``): the entry's liveness is
-    established by the caller's sweep, so no ``ps`` call is needed here to
-    know whose record this is — the pid is still read back out of the record
-    rather than trusted from the file name.
+    and restamps it on every change. This reads the one record the caller
+    names rather than scanning the directory
+    (``process_detection.scan_sessions``/``session.scan_live_sessions``):
+    every caller here already knows ``pid`` is alive and is the process we
+    stamped (the registry's ``entry_is_live``/``live_entries`` check), so no
+    ``is_pid_alive``/``pid_matches_record`` probe is needed a second time to
+    know whose record this is — the pid is still read back out of the
+    record itself rather than trusted from the file name. Shared by
+    :func:`session_status` and :func:`describe_sessions`.
     """
     try:
         raw = json.loads(
@@ -319,6 +323,15 @@ def session_status(session_dir: Path, pid: int) -> str | None:
         # pass (and with it every account's token push) down with it.
         return None
     if not isinstance(raw, dict) or raw.get("pid") != pid:
+        return None
+    return raw
+
+
+def session_status(session_dir: Path, pid: int) -> str | None:
+    """Claude's status for the instance ``pid`` inside a managed profile, or
+    None when it has not written a record yet or the record is unusable."""
+    raw = _read_session_record(session_dir, pid)
+    if raw is None:
         return None
     status = raw.get("status")
     return status if isinstance(status, str) else None
@@ -831,3 +844,70 @@ class ManagedSessionRegistry:
             if remove_managed_profile(path):
                 removed.append(path.name)
         return removed
+
+
+# 10000-01-01T00:00:00Z in epoch ms — one millisecond-grid step past
+# datetime.max (9999-12-31T23:59:59.999999Z), so it is an exclusive
+# ceiling: describe_sessions below bounds a record's statusUpdatedAt with
+# `<`, never `<=`.
+_MAX_EPOCH_MS = 253_402_300_800_000
+
+
+@dataclass(frozen=True)
+class ManagedSessionView:
+    """One row of ``cswap sessions``: a live managed entry joined with
+    Claude's own record for the instance holding it."""
+
+    entry: ManagedEntry
+    number: str | None      # the identity's current slot, None if removed
+    status: str             # Claude's status; "starting" before it registers
+    cwd: str
+    idle_since_ms: int | None
+
+
+def describe_sessions(
+    registry: ManagedSessionRegistry, sequence_data: dict
+) -> list[ManagedSessionView]:
+    """Live managed sessions joined with Claude's own session records, for
+    ``cswap sessions``. Ordered by ``created_at`` (launch order), oldest
+    first, not by registry storage order (``_write`` sorts by session id).
+
+    Read-only: dead entries are skipped, not removed — a listing must not
+    delete anything the user did not ask it to change, so this calls
+    ``live_entries()`` rather than ``sweep()`` (the engine's tick and the
+    next ``run --auto`` are what reap dead rows and their profiles).
+    ``live_entries()`` already proves each entry's pid alive and
+    unrecycled, so the session record is read directly by that pid
+    (``_read_session_record``) instead of rescanning the profile's
+    ``sessions/`` directory and re-probing every pid there a second time.
+    """
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    views: list[ManagedSessionView] = []
+    for entry in sorted(registry.live_entries(), key=lambda e: e.created_at):
+        raw = _read_session_record(registry.session_dir(entry.session_id), entry.pid)
+        number = ClaudeAccountSwitcher._find_account_slot(
+            sequence_data, entry.account.email, entry.account.organization_uuid
+        )
+        if raw is None:
+            status, cwd, idle_since_ms = "starting", "", None
+        else:
+            status_raw = raw.get("status")
+            status = status_raw if isinstance(status_raw, str) else "unknown"
+            cwd_raw = raw.get("cwd")
+            cwd = cwd_raw if isinstance(cwd_raw, str) else ""
+            idle_since_ms = None
+            if status == "idle":
+                candidate = _epoch_ms(raw.get("statusUpdatedAt"))
+                # _epoch_ms only rejects non-numeric/NaN/<=0 — a unit bug
+                # elsewhere (e.g. nanoseconds instead of milliseconds) can
+                # still hand back a number datetime.fromtimestamp cannot
+                # hold, so bound it here, where the value is produced,
+                # rather than let it reach every consumer downstream.
+                if candidate is not None and candidate < _MAX_EPOCH_MS:
+                    idle_since_ms = candidate
+        views.append(ManagedSessionView(
+            entry=entry, number=number, status=status, cwd=cwd,
+            idle_since_ms=idle_since_ms,
+        ))
+    return views

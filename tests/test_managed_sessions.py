@@ -790,3 +790,78 @@ class TestProfileAndHooks:
 
         assert (per_account / "keep.txt").read_text() == "not ours"
         assert any("Refusing to remove" in r.getMessage() for r in caplog.records)
+
+
+class TestDescribeSessions:
+    SEQUENCE = {"accounts": {"2": {"email": "b@example.com", "organizationUuid": "org-b"}}}
+
+    def test_registered_starting_and_unknown_account(self, registry):
+        registry.allocate("auto-00000001", _always(B), pid=os.getpid(), proc_start=None)
+        d = _make_profile(registry, "auto-00000001")
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "cwd": "/work/app", "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000,
+        }))
+        registry.allocate("auto-00000002", _always(A), pid=os.getpid(), proc_start=None)
+        _make_profile(registry, "auto-00000002")
+
+        views = {v.entry.session_id: v for v in ms.describe_sessions(registry, self.SEQUENCE)}
+
+        first = views["auto-00000001"]
+        assert (first.number, first.status, first.cwd, first.idle_since_ms) == (
+            "2", "idle", "/work/app", 1_758_000_000_000,
+        )
+        second = views["auto-00000002"]
+        assert (second.number, second.status, second.idle_since_ms) == (None, "starting", None)
+
+    def test_dead_entries_are_not_listed_and_not_removed(self, registry, monkeypatch):
+        registry.allocate("auto-00000001", _always(B), pid=DEAD_PID, proc_start=None)
+        monkeypatch.setattr(ms, "is_pid_alive", lambda pid: pid != DEAD_PID)
+        assert ms.describe_sessions(registry, self.SEQUENCE) == []
+        assert "auto-00000001" in registry.entries()
+
+    def test_orders_by_created_at_not_registry_storage_order(self, backup_dir):
+        """The registry stores (and reads back) entries sorted by session id
+        (``_write`` sorts its ``sessions`` map), which is not launch order.
+        Picking ids whose alphabetical order is the reverse of their
+        ``created_at`` order tells the two apart: only a sort keyed on
+        ``created_at`` gets this right."""
+        times = iter([2_000_000_000.0, 1_000_000_000.0])
+        registry = ManagedSessionRegistry(backup_dir, clock=lambda: next(times))
+        registry.allocate("auto-0000aaaa", _always(B), pid=os.getpid(), proc_start=None)
+        registry.allocate("auto-0000bbbb", _always(A), pid=os.getpid(), proc_start=None)
+
+        views = ms.describe_sessions(registry, self.SEQUENCE)
+
+        assert [v.entry.session_id for v in views] == ["auto-0000bbbb", "auto-0000aaaa"]
+
+    def test_non_string_status_and_cwd_read_as_unknown(self, registry):
+        registry.allocate("auto-00000001", _always(B), pid=os.getpid(), proc_start=None)
+        d = _make_profile(registry, "auto-00000001")
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "status": 7, "cwd": 9,
+        }))
+
+        [view] = ms.describe_sessions(registry, self.SEQUENCE)
+
+        assert (view.status, view.cwd) == ("unknown", "")
+
+    def test_out_of_range_status_updated_at_drops_idle_since(self, registry):
+        """A unit bug in Claude's record (statusUpdatedAt in nanoseconds,
+        not milliseconds) must not reach datetime.fromtimestamp downstream
+        (json_output._timestamp) -- describe_sessions bounds it away here,
+        at the point the value is produced, instead."""
+        registry.allocate("auto-00000001", _always(B), pid=os.getpid(), proc_start=None)
+        d = _make_profile(registry, "auto-00000001")
+        (d / "sessions").mkdir()
+        (d / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+            "pid": os.getpid(), "status": "idle",
+            "statusUpdatedAt": 1_758_000_000_000_000_000,  # ns-scale, not ms
+        }))
+
+        [view] = ms.describe_sessions(registry, self.SEQUENCE)
+
+        assert view.status == "idle"
+        assert view.idle_since_ms is None

@@ -9,8 +9,12 @@ the single ``json.dumps`` (see cli.py).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from claude_swap import oauth, pace
+
+if TYPE_CHECKING:
+    from claude_swap.managed_sessions import ManagedSessionView
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -278,6 +282,44 @@ def account_row(
         )
         row.update(usage_failure_fields(status, last_error, backoff_until))
     return row
+
+
+def _slot_number(number: str | None) -> int | None:
+    """``ManagedSessionView.number`` as an int for the JSON row, or None
+    when there is no slot or the registered account no longer has one (see
+    ``account_ref``) — also when the slot key itself is not numeric, which
+    would otherwise raise ``ValueError`` past ``_sessions_command``'s
+    ``ClaudeSwitchError`` handler on a hand-edited ``sequence.json``."""
+    if not number:
+        return None
+    try:
+        return int(number)
+    except ValueError:
+        return None
+
+
+def managed_session_row(view: ManagedSessionView) -> dict:
+    """One ``cswap sessions --json`` row."""
+    entry = view.entry
+    return {
+        "id": entry.session_id,
+        "pid": entry.pid,
+        "account": account_ref(_slot_number(view.number), entry.account.email),
+        "organizationUuid": entry.account.organization_uuid,
+        "source": entry.source,
+        "status": view.status,
+        # None (not "") while the session hasn't registered yet — distinct
+        # from an eventual empty cwd, which Claude does not actually emit.
+        "cwd": view.cwd or None,
+        "idleSince": (
+            _timestamp(view.idle_since_ms / 1000)
+            if view.idle_since_ms is not None
+            else None
+        ),
+        "createdAt": entry.created_at,
+        "lastAssignedAt": entry.last_assigned_at,
+        "lastReason": entry.last_reason,
+    }
 
 
 def error_envelope(exc: Exception) -> dict:
