@@ -7,15 +7,17 @@ import json
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, paths, printer, tls
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import error_envelope
+from claude_swap.json_output import SCHEMA_VERSION, error_envelope
 from claude_swap.printer import (
+    abbreviate_path,
     accent,
     bolded,
     dimmed,
     error,
     force_utf8_output,
+    format_age,
     muted,
     warning,
 )
@@ -98,7 +100,7 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
 
 
 def _run_command(argv: list[str]) -> None:
-    """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
+    """Handle `cswap run NUM|EMAIL|--auto [--no-share] [-- <claude args>]`.
 
     Pre-dispatched before the main parser is built: a positional subcommand
     can't coexist with main()'s mutually-exclusive flag group, and this keeps
@@ -133,6 +135,8 @@ Examples:
   cswap run 2 --share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
+  cswap run --auto
+  cswap run --auto -- --resume
         """,
     )
     parser.add_argument(
@@ -154,7 +158,7 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
@@ -173,15 +177,47 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Pick the account automatically (balance policy) and launch a "
+            "managed session: cswap keeps its token fresh centrally and "
+            "history is always shared with ~/.claude. Not supported on Windows."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
 
+    if args.auto:
+        conflicts = [
+            name
+            for name, present in (
+                ("NUM|EMAIL", args.account is not None),
+                ("--no-share", args.no_share),
+                ("--require-session", args.require_session),
+                ("--no-share-history", args.share_history is False),
+            )
+            if present
+        ]
+        if conflicts:
+            parser.error(
+                f"--auto cannot be combined with {', '.join(conflicts)}; "
+                "use `cswap run NUM` instead"
+            )
+
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
+
+        if args.auto:
+            from claude_swap.managed_launch import run_auto
+
+            run_auto(switcher, tail)
+            return  # only reachable in tests where exec is mocked
 
         from claude_swap.session import SessionManager
 
@@ -192,7 +228,7 @@ Examples:
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=bool(args.share_history),
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -204,7 +240,7 @@ Examples:
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=bool(args.share_history),
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -227,6 +263,170 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+# The verbs `cswap session` dispatches before any other CLI setup. A tuple
+# rather than an if-chain so the usage line and the dispatch cannot drift.
+_HOOK_VERBS = ("ensure", "release")
+
+
+def _session_command(argv: list[str]) -> None:
+    """Handle `cswap session ensure|release`: the hooks a managed session
+    runs, dispatched ahead of every other CLI setup.
+
+    These run inside somebody's Claude Code session — `ensure` on every
+    prompt — so this path does no theme detection (its terminal query would
+    go into Claude's pipe), builds no parser, and prints nothing on the hook
+    verbs. Anything else is a person typing, so that one does print, in the
+    ASCII it is written in: this runs above the output setup, so the message
+    cannot assume the console can render anything else.
+
+    `cswap session` is a character away from `cswap sessions`, and neither
+    it nor its verbs appear in any help output, so the likeliest reader of
+    that message is somebody who meant the other command. It says so, and
+    says what this one is for, rather than offering two verbs nobody should
+    run by hand.
+
+    The exit code is the other half of that. 2 is what Claude Code reads as
+    a blocking hook decision, and every other path here exits 0 by
+    construction; this branch is reachable from a stale or hand-edited
+    ``--settings`` document naming a verb this build no longer has. So the
+    usage error is for a terminal: with stdout attached to one it prints and
+    exits 2 like any other misuse, and otherwise it exits 0 without a word,
+    because the only other caller is a hook whose turn must not be blocked
+    over a spelling.
+
+    The verb body — its import included — is what carries the hooks'
+    fail-open promise here. Each of them swallows everything it can reach,
+    but neither can swallow its own import, and this dispatch runs above
+    ``main``'s try. A broken install — a half-written module, a dependency
+    the interpreter cannot load — would otherwise take that exit code
+    straight back to Claude, and what that costs depends on the event:
+    ``ensure`` runs on ``UserPromptSubmit``, where a non-zero exit blocks
+    the turn the user just started, and ``release`` on ``SessionEnd``,
+    where it reports a failure nobody asked about in a session that is
+    already over. Neither is acceptable, so both verbs go through the same
+    guard; neither is dispatched outside it.
+    """
+    verb = argv[0] if argv else ""
+    # `len(argv) == 1`: the verbs take nothing, and quietly running the hook
+    # while dropping the rest would hide a typo in a flag somebody adds
+    # later. An argument they do not know is a usage error like any other.
+    if verb in _HOOK_VERBS and len(argv) == 1:
+        try:
+            from claude_swap import session_hooks
+
+            code = getattr(session_hooks, verb)()
+        except BaseException:  # noqa: BLE001 - fail open, unconditionally
+            code = 0
+        sys.exit(code)
+    if not _stdout_is_a_terminal():
+        sys.exit(0)
+    # A literal, not `_prog_name()`: that is `sys.argv[0]`, which can hold
+    # anything, and this runs above `force_utf8_output()` — so a console
+    # that cannot encode it would turn this message into a traceback. The
+    # verbs are ASCII by construction, and so is the rest of this.
+    error(
+        "Usage: cswap session {" + "|".join(_HOOK_VERBS) + "}\n"
+        "`cswap session` is internal: `cswap run --auto` registers these "
+        "verbs as Claude Code\nhooks inside each managed session, and they "
+        "take no arguments of their own.\nDid you mean `cswap sessions`, "
+        "which lists the managed sessions you have running?"
+    )
+    sys.exit(2)
+
+
+def _stdout_is_a_terminal() -> bool:
+    """Whether stdout is attached to a terminal, without ever raising.
+
+    A detached or closed stdout answers by raising rather than returning
+    False, and this decides an exit code on a path whose whole promise is
+    that it does not fail — so anything but a clear yes counts as "not a
+    person", which is the side that exits 0.
+    """
+    try:
+        return bool(sys.stdout is not None and sys.stdout.isatty())
+    except Exception:  # noqa: BLE001 - a stdout that cannot answer is a no
+        return False
+
+
+def _sessions_command(argv: list[str]) -> None:
+    """Handle `cswap sessions [--json]`: list live managed sessions
+    (started with `cswap run --auto`).
+
+    Read-only: never sweeps dead entries or reaps their profiles (that is
+    the engine's tick and the next `run --auto`'s job) — this only reads
+    the registry and each session's own status record.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} sessions",
+        description="List live managed sessions started with `cswap run --auto`.",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON to stdout"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.json_output import managed_session_row
+    from claude_swap.managed_sessions import ManagedSessionRegistry, describe_sessions
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        views = describe_sessions(
+            ManagedSessionRegistry(switcher.backup_dir),
+            # Not _get_sequence_data_migrated(): that reader writes
+            # sequence.json back out when it migrates an old shape, and a
+            # listing command must never write anything the user did not
+            # ask it to change (the same read-only rule describe_sessions
+            # itself follows for the registry).
+            switcher._get_sequence_data() or {},
+        )
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+    if args.json:
+        print(json.dumps(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "sessions": [managed_session_row(v) for v in views],
+            },
+            indent=2,
+        ))
+        return
+    if not views:
+        print(dimmed("No managed sessions running. Start one with `cswap run --auto`."))
+        return
+
+    def _account_label(view) -> str:
+        return f"Account-{view.number}" if view.number else "Account-?"
+
+    print(bolded("Managed sessions:"))
+    id_w = max(len(v.entry.session_id) for v in views)
+    pid_w = max(len(str(v.entry.pid)) for v in views)
+    account_w = max(len(_account_label(v)) for v in views)
+    for view in views:
+        state = view.status
+        if view.idle_since_ms is not None:
+            state = f"idle since {format_age(view.idle_since_ms)}"
+        cwd = abbreviate_path(view.cwd) if view.cwd else "-"
+        print(
+            f"  {accent(f'{view.entry.session_id:<{id_w}}')}  "
+            f"PID {view.entry.pid:<{pid_w}}  "
+            f"{_account_label(view):<{account_w}} ({view.entry.account.email})  "
+            f"{state}  {cwd}  "
+            f"{muted(f'reason={view.entry.last_reason} assigned={view.entry.last_assigned_at}')}"
+        )
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -664,12 +864,13 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "balance"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'balance' (when switching, pick the account "
+            "furthest behind an even weekly schedule)"
         ),
     )
     parser.add_argument(
@@ -890,31 +1091,6 @@ Examples:
         sys.exit(130)
 
 
-def _use_native_tls() -> None:
-    """Route TLS trust decisions through the OS-native verifier.
-
-    Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
-    chain. Python's stdlib ``ssl`` uses OpenSSL, which on Windows loads the
-    system cert store as a flat set and matches CA certs by *subject name*, so a
-    stale, expired duplicate of an intermediate (e.g. an old ``ISRG Root X2``
-    left in the user's store) can shadow the valid path and fail verification
-    with "certificate has expired" even though the served chain is valid — which
-    silently breaks inactive-account token refresh. The OS-native verifiers
-    (SChannel on Windows, SecureTransport on macOS) build the chain correctly
-    and don't trip on the expired duplicate — the same reason Claude Code (Node,
-    with its own bundled roots) is unaffected. ``truststore`` delegates to them.
-
-    Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety.
-    """
-    try:
-        import truststore
-
-        truststore.inject_into_ssl()
-    except Exception:
-        pass
-
-
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -975,9 +1151,23 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
-    force_utf8_output()
-    _use_native_tls()
     argv = sys.argv[1:]
+    # First, before anything else in this function: the managed-session
+    # hooks run on every prompt of every managed session, and the theme
+    # probe below can write a terminal query that would land in Claude
+    # Code's pipe. Dispatching here skips the shared setup underneath as
+    # well, which is the one place in this CLI where that happens. The
+    # hook verbs print nothing, so the output setup buys them nothing
+    # (the unknown-verb usage error underneath does print, and is ASCII
+    # by construction); and the native TLS verifier is installed by
+    # `session_hooks.run_ensure` itself, on the far side of its gate,
+    # where the one path that can open a connection lives — `release`
+    # opens none.
+    if argv and argv[0] == "session":
+        _session_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    force_utf8_output()
+    tls.use_native_tls()
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -993,6 +1183,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "sessions":
+        _sessions_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1047,6 +1240,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s sessions                   list live managed sessions
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

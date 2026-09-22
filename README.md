@@ -91,6 +91,7 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
+cswap auto --strategy balance         # keep every account's week on schedule
 ```
 
 <details>
@@ -98,7 +99,9 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
-- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `balance` switches exactly when `best` does, but picks the account that is furthest **behind an even weekly schedule** — so every account's weekly quota gets spent shortly before its own reset instead of one account being drained while the rest sit idle, and several accounts keep 5-hour headroom at the same time.
+  - **How `balance` scores:** among the accounts that clear the usual health checks — below the threshold, better than the current account by the hysteresis margin, and not the one you just switched away from — each account's on-schedule target is `min(100, 100 × elapsed / (7 days − lead))`, where `elapsed` is the time since its weekly window started; `slack = target − weekly %` (positive = behind schedule). An account is then set aside if its projected 5-hour usage would reach `autoswitch.balanceFiveHourCeiling` (default 85), or its weekly or `--model` window is already at the threshold; whatever remains is ranked by `slack − balanceFiveHourWeight × projected 5-hour %`, highest first. If nothing qualifies, `balance` falls back to whichever surviving account's limiting window comes back soonest, so it never refuses to move while any account still has room. The threshold, cooldown, and the "every account above the threshold" fallback all work the same as for `best`.
+  - **Tuning** (`cswap config set …`): `autoswitch.balanceLeadHours` (default 24, 0–96) — finish each week this many hours before its reset; `autoswitch.balanceFiveHourCeiling` (default 85, 10–100); `autoswitch.balanceFiveHourWeight` (default 0.5, 0–5) — how strongly an emptier 5-hour window is preferred; `autoswitch.balanceLoadPerSession` (default 15, 0–100) — 5-hour % each busy Claude Code session is assumed to add, which is what keeps several [managed sessions](#balanced-managed-sessions-cswap-run---auto) from piling onto the same account.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -162,6 +165,38 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Balanced managed sessions (`cswap run --auto`)
+
+Let cswap pick the account for each new terminal, so parallel sessions spread across your accounts instead of all burning one 5-hour window:
+
+```bash
+cswap run --auto                # launch Claude Code on the best account right now
+cswap run --auto -- --resume    # everything after '--' is forwarded to claude
+cswap sessions                  # list running managed sessions
+cswap sessions --json           # same, machine-readable
+```
+
+- A managed session never lands on your default login's account while another account can take it. Among the rest, cswap picks whichever account the weekly schedule says is furthest behind — the same target-vs-actual formula the `balance` autoswitch strategy uses (see above) — with room left in its current 5-hour window; every busy session already placed on an account counts against that room, including one still starting up (Claude hasn't recorded a status for it yet) — an idle one doesn't. If no account is clear of both thresholds, the session goes to whichever one's quota frees up soonest. Quarantined accounts, API-key accounts, and any account that already has its own live `cswap run N` session are never candidates.
+- Only when nothing else can take the session — every other account is at its limit or its usage can't be read — does a managed session fall back to your default login, borrowing a read-only copy of its current access token; it never touches its refresh token. While it holds that copy it re-checks at most once a minute, not on every prompt, that the login hasn't rotated the token underneath it.
+- `--auto` can't be combined with an explicit `NUM|EMAIL`, `--no-share`, `--require-session`, or `--no-share-history`: a managed session always shares settings, keybindings, CLAUDE.md, skills, commands, agents, MCP servers and chat history with `~/.claude`, the same as `cswap run NUM --share-history`, so `--resume` shows the same conversations whichever account a session lands on.
+- A managed session keeps itself working, with or without a daemon. On every prompt you submit — including the ones where it finds nothing to do, at about 0.1s each, almost all of it Python starting up — it replaces its own access token if that token is within ten minutes of expiring, and it moves itself off an account that has hit a limit or that `cswap auto` has quarantined. `cswap auto` (or the menu bar app's auto-switch, which runs the same engine) does both for every managed session on each of its checks, so a session that has either one keeps working.
+- The half a session does for itself depends on Claude Code hooks, which cswap registers **when the session launches**: a session that was already running when you upgraded keeps the old behaviour until you start a new one. Hooks don't run if Claude Code is in safe mode (`--safe-mode`), if `disableAllHooks` is set in whichever settings file applies (yours, the project's, or your organization's), or if your organization's managed settings set `allowManagedHooksOnly`. A session in one of those depends on `cswap auto` as before.
+- A running session can change account. It moves as soon as the account it's on is out of quota — at the moment you press enter, or on `cswap auto`'s next check, even mid-turn, since a session on an exhausted account can't work anyway. Balancing moves are the daemon's alone and wait for quiet: the session must have been idle for `sessions.idleReassignMinutes` (default 60) and another account must score `sessions.reassignMargin` (default 15) better on the balance scale, because moving a session invalidates its prompt cache and after an hour idle that cache has expired on its own. `autoswitch.cooldownSeconds` (default 300) bounds how often `cswap auto` will try to move the same session.
+- Nothing changes inside the session when it moves: Claude picks the new token up on its next request, and your conversation, transcript and `--resume` history are untouched — history is shared with `~/.claude`, so the same conversation continues on whichever account the session is now on. A move that lands mid-turn doesn't rescue the reply in flight, which still hits the old account's limit; what you send after it goes out on the new account. `cswap sessions` shows where the session went and why (`lastAssignedAt`, `lastReason`), and so do `cswap auto`'s log and `--json` stream (a `session-reassigned` event), the dashboard's auto view and the menu bar.
+- When a session exits it hands the account back itself — registry row, profile directory and, on macOS, its Keychain item — so the next `cswap run --auto` can place onto that account right away. If something else is still working inside the profile (a background process that inherited `CLAUDE_CONFIG_DIR`), the directory is left where it is. A session killed outright, or one whose hooks never ran, is reclaimed instead by `cswap auto`'s next check or the next `cswap run --auto`.
+- macOS and Linux only for now; on Windows use `cswap run NUM`.
+
+`cswap sessions` lists each live session's id, pid, account, and Claude's own status (`starting` before it registers, `busy`, or `idle since …`), plus its working directory and when/why it was placed there. `--json` emits `{"schemaVersion": 1, "sessions": [...]}`, one object per session with `id`, `pid`, `account` (`{number, email}`), `organizationUuid`, `source` (`"backup"`, or `"lane0"` for a session borrowing the default login's token), `status`, `cwd`, `idleSince`, `createdAt`, `lastAssignedAt`, and `lastReason`.
+
+The [dashboard](#interactive-dashboard-tui), `cswap watch` and the [menu bar](#menu-bar-macos) show how many managed sessions each account is carrying, beside its usage. That count can run high when no daemon is running: a session that was killed outright keeps counting until something sweeps it — which only `cswap auto` and the next `cswap run --auto` do — and so does a row whose PID the system has since handed to something unrelated. The menu bar can be refreshing as rarely as every five minutes on top of that. `cswap sessions` is the reliable answer.
+
+The idle rule for balancing moves has two settings of its own:
+
+```bash
+cswap config set sessions.idleReassignMinutes 30   # 5–1440
+cswap config set sessions.reassignMargin 25        # 0–100
+```
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -182,6 +217,8 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap run --auto                # Launch a managed session on the balance-picked account
+cswap sessions                  # List running managed sessions
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
@@ -220,6 +257,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
+- Managed sessions (`cswap run --auto`) hold an access token only — never a refresh token. Each one checks its own on every prompt you submit and replaces it once it is within ten minutes of expiring, and `cswap auto` does the same for all of them on each of its checks; where Claude Code runs hooks, either one alone keeps them working ([details](#balanced-managed-sessions-cswap-run---auto))
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 
 ## Data locations
@@ -230,7 +268,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`; managed sessions (`cswap run --auto`) live alongside them in `sessions/<id>/` (ids look like `auto-1a2b3c4d`) and are tracked in `sessions/managed.json`. Each managed profile also holds the `--settings` document Claude Code is launched with, which is where its two hooks are registered, and small dot-file stamps recording when it last re-checked a borrowed token and last considered a move. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — quarantined accounts, the switch cooldown, a per-session move cooldown, and the claims that stop two engines moving the same session at once; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -274,6 +312,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.strategy balance  # spend every account's week on schedule (see "auto")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

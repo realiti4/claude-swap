@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
 import os
 import re
 import shutil
@@ -69,7 +68,6 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
-    error,
     format_age,
     ide_short_name,
     muted,
@@ -690,8 +688,10 @@ class ClaudeAccountSwitcher:
         profile's possibly-stale plaintext seed — and rather than reaching the
         fallbacks below, which belong to other stores entirely.
 
-        Read-only. cswap does not write claude's hashed keychain entry — see
-        the ``session`` module docstring for why.
+        Read-only. cswap writes claude's hashed keychain entry only for
+        managed ``auto-*`` profiles, through
+        ``session_credentials.write_session_credential`` — see the ``session``
+        module docstring for why no other profile's.
         """
         from claude_swap.session import read_config_dir_credentials
 
@@ -1747,6 +1747,7 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
+        session_counts = self._managed_session_counts(seq_data)
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -1765,6 +1766,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    managed_sessions=session_counts.get(n, 0),
                 )
             )
         return AccountsSnapshot(
@@ -1772,6 +1774,38 @@ class ClaudeAccountSwitcher:
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
         )
+
+    def _managed_session_counts(self, seq_data: dict) -> dict[str, int]:
+        """Managed sessions per slot number, for the display surfaces.
+
+        One pass per snapshot, not one per account: the registry is read
+        once and the slot lookup runs once per ACCOUNT that has sessions,
+        rather than once per session or once per slot.
+
+        Never raises, and the whole of it is inside that promise — the slot
+        lookup included, which walks a sequence file this process did not
+        write and assumes a shape it may not have. A registry this build
+        cannot read, a sessions root that is not there at all, a row whose
+        account no longer maps to a slot — each of those is "no count", not
+        a snapshot the TUI, the watch page and the menu bar all fail to
+        build. The count is a decoration on a display; nothing decides
+        anything with it.
+        """
+        from claude_swap.managed_sessions import ManagedSessionRegistry
+
+        counts: dict[str, int] = {}
+        try:
+            by_account = ManagedSessionRegistry(self.backup_dir).counts_by_account()
+            for account, count in by_account.items():
+                number = self._find_account_slot(
+                    seq_data, account.email, account.organization_uuid
+                )
+                if number is not None:
+                    counts[number] = counts.get(number, 0) + count
+        except Exception as e:  # noqa: BLE001 - a display must not fail on this
+            self._logger.debug(f"Managed session counts unavailable: {e}")
+            return {}
+        return counts
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
@@ -2093,6 +2127,134 @@ class ClaudeAccountSwitcher:
             )
         finally:
             consume_lock.release()
+
+    def freshen_backup_credential(
+        self, account_num: str, email: str, *, now_ms: float, buffer_ms: int
+    ) -> tuple[str, str | None]:
+        """A slot's backup credential, freshened through the consume gate.
+
+        The stored credential is returned as is while its access token
+        outlives ``now_ms + buffer_ms``; otherwise (a missing or empty access
+        token counts as expired) its refresh token is
+        consumed via :meth:`consume_backup_grant` (which persists the
+        successor under its own lock). Shared by the auto-switch engine's
+        freshen and the managed-session token push, so both map the gate's
+        outcomes identically.
+
+        Returns ``(status, credentials)``; ``credentials`` is the slot's
+        current full credential JSON when status is ``"ok"``, else None.
+        Statuses:
+
+        - ``"ok"``
+        - ``"no-backup"`` — the slot stores no credential at all (removed
+          between reads, or never captured); retrying cannot produce one
+        - ``"invalid_grant"`` — dead lineage: no parseable OAuth data, the
+          grant was rejected, or there is no refresh token to consume
+        - ``"identity-conflict"`` — the grant is alive but authenticates as a
+          different account than the slot records
+        - one of ``oauth._DETERMINISTIC_REFRESH_ERRORS`` verbatim
+          (``store-unmirrored``, ``invalid_client``, ``consume-busy``,
+          ``stash-unreadable``) — systemic refusals that name their own cause
+        - ``"transient"`` — anything else; try again later
+
+        Store reads and the gate raise ``ClaudeSwitchError`` as they always
+        do; that propagates. The caller must NOT hold ``self.lock_file``.
+        """
+        creds = self.read_account_credentials(account_num, email)
+        if not creds:
+            return "no-backup", None
+        data = oauth.extract_oauth_data(creds)
+        if not data:
+            return "invalid_grant", None
+        expires_at = data.get("expiresAt")
+        access_token = data.get("accessToken")
+        # No access token means nothing to activate or copy, whatever
+        # expiresAt says (a refresh-only credential usually carries none):
+        # treat it as expired so the grant is consumed for one.
+        near_expiry = (
+            not isinstance(access_token, str)
+            or not access_token
+            or (
+                isinstance(expires_at, (int, float))
+                and now_ms + buffer_ms >= expires_at
+            )
+        )
+        if not near_expiry:
+            return "ok", creds
+        # The consume gate serializes every backup-rt POST (the recovery
+        # branch in `_fetch_active_usage` is a second call site, under the
+        # same per-slot consume lock):
+        # it re-reads under the slot lock (our snapshot may be superseded),
+        # consults the session profile for a newer generation, and persists
+        # via fingerprint CAS — so a freshen racing the collector (or a
+        # sibling surface) can no longer double-consume one grant.
+        outcome = self.consume_backup_grant(account_num, email, creds)
+        if outcome.error is None and outcome.credentials:
+            # The gate already persisted the successor (or adopted a racing
+            # writer's newer lineage) under its own lock.
+            if self._token_identity_conflicts(account_num, outcome.token_account):
+                # The slot's stored credential authenticates as a *different*
+                # account — handing it out would put the user on the wrong
+                # account with every gauge reading normal. Not usable; the
+                # caller quarantines or refuses it (released automatically
+                # once the credential is replaced by a re-add).
+                return "identity-conflict", None
+            return "ok", outcome.credentials
+        if outcome.error in ("invalid_grant", "no_refresh_token"):
+            return "invalid_grant", None
+        if outcome.error in oauth._DETERMINISTIC_REFRESH_ERRORS:
+            # Deterministic conditions, not network trouble: every slot
+            # refuses identically and keeps refusing until something outside
+            # this process changes — the shell for store-unmirrored (an
+            # inherited CLAUDE_SECURESTORAGE_CONFIG_DIR), our OAuth client
+            # registration for invalid_client. Reported distinctly so callers
+            # name the real cause instead of "(network?)", which would send
+            # the user to check a connection that is fine.
+            return outcome.error, None
+        return "transient", None
+
+    def _token_identity_conflicts(
+        self, account_num: str, token_account: dict | None
+    ) -> bool:
+        """Use the token endpoint's free identity to verify/backfill a slot.
+
+        The refresh grant just ran against the slot's own stored credential,
+        so ``token_account`` (when the server includes it) names who that
+        credential really is. Returns True on a *conflict*: the credential
+        authenticates under a different organization than the slot records
+        (org compared first, whenever both sides record one), or as a
+        different account uuid. An empty slot uuid (blank-uuid records from
+        older versions, add-token placeholders) is backfilled — but only
+        when no org conflict exists: a wrong-org credential is evidence the
+        slot holds the wrong account, and backfilling *its* uuid would
+        poison the slot's identity record (backfill never rewrites a
+        non-empty uuid, so that corruption would be sticky).
+
+        ``_parse_token_account`` already enforces a strict boundary, but this
+        identity is opportunistic — re-check types here so malformed data can
+        never break the freshen that carried it (the successor credential is
+        already persisted by the time this runs).
+        """
+        if not isinstance(token_account, dict):
+            return False
+        ta_uuid = token_account.get("uuid")
+        if not isinstance(ta_uuid, str) or not ta_uuid.strip():
+            return False
+        ta_uuid = ta_uuid.strip()
+        slot_identity = self.account_identity(account_num)
+        ta_org = token_account.get("organizationUuid")
+        slot_org = slot_identity.get("organizationUuid") or ""
+        if isinstance(ta_org, str) and ta_org and slot_org and ta_org != slot_org:
+            return True
+        if not slot_identity.get("uuid"):
+            try:
+                self.backfill_account_uuid(account_num, ta_uuid)
+            except Exception as e:  # never let bookkeeping break a freshen
+                self._logger.debug(
+                    "uuid backfill failed for account %s: %r", account_num, e
+                )
+            return False
+        return slot_identity["uuid"] != ta_uuid
 
     def _consume_backup_grant_locked(
         self, account_num: str, email: str, snapshot: str
@@ -7296,35 +7458,67 @@ class ClaudeAccountSwitcher:
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
-        sessions_root = self.backup_dir / "sessions"
-        session_dirs = (
-            [d for d in sessions_root.iterdir() if d.is_dir()]
-            if sessions_root.is_dir()
-            else []
+        from claude_swap.managed_sessions import (
+            ManagedSessionRegistry,
+            is_managed_session_id,
+            sessions_root,
         )
         from claude_swap.session import scan_live_sessions
 
-        live = {}
-        unreadable = {}
+        root = sessions_root(self.backup_dir)
+        session_dirs = (
+            [d for d in root.iterdir() if d.is_dir()] if root.is_dir() else []
+        )
+
+        live: dict[str, list[int]] = {}
+        unreadable: dict[str, int] = {}
         for d in session_dirs:
             sessions, bad = scan_live_sessions(d)
             if sessions:
                 live[d.name] = [s.pid for s in sessions]
             elif bad:
                 unreadable[d.name] = bad
+        # A managed session is live from the moment its registry entry is
+        # written -- BEFORE exec, let alone before Claude writes its first
+        # `sessions/<pid>.json` record -- so `scan_live_sessions` above sees
+        # nothing for the gap between them. Fold the registry's own liveness
+        # signal in too, or that gap is a window where purge deletes a
+        # profile whose process is running.
+        registry = ManagedSessionRegistry(self.backup_dir)
+        for entry in registry.live_entries():
+            pids = live.setdefault(entry.session_id, [])
+            if entry.pid not in pids:
+                pids.append(entry.pid)
         if live:
             details = "; ".join(
                 f"{name} (PID {', '.join(map(str, pids))})"
                 for name, pids in live.items()
             )
+            hint = (
+                " Run `cswap sessions` to see each managed session's cwd."
+                if any(is_managed_session_id(name) for name in live)
+                else ""
+            )
             raise SessionError(
                 f"Live session-mode Claude instance(s) found: {details}. "
-                "Exit them first, then retry --purge."
+                f"Exit them first, then retry --purge.{hint}"
             )
-        if unreadable:
-            details = "; ".join(
+        # A corrupt or unreadable managed.json degrades to "no managed
+        # sessions" for the registry's polling callers -- right for them,
+        # wrong here: it would read a live managed session as absent and
+        # purge would then rmtree its profile and Keychain item out from
+        # under it, same hazard as an unreadable per-session record below.
+        registry_unreadable = registry.unreadable_reason()
+        if unreadable or registry_unreadable is not None:
+            details_parts = [
                 f"{name} ({n} record(s))" for name, n in unreadable.items()
-            )
+            ]
+            if registry_unreadable is not None:
+                details_parts.append(
+                    f"the managed session registry {registry.path} "
+                    f"({registry_unreadable})"
+                )
+            details = "; ".join(details_parts)
             raise SessionError(
                 f"Session records that could not be read: {details}. Whether a "
                 "Claude instance is live cannot be determined, and purging "

@@ -120,6 +120,24 @@ class AccountInfo:
         }
 
 
+def session_count_label(count: int) -> str:
+    """``"2 sessions"`` for a display, empty for an account with none.
+
+    The one place this string is spelled. The TUI re-exports it through
+    ``tui.widgets`` and the menu bar imports it directly — it lives here
+    because this module pulls in neither rich nor textual, and the menu bar
+    must not pull them into its process (see ``tui/__init__``, which keeps
+    those imports inside ``run``).
+
+    Zero renders as nothing rather than as "0 sessions": a count that could
+    not be taken arrives here as 0 as well, and an absence is the honest way
+    to show "no information".
+    """
+    if count <= 0:
+        return ""
+    return f"{count} session{'' if count == 1 else 's'}"
+
+
 @dataclass(frozen=True)
 class AccountSnapshot:
     """One managed account as seen by interactive UIs (the TUI).
@@ -140,6 +158,12 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Live managed sessions (`cswap run --auto`) placed on this account. Live,
+    # not busy: the question a display answers is "how much of my parallel
+    # work is on this account", which an idle session is still part of. A
+    # count nobody could take reads as 0 here, and 0 renders as nothing at
+    # all — never as "0 sessions", which would be a claim.
+    managed_sessions: int = 0
 
     @property
     def display_tag(self) -> str:

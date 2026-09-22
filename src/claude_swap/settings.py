@@ -47,7 +47,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset), or
+    # "balance" (the account furthest behind its weekly schedule; balance.py).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +59,18 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Balance strategy knobs (balance.py; read only when strategy == "balance").
+    # lead: finish each weekly window this many hours before it resets, so
+    # the on-schedule target reaches 100% a little early rather than exactly
+    # at the reset. ceiling: skip an account whose projected 5h utilization
+    # (its 5h pct plus load_per_session for each busy session on it) would
+    # reach this. weight: score penalty per projected 5h point, so of two
+    # equally behind-schedule accounts the one with the emptier 5h window
+    # wins.
+    balance_lead_hours: float = 24.0
+    balance_five_hour_ceiling: float = 85.0
+    balance_five_hour_weight: float = 0.5
+    balance_load_per_session: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -67,7 +81,32 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class SessionsSettings:
+    """Managed-session policy knobs (``sessions`` section).
+
+    ``idle_reassign_minutes`` is how long a managed session must have been
+    idle before it may be moved to a better account. Moving a session
+    invalidates its prompt cache, so the floor is the SHORTEST cache
+    lifetime -- five minutes, the default -- rather than zero: under it a
+    move is certain to throw away a live cache, buying a little balance and
+    paying for a full uncached re-read of the conversation on the next
+    turn. Above it the cache may or may not still be there (an hour is the
+    longest lifetime available), which is a trade worth offering rather
+    than one worth forbidding.
+    ``reassign_margin`` is how much better the target's balance score must
+    be for an idle move to be worth making at all.
+    """
+
+    idle_reassign_minutes: float = 60.0
+    reassign_margin: float = 15.0
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "sessions": SessionsSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -79,9 +118,9 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "ui", "sessions")
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
+    field: str  # snake_case field on that section's settings dataclass
     kind: str  # "float" | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
@@ -120,7 +159,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "balance"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -135,9 +174,45 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
+        # Upper lead bound 96h keeps the effective schedule at >= 3 days of
+        # the 7-day window; a ceiling below 10% would exclude nearly every
+        # account; a weight above 5 lets the 5h term swamp weekly slack.
+        SettingSpec(
+            "autoswitch", "balanceLeadHours", "balance_lead_hours", "float", 0.0, 96.0,
+            help="balance: aim to finish each weekly window this many hours before reset",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceFiveHourCeiling", "balance_five_hour_ceiling", "float",
+            10.0, 100.0,
+            help="balance: skip accounts whose projected 5h pct reaches this",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceFiveHourWeight", "balance_five_hour_weight", "float",
+            0.0, 5.0,
+            help="balance: score penalty per projected 5h pct",
+        ),
+        SettingSpec(
+            "autoswitch", "balanceLoadPerSession", "balance_load_per_session", "float",
+            0.0, 100.0,
+            help="balance: 5h pct each busy session is assumed to add",
+        ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        # Floor 5 minutes: that is the SHORTEST prompt-cache lifetime and
+        # the default one, so under it a move is certain to cost a full
+        # uncached re-read of the conversation, which is the cost this delay
+        # exists to avoid. Ceiling one day — past that the rule never fires
+        # in a working day.
+        SettingSpec(
+            "sessions", "idleReassignMinutes", "idle_reassign_minutes", "float",
+            5.0, 1440.0,
+            help="Move an idle managed session to a better account after this many minutes",
+        ),
+        SettingSpec(
+            "sessions", "reassignMargin", "reassign_margin", "float", 0.0, 100.0,
+            help="An idle move needs this much more balance score on the target",
         ),
     )
 }
@@ -146,6 +221,12 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
     spec.field: spec.json_key
     for spec in SETTING_SPECS.values()
     if spec.section == "autoswitch"
+}
+
+_SESSIONS_KEYS: dict[str, str] = {
+    spec.field: spec.json_key
+    for spec in SETTING_SPECS.values()
+    if spec.section == "sessions"
 }
 
 
@@ -167,8 +248,9 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped_section(settings, section: str):
+    """Clamp one section's values into the SETTING_SPECS ranges; bad types →
+    the default. Returns a new instance of ``settings``' own class."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -177,7 +259,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "autoswitch":
+        if spec.section != section:
             continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
@@ -197,7 +279,11 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
+
+
+def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
+    return _clamped_section(settings, "autoswitch")
 
 
 def _read_raw(path: Path) -> dict:
@@ -246,6 +332,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_session_settings(backup_root: Path) -> SessionsSettings:
+    """Load the sessions section; missing/corrupt file or fields → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("sessions")
+    if not isinstance(section, dict):
+        return SessionsSettings()
+    kwargs = {}
+    for field, json_key in _SESSIONS_KEYS.items():
+        if json_key in section:
+            kwargs[field] = section[json_key]
+    try:
+        loaded = SessionsSettings(**kwargs)
+    except TypeError:
+        loaded = SessionsSettings()
+    return _clamped_section(loaded, "sessions")
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +515,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "sessions": load_session_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
