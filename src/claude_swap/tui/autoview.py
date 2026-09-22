@@ -30,7 +30,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountsSnapshot, session_count_label
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
@@ -320,6 +320,14 @@ class AutoScreen(Screen):
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
+            # The managed load, on the line where it informs the choice: an
+            # account at 20% already carrying three sessions is a different
+            # proposition from an empty one at the same number, and this
+            # panel draws the full card for the ACTIVE account only, so
+            # nothing else on this screen says it.
+            sessions = session_count_label(acc.managed_sessions)
+            if sessions:
+                entry.append(f"  {sessions}", style=palette.muted)
             lines[acc.number] = entry
 
         text = Text()

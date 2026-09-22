@@ -1747,6 +1747,7 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
+        session_counts = self._managed_session_counts(seq_data)
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -1765,6 +1766,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    managed_sessions=session_counts.get(n, 0),
                 )
             )
         return AccountsSnapshot(
@@ -1772,6 +1774,38 @@ class ClaudeAccountSwitcher:
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
         )
+
+    def _managed_session_counts(self, seq_data: dict) -> dict[str, int]:
+        """Managed sessions per slot number, for the display surfaces.
+
+        One pass per snapshot, not one per account: the registry is read
+        once and the slot lookup runs once per ACCOUNT that has sessions,
+        rather than once per session or once per slot.
+
+        Never raises, and the whole of it is inside that promise — the slot
+        lookup included, which walks a sequence file this process did not
+        write and assumes a shape it may not have. A registry this build
+        cannot read, a sessions root that is not there at all, a row whose
+        account no longer maps to a slot — each of those is "no count", not
+        a snapshot the TUI, the watch page and the menu bar all fail to
+        build. The count is a decoration on a display; nothing decides
+        anything with it.
+        """
+        from claude_swap.managed_sessions import ManagedSessionRegistry
+
+        counts: dict[str, int] = {}
+        try:
+            by_account = ManagedSessionRegistry(self.backup_dir).counts_by_account()
+            for account, count in by_account.items():
+                number = self._find_account_slot(
+                    seq_data, account.email, account.organization_uuid
+                )
+                if number is not None:
+                    counts[number] = counts.get(number, 0) + count
+        except Exception as e:  # noqa: BLE001 - a display must not fail on this
+            self._logger.debug(f"Managed session counts unavailable: {e}")
+            return {}
+        return counts
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file

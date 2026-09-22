@@ -81,6 +81,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    managed_sessions: int = 0,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -93,6 +94,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        managed_sessions=managed_sessions,
     )
 
 
@@ -1495,6 +1497,32 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_carry_their_managed_load(self, tmp_path, fake_engine):
+        """This panel draws the full card for the ACTIVE account only, so
+        without this the one place a user chooses between accounts is the
+        one place their managed load is invisible — and an account at 20%
+        already carrying three sessions is a different proposition from an
+        empty one at the same number."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(20.0, 10.0), managed_sessions=3),
+                make_account(3, entry=make_entry(15.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "3 sessions" in plain
+            # Nothing for an account carrying none: a stated zero would be a
+            # claim about a count that may simply not have been taken.
+            assert "0 session" not in plain
+
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
     ):
@@ -1726,3 +1754,54 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestSessionCountLabel:
+    """The one string that says how many managed sessions an account has.
+
+    It lives in `models`, not in `widgets`, because the menu bar renders the
+    same thing and must not import rich or textual to do it — `tui/__init__`
+    keeps those imports inside `run` so the plain CLI paths never pay for
+    them. `widgets` re-exports it, which is how both surfaces stay in
+    agreement about the wording.
+    """
+
+    @staticmethod
+    def _label(count):
+        from claude_swap.tui.widgets import session_count_label
+
+        return session_count_label(count)
+
+    def test_none_renders_nothing(self):
+        assert self._label(0) == ""
+
+    def test_a_count_nobody_could_take_renders_nothing_either(self):
+        """An unreadable registry arrives here as 0, and "0 sessions" would be
+        a claim about an account that may well have three. Absence is the
+        honest rendering of "no information"."""
+        assert self._label(-1) == ""
+
+    def test_one_is_singular(self):
+        assert self._label(1) == "1 session"
+
+    def test_many_are_plural(self):
+        assert self._label(3) == "3 sessions"
+
+    def test_the_card_shows_the_count(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        acc = make_account("2", managed_sessions=2)
+        assert "2 sessions" in account_card_text(acc, 100).plain
+
+    def test_the_mini_line_shows_the_count(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        acc = make_account("2", managed_sessions=1)
+        assert "1 session" in mini_account_text(acc, now=1_000_000.0).plain
+
+    def test_an_account_with_no_sessions_says_nothing(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = make_account("2", managed_sessions=0)
+        assert "session" not in account_card_text(acc, 100).plain
+        assert "session" not in mini_account_text(acc, now=1_000_000.0).plain

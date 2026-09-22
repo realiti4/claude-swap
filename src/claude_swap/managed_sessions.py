@@ -511,6 +511,22 @@ def entry_is_live(entry: ManagedEntry, *, timeout: float = PS_TIMEOUT_S) -> bool
 BUSY_STATUS = "busy"
 
 
+def _tally_by_account(
+    entries: Iterable[ManagedEntry], keep: Callable[[ManagedEntry], bool]
+) -> dict[AccountRef, int]:
+    """Rows per account among those ``keep`` accepts.
+
+    The two counts this module publishes — busy sessions for placement, live
+    ones for a display — differ only in that predicate, and a count that
+    drifts between them would be a subtle thing to notice.
+    """
+    counts: dict[AccountRef, int] = {}
+    for entry in entries:
+        if keep(entry):
+            counts[entry.account] = counts.get(entry.account, 0) + 1
+    return counts
+
+
 def _read_session_record(session_dir: Path, pid: int) -> dict | None:
     """The raw Claude session record for ``pid``, or None when it has not
     been written yet or the record is unusable.
@@ -886,6 +902,31 @@ class ManagedSessionRegistry:
     def live_entries(self) -> list[ManagedEntry]:
         return [e for e in self._read().values() if entry_is_live(e)]
 
+    def counts_by_account(self) -> dict[AccountRef, int]:
+        """Sessions per account, for a display that repaints on a timer.
+
+        The cheap sibling of :meth:`live_entries`. It keeps the alive-pid
+        test, which is a signal, and drops ``pid_matches_record``, which
+        costs a ``ps`` per row on macOS — once per row per repaint, on a
+        surface that rebuilds every few seconds, for a question whose wrong
+        answer is one stale number on a screen. What that gives up is a row
+        whose PID has been recycled by an unrelated process, which stays
+        counted until the next sweep drops it; what it avoids is a display
+        that spawns subprocesses to draw itself.
+
+        A registry nobody can read is an empty result, exactly as ``get``
+        treats one: this is a reader for a display, and the caller renders
+        "no count" and "no sessions" the same way rather than claiming a
+        zero. It reads with ``warn=False`` for the same reason — a surface
+        that repaints every few seconds would otherwise put the same
+        "unreadable" warning in the rotating log hundreds of times an hour
+        and push real diagnostics out of it, about a state it has already
+        decided it does not mind.
+        """
+        return _tally_by_account(
+            self._read(warn=False).values(), lambda e: is_pid_alive(e.pid)
+        )
+
     def busy_counts(self, entries: Iterable[ManagedEntry]) -> dict[AccountRef, int]:
         """Busy sessions per account (``entry_is_busy``): a reservation with
         no Claude record yet counts, an idle or waiting one does not. This
@@ -894,11 +935,9 @@ class ManagedSessionRegistry:
         (``allocate``'s ``choose``) and the engine's lane-0 ranking
         (``autoswitch._busy_by_slot``, which delegates here rather than
         re-filtering the same entries a second time)."""
-        counts: dict[AccountRef, int] = {}
-        for entry in entries:
-            if entry_is_busy(self.session_dir(entry.session_id), entry):
-                counts[entry.account] = counts.get(entry.account, 0) + 1
-        return counts
+        return _tally_by_account(
+            entries, lambda e: entry_is_busy(self.session_dir(e.session_id), e)
+        )
 
     def allocate(
         self,

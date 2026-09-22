@@ -825,6 +825,19 @@ def _in_a_clean_child(argv, home) -> subprocess.CompletedProcess:
     )
 
 
+class TestSessionCounts:
+    def test_rows_are_counted_per_account(self, registry):
+        """The display's count: alive rows, tallied by account, without the
+        process-identity probe `live_entries` runs."""
+        for sid, account in (("auto-00000011", A), ("auto-00000012", B),
+                             ("auto-00000013", B)):
+            registry.allocate(
+                sid, lambda _busy, a=account: (a, "backup"),
+                pid=os.getpid(), proc_start=None,
+            )
+        assert registry.counts_by_account() == {A: 1, B: 2}
+
+
 class TestHooksFile:
     """The `--settings` document every managed session is launched with.
 

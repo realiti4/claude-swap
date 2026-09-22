@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import pathlib
 import plistlib
 import sys
 from pathlib import Path
@@ -240,6 +241,32 @@ def test_format_account_label_disabled_marker():
 
 # --- usage logging -------------------------------------------------------------
 
+def test_the_account_row_shows_a_session_count():
+    label = menubar.format_account_label(
+        2, "b@example.com", {"five_hour": {"pct": 10.0}}, now=1_000_000.0, sessions=2,
+    )
+    assert "2 sessions" in label
+
+
+def test_no_sessions_leaves_the_row_alone():
+    label = menubar.format_account_label(
+        2, "b@example.com", {"five_hour": {"pct": 10.0}}, now=1_000_000.0,
+    )
+    assert "session" not in label
+
+
+def test_the_row_says_it_the_way_the_tui_does(monkeypatch):
+    """One renderer, two surfaces. Comparing the menu bar's output to the
+    shared renderer's output would pass just as well if the menu bar spelled
+    the wording out itself, so the seam is what is checked: replace the
+    renderer and the row must change with it."""
+    monkeypatch.setattr(menubar, "session_count_label", lambda n: f"<{n} of them>")
+    label = menubar.format_account_label(
+        2, "b@example.com", None, now=1_000_000.0, sessions=1,
+    )
+    assert "<1 of them>" in label
+
+
 def test_format_usage_log_full():
     usage = {
         "five_hour": {"pct": 35.0, "clock": "06:59"},
@@ -449,13 +476,17 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False,
+        managed_sessions=0,
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.managed_sessions = managed_sessions
 
 
 class _FakeSnap:
@@ -477,19 +508,37 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
+        _FakeAcct(
+            "1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0),
+            managed_sessions=2,
+        ),
         _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    # (num, email, is_active, display_usage, last_good, alias, disabled,
+    #  fetched_at, managed_sessions)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, 2)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True,
+        None, 0,
     )
+
+
+def test_the_row_can_be_read_by_name():
+    """The menu's three consumers read these rows by name — they live inside
+    the rumps app glue, which the suite cannot import, so nothing else would
+    notice a field constructed in the wrong position."""
+    lg = {"five_hour": {"pct": 10.0}}
+    accts = [_FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=9.0),
+                       alias="work", disabled=True, managed_sessions=3)]
+    row = menubar._adapt_snapshot(_FakeSnap(accts))["accounts"][0]
+    assert (row.num, row.email, row.is_active) == ("1", "a@x.com", True)
+    assert (row.display_usage, row.last_good, row.fetched_at) == (lg, lg, 9.0)
+    assert (row.alias, row.disabled, row.sessions) == ("work", True, 3)
 
 
 def test_adapt_snapshot_empty():
@@ -695,3 +744,212 @@ class TestNotificationFor:
             ),
         ]
         assert [menubar.notification_for(e) for e in quiet] == [None, None, None]
+
+
+# --- the account row's consumers ---------------------------------------------
+
+
+def _row(num="1", email="a@x.com", *, last_good=None, sessions=0):
+    """A row with its two usage fields DIFFERENT on purpose.
+
+    `display_usage` is what the menu shows and `last_good` is the last real
+    measurement, and for an account with a sentinel they are not the same
+    kind of thing at all: the display is a note string while `last_good` is
+    still a dict. A helper that put one object in both would let a reader of
+    the wrong field pass every test here and then quietly stop logging
+    usage for exactly those accounts.
+    """
+    return menubar.AccountRow(
+        num, email, False, menubar.SENTINEL_NOTES[USAGE_API_KEY], last_good,
+        "", False, None, sessions,
+    )
+
+
+def test_the_usage_log_reads_rows_by_name():
+    """The row shape this reads is the one `_adapt_snapshot` produces, and it
+    used to be read by position inside the rumps app glue — where the suite
+    cannot reach it. It lives out here now, because a row it cannot take
+    apart is not a cosmetic failure: the refresh worker logs the snapshot
+    before it assigns it, so a raise here leaves the menu bar on its empty
+    snapshot for good."""
+    usage = {"five_hour": {"pct": 35.0}, "seven_day": {"pct": 10.0}}
+    seen: dict = {}
+    lines = menubar.usage_log_lines([_row(last_good=usage, sessions=2)], seen)
+    assert lines == [menubar.format_usage_log("a@x.com", usage)]
+    assert seen == {"1": menubar._usage_log_key(usage)}
+
+
+def test_the_usage_log_says_a_thing_once():
+    usage = {"five_hour": {"pct": 35.0}, "seven_day": {"pct": 10.0}}
+    seen: dict = {}
+    rows = [_row(last_good=usage)]
+    assert menubar.usage_log_lines(rows, seen)
+    assert menubar.usage_log_lines(rows, seen) == []
+    moved = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 10.0}}
+    assert menubar.usage_log_lines([_row(last_good=moved)], seen)
+
+
+def test_the_usage_log_skips_an_account_with_nothing_to_say():
+    seen: dict = {}
+    assert menubar.usage_log_lines([_row(last_good=None)], seen) == []
+    assert seen == {}
+
+
+def _row_takedowns(source: str, *, lists=()) -> list[tuple[int, int | None]]:
+    """Every place ``source`` takes an account row apart.
+
+    One entry per site, as ``(line, names)``: ``names`` is None when the row
+    is bound to a single name (and therefore read by field), and the number
+    of names when it is unpacked positionally. Follows the accounts list and
+    individual rows through assignments — plain and annotated, to a fixed
+    point, so an alias of an alias is still an alias — and looks at ``for``
+    loops, comprehensions and tuple assignments alike.
+
+    ``lists`` seeds the set of names holding the accounts list, for a
+    consumer that is handed the rows as an argument instead of reading them
+    out of the snapshot itself.
+
+    The one shape it does NOT follow is a call: ``for a, b in
+    list(self.snapshot["accounts"])`` is invisible to it. Closing that means
+    deciding which calls pass a list through unchanged, which is a judgement
+    this does not have; the tripwire on the number of sites found is what
+    covers it, since a new consumer written that way leaves the count short.
+    """
+    import ast
+
+    def is_accounts(node):
+        return (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "accounts"
+        )
+
+    tree = ast.parse(source)
+    assignments = [
+        (node.targets if isinstance(node, ast.Assign) else [node.target], node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+    ]
+    loops = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension))
+    ]
+
+    def is_list(node):
+        return is_accounts(node) or (
+            isinstance(node, ast.Name) and node.id in lists
+        )
+
+    def is_row(node):
+        # `accounts[i]`, or a name already known to hold a row.
+        return (isinstance(node, ast.Subscript) and is_list(node.value)) or (
+            isinstance(node, ast.Name) and node.id in rows
+        )
+
+    # Names are file-wide rather than per-function: a name shadowed in
+    # another scope would only make this look at one site too many, which is
+    # the safe direction for a guard.
+    lists: set[str] = set(lists)
+    rows: set[str] = set()
+    for _ in range(len(assignments) + len(loops) + 1):
+        before = (len(lists), len(rows))
+        for targets, value in assignments:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    if is_list(value):
+                        lists.add(target.id)
+                    elif is_row(value):
+                        rows.add(target.id)
+        for loop in loops:
+            if is_list(loop.iter) and isinstance(loop.target, ast.Name):
+                rows.add(loop.target.id)
+        if (len(lists), len(rows)) == before:
+            break
+
+    found: dict[int, tuple[int, int | None]] = {}
+
+    def record(target, source_node):
+        line = getattr(source_node, "lineno", None) or target.lineno
+        if isinstance(target, ast.Tuple):
+            # A starred element counts as positional too: it survives a
+            # field being added, but it still reads fields by position.
+            found[line] = (line, len(target.elts))
+        elif isinstance(target, ast.Name):
+            found[line] = (line, None)
+
+    for loop in loops:
+        if is_list(loop.iter):
+            record(loop.target, getattr(loop, "target", loop))
+    for targets, value in assignments:
+        if is_row(value):
+            for target in targets:
+                record(target, target)
+    return sorted(found.values())
+
+
+def test_no_row_is_taken_apart_by_position():
+    """The structural guard for a file the suite cannot import.
+
+    The rows are consumed in four places. Three of them live inside
+    `MenuBarApp`, which is defined inside the function that imports rumps —
+    an optional extra this suite never installs — so nothing here can catch
+    a bad unpack by running them. The ninth field (session counts) turned
+    every positional unpack into a `ValueError` at runtime, so this reads
+    the module's own source instead: a row may be bound to one name and read
+    by field, or unpacked into exactly as many names as the row has.
+
+    Following the list through an alias is the point, not a detail: a search
+    for `self.snapshot["accounts"]` cannot see `accounts =
+    self.snapshot["accounts"]` two lines earlier, and the consumer that
+    shipped broken read a local `snap["accounts"]` instead.
+    """
+    width = len(menubar.AccountRow._fields)
+    source = pathlib.Path(menubar.__file__).read_text(encoding="utf-8")
+    # `rows` is the parameter the fourth consumer takes its list under: it
+    # is handed the rows rather than reading them out of the snapshot, so it
+    # has to be named for the guard to see it. That one is ordinary tested
+    # code (above) and is held to the same rule anyway, since its positional
+    # unpack is the one that shipped.
+    takedowns = _row_takedowns(source, lists=("rows",))
+    for line, names in takedowns:
+        assert names is None or names == width, (
+            f"{menubar.__file__}:{line} reads {names} fields of a "
+            f"{width}-field AccountRow by position"
+        )
+    assert len(takedowns) == 4, (
+        f"expected the four known row consumers, found {len(takedowns)} — if "
+        "one was added, moved, or written through a call this cannot follow, "
+        "this guard has to be pointed at it"
+    )
+
+
+@pytest.mark.parametrize("snippet, expected", [
+    ('for a, b in self.snapshot["accounts"]:\n    pass', [(1, 2)]),
+    ('for row in self.snapshot["accounts"]:\n    pass', [(1, None)]),
+    ('accounts = self.snapshot["accounts"]\nfor a, b in accounts:\n    pass',
+     [(2, 2)]),
+    # An alias of an alias, and an annotated one: both were holes.
+    ('accounts = self.snapshot["accounts"]\nlater = accounts\n'
+     'for a, b in later:\n    pass', [(3, 2)]),
+    ('rows: list = self.snapshot["accounts"]\nfor a, b in rows:\n    pass',
+     [(2, 2)]),
+    # A single row, pulled out and unpacked rather than looped over.
+    ('accounts = self.snapshot["accounts"]\nfirst, second = accounts[0]',
+     [(2, 2)]),
+    ('row = self.snapshot["accounts"][0]\nnum, email = row', 
+     [(1, None), (2, 2)]),
+    # A starred read is still positional.
+    ('for a, b, *rest in self.snapshot["accounts"]:\n    pass', [(1, 3)]),
+    # Comprehensions: the branch that used to raise on a missing lineno.
+    ('x = [a for a, b in self.snapshot["accounts"]]', [(1, 2)]),
+    ('x = [r.num for r in self.snapshot["accounts"]]', [(1, None)]),
+    # Nothing to do with the rows.
+    ('for a, b in other["things"]:\n    pass', []),
+    # The documented blind spot.
+    ('for a, b in list(self.snapshot["accounts"]):\n    pass', []),
+])
+def test_the_guard_sees_what_it_claims_to(snippet, expected):
+    """The guard is a parser, so it gets tests of its own — every shape here
+    is one a reader could plausibly write, and all but the last one were
+    holes at some point."""
+    assert _row_takedowns(snippet) == expected
