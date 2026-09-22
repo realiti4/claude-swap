@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import settings
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    SessionsSettings,
     UiSettings,
     effective_settings,
     load_settings,
@@ -243,9 +245,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["sessions"] == {
+            f.name for f in SessionsSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "sessions": SessionsSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
@@ -439,3 +448,46 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestSessionsSection:
+    def test_defaults_without_a_file(self, tmp_path):
+        s = settings.load_session_settings(tmp_path)
+        assert (s.idle_reassign_minutes, s.reassign_margin) == (60.0, 15.0)
+
+    def test_values_are_read(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "sessions": {"idleReassignMinutes": 30, "reassignMargin": 5},
+        }))
+        s = settings.load_session_settings(tmp_path)
+        assert (s.idle_reassign_minutes, s.reassign_margin) == (30.0, 5.0)
+
+    def test_out_of_range_values_are_clamped(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "sessions": {"idleReassignMinutes": 0, "reassignMargin": 500},
+        }))
+        s = settings.load_session_settings(tmp_path)
+        assert (s.idle_reassign_minutes, s.reassign_margin) == (5.0, 100.0)
+
+    def test_garbage_values_fall_back_to_defaults(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "sessions": {"idleReassignMinutes": "soon", "reassignMargin": True},
+        }))
+        s = settings.load_session_settings(tmp_path)
+        assert (s.idle_reassign_minutes, s.reassign_margin) == (60.0, 15.0)
+
+    def test_set_setting_writes_only_that_key(self, tmp_path):
+        settings.set_setting(tmp_path, "sessions.idleReassignMinutes", "20")
+        raw = json.loads((tmp_path / "settings.json").read_text())
+        assert raw["sessions"] == {"idleReassignMinutes": 20.0}
+
+    def test_effective_settings_lists_the_section(self, tmp_path):
+        rows = {spec.dotted: (value, is_set)
+                for spec, value, is_set in settings.effective_settings(tmp_path)}
+        assert rows["sessions.idleReassignMinutes"] == (60.0, False)
+        assert rows["sessions.reassignMargin"] == (15.0, False)
+
+    def test_a_rejected_value_names_the_bounds(self, tmp_path):
+        with pytest.raises(ConfigError, match="between 5 and 1440"):
+            settings.set_setting(tmp_path, "sessions.idleReassignMinutes", "2")
