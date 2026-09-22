@@ -417,7 +417,7 @@ class TestBackoff:
 
     def test_hour_scale_margin_clears_the_measured_re_block_band(self):
         # Honoring Retry-After *exactly* puts the retry on the deadline itself,
-        # where the server is not reliably ready: measured over this machine's
+        # where the server is not reliably ready: measured over one machine's
         # log (re-measured 2026-08-03, round 8, method in the
         # RETRY_AFTER_MARGIN_S comment), 20 of 35 block lapses re-blocked
         # within 900s of their own deadline (+2s … +887s) and each cost a

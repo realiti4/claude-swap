@@ -684,6 +684,11 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # The bridge-title repair's own state. Declared here rather
+        # than conjured by the method that reads it, so the engine's
+        # state is visible in one place.
+        self._bridge_titles_next_at: float = 0.0
+        self._bridge_titles_last: str | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -876,8 +881,16 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
+    #: How often the bridge-title restore may ask the API. A repair cadence,
+    #: not a poll: ticks are frequent and a re-mint is rare.
+    BRIDGE_TITLE_INTERVAL_S = 300.0
+
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        # After the tick, not before it, and in a `finally` so an error path
+        # still repairs. Running it first made a tick that is about to prevent
+        # a lockout wait on an HTTPS listing, and it ran BEFORE the switch that
+        # re-mints the very bridges it repairs.
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -888,6 +901,143 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+        finally:
+            self._restore_bridge_titles_if_due()
+
+    def _restore_bridge_titles_if_due(self) -> None:
+        """Put locally-named sessions' names back on their cloud bridges.
+
+        WHY THE ENGINE OWNS IT. cswap-pin implements the repair, but its one
+        caller fires only when a `POST /v1/code/sessions` REACHES the proxy --
+        so the repair is triggered by the very thing it exists to survive.
+        This engine runs on a timer, is the thing that rotates accounts (so it
+        is present when bridges are re-minted), and LIVE is single-instance, so
+        two of them cannot both PUT.
+
+        NEVER RAISES: `tick` is documented that way and a cosmetic repair must
+        not end a tick that was about to prevent a lockout.
+        """
+        # Can it run at all, before is it time to: below the cadence check, a
+        # machine without the extra still moved `_bridge_titles_next_at`
+        # forward -- a timer kept for work that cannot happen.
+        from claude_swap import pin as _pin
+
+        if not _pin.is_available():
+            return
+        # The ENGINE's clock, like the other time reads in this class: this
+        # one called the module's `time.time()`, so a test advancing the
+        # injected clock could not make the repair due.
+        #
+        # Dry run must not write, and `PUT /v1/code/sessions/<id>` renames the
+        # user's real cloud sessions. Every mutation in `_tick_inner` is gated
+        # on this flag; the restore runs outside it, from `tick()`'s `finally`.
+        # It also restores the single-writer premise: a second TUI is DEMOTED
+        # to dry-run rather than stopped.
+        if self.dry_run:
+            return
+        # The whole body is guarded, because this runs from `tick()`'s
+        # `finally`: a raise here REPLACES whatever tick() was about to return
+        # or propagate. `cswap auto --once` does `sys.exit(engine.tick().value)`
+        # under a handler that catches only ClaudeSwitchError.
+        try:
+            now = self.clock()
+            if now < self._bridge_titles_next_at:
+                return
+            self._bridge_titles_next_at = now + self.BRIDGE_TITLE_INTERVAL_S
+            # Every way out reports. Three bare `return`s used to sit here,
+            # and `no-token` is the persistent shape: an API-key slot, an
+            # unreadable blob or a locked keychain makes it None on every pass
+            # forever with nothing saying so.
+            names = _pin.live_bridge_names()
+            if not names:
+                self._report_bridge_titles("no-live-names", 0)
+                return
+            number = self._bridge_owner_number()
+            if not number:
+                self._report_bridge_titles("no-account", 0)
+                return
+            email = self.switcher.account_email(number)
+            creds = self.switcher.read_account_credentials(number, email)
+            token = _access_token_of(creds)
+            if not token:
+                self._report_bridge_titles("no-token", 0)
+                return
+            done, outcome = oauth.restore_bridge_titles(token, names)
+            self._report_bridge_titles(outcome, done)
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            # The reporter can raise too, and it sits in the handler rather
+            # than the guarded body, so it was the one statement whose failure
+            # still escaped into `tick()`'s `finally`.
+            try:
+                _logger.debug("bridge title restore skipped: %r", e)
+                self._report_bridge_titles(f"raised:{type(e).__name__}", 0)
+            except Exception:  # noqa: BLE001 — nothing left to report with
+                pass
+
+    def _bridge_owner_number(self) -> str | None:
+        """Which account's bearer can SEE these bridges — the pinned one.
+
+        A pin exists precisely so Remote Control bridges stay on an account
+        the switcher is NOT active on, and the import guard above means this
+        only runs when a pin is installed -- so the mismatched case is the only
+        case. With the wrong bearer `_list_bridge_sessions` returns the ACTIVE
+        account's sessions, any PUT is refused, and the outcome is a permanent
+        `no-bridges`. It appeared to work whenever cswap's own process happened
+        to sit behind the pin proxy, which is a property of the machine, not of
+        this code.
+
+        NO SILENT FALLBACK to the active account when the pinned email is not
+        in the roster: we have no credential for the account that owns the
+        bridges, and saying so once is worth more than a repair that cannot
+        work and does not admit it. Both ways of having no usable account
+        report `no-account`.
+        """
+        from . import pin
+
+        # Ask the seam. Two defects lived in the loop this replaces, and both
+        # end with this returning None and the tick reporting `no-account` on
+        # every pass. By email: `account_email(n) == pinned` takes whichever
+        # slot comes first, and a roster can hold a personal+org pair sharing
+        # one address. Over `switchable_account_numbers()`: that list EXCLUDES
+        # disabled slots, and disabling the pinned account is the only way
+        # today to keep the rotation off it. `pinned_slot` resolves on the
+        # composite and does not filter on rotation eligibility, which is the
+        # right question here -- we want the BEARER, not a rotation candidate.
+        if not pin.pinned_email(self.switcher):
+            return self.switcher.current_account_number()
+        return pin.pinned_slot(self.switcher)
+
+    def _report_bridge_titles(self, outcome: str, done: int) -> None:
+        """Say it when it CHANGES, and only then.
+
+        `if done: _logger.info(...)` meant a run that renamed nothing said
+        nothing, and five different reasons for renaming nothing were all that
+        same silence -- including one live for 107 minutes with every HTTPS
+        call dying on CERTIFICATE_VERIFY_FAILED.
+
+        A 300 s timer that logs every pass is a log nobody reads, so the fix is
+        transitions, not "log always". `renamed` is an action, not a state, so
+        it speaks every time; everything else speaks once and then holds.
+        """
+        if outcome == "renamed":
+            _logger.info("restored %d cloud bridge title(s)", done)
+            self._bridge_titles_last = outcome
+            return
+        # Dedup on the KIND, not the counts: `partial-3-of-40` carries its
+        # numbers, so a persistently slow endpoint would make every pass a
+        # different string and the transition rule would never fire.
+        kind = "".join("N" if c.isdigit() else c for c in outcome)
+        if kind == self._bridge_titles_last:
+            return
+        self._bridge_titles_last = kind
+        # Faults are "wrong and nobody asked for it": `list-failed`, a raise,
+        # `no-token` (a credential yielding no bearer, repeating forever
+        # without repairing anything) and `no-account`. `no-live-names` is not
+        # -- no live bridges is an ordinary state worth one line when it begins.
+        loud = (outcome in ("list-failed", "no-token", "no-account")
+                or outcome.startswith("raised:"))
+        (_logger.warning if loud else _logger.info)(
+            "cloud bridge titles: %s", outcome)
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -1582,7 +1732,7 @@ class AutoSwitchEngine:
                       departure baseline never fires for an account that had
                       nothing to improve on. The `+SPENT_HEADROOM_PCT` on top
                       of the bare ratio is what the bare ratio misses:
-                      measured on this branch's own flap fleet (peer frozen
+                      measured on a live rotation (peer frozen
                       4.0 pts, active burning 98.0% -> 98.4%), it flips
                       true at active=1.8 pts purely because the active kept
                       burning; the same walk with the margin added stays
@@ -2362,3 +2512,25 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+def _access_token_of(credentials) -> str | None:
+    """The bearer inside a stored credential blob, or ``None``.
+
+    Tolerant on purpose: an API-key account is a bare string with no bearer,
+    and the only caller's whole job is optional. Anything it cannot read is
+    "no token", never a raise.
+    """
+    if not credentials:
+        return None
+    try:
+        raw = json.loads(credentials) if isinstance(credentials, str) else credentials
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(raw, dict):
+        return None
+    section = raw.get("claudeAiOauth")
+    if not isinstance(section, dict):
+        return None
+    token = section.get("accessToken")
+    return str(token) if token else None

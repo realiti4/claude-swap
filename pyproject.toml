@@ -33,6 +33,22 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+# A CORRECTNESS FLOOR, not a freshness one: below it, this branch's
+# `apply_pin(identity=...)` is a TypeError at the call rather than a degraded
+# feature. Raise it for each API this branch requires OUTRIGHT, and name the
+# error the old version actually raises. `heal(identity=...)` is deliberately
+# NOT covered -- the caller probes the installed signature and falls back to
+# the positional form -- so do not raise the floor for it and do not delete
+# that probe as redundant. `carry_live_pointers` and `remembered_pin_identity`
+# are not covered either: absent below 0.1.223 and 0.1.215, `_ask` answers None
+# there, and both callers read None as the behaviour they had before the seam
+# existed. Degraded, not a TypeError -- which is what keeps this floor a
+# correctness one.
+#
+# NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
+# installs this so the seam test runs on Windows too, and a marker makes that
+# test decorative instead of red.
+pin = ["cswap-pin>=0.1.143"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -51,19 +67,51 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `claude-swap[pin]`, NOT a second `cswap-pin>=...`: the extra above is the one
+# floor, and spelling the version again here is how the two drift.
+#
+# The extra has to be installed somewhere or its contract is untested. cswap
+# READS a marker cswap-pin WRITES and the two version independently, so
+# `test_the_marker_still_matches_the_package_that_writes_it` is the only thing
+# standing between a rename there and `--clear` reporting "No cloud account
+# pinned" over a live wiring. `uv sync --locked` installs base + dev only, so
+# without this it never ran.
+#
+# This does NOT weaken "works without the extra": `TestImportSafeWithoutTheExtra`
+# and `TestClearRunsWithTheExtraGone` block `cswap_pin` at `sys.meta_path` or
+# scan the AST, so they hold whether or not the package is present.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
+    "claude-swap[pin]",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# A THREAD THAT DIES ON AN EXCEPTION FAILS THE RUN. Unhandled it is only a
+# warning, and a warning in a list of ~50 is read by nobody: one sat on every
+# run for as long as anyone had looked. This makes the next one fail instead
+# of joining the list.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
 # Parallel by default. The suite is ~1900 tests of mostly-idle work (file
 # locks, subprocess fakes, Textual pilots), so wall clock was dominated by
 # doing them one at a time, not by any single slow test: 25 ms/test spread
 # across the whole suite, with the top five totalling under 7 s of a 51 s run.
 # Measured here, 48 cores: 51.0s serial -> 12.1s (-n 8) -> 7.7s (-n 16), same
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
-# store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
-# cores) and this box both get the cores they have.
+# store hash unmoved.
+#
+# `auto` here so any machine scales from the cores it has. CI OVERRIDES IT with
+# `-n 8` (see .github/workflows/ci.yml): the work is mostly WAITING, so on a
+# runner's 4 vCPUs one-worker-per-core leaves cores idle. Measured on 4 CPUs,
+# same 1995 passed: auto(=4) 16.9s, -n 6 14.1s, -n 8 14.5s, -n 10 14.7s. xdist
+# takes only `auto`, `logical` or an integer -- no multiplier spelling -- so
+# the oversubscription has to be a literal, and a literal belongs where the
+# machine is known.
 addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [

@@ -224,7 +224,12 @@ def migrate_windows_keyring_to_files(switcher: "ClaudeAccountSwitcher") -> bool:
 
         # --- write + verify before deleting the only other copy -----------
         try:
-            switcher._write_account_credentials(account_num, email, creds)
+            # attributed=True: `creds` was just read from this exact
+            # (account_num, email) key's own Windows keyring entry above —
+            # a backend move, never a different account's bytes.
+            switcher._write_account_credentials(
+                account_num, email, creds, attributed=True
+            )
             readback = switcher._read_account_credentials(account_num, email)
         except Exception as e:  # noqa: BLE001
             switcher._logger.warning(
@@ -440,8 +445,15 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
         # --- write + verify before deleting the source ------------------------
         # Keychain-only helpers: this migration targets the security service, so
         # it must not be diverted to .enc files by the transparent backup methods.
+        # attributed=True: `creds` is read from the OLD keyring under
+        # `source_username`, which is either the exact `account-{num}-{email}`
+        # key this slot already owns, or (only when `email_counts[email] == 1`,
+        # checked above — an ambiguous match is skipped entirely) the legacy
+        # `account-None-{email}` alias that can name no other slot. Either way
+        # these are the SAME bytes this slot's own record already names, moved
+        # between backends, not a foreign lineage.
         try:
-            switcher._kc_write_backup(account_num, email, creds)
+            switcher._kc_write_backup(account_num, email, creds, attributed=True)
             readback = switcher._kc_read_backup(account_num, email)
         except Exception as e:  # noqa: BLE001
             switcher._logger.warning(

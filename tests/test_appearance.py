@@ -303,6 +303,56 @@ class TestCliShouldProbe:
     def test_plain_command_with_colors_probes(self):
         assert appearance.cli_should_probe(["list"], colors_enabled=True) is True
 
+    def test_the_pins_launch_flags_never_probe(self):
+        """Both reasons above, on a path `run` was excluded for.
+
+        `pin --ensure` and `pin --get_port` run from an rc hook before EVERY
+        hand-launched `claude`. This probe puts the terminal into cbreak,
+        writes OSC 11 to stdout and select-waits `_TIMEOUT_S = 1.0` — larger
+        by itself than the entire budget the pin's launch path is built
+        around (`_LAUNCH_PROBE_S` 0.2, `_LAUNCH_LOCK_BUDGET_S` 0.5), and
+        `--ensure`'s contract is silence. `--get_port` prints a bare number
+        for a script to read, which is the `--json` reason spelled
+        differently.
+        """
+        for argv in (["pin", "--ensure"], ["pin", "--get_port"],
+                     ["pin", "--get_certdir"]):
+            assert appearance.cli_should_probe(argv, colors_enabled=True) is False, argv
+
+    def test_every_script_consumed_pin_flag_is_listed(self):
+        """THE LIST GOES STALE THE FIRST TIME A FLAG IS ADDED, and it did:
+        `--get_certdir` prints a bare path for `D=$(cswap pin --get_certdir)`,
+        the identical contract to `--get_port`, and was missing here — so the
+        one command whose purpose is answering instantly while somebody
+        diagnoses a dead pin sat in cbreak for a second first.
+
+        Derived from the parser rather than retyped, so a flag added later
+        fails this instead of quietly joining the ones that probe.
+        """
+        import inspect
+        import re
+
+        from claude_swap import cli
+
+        # READ OUT OF THE SOURCE, because the pin parser is built inside the
+        # command function and there is no factory to call. A regex over that
+        # one function's text is enough: every flag is a literal there.
+        src = inspect.getsource(cli._pin_command)
+        flags = sorted(set(re.findall(r'"(--get_[a-z_]+)"', src)))
+        assert len(flags) >= 2, (
+            f"the scan found {flags}; it is meant to see every --get_* flag "
+            "on `cswap pin` and a scan that finds one proves nothing")
+        for opt in flags:
+            assert appearance.cli_should_probe(
+                ["pin", opt], colors_enabled=True) is False, (
+                f"{opt} prints a bare value for a script to read and still "
+                "puts the terminal into cbreak for a second first")
+
+    def test_an_interactive_pin_still_probes(self):
+        """The control, and the reason the rule keys on the FLAG not on `pin`:
+        `cswap pin 2` renders to a human and must keep its theme."""
+        assert appearance.cli_should_probe(["pin", "2"], colors_enabled=True) is True
+
 
 def test_query_short_circuits_under_tmux(monkeypatch):
     """Inside tmux the OSC 11 probe is skipped (never waits out the timeout)."""

@@ -431,6 +431,70 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
 
 sys.addaudithook(_real_store_audit_hook)
 
+def _reattach_orphaned_modules() -> list[str]:
+    """Put back any ``claude_swap`` module a ``patch.dict`` restore deleted.
+
+    `unittest.mock`'s `patch.dict(sys.modules, ...)` — which several tests here
+    use to fake `keyring` — restores by CLEARING the dict and repopulating from
+    an ENTRY-TIME snapshot. A module FIRST IMPORTED INSIDE the block is
+    therefore DELETED from `sys.modules` on exit, while surviving as an
+    attribute of its parent package.
+
+    That pair (attribute of parent, absent from `sys.modules`) silently defeats
+    patching. `monkeypatch.setattr("claude_swap.X.f", stub)` resolves by
+    importing the ROOT and walking with `getattr`, so it finds the orphan,
+    patches it, and REPORTS SUCCESS — while `from claude_swap.X import f` finds
+    no `sys.modules` entry, RE-IMPORTS a fresh module, and calls the REAL `f`.
+    Two module objects, nothing raised. Measured: `test_cli_accepts_heal`
+    failed 4 in 32 full-suite runs that way, its stub never called and its own
+    tripwire never fired.
+
+    WHY THIS AND NOT A LIST OF IMPORTS. The first fix imported the three known
+    victims at module scope so they would be in every snapshot. It worked and
+    it was the wrong shape: three names are today's, a fourth joins them the
+    moment some other module is first imported inside such a block, and the
+    list goes stale WHILE STILL PASSING — the same failure as the verify-merge
+    greps deleted this morning. Worse, WHICH modules get orphaned depends on
+    the machine: `pin` alone where the `cswap-pin` extra is installed, and
+    `pin` + `update_check` + `cache` where it is not, because `_impl()` only
+    raises (and `_install_hint()` only runs its lazy import chain) when the
+    extra is absent. A list would have had to enumerate a set that differs per
+    environment, which is not a set anyone can keep correct.
+
+    This asks the question instead, so it holds for any module, on any machine,
+    with or without the extra.
+    """
+    import sys as _sys
+    from types import ModuleType as _ModuleType
+
+    restored: list[str] = []
+    for parent_name in [n for n in list(_sys.modules) if n.startswith("claude_swap")]:
+        parent = _sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        for attr in dir(parent):
+            child = getattr(parent, attr, None)
+            if not isinstance(child, _ModuleType):
+                continue
+            name = getattr(child, "__name__", "")
+            if name.startswith("claude_swap") and name not in _sys.modules:
+                _sys.modules[name] = child
+                restored.append(name)
+    return restored
+
+
+@pytest.fixture(autouse=True)
+def _no_orphaned_claude_swap_modules():
+    """Re-attach after every test, so the NEXT test patches what it calls.
+
+    Teardown, not setup: the orphan is created inside the test that runs the
+    `patch.dict` block, and the damage is done to whichever test patches that
+    module afterwards. Repairing at the end of each test closes the window
+    before anything can fall into it.
+    """
+    yield
+    _reattach_orphaned_modules()
+
 
 class _KeychainStore:
     """In-memory ``(service, account) -> secret`` map standing in for the real

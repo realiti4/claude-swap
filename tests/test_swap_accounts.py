@@ -178,11 +178,11 @@ class TestSwapAccounts:
         real_write = ClaudeAccountSwitcher._write_account_credentials
         calls = {"n": 0}
 
-        def failing_write(self, num, email, creds):
+        def failing_write(self, num, email, creds, attributed=False):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise OSError("disk full (injected)")
-            return real_write(self, num, email, creds)
+            return real_write(self, num, email, creds, attributed=attributed)
 
         # Scoped context, not the fixture's shared `monkeypatch`: that
         # instance also carries the autouse colour/keychain/home scrubs, and
@@ -219,11 +219,11 @@ class TestSwapAccounts:
         real_write = ClaudeAccountSwitcher._write_account_credentials
         calls = {"n": 0}
 
-        def failing_write(self, num, email, creds):
+        def failing_write(self, num, email, creds, attributed=False):
             calls["n"] += 1
             if calls["n"] >= 2:
                 raise OSError("disk full (injected, persistent)")
-            return real_write(self, num, email, creds)
+            return real_write(self, num, email, creds, attributed=attributed)
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
