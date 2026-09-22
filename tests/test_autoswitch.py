@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
+import claude_swap.autoswitch as autoswitch_mod
+from claude_swap import managed_sessions as managed_sessions_mod
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
@@ -21,20 +24,32 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    ManagedSessionsRefreshedEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SessionReleasedEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
     pct_label,
+    quarantined_numbers,
 )
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.managed_sessions import (
+    AccountRef,
+    ManagedSessionRegistry,
+    create_managed_profile,
+)
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+
+
+DAY = 86400.0
 
 
 class FakeClock:
@@ -1919,6 +1934,20 @@ class TestQuarantineLifecycle:
         assert state["lastSwitchAt"] == 123.0
         assert "3" in state["quarantine"]
 
+    def test_quarantined_numbers_reads_the_state_file(self, harness):
+        """The view callers outside the engine (``cswap run --auto``) get."""
+        backup_dir = harness.switcher.backup_dir
+        assert quarantined_numbers(backup_dir) == set()  # no state file yet
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        assert quarantined_numbers(backup_dir) == {"2"}
+
+    def test_quarantined_numbers_survives_an_unusable_state_file(self, harness):
+        backup_dir = harness.switcher.backup_dir
+        (backup_dir / "autoswitch_state.json").write_text("{not json")
+        assert quarantined_numbers(backup_dir) == set()
+        (backup_dir / "autoswitch_state.json").write_text(json.dumps({"quarantine": []}))
+        assert quarantined_numbers(backup_dir) == set()
+
 
 class TestDryRunAndNoOp:
     def test_dry_run_mutates_nothing(self, temp_home):
@@ -3479,8 +3508,10 @@ class TestEveryAccountAboveThreshold:
         then trade places forever.
         """
         h = EngineHarness(temp_home, strategy="consume-first")
-        h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
-        h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
         a = self._at(h, 600)
         b = self._at(h, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
         outcome = h.tick_with_usage({
@@ -3584,7 +3615,7 @@ class TestRecoveryHorizon:
     def test_a_days_away_reset_does_not_buy_headroom(self, harness):
         """The measured live shape. Every reset is days out, so ranking falls
         back to headroom and the account with 9 points left keeps the work."""
-        outcome = harness.tick_with_usage({
+        harness.tick_with_usage({
             "1": _usage(91, self._at(harness, 109 * 3600)),  # active, 9 left
             "2": _usage(94, self._at(harness, 80 * 3600)),
             "3": _usage(98, self._at(harness, 50 * 3600)),   # 2 left, soonest
@@ -7028,8 +7059,6 @@ class TestBalanceStrategy:
     (balance.rank_accounts) wins over the one with merely the most headroom.
     """
 
-    DAY = 86400.0
-
     def _harness(self, temp_home: Path, strategy: str = "balance") -> EngineHarness:
         h = EngineHarness(temp_home, strategy=strategy)
         h.seed(1, "a@example.com")
@@ -7042,13 +7071,13 @@ class TestBalanceStrategy:
         now = h.clock.now
         return {
             # Active over the threshold on its 5h window -> proactive move.
-            "1": _usage7(95, 20, _iso_at(now + 3 * self.DAY)),
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
             # Weekly resets in 1 day: target 100 (24h lead), used 60 ->
             # slack 40, score 40 - 0.5 * 10 = 35. Headroom 40.
-            "2": _usage7(10, 60, _iso_at(now + self.DAY)),
+            "2": _usage7(10, 60, _iso_at(now + DAY)),
             # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
             # score 11.7. Headroom 95 — `best` would pick this one.
-            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
         }
 
     def test_fixture_discriminates_best_picks_most_headroom(self, temp_home):
@@ -7068,9 +7097,9 @@ class TestBalanceStrategy:
         h = self._harness(temp_home)
         now = h.clock.now
         outcome = h.tick_with_usage({
-            "1": _usage7(20, 5, _iso_at(now + 6 * self.DAY)),   # active well below the threshold
-            "2": _usage7(0, 10, _iso_at(now + self.DAY / 2)),   # far behind
-            "3": _usage7(0, 0, _iso_at(now + self.DAY)),
+            "1": _usage7(20, 5, _iso_at(now + 6 * DAY)),   # active well below the threshold
+            "2": _usage7(0, 10, _iso_at(now + DAY / 2)),   # far behind
+            "3": _usage7(0, 0, _iso_at(now + DAY)),
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
@@ -7083,7 +7112,7 @@ class TestBalanceStrategy:
         outcome = h.tick_with_usage({
             "1": {
                 "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 3 * 3600)},
-                "seven_day": {"pct": 20.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+                "seven_day": {"pct": 20.0, "resets_at": _iso_at(now + 3 * DAY)},
             },
             # Both over the 85% five-hour ceiling (ineligible), both below the
             # 90% threshold and clear of the 10-pt hysteresis margin (valid
@@ -7091,11 +7120,11 @@ class TestBalanceStrategy:
             # back sooner -> the policy's fallback picks #3.
             "2": {
                 "five_hour": {"pct": 86.0, "resets_at": _iso_at(now + 4 * 3600)},
-                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * DAY)},
             },
             "3": {
                 "five_hour": {"pct": 87.0, "resets_at": _iso_at(now + 3600)},
-                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * self.DAY)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 3 * DAY)},
             },
         })
         assert outcome is TickOutcome.SWITCHED
@@ -7105,14 +7134,14 @@ class TestBalanceStrategy:
         h = self._harness(temp_home)
         now = h.clock.now
         outcome = h.tick_with_usage({
-            "1": _usage7(99, 20, _iso_at(now + 3 * self.DAY)),
+            "1": _usage7(99, 20, _iso_at(now + 3 * DAY)),
             # Eligible under balance (5h 80 < 85, 7d 89.5 < 90) and first in
             # its order, but headroom 10.5 vs the active's 1 misses the 10-pt
             # hysteresis margin -> not a landing.
-            "2": _usage7(80, 89.5, _iso_at(now + self.DAY)),
+            "2": _usage7(80, 89.5, _iso_at(now + DAY)),
             # Over the five-hour ceiling -> omitted by the policy while an
             # eligible account exists; still a valid, healthy landing.
-            "3": _usage7(86, 10, _iso_at(now + 3 * self.DAY)),
+            "3": _usage7(86, 10, _iso_at(now + 3 * DAY)),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
@@ -7132,7 +7161,7 @@ class TestBalanceStrategy:
     def test_at_limit_escape_ranks_by_balance(self, temp_home):
         h = self._harness(temp_home)
         usage = self._behind_vs_roomy(h)
-        usage["1"] = _usage7(100, 20, _iso_at(h.clock.now + 3 * self.DAY))
+        usage["1"] = _usage7(100, 20, _iso_at(h.clock.now + 3 * DAY))
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
@@ -7145,9 +7174,9 @@ class TestBalanceStrategy:
         h.events.clear()
         now = h.clock.now
         outcome = h.tick_with_usage({
-            "2": _usage7(95, 60, _iso_at(now + self.DAY)),
-            "1": _usage7(0, 0, _iso_at(now + self.DAY)),
-            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+            "2": _usage7(95, 60, _iso_at(now + DAY)),
+            "1": _usage7(0, 0, _iso_at(now + DAY)),
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 2
@@ -7262,7 +7291,7 @@ class TestBalanceStrategy:
                 "1": {
                     "five_hour": {"pct": 10.0},
                     "seven_day": {
-                        "pct": 5.0, "resets_at": _iso_at(now + self.DAY)
+                        "pct": 5.0, "resets_at": _iso_at(now + DAY)
                     },
                 },
                 "2": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 0.0}},
@@ -7272,7 +7301,7 @@ class TestBalanceStrategy:
                 "3": {
                     "five_hour": {"pct": 10.0},
                     "seven_day": {
-                        "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                        "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
                     },
                 },
             },
@@ -7332,12 +7361,12 @@ class TestBalanceStrategy:
             "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 10.0}},
             "2": {
                 "five_hour": {"pct": 20.0},
-                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + self.DAY)},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + DAY)},
             },
             "3": {
                 "five_hour": {"pct": 20.0},
                 "seven_day": {
-                    "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
                 },
             },
         }) is TickOutcome.SWITCHED
@@ -7353,13 +7382,13 @@ class TestBalanceStrategy:
             # pick this.
             "1": {
                 "five_hour": {"pct": 74.0},
-                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + self.DAY)},
+                "seven_day": {"pct": 5.0, "resets_at": _iso_at(now + DAY)},
             },
             "2": {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}},
             "3": {
                 "five_hour": {"pct": 20.0},
                 "seven_day": {
-                    "pct": 50.0, "resets_at": _iso_at(now + 6 * self.DAY)
+                    "pct": 50.0, "resets_at": _iso_at(now + 6 * DAY)
                 },
             },
         })
@@ -7376,11 +7405,11 @@ class TestBalanceStrategy:
             "1": None,
             # Weekly resets in 1 day: target 100, used 60 -> slack 40,
             # score 40 - 0.5*10 = 35. Headroom 40.
-            "2": _usage7(10, 60, _iso_at(now + self.DAY)),
+            "2": _usage7(10, 60, _iso_at(now + DAY)),
             # Weekly resets in 6 days: target 16.7, used 5 -> slack 11.7,
             # score 11.7. Headroom 95 -- most headroom, but less behind
             # schedule than #2.
-            "3": _usage7(0, 5, _iso_at(now + 6 * self.DAY)),
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
         }
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
@@ -7388,3 +7417,491 @@ class TestBalanceStrategy:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "failover"
         assert h.active_number() == 2
+
+
+MANAGED_DEAD_PID = 999_999
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="managed sessions are POSIX-only (v1)"
+)
+class TestManagedSessionUpkeep:
+    """Managed-session upkeep, run at the top of every tick (issue #382).
+
+    Exited managed sessions are released, the survivors' load feeds the
+    balance ranking, and every live session of an account gets the token its
+    slot currently holds.
+    """
+
+    SID_B1, SID_B2, SID_C1 = "auto-000000b1", "auto-000000b2", "auto-000000c1"
+
+    @staticmethod
+    def _registry(harness) -> ManagedSessionRegistry:
+        return ManagedSessionRegistry(harness.switcher.backup_dir)
+
+    def _add(
+        self, harness, sid, email, *, pid=None, fingerprint=None, profile=True, org=""
+    ) -> Path:
+        registry = self._registry(harness)
+        registry.allocate(
+            sid, lambda busy: (AccountRef(email, org), "backup"),
+            pid=pid or os.getpid(), proc_start=None,
+        )
+        if profile:
+            # ``allocate`` writes the reservation BEFORE the profile exists,
+            # so a row without a directory is a state the engine really meets.
+            create_managed_profile(registry.session_dir(sid))
+        if fingerprint:
+            registry.update(sid, access_fingerprint=fingerprint)
+        return registry.session_dir(sid)
+
+    @staticmethod
+    def _record(session_dir: Path, status: str | None, *, pid: int | None = None) -> None:
+        """The record Claude keeps for its own instance inside the profile."""
+        pid = os.getpid() if pid is None else pid
+        (session_dir / "sessions").mkdir(exist_ok=True)
+        payload: dict = {"pid": pid}
+        if status is not None:
+            payload["status"] = status
+        (session_dir / "sessions" / f"{pid}.json").write_text(json.dumps(payload))
+
+    @staticmethod
+    def _usage_all() -> dict:
+        return {"1": _usage(10), "2": _usage(10), "3": _usage(10)}
+
+    def _balance_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="balance")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _two_beats_three_unless_loaded(self, h: EngineHarness) -> dict:
+        """Usage where #2 wins on balance by 1.3 points — one busy managed
+        session (15 points of projected 5h load, halved by the weight) is
+        enough to hand the tick to #3."""
+        now = h.clock.now
+        return {
+            # Active over the threshold on its 5h window -> proactive move.
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+            # Weekly resets in 1 day: target 100 (24 h lead), used 82 ->
+            # slack 18, score 18 - 0.5 * 10 = 13. One busy session projects
+            # the 5h window to 25 and the score to 5.5.
+            "2": _usage7(10, 82, _iso_at(now + DAY)),
+            # Weekly resets in 6 days: target 16.7, used 5 -> score 11.7.
+            "3": _usage7(0, 5, _iso_at(now + 6 * DAY)),
+        }
+
+    def test_no_managed_state_is_a_no_op(self, harness, monkeypatch):
+        checked: list = []
+        monkeypatch.setattr(
+            managed_sessions_mod, "entry_is_live", lambda entry: checked.append(entry)
+        )
+        harness.tick_with_usage(self._usage_all())
+        # Nothing read, nothing created, and above all no liveness check: the
+        # no-state path must cost a stat, not a `ps` (nor a sessions/ tree
+        # every tick on an installation that has never launched one).
+        assert checked == []
+        assert not (harness.switcher.backup_dir / "sessions").exists()
+        assert "managed-sessions-refreshed" not in harness.kinds()
+        assert "session-released" not in harness.kinds()
+
+    def test_push_reaches_every_session_of_the_account_only(self, harness, monkeypatch):
+        now_ms = int(harness.clock.now * 1000)
+        harness.seed(2, "b@example.com", expires_at=now_ms + 60_000)
+        harness.seed(3, "c@example.com", expires_at=now_ms + 3_600_000)
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        b2 = self._add(harness, self.SID_B2, "b@example.com")
+        c_fp = oauth.access_token_fingerprint(json.dumps({"claudeAiOauth": {"accessToken": "sk-3"}}))
+        c1 = self._add(harness, self.SID_C1, "c@example.com", fingerprint=c_fp)
+        (c1 / ".credentials.json").write_text("untouched")
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-new", "refreshToken": "rt-2-new", "expiresAt": now_ms + 3_600_000,
+        }})
+        calls: list[str] = []
+
+        def gate(number, email, snapshot):
+            calls.append(number)
+            return oauth.RefreshOutcome(rotated, None)
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", gate)
+        harness.tick_with_usage(self._usage_all())
+
+        assert calls == ["2"]
+        for d in (b1, b2):
+            blob = json.loads((d / ".credentials.json").read_text())["claudeAiOauth"]
+            assert blob["accessToken"] == "sk-2-new" and "refreshToken" not in blob
+        assert (c1 / ".credentials.json").read_text() == "untouched"
+        refreshed = [e for e in harness.events if isinstance(e, ManagedSessionsRefreshedEvent)]
+        assert [(e.number, sorted(e.sessions)) for e in refreshed] == [
+            ("2", [self.SID_B1, self.SID_B2])
+        ]
+
+    def test_dead_grant_quarantines_once_and_leaves_sessions(self, harness, monkeypatch):
+        now_ms = int(harness.clock.now * 1000)
+        harness.seed(2, "b@example.com", expires_at=now_ms + 60_000)
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        calls: list[str] = []
+
+        def gate(number, email, snapshot):
+            calls.append(number)
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", gate)
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        quarantines = [e for e in harness.events if isinstance(e, QuarantineEvent)]
+        assert [(e.number, e.reason) for e in quarantines] == [("2", "invalid_grant")]
+        assert calls == ["2"]
+        assert not (b1 / ".credentials.json").exists()
+
+    def test_access_only_sessions_never_trigger_quarantine(self, harness, monkeypatch):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        # What a managed profile always holds: an access token, no refresh
+        # token, and (here) an expiry inside the freshen buffer. Anything that
+        # evaluated the SESSION's credential for a refresh would read a dead
+        # lineage off it and quarantine the slot; only the slot's own backup
+        # may ever be refreshed.
+        (b1 / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-session-old",
+            "expiresAt": int(harness.clock.now * 1000) + 1_000,
+        }}))
+
+        def no_refresh(*args):
+            raise AssertionError("no refresh expected")
+
+        monkeypatch.setattr(harness.switcher, "consume_backup_grant", no_refresh)
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        assert "account-quarantined" not in harness.kinds()
+        # The push itself landed: the session holds the slot's current access
+        # token, still without a refresh token, and only the first tick wrote.
+        blob = json.loads((b1 / ".credentials.json").read_text())["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-2" and "refreshToken" not in blob
+        refreshed = [e for e in harness.events if isinstance(e, ManagedSessionsRefreshedEvent)]
+        assert [(e.number, e.source, e.sessions) for e in refreshed] == [
+            ("2", "backup", (self.SID_B1,))
+        ]
+
+    def test_dead_session_is_swept_with_event(self, harness, monkeypatch):
+        dead = self._add(harness, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        harness.tick_with_usage(self._usage_all())
+        assert not dead.exists()
+        released = [e for e in harness.events if isinstance(e, SessionReleasedEvent)]
+        assert [(e.session_id, e.reason) for e in released] == [(self.SID_B1, "process-exited")]
+        assert released[0].to_json()["session"] == self.SID_B1
+        assert self._registry(harness).entries() == {}
+
+    def test_dry_run_touches_nothing(self, harness, monkeypatch):
+        dead = self._add(harness, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        harness.engine = harness._make_engine(dry_run=True)
+        harness.tick_with_usage(self._usage_all())
+        assert dead.exists()
+        assert self.SID_B1 in self._registry(harness).entries()
+
+    def test_upkeep_failure_does_not_block_the_lane0_decision(self, harness, monkeypatch):
+        self._add(harness, self.SID_B1, "b@example.com")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(autoswitch_mod, "push_refresh", boom)
+        outcome = harness.tick_with_usage(self._usage_all())
+        assert outcome is TickOutcome.NO_ACTION
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "Managed sessions: RuntimeError: disk on fire"
+        ]
+        # ...and the load this tick counted survives the push that failed
+        # after it: the ranking below runs on THIS tick's count, never on a
+        # previous one, so the count has to be taken before the push.
+        assert harness.engine._managed_busy == {"2": 1}
+
+    # One liveness pass per tick, shared by the sweep and the push.
+
+    def test_liveness_is_checked_once_per_entry_per_tick(self, harness, monkeypatch):
+        """``entry_is_live`` shells out to ``ps`` per entry on macOS, so the
+        sweep's live set is what the push must run on."""
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        self._add(harness, self.SID_B2, "b@example.com")
+        real = managed_sessions_mod.entry_is_live
+        checked: list[str] = []
+
+        def counting(entry):
+            checked.append(entry.session_id)
+            return real(entry)
+
+        monkeypatch.setattr(managed_sessions_mod, "entry_is_live", counting)
+        harness.tick_with_usage(self._usage_all())
+
+        assert sorted(checked) == [self.SID_B1, self.SID_B2]
+        # ...and the push still reached them, i.e. the live set was used.
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    # Busy managed sessions count as load when balance ranks lane 0.
+
+    def test_a_busy_managed_session_ranks_lane0_off_that_account(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_an_idle_managed_session_is_not_load(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "idle")
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_reservation_with_no_record_yet_counts_as_load(self, temp_home):
+        h = self._balance_harness(temp_home)
+        self._add(h, self.SID_B1, "b@example.com")  # launched, no status written
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_swept_session_is_not_load_on_the_tick_that_sweeps_it(
+        self, temp_home, monkeypatch
+    ):
+        h = self._balance_harness(temp_home)
+        dead = self._add(h, self.SID_B1, "b@example.com", pid=MANAGED_DEAD_PID)
+        self._record(dead, "busy", pid=MANAGED_DEAD_PID)
+        monkeypatch.setattr(managed_sessions_mod, "is_pid_alive", lambda pid: pid != MANAGED_DEAD_PID)
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_load_over_the_ceiling_still_lands_on_a_candidate(self, temp_home):
+        """The count is added to the 5h window before the ceiling gate, so
+        enough managed sessions push every qualifying account over it and
+        leave the ranking with nothing eligible. It must still hand back the
+        accounts that can work — soonest binding recovery first — instead of
+        blocking the tick or ranking on an axis of its own: #3 recovers in an
+        hour, #2 not for four, and #2 has the larger headroom that any other
+        key would pick."""
+        h = self._balance_harness(temp_home)
+        now = h.clock.now
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        self._record(self._add(h, self.SID_C1, "c@example.com"), "busy")
+        usage = {
+            "1": _usage7(95, 20, _iso_at(now + 3 * DAY)),
+            # 75 + 15 = 90, over the 85 ceiling; headroom 25, recovers in 4h.
+            "2": {
+                "five_hour": {"pct": 75.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 40.0, "resets_at": _iso_at(now + 6 * DAY)},
+            },
+            # 80 + 15 = 95, over it too; headroom 20, but back in an hour.
+            "3": {
+                "five_hour": {"pct": 80.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(now + 6 * DAY)},
+            },
+        }
+
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_dry_run_ranks_with_the_same_load(self, temp_home):
+        """A preview that ignored the load would not preview what runs."""
+        h = self._balance_harness(temp_home)
+        self._record(self._add(h, self.SID_B1, "b@example.com"), "busy")
+        h.engine = h._make_engine(dry_run=True)
+        assert h.tick_with_usage(self._two_beats_three_unless_loaded(h)) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.dry_run is True
+        assert switch.to_ref == {"number": 3, "email": "c@example.com"}
+        assert h.active_number() == 1
+
+    # -- failure paths of the upkeep pass -------------------------------------
+
+    def test_an_unreadable_status_record_never_stops_the_push(self, harness):
+        """A status record ``json.loads`` cannot survive — pathological
+        nesting raises ``RecursionError`` on one machine and parses on the
+        next — must be inert either way. Unhandled, it escaped the busy count
+        and took every tick's push with it."""
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        (b1 / "sessions").mkdir()
+        # Deep enough that the parser gives up on any ordinary stack (it
+        # still parses at 20k here); a machine that does parse it reads a
+        # list, not an object, which is just as inert.
+        nested = "[" * 100_000 + "]" * 100_000
+        (b1 / "sessions" / f"{os.getpid()}.json").write_text(nested)
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert [e.message for e in harness.events if isinstance(e, ErrorEvent)] == []
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_failed_push_is_reported_once_while_it_persists(self, harness):
+        # A registry row whose profile directory is not there: the writer
+        # refuses it (no-session-dir) on this and every later pass.
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B1}"
+        ]
+        assert errors[0].transient is True
+
+    def test_a_push_that_recovers_re_arms_the_report(self, harness):
+        session_dir = self._registry(harness).session_dir(self.SID_B1)
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        harness.tick_with_usage(self._usage_all())
+        create_managed_profile(session_dir)
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert harness.engine._session_health == {}
+        assert json.loads((session_dir / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_removed_account_is_reported_once_and_re_armed(self, harness):
+        """The session keeps running on a token nobody can refresh any more.
+        `cswap sessions` still lists it as healthy, so the daemon saying
+        nothing is the user's only warning that Claude is about to start
+        failing to authenticate there."""
+        self._add(harness, self.SID_B1, "b@example.com")
+        data = harness.switcher._get_sequence_data()
+        del data["accounts"]["2"]
+        data["sequence"].remove(2)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "Could not refresh 1 managed session(s) on b@example.com "
+            "(account-gone): no slot holds that account any more — re-add it "
+            "with `cswap add`, or stop the session. Their access token stops "
+            f"working within the hour — {self.SID_B1}"
+        ]
+        assert errors[0].transient is True
+
+        harness.seed(2, "b@example.com")
+        harness.tick_with_usage(self._usage_all())
+        assert harness.engine._session_health == {}
+        assert [e.message for e in harness.events if isinstance(e, ErrorEvent)] == [
+            errors[0].message
+        ]
+
+    def test_a_quarantined_slot_strands_its_sessions_with_its_own_report(
+        self, harness
+    ):
+        """Distinct from a refusal to resolve: the account is fine, cswap is
+        deliberately not touching the slot, and the user can lift it."""
+        self._add(harness, self.SID_B1, "b@example.com")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        harness.events.clear()
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "1 managed session(s) on b@example.com are stranded on "
+            "quarantined Account-2: their access token is no longer refreshed "
+            "and stops working within the hour. Repair the slot (re-add the "
+            f"account) or stop the session — {self.SID_B1}"
+        ]
+
+    def test_two_slots_sharing_an_email_report_independently(self, harness):
+        """One Claude login in two organizations occupies two slots, and
+        cswap's account identity is the (email, organizationUuid) pair. Keyed
+        on the address alone, each pass would overwrite what the other left
+        and both would report again on every tick — the log-burying the
+        dedupe exists to prevent."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["3"] = dict(data["accounts"]["2"], organizationUuid="org-2")
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.switcher._write_account_credentials(
+            "3", "b@example.com",
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-3", "refreshToken": "rt-3"}}),
+        )
+        harness.switcher._write_account_config(
+            "3", "b@example.com",
+            json.dumps({"oauthAccount": {
+                "emailAddress": "b@example.com", "organizationUuid": "org-2",
+            }}),
+        )
+        # Neither profile exists, so the writer refuses both pushes for good.
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        self._add(harness, self.SID_B2, "b@example.com", org="org-2", profile=False)
+
+        harness.tick_with_usage(self._usage_all())
+        harness.tick_with_usage(self._usage_all())
+
+        errors = [e for e in harness.events if isinstance(e, ErrorEvent)]
+        assert sorted(e.message for e in errors) == [
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B1}",
+            f"Could not update 1 managed session(s) on b@example.com: {self.SID_B2}",
+        ]
+
+    def test_an_account_without_sessions_loses_its_key(self, harness, monkeypatch):
+        """Otherwise the dict grows for the life of the daemon, one key per
+        account that ever had a session in trouble."""
+        self._add(harness, self.SID_B1, "b@example.com", profile=False)
+        harness.tick_with_usage(self._usage_all())
+        assert list(harness.engine._session_health) == [AccountRef("b@example.com", "")]
+
+        # The session's process exited: the sweep takes its row, and this
+        # pass's results say nothing about the account at all.
+        monkeypatch.setattr(managed_sessions_mod, "entry_is_live", lambda entry: False)
+        harness.tick_with_usage(self._usage_all())
+
+        assert harness.engine._session_health == {}
+
+    def test_an_unreadable_roster_costs_the_load_not_the_tick(
+        self, harness, monkeypatch, caplog
+    ):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+
+        def torn(switcher, account):
+            raise ClaudeSwitchError("sequence.json is unreadable")
+
+        monkeypatch.setattr(autoswitch_mod, "slot_for_account", torn)
+        with caplog.at_level("WARNING", logger="claude-swap"):
+            outcome = harness.tick_with_usage(self._usage_all())
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.engine._managed_busy == {}
+        # Ranking as if the account carried no session load is a decision the
+        # user cannot see anywhere else, so it must not be silent.
+        assert [
+            r.getMessage() for r in caplog.records
+            if "Managed-session load" in r.getMessage()
+        ] == [
+            "Managed-session load on b@example.com not counted this tick: "
+            "the account roster could not be read (sequence.json is unreadable)"
+        ]
+        # The push looks the slot up on its own account by account, so it is
+        # untouched by the count giving up on one.
+        assert json.loads((b1 / ".credentials.json").read_text())[
+            "claudeAiOauth"
+        ]["accessToken"] == "sk-2"
+
+    def test_a_released_quarantine_resumes_the_push_on_the_same_tick(self, harness):
+        b1 = self._add(harness, self.SID_B1, "b@example.com")
+        harness.engine._quarantine("2", "b@example.com", "invalid_grant")
+        # The user re-logged in and re-captured the slot: a new lineage, so
+        # the quarantine lifts on the next tick — and the push must not wait
+        # one further tick behind it.
+        harness.switcher._write_account_credentials("2", "b@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"}}
+        ))
+        harness.events.clear()
+
+        harness.tick_with_usage(self._usage_all())
+
+        assert any(isinstance(e, UnquarantineEvent) for e in harness.events)
+        blob = json.loads((b1 / ".credentials.json").read_text())["claudeAiOauth"]
+        assert blob["accessToken"] == "sk-2b" and "refreshToken" not in blob

@@ -290,6 +290,52 @@ def entry_is_live(entry: ManagedEntry) -> bool:
     return is_pid_alive(entry.pid) and pid_matches_record(entry.pid, entry.proc_start)
 
 
+# Claude's own status for a session: "busy" while it is working, "idle" once
+# it is waiting for the next prompt, "waiting" while a prompt of its own is
+# unanswered. Only a busy session is spending the account's 5h window.
+BUSY_STATUS = "busy"
+
+
+def session_status(session_dir: Path, pid: int) -> str | None:
+    """Claude's status for the instance ``pid`` inside a managed profile, or
+    None when it has not written a record yet or the record is unusable.
+
+    Claude keeps one record per instance at ``<config>/sessions/<pid>.json``
+    and restamps ``status`` on every change. This reads the one record the
+    registry entry names rather than scanning the directory
+    (``process_detection.scan_sessions``): the entry's liveness is
+    established by the caller's sweep, so no ``ps`` call is needed here to
+    know whose record this is — the pid is still read back out of the record
+    rather than trusted from the file name.
+    """
+    try:
+        raw = json.loads(
+            (session_dir / "sessions" / f"{pid}.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, RecursionError):
+        # Same set ``scan_sessions`` reads these records under, RecursionError
+        # included: pathological nesting exhausts the parser's stack on one
+        # machine and parses on the next, and neither may take the upkeep
+        # pass (and with it every account's token push) down with it.
+        return None
+    if not isinstance(raw, dict) or raw.get("pid") != pid:
+        return None
+    status = raw.get("status")
+    return status if isinstance(status, str) else None
+
+
+def entry_is_busy(session_dir: Path, entry: ManagedEntry) -> bool:
+    """Whether a live managed session counts toward its account's 5h load.
+
+    True when Claude reports the session busy, and also when there is no
+    status to read: an entry is written before ``exec``, so a session whose
+    Claude has not created its record yet is a live reservation that counts
+    alongside the busy ones, and reading it as idle would let a launch and
+    the lane-0 ranking pile onto one account in the same window.
+    """
+    return session_status(session_dir, entry.pid) in (None, BUSY_STATUS)
+
+
 def _validate_row(account: AccountRef, pid: object, source: object) -> None:
     """Raise ``ValueError`` for a row :meth:`ManagedEntry.from_json` would
     drop or silently reset on the next read (an invalid pid drops the
