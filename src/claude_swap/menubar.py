@@ -28,10 +28,10 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
-from claude_swap.switcher import SENTINEL_NOTES
+from claude_swap.switcher import SENTINEL_NOTES, USAGE_RELOGIN_REQUIRED
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -283,11 +283,20 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    login_expires_at: float | None = None,
+    quarantined: bool = False,
 ) -> str:
-    """Build one account row's menu label."""
+    """Build one account row's menu label.
+
+    Ends with a "login <countdown>" segment (:func:`oauth.format_login_expiry`,
+    the same judgement the CLI/TUI views use), stripped of its column padding:
+    an NSMenu row is proportional-font, so alignment there is meaningless and
+    the segment's *position* (last, after usage) is what stays constant.
+    """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    login = oauth.format_login_expiry(login_expires_at, quarantined, now).strip()
+    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)} · login {login}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -411,12 +420,15 @@ EMPTY_SNAPSHOT: dict = {
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, login_expires_at, quarantined), ...],
     "active_email": str | None, "active_usage": dict | str | None,
     "active_alias": str | None}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
+    ``login_expires_at``/``quarantined`` are the same fields the TUI's login
+    row reads (``AccountSnapshot.login_expires_at``, sentinel ==
+    ``USAGE_RELOGIN_REQUIRED``) — no extra credential read.
     """
     accounts = []
     active_email = None
@@ -428,6 +440,7 @@ def _adapt_snapshot(snap) -> dict:
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
                 acc.alias, acc.disabled, acc.usage.fetched_at,
+                acc.login_expires_at, acc.usage.sentinel == USAGE_RELOGIN_REQUIRED,
             )
         )
         if acc.is_active:
@@ -624,7 +637,10 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
+            for (
+                num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at,
+                _login_expires_at, _quarantined,
+            ) in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -760,10 +776,14 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            for (
+                num, email, is_active, display, _last_good, alias, disabled, fetched_at,
+                login_expires_at, quarantined,
+            ) in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        login_expires_at=login_expires_at, quarantined=quarantined,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -802,7 +822,10 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+            for (
+                num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at,
+                _login_expires_at, _quarantined,
+            ) in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
@@ -812,7 +835,10 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+            for (
+                num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at,
+                _login_expires_at, _quarantined,
+            ) in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)

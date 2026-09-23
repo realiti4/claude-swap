@@ -249,7 +249,7 @@ class TestUsageDisplay:
         get_global_config_path().write_text(
             json.dumps({"primaryApiKey": API_KEY}), encoding="utf-8"
         )
-        entry = s._active_account_usage("2", "api-key-2@token.local", "")
+        entry, _login_expires_at = s._active_account_usage("2", "api-key-2@token.local", "")
         assert entry.sentinel == USAGE_API_KEY
         assert entry.decision_value() == USAGE_API_KEY
 
