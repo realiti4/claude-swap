@@ -100,6 +100,20 @@ def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
     return out
 
 
+# ``oauth._RESET_GRANT_FIELDS`` as the JSON spells them.
+_RESET_GRANT_KEYS = {
+    "id": "id", "label": "label", "resets_total": "resetsTotal",
+    "resets_left": "resetsLeft", "starts_at": "startsAt", "ends_at": "endsAt",
+    "clears": "clears", "paused": "paused", "usable_now": "usableNow",
+    "use_requires_limit": "useRequiresLimit",
+}
+
+
+def _reset_grant_to_json(grant: dict) -> dict:
+    """Project one promotional limit-reset grant (additive ``resetGrants``)."""
+    return {json_key: grant[key] for key, json_key in _RESET_GRANT_KEYS.items() if key in grant}
+
+
 def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     """Convert the internal usage dict to its camelCase JSON projection.
 
@@ -129,6 +143,8 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    if "reset_grants" in usage:
+        out["resetGrants"] = [_reset_grant_to_json(g) for g in usage["reset_grants"]]
     return out
 
 

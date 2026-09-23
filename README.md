@@ -274,6 +274,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set usage.resetGrants true   # also poll for promotional limit resets (see "JSON output")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -331,6 +332,8 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+
+With `cswap config set usage.resetGrants true`, `usage` additively carries `resetGrants`: the account's promotional usage-limit resets (what Claude Code offers as `/limit-reset`), one entry per grant with `id`, `label`, `resetsTotal`/`resetsLeft`, `startsAt`/`endsAt` (ISO-8601), `clears` (the windows it refills, e.g. `five_hour`, `seven_day`), `usableNow`, `useRequiresLimit` (whether you must be at a limit to use it) and `paused`. An empty list is an eligible account holding none; the key is absent while the setting is off. The server only answers this to Claude Code's own User-Agent, so while the setting is on the usage poll presents as Claude Code instead of `claude-swap/1.0` — which is why it is off by default.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 

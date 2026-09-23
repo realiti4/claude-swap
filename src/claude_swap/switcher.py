@@ -85,7 +85,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1821,6 +1826,10 @@ class ClaudeAccountSwitcher:
         inputs = (loaded.threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _reset_grants_wanted(self) -> bool:
+        """``usage.resetGrants``, read per fetch so a change lands on the next poll."""
+        return load_usage_settings(self.backup_dir).reset_grants
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4138,6 +4147,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                reset_grants=self._reset_grants_wanted(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4621,6 +4631,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            reset_grants=self._reset_grants_wanted(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -4891,6 +4902,7 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
+            reset_grants=self._reset_grants_wanted(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -4912,7 +4924,10 @@ class ClaudeAccountSwitcher:
         stamp = oauth.access_token_fingerprint(creds)
         if stamp is not None and stamp == rejected_fp:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        outcome = oauth.try_fetch_usage_for_account(num, email, creds, is_active=True)
+        outcome = oauth.try_fetch_usage_for_account(
+            num, email, creds, is_active=True,
+            reset_grants=self._reset_grants_wanted(),
+        )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
         return FetchRecord(
