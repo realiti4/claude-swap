@@ -281,6 +281,23 @@ class TestMergedWithCli:
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
 
+    def test_priority_accounts_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(),
+            _args(strategy="priority", priority_accounts="enterprise,2"),
+        )
+        assert merged.strategy == "priority"
+        assert merged.priority_accounts == "enterprise,2"
+
+    def test_priority_is_an_accepted_strategy_everywhere(self):
+        # `_clamped` reverts an out-of-range value to the default, and the
+        # `config set` validator reads the same tuple — so a strategy the
+        # spec does not list is silently unsettable through either surface.
+        assert "priority" in SETTING_SPECS["autoswitch.strategy"].choices
+        assert merged_with_cli(
+            AutoSwitchSettings(), _args(strategy="priority")
+        ).strategy == "priority"
+
 
 class TestAtomicWriteThroughSymlink:
     """A rename does not follow links, so renaming onto a symlinked path
