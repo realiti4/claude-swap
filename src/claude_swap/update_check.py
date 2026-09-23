@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import urllib.request
+from importlib.metadata import distribution
 from pathlib import Path
 from typing import NamedTuple
 
@@ -69,6 +70,15 @@ def _is_newer(latest: str, current: str) -> bool:
     return latest_version > current_version
 
 
+def _is_editable_install() -> bool:
+    """Return True if claude-swap runs from an editable install (PEP 610)."""
+    try:
+        text = distribution("claude-swap").read_text("direct_url.json")
+        return bool(text and json.loads(text).get("dir_info", {}).get("editable"))
+    except Exception:
+        return False
+
+
 def _detect_install_method() -> str | None:
     """Return 'uv', 'pipx', or None if we can't tell."""
     prefix = Path(sys.prefix)
@@ -95,6 +105,9 @@ def _detect_install_method() -> str | None:
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
+        if _is_editable_install():
+            return None
+
         latest_version = None
 
         # Try reading cache
