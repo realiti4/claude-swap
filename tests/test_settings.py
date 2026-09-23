@@ -16,9 +16,11 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    UsageSettings,
     effective_settings,
     load_settings,
     load_ui_settings,
+    load_usage_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -152,6 +154,27 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestUsageSettings:
+    def test_missing_file_defaults_off(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path) == UsageSettings(reset_grants=False)
+
+    def test_reads_true(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"usage": {"resetGrants": True}}))
+        assert load_usage_settings(tmp_path).reset_grants is True
+
+    def test_non_bool_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"usage": {"resetGrants": "yes"}}))
+        assert load_usage_settings(tmp_path).reset_grants is False
+
+    def test_set_and_unset(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.resetGrants", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "usage": {"resetGrants": True}}
+        assert load_usage_settings(tmp_path).reset_grants is True
+        assert unset_setting(tmp_path, "usage.resetGrants") is True
+        assert "usage" not in json.loads(settings_path(tmp_path).read_text())
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +186,14 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["usage"] == {
+            f.name for f in UsageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(), "ui": UiSettings(), "usage": UsageSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

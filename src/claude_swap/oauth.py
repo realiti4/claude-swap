@@ -394,14 +394,31 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
-def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+# The usage endpoint hands out the promotional limit-reset block (the
+# ``cedar_ember`` block Claude Code's ``/limit-reset`` reads) only to Claude
+# Code's own User-Agent: any other one gets ``ineligible_reason: "surface"``
+# and no grants (measured 2026-09-23 against Claude Code 2.1.280). So the
+# default poll keeps cswap's own User-Agent, and only ``usage.resetGrants``
+# opts a poll into presenting as the CLI.
+CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.280 (external, cli)"
+
+
+def request_usage_data(access_token: str, *, reset_grants: bool = False) -> dict:
+    """Request raw utilization data from the Anthropic usage API.
+
+    ``reset_grants`` also asks for the promotional limit-reset block, which
+    means presenting as Claude Code (see ``CLAUDE_CODE_USER_AGENT``).
+    """
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
         "User-Agent": "claude-swap/1.0",
     }
+    if reset_grants:
+        url += "?cedar_ember=1"
+        headers["User-Agent"] = CLAUDE_CODE_USER_AGENT
+        headers["x-app"] = "cli"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
@@ -532,7 +549,41 @@ def build_usage_result(data: dict) -> dict | None:
         if scoped:
             result["scoped"] = scoped
 
+    grants = _reset_grants(data.get("cedar_ember"))
+    if grants is not None:
+        result["reset_grants"] = grants
+
     return result if result else None
+
+
+# Per-grant fields kept from the ``cedar_ember`` block, as the server names
+# them. ``percent_used``/``blocking``/``arm`` are Claude Code's own UI state.
+_RESET_GRANT_FIELDS = (
+    "id", "label", "resets_total", "resets_left", "starts_at", "ends_at",
+    "clears", "paused", "usable_now", "use_requires_limit",
+)
+
+
+def _reset_grants(block: object) -> list[dict] | None:
+    """Promotional limit-reset grants from a ``cedar_ember`` block.
+
+    The block is only there when the request asked for it
+    (``request_usage_data(..., reset_grants=True)``). ``None`` when it is
+    absent or carries no grants list — unknown — as opposed to ``[]``, an
+    account holding no grant, so consumers can tell the two apart. A grant
+    without a string ``id`` or an integer ``resets_left`` is skipped.
+    """
+    if not isinstance(block, dict) or not isinstance(block.get("grants"), list):
+        return None
+    grants = []
+    for grant in block["grants"]:
+        if not isinstance(grant, dict) or not isinstance(grant.get("id"), str):
+            continue
+        left = grant.get("resets_left")
+        if isinstance(left, bool) or not isinstance(left, int):
+            continue
+        grants.append({k: grant[k] for k in _RESET_GRANT_FIELDS if k in grant})
+    return grants
 
 
 def relevant_windows(
@@ -643,6 +694,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    reset_grants: bool = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -651,7 +703,8 @@ def try_fetch_usage_for_account(
     when given: the switcher passes its consume gate, which re-reads the
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
-    unused for the refresh (the gate persists internally).
+    unused for the refresh (the gate persists internally). ``reset_grants``
+    is forwarded to ``request_usage_data``.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -703,7 +756,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = request_usage_data(access_token, reset_grants=reset_grants)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -752,7 +805,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            data = request_usage_data(new_token, reset_grants=reset_grants)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
