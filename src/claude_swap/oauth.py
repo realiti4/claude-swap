@@ -70,6 +70,22 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def is_newer_generation(live: str, backup: str | None) -> bool:
+    """True only when both credentials carry an access-token ``expiresAt``
+    and ``live``'s is strictly later. Every refresh mints an access token
+    with a fresh expiry, so a later expiry is a later generation of the
+    lineage; anything unknown answers False."""
+    expiries = [
+        (extract_oauth_data(c or "") or {}).get("expiresAt") for c in (live, backup)
+    ]
+    live_exp, backup_exp = expiries
+    return (
+        isinstance(live_exp, (int, float))
+        and isinstance(backup_exp, (int, float))
+        and live_exp > backup_exp
+    )
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 
