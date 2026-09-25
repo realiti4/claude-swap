@@ -37,6 +37,10 @@ ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+TITLE_STYLE_CHOICES: tuple[str, ...] = ("active", "all")
+# Below this a window is "comfortable" (green); from here up to the auto-switch
+# threshold it is "warn" (orange); at or past the threshold it is "high" (red).
+WARN_PCT = 50
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 
@@ -97,6 +101,7 @@ class MenuBarSettings:
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
+    title_style: str = "active"  # one of TITLE_STYLE_CHOICES: active account only, or every account
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -335,6 +340,153 @@ def format_title(
     return f"{ICON} " + " · ".join(segments)
 
 
+@dataclass(frozen=True)
+class TitleCell:
+    """One account's slot in the all-accounts menu-bar title."""
+
+    label: str
+    five_hour: float | None
+    seven_day: float | None
+    active: bool
+    stale: bool = False  # a sentinel state (e.g. token expired): last-known numbers, not live
+
+
+def usage_level(pct: float | None, threshold: int) -> str:
+    """Colour bucket for a window: ``unknown``, ``ok``, ``warn`` or ``high``.
+
+    ``high`` starts at the auto-switch threshold, so red means "the engine
+    would move off this account now".
+    """
+    if pct is None:
+        return "unknown"
+    if pct >= threshold:
+        return "high"
+    if pct >= WARN_PCT:
+        return "warn"
+    return "ok"
+
+
+def title_cells(accounts: list, now: float | None = None) -> list[TitleCell]:
+    """Build the all-accounts title cells from ``_adapt_snapshot`` rows.
+
+    Disabled accounts are left out (they are out of rotation) unless one is
+    the account in use. Usage is the last-good measurement; an account in a
+    sentinel state (expired token, …) keeps its last-known numbers but is
+    marked ``stale`` so it is not drawn as live. An account never measured
+    shows unknowns.
+    """
+    if now is None:
+        now = time.time()
+    cells = []
+    for num, email, is_active, display, last_good, alias, disabled, _fetched in accounts:
+        if disabled and not is_active:
+            continue
+        seven = last_good.get("seven_day") if isinstance(last_good, dict) else None
+        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
+        seven_pct = (
+            float(seven["pct"])
+            if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float))
+            else None
+        )
+        cells.append(
+            TitleCell(
+                label=_local_part(alias if alias else email, limit=8),
+                five_hour=_window_pct(last_good, "five_hour"),
+                seven_day=seven_pct,
+                active=bool(is_active),
+                stale=isinstance(display, str),
+            )
+        )
+    return cells
+
+
+def _pct_text(pct: float | None) -> str:
+    return "–" if pct is None else f"{pct:.0f}"
+
+
+def format_all_title(cells: list[TitleCell]) -> str:
+    """Plain-text form of the all-accounts title (fallback + tooltip).
+
+    ``home 5·2  *work 8·85  side 40·60?`` — the active account is starred,
+    a stale one's numbers end in ``?``.
+    """
+    if not cells:
+        return ICON
+    parts = [
+        f"{'*' if c.active else ''}{c.label} {_pct_text(c.five_hour)}·{_pct_text(c.seven_day)}"
+        f"{'?' if c.stale else ''}"
+        for c in cells
+    ]
+    return f"{ICON} " + "  ".join(parts)
+
+
+def all_accounts_image(AppKit, cells: list[TitleCell], threshold: int):
+    """Draw the all-accounts title as an NSImage: per account, ``5h · 7d``
+    coloured by :func:`usage_level` over the account's name in small type,
+    the account in use in bold on a soft rounded highlight.
+
+    Drawn in a drawing handler so the system colours resolve against the
+    menu bar's current appearance (light/dark) every time it redraws.
+    """
+    num_font = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(10, AppKit.NSFontWeightSemibold)
+    label_font = AppKit.NSFont.systemFontOfSize_weight_(8, AppKit.NSFontWeightMedium)
+    active_label_font = AppKit.NSFont.systemFontOfSize_weight_(8, AppKit.NSFontWeightBold)
+    level_colors = {
+        "ok": AppKit.NSColor.systemGreenColor(),
+        "warn": AppKit.NSColor.systemOrangeColor(),
+        "high": AppKit.NSColor.systemRedColor(),
+        "unknown": AppKit.NSColor.secondaryLabelColor(),
+    }
+    secondary = AppKit.NSColor.secondaryLabelColor()
+    primary = AppKit.NSColor.labelColor()
+
+    def _cell_color(cell, pct):
+        # last-known numbers of an expired/unavailable account are not live: grey
+        return secondary if cell.stale else level_colors[usage_level(pct, threshold)]
+
+    def _attr(text, font, color):
+        return AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            text,
+            {AppKit.NSFontAttributeName: font, AppKit.NSForegroundColorAttributeName: color},
+        )
+
+    rendered = []
+    for c in cells:
+        top = AppKit.NSMutableAttributedString.alloc().init()
+        top.appendAttributedString_(
+            _attr(_pct_text(c.five_hour), num_font, _cell_color(c, c.five_hour))
+        )
+        top.appendAttributedString_(_attr(" · ", num_font, secondary))
+        top.appendAttributedString_(
+            _attr(_pct_text(c.seven_day), num_font, _cell_color(c, c.seven_day))
+        )
+        label = _attr(c.label, active_label_font if c.active else label_font, primary)
+        rendered.append((top, label))
+
+    gap, pad = 2.0, 5.0  # between cells; inside each cell (room for the active pill)
+    height = float(AppKit.NSStatusBar.systemStatusBar().thickness())
+    widths = [max(top.size().width, label.size().width) + 2 * pad for top, label in rendered]
+    width = sum(widths) + gap * (len(widths) - 1)
+    actives = [c.active for c in cells]
+
+    def _draw(_rect):
+        x = 0.0
+        for (top, label), w, active in zip(rendered, widths, actives):
+            if active:
+                # a soft rounded highlight behind the account in use
+                primary.colorWithAlphaComponent_(0.18).setFill()
+                AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    ((x, 0.5), (w, height - 1.0)), 5.0, 5.0
+                ).fill()
+            top_size, label_size = top.size(), label.size()
+            label.drawAtPoint_((x + (w - label_size.width) / 2.0, 0.5))
+            top.drawAtPoint_((x + (w - top_size.width) / 2.0, height - top_size.height - 0.5))
+            x += w + gap
+        return True
+
+    return AppKit.NSImage.imageWithSize_flipped_drawingHandler_((width, height), False, _draw)
+
+
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
@@ -548,7 +700,7 @@ def run(switcher) -> int:
     )
 
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import load_settings, set_setting
+    from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -732,13 +884,48 @@ def run(switcher) -> int:
                 return 0
 
         # ---- menu construction -----------------------------------------------
-        def rebuild_menu(self):
+        def _apply_title(self, threshold):
+            """Set the status item: text for the active account, or the drawn
+            all-accounts image. The status item only exists once rumps is
+            running, so before that (and if drawing fails) the all-accounts
+            style falls back to its plain-text form."""
+            # rumps has no public handle on the NSStatusItem; reach for the
+            # private one defensively and degrade to the text title without it.
+            item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+            button = item.button() if item is not None else None
+            if self.settings.title_style == "all":
+                cells = title_cells(self.snapshot["accounts"])
+                text = format_all_title(cells)
+                image = None
+                if button is not None and cells:
+                    try:
+                        image = all_accounts_image(AppKit, cells, threshold)
+                    except Exception:
+                        self.switcher._logger.debug("menubar title image failed", exc_info=True)
+                if image is None:
+                    if button is not None:
+                        button.setImage_(None)
+                    self.title = text
+                    return
+                # image first: a status item left with neither title nor image
+                # gets rumps' fallback text
+                button.setImage_(image)
+                button.setToolTip_(text)
+                self.title = ""
+                return
+            if button is not None:
+                button.setImage_(None)
+                button.setToolTip_(None)
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
             )
+
+        def rebuild_menu(self):
+            threshold = self._threshold()  # one settings read per rebuild
+            self._apply_title(threshold or int(AutoSwitchSettings().threshold))
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh
@@ -785,7 +972,7 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
-                self._settings_menu(rumps),
+                self._settings_menu(rumps, threshold),
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
@@ -839,9 +1026,24 @@ def run(switcher) -> int:
             menu.add(rumps.MenuItem("Open full log…", callback=self.on_open_log))
             return menu
 
-        def _settings_menu(self, rumps):
+        def _settings_menu(self, rumps, threshold):
             menu = rumps.MenuItem("Settings")
-            name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
+            style_menu = rumps.MenuItem("Menu bar shows")
+            style_labels = {"active": "Active account", "all": "All accounts"}
+            for style in TITLE_STYLE_CHOICES:
+                ch = rumps.MenuItem(style_labels[style], callback=self._make_title_style(style))
+                ch.state = 1 if self.settings.title_style == style else 0
+                style_menu.add(ch)
+            menu.add(style_menu)
+
+            # The options below shape the single-account title only; the
+            # all-accounts view ignores them, so grey them out there.
+            single = self.settings.title_style != "all"
+
+            def _cb(fn):
+                return fn if single else None
+
+            name_item = rumps.MenuItem("Show account name in menu bar", callback=_cb(self.on_toggle_name))
             name_item.state = 1 if self.settings.show_account_name else 0
             menu.add(name_item)
 
@@ -849,13 +1051,13 @@ def run(switcher) -> int:
             tp_labels = {"off": "None", "5h": "Session (5h)",
                          "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
             for mode in TITLE_PCT_CHOICES:
-                ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
+                ch = rumps.MenuItem(tp_labels[mode], callback=_cb(self._make_title_pct(mode)))
                 ch.state = 1 if self.settings.title_pct == mode else 0
                 title_pct.add(ch)
             menu.add(title_pct)
 
             scoped_item = rumps.MenuItem(
-                "Show model limits in title", callback=self.on_toggle_scoped
+                "Show model limits in title", callback=_cb(self.on_toggle_scoped)
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
@@ -873,7 +1075,7 @@ def run(switcher) -> int:
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
+            current = threshold
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
                 ch.state = 1 if current == pct else 0
@@ -1013,6 +1215,12 @@ def run(switcher) -> int:
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
             self._save_and_rebuild()
+
+        def _make_title_style(self, style):
+            def cb(_sender):
+                self.settings.title_style = style
+                self._save_and_rebuild()
+            return cb
 
         def _make_title_pct(self, mode):
             def cb(_sender):
