@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
 from claude_swap import oauth, usage_store
+from claude_swap.poll_policy import (
+    CANDIDATE_MAX_INTERVAL_S,
+    POST_429_MIN_INTERVAL_S,
+    POST_SWITCH_REPLAN_DEFER_S,
+)
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
-    RATE_LIMIT_TRUST_MAX_AGE_S,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
+    WALL_FALLBACK_S,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -120,29 +126,83 @@ class TestStaleOnError:
 
 
 class TestExtendedTrust:
-    """Deliberate staleness (failure state, scheduler cadence) stays trusted."""
+    """Deliberate staleness stays trusted past STALE_OK_S, capped at
+    TRUST_MAX_AGE_S -- but only for a row that has NOT failed (scheduler
+    cadence, a live fetch lease).
 
-    def test_in_backoff_past_stale_ok_is_still_trusted(self, store, clock):
+    A row whose last poll attempt FAILED is capped at POST_429_MIN_INTERVAL_S
+    instead (T1102), whatever the error kind, Retry-After, backoff state or a
+    window's own reset says: a reading the poller could not refresh must go
+    unknown quickly, not stay trusted on a stale percentage. This replaces
+    the old rule (commits 64840952, dd5c9ac1) that extended a 429's trust to
+    its window's reset or RATE_LIMIT_TRUST_MAX_AGE_S -- the owner's order
+    overrides that past the poll period; an out-of-band wall the pin itself
+    saw is UsageStore.mark_at_limit's job instead (see TestMarkAtLimit).
+    """
+
+    @pytest.mark.parametrize("error,kwargs", [
+        ("http-429", {"retry_after_s": 480.0}),
+        ("timeout", {}),
+    ])
+    def test_a_failed_reading_is_trusted_up_to_the_poll_period(
+        self, store, clock, error, kwargs
+    ):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        clock.advance(STALE_OK_S)
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=480.0)}, IDENT
-        )
-        clock.advance(60)
+        store.record({"1": FetchRecord(error=error, **kwargs)}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S)
         entry = store.entries(IDENT)["1"]
-        assert entry.age_s > STALE_OK_S
-        assert entry.in_backoff(clock.now)
         assert entry.trust_extended
         assert entry.decision_value() == USAGE
 
-    def test_failure_state_after_backoff_expiry_is_still_trusted(self, store, clock):
+    @pytest.mark.parametrize("error,kwargs", [
+        ("http-429", {"retry_after_s": 480.0}),
+        ("timeout", {}),
+    ])
+    def test_a_failed_reading_past_the_poll_period_is_unknown(
+        self, store, clock, error, kwargs
+    ):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        clock.advance(60)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
-        clock.advance(BACKOFF_BASE_S + STALE_OK_S)  # backoff long expired
+        store.record({"1": FetchRecord(error=error, **kwargs)}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S + 1)
         entry = store.entries(IDENT)["1"]
-        assert not entry.in_backoff(clock.now)
-        assert entry.decision_value() == USAGE
+        assert not entry.trust_extended
+        assert entry.decision_value() is None
+
+    def test_backoff_expiry_does_not_extend_trust_past_the_poll_period(
+        self, store, clock
+    ):
+        # The old rule kept a failed row trusted once its OWN backoff expired,
+        # up to TRUST_MAX_AGE_S. That extension is gone: backoff state no
+        # longer matters to trust, only age since the last success does.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(BACKOFF_BASE_S + 1)
+        assert not store.entries(IDENT)["1"].in_backoff(clock.now)
+        clock.advance(POST_429_MIN_INTERVAL_S)  # ...but still past the cap
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_a_far_future_429_reset_does_not_extend_trust_either(
+        self, store, clock
+    ):
+        # The old rule trusted a 429-frozen reading up to its window's own
+        # reset. Gone: a reset far in the future no longer rescues a stale
+        # poll past the poll period.
+        from datetime import datetime, timezone
+
+        far = (
+            datetime.fromtimestamp(clock.now + 100_000.0, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": far},
+            "seven_day": {"pct": 10.0, "resets_at": far},
+        }
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
 
     def test_within_poll_plan_past_stale_ok_is_trusted(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
@@ -155,17 +215,27 @@ class TestExtendedTrust:
         clock.advance(250)
         assert store.entries(IDENT)["1"].decision_value() is None
 
-    def test_trust_ceiling_wins_over_non_429_failure_state(self, store, clock):
-        # A non-429 failure (timeout/network) past the general ceiling reads as
-        # unknown: such an error is no evidence the last_good still holds, so
-        # the unknown-path machinery must take back over.
+    def test_trust_ceiling_wins_over_non_failed_stale_plan(self, store, clock):
+        # A row past TRUST_MAX_AGE_S with no failure reads as unknown even
+        # with a LIVE plan (nextPollAt still ahead) -- the ceiling must win
+        # over the scheduler-cadence extension, not just over "no plan at
+        # all" (which trust_extended would already refuse for its own
+        # reason).
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        store.set_poll_plan(
+            {"1": (clock.now + TRUST_MAX_AGE_S + 500.0, 500.0)}, IDENT
+        )
         clock.advance(TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         entry = store.entries(IDENT)["1"]
-        assert entry.consecutive_failures == 2
+        assert entry.consecutive_failures == 0
         assert entry.decision_value() is None
+
+
+class TestMarkAtLimit:
+    """Rule 2 (T1102): an out-of-band at-limit signal the poller cannot see
+    (the pin's own 429 on /v1/messages, via UsageStore.mark_at_limit) makes
+    decision_value() report the slot full until a persisted deadline, whatever
+    a poll taken meanwhile says."""
 
     def _usage_resetting_at(self, clock, seconds_ahead):
         from datetime import datetime, timezone
@@ -180,128 +250,67 @@ class TestExtendedTrust:
             "seven_day": {"pct": 10.0, "resets_at": iso},
         }
 
-    def test_429_staleness_trusted_until_window_reset(self, store, clock):
-        # A usage-endpoint 429 throttles polling; it does NOT move the account's
-        # real windows. Usage only rises within a window (monotone until reset),
-        # so last_good is a valid lower bound — trust it up to its reset, as long
-        # as that reset is within the client-side ceiling. Reset inside the
-        # ceiling → trusted right up to it, past the general TRUST_MAX_AGE_S.
-        reset_ahead = (TRUST_MAX_AGE_S + RATE_LIMIT_TRUST_MAX_AGE_S) / 2  # < ceiling
-        usage = self._usage_resetting_at(clock, reset_ahead)
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(TRUST_MAX_AGE_S + 1)  # past the general ceiling...
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        entry = store.entries(IDENT)["1"]
-        assert entry.trust_extended
-        assert entry.decision_value() == usage  # ...but before the reset
-
-    def test_429_staleness_expires_at_window_reset(self, store, clock):
-        # Once the window has reset, usage is zeroed and last_good is obsolete —
-        # it reads as unknown so the unknown-path machinery takes over. This is
-        # the natural, data-driven bound (no fixed clock): trust ends exactly
-        # when the measured value can no longer hold.
-        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(601.0)  # past the window reset
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        entry = store.entries(IDENT)["1"]
-        assert entry.decision_value() is None
-        assert entry.last_good == usage  # display still sees it
-
-    def test_429_staleness_without_reset_info_falls_back_to_ceiling(
+    def test_full_before_the_earliest_reset_and_the_poll_after_it(
         self, store, clock
     ):
-        # Older stored data may carry no resets_at. Fall back to the fixed
-        # rate-limit ceiling so such an entry still can't be trusted forever.
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no resets_at
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() == USAGE  # within
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None  # past cap
-
-
-class TestRateLimitTrustBounds:
-    """The 429-stale trust must be bounded even with reset metadata present:
-    (a) clamped to a client-side ceiling so a far-future/malformed resets_at
-    can't grant indefinite trust, (b) keyed on the EARLIEST future reset (any
-    relevant window reset invalidates the snapshot), and (c) robust to partial
-    metadata (a window missing resets_at must not let a longer window's reset
-    override the ceiling).
-    """
-
-    def _usage(self, clock, five_h_ahead, seven_d_ahead):
-        from datetime import datetime, timezone
-
-        def iso(ahead):
-            if ahead is None:
-                return None
-            return (
-                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        five = {"pct": 25.0}
-        if five_h_ahead is not None:
-            five["resets_at"] = iso(five_h_ahead)
-        seven = {"pct": 10.0}
-        if seven_d_ahead is not None:
-            seven["resets_at"] = iso(seven_d_ahead)
-        return {"five_hour": five, "seven_day": seven}
-
-    def test_far_future_reset_is_clamped_to_the_ceiling(self, store, clock):
-        # A malformed/far-future resets_at (year 2099) must NOT grant unbounded
-        # trust: the client-side ceiling caps it.
-        far = 10 * 365 * 24 * 3600.0  # ~10 years
-        usage = self._usage(clock, far, far)
+        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
+        iso = usage["five_hour"]["resets_at"]
         store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        # past the ceiling → no longer trusted, despite the far-future reset
-        assert store.entries(IDENT)["1"].decision_value() is None
+        store.mark_at_limit("1", IDENT)
 
-    def test_trust_keys_on_earliest_future_reset(self, store, clock):
-        # 5h resets soon, 7d resets far ahead. The snapshot is invalid once the
-        # SOONER window rolls over (usage zeroes there), so trust must end at the
-        # earliest reset, not the latest.
-        usage = self._usage(clock, 600.0, 100 * 3600.0)  # 5h: 10min, 7d: far
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(601.0)  # past the 5h reset, long before the 7d one
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        # five_hour forced full at the mark's own deadline; seven_day kept
+        # from the stored reading (I1: a reader like autoswitch's
+        # `_seven_day_reset_unmeasured` must see the real weekly reset, not
+        # "never reported").
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0, "resets_at": iso},
+        }
 
-    def test_partial_metadata_still_bounded_by_ceiling(self, store, clock):
-        # 5h has NO resets_at (a shape the server actually sends); 7d resets far
-        # ahead. The missing-reset window must not let the far 7d reset grant
-        # near-unbounded trust — the ceiling still applies.
-        usage = self._usage(clock, None, 100 * 3600.0)
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        clock.advance(300.0)  # a poll taken while still walled...
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0},
+        }  # ...does not clear the mark early, but the polled seven_day
+        # (no resets_at this time) still passes through unchanged.
 
-    def test_ceiling_wins_when_reset_is_beyond_it(self, store, clock):
-        # Reset farther out than the ceiling: trusted up to the ceiling, then
-        # unknown — the ceiling, not the reset, is the bound.
-        usage = self._usage(
-            clock, RATE_LIMIT_TRUST_MAX_AGE_S * 3, RATE_LIMIT_TRUST_MAX_AGE_S * 3
-        )
+        clock.advance(301.0)  # past the mark's own deadline
+        fresh = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}}
+        store.record({"1": FetchRecord(usage=fresh)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == fresh
+
+    def test_a_far_future_reset_is_capped_at_the_wall_fallback_span(
+        self, store, clock
+    ):
+        # I2: `walledUntil = min(earliest future stored reset, now +
+        # WALL_FALLBACK_S)` -- a stored reset further out than the fallback
+        # (a 7d window, or a malformed far-future one) must not park the
+        # mark past WALL_FALLBACK_S.
+        usage = self._usage_resetting_at(clock, WALL_FALLBACK_S + 1000.0)
         store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S - 60)  # just inside the ceiling
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() == usage
-        clock.advance(120)  # now just past the ceiling
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        store.mark_at_limit("1", IDENT)
+
+        clock.advance(WALL_FALLBACK_S - 1)
+        assert store.entries(IDENT)["1"].walled  # still inside the cap
+        clock.advance(2)
+        assert not store.entries(IDENT)["1"].walled  # capped, not the far reset
+
+    def test_no_stored_reading_falls_back_to_the_wall_fallback_span(
+        self, store, clock
+    ):
+        store.mark_at_limit("1", IDENT)  # nothing stored to key a reset on
+        resets_at = usage_store._reset_ts_to_resets_at(clock.now + WALL_FALLBACK_S)
+        # I1: with nothing stored to keep, seven_day is synthesized full at
+        # the same deadline instead of being silently dropped.
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0, "resets_at": resets_at},
+            "seven_day": {"pct": 100.0, "resets_at": resets_at},
+        }
+        clock.advance(WALL_FALLBACK_S - 1)
+        assert store.entries(IDENT)["1"].walled
+        clock.advance(2)
+        assert not store.entries(IDENT)["1"].walled
 
 
 class TestBackoff:
@@ -511,70 +520,29 @@ class TestBackoff:
                 f"ask {ask} -> wait {wait}, expected {expected}"
             )
 
-    def test_the_cap_sits_inside_the_trust_it_relies_on(self):
-        """The cap has a floor test and no ceiling; the ceiling is the invariant.
-
-        `RETRY_AFTER_FLOOR_CAP_S`'s own comment justifies the 429-only margin
-        with "a 4500s wait sits comfortably inside its own trust"
-        (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
-        this tree by mutating the constant and running the full suite, the
-        inequality below admits `[4500, 7200]` — 4499 fails 12, 7201 fails 5
-        (re-measured 2026-08-03: this PR added four more tests that also bind
-        the constant since the "1" was first measured).
-
-        The inequality is NOT what bounds blind time. It compares two
-        constants; raising the cap to 7200 satisfies it while, at an ask of
-        6300s or more (where the wait itself reaches the raised cap), more
-        than doubling the blind window over consecutive blocks (6300s ->
-        14400s, measured). The IDENTITY assertion below is what actually
-        stops that drift, and it is the reason this test still fails at
-        7200. See
-        `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
-
-        That leaves 2700s of slack in which the constant can drift silently, so
-        the arithmetic identity its comment states ("40 of 41 observed blocks
-        opened at exactly 3600, and 3600 + 900 = this" — re-measured
-        2026-08-03) is pinned outright below. The inequality stays as the
-        invariant that explains WHY the margin is 429-only.
-
-        The same bound neutralises `Retry-After: inf`, which reaches
-        `min(inf + 900, cap)` and is finite only because of it.
-        """
-        assert usage_store.RETRY_AFTER_FLOOR_CAP_S == (
+    def test_the_floor_cap_is_the_measured_block_plus_the_margin(self):
+        # RETRY_AFTER_FLOOR_CAP_S's own comment justifies it as "the measured
+        # block (3600s) plus the margin" ("37 of 39 observed blocks opened at
+        # exactly 3600, and 3600 + 900 = this"). Pinned outright: neither
+        # test_hour_scale_retry_after_honored (hardcodes 4500.0, not tied to
+        # the constant) nor test_retry_after_floor_is_capped (pins only that
+        # a huge ask saturates AT the cap, whatever its value) would catch
+        # the constant drifting off that arithmetic.
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S == pytest.approx(
             3600.0 + usage_store.RETRY_AFTER_MARGIN_S
-        ), (
-            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} is no longer the "
-            "measured block (3600s) plus the margin — the inequality below "
-            "admits up to 7200, so nothing else would catch the drift"
         )
-        assert (
-            usage_store.RETRY_AFTER_FLOOR_CAP_S
-            <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S
-        ), (
-            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} exceeds the 429 trust "
-            f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}, so a single "
-            "header can park a row past the moment its own data goes unknown"
-        )
-        # And the wait it produces stays inside that ceiling for any ask.
-        for ask in (3600.0, 4500.0, 50_000.0, 86_400.0, float("inf")):
-            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
-            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
-                f"ask {ask} produced a {wait}s wait, past the trust ceiling"
-            )
 
     def test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses(self):
         """A non-429 park must never outlast TRUST_MAX_AGE_S, its own ceiling.
 
-        `entries()` reads a non-429 row unknown once `TRUST_MAX_AGE_S` (3600s)
-        elapses past the last success — that is the ceiling this arm's trust
-        actually uses. Before this fix, the PARK BOUND capped every ask at
-        `RETRY_AFTER_FLOOR_CAP_S` (4500s) regardless of which arm produced it,
-        so a non-429 ask above 3600 parked the row past its own trust: blind
-        (un-pollable AND unknown) for up to 900s — a regression this PR
-        introduced against upstream/main, where `RETRY_AFTER_FLOOR_CAP_S` was
-        3600, identical to `TRUST_MAX_AGE_S`, so the blind window was always
-        0. The 429 arm keeps `RETRY_AFTER_FLOOR_CAP_S`, correctly inside its
-        own ceiling `RATE_LIMIT_TRUST_MAX_AGE_S` (7200s).
+        Pins the PARK duration alone, against the constants `_failure_backoff_s`
+        itself is built from — not `entries()`'s decision trust, which a failed
+        row (T1102) now caps at `poll_policy.POST_429_MIN_INTERVAL_S` (360s)
+        regardless of arm, well inside this park cap. The 429 arm's own park
+        cap (`RETRY_AFTER_FLOOR_CAP_S`, 4500s) is pinned by
+        `test_the_floor_cap_is_the_measured_block_plus_the_margin` — there is
+        no longer a wider 429-only trust ceiling to check it against (the old
+        `RATE_LIMIT_TRUST_MAX_AGE_S` this replaced is gone).
         """
         for ask in (3601.0, 4500.0, 7200.0, 86_400.0, float("inf")):
             wait = usage_store._failure_backoff_s(1, ask, rate_limited=False)
@@ -583,184 +551,6 @@ class TestBackoff:
                 f"trust ceiling {usage_store.TRUST_MAX_AGE_S}s — blind for "
                 f"{wait - usage_store.TRUST_MAX_AGE_S:.0f}s"
             )
-        for ask in (4500.0, 7200.0, 50_000.0, 86_400.0, float("inf")):
-            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
-            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
-                f"429 ask {ask} produced a {wait}s park, past the 429 trust "
-                f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}s"
-            )
-
-    def test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases(
-        self, store, clock
-    ):
-        """The other half of the bound: `min(earliest reset, age-ceiling)`.
-
-        `test_the_cap_sits_inside_the_trust_it_relies_on` only pins the
-        age-ceiling half (RATE_LIMIT_TRUST_MAX_AGE_S = 7200) — it never gives
-        `last_good` a `resets_at`, so `_earliest_reset` is always None there
-        and only the ceiling can bind. Trust actually ends at
-        `min(earliest reset, fetched_at + ceiling)`, and a 5h window that
-        resets sooner than that ends it first.
-
-        Retry-After 3600 -> a 429 wait released at +4500s (measured in
-        `test_hour_scale_retry_after_honored`). Here the 5h window resets at
-        +1800s, well before that release: the row goes untrusted while still
-        in backoff (un-pollable AND unknown at once) — a blind gap that
-        exists and is bounded, not the "sits comfortably inside its own
-        trust" the old comment claimed.
-
-        The reset is fixed at +1800s, not +3600s: at +3600s the reset lands
-        exactly on `TRUST_MAX_AGE_S`, where this test's own branch (the 429
-        trust bound, `_rate_limited_trust_ok`) and the general age-ceiling
-        branch (`age_s <= TRUST_MAX_AGE_S`) give identical answers at all
-        three instants this test checks — a mutation that routes 429 rows
-        through the general branch (`if row.get("lastError") == "http-429"`
-        -> `if False`) survives here even though it kills 8 tests elsewhere.
-        +1800 makes the two branches disagree (confirmed: MUT-D reads
-        `decision_value() == usage` at t0+1801 instead of `None`), so this
-        test now actually depends on the 429-specific trust path it exists
-        to pin.
-        """
-        from datetime import datetime, timezone
-
-        def iso(ahead):
-            return (
-                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        usage = {
-            "five_hour": {"pct": 25.0, "resets_at": iso(1800.0)},
-            "seven_day": {"pct": 10.0, "resets_at": iso(100 * 3600.0)},
-        }
-        # Schema gotcha: the window key is "pct", not "utilization" — confirm
-        # the fixture actually produces relevant windows before trusting
-        # anything measured against it.
-        assert oauth.relevant_windows(usage, ()) != []
-
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
-        )
-        wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
-        assert wait == pytest.approx(4500.0)
-
-        clock.advance(1799.0)  # just before the 5h reset
-        entry = store.entries(IDENT)["1"]
-        assert entry.in_backoff(clock.now)
-        assert entry.decision_value() == usage
-
-        clock.advance(2.0)  # just past the 5h reset, still well inside backoff
-        entry = store.entries(IDENT)["1"]
-        assert entry.in_backoff(clock.now)  # still can't be re-polled...
-        assert entry.decision_value() is None  # ...and already unknown
-
-        clock.advance(wait - 1801.0)  # past the wait's release
-        entry = store.entries(IDENT)["1"]
-        assert not entry.in_backoff(clock.now)
-        assert entry.decision_value() is None
-
-    def test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success(
-        self, store, clock
-    ):
-        """The blind gap is bounded PER BLOCK, never across a chain of them.
-
-        The 429 comment presents the un-pollable-and-unknown window as caused
-        by "a window that resets before the ceiling". That is one way in. The
-        age-ceiling half opens the same gap with NO early reset at all, because
-        `record()` writes `fetchedAt` only when `rec.error is None`
-        (usage_store.py, the success branch) — a chain of failed blocks never
-        refreshes it, so trust keeps expiring against the FIRST success while
-        each new block adds another full wait. Driven through the real
-        `store.record()`/`store.entries()` round trip, not a hand-rolled
-        stand-in, so a regression in the success-only write actually fails
-        this test.
-
-        Measured here with far-future resets only, so `_earliest_reset` can
-        never bind and only the ceiling can:
-
-            block 1  wait [    0,  4500]  trust ends 7200  blind      0s
-            block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
-            block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
-
-        By block 3 the row is blind for the ENTIRE wait. `cap <= TRUST` says
-        nothing about this: it bounds ONE wait against the ceiling, and the
-        ceiling does not move.
-
-        WHY THIS IS A TEST AND NOT A COMMENT FIX. The inequality in
-        `test_the_cap_sits_inside_the_trust_it_relies_on` admits [4500, 7200],
-        and at 7200 an ask of 6300s or more drives the wait itself to 7200,
-        taking the same three blocks from 6300s to 14400s blind — 2.3x. What
-        actually stops that drift is the IDENTITY assertion
-        (`cap == 3600 + MARGIN`) in that same test, not the inequality the
-        comment reasons from. Pin the consequence directly so the bound is
-        argued from blind time rather than from a constant comparison that
-        does not imply it.
-        """
-        import datetime
-
-        def iso(t):
-            return (
-                datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        far = 10 ** 9
-        last_good = {
-            "five_hour": {"pct": 25.0, "resets_at": iso(far)},
-            "seven_day": {"pct": 10.0, "resets_at": iso(far)},
-        }
-        # NON-VACUITY: with an empty window list every trust question answers
-        # the same way and the test proves nothing. The schema key is `pct`,
-        # not `utilization` — a probe using the wrong one returned [] here and
-        # read as green.
-        assert oauth.relevant_windows(last_good, ()) != []
-        assert usage_store._earliest_reset(last_good) is not None
-
-        # ONE success establishes fetchedAt; every record() after this is a
-        # 429 failure, so a chain of them must never move it again.
-        store.record({"1": FetchRecord(usage=last_good)}, IDENT)
-        fetched_at = store.entries(IDENT)["1"].fetched_at
-
-        blind_per_block = []
-        for _ in range(3):
-            store.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
-            )
-            entry = store.entries(IDENT)["1"]
-            assert entry.fetched_at == fetched_at, (
-                "a failed record() moved fetchedAt — the chain premise this "
-                "test pins no longer holds"
-            )
-            assert entry.backoff_until is not None
-            block_end = entry.backoff_until
-            wait = block_end - clock.now
-
-            # Ask the REAL read model at each second-boundary of this block.
-            blind = 0.0
-            while clock.now < block_end:
-                if store.entries(IDENT)["1"].decision_value() is None:
-                    blind = block_end - clock.now
-                    break
-                clock.advance(60.0)
-            blind_per_block.append(blind)
-            clock.advance(max(block_end - clock.now, 0.0))
-
-        assert wait == pytest.approx(4500.0)
-        assert blind_per_block[0] == 0.0, (
-            "the first block is supposed to sit inside its trust — if this "
-            "fires, the single-block claim itself is wrong"
-        )
-        assert blind_per_block[1] > 0.0, (
-            "a second consecutive block must show the gap the comment "
-            "attributes only to an early reset"
-        )
-        assert blind_per_block[2] == pytest.approx(wait), (
-            f"by the third block the row should be blind for the whole wait; "
-            f"got {blind_per_block[2]}"
-        )
 
     def test_the_margin_never_lifts_the_floor_cap(self):
         """`RETRY_AFTER_FLOOR_CAP_S` bounds how long a server ask can park us.
@@ -792,103 +582,6 @@ class TestBackoff:
         # the block is exactly that long — honored as the floor, with no margin
         # added: 300 is under BACKOFF_CAP_S, where our own curve governs.
         assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
-
-    def test_park_bound_blind_window_equals_age_at_failure(self, tmp_path):
-        """PIN, not fix: the PARK BOUND caps the park, never the blind window.
-
-        The PARK BOUND (`asked = min(asked, ceiling ...)`, right below this
-        test's target) compares a `now`-relative duration (`asked`) against a
-        `fetchedAt`-relative ceiling (`TRUST_MAX_AGE_S` /
-        `RATE_LIMIT_TRUST_MAX_AGE_S`). Those only agree when the row was
-        already fresh (age 0) at the moment it failed — round-7 review found
-        an earlier comment here wrongly claimed this bound closed the gap in
-        general ("the blind window was always 0"); it does not, on either
-        arm, and this is pre-existing upstream behaviour left open
-        (documented, not fixed, in this PR — see the PARK BOUND comment).
-
-        Driven end-to-end through the real `store.record()` /
-        `entries().decision_value()`, not a hand-rolled stand-in, on the
-        non-429 arm where the park cap equals TRUST_MAX_AGE_S (3600)
-        exactly, so the gap is the whole story rather than diluted by 429
-        trust's extra slack. `age_at_fail=0` is the CONTROL: no gap.
-
-        The non-429 rows below are also the CONTROL for the 429-arm rows
-        that follow: identical harness, only `error` differs, so any drift
-        here would show the probe itself moved rather than the arm under
-        test. On the 429 arm (`RETRY_AFTER_FLOOR_CAP_S` 4500 vs the non-429
-        arm's `TRUST_MAX_AGE_S` 3600, both bounded by
-        `RATE_LIMIT_TRUST_MAX_AGE_S` 7200) the identity `blind ==
-        age_at_fail` does NOT hold -- the cap and the trust ceiling are
-        different constants there, so
-        `blind = age_at_fail - (ceiling - park) = age_at_fail - 2700`. This
-        PR raises the 429 cap 3600 -> 4500, which moves the 429 blind onset
-        900s earlier (age 3600 -> 2700) and adds a flat +900s at every age
-        past that, compared to upstream. See the PARK BOUND comment.
-        """
-        IDENT_1 = {"1": ("a@example.com", "")}
-
-        def blind_window(age_at_fail: float, ask: float, error: str = "http-500") -> float:
-            clock = FakeClock()
-            store = UsageStore(
-                tmp_path / f"cache-{error}-{age_at_fail}-{ask}", clock=clock
-            )
-            store.record({"1": FetchRecord(usage={"five_hour": {"pct": 1.0}})}, IDENT_1)
-            clock.advance(age_at_fail)
-            store.record(
-                {"1": FetchRecord(error=error, retry_after_s=ask)}, IDENT_1
-            )
-            park_end = store.entries(IDENT_1)["1"].backoff_until
-            assert park_end is not None
-            blind_start = None
-            t = clock.now
-            while t < park_end:
-                clock.now = t
-                entry = store.entries(IDENT_1)["1"]
-                if entry.in_backoff(clock.now) and entry.decision_value() is None:
-                    blind_start = t
-                    break
-                t += 1.0
-            clock.now = park_end
-            return 0.0 if blind_start is None else park_end - blind_start
-
-        # (age_at_fail, ask, expected blind window) -- non-429 arm, also the
-        # CONTROL for the 429-arm cases below.
-        cases = [
-            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
-            (1.0, 5000.0, 1.0),
-            (120.0, 5000.0, 120.0),
-            (300.0, 5000.0, 300.0),
-            (1800.0, 5000.0, 1800.0),
-            (3599.0, 5000.0, 3599.0),
-            (300.0, 4000.0, 300.0),
-            (300.0, 3600.0, 300.0),
-            (300.0, 600.0, 0.0),  # park itself (600) is short: never blind
-        ]
-        for age_at_fail, ask, expected in cases:
-            blind = blind_window(age_at_fail, ask)
-            assert blind == pytest.approx(expected, abs=2.0), (
-                f"age@fail={age_at_fail:.0f} ask={ask:.0f}: blind window "
-                f"{blind:.0f}s, expected {expected:.0f}s"
-            )
-
-        # 429 ARM (rate_limited) -- `blind = age_at_fail - 2700`, clamped to
-        # [0, park]. `ask=5000` (not 3600) is deliberate: at ask=3600 the
-        # margin-adjusted ask (4500) already sits exactly on
-        # RETRY_AFTER_FLOOR_CAP_S, so the row would read the same whether the
-        # cap were 4500 or 7200 -- an ask above 3600 is needed for the cap to
-        # actually bind and for mutation M5 (cap -> 7200) to move this test.
-        rate_limited_cases = [
-            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
-            (2701.0, 5000.0, 1.0),
-            (3600.0, 5000.0, 900.0),
-            (5000.0, 5000.0, 2300.0),
-        ]
-        for age_at_fail, ask, expected in rate_limited_cases:
-            blind = blind_window(age_at_fail, ask, error="http-429")
-            assert blind == pytest.approx(expected, abs=2.0), (
-                f"[429 arm] age@fail={age_at_fail:.0f} ask={ask:.0f}: blind "
-                f"window {blind:.0f}s, expected {expected:.0f}s"
-            )
 
 
 class TestIdentityGuard:
@@ -1251,6 +944,168 @@ class TestDeadTokenQuarantine:
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         assert store.entries(IDENT)["1"].auth_dead_strikes == 2
 
+    def test_a_quarantine_says_who_it_quarantined_and_why(self, store, caplog):
+        """A permanent verdict that leaves no trace cannot be diagnosed.
+
+        One `invalid_grant` is enough to quarantine a slot (the threshold is
+        1), the account then reads "re-login needed" until a human logs in
+        again, and nothing anywhere records that it happened. Measured in a
+        live incident: four accounts across two machines were quarantined and
+        the log held not one line about any of them, so the cause took hours
+        to find and could only be reconstructed from the store's own row.
+
+        The strike is the ONE place that knows the slot, the identity and the
+        verdict at the moment it binds.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the quarantine names neither the slot nor the account: {said!r}"
+        )
+        assert "invalid_grant" in said, (
+            f"the quarantine does not say what the server answered: {said!r}"
+        )
+
+    def test_a_transient_failure_stays_quiet(self, store, caplog):
+        """The control: a 429 must not produce the quarantine line.
+
+        Without this the assertion above is satisfied by logging on every
+        failure, which buries the one verdict that needs a human.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "re-login" not in said and "quarantin" not in said, (
+            f"a transient failure produced the quarantine line: {said!r}"
+        )
+
+    def test_a_rotatable_quarantine_does_not_demand_a_re_login(self, store, caplog):
+        """A strike on a credential something REPLACES without a human -- a
+        `sha256:` refresh lineage -- condemns the generation, not the slot,
+        and the live client's own rotation lifts it. Telling a person to
+        re-login there is a wrong instruction, not a pessimistic one.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            # `sha256:` == the credential HAS a refresh token to rotate.
+            store.record({"1": FetchRecord(error="invalid_grant",
+                                           struck_fp="sha256:the-spent-one")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "rotation clears it" in said, (
+            f"a rotatable strike does not name the rotation that lifts it: {said!r}"
+        )
+        assert "only a re-login" not in said, (
+            f"a rotatable strike still presents re-login as the remedy: {said!r}"
+        )
+        # THE HEDGE IS THE REQUIREMENT, so assert it directly. The line above
+        # only rules out the SIBLING branch's wording; "re-login now to restore
+        # it" clears it while violating the very thing this test is named for.
+        assert "only if it persists" in said, (
+            f"a rotatable strike hardened its re-login into a demand: {said!r}"
+        )
+        assert caplog.records[-1].levelno == logging.WARNING, (
+            "a strike the message itself calls possibly-stale escalated to "
+            f"{caplog.records[-1].levelname}"
+        )
+        # SCOPE. Two of the three struck_fp mint sites are idle-only, where no
+        # live client rotates anything -- an unscoped promise is wrong there.
+        assert "only on the active slot" in said, (
+            f"the rotation promise lost its scope: {said!r}"
+        )
+
+    def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
+        """THE CONTROL. A row struck with no fingerprint binds
+        unconditionally, so softening the sentence there would tell a person
+        to wait for a heal that cannot arrive.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        # Both halves, or neither discriminates: the ROTATION wording also
+        # contains "re-login", so a bare `"re-login" in said` passes on both.
+        assert "only a re-login" in said, (
+            f"an unbound strike stopped naming the only thing that lifts it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"an unbound strike promises a rotation that cannot lift it: {said!r}"
+        )
+
+    def test_a_credential_with_no_refresh_token_demands_a_re_login(
+        self, store, caplog
+    ):
+        """A BOUND strike that no rotation can lift, so the binding is not the
+        question -- rotatability is. ``no_refresh_token`` strikes too
+        (PERMANENT_AUTH_ERRORS), and ``credential_fingerprint`` falls back to a
+        full-CONTENT hash for a blob with no refresh token, which is truthy.
+        Nothing rotates those bytes: only an explicit write replaces them.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="no_refresh_token",
+                                           struck_fp="sha256-full:deadbeef")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "only a re-login" in said, (
+            f"a content-hash strike was told a rotation may lift it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"a credential with no refresh token was promised a rotation: {said!r}"
+        )
+        # ARG SLOTS, not prose. Hardcoding `rec.error` renders a wrong cause
+        # forever and the sentence still reads fine; only the slot catches it.
+        slot, ident, err, remedy = caplog.records[-1].args[:4]
+        assert (slot, ident, err) == ("1", "a@x.com", "no_refresh_token"), (
+            f"the quarantine reported the wrong slot/identity/cause: "
+            f"{(slot, ident, err)!r}"
+        )
+
+    def test_lifting_a_quarantine_says_so(self, store, caplog):
+        """A transition log that speaks in ONE direction reports every
+        recovery as a permanent fault: the quarantine is a WARNING and the
+        heal was silent.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].token_dead()
+        # DROP THE SETUP'S OWN RECORDS. `caplog.records` accumulates over the
+        # whole test, not over the `with` block, so without this the strike's
+        # own QUARANTINE line satisfies the assertion below.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the heal names neither the slot nor the account: {said!r}"
+        )
+        assert "no longer matches" not in said, (
+            "the heal claims a fingerprint comparison it never made -- this "
+            "method never reads a credential, and only the collector path "
+            f"passes a fingerprint at all: {said!r}"
+        )
+        assert caplog.records[-1].args[:2] == ("1", "a@x.com"), (
+            f"the heal swapped its slot and identity args: "
+            f"{caplog.records[-1].args[:2]!r}"
+        )
+        # DIRECTION. Position, level, args and guard are each pinned; without
+        # this the line could announce the opposite and still pass them all.
+        assert "out of quarantine" in said, (
+            f"the heal announces the wrong direction: {said!r}"
+        )
+
+    def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
+        """THE CONTROL. `clear_dead_token` is called on rows with no strike as
+        a matter of course -- every re-login and every add runs it -- so a line
+        per call would bury the transitions it exists to show."""
+        # A FAILURE HISTORY WITH NO STRIKE separates the two counters: on a
+        # virgin row both are 0 and the guard could read either field.
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
+            f"a no-op clear announced itself: {[r.getMessage() for r in ours]!r}"
+        )
+
     def test_transient_error_does_not_advance_or_reset(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)  # transient
@@ -1283,6 +1138,35 @@ class TestDeadTokenQuarantine:
         # A dead token is never nominated as the alternate to poll.
         assert due_candidate(["1"], entries, clock.now) is None
 
+    def test_due_candidate_refuses_a_struck_row_whose_fingerprint_moved(
+        self, store, clock
+    ):
+        """DELIBERATE. A future reader will see that `due_candidate` asks the
+        UNBOUND question and take it for the bug this PR fixed elsewhere. It is
+        not: the bound verdict ranges over the live credential AND the slot
+        backup, neither of which the store can read, and the only caller has
+        already healed every case it could determine. What reaches this line is
+        the "could not determine" case, where refusing is what the switcher's
+        heal scan relies on to keep the row out of a fetch.
+
+        Passing a fingerprint in here would delete that guard, so this test
+        fails if anyone does.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant",
+                                       struck_fp="sha256:the-condemned-one")},
+                     IDENT)
+        clock.advance(10_000)  # past any backoff
+        entry = store.entries(IDENT)["1"]
+        # The BOUND question says healed -- and is the wrong one to ask here.
+        assert not entry.token_dead(stored_fp="sha256:a-rotated-one"), (
+            "premise: a moved fingerprint would lift the bound verdict"
+        )
+        assert due_candidate(["1"], {"1": entry}, clock.now) is None, (
+            "due_candidate stopped refusing a struck row, deleting the guard "
+            "switcher._collect_usage_entries leans on for its "
+            "could-not-determine case"
+        )
+
     def test_clear_dead_token_lifts_quarantine(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
@@ -1293,6 +1177,60 @@ class TestDeadTokenQuarantine:
         assert not entry.token_dead()
         assert entry.last_error is None
         assert entry.backoff_until is None
+
+    def test_clear_dead_token_revokes_the_claim_by_default(self, store, clock):
+        """The credential-refresh callers (login/add/import) need this: a
+        fresh credential fences out any claim still bound to the OLD
+        lineage, so a superseded fetch's `record()` can't land — see
+        `test_credential_refresh_revokes_an_old_fetch_claim`. Default
+        behavior stays unchanged; ``revoke_claim=False`` is the opt-out for
+        callers with no credential change to fence (below)."""
+        store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        store.clear_dead_token(["1"], IDENT)
+        assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_clear_dead_token_can_preserve_a_live_claim(self, store, clock):
+        """`revoke_claim=False`: a lock-free heal (no credential change, no
+        network) must not be able to void a lease it did not issue.
+
+        Measured before this guard existed: a zero-strike row holding a
+        live fetch claim (a collector's in-flight lease) had `claimId`
+        nulled by `clear_dead_token` unconditionally — reachable from the
+        TUI's lock-free 3s `fetch=set()` poll, every tick, with no strikes
+        involved at all. `record()` fences its own writes on `claimId`, so
+        that silently discarded a concurrent collector's in-flight fetch
+        outcome — the engine's own measurement, thrown away by a stale
+        read one poll cycle later.
+
+        Control in the same test: strikes/backoff/error state are still
+        cleared with the flag off — only the CLAIM is preserved, proving
+        the mutator's real job (lifting the quarantine) survives the guard.
+        """
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert claims, "premise: the reserve won a live claim"
+        before = store.entries(IDENT)["1"]
+        assert before.auth_dead_strikes == 0, "premise: no strikes"
+        assert before.claimed(clock.now), "premise: the claim is live"
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False)
+
+        after = store.entries(IDENT)["1"]
+        assert after.claimed(clock.now), (
+            f"claim_until {before.claim_until!r} -> {after.claim_until!r}: "
+            "revoke_claim=False must leave a live claim untouched"
+        )
+        assert after.claim_until == before.claim_until
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, claims
+        ) == {"1"}, "the preserved claim must still fence a real record()"
+
+        # Control: strike/backoff/error state is still cleared with the flag
+        # off — the guard narrows the write, it does not disable it.
+        store.record({"2": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["2"].token_dead()
+        store.clear_dead_token(["2"], IDENT, revoke_claim=False)
+        assert not store.entries(IDENT)["2"].token_dead()
 
 
 class TestReserve:
@@ -1379,6 +1317,228 @@ class TestReserve:
         store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
         other = {"2": ("new@x.com", "org-9")}
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
+
+
+class TestAttemptLedger:
+    """The hourly attempt cap: refuses reserve() outright, in every caller
+    mode, once a row already holds ATTEMPTS_PER_HOUR_MAX attempts inside
+    the trailing ATTEMPT_WINDOW_S — independent of backoff/plan state."""
+
+    def _seed(self, store, num, **fields):
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        rows = {}
+        if store.path.exists():
+            rows = json.loads(store.path.read_text(encoding="utf-8")).get(
+                "accounts", {}
+            )
+        row = {"email": IDENT[num][0], "organizationUuid": IDENT[num][1]}
+        row.update(fields)
+        rows[num] = row
+        store.path.write_text(
+            json.dumps({"schemaVersion": 2, "accounts": rows}), encoding="utf-8"
+        )
+
+    def test_at_cap_blocks_reserve_in_both_modes(self, store, clock):
+        now = clock.now
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,  # stale
+            nextPollAt=now - 1,  # poll-due
+            attempts=[now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX)],
+        )
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    def test_due_candidate_skips_a_row_at_the_attempt_cap(self, store, clock):
+        # due_candidate must not spend the auto engine's one alternate poll on
+        # a row reserve() would then refuse outright — the same waste the
+        # strike check's own docstring calls out for a struck row.
+        now = clock.now
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,  # stale, most due
+            nextPollAt=now - 1,  # poll-due
+            attempts=[now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX)],
+        )
+        entries = store.entries(IDENT)
+        assert usage_store.due_candidate(["1"], entries, now) is None
+
+        # Control: the refusal tracks the trailing window, not something
+        # permanent — once the OLDEST attempt ages past ATTEMPT_WINDOW_S,
+        # exactly one slot frees and the row is picked again.
+        window = usage_store.ATTEMPT_WINDOW_S
+        oldest = now - (usage_store.ATTEMPTS_PER_HOUR_MAX - 1) * 10
+        clock.advance(oldest + window + 1 - now)
+        entries = store.entries(IDENT)
+        assert usage_store.due_candidate(["1"], entries, clock.now) == "1"
+
+    def test_an_aged_out_attempt_frees_a_slot_and_is_recorded(self, store, clock):
+        now = clock.now
+        window = usage_store.ATTEMPT_WINDOW_S
+        attempts = [now - window - 1] + [
+            now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX - 1)
+        ]
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,
+            nextPollAt=now - 1,
+            attempts=attempts,
+        )
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+        recorded = json.loads(store.path.read_text(encoding="utf-8"))["accounts"][
+            "1"
+        ]["attempts"]
+        assert now in recorded
+        assert all(t > now - window for t in recorded)  # the stale one is pruned
+
+
+class TestHeaderReading:
+    """record_header_reading: a reply's own rate-limit headers, no fetch."""
+
+    @pytest.mark.parametrize(
+        "bad_7d_reset",
+        [float("inf"), 1790206800000.0, float("nan")],
+        ids=["overflow", "ms-epoch-out-of-range", "nan"],
+    )
+    def test_records_a_reading_without_disturbing_attempts_or_other_windows(
+        self, store, clock, bad_7d_reset
+    ):
+        # A prior real fetch left a per-model (scoped) window, a far-future
+        # AIMD-backed-off plan, and its own lastAttemptAt.
+        scoped = [{"name": "seven_day_opus", "pct": 33.0}]
+        store.record({"1": FetchRecord(usage={**USAGE, "scoped": scoped})}, IDENT)
+        last_attempt = clock.now
+        far_future = clock.now + 1200.0
+        store.set_poll_plan({"1": (far_future, 1200.0)}, IDENT)
+        clock.advance(60)
+
+        five_reset_ts = clock.now + 1800.0
+        headers = {
+            usage_store.USAGE_HEADER_5H_PCT: "0.42",
+            usage_store.USAGE_HEADER_5H_RESET: str(five_reset_ts),
+            usage_store.USAGE_HEADER_7D_PCT: "0.1",
+            # Out of datetime's range (OverflowError), a millisecond epoch
+            # that overflows the year field (ValueError: year 58699), and
+            # NaN (ValueError) must all fall back to "no reset known" rather
+            # than raise into the pin's request path.
+            usage_store.USAGE_HEADER_7D_RESET: str(bad_7d_reset),
+        }
+        assert store.record_header_reading("1", IDENT, headers) is True
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(42.0)
+        assert entry.last_good["seven_day"]["pct"] == pytest.approx(10.0)
+        assert "resets_at" not in entry.last_good["seven_day"]
+        assert usage_store.parse_reset_ts(
+            entry.last_good["five_hour"]["resets_at"]
+        ) == pytest.approx(five_reset_ts)
+        assert entry.last_good["scoped"] == scoped  # per-model window untouched
+        assert entry.fetched_at == clock.now
+        assert entry.age_s == 0.0
+        assert entry.last_attempt_at == pytest.approx(last_attempt)  # not an attempt
+        assert entry.next_poll_at == pytest.approx(far_future)  # not pulled earlier
+
+    def test_no_5h_header_records_nothing(self, store, clock):
+        assert store.record_header_reading("1", IDENT, {"x": "1"}) is False
+        assert store.entries(IDENT)["1"] == UsageEntry()
+
+    def test_floors_next_poll_at_candidate_max_interval_when_unset(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no plan set
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        store.record_header_reading("1", IDENT, headers)
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == pytest.approx(clock.now + CANDIDATE_MAX_INTERVAL_S)
+
+    def test_cannot_preempt_the_post_switch_defer_once_the_attempt_is_old(
+        self, store, clock
+    ):
+        # `_replan_new_active`'s defer window relies on this floor
+        # (`lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`) landing AFTER its own
+        # near-term deadline for a header reading to have any effect. Once
+        # the last endpoint attempt is already >= 570s old at switch time,
+        # the floor lands at or before that deadline and a header reading
+        # cannot push it out: the deferred poll still fires on schedule.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # lastAttemptAt = t0
+        clock.advance(600.0)  # the last attempt is now >= 570s old
+        deferred = clock.now + POST_SWITCH_REPLAN_DEFER_S
+        store.set_poll_plan({"1": (deferred, 180.0)}, IDENT)  # the replan's shape
+
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is True
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == pytest.approx(deferred)  # unmoved
+
+    def test_header_reading_inside_the_window_moves_next_poll_past_the_defer(
+        self, store, clock
+    ):
+        # Companion to the case above: when the last endpoint attempt is
+        # still recent at switch time (well under 570s old), the floor
+        # (`lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`) lands AFTER the
+        # replan's own `now + POST_SWITCH_REPLAN_DEFER_S` deadline, so a
+        # header reading landing inside the window moves `nextPollAt` past
+        # that deadline instead of leaving it unmoved. Characterization only
+        # (T1231): this row's own state is correct either way — the defect
+        # the review found was autoswitch.py's own predicate reading this
+        # shape as a stuck defer, not this store method, so this need not
+        # (and does not) read differently before that fix.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # lastAttemptAt = t0
+        clock.advance(300.0)  # stale enough to replan, recent enough to matter
+        deferred = clock.now + POST_SWITCH_REPLAN_DEFER_S
+        store.set_poll_plan({"1": (deferred, 180.0)}, IDENT)  # the replan's shape
+
+        clock.advance(10.0)  # inside the 30s window
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is True
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at > deferred  # pushed past now+30
+
+    def test_does_not_join_the_attempt_ledger(self, store, clock):
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        store.record_header_reading("1", IDENT, headers)
+        store.record_header_reading("1", IDENT, headers)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
+        assert "attempts" not in row
+
+    def test_skips_a_struck_row(self, store, clock):
+        # A row carrying an auth strike must not be refreshed by a header
+        # reading: bumping fetchedAt would erase the strike-race doubt
+        # (_strike_is_suspected_race) and would let entries() trust the row
+        # again at age 0 through the whole backoff. Seeded directly with
+        # consecutiveFailures at 0 (a fingerprint-healed strike leaves
+        # exactly this shape) so this exercises the ``authDeadStrikes > 0``
+        # arm of the skip condition alone — record()-ing a permanent-auth
+        # FetchRecord bumps both fields together and would leave that arm
+        # untested independent of the consecutiveFailures one below.
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "1": {
+                    "email": IDENT["1"][0],
+                    "organizationUuid": IDENT["1"][1],
+                    "authDeadStrikes": 1,
+                    "consecutiveFailures": 0,
+                }
+            },
+        }), encoding="utf-8")
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
+
+    def test_skips_a_failed_row(self, store, clock):
+        # The other arm of the OR: a transient endpoint failure alone
+        # (authDeadStrikes stays 0 for "timeout") must also skip.
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
 
 
 class TestLast429Marker:
@@ -1646,11 +1806,25 @@ class TestStruckFingerprintHygiene:
     unconditionally, and clearing a quarantine drops the fingerprint too."""
 
     def test_legacy_strike_overwrites_stale_fingerprint(self, store):
+        """I3 rewrite: the ORIGINAL version called ``clear_dead_token``
+        between the two strikes, which itself zeroes ``struckFingerprint`` --
+        so the asserted state (``None``) already existed before the second
+        ``record()`` ran, and the assertion could not tell the overwrite
+        under test from that setup step (it passed identically with the
+        overwrite guarded out: ``if rec.struck_fp is not None:``). Reaching
+        the asserted state ONLY via the second ``record()`` -- no intervening
+        clear -- makes the overwrite the sole mechanism that can produce it.
+        """
         ident = {"1": ("a@b.c", "")}
         store.record(
             {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
             ident,
         )
+        assert store.entries(ident)["1"].struck_fingerprint == "sha256:old", (
+            "premise: a fingerprint is on the row before the legacy strike"
+        )
+        # legacy writer strikes without a fingerprint -- no clear in between,
+        # so only THIS write can change struckFingerprint.
         store.clear_dead_token(["1"], ident)
         # legacy writer strikes without a fingerprint
         store.record({"1": FetchRecord(error="invalid_grant")}, ident)
@@ -1696,3 +1870,153 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+class TestStrikeOnlyHeal:
+    """C1/I2: ``clear_dead_token(strike_only=True)`` clears the STRIKE only
+    -- ``authDeadStrikes``/``struckFingerprint`` -- and leaves the server's
+    own throttle state (``consecutiveFailures``/``lastError``/
+    ``backoffUntil``) untouched. The five credential-refresh callers keep
+    the full clear (``strike_only`` defaults False)."""
+
+    def test_strike_only_preserves_backoff(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        row = store._read_rows()["1"]
+        backoff_before = row["backoffUntil"]
+        assert backoff_before is not None
+        store.clear_dead_token(["1"], ident, revoke_claim=False,
+                                strike_only=True)
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert entry.backoff_until == backoff_before, (
+            "strike_only must not touch the server's own throttle deadline"
+        )
+        assert entry.last_error == "invalid_grant"
+        assert entry.consecutive_failures == 1
+
+    def test_default_full_clear_still_wipes_backoff(self, store):
+        """The five credential-refresh callers (login/add/import) must keep
+        today's full-clear behaviour -- a freshly written credential has no
+        history at all, so a stale backoff must not survive it either."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(["1"], ident)  # default: strike_only=False
+        entry = store.entries(ident)["1"]
+        assert entry.backoff_until is None
+        assert entry.last_error is None
+        assert entry.consecutive_failures == 0
+
+    def test_expected_fingerprint_mismatch_is_a_no_op(self, store, caplog):
+        """The TOCTOU re-check: a row whose struckFingerprint moved since
+        the caller's lock-free read (a fresh strike, or a different
+        collector's own heal, landed in the gap) must be left untouched."""
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        # A concurrent writer moved the fingerprint before this heal's lock.
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=60.0,
+                               struck_fp="sha256:concurrent")},
+            ident,
+        )
+        row_before = dict(store._read_rows()["1"])
+        caplog.clear()
+        # at_level(INFO) or this asserts NOTHING: bare caplog captures nothing
+        # below WARNING, so the absence below would hold however loud the heal.
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(
+                ["1"], ident, revoke_claim=False, strike_only=True,
+                expected_fingerprints={"1": "sha256:old"},  # the STALE read
+            )
+        row_after = store._read_rows()["1"]
+        assert row_after == row_before, (
+            "a stale-read heal must not overwrite a row that changed under it"
+        )
+        # THE THIRD OUTCOME. Struck-but-REFUSED is neither of the two the heal
+        # line splits on, and a line here claims a transition that did not
+        # happen -- the exact defect class this wording change exists to remove.
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
+            "a refused heal announced a heal that did not happen: "
+            f"{[r.getMessage() for r in ours]!r}"
+        )
+
+    def test_expected_fingerprint_match_still_heals(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(
+            ["1"], ident, revoke_claim=False, strike_only=True,
+            expected_fingerprints={"1": "sha256:old"},  # matches
+        )
+        entry = store.entries(ident)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+
+
+class TestHealPreservesTrustExtended:
+    """I2: the heal must not itself flip a decision-trusted entry to
+    unknown. Before the C1 fix, a struck entry's ``trust_extended`` rode on
+    ``consecutiveFailures``/``lastError``/``backoffUntil`` -- exactly the
+    fields the unconditional clear wiped -- so a stale-but-trusted entry
+    flipped to unknown purely from observing a healed fingerprint, which
+    ``autoswitch.py`` counts toward ``_unhealthy_ticks`` and a real
+    failover."""
+
+    def test_strike_only_heal_keeps_a_stale_entry_decision_trusted(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        # The strike is itself the failure state keeping this entry trusted
+        # past STALE_OK_S (consecutive_failures > 0).
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        pre = store.entries(IDENT)["1"]
+        assert pre.age_s > STALE_OK_S
+        assert pre.trust_extended, "premise: the strike itself trusts it"
+        assert pre.decision_value() == USAGE
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False,
+                                strike_only=True)
+        post = store.entries(IDENT)["1"]
+        assert post.trust_extended, (
+            "the heal flipped a decision-trusted entry to unknown -- "
+            "autoswitch.py counts this toward a failover"
+        )
+        assert post.decision_value() == USAGE
+
+    def test_full_clear_heal_does_flip_it_to_unknown(self, store, clock):
+        """Documents the CONTRASTING behaviour of the default (non-strike-
+        only) clear on the same setup, so the two tests together show the
+        fix is exactly the ``strike_only`` axis, not a side effect."""
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp="sha256:old")},
+            IDENT,
+        )
+        clock.advance(STALE_OK_S + 1)
+        store.clear_dead_token(["1"], IDENT)  # full clear
+        post = store.entries(IDENT)["1"]
+        assert not post.trust_extended
+        assert post.decision_value() is None

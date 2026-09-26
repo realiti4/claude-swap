@@ -28,25 +28,33 @@ batch, not one request.
 
 from __future__ import annotations
 
+import logging
 import json
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
+    ATTEMPT_WINDOW_S,
+    ATTEMPTS_PER_HOUR_MAX,
+    CANDIDATE_MAX_INTERVAL_S,
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
     JITTER_FRAC,
+    POST_429_MIN_INTERVAL_S,
     RECENT_429_WINDOW_S,
     RESET_SLACK_S,
     SERVE_TTL_S,
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
+
+_logger = logging.getLogger("claude-swap")
 
 SCHEMA_VERSION = 2
 
@@ -61,6 +69,10 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+
+# Fallback span for `UsageStore.mark_at_limit` when the walled row carries no
+# stored reading to key its expiry on (the widest ordinary window: 5h).
+WALL_FALLBACK_S = 18000.0
 
 
 def _live_claim(
@@ -82,31 +94,16 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
-# Deliberate staleness (failure backoff, scheduler-chosen cadence) extends
-# decision trust past STALE_OK_S, but never past this ceiling: a forever-failing
-# account must eventually read as unknown so the unknown-path machinery
-# (escalate-all, unhealthy ticks, verified failover) takes back over. The
-# ceiling deliberately overrides even a Retry-After longer than itself —
-# trust must never be server-controlled and unbounded.
+# Deliberate staleness (a not-yet-due scheduler cadence, or a live fetch
+# lease) extends decision trust past STALE_OK_S, but never past this ceiling:
+# an account with nothing scheduled must eventually read as unknown so the
+# unknown-path machinery (escalate-all, unhealthy ticks, verified failover)
+# takes back over. A row whose last poll attempt FAILED does not use this
+# ceiling: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
+# UsageStore.entries), whatever Retry-After or any window reset says — a
+# throttled or erroring account must go unknown for decisions quickly, not
+# stay trusted on the strength of a stale measurement.
 TRUST_MAX_AGE_S = 3600.0
-
-# A usage-endpoint 429 is a polling throttle, not a change in the account's
-# real model quota: the endpoint budgets *usage requests* (scope is
-# regime-dependent; see poll_policy), independent of the 5h/7d limits it
-# reports. It does NOT move
-# the account's real windows, and usage only rises within a window (monotone
-# until the window resets), so last_good is a valid lower bound on the true
-# usage right up to that reset. Trust it until then — data-driven, not a fixed
-# clock: flipping it to "unknown" early (the old fixed 2h ceiling) made a
-# throttled account an unusable switch target and drove failover flapping /
-# all-exhausted sleeps even while the account was plainly fine. Once the window
-# resets, usage is zeroed and last_good is obsolete → unknown. Matches Claude
-# Code's own 2.1.208 "show last-known usage when rate-limited" behavior.
-#
-# Fallback ceiling for 429-stale data that carries no resets_at (older stored
-# rows): still bounded so it can't be trusted forever. Non-429 failures always
-# use TRUST_MAX_AGE_S (a timeout/network error is no evidence last_good holds).
-RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
 
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
 BACKOFF_BASE_S = 30.0
@@ -215,16 +212,73 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
-# only a re-login helps. One such answer is already definitive: the server
-# explicitly rejected the grant, which no transient 429/timeout/network blip
-# does, so there is nothing to gain by retrying (and each retry with a dead
-# token just draws a fresh 401/429). At this many strikes the account is
-# quarantined: no more fetches, and the collector surfaces "re-login needed".
-# A single success — or a credential refresh via login/add — resets the count
-# and lifts the quarantine. Raise to 2 if a buffer against a one-off
-# misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
+# though the ACCOUNT can, without a human, once the live client rotates to a
+# generation the strike did not condemn. One such answer is already
+# definitive: the server explicitly rejected the grant, which no transient
+# 429/timeout/network blip does, so there is nothing to gain by retrying (and
+# each retry with a dead token just draws a fresh 401/429). At this many
+# strikes the account is quarantined: no more fetches, and the collector
+# surfaces "re-login needed". A single success, a credential refresh via
+# login/add, or a rotation that moves the stored fingerprint off the condemned
+# generation resets the count and lifts the quarantine. Raise to 2 if a
+# buffer against a one-off misclassification is ever wanted; the trade-off
+# is a ~10-min-slower verdict
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
+
+
+def _strike_time(row: dict) -> float | None:
+    """When this row's strike landed.
+
+    Falls back to `lastAttemptAt` for a struck row written before `struckAt`
+    existed: that is the field the previous release measured, so this
+    reproduces its reading rather than re-condemning every row it was
+    doubting — which no later fetch could undo, the strike being what blocks
+    the fetch that would clear it.
+
+    The fallback only ever has to answer once. `reserve` migrates such a row
+    before it overwrites `lastAttemptAt`, so the value read here has not been
+    moved by an attempt.
+    """
+    at = _num_or_none(row.get("struckAt"))
+    return at if at is not None else _num_or_none(row.get("lastAttemptAt"))
+
+
+def _strike_is_suspected_race(
+    strikes: int, fetched_at: float | None, struck_at: float | None
+) -> bool:
+    """Whether to doubt this row's FIRST strike because a success preceded it.
+
+    Only a row at or below the threshold is doubted, so this permits one POST
+    THAT RETURNS A VERDICT: the retry either succeeds (`record` zeroes the
+    count) or lands a second strike no window can excuse. That keeps the
+    endless-401 loop away and makes the width non-critical -- erring either
+    way costs one fetch.
+
+    A TRANSIENT failure returns no verdict, and since it advances neither
+    `struckAt` nor the strike count the doubt survives it. That is deliberate:
+    a timeout is no evidence about the token, so a possibly-live one should
+    keep being retried -- paced by `backoffUntil`, which every RECORDED
+    failure sets (an outcome fenced out by a stale claim records nothing at
+    all, so it neither strikes nor paces).
+
+    THE STRIKE'S OWN TIME, not `lastAttemptAt`. That field advances on every
+    attempt -- `reserve` stamps it before the fetch and `record` stamps it for
+    any outcome -- so a timeout, or a collector killed mid-fetch, would widen
+    a doubted strike out of its window having learned nothing about the token.
+    One `invalid_grant` plus one network blip then quarantines a healthy
+    account permanently, which is the state this guard exists to prevent.
+
+    Missing either timestamp is "no evidence", not "a race", so rows struck
+    before `struckAt` existed read as they did. A negative gap is not one
+    either: there the success is the LATER event and already zeroed the strike.
+    """
+    if strikes > AUTH_DEAD_STRIKES:
+        return False
+    if fetched_at is None or struck_at is None:
+        return False
+    return struck_at >= fetched_at
+
 
 # Fetch errors that prove the stored credential is permanently unusable (vs.
 # transient 429/timeout/network). Only these advance the dead-token strike
@@ -299,17 +353,40 @@ class UsageEntry:
     # Fingerprint of the generation the strikes condemned (absent on legacy
     # rows → strikes bind unconditionally). See ``token_dead``.
     struck_fingerprint: str | None = None
+    # When the most recent strike landed (at AUTH_DEAD_STRIKES = 1, the only
+    # one). Populated by `entries`, which falls back to `lastAttemptAt` for
+    # rows written before this field existed — see `_strike_time`.
+    struck_at: float | None = None
     # The refused access token a live session's fetch stamped (see
     # ``FetchRecord.rejected_fp``); None once a fetch succeeds.
     rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
-    # *deliberate*: the server is refusing fresher data (failure state), or the
-    # scheduler itself chose the cadence (within nextPollAt). Capped at
-    # TRUST_MAX_AGE_S. Computed by UsageStore.entries().
+    # *deliberate*: the scheduler itself chose the cadence (within
+    # nextPollAt), or a fetch lease is live. Capped at TRUST_MAX_AGE_S. A row
+    # whose last poll attempt FAILED never sets this from either of those —
+    # see UsageStore.entries, which caps a failed row's trust at
+    # poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
+    # UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # An out-of-band signal (the pin's own 429 on /v1/messages, not this
+    # poller) marked this slot at-limit until a persisted deadline that has
+    # not yet passed — see UsageStore.mark_at_limit. Overrides last_good for
+    # DECISIONS only; display still reads last_good/age_s as measured.
+    walled: bool = False
+    # The mark's own deadline (epoch seconds), while `walled` -- the synthetic
+    # reading `decision_value()` builds keys its `resets_at` on this, not the
+    # poller's own reset, so a reader like autoswitch's
+    # `_seven_day_reset_unmeasured` sees a real deadline rather than "never
+    # reported" and can't pick the walled slot as a last-chance probe target.
+    walled_until: float | None = None
+    # Attempts still inside the trailing ATTEMPT_WINDOW_S (the same pruned
+    # count _row_eligible refuses reserve() on at ATTEMPTS_PER_HOUR_MAX).
+    # Exposed so a read-model consumer like due_candidate can honor the same
+    # cap without a second copy of the count.
+    attempts_in_window: int = 0
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -373,6 +450,10 @@ class UsageEntry:
         """
         if self.auth_dead_strikes < threshold:
             return False
+        if _strike_is_suspected_race(
+            self.auth_dead_strikes, self.fetched_at, self.struck_at
+        ):
+            return False
         if (
             stored_fp is not None
             and self.struck_fingerprint is not None
@@ -384,13 +465,24 @@ class UsageEntry:
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
-        Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        Sentinel wins; else, while ``walled``, a synthetic full reading (an
+        out-of-band at-limit signal outranks whatever the poller has) built
+        by ``_walled_decision_value``; else last-good while it is recent
+        enough to trust (≤ ``STALE_OK_S``, or ``trust_extended`` for
+        deliberate staleness); else None (unknown). The ``STALE_OK_S``/
+        ``trust_extended`` test is this method's own, on age alone.
+        ``entries()`` caps a row whose last poll attempt FAILED at
+        ``poll_policy.POST_429_MIN_INTERVAL_S`` (360s), so such a row still
+        reaches the ``trust_extended`` branch between ``STALE_OK_S`` (300s)
+        and that cap; a row whose last attempt did not fail keeps the wider
+        ``TRUST_MAX_AGE_S`` ceiling instead. Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
+        if self.walled:
+            return _walled_decision_value(self.last_good, self.walled_until)
         if (
             self.last_good is not None
             and self.age_s is not None
@@ -433,16 +525,31 @@ def due_candidate(
 ) -> str | None:
     """The due candidate with the stalest data, or None.
 
-    Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
-    accounts (api-key / no credentials) have nothing to fetch. A
+    Due = past its ``nextPollAt``, not in failure backoff, and not already at
+    its hourly attempt cap (``ATTEMPTS_PER_HOUR_MAX``, the same count
+    ``_row_eligible`` refuses ``reserve()`` on — picking a capped row here
+    would waste the pass, since ``reserve()`` would then refuse it too).
+    Sentinel accounts (api-key / no credentials) have nothing to fetch. A
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
+    Used by the auto engine to pick the single alternate to poll per pass.
+    Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
+
+    THE STRIKE CHECK IS DELIBERATELY UNBOUND — it asks ``token_dead()`` with no
+    ``stored_fp``, so a strike condemning a generation the slot no longer holds
+    still refuses it. The bound verdict ranges over BOTH stored sources (see
+    ``switcher._entry_token_dead``) and this function can read neither. The
+    entries come from ``_collect_usage_entries``, which has already healed
+    every case it could decide and sentinelled every confirmed-dead one; what
+    reaches here is "could not determine", where that scan relies on this
+    refusal to keep the row out of a fetch. Binding it would not merely drop a
+    guard, it would WASTE the pass: ``_row_eligible`` refuses a struck row
+    under the write lock regardless, so ``reserve`` returns nothing and the one
+    alternate poll is spent on a row that cannot be fetched.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -452,8 +559,10 @@ def due_candidate(
             continue
         if entry.sentinel is not None:
             continue
+        if entry.attempts_in_window >= ATTEMPTS_PER_HOUR_MAX:
+            continue  # reserve() would refuse it too; don't waste the pass
         if entry.token_dead():
-            continue  # dead refresh-token: quarantined, needs a re-login
+            continue  # quarantined; what lifts it is the docstring's business
         if entry.in_backoff(now):
             continue
         if (
@@ -489,44 +598,94 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
     return min(resets) if resets else None
 
 
-def _rate_limited_trust_ok(
-    last_good: dict | None,
-    age_s: float | None,
-    now: float,
-    models: tuple[str, ...] = (),
-) -> bool:
-    """Whether 429-stale ``last_good`` is still trustworthy for decisions.
+def _reset_ts_to_resets_at(ts: float) -> str:
+    """Epoch seconds as the ISO-8601 ``resets_at`` string ``oauth`` writes and
+    ``poll_policy.parse_reset_ts`` reads back (same pattern as
+    ``oauth.refresh_token_expiry_display``)."""
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
-    Usage rises monotonically within a window, so a rate-limited (frozen)
-    last_good is a valid lower bound until its window resets — but only up to a
-    client-side ceiling, so a far-future or malformed ``resets_at`` can never
-    grant unbounded trust. The bound is:
 
-        now < min(earliest future relevant-window reset, age-ceiling)
+# The same 5h/7d rate-limit headers Claude Code itself reads off every
+# ``/v1/messages`` reply (confirmed against the 2.1.281 binary), free on any
+# request that already went out. No per-model window rides in them.
+USAGE_HEADER_5H_PCT = "anthropic-ratelimit-unified-5h-utilization"
+USAGE_HEADER_5H_RESET = "anthropic-ratelimit-unified-5h-reset"
+USAGE_HEADER_7D_PCT = "anthropic-ratelimit-unified-7d-utilization"
+USAGE_HEADER_7D_RESET = "anthropic-ratelimit-unified-7d-reset"
 
-    - **earliest** relevant-window reset (not latest): once the *soonest*
-      window rolls over, usage there is zeroed and the whole snapshot is
-      obsolete — a later window's reset can't rescue it. So if the earliest
-      known reset is already in the past, the value is untrusted outright,
-      regardless of any farther-future window.
-    - **age-ceiling** (``RATE_LIMIT_TRUST_MAX_AGE_S`` past ``last_good``): the
-      hard client-side cap. It applies whether or not any reset is known, so
-      even an all-``resets_at`` response — including a far-future or malformed
-      one — is bounded, matching the ~1h stale fallback Claude Code itself uses.
-      Rows with no reset info at all fall back to it alone.
 
-    A window carrying no ``resets_at`` simply contributes no timestamp; it never
-    extends trust, so partial metadata can only tighten the bound, never loosen
-    it. ``models`` selects the per-model scoped windows that also gate the
-    account, so their resets are considered too (matching the scheduler's view).
+def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
+    """A rate-limit header's utilization, as this store's 0-100 ``pct``
+    scale (``oauth.build_usage_result``'s shape).
+
+    The header itself is a 0-1 FRACTION, clamped — confirmed against Claude
+    Code 2.1.281's own parser (``Math.max(0, Math.min(1, Number(raw)))``,
+    then rendered for display as ``Math.round(utilization*100)``), matching
+    a 2026-07-28 probe that read ``0.12`` off a live reply. None when the
+    header is absent or not a number.
     """
-    if age_s is None:
-        return False
-    ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
-    soonest = _earliest_reset(last_good, models)
-    # The soonest window to roll over invalidates the snapshot; never trust past
-    # it, and never past the client-side ceiling.
-    return now < (min(soonest, ceiling) if soonest is not None else ceiling)
+    raw = headers.get(key)
+    if raw is None:
+        return None
+    try:
+        fraction = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, fraction)) * 100.0
+
+
+def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
+    """A rate-limit reset header (Unix seconds) as the stored ``resets_at``
+    ISO string, or None when absent/unparseable/out of range: ``inf``
+    (``OverflowError``), a millisecond epoch overflowing the year field
+    (``ValueError``, e.g. "1790206800000"), "nan" (``ValueError``), or a
+    platform ``time_t`` rejection (``OSError``) must all read as "no reset
+    known", never propagate into the pin's request path."""
+    raw = headers.get(key)
+    if raw is None:
+        return None
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return _reset_ts_to_resets_at(ts)
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
+    """The synthetic full reading ``UsageEntry.decision_value`` reports while
+    ``walled``.
+
+    Keeps whatever the stored reading knows about the OTHER windows
+    (``seven_day``, ``scoped``) unchanged — a reader like autoswitch's
+    ``_seven_day_reset_unmeasured`` must see the real weekly reset, or a
+    walled 5h-only slot reads as "weekly reset never reported" and becomes
+    eligible as a last-chance probe target despite the wall. Forces
+    ``five_hour`` to full at the mark's own deadline (``walled_until``, its
+    ``resets_at``); with no stored reading to keep, ``seven_day`` is
+    synthesized the same way so both windows carry the mark's deadline
+    instead of one appearing unmeasured.
+    """
+    resets_at = _reset_ts_to_resets_at(walled_until) if walled_until is not None else None
+    five_hour: dict = {"pct": 100.0}
+    if resets_at is not None:
+        five_hour["resets_at"] = resets_at
+    value: dict = {
+        k: v for k, v in last_good.items() if k in ("seven_day", "scoped")
+    } if isinstance(last_good, dict) else {}
+    if "seven_day" not in value:
+        seven_day: dict = {"pct": 100.0}
+        if resets_at is not None:
+            seven_day["resets_at"] = resets_at
+        value["seven_day"] = seven_day
+    value["five_hour"] = five_hour
+    return value
 
 
 def _failure_backoff_s(
@@ -573,49 +732,35 @@ def _failure_backoff_s(
     # "may this ask park a row for a day" — through one flag. Separating them
     # is why the bound is now its own unconditional statement below.
     if retry_after_s > BACKOFF_CAP_S and rate_limited:
-        # THE MARGIN IS 429-ONLY, and the ceiling is why. It was measured on
-        # usage-endpoint blocks, whose stale data stays decision-trusted until
-        # `min(earliest relevant-window reset, fetched_at +
-        # RATE_LIMIT_TRUST_MAX_AGE_S)` — not the age-ceiling alone. A window
-        # that resets before the ceiling ends trust first, so the 4500s wait
-        # does NOT always sit inside its own trust: an earlier reset can leave
-        # the row un-pollable (still in backoff) and unknown (trust expired)
-        # for the remainder of the wait — see
-        # `test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases`.
+        # THE MARGIN IS 429-ONLY. It was measured on usage-endpoint blocks.
+        # SINCE T1102, a failed row's stale data stays decision-trusted only
+        # to `fetched_at + poll_policy.POST_429_MIN_INTERVAL_S` (360s) on
+        # EVERY arm — no window-reset component, and no separate wider
+        # ceiling for the 429 arm (the old `RATE_LIMIT_TRUST_MAX_AGE_S` this
+        # replaced is gone). So the 4500s wait never sits inside its own
+        # trust, not even for a row fresh at the moment it failed: `record()`
+        # writes `fetchedAt` on SUCCESS only, so a chain of failed blocks
+        # keeps measuring trust from the first success while each block adds
+        # another full wait, and past block 1 the row is blind for the whole
+        # thing, not a growing fraction of it (measured end-to-end through
+        # `store.record()` / `entries().decision_value()`; ``blind`` is the
+        # duration both un-pollable and unknown at once):
         #
-        # AND THE EARLY RESET IS ONLY ONE WAY IN. The age-ceiling half opens
-        # the same gap with no early reset at all, because `record()` writes
-        # `fetchedAt` on SUCCESS only: a chain of failed blocks keeps measuring
-        # trust from the first success while each block adds another full wait.
-        # Measured with far-future resets only, so only the ceiling can bind:
+        #     block 1  wait [    0,  4500]  trust ends   360  blind   4140s
+        #     block 2  wait [ 4500,  9000]  trust ends   360  blind   4500s (whole block)
+        #     block 3  wait [ 9000, 13500]  trust ends   360  blind   4500s (whole block)
         #
-        #     block 1  wait [    0,  4500]  trust ends 7200  blind      0s
-        #     block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
-        #     block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
+        # That is the tradeoff this margin makes in exchange for fewer
+        # requests, and it is worth stating at its true, now much larger,
+        # size rather than as a single-block figure.
         #
-        # So the gap is bounded PER BLOCK and not across a chain — by block 3
-        # the row is blind for the whole wait. That is the tradeoff this margin
-        # makes in exchange for fewer requests, and it is worth stating at its
-        # true size rather than as a single-block figure.
-        #
-        # WHAT ACTUALLY BOUNDS IT is the identity `cap == 3600 + MARGIN` in
-        # `test_the_cap_sits_inside_the_trust_it_relies_on`, NOT the
-        # `cap <= RATE_LIMIT_TRUST_MAX_AGE_S` inequality that test also states.
-        # The inequality admits [4500, 7200], and at 7200 an ask of 6300s or
-        # more pushes the wait itself to 7200, taking the same three blocks
-        # from 6300s to 14400s blind (2.3x). Reason about this from blind
-        # time; the constant comparison does not imply it. Pinned by
-        # `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
-        #
-        # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and
-        # `_classify_usage_error` parses Retry-After for ANY HTTPError code,
-        # not just 429. A 503 carrying `Retry-After: 3600` therefore took the
-        # margin and waited 4500s while its last_good went untrusted at 3600s:
-        # 900s in which the row can neither be re-polled (still in backoff) nor
-        # used (unknown), and the unhealthy-tick counter reads that blindness
-        # as a failing account and fails over. Measured: blind window 179s ->
-        # 1079s, and (at a 120s tick interval, 3 unhealthy ticks) a failover
-        # at +3781s that main never performs.
+        # Every other failure (non-429 included) uses the SAME
+        # POST_429_MIN_INTERVAL_S ceiling — there is no separate non-429
+        # ceiling either any more. `_classify_usage_error` parses Retry-After
+        # for ANY HTTPError code, not just 429, so a non-429 error carrying a
+        # long one still parks the row on the non-429 arm's own cap
+        # (`TRUST_MAX_AGE_S`, 3600s, below) — see the non-429 table further
+        # down for the same blind-window shape on that arm.
         #
         # Capping the constant instead would land a 3600s ask exactly on its
         # deadline — the defect this whole change exists to fix.
@@ -630,15 +775,20 @@ def _failure_backoff_s(
         # by mutation: adding it back (`min(x, RETRY_AFTER_FLOOR_CAP_S)`
         # around the line below) survives the full suite.
         asked = retry_after_s + RETRY_AFTER_MARGIN_S
-    # PARK BOUND — every ask is capped, but by the ceiling ITS OWN arm's trust
-    # actually uses, not a single shared constant. This restores nothing about
-    # trust: `entries()` still reads the row unknown once the relevant ceiling
-    # elapses past the last SUCCESS, exactly as before this line, so a capped
-    # ask can still be released un-pollable and unknown together. What this
-    # bounds is the PARK itself — how long the row can be held un-pollable —
-    # not whether it is trusted at the end of it.
+    # PARK BOUND — every ask is capped, arm-specific
+    # (`RETRY_AFTER_FLOOR_CAP_S` for 429, `TRUST_MAX_AGE_S` for non-429), but
+    # SINCE T1102 neither cap is the ceiling decision trust actually uses any
+    # more — `entries()` caps a failed row's trust at
+    # `poll_policy.POST_429_MIN_INTERVAL_S` (360s) on BOTH arms (see the
+    # table above). This restores nothing about trust: `entries()` still
+    # reads the row unknown once POST_429_MIN_INTERVAL_S elapses past the
+    # last SUCCESS, exactly as before this line, so a capped ask is still
+    # released un-pollable and unknown together — now for nearly its whole
+    # length on both arms. What this bounds is the PARK itself — how long
+    # the row can be held un-pollable — not whether it is trusted at the end
+    # of it.
     #
-    # Without it BOTH arms are at risk of outliving their own trust:
+    # Without it BOTH arms are at risk of parking indefinitely:
     # `_classify_usage_error` (oauth.py) parses Retry-After for ANY HTTPError
     # code, not just 429, and the usage endpoint sits behind Cloudflare, which
     # emits Retry-After on 503s as routine overload signaling. Measured: a
@@ -648,14 +798,13 @@ def _failure_backoff_s(
     # non-standard `Infinity` literal, which survives a restart.
     #
     # A PRIOR REVISION reused RETRY_AFTER_FLOOR_CAP_S (4500) for both arms,
-    # reasoning "one answer to how long any ask can park a row". That is
-    # wrong for the non-429 arm: `entries()` reads a non-429 row unknown once
-    # TRUST_MAX_AGE_S (3600) elapses past the last success, not
-    # RETRY_AFTER_FLOOR_CAP_S — so a non-429 ask above 3600 parked the row
-    # 900s past its own trust: blind (un-pollable AND unknown) for that whole
-    # margin. See `test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses`.
-    # The 429 arm keeps RETRY_AFTER_FLOOR_CAP_S (4500), correctly inside its
-    # own ceiling RATE_LIMIT_TRUST_MAX_AGE_S (7200).
+    # reasoning "one answer to how long any ask can park a row". Keeping the
+    # two PARK caps arm-specific is still right: PARK bounds how long a row
+    # is un-pollable, a question with no single right answer across arms
+    # (`test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses` pins
+    # each PARK cap against its own arm's constant); unifying the DECISION
+    # TRUST ceiling across arms was a separate change (T1102,
+    # `poll_policy.POST_429_MIN_INTERVAL_S`), not this bound's job.
     #
     # CORRECTED 2026-08-03 — the line above does NOT close the blind window
     # in general, on either arm, and an earlier version of this comment
@@ -666,41 +815,49 @@ def _failure_backoff_s(
     # it is capped against (`RETRY_AFTER_FLOOR_CAP_S` / `TRUST_MAX_AGE_S`) is
     # an AGE measured from the last SUCCESS (`fetchedAt`), which `entries()`
     # actually uses. Those agree only when the row was already fresh (age 0)
-    # at the moment it failed. On the arm measured directly below (non-429,
-    # whose park cap equals the trust ceiling it is checked against) the gap
-    # reduces to the row's AGE AT FAILURE, up to the whole park — but that is
-    # an ARM-SPECIFIC coincidence, not the general rule: see the general
-    # closed form and the 429-arm numbers further down, where cap and
-    # ceiling are different constants and the identity does not hold.
-    # Measured end-to-end through `store.record()` / `entries().decision_
-    # value()`, with a control (row already fresh at failure -> no gap):
+    # at the moment it failed.
     #
-    #  age@fail     ask    park   blind  starts  verdict
-    #         0    5000    3600       0    None  ok      <- CONTROL
-    #         1    5000    3600       0    None  ok
-    #       120    5000    3600     119  3481.0  blind
-    #       300    5000    3600     299  3301.0  blind
-    #      1800    5000    3600    1799  1801.0  blind
-    #      3599    5000    3600    3598     2.0  blind
-    #       300    4000    3600     299  3301.0  blind
-    #       300    3600    3600     299  3301.0  blind
-    #       300     600     600       0    None  ok
+    # UPDATED FOR T1102 — before T1102 the non-429 arm's park cap
+    # (TRUST_MAX_AGE_S) happened to equal the decision-trust ceiling
+    # `entries()` checked against (also TRUST_MAX_AGE_S then), so on that arm
+    # alone the gap reduced to the row's age at failure, an ARM-SPECIFIC
+    # coincidence. T1102 collapsed decision trust to
+    # `poll_policy.POST_429_MIN_INTERVAL_S` (360s) on BOTH arms, so neither
+    # arm's park cap equals its trust ceiling any more and that coincidence
+    # is gone — every table below now shows a much larger blind window from
+    # a much smaller age at failure. Measured end-to-end through
+    # `store.record()` / `entries().decision_value()`, with a control (row
+    # already fresh at failure — still blind, since even age 0 now exceeds
+    # nothing: the park itself now vastly outlasts the ceiling):
+    #
+    #  age@fail     ask    park   blind  verdict
+    #         0    5000    3600    3240  blind   <- CONTROL: even fresh is blind now
+    #         1    5000    3600    3241  blind
+    #       120    5000    3600    3360  blind
+    #       300    5000    3600    3540  blind
+    #      1800    5000    3600    3600  blind   <- capped at park: age@fail already exceeds the ceiling
+    #      3599    5000    3600    3600  blind
+    #       300    4000    3600    3540  blind
+    #       300    3600    3600    3540  blind
+    #       300     600     600     540  blind   <- even the shortest ask goes blind now
     #
     # Blind = the row is in backoff (un-pollable) AND `decision_value()` is
     # None (unknown) at the same instant. Every row above is the non-429
-    # (`rate_limited=False`) arm, where the park cap equals TRUST_MAX_AGE_S
-    # (3600) exactly — the ask=4000/3600 rows show the SAME park (3600) as
-    # ask=5000 once the ask exceeds the ceiling, and ask=600 shows a park
-    # shorter than the ceiling never goes blind at all (its own curve is the
-    # binding constraint, not the ceiling). On THIS ARM, and only this arm,
-    # "the blind window equals the age at failure" holds — because the cap
-    # (TRUST_MAX_AGE_S) and the trust ceiling `entries()` actually reads
-    # against (also TRUST_MAX_AGE_S) are the SAME constant, so they cancel.
-    # General form, both arms: `blind = age_at_fail - (ceiling - park)`,
-    # where `ceiling` is RATE_LIMIT_TRUST_MAX_AGE_S (7200) on the 429 arm and
-    # TRUST_MAX_AGE_S (3600) on the non-429 arm above. It equals the age at
-    # failure only where `ceiling == park`, which is true on the non-429 arm
-    # (3600 == 3600) and false on the 429 arm (7200 != 4500).
+    # (`rate_limited=False`) arm, where the park cap is TRUST_MAX_AGE_S
+    # (3600) — the ask=4000/3600 rows show the SAME park (3600) as ask=5000
+    # once the ask exceeds it. General form, both arms:
+    # `blind = park - max(0, ceiling - age_at_fail)`, where `ceiling` is
+    # `poll_policy.POST_429_MIN_INTERVAL_S` (360) on BOTH arms since T1102 —
+    # so `blind` saturates at the full `park` once `age_at_fail >= ceiling`,
+    # which now happens almost immediately (360s in) rather than needing the
+    # park's own length (3600s or 4500s) to elapse first.
+    #
+    # SUPERSEDED BY T1102 (2026-09-23) — the table below was measured against
+    # the trust ceiling then current (`RATE_LIMIT_TRUST_MAX_AGE_S`, 7200s on
+    # the 429 arm), since deleted; T1102 replaced it with the single 360s
+    # `poll_policy.POST_429_MIN_INTERVAL_S` ceiling the table above now uses.
+    # The comparison and its numbers are kept as the historical record of
+    # round 8's finding, not as a description of current behaviour.
     #
     # CORRECTED 2026-08-03 (round 8) — the paragraph that used to sit here
     # said this is "PRE-EXISTING, not a regression this PR introduced",
@@ -724,8 +881,8 @@ def _failure_backoff_s(
     # earlier — and every age past onset is a flat +900s worse than
     # upstream. This is reachable with no contrived staleness: after one 429
     # block the row's age at the next failure IS the park length, so a real
-    # chain of blocks compounds it (see `test_park_bound_blind_window_
-    # equals_age_at_failure`'s 429-arm cases and the DECISION note below).
+    # chain of blocks compounds it (see the block table above and the
+    # DECISION note below).
     # `autoswitch.py` reads a blind row as `active_headroom is None` and
     # turns it into failover pressure — the exact downstream consequence
     # round 6 was written to remove, and on the 429 arm this PR makes it
@@ -880,10 +1037,10 @@ class UsageStore:
         """Identity-guarded snapshot for the given slots (empty entry when the
         row is missing or belongs to a different account).
 
-        ``models`` are the configured scoped-window model names; they let the
-        429-stale trust bound also honor per-model (e.g. Fable) window resets,
-        matching the scheduler's window view. Omitted (``()``) for callers that
-        only read timestamps/last-good and never consult scoped resets."""
+        ``models`` is accepted for call-site symmetry with ``mark_at_limit``
+        (which does consume it, to pick the earliest relevant-window reset a
+        wall mark expires at) but is not itself read here: the walled flag on
+        each row is a plain deadline comparison against ``now``."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -902,36 +1059,32 @@ class UsageStore:
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
+            walled_until = _num_or_none(row.get("walledUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
-            # A usage-endpoint 429 throttles polling without moving the
-            # account's real windows. Usage is monotone within a window, so
-            # last_good is a valid lower bound until that window resets: trust it
-            # right up to the earliest future reset (data-driven, no fixed
-            # clock). Rows with no reset info fall back to a bounded ceiling. A
-            # non-429 failure (timeout/network) is no evidence last_good still
-            # holds, so it always uses the general ceiling.
-            if row.get("lastError") == "http-429":
-                within_ceiling = _rate_limited_trust_ok(
-                    last_good if isinstance(last_good, dict) else None,
-                    age_s,
-                    now,
-                    models,
+            #
+            # A row whose last poll attempt FAILED (any error, 429 included)
+            # is capped at POST_429_MIN_INTERVAL_S past the last success,
+            # full stop — never the scheduler-cadence/live-claim extension
+            # below, and never a window's own reset: a reading the poller
+            # could not refresh must go unknown quickly, not stay trusted on
+            # an old percentage. A row that has NOT failed keeps the
+            # scheduler-cadence/live-claim extension, capped at
+            # TRUST_MAX_AGE_S, exactly as before.
+            if consecutive_failures > 0:
+                trust_extended = (
+                    age_s is not None and age_s <= POST_429_MIN_INTERVAL_S
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
-            live_claim = _live_claim(claim_until, last_attempt_at, now)
-            trust_extended = (
-                within_ceiling
-                and (
-                    consecutive_failures > 0
-                    or (next_poll_at is not None and now < next_poll_at)
+                live_claim = _live_claim(claim_until, last_attempt_at, now)
+                trust_extended = within_ceiling and (
+                    (next_poll_at is not None and now < next_poll_at)
                     or live_claim
                 )
-            )
             out[num] = UsageEntry(
                 last_good=last_good if isinstance(last_good, dict) else None,
                 fetched_at=fetched_at,
@@ -945,9 +1098,13 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
+                struck_at=_strike_time(row),
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
+                walled=walled_until is not None and now < walled_until,
+                walled_until=walled_until,
+                attempts_in_window=len(_pruned_attempts(row, now)),
             )
         return out
 
@@ -1005,7 +1162,11 @@ class UsageStore:
         claiming separately lets two collectors both pass the check and both
         fetch; the re-check under the lock closes that window. Eligibility:
         not quarantined (dead token), not in failure backoff, not claimed
-        within ``CLAIM_TTL_S``, and then by caller mode —
+        within ``CLAIM_TTL_S``, not already holding ``ATTEMPTS_PER_HOUR_MAX``
+        attempts inside the trailing ``ATTEMPT_WINDOW_S`` (the row's own
+        ``attempts`` ledger, pruned and stamped with ``now`` here on a win —
+        binds in every caller mode below, forced or scheduled), and then by
+        caller mode —
 
         - ``respect_plans=True`` (on-demand callers: list/status/switch,
           dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
@@ -1039,7 +1200,17 @@ class UsageStore:
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
+                # A row struck before `struckAt` existed carries its strike
+                # time in `lastAttemptAt`, and the stamp below is about to
+                # overwrite it. Migrate here, once, or the doubt such a row is
+                # owed survives exactly one retry and a timeout then condemns
+                # it forever.
+                if row.get("struckAt") is None and int(
+                    row.get("authDeadStrikes") or 0
+                ):
+                    row["struckAt"] = row.get("lastAttemptAt")
                 row["lastAttemptAt"] = now
+                row["attempts"] = _pruned_attempts(row, now) + [now]
                 row["claimId"] = claim_id
                 row["claimUntil"] = now + CLAIM_TTL_S
                 won[num] = claim_id
@@ -1094,6 +1265,7 @@ class UsageStore:
                 row["backoffUntil"] = None
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["struckAt"] = None
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -1112,6 +1284,78 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # The strike's own time. `lastAttemptAt` moves on every
+                    # attempt, so only this can bound the race doubt.
+                    row["struckAt"] = now
+                    # SAY SO. This is the only place that knows the slot, the
+                    # identity and the verdict at the moment it binds, and at
+                    # AUTH_DEAD_STRIKES=1 one line here is the whole
+                    # difference between a diagnosable quarantine and an
+                    # account that silently starts demanding a re-login.
+                    # Measured in a live incident: four accounts across two
+                    # machines quarantined, not one line about any of them.
+                    if int(row["authDeadStrikes"]) >= AUTH_DEAD_STRIKES:
+                        _ident = identities.get(num) if identities else None
+                        # WHAT LIFTS IT IS WHETHER THESE BYTES CAN ROTATE.
+                        # `sha256:` is minted only when a refresh token existed
+                        # (oauth.credential_fingerprint), and on the ACTIVE slot
+                        # the live client rotates it with no human — which is
+                        # why the line hedges rather than promises: an IDLE slot
+                        # needs an explicit write too, as do a `sha256-full:`
+                        # content hash (no_refresh_token) and an unbound strike.
+                        # Routing on the fingerprint rather than on `rec.error`
+                        # keeps a future PERMANENT_AUTH_ERRORS member correct
+                        # with no edit here.
+                        _lifted_by = (
+                            "a credential rotation clears it — automatic "
+                            "only on the active slot — so this may already be "
+                            "stale; a re-login is needed only if it persists"
+                            if (rec.struck_fp or "").startswith("sha256:")
+                            else "only a re-login replacing the stored "
+                                 "credential clears it"
+                        )
+                        # THE LINE MUST SAY WHAT THE VERDICT SAYS. It fired
+                        # on the RAW count while `token_dead` doubted the same
+                        # strike, so a slot that keeps being fetched was
+                        # announced as quarantined and the remedy named a
+                        # re-login nobody needed — the consume-gate race reads
+                        # exactly like an expired token in the one place a
+                        # person looks.
+                        _doubted = _strike_is_suspected_race(
+                            int(row["authDeadStrikes"]),
+                            _num_or_none(row.get("fetchedAt")),
+                            now,
+                        )
+                        if _doubted:
+                            _logger.info(
+                                "Account %s (%s): a refresh answered %s, but "
+                                "this lineage has succeeded before, so this "
+                                "first strike is DOUBTED as a race — the slot "
+                                "keeps being fetched and one retry settles it. "
+                                "No re-login is implied. Strike %s of %s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
+                        else:
+                            # NOT "the token endpoint answered":
+                            # no_refresh_token is decided before any request
+                            # is built.
+                            _logger.warning(
+                                "Account %s (%s) is quarantined: its stored "
+                                "credential's refresh failed with %s, so it is "
+                                "not fetched and reads "
+                                "\"re-login may be needed\" — %s. Strike %s of "
+                                "%s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                _lifted_by,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
                     # Additive field (absent/None = legacy unconditional
                     # binding). Always overwrite: a legacy writer's strike
                     # must bind unconditionally, not inherit a stale
@@ -1149,6 +1393,121 @@ class UsageStore:
                 self._write_rows(rows)
         return accepted
 
+    def mark_at_limit(
+        self,
+        num: str,
+        identities: dict[str, Identity],
+        models: tuple[str, ...] = (),
+    ) -> None:
+        """Persist that ``num`` is at its limit, per a signal the poller
+        cannot see (the pin's own 429 on ``/v1/messages``, not a fetch).
+
+        Expires at ``min(`` the row's OWN stored reading's earliest future
+        relevant-window reset, ``now + WALL_FALLBACK_S)`` — a 5h window's
+        own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
+        that genuine reset, but a stored 7d (or scoped, or malformed
+        far-future) reset is capped at the fallback instead, well before its
+        own reset: the mark lifts on the trade that a possibly-early release
+        beats parking it for days; ``WALL_FALLBACK_S`` from now alone when no
+        reading is stored to key it on. While the mark has not expired, ``entries()``
+        reports the slot as walled and ``UsageEntry.decision_value()`` reads
+        it full for decisions, whatever a later poll says (a successful poll
+        does not clear the mark early). A repeated call overwrites any prior
+        mark with this newer observation.
+        """
+        now = self.clock()
+        fallback = now + WALL_FALLBACK_S
+
+        def apply(_num: str, row: dict) -> None:
+            reset = _earliest_reset(row.get("lastGood"), models)
+            row["walledUntil"] = (
+                min(reset, fallback) if reset is not None and reset > now
+                else fallback
+            )
+
+        self._mutate(identities, [num], apply)
+
+    def record_header_reading(
+        self,
+        num: str,
+        identities: dict[str, Identity],
+        headers: Mapping[str, str],
+    ) -> bool:
+        """Record a 5h/7d reading straight off a ``/v1/messages`` reply's own
+        rate-limit headers (see the ``USAGE_HEADER_*`` names above) — no
+        fetch involved, free on a request that already went out. Not an
+        attempt: never touches the attempt ledger and never resets
+        failure/backoff state (a header reading says nothing about whether
+        the next real fetch will succeed). Other stored windows (per-model,
+        extra usage — the headers carry neither) are left as they were.
+
+        Sets ``fetchedAt`` to ``now`` so the reading is trusted immediately,
+        but leaves the real endpoint still due at ``lastAttemptAt +
+        CANDIDATE_MAX_INTERVAL_S`` (``nextPollAt = max(existing, that)`` —
+        never pulled EARLIER than a plan already in place), so while replies
+        keep flowing the endpoint is still asked at least every
+        ``CANDIDATE_MAX_INTERVAL_S`` for what these headers don't carry,
+        instead of on every scheduled tick.
+
+        Callers must throttle themselves — the pin calls this at most once
+        per 30s per slot; a hot path replying every request would otherwise
+        write the store that often.
+
+        Records nothing and returns False when the row carries any auth
+        strike (``authDeadStrikes`` > 0) or any endpoint failure
+        (``consecutiveFailures`` > 0): a header reading refreshes only a row
+        whose last endpoint fetch succeeded. Bumping ``fetchedAt`` on a
+        struck or failed row would otherwise reach past the endpoint's own
+        failure/strike machinery — erasing ``_strike_is_suspected_race``'s
+        doubt (it compares the strike time against ``fetchedAt``) and
+        letting ``entries()`` trust the row again at age 0 through the whole
+        backoff — so the strike and failure state stays keyed on the
+        endpoint alone.
+
+        Returns True when a reading was recorded (the 5h utilization header
+        was present and the row was eligible); False, recording nothing,
+        otherwise.
+        """
+        five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
+        if five_pct is None:
+            return False
+        seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
+        five_reset = _header_reset(headers, USAGE_HEADER_5H_RESET)
+        seven_reset = _header_reset(headers, USAGE_HEADER_7D_RESET)
+        recorded = False
+
+        def apply(_num: str, row: dict) -> None:
+            nonlocal recorded
+            if (
+                int(row.get("authDeadStrikes") or 0) > 0
+                or int(row.get("consecutiveFailures") or 0) > 0
+            ):
+                return
+            recorded = True
+            now = self.clock()
+            last_good = dict(row.get("lastGood") or {})
+            five_entry: dict = {"pct": five_pct}
+            if five_reset is not None:
+                five_entry["resets_at"] = five_reset
+            last_good["five_hour"] = five_entry
+            if seven_pct is not None:
+                seven_entry: dict = {"pct": seven_pct}
+                if seven_reset is not None:
+                    seven_entry["resets_at"] = seven_reset
+                last_good["seven_day"] = seven_entry
+            row["lastGood"] = last_good
+            row["fetchedAt"] = now
+            floor = (
+                _num_or_none(row.get("lastAttemptAt")) or now
+            ) + CANDIDATE_MAX_INTERVAL_S
+            existing_next = _num_or_none(row.get("nextPollAt"))
+            row["nextPollAt"] = (
+                floor if existing_next is None else max(existing_next, floor)
+            )
+
+        self._mutate(identities, [num], apply)
+        return recorded
+
     def set_poll_plan(
         self,
         plans: dict[str, tuple[float | None, float | None]],
@@ -1166,27 +1525,79 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        revoke_claim: bool = True,
+        strike_only: bool = False,
+        expected_fingerprints: dict[str, str | None] | None = None,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
         Called after a re-login/add rewrites a slot's stored credential: the
-        strike count (and the failure/backoff state riding with it) no longer
-        reflects reality, and the account must become fetch-eligible again so the
-        next pass can prove the new token good. A no-op for rows with no strikes.
+        strike count (and, for the default full clear, the failure/backoff
+        state riding with it) no longer reflects reality, and the account
+        must become fetch-eligible again so the next pass can prove the new
+        token good. A no-op for rows with no strikes.
+
+        The defaults are for a caller that REWROTE the credential: that
+        lineage is dead, so its fetch lease and its whole failure history go
+        with it. The three keywords are the opposite caller — the collector,
+        which merely OBSERVES a strike heal from a lock-free ``fetch=set()``
+        read and has no credential change of its own to fence:
+
+        ``revoke_claim=False`` keeps ``claimId``, the field ``record()``
+        fences on, so a different collector's in-flight lease survives.
+        ``strike_only=True`` keeps ``consecutiveFailures``/``lastError``/
+        ``backoffUntil``: a fingerprint that stopped matching is no evidence
+        the server's 429 throttle lifted. ``expected_fingerprints`` re-checks
+        ``struckFingerprint`` UNDER THIS METHOD'S LOCK against what that
+        lock-free read saw, so a strike landing in the gap is not overwritten
+        by a stale decision; a row that no longer matches is left alone.
         """
         nums = list(nums)
         if not nums:
             return
 
-        def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+        def apply(num: str, row: dict) -> None:
+            if (
+                expected_fingerprints is not None
+                and row.get("struckFingerprint") != expected_fingerprints.get(num)
+            ):
+                return  # the row moved since the caller's lock-free read
+            # BOTH DIRECTIONS OR NEITHER: a transition log that speaks only
+            # on the way in reports every recovery as a permanent fault. Only
+            # a struck row speaks — every re-login and add calls this on
+            # unstruck rows, and a line per call would bury the transitions.
+            if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+                # STORE-FACT WORDING (transfer.py's own rule): this method
+                # never reads a credential and only the collector path passes a
+                # fingerprint, so a comparison claim is one it did not make —
+                # and false outright for a forced import of the byte-identical
+                # generation (`same_generation`).
+                _logger.info(
+                    "Account %s (%s) is out of quarantine: its dead-token "
+                    "strike was cleared, so it is fetched again.",
+                    num,
+                    identities[num][0],  # _mutate already indexed it
+                )
+            if revoke_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
-            row["consecutiveFailures"] = 0
-            row["lastError"] = None
-            row["backoffUntil"] = None
+            row["struckAt"] = None
+            if not strike_only:
+                # A strike heal is evidence the FINGERPRINT no longer matches,
+                # not evidence the server's own 429 throttle lifted:
+                # `backoffUntil`/`lastError` are the server's word, and erasing
+                # them re-opens a token still inside its own block. The
+                # unconditional copy of these three lines that the merge left
+                # below this guard defeated it entirely.
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 
@@ -1195,12 +1606,37 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _pruned_attempts(row: dict, now: float) -> list[float]:
+    """The row's ``attempts`` ledger, filtered to timestamps still inside
+    ``ATTEMPT_WINDOW_S``. A row with no ledger (written before this change,
+    or never fetched) reads as empty rather than refusing it."""
+    ledger = row.get("attempts")
+    if not isinstance(ledger, list):
+        return []
+    cutoff = now - ATTEMPT_WINDOW_S
+    return [t for t in ledger if isinstance(t, (int, float)) and t > cutoff]
+
+
 def _row_eligible(
     row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    # The hourly attempt cap binds in every mode, forced or scheduled: a row
+    # that already spent its budget this trailing hour is ineligible however
+    # due or stale it looks.
+    if len(_pruned_attempts(row, now)) >= ATTEMPTS_PER_HOUR_MAX:
+        return False
+    # A suspected race stays eligible ON PURPOSE: the strike blocks the fetch,
+    # and only a fetch can succeed, so vetoing here is what made one
+    # `invalid_grant` permanent. Backoff below still paces the single retry.
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES and not (
+        _strike_is_suspected_race(
+            int(row.get("authDeadStrikes") or 0),
+            _num_or_none(row.get("fetchedAt")),
+            _strike_time(row),
+        )
+    ):
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
@@ -1220,6 +1656,7 @@ def _row_eligible(
         _num_or_none(row.get("pollIntervalS")),
         now,
     )
+
     if respect_plans:
         return stale and (poll_due or next_poll_at is None or overslept)
     if repair_overslept:

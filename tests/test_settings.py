@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import stat
 import sys
 from pathlib import Path
@@ -82,11 +84,11 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
-    def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
+    def test_unsupported_strategy_falls_back_to_the_default(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
-        assert load_settings(tmp_path).strategy == "best"
+        assert load_settings(tmp_path).strategy == "consume-first"
 
     def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
@@ -122,6 +124,104 @@ class TestSaveSettings:
         save_settings(tmp_path, AutoSwitchSettings())
         mode = stat.S_IMODE(settings_path(tmp_path).stat().st_mode)
         assert mode == 0o600
+
+    def test_overwrite_backs_up_the_old_file_to_prev(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
+        assert load_settings(tmp_path).threshold == 85.0
+
+    def test_first_save_writes_no_backup(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings())
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert not prev.exists()
+
+    def test_identical_second_save_leaves_prev_unchanged(self, tmp_path: Path):
+        # A repeated identical save must not overwrite a real `.prev` with
+        # a duplicate of the bytes already on disk.
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        first_prev_bytes = prev.read_bytes()
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        assert prev.read_bytes() == first_prev_bytes
+
+    def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch, caplog):
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        real_replace = os.replace
+
+        def _raise_for_prev(src, dst):
+            if str(dst).endswith(".prev"):
+                raise OSError("disk full")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", _raise_for_prev)
+        with caplog.at_level(logging.WARNING):
+            save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        assert "back up" in caplog.text.lower()
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert not prev.exists()
+        assert load_settings(tmp_path).threshold == 85.0
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_prev_mode_is_0600(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert stat.S_IMODE(prev.stat().st_mode) == 0o600
+
+    def test_non_settings_file_gets_no_prev_backup(self, tmp_path: Path):
+        other = tmp_path / "state.json"
+        atomic_write_json(other, {"a": 1})
+        atomic_write_json(other, {"a": 2})
+        assert not other.with_name("state.json.prev").exists()
+
+    def test_symlinked_settings_prev_sits_beside_the_link(self, tmp_path: Path):
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"
+        tracked.write_text(json.dumps({"autoswitch": {"threshold": 70.0}}))
+        old_bytes = tracked.read_bytes()
+        link = live / "settings.json"
+        link.symlink_to(tracked)
+
+        atomic_write_json(link, {"autoswitch": {"threshold": 85.0}})
+
+        prev = live / "settings.json.prev"
+        assert prev.exists()
+        assert prev.read_bytes() == old_bytes
+        assert not (repo / "settings.json.prev").exists()
+
+
+class TestReadRawReturnsDict:
+    """Regression: callers outside this module expect a dict back."""
+
+    def test_read_raw_returns_a_dict(self, tmp_path: Path):
+        from claude_swap.settings import _read_raw
+
+        settings_path(tmp_path).write_text(
+            json.dumps({"remoteControl": {"pinned": True}})
+        )
+        raw = _read_raw(settings_path(tmp_path))
+        assert isinstance(raw, dict)
+        assert raw["remoteControl"]["pinned"] is True
+
+    def test_read_raw_for_write_returns_a_dict(self, tmp_path: Path):
+        from claude_swap.settings import _read_raw_for_write
+
+        settings_path(tmp_path).write_text(
+            json.dumps({"remoteControl": {"pinned": True}})
+        )
+        raw = _read_raw_for_write(settings_path(tmp_path))
+        assert isinstance(raw, dict)
+        assert raw["remoteControl"]["pinned"] is True
 
 
 class TestUiSettings:
@@ -236,6 +336,27 @@ class TestSetUnsetSetting:
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert not settings_path(tmp_path).exists()
+
+    def test_set_setting_backs_up_existing_file_to_prev(self, tmp_path: Path):
+        # set_setting is a live writer (cli.py, tui/app.py, menubar.py); it
+        # must leave a `.prev` recovery copy like save_settings does.
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        set_setting(tmp_path, "autoswitch.threshold", "85")
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
+
+    def test_unset_setting_backs_up_existing_file_to_prev(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        set_setting(tmp_path, "autoswitch.cooldownSeconds", "60")
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        unset_setting(tmp_path, "autoswitch.cooldownSeconds")
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
 
 
 class TestEffectiveSettings:

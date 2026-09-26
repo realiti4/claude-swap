@@ -36,7 +36,9 @@ its functions are only meaningful on macOS.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+from datetime import datetime, timezone
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
@@ -154,6 +156,39 @@ def item_exists(service: str, account: str) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         return False
     return result.returncode == 0
+
+
+_MDAT_RE = re.compile(r'"mdat"<timedate>=0x[0-9A-Fa-f]+\s+"(\d{14})Z')
+
+
+def item_modified_at(service: str, account: str) -> float | None:
+    """UTC epoch of the item's Keychain ``mdat`` (last-modified) attribute.
+
+    Attribute-only lookup (no ``-w``): nothing is decrypted. Non-raising —
+    absent item, parse failure, timeout or a missing binary all return
+    ``None``, since this feeds a freshness comparison where "don't know"
+    must never be read as a claim.
+    """
+    try:
+        result = subprocess.run(
+            [_SECURITY, "find-generic-password", "-a", account, "-s", service],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = _MDAT_RE.search(result.stdout)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(
+            match.group(1), "%Y%m%d%H%M%S"
+        ).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def set_password(service: str, account: str, password: str) -> None:

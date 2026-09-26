@@ -78,6 +78,8 @@ class SnapshotSource:
         if (
             prev.usage.sentinel == USAGE_TOKEN_EXPIRED
             and fetched == prev_fetched
+            and acc.access_token_fp is not None
+            and acc.access_token_fp == prev.access_token_fp
         ):
             return replace(acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED))
         return acc

@@ -93,6 +93,25 @@ ACTIVE_MAX_INTERVAL_S = 300.0
 CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
 
+# A just-activated account's stale candidate plan (``_replan_new_active``) is
+# never pulled all the way to "now": an immediate deadline would leave the
+# row already due for the moment an ON-DEMAND caller (e.g. the statusline's
+# `cswap list`) next reads it, and that caller re-fetches on its own. The
+# pin's own per-slot header throttle (``record_header_reading``, called at
+# most once per 30s per slot) does NOT delay the FIRST reading on a newly
+# live slot -- the very first ``/v1/messages`` reply already records one --
+# so this window is only a chance for that reply's traffic to arrive before
+# an on-demand caller is allowed to poll on its own; a header reading only
+# ever pushes ``nextPollAt`` OUT (``max(existing, lastAttemptAt +
+# CANDIDATE_MAX_INTERVAL_S)``, never earlier), so once the last endpoint
+# attempt is already >= 570s old that floor lands at or before this window's
+# own deadline and the deferred poll fires on schedule regardless. Measured
+# 2026-09-24 (T1231, on T1178's analyzer): with header readings already
+# wired in, slot 6 still logged 8 usage-endpoint attempts in one hour
+# against a target of at most 6, traced to the statusline's own fetch
+# landing 0.55s after the switch.
+POST_SWITCH_REPLAN_DEFER_S = 30.0
+
 # Exhaustion is stable enough to poll slowly, but not to stop polling until a
 # reported reset. Quota grants and provider-side corrections can make an
 # account usable before that timestamp, and decision-grade status must not age
@@ -110,6 +129,18 @@ MOVEMENT_DELTA_PCT = 1.0
 # ±fraction applied to each scheduled interval so independent processes
 # (watch + menu bar + auto) drift apart instead of fetching in lockstep.
 JITTER_FRAC = 0.1
+
+# Hard cap on raw fetch attempts per identity per trailing hour — refuses
+# eligibility outright (``usage_store._row_eligible``), independent of and in
+# addition to every cadence/backoff decision above, so no caller (forced or
+# scheduled) can push a burst past what the endpoint itself allows. Measured
+# 2026-09-23: probe3 (see the module docstring) admitted 30 from a rested
+# identity; 27-32 per host per trailing hour read clean over the same window
+# in the live fleet's logs. The steady scheduled cadence runs ~18/h on the
+# active account, so this only binds during a burst (switch flapping,
+# escalation, pre-switch refetch).
+ATTEMPTS_PER_HOUR_MAX = 28
+ATTEMPT_WINDOW_S = 3600.0
 
 # Reaction to a 429 with ``Retry-After: 0`` (the saturated-window edge):
 # probe at most every 5 minutes (≤12/hour) so aging-out — up to ~30/hour —

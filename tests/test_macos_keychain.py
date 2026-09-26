@@ -10,6 +10,7 @@ function bodies run against a fake process.)
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -206,6 +207,56 @@ def test_keychain_account_name_no_user_env_avoids_legacy_default(monkeypatch):
     monkeypatch.delenv("USER", raising=False)
     name = macos_keychain.keychain_account_name()
     assert name and name != "user"
+
+
+# ---------------------------------------------------------------------------
+# item_modified_at
+# ---------------------------------------------------------------------------
+
+
+def test_item_modified_at_parses_a_captured_attribute_block():
+    """T1312 [m]: parsed against a REALISTIC captured
+    ``security find-generic-password`` attribute block (no ``-w``), not a
+    hand-built string that happens to satisfy the regex."""
+    stdout = (
+        'keychain: "/Users/x/Library/Keychains/login.keychain-db"\n'
+        'version: 512\n'
+        'class: "genp"\n'
+        'attributes:\n'
+        '    0x00000007 <blob>="Claude Code-credentials"\n'
+        '    0x00000008 <blob>=<NULL>\n'
+        '    "acct"<blob>="x"\n'
+        '    "cdat"<timedate>=0x32303236303931383132333435365A00  '
+        '"20260918123456Z"\n'
+        '    "crtr"<uint32>=<NULL>\n'
+        '    "cusi"<sint32>=<NULL>\n'
+        '    "invi"<sint32>=0x0\n'
+        '    "mdat"<timedate>=0x32303236303932343130313533305A00  '
+        '"20260924101530Z"\n'
+        '    "prot"<blob>=<NULL>\n'
+        '    "scrp"<sint32>=<NULL>\n'
+        '    "svce"<blob>="Claude Code-credentials"\n'
+        '    "type"<uint32>=<NULL>\n'
+    )
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0, stdout=stdout)
+        got = macos_keychain.item_modified_at("Claude Code-credentials", "x")
+    expected = datetime.strptime(
+        "20260924101530", "%Y%m%d%H%M%S"
+    ).replace(tzinfo=timezone.utc).timestamp()
+    assert got == expected
+    args = run.call_args.args[0]
+    assert "-w" not in args, "the mdat read must be attribute-only, no -w"
+
+
+@pytest.mark.parametrize("returncode, stdout", [
+    (44, ""),                    # absent item (rc-44)
+    (0, "attributes:\n"),        # no "mdat" attribute in the output
+])
+def test_item_modified_at_none_when_unavailable(returncode, stdout):
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(returncode, stdout=stdout)
+        assert macos_keychain.item_modified_at("svc", "acct") is None
 
 
 # The real-Keychain round-trip test lives in test_macos_keychain_contract.py,
