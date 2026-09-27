@@ -103,6 +103,7 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    show_usage_bars: bool = True  # draw each account as a panel of usage bars
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -289,9 +290,13 @@ def format_account_label(
     fetched_at: float | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    return f"{num}  {account_identity(email, alias)}{marker}  {usage_summary(usage, now, fetched_at)}"
+
+
+def account_identity(email: str, alias: str | None = None) -> str:
+    """How an account names itself in a menu row: ``alias  (email)`` or the email."""
+    return f"{alias}  ({email})" if alias else email
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -390,6 +395,21 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
         stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
         out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
     return out[-limit:][::-1]
+
+
+def purge_menu_callbacks(registry: dict, nsmenu) -> None:
+    """Drop every native item of ``nsmenu`` (and its submenus) from ``registry``.
+
+    ``registry`` is rumps' process-global ``NSApp._ns_to_py_and_callback``,
+    which ``Menu.clear()`` never prunes; see ``rebuild_menu``. Items whose
+    content is a custom view (the usage-bar panels) are ordinary entries of
+    ``itemArray()``, so they are covered the same way.
+    """
+    for item in nsmenu.itemArray():
+        registry.pop(item, None)
+        sub = item.submenu()
+        if sub is not None:
+            purge_menu_callbacks(registry, sub)
 
 
 def _account_display_usage(entry) -> dict | str | None:
@@ -938,6 +958,18 @@ def run(switcher) -> int:
         AppKit.NSApplicationActivationPolicyAccessory
     )
 
+    create_app(switcher).run()
+    return 0
+
+
+def create_app(switcher):
+    """Build the menu bar app for ``switcher`` without starting its event loop.
+
+    ``run`` starts it; tests drive the returned app directly (rebuilds, the
+    sync tick, panel activation) with a fake switcher.
+    """
+    import rumps
+
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
@@ -969,6 +1001,14 @@ def run(switcher) -> int:
             self._engine_events: list = []
             self._event_lock = threading.Lock()
             self._dashboard = DashboardLauncher(switcher._logger, switcher.backup_dir)
+            # Native menu support (usage panels, deferred rebuilds). The
+            # target and the delegate live as long as the app; rebuilds
+            # never replace them.
+            self._menu_open = False
+            self._rebuild_pending = False  # a rebuild waiting for the menu to close
+            self._bars_broken = False  # a panel failed to draw: text rows this session
+            self._account_target = None
+            self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -1016,7 +1056,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, *_extra in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -1029,9 +1069,9 @@ def run(switcher) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
-            if self._dirty:
+            if self._dirty or (self._rebuild_pending and not self._menu_open):
                 self._dirty = False
-                self.rebuild_menu()
+                self.rebuild_menu()  # defers again by itself while the menu is open
             self._detect_active_change()
             self._drain_engine_events()
             dashboard_error = self._dashboard.take_error()
@@ -1128,11 +1168,20 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            if self._menu_open:
+                # Rebuilding purges the rumps callbacks of the items on
+                # screen and swaps rows under the pointer; wait for close.
+                self._rebuild_pending = True
+                return
+            self._rebuild_pending = False
+            # Read once: a worker refresh can replace self.snapshot at any
+            # moment, and every part of this menu must describe one snapshot.
+            snap = self.snapshot
             self.title = format_title(
-                self.snapshot["active_email"],
-                self.snapshot["active_usage"],
+                snap["active_email"],
+                snap["active_usage"],
                 self.settings,
-                alias=self.snapshot.get("active_alias"),
+                alias=snap.get("active_alias"),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -1146,26 +1195,9 @@ def run(switcher) -> int:
             # it, degrade to "leaks again" rather than crashing on every rebuild.
             _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
             if _reg is not None:
-                def _purge(nsmenu):
-                    for _it in nsmenu.itemArray():
-                        _reg.pop(_it, None)
-                        _sub = _it.submenu()
-                        if _sub is not None:
-                            _purge(_sub)
-                _purge(self.menu._menu)
+                purge_menu_callbacks(_reg, self.menu._menu)
             self.menu.clear()
-            account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
-                    ),
-                    callback=self._make_switch_to(num),
-                )
-                item.state = 1 if is_active else 0
-                account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+            account_items = self._account_items(snap)
 
             self.menu = [
                 *account_items,
@@ -1177,8 +1209,8 @@ def run(switcher) -> int:
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
-                self._disable_menu(rumps),
-                self._remove_menu(rumps),
+                self._disable_menu(rumps, snap),
+                self._remove_menu(rumps, snap),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
@@ -1187,6 +1219,98 @@ def run(switcher) -> int:
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
 
+        def _account_items(self, snap):
+            """One row per account: a text row, drawn as a usage panel when enabled."""
+            rows = []  # (account number, item)
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra in snap["accounts"]:
+                item = rumps.MenuItem(
+                    format_account_label(
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                    ),
+                    callback=self._make_switch_to(num),
+                )
+                item.state = 1 if is_active else 0
+                rows.append((num, item))
+            if not rows:
+                return [rumps.MenuItem("No managed accounts", callback=None)]
+            if (
+                self.settings.show_usage_bars
+                and not self._bars_broken
+                and self._account_target is not None
+            ):
+                self._attach_usage_bars(rows, snap["accounts"])
+            return [item for _num, item in rows]
+
+        def _attach_usage_bars(self, rows, accounts):
+            """Draw every account row as a usage panel, or leave them all as text.
+
+            Panels are paired with rows by account number. Any failure here
+            (building, attaching, installing the delegate) is rolled back by
+            ``attach_usage_panels`` to the exact text rows.
+            """
+            try:
+                from claude_swap import menubar_panel_view as pv
+                from claude_swap.menubar_panel import build_account_panel
+
+                now = time.time()
+                panels = {entry[0]: build_account_panel(entry, now) for entry in accounts}
+                pv.attach_usage_panels(
+                    [(item, panels[num]) for num, item in rows],
+                    target=self._account_target,
+                    on_draw_failure=self._panel_draw_failed,
+                    after_attach=self._install_menu_delegate,
+                )
+            except Exception:
+                self.switcher._logger.debug("usage bars unavailable; showing text rows", exc_info=True)
+
+        def _setup_native_menu(self):
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                self._account_target = pv.make_account_target(
+                    self._activate_account,
+                    is_open=lambda: self._menu_open,
+                    menu=self.menu._menu,
+                )
+                self._install_menu_delegate()
+            except Exception:
+                self.switcher._logger.debug("native menu support unavailable", exc_info=True)
+
+        def _install_menu_delegate(self):
+            from claude_swap import menubar_panel_view as pv
+
+            pv.install_menu_delegate(
+                self.menu._menu, on_open=self._menu_will_open, on_close=self._menu_did_close
+            )
+
+        def _menu_will_open(self):
+            self._menu_open = True
+
+        def _menu_did_close(self):
+            self._menu_open = False  # a pending rebuild runs on the next sync tick
+
+        def _activate_account(self, num):
+            """Switch for a usage panel, checked against the snapshot current now.
+
+            The panel was drawn from an earlier snapshot; the account may have
+            been removed since, in which case nothing is switched.
+            """
+            if not any(str(entry[0]) == num for entry in self.snapshot["accounts"]):
+                self.switcher._logger.info(
+                    "Menu bar: account %s is no longer listed; not switching", num
+                )
+                return
+            self._make_switch_to(num)(None)
+
+        def _panel_draw_failed(self):
+            # Called from inside a panel's drawRect_ error handler.
+            if not self._bars_broken:
+                self._bars_broken = True
+                self.switcher._logger.warning(
+                    "Menu bar usage bars failed to draw; showing text rows", exc_info=True
+                )
+            self._rebuild_pending = True
+
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
@@ -1194,22 +1318,22 @@ def run(switcher) -> int:
                 menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
             return menu
 
-        def _remove_menu(self, rumps):
+        def _remove_menu(self, rumps, snap):
             menu = rumps.MenuItem("Remove account")
-            accounts = self.snapshot["accounts"]
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, *_extra in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
-        def _disable_menu(self, rumps):
+        def _disable_menu(self, rumps, snap):
             menu = rumps.MenuItem("Disable / enable account")
-            accounts = self.snapshot["accounts"]
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, *_extra in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
@@ -1256,6 +1380,10 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
+            bars_item.state = 1 if self.settings.show_usage_bars else 0
+            menu.add(bars_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -1415,6 +1543,12 @@ def run(switcher) -> int:
             self.settings.title_scoped = not self.settings.title_scoped
             self._save_and_rebuild()
 
+        def on_toggle_usage_bars(self, _sender):
+            self.settings.show_usage_bars = not self.settings.show_usage_bars
+            if self.settings.show_usage_bars:
+                self._bars_broken = False  # asked for again: try drawing them again
+            self._save_and_rebuild()
+
         def _make_title_pct(self, mode):
             def cb(_sender):
                 self.settings.title_pct = mode
@@ -1453,5 +1587,4 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             return cb
 
-    MenuBarApp().run()
-    return 0
+    return MenuBarApp()
