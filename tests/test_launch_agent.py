@@ -187,11 +187,22 @@ def test_install_creates_the_log_directory(tmp_path):
 
 def test_install_boots_out_first_when_already_loaded(tmp_path):
     # Without this, launchd refuses a reinstall with "service already loaded".
-    with patch.object(launch_agent.subprocess, "run") as run:
-        run.side_effect = _router({"print": _completed(0)})
+    # The fake tracks load state like real launchd: loaded until a bootout
+    # actually clears it, so install's unload wait returns on the first poll
+    # instead of waiting out the real timeout.
+    state = {"loaded": True}
+
+    def run(argv, **kwargs):
+        if argv[1] == "print":
+            return _completed(0 if state["loaded"] else 1)
+        if argv[1] == "bootout":
+            state["loaded"] = False
+        return _completed(0)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
         launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
 
-    subcommands = [c.args[0][1] for c in run.call_args_list]
+    subcommands = [c.args[0][1] for c in ran.call_args_list]
     assert subcommands.index("bootout") < subcommands.index("bootstrap")
 
 
