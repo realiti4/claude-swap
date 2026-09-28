@@ -640,21 +640,33 @@ class ClaudeAccountSwitcher:
         ``add_account`` then cleared the dead-token strike — re-creating on the
         common path exactly the stale-consume this PR exists to prevent.
 
-        I-1 (round 9): returns the value THIS read produced so the caller
-        captures those exact bytes instead of reading again. The check-read
-        and a separate use-read are two independent Keychain reads — a
-        Keychain that answers the first and fails the second passes the
-        guard and then captures the possibly-stale plaintext fallback
-        anyway, which is precisely the outcome this guard exists to prevent.
+        Returns the value THIS read produced, so the caller captures those
+        exact bytes rather than reading again. A check-read and a separate
+        use-read are two independent Keychain reads, and one that answers the
+        first and fails the second passes the guard and then captures the
+        possibly-stale plaintext fallback anyway.
         """
         active = self._read_active_credentials()
-        if active.degraded:
+        # A MANAGED API KEY IS NOT OURS TO REFUSE. It has no generation to
+        # supersede, and its real door is `--add-token`, which
+        # `_reject_live_api_key_capture` names when `add_account` runs it right
+        # after this read. Raising here reaches the user with a remedy for a
+        # different cause AND hides the one that would work: on a session with
+        # no GUI the Keychain does not become readable inside this process, so
+        # the correct message is never printed at all.
+        if active.degraded and not looks_like_api_key(active.value or ""):
+            # SAYS WHAT IS KNOWN IN EVERY ARM. Two of the reachable ones have
+            # nothing readable at all, so a message about a readable fallback
+            # would be vacuous there. What holds throughout is that a capture
+            # taken from a degraded read is either empty or possibly already
+            # superseded: with no GUI Claude Code writes the plaintext file
+            # itself, and then the fallback IS the live generation.
             raise CredentialReadError(
-                "The macOS Keychain is unreadable right now (locked or no GUI "
-                "session), so the only readable credential is a plaintext "
-                "fallback that may be a superseded generation — capturing it "
-                "would file a spent refresh token against this slot. Retry "
-                "from a GUI terminal."
+                "The OAuth Keychain read failed, so a capture now would "
+                "either store nothing or store a possibly superseded "
+                "generation against this slot. A locked Keychain or a "
+                "session with no GUI is the usual cause, and retrying from "
+                "a GUI terminal is what clears that one."
             )
         return active.value
 
