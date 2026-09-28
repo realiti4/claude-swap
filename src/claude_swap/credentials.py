@@ -204,19 +204,43 @@ SHARED_CREDENTIAL_KEYS = frozenset({
     "pluginSecrets",
 })
 
+# Claude Code's separate Claude Design credential, written by /design-login.
+# It has its own OAuth client and refresh token, and Claude Code does not check
+# it against the login beside it, so a design login granted to one account
+# keeps working while another account is logged in. Claude Code revokes and
+# deletes it on /login and /logout.
+DESIGN_CREDENTIAL_KEY = "designOauth"
+
 # Account-scoped siblings cswap knows about, named so the unrecognized-key
 # probe below doesn't flag them: claudeAiOauth is the login itself,
-# trustedDeviceToken is enrolled per (device, account) at /login.
+# trustedDeviceToken is enrolled per (device, account) at /login, and
+# designOauth stays with the slot unless the swap.designLogin setting is off.
 ACCOUNT_CREDENTIAL_KEYS = frozenset({
     "claudeAiOauth",
     "trustedDeviceToken",
+    DESIGN_CREDENTIAL_KEY,
 })
 
 
-def shared_credential_fields(credentials: str | None) -> dict | None:
+def shared_credential_keys(swap_design_login: bool = True) -> frozenset[str]:
+    """The live-owned sibling keys for one activation.
+
+    ``SHARED_CREDENTIAL_KEYS``, plus ``designOauth`` when ``swap.designLogin``
+    is off: the live design login then wins over the target slot's snapshot,
+    presence and absence alike.
+    """
+    if swap_design_login:
+        return SHARED_CREDENTIAL_KEYS
+    return SHARED_CREDENTIAL_KEYS | {DESIGN_CREDENTIAL_KEY}
+
+
+def shared_credential_fields(
+    credentials: str | None, keys: frozenset[str] = SHARED_CREDENTIAL_KEYS
+) -> dict | None:
     """Return the machine-shared fields of a Claude OAuth credential object.
 
-    Only the ``SHARED_CREDENTIAL_KEYS`` allowlist is machine-shared; other
+    Only the ``keys`` allowlist is machine-shared (``SHARED_CREDENTIAL_KEYS``
+    unless the caller widens it with ``shared_credential_keys``); other
     siblings of ``claudeAiOauth`` are account-scoped or unknown and stay
     slot-owned. ``None`` means the input is not a JSON credential object
     (missing, malformed, or a managed API key). A dictionary — including
@@ -231,18 +255,20 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
         # safe), but silently: if Claude Code grows a new *shared* key,
         # that default quietly reintroduces the stale-restore papercut for
         # it — leave a trace so it gets noticed.
-        unrecognized = data.keys() - SHARED_CREDENTIAL_KEYS - ACCOUNT_CREDENTIAL_KEYS
+        unrecognized = data.keys() - keys - ACCOUNT_CREDENTIAL_KEYS
         if unrecognized:
             _logger.debug(
                 "Live credential has sibling keys cswap does not recognize "
                 "(a newer Claude Code?), treating them as slot-owned: %s",
                 sorted(unrecognized),
             )
-    return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+    return {key: data[key] for key in keys if key in data}
 
 
 def merge_shared_credential_fields(
-    target_credentials: str, shared_fields: dict
+    target_credentials: str,
+    shared_fields: dict,
+    keys: frozenset[str] = SHARED_CREDENTIAL_KEYS,
 ) -> str:
     """Compose a target Claude login with the machine's shared fields.
 
@@ -261,7 +287,7 @@ def merge_shared_credential_fields(
     composed = {
         key: value
         for key, value in target.items()
-        if key not in SHARED_CREDENTIAL_KEYS
+        if key not in keys
     }
     composed.update(shared_fields)
     return json.dumps(composed)

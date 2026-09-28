@@ -282,6 +282,21 @@ cswap config path                         # where settings.json lives
 
 </details>
 
+### One Claude Design login for every account
+
+Claude Code stores the Claude Design credential from `/design-login` in the same credential store as your login, so by default it travels with the slot: each account keeps its own design login, or none.
+
+Claude Code does not require that credential to belong to the account you are logged in as. If your Design projects live on one account, keep that one design login across every switch:
+
+```bash
+cswap config set swap.designLogin false
+```
+
+Then run `/design-login` once, from any account. Switches leave that credential in place instead of restoring each slot's own copy.
+
+- **`/login` and `/logout` revoke it.** Claude Code revokes the design credential whenever you log in or out, and a revoked token cannot be restored from a backup. Add your accounts first and run `/design-login` last.
+- **Slots still keep copies.** A switch still backs the live design login up into the slot you leave. `cswap run` sessions start from that copy, and turning the setting back on restores each slot's copy, so run `/design-login` again in either case.
+
 ### Backup and migration
 
 Move account data between machines or back it up:
