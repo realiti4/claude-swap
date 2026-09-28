@@ -523,6 +523,44 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
+    def test_condemned_true_refuses_before_any_network_call(self):
+        """The guard's polarity, proven at the chokepoint itself: a CONFIRMED
+        mismatch refuses without a single byte on the wire."""
+        with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            outcome = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: True,
+            )
+        mock_urlopen.assert_not_called()
+        assert outcome.error == "foreign-lineage"
+        assert outcome.credentials is None
+
+    def test_CONTROL_condemned_false_or_absent_still_posts(self):
+        """Positive control: without this, the RED test above would pass
+        just as well for a guard that refuses every refresh. Absence of
+        evidence (``condemned`` returning False, or not passed at all) must
+        never refuse — refusing a legitimate refresh is the harm the guard
+        exists to prevent."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            no_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials()
+            )
+            not_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: False,
+            )
+        assert no_condemned.error is None
+        assert not_condemned.error is None
+
     def test_invalid_json_is_transient(self):
         # Changed contract (stale-credential robustness): an unparseable blob
         # is more likely a torn read than a credential shape — it must not
@@ -1487,6 +1525,34 @@ class TestConsumeBusyIsDeterministic:
             )
         assert out.error == "consume-busy", out.error
         usage.assert_not_called()
+
+    def test_a_condemned_lineage_does_not_spend_a_doomed_request_either(self):
+        """The consume-gate path's own refusal (`condemned=` returning True,
+        via `consume_backup_grant` as `refresh_via`) must reach the store as
+        `foreign-lineage`, not the generic `refresh-failed` a fallthrough-then-
+        401-then-retry would produce, and must not re-enter the gate a second
+        time to learn the same thing."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        calls = []
+
+        def refusing_gate(*a):
+            calls.append(a)
+            return oauth.RefreshOutcome(None, "foreign-lineage")
+
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=refusing_gate,
+            )
+        assert out.error == "foreign-lineage", out.error
+        usage.assert_not_called()          # no doomed GET with the dead token
+        assert len(calls) == 1             # no second gate round
 
     def test_every_deterministic_kind_has_a_note(self):
         """The reason these kinds stay distinct is the note they carry.

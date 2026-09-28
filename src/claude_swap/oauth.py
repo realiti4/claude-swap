@@ -115,6 +115,10 @@ class RefreshOutcome:
       token is dead and re-login is required
     - ``"no_refresh_token"`` — the stored credential carries no usable refresh
       token (also permanent for retry purposes)
+    - ``"foreign-lineage"`` — the caller's own ``condemned`` check confirmed
+      these bytes are a different slot's grant; refused before any network
+      call. Not a strike-worthy verdict about THIS slot's credential — the
+      next pass re-reads and, if the slot's own bytes changed, may proceed.
     - ``"transient"`` — network/server error; the token may still be valid
 
     ``token_account`` is the account identity the token endpoint optionally
@@ -143,13 +147,27 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0,
+    *, condemned: "Callable[[str], bool] | None" = None,
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``condemned``, when given, is consulted with ``credentials``'
+    ``credential_fingerprint`` right before the POST: a confirmed
+    ``True`` refuses without sending a single byte over the wire
+    (``"foreign-lineage"``, no strike). This is the ONE place every
+    in-tree caller's refresh POST passes through, so a caller that wants
+    the "never POST another slot's grant" guarantee holds it here rather
+    than re-implementing its own pre-POST check — a second call site that
+    forgot to would otherwise reopen exactly this hole. Never refuses on
+    ``condemned`` returning False OR on no ``condemned`` at all: absence of
+    evidence is not a mismatch (see the module's ``_probe_verdicts``
+    convention), and refusing a refresh this codebase cannot prove is
+    foreign is the very re-login this guard exists to prevent.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -165,6 +183,9 @@ def try_refresh_oauth_credentials(
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
+
+    if condemned is not None and condemned(credential_fingerprint(credentials)):
+        return RefreshOutcome(None, "foreign-lineage")
 
     try:
         body = json.dumps({
@@ -633,6 +654,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "foreign-lineage",
 )
 
 

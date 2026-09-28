@@ -1895,6 +1895,7 @@ class TestQuarantineLifecycle:
             json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"},
             }),
+            attributed=True,
         )
         harness.events.clear()
         outcome = harness.tick_with_usage({
@@ -1969,6 +1970,7 @@ class TestDryRunAndNoOp:
         h.switcher._write_account_credentials(
             "2", "b@example.com",
             json.dumps({"claudeAiOauth": {"accessToken": "n", "refreshToken": "n"}}),
+            attributed=True,
         )
         h.events.clear()
         h.engine = h._make_engine(dry_run=True)
@@ -2379,7 +2381,7 @@ class TestTokenIdentity:
             "expiresAt": 99_999_999_999_000,
         }})
 
-        def refresh(creds):
+        def refresh(creds, **kw):
             data = json.loads(creds)["claudeAiOauth"]
             if data["refreshToken"] == "rt-2":
                 return oauth.RefreshOutcome(
@@ -2425,9 +2427,10 @@ class TestTokenIdentity:
                 "accessToken": "sk-2-dead", "refreshToken": "rt-2-dead",
                 "expiresAt": 0,
             }}),
+            attributed=True,
         )
 
-        def refresh(creds):
+        def refresh(creds, **kw):
             data = json.loads(creds)["claudeAiOauth"]
             if data["refreshToken"] == "rt-2-dead":
                 return oauth.RefreshOutcome(None, "invalid_grant")
@@ -2443,7 +2446,14 @@ class TestTokenIdentity:
         q = harness.state().get("quarantine", {})
         assert q.get("2", {}).get("reason") == "invalid_grant"
         # The safety copy was not consumed, and the switch landed elsewhere.
-        assert len(harness.switcher.list_unclaimed_credentials()) == 1
+        # (The switch itself also stashes its own outgoing slot 1, whose
+        # divergence the oracle can't resolve in this harness -- no longer
+        # a fail-open backup, so it adds its own unclaimed entry rather
+        # than reusing or displacing the pre-seeded one.)
+        entries = harness.switcher.list_unclaimed_credentials()
+        assert len(entries) == 2
+        reasons = {e.get("reason") for e in entries.values()}
+        assert reasons == {None, "unresolved"}, reasons
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
@@ -5795,6 +5805,14 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3
@@ -5878,6 +5896,14 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3

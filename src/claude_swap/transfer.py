@@ -537,8 +537,12 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
+        # attributed=True: `target_num` is either a fresh/empty slot, or
+        # `entry["email"]`'s OWN existing slot (matched by identity above),
+        # overwritten only under explicit `--force` or the identity-guarded
+        # dead-token auto-heal — never a different account's slot.
         switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
+            target_num, entry["email"], entry["creds_text"], attributed=True
         )
         switcher._write_account_config(
             target_num, entry["email"], entry["config_text"]
