@@ -1386,7 +1386,11 @@ class SessionManager:
                 return False
             try:
                 self._merge_history_into_source(src, dest)
-            except OSError as e:
+            except (OSError, ValueError) as e:
+                # ValueError covers UnicodeDecodeError: a byte-corrupt
+                # history file is "nothing readable to merge", and losing a
+                # launch to a stray byte in ~/.claude/history.jsonl would
+                # strand every account that has not migrated yet.
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
                 )
@@ -1427,8 +1431,9 @@ class SessionManager:
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
         duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        not already present. ``dest`` is removed once empty; any failure —
+        an OSError, or a UnicodeDecodeError on a byte-corrupt history file —
+        propagates and leaves remaining files in place for the next try.
         """
         if dest.is_dir():
             _mkdir_private(src)
@@ -1445,9 +1450,10 @@ class SessionManager:
                 shutil.move(str(path), str(target))
             dest.rmdir()
         else:
-            existing: set[str] = set()
+            existing_text = ""
             if src.exists():
-                existing = set(src.read_text(encoding="utf-8").splitlines())
+                existing_text = src.read_text(encoding="utf-8")
+            existing = set(existing_text.splitlines())
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
@@ -1457,8 +1463,14 @@ class SessionManager:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 if not src.exists():
                     src.touch(mode=0o600)  # match Claude Code's history mode
+                # A history.jsonl torn by a crashed append ends mid-line, and
+                # appending onto it would weld that tail to the first merged
+                # entry — one line that parses as neither, with no second
+                # copy to recover from once dest is unlinked below.
+                torn = bool(existing_text) and not existing_text.endswith("\n")
+                terminator = "\n" if torn else ""
                 with src.open("a", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(terminator + "\n".join(lines) + "\n")
             dest.unlink()
 
     @staticmethod

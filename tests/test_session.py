@@ -1928,6 +1928,41 @@ class TestShareHistoryPosix:
         ).read_text() == "main-a\n"
         assert (session_dir / "projects").is_symlink()
 
+    def test_merge_keeps_an_unterminated_shared_line_whole(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_text('{"p": "main"}')  # torn tail
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        lines = (source / "history.jsonl").read_text().splitlines()
+        assert lines == ['{"p": "main"}', '{"p": "profile"}']
+
+    def test_merge_skipped_when_profile_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (session_dir / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Unreadable history is skipped, not fatal: the launch goes ahead and
+        # the bytes stay put for a later attempt.
+        assert (session_dir / "history.jsonl").read_bytes() == b'{"p": "\xff\xfe"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
+    def test_merge_skipped_when_shared_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "history.jsonl").read_text() == '{"p": "profile"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
     def test_merge_deferred_while_profile_live(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
