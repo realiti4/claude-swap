@@ -1967,7 +1967,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, reset_grants=False):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -1999,6 +1999,25 @@ class TestActiveAccountRefresh:
         }
         write_live.assert_called_once_with(self._REFRESHED)
         write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+
+    def test_forwards_the_reset_grants_setting(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """``usage.resetGrants`` reaches the usage fetch as ``reset_grants=True``."""
+        from claude_swap.settings import set_setting
+
+        switcher = self._switcher(sample_sequence_data)
+        set_setting(switcher.backup_dir, "usage.resetGrants", "true")
+        with patch.object(switcher, "_read_credentials", return_value=self._REFRESHED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._REFRESHED
+             ), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 1}})) as fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._REFRESHED)
+
+        assert result.usage == {"five_hour": {"pct": 1}}
+        assert fetch.call_args.kwargs["reset_grants"] is True
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2037,7 +2056,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, reset_grants=False):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2368,7 +2387,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, reset_grants=False):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -7866,7 +7885,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, reset_grants=False):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})
