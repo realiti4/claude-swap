@@ -159,6 +159,13 @@ class AccountsSnapshot:
     active_number: str | None
     accounts: tuple[AccountSnapshot, ...]
     taken_at: float
+    # `settings.warm_on_reset`'s in-flight isolated ping, straight from
+    # `autoswitch_state.json`'s "pinging" key (``{"number", "since"}``) if
+    # some `cswap auto` is mid-touch right now, else ``None``. Display-only:
+    # TUIs use ``number`` to tag that account "priming" — the ping never
+    # touches the active credential, so ``active_number`` above is never
+    # affected by it.
+    pinging: dict | None = None
 
 
 @dataclass
