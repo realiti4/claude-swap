@@ -94,6 +94,13 @@ class CswapApp(App):
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
+        elif self._start == "auto":
+            # ONLY the explicit `cswap tui --auto` opens on the auto view,
+            # and only it starts the engine LIVE. A bare `cswap tui` lands on
+            # the dashboard, and reaching the auto view from the menu watches
+            # without switching — opening a view must never begin switching
+            # accounts.
+            self.push_screen(AutoScreen(start_live=True))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
@@ -271,7 +278,18 @@ class CswapApp(App):
             if payload.get("switched"):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                if payload.get("needsLogin"):
+                    # Landing on a credential-less slot leaves the machine
+                    # LOGGED OUT. "Switched to <email>" describes that exactly
+                    # like a working account, and the recovery step (`/login`)
+                    # is only in the payload's own message.
+                    self.notify(
+                        str(payload.get("message") or f"Switched to {target}"),
+                        title="Switch",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(f"Switched to {target}", title="Switch")
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")

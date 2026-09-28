@@ -82,11 +82,11 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
-    def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
+    def test_unsupported_strategy_falls_back_to_the_default(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
-        assert load_settings(tmp_path).strategy == "best"
+        assert load_settings(tmp_path).strategy == "consume-first"
 
     def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
@@ -97,6 +97,16 @@ class TestLoadSettings:
     def test_set_strategy_consume_first(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_dynamic_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "dynamic"}})
+        )
+        assert load_settings(tmp_path).strategy == "dynamic"
+
+    def test_set_strategy_dynamic(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "dynamic")
+        assert load_settings(tmp_path).strategy == "dynamic"
 
 
 class TestSaveSettings:
