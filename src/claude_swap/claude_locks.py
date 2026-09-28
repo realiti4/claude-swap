@@ -38,6 +38,9 @@ import random
 import threading
 import time
 from contextlib import contextmanager
+
+from claude_swap.exceptions import LockError
+from claude_swap.locking import FileLock
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeCodeLockTimeout
@@ -59,6 +62,11 @@ TOUCH_INTERVAL_S = 3.0
 # Note this is a PER-LOCK budget: claude_credentials_lock acquires two locks
 # sequentially, so its worst case is ~2x this value.
 DEFAULT_TIMEOUT_S = 9.0
+# A CAP on the stale-takeover guard wait; the caller's remaining budget is the
+# real bound. Shrink it and the contended-guard test refuses on its own premise.
+_TAKEOVER_GUARD_S = 0.5
+# A short back-off after an arm declines, so the retry loop cannot spin hot.
+_DECLINE_BACKOFF_S = 0.05
 
 _logger = logging.getLogger("claude-swap")
 
@@ -80,6 +88,24 @@ def config_lock_dir() -> Path:
     """Lock directory guarding the global config file (``~/.claude.json.lock``)."""
     path = get_global_config_path()
     return path.parent / (path.name + ".lock")
+
+
+def _nap(want: float, start: float, timeout: float) -> None:
+    """Sleep at most what is LEFT of the budget, never a full jitter draw.
+
+    The deadline is checked at the top of the loop, so a sleep longer than the
+    remainder runs to completion first and the raise lands late: measured, a
+    0.01s budget took 0.302s and a 0.1s budget 0.258s. Clamping to the
+    remainder rather than to `timeout` is what makes that true on the SECOND
+    retry too -- `min(want, timeout)` is a no-op once most of the budget is
+    already spent.
+
+    Never negative: an expired budget sleeps zero and the caller's next
+    deadline check raises, which is the same instant either way.
+    """
+    left = timeout - (time.monotonic() - start)
+    if left > 0:
+        time.sleep(min(want, left))
 
 
 @contextmanager
@@ -117,25 +143,54 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            continue  # holder released between mkdir and stat; retry now
-        if time.time() - held_mtime > staleness:
-            # Dead holder per the protocol: remove and retake. Losing the
-            # rmdir/mkdir race to another waiter just means looping again.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+            # BACK OFF HERE TOO. A dangling symlink at the lock path answers
+            # FileExistsError to mkdir and FileNotFoundError to stat, so this
+            # arm can repeat for the whole budget.
+            _nap(_DECLINE_BACKOFF_S, start, timeout)
             continue
-        time.sleep(0.25 + random.random() * 0.25)
+        if time.time() - held_mtime > staleness:
+            # Dead holder per the protocol: remove and retake. Declining --
+            # a peer retook it, or the corpse could not be removed -- must
+            # not spin hot, and must not sleep past the deadline.
+            if not _take_over_stale(
+                lock_dir, staleness, budget=timeout - (time.monotonic() - start)
+            ):
+                _nap(_DECLINE_BACKOFF_S, start, timeout)
+            continue
+        _nap(0.25 + random.random() * 0.25, start, timeout)
 
     stop_touching = threading.Event()
+    warned = False
+    last_ok = time.time()
 
     def _touch() -> None:
+        nonlocal warned, last_ok
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
-            except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
+                # THE LATCH IS PER FREEZE, NOT PER HOLD: a refresh that lands
+                # ends the episode the warning describes, so the next freeze
+                # is a new fact and the takeover it precedes needs saying.
+                last_ok, warned = time.time(), False
+            except FileNotFoundError:
+                return  # gone; nothing left to keep alive
+            except OSError as e:
+                # Transient, so stay armed: absence is terminal and every
+                # other errno is not. Re-checking the path to tell them apart
+                # is a second syscall that can fail the same way, and from
+                # 3.14 one that reads absence out of a permission error.
+                #
+                # WARN ONLY ONCE THE SENTENCE IS TRUE. It describes a freeze
+                # that outlives `staleness`; firing on the first failure
+                # announced imminent theft over a lock that stayed fresh.
+                if not warned and time.time() - last_ok > staleness:
+                    warned = True
+                    _logger.warning(
+                        "Could not refresh %s (%s); its mtime stops advancing, "
+                        "so a waiter may take it over as stale",
+                        lock_dir,
+                        e,
+                    )
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -152,6 +207,40 @@ def proper_lockfile(
             )
         except OSError as e:
             _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+
+
+def _take_over_stale(lock_dir: Path, staleness: float, budget: float) -> bool:
+    """Remove a lock whose holder is gone, but never a successor's.
+
+    `os.stat` decides and `os.rmdir` acts; between them a peer can create ITS
+    lock at this name, and removing that puts two processes inside the critical
+    section at once. The window is serialized on an flock -- the one primitive
+    here a peer cannot steal -- with the staleness re-read inside it. Claude
+    Code performs the same takeover and takes no lock of ours, so this closes
+    the race between cswap processes and only narrows the cross-implementation
+    one.
+
+    Waits the smaller of `budget` (what the caller has left) and
+    `_TAKEOVER_GUARD_S`, so a contended guard cannot outlive the caller's
+    deadline. True means the name is free to take -- corpse removed, or
+    already gone. False means back off and retry: a peer retook it, the rmdir
+    was refused, or the budget is spent.
+    """
+    # NEVER UNLINK THIS. An flock belongs to the open file description, so
+    # unlink-and-recreate leaves two waiters holding flocks on different
+    # inodes, both inside the window this serializes.
+    guard = lock_dir.parent / f"{lock_dir.name}.takeover"
+    try:
+        with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
+            try:
+                if time.time() - os.stat(lock_dir).st_mtime <= staleness:
+                    return False  # a peer retook it; it is not ours to remove
+                os.rmdir(lock_dir)
+            except FileNotFoundError:
+                pass  # gone before or during the removal; either way it is free
+            return True  # the name is free; the caller's mkdir decides
+    except (LockError, OSError):
+        return False
 
 
 @contextmanager
