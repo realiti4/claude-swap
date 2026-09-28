@@ -360,10 +360,21 @@ class CredentialStore:
             # choice. See `_keychain_unreadable`.
             self._keychain_op_failed = True
             self._keychain_usable_cache = False
+            # NOT re-armed after an UNVERIFIED pin. `_pin_file_mode` zeroes this
+            # deadline so no re-probe can route back onto a residual it could not
+            # verify-clear, and the backup paths reach here without consulting
+            # `_use_keychain` — an idle slot's failing read, or the
+            # `_delete_backup_keychain_quiet` that every post-pin backup write
+            # runs, handed the pin a fresh 60s expiry, after which a recovered
+            # Keychain answered the active read with the account the user just
+            # switched AWAY from, reported as clean. A VERIFIED clear keeps its
+            # re-arm: nothing can shadow the file there, and the pin settled the
+            # failure flags precisely so a later failure is theirs to answer.
             # Monotonic so a wall-clock jump can't expire the cooldown early/late.
-            self._keychain_disabled_until = (
-                time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
-            )
+            if self._residual_verdict is not False:
+                self._keychain_disabled_until = (
+                    time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
+                )
             raise
         # A SUCCESS is an observation too, and it is the newer one. Recording
         # only failures made `_keychain_op_failed` monotone, and the cooldown
@@ -434,9 +445,10 @@ class CredentialStore:
         self._residual_verdict = residual_cleared
         if residual_cleared:
             # Settle what happened before; later failures are the flags'
-            # question again. `_kc_call` re-arms the cooldown on any failure
-            # with no pin check, and backup reads reach it without consulting
-            # `_use_keychain`, so the active read IS reachable after a pin.
+            # question again. `_kc_call` re-arms the cooldown on a later
+            # failure under THIS verdict, and backup reads reach it without
+            # consulting `_use_keychain`, so the active read IS reachable
+            # after a verified pin.
             # Measured: a stored True made a genuine later failure read
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False

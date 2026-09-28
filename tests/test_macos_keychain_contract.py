@@ -1200,3 +1200,137 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         with pytest.raises(SwitchError) as exc:
             s._perform_switch("2", emit_output=False, force_activate=True)
         assert "has no stored credentials" in str(exc.value), exc.value
+
+
+class TestAnUnverifiedPinStaysPinned:
+    """`_pin_file_mode(residual_cleared=False)` must last the whole process.
+
+    The pin exists because a write that fell back to the plaintext file could
+    not verify-delete the old Keychain item, so a residual may still shadow it.
+    It enforces "no re-probe" by zeroing `_keychain_disabled_until` — but
+    `_kc_call` re-armed that deadline on ANY later failure with no pin check,
+    and the backup paths reach `_kc_call` without consulting `_use_keychain`
+    (`_read_account_credentials` -> `_kc_read_backup`, and every post-pin
+    backup write -> `_delete_backup_keychain_quiet`). A failure there is close
+    to certain, since a broken Keychain is why the write fell back in the first
+    place, so the pin quietly acquired a 60s expiry.
+    """
+
+    def test_a_later_failure_does_not_rearm_the_reprobe_after_an_unverified_pin(
+        self, macos_switcher
+    ):
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._pin_file_mode(residual_cleared=False)
+        assert store._use_keychain() is False
+        assert store._keychain_disabled_until == 0.0, "premise: pinned, no deadline"
+
+        # A backup read for some idle slot goes straight to `_kc_read_backup`
+        # without consulting `_use_keychain`, and fails because the Keychain is
+        # still locked — the very reason the write fell back a moment ago.
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(lambda: (_ for _ in ()).throw(_kc.KeychainError("locked")))
+
+        assert store._keychain_disabled_until == 0.0, (
+            "an unrelated Keychain failure re-armed the re-probe deadline on a "
+            "pinned file mode — the pin now expires"
+        )
+
+    def test_a_verified_pin_still_rearms_so_a_later_failure_is_observed(
+        self, macos_switcher
+    ):
+        """The other verdict keeps its self-heal.
+
+        A verified clear proves no item can shadow the file, so re-probing is
+        safe and the project WANTS it: `_pin_file_mode`'s True branch settles
+        the failure flags precisely because "later failures are the flags'
+        question again", and `test_a_verified_clear_does_not_mask_a_LATER_failure`
+        narrates that re-armed timeline as a wanted route. Only the unverified
+        verdict may suppress the re-arm.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._pin_file_mode(residual_cleared=True)
+        assert store._keychain_disabled_until == 0.0, "premise: pinned, no deadline"
+
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(lambda: (_ for _ in ()).throw(_kc.KeychainError("locked")))
+
+        assert store._keychain_disabled_until > 0.0, (
+            "a verified clear lost its cooldown re-probe, so the active read "
+            "that records a fresh verdict became unreachable for the process"
+        )
+
+    def test_the_unverified_residual_is_not_served_after_the_cooldown(
+        self, macos_switcher, block_real_keychain, monkeypatch
+    ):
+        """End to end: the residual comes back and answers for the switch.
+
+            t0  a switch writes the new account's OAuth credential; the
+                Keychain write fails, so it falls back to the plaintext file
+                and its best-effort `_delete_active_keychain_entry()` fails too
+                — the OLD account's item survives and
+                `_pin_file_mode(residual_cleared=False)` fires.
+            t1  a backup read for an idle slot reaches the Keychain (it does
+                not consult `_use_keychain`) and fails; `_kc_call` re-arms the
+                cooldown the pin had zeroed.
+            t2  the Keychain recovers — a GUI unlock, an ACL grant — and 60s
+                later the daemon reads the active credential. `_use_keychain`
+                sees a lapsed deadline, re-probes, and serves the residual.
+
+        Worse than the state it replaced: the re-probed read returns
+        `ActiveCredentials(val, False)`, so the superseded generation is handed
+        out as clean and `_refuse_degraded_capture` is disarmed.
+        """
+        import time
+
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.credentials import (
+            CLAUDE_CODE_KEYCHAIN_SERVICE,
+            KEYCHAIN_RECHECK_COOLDOWN_S,
+        )
+
+        store = macos_switcher._store
+        residual_key = (CLAUDE_CODE_KEYCHAIN_SERVICE, _kc.keychain_account_name())
+        block_real_keychain.data[residual_key] = "OLD-ACCOUNT-CREDENTIAL"
+
+        healthy_get = _kc.get_password
+        healthy_set = _kc.set_password
+        healthy_delete = _kc.delete_password
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        # t0 — the write falls back to the file and cannot clear the residual.
+        monkeypatch.setattr(_kc, "set_password", locked)
+        monkeypatch.setattr(_kc, "delete_password", locked)
+        store._write_oauth_credentials("NEW-ACCOUNT-CREDENTIAL")
+        monkeypatch.setattr(_kc, "set_password", healthy_set)
+        monkeypatch.setattr(_kc, "delete_password", healthy_delete)
+
+        assert store._last_active_credentials_backend == "file"
+        assert store._residual_verdict is False, "premise: unverified residual"
+        assert block_real_keychain.data[residual_key] == "OLD-ACCOUNT-CREDENTIAL", (
+            "premise: the residual really is still there"
+        )
+
+        # t1 — an idle slot's backup read fails against the same locked Keychain.
+        monkeypatch.setattr(_kc, "get_password", locked)
+        macos_switcher._read_account_credentials("9", "idle@example.com")
+        monkeypatch.setattr(_kc, "get_password", healthy_get)
+
+        # t2 — 60s of wall time pass. A pinned file mode has no deadline to
+        # lapse; only a re-armed one does.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            time,
+            "monotonic",
+            lambda: real_monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S + 1,
+        )
+
+        assert store._read_credentials() == "NEW-ACCOUNT-CREDENTIAL", (
+            "the pinned file mode was re-probed away and the unverified "
+            "Keychain residual answered for the switch"
+        )
