@@ -2638,6 +2638,100 @@ class TestModelAwareSwitch:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    # -- model spent on every candidate (see autoswitch._session_escape) ------
+
+    @staticmethod
+    def _spent(five_h: float, seven_d: float = 40.0) -> dict:
+        """Fable at 100% plus the given account-wide windows."""
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+
+    def test_model_spent_everywhere_escapes_a_session_spent_account(
+        self, temp_home
+    ):
+        # Fable is gone on all three, so the model-aware ranking is empty. #1
+        # is also out of 5h quota and can serve nothing; #2 and #3 can still
+        # serve every other model. Leave, to the one with the most room.
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": self._spent(100), "2": self._spent(10), "3": self._spent(50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_model_spent_on_candidates_only_still_escapes(self, temp_home):
+        # The logged incident: the active account still had Fable left but no
+        # 5h quota to use it with, and the peer was out of Fable. Both score
+        # zero on the model axis; only the peer can do any work. (#3, fully
+        # spent, only pads the fixture's three-account fleet.)
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 58.0},
+                  "scoped": [{"name": "Fable", "pct": 90.0}]},
+            "2": {"five_hour": {"pct": 6.0}, "seven_day": {"pct": 92.0},
+                  "scoped": [{"name": "Fable", "pct": 100.0}]},
+            "3": self._spent(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_model_spent_everywhere_weekly_spent_active_escapes_too(
+        self, temp_home
+    ):
+        # The 7d window blocks the account just as hard as the 5h one.
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": self._spent(20, seven_d=100),
+            "2": self._spent(100),
+            "3": self._spent(30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_model_spent_everywhere_holds_while_active_still_serves(
+        self, temp_home
+    ):
+        # #1 still has session room for other models, and every peer is just
+        # as spent on Fable: moving gains nothing. Unchanged all-exhausted.
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": self._spent(40), "2": self._spent(10), "3": self._spent(50),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_model_spent_everywhere_without_session_room_anywhere(
+        self, temp_home
+    ):
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": self._spent(100), "2": self._spent(100), "3": self._spent(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_model_spent_everywhere_escape_does_not_flap(self, temp_home):
+        # Having escaped to #2, the next tick sees #2 with session room: the
+        # escape does not apply from there, so it stays (all-exhausted).
+        h = self._seed(temp_home, model="Fable")
+        usage = {
+            "1": self._spent(100), "2": self._spent(10), "3": self._spent(100),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
     def test_dual_exhausted_candidate_recovers_at_its_later_reset(self, temp_home):
         # #2 is blocked on both its 5h (resets 12:00) and Fable (15:00): it's
         # only usable again at the LATER one. #3 recovers later still (20:00),
