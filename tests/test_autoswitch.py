@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    ModelChangeEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -2772,6 +2774,272 @@ _R_PAST = "1970-01-10T00:00:00Z"
 _R_SOON = "2024-01-05T00:00:00Z"
 _R_LATER = "2024-01-08T00:00:00Z"
 _R_LATEST = "2024-01-10T00:00:00Z"
+
+
+
+class TestModelFallback:
+    """`autoswitch.fallbackModel`: once every account's `autoswitch.model`
+    limit is hit, decide on the fallback model's windows instead — rotating
+    accounts cannot help any more, but a different model still runs."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        kw.setdefault("model", "Fable")
+        kw.setdefault("fallback_model", "Opus")
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _changes(h: EngineHarness) -> list[str]:
+        return [e.change for e in h.events if isinstance(e, ModelChangeEvent)]
+
+    def _engage(self, h: EngineHarness) -> None:
+        h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        assert self._changes(h) == ["fallback"]
+        h.events.clear()
+
+    def test_engages_when_every_account_is_over_the_threshold(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 95),
+            "3": _model_usage(5, 90),  # exactly at the (default 90) threshold
+        })
+        event = next(e for e in h.events if isinstance(e, ModelChangeEvent))
+        assert event.to_json() | {"ts": ""} == {
+            "schemaVersion": 1,
+            "event": "model-change",
+            "ts": "",
+            "change": "fallback",
+            "model": "Opus",
+            "primaryModel": "Fable",
+            "fallbackModel": "Opus",
+        }
+        # Decided on the fallback axes in the SAME tick: Fable no longer
+        # binds, 5h is at 5% → nothing to do, and nothing is "exhausted".
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "all-exhausted" not in h.kinds()
+        assert h.state()["modelFallback"]["active"] is True
+
+    def test_one_account_with_room_is_an_ordinary_switch(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 100),
+            "3": _model_usage(5, 40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert self._changes(h) == []
+
+    def test_an_unreadable_account_blocks_the_fallback(self, temp_home):
+        # It might be the one with room; a wrong fallback downgrades every
+        # session for nothing.
+        h = self._seed(temp_home)
+        h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 100),
+            "3": None,
+        })
+        assert self._changes(h) == []
+        assert "modelFallback" not in h.state()
+
+    def test_an_account_without_the_window_blocks_the_fallback(self, temp_home):
+        # No Fable window reported = not limited on Fable.
+        h = self._seed(temp_home)
+        h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 100),
+            "3": _usage(5),
+        })
+        assert self._changes(h) == []
+
+    def test_full_account_windows_alone_never_engage_it(self, temp_home):
+        # A full 5h binds every model alike: another model would not run either.
+        h = self._seed(temp_home)
+        h.tick_with_usage({n: _model_usage(100, 40) for n in ("1", "2", "3")})
+        assert self._changes(h) == []
+
+    def test_rotation_keeps_working_while_engaged(self, temp_home):
+        h = self._seed(temp_home)
+        self._engage(h)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(100, 100),
+            "2": _model_usage(10, 100),
+            "3": _model_usage(40, 100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._changes(h) == []  # still engaged, not re-announced
+
+    def test_release_waits_for_the_hysteresis_margin(self, temp_home):
+        h = self._seed(temp_home)  # threshold 90, hysteresis 10 → release < 80
+        self._engage(h)
+        h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 80),
+            "3": _model_usage(5, 100),
+        })
+        assert self._changes(h) == []
+        h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 79),
+            "3": _model_usage(5, 100),
+        })
+        event = next(e for e in h.events if isinstance(e, ModelChangeEvent))
+        assert (event.change, event.model) == ("restored", "Fable")
+        assert h.state()["modelFallback"]["active"] is False
+        # Back on the Fable axes in the same tick: #1 is maxed, #2 has room.
+        assert h.active_number() == 2
+
+    def test_release_does_not_need_every_account_readable(self, temp_home):
+        h = self._seed(temp_home)
+        self._engage(h)
+        h.tick_with_usage({"1": None, "2": _model_usage(5, 0), "3": None})
+        assert self._changes(h) == ["restored"]
+
+    def test_a_new_engine_resumes_engaged_without_reannouncing(self, temp_home):
+        h = self._seed(temp_home)
+        self._engage(h)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage(
+            {n: _model_usage(5, 100) for n in ("1", "2", "3")}
+        )
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._changes(h) == []
+        assert "all-exhausted" not in h.kinds()
+
+    def test_dry_run_reports_but_persists_and_runs_nothing(self, temp_home):
+        h = self._seed(temp_home, on_model_change="never-run")
+        h.engine = h._make_engine(dry_run=True)
+        with patch("claude_swap.autoswitch.subprocess.run") as run:
+            h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        assert self._changes(h) == ["fallback"]
+        assert "modelFallback" not in h.state()
+        run.assert_not_called()
+
+    def test_command_gets_the_change_in_its_environment(self, temp_home):
+        h = self._seed(temp_home, on_model_change="notify-sessions")
+        with patch("claude_swap.autoswitch.subprocess.run") as run:
+            run.return_value.returncode = 0
+            h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        (args, kwargs), = run.call_args_list
+        assert args == ("notify-sessions",)
+        assert kwargs["shell"] is True
+        # --json owns stdout: the command's output must never be inherited.
+        assert kwargs["capture_output"] is True
+        env = kwargs["env"]
+        assert env["CSWAP_MODEL_EVENT"] == "fallback"
+        assert env["CSWAP_MODEL"] == "Opus"
+        assert env["CSWAP_PRIMARY_MODEL"] == "Fable"
+        assert env["CSWAP_FALLBACK_MODEL"] == "Opus"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            subprocess.TimeoutExpired("notify-sessions", 60),
+            OSError("no shell"),
+            None,  # ran, exited non-zero
+        ],
+    )
+    def test_a_broken_command_never_stops_the_engine(self, temp_home, failure):
+        h = self._seed(temp_home, on_model_change="notify-sessions")
+        with patch("claude_swap.autoswitch.subprocess.run") as run:
+            if failure is None:
+                run.return_value.returncode = 3
+                run.return_value.stderr = "boom\nlast line"
+                run.return_value.stdout = ""
+            else:
+                run.side_effect = failure
+            outcome = h.tick_with_usage(
+                {n: _model_usage(5, 100) for n in ("1", "2", "3")}
+            )
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.state()["modelFallback"]["active"] is True
+        errors = [e for e in h.events if isinstance(e, ErrorEvent)]
+        assert len(errors) == 1 and "onModelChange" in errors[0].message
+        if failure is None:
+            assert errors[0].message.endswith("exited 3: last line")
+
+    def test_fallback_without_a_primary_model_warns_once_and_is_inert(
+        self, temp_home
+    ):
+        h = self._seed(temp_home, model=None)
+        for _ in range(2):
+            h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "fallbackModel" in warnings[0].message
+        assert self._changes(h) == []
+
+    def test_human_lines_say_which_way_it_went(self):
+        kw = dict(primary_model="Fable", fallback_model="Opus")
+        engaged = ModelChangeEvent(change="fallback", model="Opus", **kw).human()
+        released = ModelChangeEvent(change="restored", model="Fable", **kw).human()
+        assert "Fable" in engaged and "falling back to Opus" in engaged
+        assert "Fable is available again" in released
+
+    def test_several_primary_models_engage_on_the_worst_of_them(self, temp_home):
+        # "Fable,Sonnet": an account is spent once EITHER is — that is what
+        # already binds the switch decision, so the fallback reads it the same.
+        def both(fable: float, sonnet: float) -> dict:
+            usage = _model_usage(5, fable)
+            usage["scoped"].append({"name": "Sonnet", "pct": sonnet})
+            return usage
+
+        h = self._seed(temp_home, model="Fable,Sonnet")
+        h.tick_with_usage({"1": both(100, 10), "2": both(10, 95), "3": both(95, 95)})
+        event = next(e for e in h.events if isinstance(e, ModelChangeEvent))
+        assert event.primary_model == "Fable,Sonnet"
+        assert h.state()["modelFallback"]["active"] is True
+
+    def test_primary_all_reads_every_scoped_window(self, temp_home):
+        h = self._seed(temp_home, model="all")
+        h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        assert self._changes(h) == ["fallback"]
+
+    def test_the_fallback_models_own_window_binds_while_engaged(self, temp_home):
+        # Opus has a weekly window of its own on some plans: spent Opus on
+        # the active account is a reason to rotate, exactly as Fable's was.
+        def with_opus(opus: float) -> dict:
+            usage = _model_usage(5, 100)
+            usage["scoped"].append({"name": "Opus", "pct": opus})
+            return usage
+
+        h = self._seed(temp_home)
+        self._engage(h)
+        outcome = h.tick_with_usage(
+            {"1": with_opus(100), "2": with_opus(20), "3": with_opus(60)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_quarantined_account_does_not_block_the_fallback(self, temp_home):
+        # Its usage is unreadable by definition, and it is out of rotation:
+        # waiting on it would mean never falling back at all.
+        h = self._seed(temp_home)
+        h.engine._quarantine("3", "c@example.com", "refresh-token-dead")
+        h.events.clear()
+        h.tick_with_usage({"1": _model_usage(5, 100), "2": _model_usage(5, 100), "3": None})
+        assert self._changes(h) == ["fallback"]
+
+    def test_poll_event_shows_the_windows_the_decision_now_reads(self, temp_home):
+        h = self._seed(temp_home)
+        h.tick_with_usage({n: _model_usage(5, 100) for n in ("1", "2", "3")})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        # Emitted after the flip, so an ignored "Fable 100%" is not rendered
+        # beside a decision that correctly paid it no attention.
+        assert "Fable" not in poll.to_json()["windowsPct"]["1"]
+
+    def test_fallback_name_matching_no_window_is_not_a_typo(self, temp_home):
+        # "Opus" reports no window of its own here; only `model` is checked.
+        h = self._seed(temp_home)
+        h.tick_with_usage({n: _model_usage(5, 10) for n in ("1", "2", "3")})
+        assert not [e for e in h.events if isinstance(e, ConfigWarningEvent)]
 
 
 def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
