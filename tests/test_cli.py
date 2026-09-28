@@ -1126,6 +1126,30 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_strategy_balance_accepted(self, temp_home):
+        assert self._run(["--once", "--strategy", "balance"], temp_home) == 2
+        assert self.FakeEngine.instances[-1].settings.strategy == "balance"
+
+    def test_strategy_balance_from_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "balance", "balanceLeadHours": 12},
+        }))
+        self._run(["--once"], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.strategy == "balance"
+        assert settings.balance_lead_hours == 12.0
+
+    def test_auto_help_lists_balance(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "balance" in capsys.readouterr().out
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
