@@ -825,7 +825,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         def no_space(*_a, **_kw):
             raise OSError(28, "No space left on device")
 
-        with patch("claude_swap.switcher.shutil.copy", side_effect=no_space):
+        with patch("claude_swap.switcher.shutil.copyfile", side_effect=no_space):
             with pytest.raises(SwitchError):
                 s.switch_to("2", json_output=True)
 

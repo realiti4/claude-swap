@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -323,17 +324,21 @@ class TestAtomicWriteThroughSymlink:
         """Beside the LINK, the rename hits EXDEV whenever the target is on
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
-        import tempfile
+        import os as os_mod
         from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
         link = live / "settings.json"; link.symlink_to(tracked)
         seen = []
-        real_mkstemp = tempfile.mkstemp
+        real_open = os_mod.open
+        # The CREATE, not `mkstemp`: the writer computes the name itself and
+        # opens it inside its guard, so an interrupt in the create still leaves
+        # a name to unlink. `os.path.dirname` of that name is the placement.
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
-            lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
+            S.os, "open",
+            lambda path, *a, **kw: (seen.append(os_mod.path.dirname(str(path))),
+                                    real_open(path, *a, **kw))[1],
         )
 
         atomic_write_json(link, {"x": 1})
@@ -355,3 +360,25 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestTheWrittenFileLandsAt0600:
+    """The published file is EXACTLY 0600, whatever the umask.
+
+    This does not distinguish setting the mode before the publish from after
+    it -- both land 0600 -- and it is not claimed to. What it pins is that
+    the mode is set at all: ``mkstemp`` masks its request, so dropping the
+    call publishes 0400 under a restrictive umask and 0600 under a lax one,
+    and only one of those is a file its owner can still write.
+    """
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+    @pytest.mark.parametrize("umask", [0o022, 0o377])
+    def test_whatever_the_umask(self, tmp_path, umask):
+        p = tmp_path / "settings.json"
+        previous = os.umask(umask)
+        try:
+            atomic_write_json(p, {"a": 1})
+        finally:
+            os.umask(previous)
+        assert oct(p.stat().st_mode & 0o777) == "0o600"
