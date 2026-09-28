@@ -41,6 +41,8 @@ class TestConfigList:
         assert code == 0
         for key in (
             "autoswitch.threshold",
+            "autoswitch.thresholdFiveHour",
+            "autoswitch.thresholdWeekly",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
@@ -51,7 +53,7 @@ class TestConfigList:
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 11
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,10 +80,15 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 11
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
+        # Unset per-window overrides report null, not the base threshold: the
+        # fallback is the engine's, and a JSON consumer must be able to see
+        # that the user never set one.
+        assert by_key["autoswitch.thresholdWeekly"]["value"] is None
+        assert by_key["autoswitch.thresholdWeekly"]["isSet"] is False
 
 
 class TestConfigSetGet:
