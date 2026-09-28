@@ -6894,3 +6894,74 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestPreferredAccounts:
+    """``autoswitch.preferred`` orders qualifying targets, never the gates."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_preferred_beats_more_headroom_when_it_qualifies(self, temp_home):
+        h = self._harness(temp_home, preferred="C@Example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(95),   # over the threshold: must move
+            "2": _usage(10),   # most headroom
+            "3": _usage(40),   # preferred, qualifies -> wins
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_preferred_by_slot_number(self, temp_home):
+        h = self._harness(temp_home, preferred="3")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_preferred_must_still_clear_the_gates(self, temp_home):
+        """A preferred account over the threshold is not landed on."""
+        h = self._harness(temp_home, preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(92),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_unknown_preferred_names_are_ignored(self, temp_home):
+        h = self._harness(temp_home, preferred="nobody@example.com,9")
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_preferred_orders_consume_first_targets_too(self, temp_home):
+        """Among sooner-resetting accounts, the preferred one wins even when
+        another resets sooner still; the strictly-sooner gate is untouched."""
+        h = self._harness(temp_home, strategy="consume-first", preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST),   # active resets last
+            "2": _usage7(10, 10, _R_SOON),     # soonest
+            "3": _usage7(10, 10, _R_LATER),    # preferred, still sooner than active
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "consume-first"
+
+    def test_preferred_does_not_override_all_spent_recovery_order(self, temp_home):
+        """Everything at/over the threshold: soonest-back still wins."""
+        h = self._harness(temp_home, preferred="c@example.com")
+        outcome = h.tick_with_usage({
+            "1": _usage(99, _iso_at(h.clock.now + 3600 * 2)),
+            "2": _usage(97, _iso_at(h.clock.now + 300)),     # soonest back
+            "3": _usage(95, _iso_at(h.clock.now + 3600)),    # preferred, later back
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
