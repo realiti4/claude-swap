@@ -5462,6 +5462,212 @@ class TestSwitchSkipsBrokenSlots:
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
 
+    def test_a_switch_opens_no_outbound_connection(
+        self, temp_home: Path, monkeypatch
+    ):
+        """HERMETICITY. An ordinary switch must never leave the box.
+
+        Guards the autouse `block_real_policy_limits_fetch` stub in
+        conftest.py: if that stub is ever bypassed, or a later change routes
+        the rotation around `_refresh_policy_cache` entirely, this must not
+        pass for the wrong reason. A pass-through spy on
+        `switcher.fetch_policy_limits` asserts the switch actually reached
+        that seam, and `socket.getaddrinfo` is blocked (recording any
+        non-loopback host before raising) so a leak is caught before any
+        resolver or connect runs -- independent of whether the runner can
+        resolve DNS at all. Clears any ambient proxy so a leak would target
+        the real address rather than a local one, and stubs the unrelated
+        usage-poll fetch so the census isolates this seam.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        import socket
+
+        from claude_swap import switcher as switcher_module
+
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+
+        # Not this seam: usage polling has its own, unrelated real-network
+        # path and is stubbed here so the check isolates fetch_policy_limits.
+        monkeypatch.setattr(oauth, "request_usage_data", lambda *a, **k: {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 0.0, "resets_at": None},
+        })
+
+        # The premise: the switch must actually reach the seam, or the
+        # absence of a recorded host below proves nothing.
+        policy_spy = MagicMock(wraps=switcher_module.fetch_policy_limits)
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits", policy_spy)
+
+        seen = []
+
+        def _blocked_getaddrinfo(host, *args, **kwargs):
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                seen.append(host)
+            raise socket.gaierror("blocked: tests must not resolve real hosts")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _blocked_getaddrinfo)
+
+        s.switch()
+
+        assert policy_spy.called, (
+            "the switch never reached switcher.fetch_policy_limits, so an "
+            "empty `seen` below would prove nothing")
+        assert seen == [], (
+            f"an ordinary switch tried to resolve a non-loopback host: "
+            f"{seen!r}")
+
+    def test_a_switch_refreshes_the_policy_cache_and_never_leaves_it_absent(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE POLICY BELONGS TO THE ACCOUNT, THE CACHE IS MACHINE-WIDE.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `<config home>/policy-limits.json`; `/remote-control` resolves
+        `Ms('allow_remote_control')` -> `Hcd()` -> that file. The fetch carries
+        whatever account is ACTIVE, the file is machine-wide, and nothing
+        rewrote it when the account changed — so one account's restrictions
+        gated every session on the machine, including accounts with no such
+        restriction.
+
+        AND DELETING IT IS NOT THE FIX, which the first cut of this got wrong.
+        Read out of the binary:
+
+            function Ms(e){ let t=Hcd()
+              if(!t){ if(aK_.has(e)){ if(fK()) return !1 } return !0 } ... }
+
+        With NO document, a gate in that set returns FALSE. Absent means
+        DENIED, not "unknown, allow" — so dropping the file would refuse
+        Remote Control to every session started after a switch until some poll
+        landed, turning a stale-answer bug into a guaranteed outage.
+
+        So: ask the server with the account that is now active, and write down
+        what it says. A fetch that fails leaves the old file in place, which is
+        no worse than today and never worse than absent.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert policy.exists(), (
+            "the cache was left ABSENT, and absent is DENIED — every session "
+            "started after this switch would be refused Remote Control")
+        assert json.loads(policy.read_text()) == fresh, (
+            "the previous account's answer survived the switch, so its "
+            "restrictions keep gating sessions under an account they no "
+            "longer describe")
+
+    def test_the_activation_path_refreshes_the_policy_cache_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE OTHER SWITCH PATH, which had no witness and lost the refresh.
+
+        `_perform_switch` has two exits. The ordinary rotation falls out of the
+        lock block; the direct-activation branch -- `force_activate`, a fresh
+        machine with no live login, post-import, or a live login cswap does not
+        manage -- returns from INSIDE it. A refresh placed after the lock is
+        reached by the first and not the second, and every existing policy test
+        drives `s.switch()` with a roster-matching live login, so all of them
+        take the first.
+
+        That gap is not a corner: activation is what runs right after
+        `cswap --import` on a new machine, which is precisely when
+        `policy-limits.json` is absent -- and absent is DENIED, so Remote
+        Control is refused until something else happens to write it.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
+
+        # NO `~/.claude.json` oauthAccount: that is what makes `switch()` take
+        # the fresh-machine path and `_perform_switch` take the activation
+        # branch. Credentials still exist, so the fetch has a token to carry.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == fresh, (
+            "the activation path returned without refreshing the policy "
+            "cache, so the previous account's restrictions keep gating every "
+            "session on the machine")
+
+    def test_a_failed_policy_fetch_leaves_the_old_answer_rather_than_none(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL. Absent is denied, so a refresh that cannot reach the
+        server must not clear the file — the old answer may be wrong for this
+        account, but no answer is wrong for every account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        policy.write_text(json.dumps(stale))
+
+        def _boom(**_kw):
+            raise OSError("no network")
+
+        monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _boom)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == stale, (
+            "a failed fetch cleared the cache; absent is DENIED, so that is "
+            "strictly worse than the answer it replaced")
+
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
         s = self._setup(temp_home)
@@ -5630,6 +5836,172 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(ConfigError, match="No accounts remain in rotation"):
             s.switch()
+
+
+class TestThePolicyFetchReadsTheLiveStore:
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_the_policy_refresh_hands_the_seam_its_switcher(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CALL SITE, which `..._asks_the_store_too` cannot see.
+
+        That case calls `fetch_policy_limits(switcher=s)` itself, so it stays
+        green when the argument is dropped here -- and every stub in this file
+        takes `**kwargs`, so a no-arg call is accepted everywhere. Dropping it
+        is the revert the comment at that line used to invite, and it silently
+        restores the keychain-only outage the seam was widened to fix.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        seen: list[object] = []
+
+        def _spy(*a, **kw):
+            # RECORD HERE, ASSERT AFTER. `_refresh_policy_cache` wraps this
+            # call in `except Exception` by design, so an assert raised inside
+            # the spy is SWALLOWED -- the run then fails on whichever later
+            # assert happens to notice, naming the wrong cause.
+            seen.append({"args": a, "kwargs": kw})
+            return None
+
+        real_fetch = switcher_mod.fetch_policy_limits
+        monkeypatch.setattr(switcher_mod, "fetch_policy_limits", _spy)
+        s._refresh_policy_cache()
+        assert seen, "premise: the refresh never called the seam at all"
+        # BOUND TO THE SIGNATURE, not read off `kwargs`. Collapsing to `{}`
+        # whenever a positional was passed made the budget assertion below
+        # report clean about a call it had not looked at: `timeout_s` handed
+        # over positionally is not in an empty dict either.
+        import inspect
+
+        got = inspect.signature(real_fetch).bind_partial(
+            *seen[0]["args"], **seen[0]["kwargs"]
+        ).arguments
+        assert got.get("switcher") is s, (
+            "the refresh called the seam without its switcher, so on a "
+            f"keychain-only host the fetch has no token to ask with: {seen}"
+        )
+        # THE BUDGET TOO. Adding `timeout_s=...` at the call site left the
+        # suite byte-identical: the seam's own case pins its DEFAULT, and every
+        # stub here takes `**kwargs`, so nothing read what the call site
+        # passes. That budget bounds the switch tail the auto engine drives
+        # right before a lockout.
+        assert "timeout_s" not in got, (
+            f"the call site overrode the seam's own budget: {got['timeout_s']}"
+        )
+
+    def test_the_policy_fetch_asks_the_store_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        blob = json.dumps({"claudeAiOauth": {"accessToken": "at-policy"}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(blob, False))
+        seen: list[str] = []
+        monkeypatch.setattr(switcher_mod.oauth, "fetch_policy_limits",
+                            lambda tok, timeout_s=None: seen.append(tok) or {})
+
+        switcher_mod.fetch_policy_limits(switcher=s)
+        assert seen == ["at-policy"], (
+            "the policy fetch found no token, so the refresh returns before it "
+            f"asks on a machine with no plaintext file: {seen}"
+        )
+
+
+class TestThePolicyFetchIsBudgeted:
+    """A switch must not spend ten seconds asking about policy.
+
+    The one call sits in `_perform_switch`, which wraps the locked body and
+    runs after it returns -- policy is network I/O and the body holds Claude
+    Code's own locks. So this budget no longer narrows a
+    credentials-vs-roster window; that window closed when the call moved out.
+    What it still bounds is the tail of `cswap switch` itself, on the path the
+    autoswitch engine drives right before a lockout, where `urlopen`'s 10s
+    default is the whole delay a user waits through for a cache refresh that
+    fails open anyway.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE WAS MEASURED. A reviewer reverted the
+    budget with `fetch_policy_limits.__defaults__ = (10.0,)` and the suite came
+    back byte-identical -- 2389 passed, 4 skipped. Both policy tests replace
+    this seam with a no-arg lambda, so by construction neither can observe a
+    timeout. The constant was a comment with no witness.
+    """
+
+    @staticmethod
+    def _creds(tmp_path):
+        p = tmp_path / ".credentials.json"
+        p.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt"}}))
+        return p
+
+    def test_the_seam_hands_oauth_the_budget_and_not_the_default(
+            self, tmp_path, monkeypatch):
+        from claude_swap import switcher as sw
+
+        seen = {}
+
+        def _spy(token, timeout_s):
+            seen["token"], seen["timeout"] = token, timeout_s
+            return {"restrictions": {}}
+
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits", _spy)
+
+        assert sw.fetch_policy_limits() == {"restrictions": {}}
+        assert seen["token"] == "sk-live"
+        # THE COMPARISON IS THE POINT, not the literal: this fails if someone
+        # "simplifies" the constant back to the fetch's own default.
+        assert seen["timeout"] == sw._POLICY_FETCH_BUDGET_S
+        assert seen["timeout"] < 10.0, (
+            "the switch transaction must be tighter than urlopen's default")
+
+    def test_an_explicit_budget_still_wins(self, tmp_path, monkeypatch):
+        """The seam keeps its parameter, so a caller that knows better can say
+        so -- and the suite's own no-arg stubs keep working because the budget
+        is a DEFAULT, not something the call site passes."""
+        from claude_swap import switcher as sw
+
+        seen = {}
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda token, timeout_s: seen.setdefault("t", timeout_s))
+        sw.fetch_policy_limits(timeout_s=0.25)
+        assert seen["t"] == 0.25
+
+    def test_CONTROL_no_credential_means_no_fetch_at_all(
+            self, tmp_path, monkeypatch):
+        """Without this, the two above pass on a seam that calls oauth
+        unconditionally."""
+        from claude_swap import switcher as sw
+
+        called = []
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: tmp_path / "absent.json")
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda *a, **k: called.append(1))
+        assert sw.fetch_policy_limits() is None
+        assert not called
+
+        # AND THE OTHER WAY THE TOKEN IS MISSING. The line above covers the
+        # absent FILE, which the `except` handles; a file that parses and
+        # carries no accessToken is the `if not token` branch, and deleting
+        # that guard left the suite byte-identical. The cost is one pointless
+        # `Bearer None` request inside the switch transaction.
+        empty = tmp_path / "tokenless.json"
+        empty.write_text(json.dumps({"claudeAiOauth": {}}))
+        monkeypatch.setattr(sw, "get_credentials_path", lambda: empty)
+        assert sw.fetch_policy_limits() is None
+        assert not called
 
 
 class TestUsageAwareSwitch:

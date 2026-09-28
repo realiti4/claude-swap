@@ -804,3 +804,37 @@ def _persist(
             f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
             file=sys.stderr,
         )
+
+
+_POLICY_LIMITS_URL = "https://api.anthropic.com/api/claude_code/policy_limits"
+
+
+def fetch_policy_limits(access_token: str,
+                        timeout_s: float = 10.0) -> dict | None:
+    """The org-policy document the SERVER returns for this credential.
+
+    Claude Code caches this at `<config home>/policy-limits.json` and reads it
+    once per process into a session cache; every gate check — `/remote-control`
+    among them — resolves against that copy. The fetch carries whichever
+    account is ACTIVE and the file is machine-wide, so the answer has to be
+    re-asked when the active account changes or one account's restrictions go
+    on gating every session on the machine.
+
+    ``None`` when it could not be asked, which the caller must keep distinct
+    from an empty document: ABSENT IS DENIED on the reader's side
+    (`Ms()` returns false for a gated capability when no document is present),
+    so writing nothing is never the safe default.
+    """
+    req = urllib.request.Request(_POLICY_LIMITS_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-client-platform": "cli",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — a switch must not fail on this
+        _logger.debug("policy_limits fetch failed: %r", e)
+        return None
+    return data if isinstance(data, dict) else None

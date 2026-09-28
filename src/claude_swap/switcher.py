@@ -77,6 +77,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -301,6 +302,51 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+#: How long a switch may spend asking the policy question.
+#:
+#: The one caller is `_perform_switch`, AFTER its body has released the locks,
+#: so this no longer narrows a credentials-vs-roster window -- that window
+#: closed when the call moved out. What it bounds is the tail of `cswap switch`
+#: itself, on the path the autoswitch engine drives right before a lockout.
+#: NOT A WALL-CLOCK BOUND: urlopen applies this per blocking socket operation,
+#: so connect, handshake and each read get it separately. The fetch's own
+#: default is 10s.
+_POLICY_FETCH_BUDGET_S = 2.0
+
+
+def fetch_policy_limits(
+    timeout_s: float = _POLICY_FETCH_BUDGET_S, switcher: "object | None" = None
+) -> "dict | None":
+    """The active credential's org-policy document, or None if unaskable.
+
+    A module-level seam so the switch path has ONE thing to stub, and so the
+    credential read lives beside the call that needs it rather than inside a
+    method that also writes files.
+
+    THROUGH THE STORE WHEN THERE IS ONE. `get_credentials_path().read_text`
+    alone sees the plaintext file and nothing else, and on macOS the active
+    credential may live in the Keychain with no such file at all -- measured:
+    one machine had it and another did not. There this returned None on every
+    call and the policy refresh went quiet for good. The plaintext read stays
+    as the fallback for callers with no switcher.
+    """
+    raw = None
+    if switcher is not None:
+        try:
+            live = switcher._read_active_credentials()
+            if live.value:
+                raw = json.loads(live.value)
+        except Exception:  # noqa: BLE001 — fall through to the file
+            raw = None
+    try:
+        if raw is None:
+            raw = json.loads(get_credentials_path().read_text(encoding="utf-8"))
+        token = (raw.get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:  # noqa: BLE001 — no credential, nothing to ask with
+        return None
+    if not token:
+        return None
+    return oauth.fetch_policy_limits(token, timeout_s=timeout_s)
 
 
 
@@ -578,6 +624,74 @@ class ClaudeAccountSwitcher:
         if sys.platform != "win32":
             os.chmod(temp_path, 0o600)
         shutil.move(str(temp_path), str(path))
+
+    def _refresh_policy_cache(self) -> None:
+        """Re-ask the org-policy question as the account that is now active.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `<config home>/policy-limits.json`, and every org-policy gate reads it
+        -- `/remote-control` among them. The fetch carries whatever account was
+        ACTIVE, the file is machine-wide, and nothing rewrote it when the
+        account changed, so one account's restrictions gated every session on
+        the machine, including accounts the server places no restriction on.
+
+        DELETING IT IS NOT THE FIX, and the first cut of this did exactly that.
+        **Absent means DENIED for the gates in that set** -- observed: with the
+        file removed, `/remote-control` refuses. So dropping it would turn a
+        stale-answer bug into a guaranteed outage for every session started
+        after a switch.
+
+        A FAILED FETCH LEAVES THE OLD ANSWER. It may be wrong for this account;
+        absent is wrong for every account. Never raises, for the same reason:
+        a switch must not fail over a cache file, and the worst case of doing
+        nothing is the state we already had.
+        """
+        # `switcher` is passed because the seam cannot reach a keychain-aware
+        # read without it: where the live credential is Keychain-only the
+        # plaintext fallback finds nothing and the refresh returns before it
+        # asks. The budget stays the seam's own `_POLICY_FETCH_BUDGET_S`.
+        try:
+            doc = fetch_policy_limits(switcher=self)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            self._logger.debug("policy refresh failed, keeping the old answer:"
+                               " %r", exc)
+            return
+        if not isinstance(doc, dict):
+            return
+        path = get_claude_config_home() / "policy-limits.json"
+        # THROUGH A SYMLINK, NEVER OVER IT -- the rule `_write_json` states
+        # above. `os.replace` swaps a directory entry and does not follow
+        # links, so a dotfiles-managed cache would be detached from its target.
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
+        # THE PID IS IN THE NAME, like every other writer in this store. A
+        # fixed temp name is shared by every process writing this file, so two
+        # concurrent switches interleave their write and replace and the
+        # survivor can be one document's bytes under the other's rename --
+        # which an atomic rename cannot protect against, because the tearing
+        # happened before it.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            # CARRY THE MODE OVER, do not mint one. This is Claude Code's file,
+            # not ours; `os.replace` publishes the TEMP file's mode, so a fresh
+            # temp under an 022 umask silently widened a 0600 document to 0644.
+            # Preserving what is there invents no policy for another program's
+            # file, and a file that does not exist yet has no mode to keep.
+            try:
+                os.chmod(tmp, path.stat().st_mode & 0o777)
+            except OSError:
+                # First creation: nothing to carry over. The umask-derived mode
+                # is a mint as well, just a looser one (0644 under 022), so
+                # pick the tighter default rather than inherit an accident.
+                os.chmod(tmp, 0o600)
+            tmp.replace(path)          # atomic: no reader sees half a document
+        except OSError as exc:
+            self._logger.debug("could not write the policy cache: %r", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -6682,6 +6796,37 @@ class ClaudeAccountSwitcher:
         )
 
     def _perform_switch(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+        provenance: dict | None = None,
+    ) -> dict:
+        """Switch, then re-ask the org-policy question. See the body below.
+
+        THE REFRESH IS NETWORK I/O AND THE BODY HOLDS THREE LOCKS -- two of
+        them Claude Code's own, which it blocks on during a credential
+        refresh -- so it cannot live inside. It cannot live at the end of the
+        body either: that body has TWO exits, and the direct-activation branch
+        (`force_activate`, a fresh machine, post-import, an unmanaged live
+        login) returns from inside the lock scope. A tail call reaches the
+        ordinary rotation only, and no test could see the difference because
+        every policy test drives a roster-matching live login.
+
+        Deliberately NOT `try`/`finally`: a switch that raised has rolled back,
+        and refreshing then writes a policy answer for an account the machine
+        is no longer on.
+        """
+        result = self._perform_switch_locked(
+            target_account,
+            emit_output=emit_output,
+            force_activate=force_activate,
+            provenance=provenance,
+        )
+        self._refresh_policy_cache()
+        return result
+
+    def _perform_switch_locked(
         self,
         target_account: str,
         emit_output: bool = True,
