@@ -630,6 +630,46 @@ def _headroom_by_account(
     }
 
 
+def _session_escape(
+    current: str,
+    oauth_candidates: Sequence[str],
+    usage: dict[str, dict | str | None],
+) -> list[str]:
+    """Candidates with account-wide room, for an active account that has none.
+
+    Only meaningful with a model filter on. There the model's weekly window is
+    folded into every headroom, so once that model is spent on every CANDIDATE
+    each one scores zero and the model-aware ranking comes back empty — "all
+    exhausted". That verdict is right about the model and wrong about the
+    account when the active one is out of 5h/7d quota: it can serve no prompt
+    on any model, while a peer with a fresh session window can still serve
+    every other model. Observed in a real log: active 5h 100 / Fable 90, peer
+    5h 6 / 7d 92 / Fable 100 emitted all-exhausted every EXHAUSTED_INTERVAL_S
+    and stayed on the blocked account until its own 5h reset.
+
+    So on the account-wide windows alone (``models=()``): nothing unless the
+    active account is blocked there, else every candidate with room, most room
+    first, sequence order breaking ties. Cannot flap: the account we land on
+    has account-wide room, so from there this returns nothing until its own
+    5h/7d is spent too.
+    """
+
+    def wide(num: str) -> float | None:
+        value = usage.get(num)
+        return oauth.account_headroom(value if isinstance(value, dict) else None)
+
+    active = wide(current)
+    if active is None or active > 0:
+        return []
+    ranked = [
+        (h, num)
+        for num in oauth_candidates
+        if (h := wide(num)) is not None and h > 0
+    ]
+    ranked.sort(key=lambda t: -t[0])
+    return [num for _, num in ranked]
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -1216,6 +1256,13 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
             )
+
+        if not ordered and trigger == "at-limit" and self._models:
+            # Every candidate is spent on the model, so the model axis has no
+            # target left; if the active account is out of 5h/7d quota,
+            # staying means no work at all. See _session_escape. Ahead of the
+            # API-key resort: a subscription account with room beats metered.
+            ordered = _session_escape(current, oauth_candidates, usage)
 
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
