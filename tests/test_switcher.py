@@ -7605,11 +7605,45 @@ class TestLockstepUsageDetection:
         assert "Account-1 and Account-2" in warnings[0]
         assert "may be the same account" in warnings[0]
 
+    def test_subsecond_reset_jitter_still_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Issue #161: the two slots are fetched a fraction of a second
+        apart, so the API hands back the same window boundary with a
+        different sub-second component. The timestamps below are the pair
+        the reporter observed."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(
+                25.0, "2026-07-25T09:00:00.129393+00:00",
+                60.0, "2026-07-28T00:00:00.101000+00:00",
+            ),
+            "2": self._entry(
+                25.0, "2026-07-25T09:00:00.340384+00:00",
+                60.0, "2026-07-28T00:00:00.902000+00:00",
+            ),
+        }
+        warnings = switcher._lockstep_usage_warnings(self._info(), entries)
+        assert len(warnings) == 1
+        assert "Account-1 and Account-2" in warnings[0]
+
     def test_differing_resets_not_flagged(self, temp_home, sample_sequence_data):
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
             "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
             "2": self._entry(25.0, "2026-07-10T13:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+        }
+        assert switcher._lockstep_usage_warnings(self._info(), entries) == []
+
+    def test_resets_a_minute_apart_not_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The tolerance absorbs fetch skew, nothing more: two accounts whose
+        5h windows opened a minute apart are still two accounts."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "2": self._entry(25.0, "2026-07-10T12:01:00Z", 60.0, "2026-07-14T00:00:00Z"),
         }
         assert switcher._lockstep_usage_warnings(self._info(), entries) == []
 
