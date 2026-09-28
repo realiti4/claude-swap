@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import types
@@ -721,6 +723,35 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _loopback_only_getaddrinfo(host, *args, **kwargs):
+    """Refuses to resolve any non-loopback host, for the whole test process:
+    ``localhost``, a loopback/unspecified IP literal, and ``None``/``""``
+    still resolve. A ``*_proxy`` naming a loopback proxy defeats this,
+    because urllib then resolves only the proxy. Spawned CLIs are outside
+    this process; they are covered by test_cli.py's ``_subprocess_env``.
+    """
+    if host in (None, "") or (isinstance(host, str) and host.lower() == "localhost"):
+        return _real_getaddrinfo(host, *args, **kwargs)
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            "blocked by tests/conftest.py network guard: %r" % (host,),
+        )
+    if addr.is_loopback or addr.is_unspecified:
+        return _real_getaddrinfo(host, *args, **kwargs)
+    raise socket.gaierror(
+        socket.EAI_NONAME, "blocked by tests/conftest.py network guard: %r" % (host,)
+    )
+
+
+socket.getaddrinfo = _loopback_only_getaddrinfo
 
 
 @pytest.fixture(autouse=True)
