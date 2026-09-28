@@ -248,6 +248,35 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--model can only be used with" in capsys.readouterr().err
 
+    def test_switch_strategy_expiring_forwarded_with_model(self):
+        """--strategy expiring is a usage-aware strategy: accepted, forwarded,
+        and --model folds into it like best/next-available."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "switch", "--strategy", "expiring", "--model", "Fable",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings()), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="expiring", json_output=False,
+            models=("Fable",), model_source="cli",
+        )
+
+    def test_auto_rejects_expiring_strategy(self, capsys):
+        """The daemon has no expiration-aware strategy; argparse must say so
+        rather than silently running `best`."""
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--strategy", "expiring"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+
     def test_plain_switch_passes_no_strategy(self):
         """Bare --switch forwards strategy=None."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -1706,6 +1735,90 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
         assert ("run", "2", [], True, True) in calls
+
+
+class TestExpiresCommand:
+    """`cswap expires` — record/clear/list a subscription-cancellation date."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _run(self, argv):
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._expires_command(argv)
+
+    def test_set_by_number_and_email(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run(["2", "2030-09-16"])
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-16"
+        assert "Recorded Account-2" in capsys.readouterr().out
+
+        self._run(["work@co.com", "2030-09-17"])
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-17"
+
+    def test_clear(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run(["2", "2030-09-16"])
+        self._run(["2", "--clear"])
+        assert "expiresAt" not in ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]
+
+    def test_list_marks_lapsed(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run([])
+        assert "No expirations recorded" in capsys.readouterr().out
+
+        self._run(["2", "2000-01-01"])
+        capsys.readouterr()
+        self._run([])
+        out = capsys.readouterr().out
+        assert "2: 2000-01-01 (lapsed)" in out
+        assert "work@co.com" in out
+
+    def test_main_dispatches_expires(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "expires", "2", "2030-09-16"]), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-16"
+
+    @pytest.mark.parametrize("argv, fragment", [
+        (["2"], "YYYY-MM-DD is required"),
+        (["2030-09-16"], "NUM|EMAIL is required before the date"),
+        (["--clear"], "NUM|EMAIL is required with --clear"),
+        (["2", "--clear", "2030-09-16"], "--clear does not take"),
+    ])
+    def test_malformed_invocations_error(self, temp_home, capsys, argv, fragment):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(argv)
+        assert excinfo.value.code == 2
+        assert fragment in capsys.readouterr().err
+
+    def test_invalid_date_is_a_clean_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(["2", "16.09.2030"])
+        assert excinfo.value.code == 1
+        assert "Invalid date" in capsys.readouterr().err
+
+    def test_unknown_account_is_a_clean_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(["9", "2030-09-16"])
+        assert excinfo.value.code == 1
+        assert "Account-9 does not exist" in capsys.readouterr().err
 
 
 class TestDisableEnableDispatch:
