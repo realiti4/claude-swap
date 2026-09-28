@@ -972,6 +972,25 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        # Paid capacity is a separate axis: never inflate included headroom.
+        # Decide on the collector's decision-grade usage, excluding disabled
+        # and quarantined accounts. A zero/unknown cap never opts into billing.
+        from claude_swap.paid_overflow import choose as choose_paid_overflow
+        overflow_eligible = [
+            n for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        overflow_choice = choose_paid_overflow(
+            {"accountEmail": settings.paid_overflow_account,
+             "maxMonthlyUsd": settings.paid_overflow_max_monthly_usd},
+            current, overflow_eligible,
+            {n: self.switcher.account_email(n) for n in overflow_eligible},
+            usage, headroom,
+        ) if settings.paid_overflow_account and settings.paid_overflow_max_monthly_usd > 0 else None
+        if overflow_choice == []:
+            self._emit(NoSwitchEvent(reason="paid-overflow", detail="included quota exhausted; staying on configured paid account"))
+            return TickOutcome.NO_ACTION
+
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
@@ -1217,6 +1236,10 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
+        if overflow_choice:
+            ordered = overflow_choice
+            trigger = "at-limit"
+
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
@@ -1286,9 +1309,9 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            self._blocked_wait_long = True
+            self._blocked_wait_long = not bool(settings.paid_overflow_account)
             earliest = self._earliest_recovery(usage)
-            if earliest is not None:
+            if earliest is not None and self._blocked_wait_long:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(
                 AllExhaustedEvent(

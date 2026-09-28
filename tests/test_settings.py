@@ -355,3 +355,11 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+def test_paid_overflow_settings_roundtrip(tmp_path):
+    set_setting(tmp_path, "autoswitch.paidOverflowAccount", "overflow@example.com")
+    set_setting(tmp_path, "autoswitch.paidOverflowMaxMonthlyUsd", "100")
+    settings = load_settings(tmp_path)
+    assert settings.paid_overflow_account == "overflow@example.com"
+    assert settings.paid_overflow_max_monthly_usd == 100

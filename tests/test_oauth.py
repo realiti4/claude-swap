@@ -367,6 +367,33 @@ class TestFetchUsage:
         assert result["seven_day"]["pct"] == 61.0
         assert "spend" not in result
 
+    def test_funded_extra_usage_without_utilization(self):
+        result = self._fetch_with_response({
+            "extra_usage": {
+                "is_enabled": True, "used_credits": 0,
+                "monthly_limit": 10000, "utilization": None,
+            },
+        })
+        assert result["spend"]["enabled"] is True
+        assert result["spend"]["pct"] == 0
+        assert result["spend"]["limit"] == 100
+
+    def test_configured_extra_usage_out_of_credits_remains_visible(self):
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0},
+            "extra_usage": {
+                "is_enabled": False, "credits_ever_enabled": True,
+                "disabled_reason": "out_of_credits",
+                "used_credits": 0, "monthly_limit": 10000,
+                "utilization": 0,
+            },
+        })
+        assert result["spend"]["limit"] == 100.0
+        assert result["spend"]["used"] == 0.0
+        assert result["spend"]["enabled"] is False
+        assert result["spend"]["disabled_reason"] == "out_of_credits"
+        assert result["five_hour"]["pct"] == 22.0
+
     def test_scoped_per_model_limits(self):
         """weekly_scoped entries in limits[] surface as result['scoped'] by model name."""
         from datetime import timedelta
