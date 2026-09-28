@@ -4256,6 +4256,115 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    def _session_creds(self, expires_at=None, refresh_token="session-rt"):
+        if expires_at is None:
+            expires_at = int(time.time() * 1000) + 3_600_000  # not expired
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "session-at",
+            "refreshToken": refresh_token,
+            "expiresAt": expires_at,
+        }})
+
+    def test_fresh_session_profile_lifts_quarantine_and_stays_fetch_eligible(
+        self, temp_home
+    ):
+        # The backup's refresh token is a normal casualty of a session
+        # profile taking over the account's credential truth (see
+        # _fetch_account_usage): dead there is expected, not a fault, as
+        # long as the profile itself is fresh.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+
+        with patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=self._session_creds(),
+        ), patch(
+            "claude_swap.session.session_identity_drifted", return_value=False
+        ), patch.object(
+            switcher, "_run_usage_fetches", return_value={}
+        ) as run:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel is None
+        run.assert_called_once()
+        fetched_infos = run.call_args.args[0]
+        assert any(i[0] == 2 for i in fetched_infos)
+        # The strike itself was cleared, not just papered over for display.
+        assert switcher._usage_store.entries(
+            {"2": ("test@example.com", "")}
+        )["2"].auth_dead_strikes == 0
+
+    def test_session_profile_with_expired_access_token_is_token_expired(
+        self, temp_home
+    ):
+        # The family is alive (a refresh token exists, unexpired); only
+        # Claude Code can renew it on the profile's next run. The strike on
+        # the dead backup is correct and must be left alone — only the
+        # slot's displayed status must stop reading "re-login needed".
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+
+        with patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=self._session_creds(expires_at=1),
+        ), patch(
+            "claude_swap.session.session_identity_drifted", return_value=False
+        ), patch.object(
+            switcher, "_run_usage_fetches"
+        ) as run:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_TOKEN_EXPIRED
+        run.assert_not_called()
+        assert switcher._usage_store.entries(
+            {"2": ("test@example.com", "")}
+        )["2"].auth_dead_strikes == 1
+
+    def test_drifted_session_profile_keeps_relogin_required(self, temp_home):
+        # An in-session /login re-pointed the profile at a different
+        # account: its token family is not this slot's, so the backup's
+        # dead verdict stands.
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+
+        with patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=self._session_creds(),
+        ), patch(
+            "claude_swap.session.session_identity_drifted", return_value=True
+        ), patch.object(
+            switcher, "_run_usage_fetches"
+        ) as run:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        run.assert_not_called()
+
+    def test_no_session_profile_keeps_relogin_required(self, temp_home):
+        # No profile at all: unchanged behaviour.
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+
+        with patch(
+            "claude_swap.session.read_session_credentials", return_value=None
+        ), patch.object(
+            switcher, "_run_usage_fetches"
+        ) as run:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        run.assert_not_called()
+
     def test_the_collector_hands_the_trust_bound_its_configured_models(
         self, temp_home
     ):
