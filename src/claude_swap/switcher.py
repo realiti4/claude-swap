@@ -5207,15 +5207,31 @@ class ClaudeAccountSwitcher:
                 continue
             before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
+            is_active = bool(info_by_num[num][4])
+            # Only the active slot's expiry is surfaced between polls (the
+            # USAGE_TOKEN_EXPIRED gate in the collect pass), so only its
+            # refresh point pulls the plan in. info[5] is the pre-fetch read:
+            # when this fetch refreshed the token, that read's refresh point
+            # is already past and the planner ignores it.
+            refresh_at = (
+                poll_policy.refresh_poll_ts(
+                    (oauth.extract_oauth_data(info_by_num[num][5]) or {}).get(
+                        "expiresAt"
+                    )
+                )
+                if is_active
+                else None
+            )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
-                is_active=bool(info_by_num[num][4]),
+                is_active=is_active,
                 threshold=threshold,
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                refresh_at=refresh_at,
             )
         return plans
 
