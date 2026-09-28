@@ -6894,3 +6894,46 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+class TestEngineAnchorsOnItsOwnThreshold:
+    """End to end: a CLI --threshold must anchor the restatement too."""
+
+    def _write_settings(self, temp_home: Path) -> None:
+        import json
+
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        settings_module.settings_path(root).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "autoswitch": {"threshold": 90.0, "windowThresholds": "7d:97"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_window_under_its_limit_is_not_evicted(self, temp_home, monkeypatch):
+        """settings.json says 90, the engine runs at 85, the window is at 95.
+
+        95 is under its configured 97 limit, so the account keeps working. The
+        reported failure restated it to 89.99 against the file's 90, which the
+        engine at 85 read as over the line and evacuated.
+        """
+        monkeypatch.setattr(oauth, "_DECISION_WINDOWS_MEMO", None, raising=False)
+        monkeypatch.setattr(oauth, "_WINDOW_THRESHOLD_MEMO", None, raising=False)
+        self._write_settings(temp_home)
+
+        h = EngineHarness(temp_home, strategy="best", threshold=85.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 95, d(3)),   # under its own 97 limit
+            "2": _usage7(10, 20, d(5)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
