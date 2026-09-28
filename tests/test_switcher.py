@@ -12486,3 +12486,124 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestBackupPreservesNewerSlotLogin:
+    """#302: the backup step must not revert an out-of-band re-login.
+
+    ``refreshTokenExpiresAt`` is stamped at login and constant across the
+    rotations inside one family, so it is the only field that orders two
+    live-vs-slot credentials by generation rather than by recency of use.
+    """
+
+    _setup_two_accounts = TestProvenanceGuard._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestProvenanceGuard._install_store_patches
+    )
+    _run_switch = TestProvenanceGuard._run_switch
+
+    _RESOLVER = {
+        "uuid": "uuid-1",
+        "email": "test@example.com",
+        "organizationUuid": None,
+    }
+
+    @staticmethod
+    def _creds(refresh: str, expires: object) -> str:
+        blob: dict = {"accessToken": f"sk-{refresh}", "refreshToken": refresh}
+        if expires is not None:
+            blob["refreshTokenExpiresAt"] = expires
+        return json.dumps({"claudeAiOauth": blob})
+
+    def _switch_with(self, temp_home, sample_sequence_data, slot, live):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = slot
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, {"creds": live},
+        )
+        try:
+            self._run_switch(switcher, resolver=self._RESOLVER)
+        finally:
+            for p in patches:
+                p.stop()
+        return creds_store[("1", "test@example.com")]
+
+    def test_newer_slot_login_survives_the_switch(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The reported case: re-login registered ahead of the old family's
+        deadline. The old family is still alive, so nothing ever 401s and the
+        .prev cushion is never reached — the slot must simply be kept."""
+        after = self._switch_with(
+            temp_home, sample_sequence_data,
+            slot=self._creds("rt-new-login", 2_000_000_000_000),
+            live=self._creds("rt-old-family", 1_000_000_000_000),
+        )
+        assert json.loads(after)["claudeAiOauth"]["refreshToken"] == "rt-new-login"
+
+    def test_ordinary_rotation_still_resyncs(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Live newer than the slot is the case own-rotated exists for: the
+        slot holds a consumed token and must be refreshed."""
+        after = self._switch_with(
+            temp_home, sample_sequence_data,
+            slot=self._creds("rt-stored", 1_000_000_000_000),
+            live=self._creds("rt-rotated", 2_000_000_000_000),
+        )
+        assert json.loads(after)["claudeAiOauth"]["refreshToken"] == "rt-rotated"
+
+    def test_same_family_deadline_resyncs(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Equal stamps mean one family whose refresh token rotated — the
+        guard must not fire, or every routine rotation would stop being
+        captured."""
+        after = self._switch_with(
+            temp_home, sample_sequence_data,
+            slot=self._creds("rt-old", 1_500_000_000_000),
+            live=self._creds("rt-rotated", 1_500_000_000_000),
+        )
+        assert json.loads(after)["claudeAiOauth"]["refreshToken"] == "rt-rotated"
+
+    def test_absent_stamp_falls_back_to_the_previous_behaviour(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Nothing to compare → the guard may not invent an ordering. It can
+        only ever skip a write, so silence has to mean the old path."""
+        after = self._switch_with(
+            temp_home, sample_sequence_data,
+            slot=self._creds("rt-new-login", None),
+            live=self._creds("rt-old-family", 1_000_000_000_000),
+        )
+        assert json.loads(after)["claudeAiOauth"]["refreshToken"] == "rt-old-family"
+
+    def test_non_numeric_stamp_falls_back(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        after = self._switch_with(
+            temp_home, sample_sequence_data,
+            slot=self._creds("rt-new-login", "2035-01-01"),
+            live=self._creds("rt-old-family", 1_000_000_000_000),
+        )
+        assert json.loads(after)["claudeAiOauth"]["refreshToken"] == "rt-old-family"
+
+    def test_classifier_reports_the_new_kind(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, _creds_store, _configs = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = self._creds("rt-old-family", 1_000_000_000_000)
+        with patch.object(
+            switcher, "_read_account_credentials",
+            return_value=self._creds("rt-new-login", 2_000_000_000_000),
+        ):
+            kind, foreign = switcher._classify_outgoing_credential(
+                "1", "test@example.com", live,
+                {"live": live, "resolved": self._RESOLVER},
+                switcher._get_sequence_data(),
+            )
+        assert (kind, foreign) == ("own-superseded", None)
