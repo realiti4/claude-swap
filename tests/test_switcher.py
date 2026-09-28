@@ -6957,6 +6957,42 @@ class TestProvenanceGuard:
         # The switch itself proceeded, onto the stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
+    def test_newer_foreign_credential_lands_in_its_owning_slot(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Foreign bytes that are a later generation (later access-token
+        expiry) than the owning slot's backup: that backup's refresh token was
+        already rotated away, so the live login goes into the owning slot —
+        still stashed, still never into the outgoing slot. As the switch
+        target, slot 2 then activates the fresh login, not the dead one."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2-rotated",
+            "expiresAt": 1,
+        }})
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == foreign
+        (entry_id,) = switcher.list_unclaimed_credentials()
+        assert _read_safety_copy(switcher, entry_id) == foreign
+        assert any("saved into Account-2" in w for w in op["warnings"])
+        assert json.loads(live_state["creds"])["claudeAiOauth"][
+            "accessToken"] == "sk-2-rotated"
+
     def test_foreign_synced_lineage_warns_without_any_write(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
@@ -7361,6 +7397,84 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == wiped
         assert op["warnings"] == []
+
+    def test_oauth_absent_live_never_overwrites_a_token_bearing_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Issue #383: after a failover into an API-key slot the live
+        credentials store is left holding only ``mcpOAuth`` entries — no
+        ``claudeAiOauth`` key at all. ``extract_oauth_data`` answers ``None``
+        there, so the ``wiped`` check misses it and the unresolved fail-open
+        wrote it over the slot's backup, destroying the only refresh token
+        (measured in the field: eight such switches emptied two slots)."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        mcp_only = json.dumps({"mcpOAuth": {
+            "some-server|abc123": {"serverName": "some-server",
+                                   "accessToken": ""},
+        }})
+        live_state = {"creds": mcp_only}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        # The slot keeps its refresh token; the switch still completed.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert json.loads(live_state["creds"])["claudeAiOauth"][
+            "accessToken"] == "sk-stale-2"
+        # An OAuth-less blob holds nothing worth stashing.
+        assert switcher.list_unclaimed_credentials() == {}
+        assert any("log in" in w.lower() for w in op["warnings"])
+
+    def test_api_key_slot_still_backs_up_its_rotated_key(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The #383 guard is gated on the BACKUP carrying OAuth, so a slot
+        that legitimately holds no OAuth on either side — an API-key slot —
+        keeps backing up normally."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-old"
+        live_state = {"creds": "sk-ant-api03-new"}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-new"
+
+    def test_mcp_only_live_never_overwrites_an_api_key_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An API-key slot's live read becomes an mcpOAuth-only blob once
+        Claude Code re-auths an MCP server; backing that up destroyed the
+        slot's only copy of the key."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
+        live_state = {"creds": json.dumps({"mcpOAuth": {
+            "some-server|abc123": {"serverName": "some-server"},
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
 
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
