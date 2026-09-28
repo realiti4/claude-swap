@@ -6537,6 +6537,15 @@ class TestMacosKeychainFallback:
         s._backup_enc_path("1", "a@example.com").write_text(bad)
         assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
 
+    def test_backup_non_utf8_enc_falls_back_to_keychain(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """A garbled .enc is garbled whatever its bytes decode to."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "FROM-KC")
+        s._backup_enc_path("1", "a@example.com").write_bytes(b"\xff\xfegarbled")
+        assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
+
     def test_backup_delete_removes_both_backends(
         self, temp_home: Path, block_real_keychain
     ):
@@ -9228,6 +9237,23 @@ class TestBackupReadTriState:
             "1", "test@example.com"
         )
         assert value == "CREDS"
+        assert unreadable is False
+
+    def test_non_utf8_enc_is_corrupt_not_a_crash(self, temp_home: Path):
+        # The .enc is the only backend here, so undecodable bytes have to reach
+        # the same content-level verdict as bad base64 rather than raising out
+        # of a reader every caller expects to answer with a value.
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._store._write_account_credentials("1", "test@example.com", "CREDS")
+        s._store._backup_enc_path("1", "test@example.com").write_bytes(
+            b"\xff\xfegarbled"
+        )
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == ""
         assert unreadable is False
 
 
@@ -12317,6 +12343,25 @@ class TestStashReaderUnreadableVsAbsent:
             "`refresh_input = current or snapshot` hides it from every "
             "POST-side assertion"
         )
+
+    def test_undecodable_entry_bytes_are_corrupt_not_a_crash(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Bytes that are not UTF-8 at all are the same corrupt entry as bad
+        base64, and must reach the same terminal verdict instead of raising
+        out of the reader on the caller's behalf."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_path = s._store._stash_entry_path(self._stash_successor(s))
+        entry_path.write_bytes(b"\xff\xfegarbled")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called
+        assert out.error == "invalid_grant"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
     def test_row_d_absent_entry_bytes_terminate_instead_of_deferring(
         self, temp_home: Path, sample_sequence_data: dict,
