@@ -76,7 +76,7 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
+Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts). Both follow `autoswitch.model` and `autoswitch.modelMode` (or `--model` and `--model-mode`), so a `prefer` setup picks the account with the most of that model's quota left — see [Automatic switching](#automatic-switching).
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
@@ -88,6 +88,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
+cswap auto --model Fable --model-mode prefer   # ...and land on the account with the most Fable left
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto --strategy consume-first   # burn the soonest-resetting account first
@@ -105,6 +106,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+  - **Model mode** (`--model-mode`, or `cswap config set autoswitch.modelMode`): `gate` (default) lets a spent model quota rule an account out as a target, just like a spent 5h/7d window. `prefer` keeps the 5h/7d windows as the only thing that can rule a target out: a spent model still makes the engine leave, but among accounts with 5h/7d room it lands on the one with the most of that model's quota left. Pick `prefer` when a 5h limit on the active account must always find a landing spot, even on a day when every account is out of Fable. Under `consume-first` only the landing check changes; the ranking stays by weekly reset. `cswap switch --strategy best` and `next-available` follow the same setting, or `--model-mode`.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -274,6 +276,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.modelMode prefer  # model limits rank targets but never exclude one (see "auto")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

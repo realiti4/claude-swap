@@ -6894,3 +6894,210 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+def _prefer_usage(
+    five_h: float,
+    fable: float | None,
+    *,
+    five_h_reset: str | None = None,
+) -> dict:
+    """Usage for the prefer-mode tests; ``fable=None`` reports no Fable window."""
+    five_hour: dict = {"pct": five_h}
+    if five_h_reset:
+        five_hour["resets_at"] = five_h_reset
+    usage: dict = {"five_hour": five_hour, "seven_day": {"pct": 0.0}}
+    if fable is not None:
+        usage["scoped"] = [{"name": "Fable", "pct": fable}]
+    return usage
+
+
+class TestModelPreferMode:
+    """``autoswitch.modelMode = prefer``: the Fable window still makes the
+    engine leave a spent account and ranks the targets, but only the 5h/7d
+    windows decide whether an account can be landed on."""
+
+    def _seed(self, temp_home: Path, accounts: int = 2, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, model="Fable", **{"model_mode": "prefer", **kw})
+        seeds = ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com"))
+        for num, email in seeds[:accounts]:
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _reasons(h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    @staticmethod
+    def _switch(h: EngineHarness) -> SwitchEvent:
+        return next(e for e in h.events if isinstance(e, SwitchEvent))
+
+    def test_session_limit_outranks_a_spent_model_on_the_target(self, temp_home):
+        # #1's 5h window is at the threshold. #2 has 5h room but its Fable is
+        # spent. In prefer mode that is no reason to refuse it.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(20, 100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_gate_mode_refuses_the_same_target(self, temp_home):
+        # The default mode reads #2's spent Fable as "at its limit" and
+        # reports the fleet exhausted while #2's 5h window sits at 20%.
+        h = self._seed(temp_home, model_mode="gate")
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(20, 100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_spent_model_leaves_an_account_with_session_room(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 100),
+            "2": _prefer_usage(20, 30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        # A spent model with 5h/7d room is a proactive move, not the
+        # at-limit escape: cooldown, hysteresis and the no-return bar apply.
+        assert self._switch(h).trigger == "proactive"
+
+    def test_spent_model_everywhere_holds(self, temp_home):
+        # Nothing to gain: both accounts are out of Fable and #1 can still
+        # work on other models. Not all-exhausted either, because #2 has 5h
+        # room.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 100),
+            "2": _prefer_usage(20, 100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_model_move_needs_the_hysteresis_margin(self, temp_home):
+        h = self._seed(temp_home)
+        # 15 pts of Fable left against 8 is under the 10-pt margin, so hold.
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 92),
+            "2": _prefer_usage(20, 85),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        # #1 burns out: 15 against 0 clears the margin.
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 100),
+            "2": _prefer_usage(20, 85),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_session_hysteresis_applies_when_the_session_window_triggered(
+        self, temp_home
+    ):
+        # #2 is below the threshold but beats #1 by only 5 pts of 5h room.
+        # Its extra Fable does not buy the move.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(85, 10),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+
+    def test_ranks_by_model_then_by_session_headroom(self, temp_home):
+        h = self._seed(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(10, 70),  # most 5h room
+            "3": _prefer_usage(30, 20),  # most Fable left
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_equal_model_headroom_breaks_the_tie_on_session_headroom(
+        self, temp_home
+    ):
+        h = self._seed(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(30, 20),
+            "3": _prefer_usage(10, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_targets_without_the_model_window_sort_last(self, temp_home):
+        h = self._seed(temp_home, accounts=3)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(90, 50),
+            "2": _prefer_usage(10, None),  # reports no Fable window at all
+            "3": _prefer_usage(30, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_means_the_session_window_is_spent(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(100, 50),
+            "2": _prefer_usage(20, 100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "at-limit"
+
+    def test_every_session_window_spent_ranks_by_soonest_reset(self, temp_home):
+        # Both 5h windows are over the threshold: the recovery ranking
+        # decides on the 5h resets, and #2's spent Fable does not veto it.
+        h = self._seed(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(92, 50, five_h_reset=_iso_at(now + 3 * 3600)),
+            "2": _prefer_usage(95, 100, five_h_reset=_iso_at(now + 600)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_prefer_without_a_model_warns_once(self, temp_home):
+        h = EngineHarness(temp_home, model_mode="prefer")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {"1": _prefer_usage(5, 10), "2": _prefer_usage(5, 10)}
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "autoswitch.modelMode is prefer" in warnings[0].message
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_prefer_with_a_model_never_warns_about_the_mode(self, temp_home):
+        h = self._seed(temp_home)
+        h.tick_with_usage({"1": _prefer_usage(5, 10), "2": _prefer_usage(5, 10)})
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_returns_when_the_left_account_gets_its_model_back(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 100),
+            "2": _prefer_usage(20, 30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(3600)
+        # #2 burned its Fable while #1's Fable window rolled over.
+        outcome = h.tick_with_usage({
+            "1": _prefer_usage(40, 0),
+            "2": _prefer_usage(20, 100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
