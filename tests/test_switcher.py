@@ -1308,7 +1308,8 @@ class TestListAccountsUsage:
         assert "test@example.com [personal] (active)" in output
         assert "account2@example.com" in output
         assert "├ 5h:" in output
-        assert "└ 7d:" in output
+        assert "├ 7d:" in output
+        assert "└ login:" in output
         assert "10%" in output
         assert "50%" in output
 
@@ -1365,8 +1366,9 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "5h:   0%" in output
-        assert "7d: 100%" in output
+        # Label column widened to fit "login:" (added alongside 5h/7d/$$).
+        assert "5h:      0%" in output
+        assert "7d:    100%" in output
         assert "usage unavailable" not in output
 
     def test_list_no_credentials(

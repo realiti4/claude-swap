@@ -24,12 +24,14 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
     pct_label,
 )
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -299,15 +301,25 @@ class AutoScreen(Screen):
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
+        candidates = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
+        # Widest email among the candidates, so every row's login column
+        # starts at the same offset regardless of which email is longest.
+        email_width = max((len(acc.email) for acc in candidates), default=0)
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
+        for acc in candidates:
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+            login_value = oauth.format_login_expiry(
+                acc.login_expires_at, quarantined
+            )
+            entry.append(f"  login {login_value}", style=palette.muted)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted

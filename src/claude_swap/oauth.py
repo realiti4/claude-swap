@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -70,6 +71,22 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def _refresh_token_expires_at_ms(credentials: str) -> float | None:
+    """Raw ``refreshTokenExpiresAt`` (epoch milliseconds), or ``None`` when
+    absent/unreadable. Shared parse behind :func:`login_expires_at_iso` and
+    :func:`login_expires_at_epoch` so there is one reader of the field."""
+    data = extract_oauth_data(credentials)
+    value = data.get("refreshTokenExpiresAt") if data else None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        return None
+    return float(value)
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 
@@ -81,15 +98,59 @@ def login_expires_at_iso(credentials: str) -> str | None:
     is the date worth showing *before* that happens. Logins issued before Claude
     Code recorded the field carry nothing, which means "unknown", never "now".
     """
-    data = extract_oauth_data(credentials)
-    value = data.get("refreshTokenExpiresAt") if data else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    value = _refresh_token_expires_at_ms(credentials)
+    if value is None:
         return None
     return (
         datetime.fromtimestamp(value / 1000, tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def login_expires_at_epoch(credentials: str) -> float | None:
+    """Epoch-seconds twin of :func:`login_expires_at_iso`: what
+    ``AccountSnapshot.login_expires_at`` and :func:`format_login_expiry` want,
+    without an ISO round-trip."""
+    value = _refresh_token_expires_at_ms(credentials)
+    return value / 1000 if value is not None else None
+
+
+# Widest shape `format_login_expiry` can produce: "needed" (6) ties "23d04h"
+# / "99d23h" (6) under the ~30-day refresh window (2-digit days is the
+# practical ceiling). ljust below pads every shorter shape to this so a
+# column of them starts at the same offset.
+_LOGIN_VALUE_WIDTH = 6
+
+
+def format_login_expiry(
+    expires_at: float | None, quarantined: bool, now: float | None = None
+) -> str:
+    """Fixed-width countdown to a stored login's refresh-token expiry.
+
+    ``"23d04h"`` at a day or more out (days, zero-padded hours), ``"5h07m"``
+    / ``"0h45m"`` under a day (zero-padded minutes), ``"needed"`` once the
+    expiry is at or before now or the account is quarantined (dead
+    refresh-token lineage — the same fact either signals), ``"?"`` when the
+    stamp is missing or unreadable. Right-padded to the widest shape
+    (``_LOGIN_VALUE_WIDTH``) so a column of these lines up.
+    """
+    if quarantined:
+        text = "needed"
+    elif expires_at is None:
+        text = "?"
+    else:
+        now = now if now is not None else datetime.now(timezone.utc).timestamp()
+        remaining = expires_at - now
+        if remaining <= 0:
+            text = "needed"
+        elif remaining >= 86400:
+            days, rem = divmod(int(remaining), 86400)
+            text = f"{days}d{rem // 3600:02d}h"
+        else:
+            rem = int(remaining)
+            text = f"{rem // 3600}h{(rem % 3600) // 60:02d}m"
+    return text.ljust(_LOGIN_VALUE_WIDTH)
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
