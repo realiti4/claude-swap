@@ -8931,6 +8931,38 @@ class TestDisableEnableAccount:
 
         assert s.is_account_disabled("2") is False
 
+    # -- malformed on-disk data --------------------------------------------
+
+    @pytest.mark.parametrize(
+        "accounts",
+        [
+            pytest.param(None, id="accounts-is-null"),
+            pytest.param([{"email": "a@example.com"}], id="accounts-is-a-list"),
+            pytest.param({"1": "a@example.com"}, id="record-is-not-an-object"),
+        ],
+    )
+    def test_disabled_flag_reads_false_on_a_malformed_roster(
+        self, temp_home, accounts
+    ):
+        """A hand-edited sequence.json must not crash the disabled lookup.
+
+        The flag read is already total for everything that is simply absent
+        — no accounts map, no record for the slot — and answers "not
+        disabled". A map or a record of the wrong JSON type took the same
+        path and raised a bare AttributeError, which `cli.py`'s
+        `except ClaudeSwitchError` does not catch: the user got a traceback
+        instead of the clean error line `_get_sequence_data` exists to
+        produce.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        data = s._get_sequence_data()
+        data["accounts"] = accounts
+        s._write_json(s.sequence_file, data)
+
+        assert s.is_account_disabled("1") is False
+        assert s.disabled_account_numbers() == []
+
     # -- warnings ----------------------------------------------------------
 
     def test_disable_active_account_warns_but_sets_flag(self, temp_home, capsys):
