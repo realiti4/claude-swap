@@ -146,6 +146,153 @@ class TestMoveAccount:
         data = switcher._get_sequence_data()
         assert data["accounts"]["5"]["email"] == "account2@example.com"
 
+    def test_move_invalidates_a_stray_profile_the_rename_could_not_displace(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: the target key's session-profile rename is best-effort
+        and is skipped outright when a profile already sits at the target
+        (the guard `not dst_dir.exists()`) — a leftover from an earlier
+        crash, never this account's own. The commit still writes this
+        account's real backup material under the target key, so a stray
+        profile left uninvalidated there would go on serving whatever
+        account the leftover belonged to under the reuse check, passing as
+        this move's own account.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        # A stray profile already at the target key/email pair, unrelated to
+        # this move — the rename below must skip it (guard), never adopt it.
+        stray = switcher._session_dir("5", "account2@example.com")
+        stray.mkdir(parents=True, exist_ok=True)
+        (stray / ".credentials.json").write_text("stray-material", encoding="utf-8")
+
+        switcher.move_account("2", "5")
+
+        assert not (stray / ".credentials.json").exists(), (
+            "DEFECT: the stray profile at the target key was never "
+            "invalidated, so it keeps serving material that predates this "
+            "move's own backup write"
+        )
+
+    def test_move_stray_at_target_does_not_strip_the_source_profiles_stale_flag(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: a stray profile already at the target key makes the
+        rename-guard skip the move outright — the source profile is left
+        exactly where it was, still needing its own re-bootstrap. The
+        carry-the-flag step must gate on the rename having actually
+        LANDED, not on `dst_dir.exists()` (true here only because of the
+        unrelated stray), or the source's own genuinely-stale profile loses
+        its flag for no reason connected to it.
+
+        A commit that then SUCCEEDS prunes slot 2 outright (by design: an
+        unmoved profile "costs at most that slot's history"), which would
+        mask the bug — the flag only matters, and only shows the loss, when
+        the commit then FAILS and the source profile is left in place.
+        """
+        from unittest.mock import patch
+
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        src = switcher._session_dir("2", "account2@example.com")
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text("live-profile", encoding="utf-8")
+        assert mark_session_stale(src)
+
+        stray = switcher._session_dir("5", "account2@example.com")
+        stray.mkdir(parents=True, exist_ok=True)
+
+        real_json = ClaudeAccountSwitcher._write_json
+        calls = {"n": 0}
+
+        def failing_json(self, path, data):
+            if path == self.sequence_file and "5" in data.get("accounts", {}):
+                calls["n"] += 1
+                raise OSError("disk full (injected)")
+            return real_json(self, path, data)
+
+        with patch.object(ClaudeAccountSwitcher, "_write_json", failing_json):
+            with pytest.raises(Exception):
+                switcher.move_account("2", "5")
+
+        assert calls["n"] >= 1, "premise: the targeted commit write must have failed"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "account2@example.com", (
+            "premise: the commit failed, so the account is still at slot 2"
+        )
+        assert src.exists(), "premise: the stray blocked the rename, so the " \
+            "source profile never left slot 2"
+
+        assert stale_marker_for(src).exists(), (
+            "DEFECT: the source profile's own stale flag was stripped even "
+            "though it never moved (a stray at the target blocked the "
+            "rename, not this profile's own re-bootstrap having landed)"
+        )
+
+    def test_move_failed_commit_restores_the_profiles_stale_flag_with_it(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: the stale marker is a SIBLING of the profile dir, not a
+        child, so restoring the profile dir on a failed commit does not
+        restore the marker with it — that must be done explicitly, or an
+        abort strips a stale flag the base never touched.
+        """
+        from unittest.mock import patch
+
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        src = switcher._session_dir("2", "account2@example.com")
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text("live-profile", encoding="utf-8")
+        assert mark_session_stale(src)
+
+        real_json = ClaudeAccountSwitcher._write_json
+        calls = {"n": 0}
+
+        def failing_json(self, path, data):
+            # Scoped to the write that actually names the target slot: an
+            # earlier internal write (e.g. a migration touch inside
+            # `_get_sequence_data_migrated`) also hits `sequence_file`, and
+            # failing THAT one aborts before the rename/carry even run,
+            # which would pass this test for the wrong reason.
+            if path == self.sequence_file and "5" in data.get("accounts", {}):
+                calls["n"] += 1
+                raise OSError("disk full (injected)")
+            return real_json(self, path, data)
+
+        with patch.object(ClaudeAccountSwitcher, "_write_json", failing_json):
+            with pytest.raises(Exception):
+                switcher.move_account("2", "5")
+
+        # PREMISES: the failing write really was the one naming the target,
+        # so the rename and the marker carry really did run first.
+        assert calls["n"] >= 1, "premise: the targeted commit write must have failed"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+
+        dst = switcher._session_dir("5", "account2@example.com")
+        assert stale_marker_for(src).exists(), (
+            "DEFECT: the aborted move's rename-back restored the profile "
+            "dir but left it without the stale flag it carried before the "
+            "move started"
+        )
+        assert not stale_marker_for(dst).exists(), (
+            "the flag was left orphaned at the target's marker path"
+        )
+
     def test_move_failed_required_clear_aborts_commit(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -346,6 +493,41 @@ class TestMoveAccount:
         # Old slot key is gone.
         assert switcher._read_account_credentials("2", "account2@example.com") == ""
         assert switcher._read_account_config("2", "account2@example.com") == ""
+
+    def test_bare_renumber_still_finds_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A renumber that only rewrites ``sequence.json`` (no ``move``) leaves
+        the backup keyed under the OLD slot number. The read for the roster's
+        NEW number must still find it, converge a copy under the new number,
+        and never delete the old one."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials("2", "account2@example.com", "creds-two")
+
+        data = switcher._get_sequence_data()
+        data["accounts"]["5"] = data["accounts"].pop("2")
+        switcher._write_json(switcher.sequence_file, data)
+
+        assert (
+            switcher._read_account_credentials("5", "account2@example.com")
+            == "creds-two"
+        )
+        # Converged: a DIRECT read (no fallback) now finds slot 5's own
+        # copy, on whichever backend this platform actually writes to...
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "5", "account2@example.com"
+            )
+            == "creds-two"
+        )
+        # ...and the old slot's item was never touched.
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "2", "account2@example.com"
+            )
+            == "creds-two"
+        )
 
     def test_move_relocates_session_profile(
         self, temp_home: Path, sample_sequence_data: dict

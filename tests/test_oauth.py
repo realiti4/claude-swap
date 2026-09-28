@@ -30,6 +30,31 @@ class TestExtractAccessToken:
         assert oauth.extract_access_token("") is None
 
 
+class TestExtractOauthData:
+    """Test extract_oauth_data."""
+
+    def test_valid_credentials(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-test-token"}})
+        assert oauth.extract_oauth_data(creds) == {"accessToken": "sk-test-token"}
+
+    def test_invalid_json(self):
+        assert oauth.extract_oauth_data("not-json") is None
+
+    def test_json_null_does_not_raise(self):
+        """minor: valid JSON decoding to a non-dict (`null`, a bare string,
+        a list) makes `data.get(...)` raise AttributeError — a backup
+        decoding to one of these must not raise out of a read path, same
+        as `extract_access_token` already guards.
+        """
+        assert oauth.extract_oauth_data("null") is None
+
+    def test_json_string_does_not_raise(self):
+        assert oauth.extract_oauth_data('"x"') is None
+
+    def test_json_list_does_not_raise(self):
+        assert oauth.extract_oauth_data("[1, 2]") is None
+
+
 class TestAccountHeadroom:
     """Test account_headroom."""
 
