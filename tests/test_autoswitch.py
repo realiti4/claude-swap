@@ -27,14 +27,17 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    WarmupAutoEvent,
     _recovery_is_useful,
     pct_label,
 )
+from claude_swap.exceptions import WarmupError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.warmup import WarmupEvent, WarmupSummary
 
 
 class FakeClock:
@@ -2053,6 +2056,176 @@ class TestEventsShape:
         assert poll.to_json()["windowsPct"]["2"] == {
             "5h": 3.0, "7d": 89.0, "Fable": 21.0,
         }
+
+
+class _FakeWarmupEngine:
+    instances: list["_FakeWarmupEngine"] = []
+    error: Exception | None = None
+    tick_duration = 0.0
+    on_tick = None
+
+    def __init__(self, switcher, *, emit, dry_run=False, clock=None, **_kwargs):
+        self.switcher = switcher
+        self.emit = emit
+        self.dry_run = dry_run
+        self.clock = clock
+        self.ticks = 0
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def tick(self) -> WarmupSummary:
+        self.ticks += 1
+        if self.tick_duration:
+            self.clock.advance(self.tick_duration)
+        if self.error is not None:
+            raise self.error
+        callback = type(self).on_tick
+        if callback is not None:
+            callback()
+        self.emit(
+            WarmupEvent(
+                "would-warm" if self.dry_run else "warmed",
+                "2",
+                "b@example.com",
+                "simulated warm-up",
+            )
+        )
+        return WarmupSummary(would_warm=1) if self.dry_run else WarmupSummary(warmed=1)
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class TestWarmupIntegration:
+    def setup_method(self):
+        _FakeWarmupEngine.instances = []
+        _FakeWarmupEngine.error = None
+        _FakeWarmupEngine.tick_duration = 0.0
+        _FakeWarmupEngine.on_tick = None
+
+    def test_disabled_by_default_does_not_construct_warmer(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine") as warmer:
+            EngineHarness(temp_home)
+
+        warmer.assert_not_called()
+
+    def test_enabled_runs_now_then_at_ten_minute_cadence(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+            warmer = _FakeWarmupEngine.instances[0]
+            assert warmer.ticks == 1
+            event = next(e for e in h.events if isinstance(e, WarmupAutoEvent))
+            assert event.action == "warmed"
+            assert event.to_json()["account"] == {
+                "number": "2",
+                "email": "b@example.com",
+            }
+
+            h.engine.tick()
+            h.clock.advance(599)
+            h.engine.tick()
+            assert warmer.ticks == 1
+            h.clock.advance(1)
+            h.engine.tick()
+            assert warmer.ticks == 2
+
+    def test_cadence_starts_when_a_slow_pass_finishes(self, temp_home):
+        _FakeWarmupEngine.tick_duration = 700
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+            h.engine.tick()
+            warmer = _FakeWarmupEngine.instances[0]
+
+            h.clock.advance(599)
+            h.engine.tick()
+            assert warmer.ticks == 1
+            h.clock.advance(1)
+            h.engine.tick()
+            assert warmer.ticks == 2
+
+    def test_warmup_error_is_reported_and_retried_on_cadence(self, temp_home):
+        _FakeWarmupEngine.error = WarmupError("state is unreadable")
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+            assert h.engine.tick() is TickOutcome.ERROR
+            warmer = _FakeWarmupEngine.instances[0]
+            assert warmer.ticks == 1
+            error = next(e for e in h.events if isinstance(e, ErrorEvent))
+            assert error.message == "five-hour warm-up: state is unreadable"
+
+            _FakeWarmupEngine.error = None
+            h.engine.tick()
+            assert warmer.ticks == 1
+            h.clock.advance(600)
+            h.engine.tick()
+            assert warmer.ticks == 2
+
+    def test_auto_sleep_is_capped_at_the_warmup_deadline(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(
+                temp_home,
+                warmup_five_hour=True,
+                interval_seconds=3600,
+            )
+            h.engine.tick()
+
+            assert h.engine._next_delay(TickOutcome.NO_ACTION) == 600.0
+
+    def test_stopped_engine_does_not_start_a_due_warmup_pass(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+            warmer = _FakeWarmupEngine.instances[0]
+            h.engine.stop()
+
+            h.engine.tick()
+
+            assert warmer.ticks == 0
+
+    def test_reenable_during_old_pass_keeps_new_warmer_due_now(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+
+            def reenable():
+                _FakeWarmupEngine.on_tick = None
+                h.engine.apply_warmup_enabled(False)
+                h.engine.apply_warmup_enabled(True)
+
+            _FakeWarmupEngine.on_tick = reenable
+            h.engine.tick()
+
+            replacement = _FakeWarmupEngine.instances[-1]
+            assert h.engine._next_warmup_at == h.clock()
+            h.engine.tick()
+            assert replacement.ticks == 1
+
+    def test_auto_dry_run_makes_integrated_warmer_dry_run(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home, warmup_five_hour=True)
+            engine = h._make_engine(dry_run=True)
+            engine.tick()
+
+        warmer = _FakeWarmupEngine.instances[-1]
+        assert warmer.dry_run is True
+        event = next(e for e in h.events if isinstance(e, WarmupAutoEvent))
+        assert event.action == "would-warm"
+
+    def test_runtime_toggle_starts_immediately_and_can_disable(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", _FakeWarmupEngine):
+            h = EngineHarness(temp_home)
+            h.engine.apply_warmup_enabled(True)
+            assert h.engine.settings.warmup_five_hour is True
+            assert h.engine._wake.is_set()
+            h.engine.tick()
+            warmer = _FakeWarmupEngine.instances[0]
+            assert warmer.ticks == 1
+
+            h.engine.apply_warmup_enabled(False)
+            h.clock.advance(600)
+            h.engine.tick()
+            assert h.engine.settings.warmup_five_hour is False
+            assert warmer.stopped is True
+            assert warmer.ticks == 1
 
 
 class TestRunLoop:
