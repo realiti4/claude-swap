@@ -1466,8 +1466,9 @@ class ClaudeAccountSwitcher:
           like ``swap account <occupant>``; the displaced account takes the
           vacated slot, so nothing is ever lost.
 
-        Slot numbers may be sparse (``remove`` leaves gaps, ``add`` grows from
-        the max), so any positive number up to 99 — or the current highest
+        Slot numbers are normally 1…n (``remove`` renumbers the rest; a
+        renumber blocked by a live session leaves a gap), so any positive
+        number up to 99 — or the current highest
         slot, if a table already grew past that — is a legal target. The cap
         exists because ``add`` numbers from the max: a stray huge target would
         inflate every future account number.
@@ -4021,6 +4022,8 @@ class ClaudeAccountSwitcher:
         # Update sequence.json
         del data["accounts"][account_num]
         data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+        if str(active_account) == account_num:
+            data["activeAccountNumber"] = None
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
@@ -4028,6 +4031,41 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        self._compact_slots()
+
+    def _compact_slots(self) -> list[tuple[str, str]]:
+        """Renumber the remaining accounts 1…n so slot numbers stay sequential
+        after a ``remove``. Each account relocates in ascending order into
+        the empty slot below it, carrying everything keyed by the number
+        (backups, session profile, alias, disabled flag, activeAccountNumber).
+        An account with a live session-mode Claude cannot move; the renumber
+        stops there so relative order holds, and says how to finish later.
+        Returns the ``(old, new)`` moves made.
+        """
+        moves: list[tuple[str, str]] = []
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            slots = sorted(data.get("accounts", {}), key=int)
+            for position, num in enumerate(slots, start=1):
+                target = str(position)
+                if num == target:
+                    continue
+                try:
+                    self._relocate_locked(num, target)
+                except SessionError as e:
+                    rest = slots[slots.index(num):]
+                    steps = " && ".join(
+                        f"cswap move {n} {i}" for i, n in enumerate(rest, start=position)
+                    )
+                    warning(
+                        f"Slots {', '.join(rest)} keep their numbers: {e} "
+                        f"Renumber later with: {steps}"
+                    )
+                    break
+                moves.append((num, target))
+        if moves:
+            print(f"{accent('Renumbered')} " + ", ".join(f"{a}→{b}" for a, b in moves))
+        return moves
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
