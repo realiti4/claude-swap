@@ -10,6 +10,7 @@ import re
 import shutil
 import threading
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -51,7 +52,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -560,24 +561,42 @@ class ClaudeAccountSwitcher:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
-
-        # Validate written content
+        # Write to a temp file first. Its name comes from mkstemp: a PID-based
+        # name is shared by every thread in one process (the menu bar writes
+        # from its worker and its main thread), so two writers could publish
+        # each other's half-written file.
+        fd, temp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temp_path = Path(temp_name)
+        # Any failure before the rename (a full disk on the write, the
+        # read-back, the chmod, the rename itself) removes the temp file;
+        # left behind, each failed write would leak one. After the rename the
+        # name is free for another writer's mkstemp, so it is left alone.
+        published = False
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
 
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            # Validate written content
+            try:
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                raise ConfigError("Generated invalid JSON")
+
+            # Permissions go on the temp file so the rename below is the final,
+            # atomic commit: nothing can fail after the file is published (a
+            # chmod on the final path could raise with the write already live,
+            # making callers roll back around committed metadata).
+            if sys.platform != "win32":
+                os.chmod(temp_path, 0o600)
+            # Same directory, so a rename: atomic, never a copy. Retried past
+            # the brief sharing locks Windows scanners take on a new file.
+            replace_with_retry(temp_path, path)
+            published = True
+        finally:
+            if not published:
+                temp_path.unlink(missing_ok=True)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -971,12 +990,23 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
-    def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
+    def set_alias(
+        self,
+        identifier: str,
+        alias: str,
+        *,
+        expected_email: str | None = None,
+        expected_org: str | None = None,
+    ) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
 
         ``identifier`` is a slot number, email, or existing alias (so a
         typo'd alias can be corrected with ``cswap alias <old> <new>`` as
         well as by number/email). Returns ``(account_num, normalized_alias)``.
+
+        ``expected_email`` and ``expected_org`` pin the account a caller
+        showed the user (the menu bar's rename prompt): see
+        ``_account_holding_identity``.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
@@ -989,27 +1019,42 @@ class ClaudeAccountSwitcher:
         except ValueError as e:
             raise ValidationError(str(e)) from e
 
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        # A read-modify-write of sequence.json, like a switch: hold the same
+        # account lock across resolve, re-read and write, or a switch landing
+        # in between (the auto-switch engine, the rotate daemon) is written
+        # back over, or overwrites the rename.
+        with FileLock(self.lock_file):
+            self._get_sequence_data_migrated()
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            if expected_email is not None:
+                account_num = self._account_holding_identity(
+                    data, account_num, expected_email, expected_org
+                )
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        conflict = self._alias_in_use(normalized, exclude_num=account_num)
-        if conflict is not None:
-            raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
+            conflict = self._alias_in_use(normalized, exclude_num=account_num)
+            if conflict is not None:
+                raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
-        record["alias"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        return account_num, normalized
+            record["alias"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            return account_num, normalized
 
-    def unset_alias(self, identifier: str) -> str:
+    def unset_alias(
+        self,
+        identifier: str,
+        *,
+        expected_email: str | None = None,
+        expected_org: str | None = None,
+    ) -> str:
         """Clear the alias for the account matching identifier.
 
         Returns the account number. Idempotent: clearing an already-unset
@@ -1020,22 +1065,56 @@ class ClaudeAccountSwitcher:
             AccountNotFoundError: identifier doesn't match any account.
         """
         self._refuse_session_shell()
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        with FileLock(self.lock_file):  # same read-modify-write as set_alias
+            self._get_sequence_data_migrated()
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            if expected_email is not None:
+                account_num = self._account_holding_identity(
+                    data, account_num, expected_email, expected_org
+                )
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "alias" in record:
-            del record["alias"]
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
-        return account_num
+            if "alias" in record:
+                del record["alias"]
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+            return account_num
+
+    @staticmethod
+    def _account_holding_identity(
+        data: dict, account_num: str | None, email: str, org: str | None
+    ) -> str:
+        """The slot holding the account the caller showed: ``(email, org)``.
+
+        An account is its email and organization together; the same email in
+        another organization is a different account. The slot resolved from
+        the identifier if it still holds that pair; otherwise the one slot
+        that does now (a swap moved it). Called under the account lock.
+        Raises AccountNotFoundError when no slot, or more than one, holds it,
+        so nothing is changed on a guess. ``org=None`` matches on email only
+        (callers that never saw an organization).
+        """
+        def same(acc: dict) -> bool:
+            if acc.get("email") != email:
+                return False
+            return org is None or (acc.get("organizationUuid", "") or "") == (org or "")
+
+        accounts = data.get("accounts", {})
+        if account_num and same(accounts.get(account_num, {})):
+            return account_num
+        holders = [num for num, acc in accounts.items() if same(acc)]
+        if len(holders) == 1:
+            return holders[0]
+        raise AccountNotFoundError(
+            f"Account {email} is no longer in slot {account_num}; nothing was changed"
+        )
 
     def list_aliases(self) -> list[tuple[str, str, str]]:
         """Every set alias as ``(account_num, alias, email)``, slot-number order."""
