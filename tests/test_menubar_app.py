@@ -52,7 +52,7 @@ class _FakeSwitcher:
         time.sleep(self.rename_delay)
         if self.rename_error is not None:
             raise self.rename_error
-        return self.rename_lands_in or num, name.strip().lower()
+        return self.rename_lands_in or num, name.strip()  # the store keeps the typed case
 
     def unset_alias(self, num, expected_email=None, expected_org=None):
         self.renames = getattr(self, "renames", []) + [("unset", num, expected_email, expected_org)]
@@ -445,7 +445,7 @@ def test_rename_prompt_is_prefilled_and_ok_stores_the_alias(app, window):
     assert window.made[0]["default_text"] == "work"
     _settle(app)  # the change shows on the next tick
     assert app.switcher.renames == [("set", "1", "Home", "a@x.com", None)]
-    assert _account_items(app)[0].title().startswith("1  home  (a@x.com)")
+    assert _account_items(app)[0].title().startswith("1  Home  (a@x.com)")  # as typed
 
 
 def test_rename_prompt_for_an_account_without_alias_starts_empty(app, window):
@@ -947,9 +947,9 @@ def test_rename_submenu_is_usable_again_after_a_failed_rename(app, window, monke
     monkeypatch.setattr(rumps, "alert", lambda **kw: 1)
     app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
     app.rebuild_menu()
-    app.switcher.rename_error = ValidationError("alias 'x y' may only contain letters")
+    app.switcher.rename_error = ValidationError("alias 'x@y' may only contain letters")
     app.switcher.rename_delay = 0.3
-    window.answer = (1, "x y")
+    window.answer = (1, "x@y")
     _choose_rename(app, 0)
     app.on_sync_tick(None)  # rebuilt while saving
     assert all(i.title().endswith("(saving…)") for i in _submenu(app, "Rename account").itemArray())
@@ -1023,3 +1023,96 @@ def test_a_probe_that_fails_once_fails_only_that_rename(app, monkeypatch):
     assert [a["message"] for a in alerts] == ["Could not rename: [Errno 5] Input/output error"]
     assert [r[:3] for r in app.switcher.renames] == [("set", "1", "work")]
     assert not app._renames_in_flight
+
+
+def test_the_prompt_keeps_a_capitalised_name(real_app):
+    # Owner report: "I cannot capitalise the first letter of the name".
+    app, switcher = real_app
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app._rename_account("1", "a@x.com", "Personal")
+    _settle(app)
+    assert _alias_on_disk(switcher) == "Personal"
+    assert _account_items(app)[0].title().startswith("1  Personal  (a@x.com)")
+
+
+def test_a_name_with_a_space_is_refused_with_the_reason(app, window, monkeypatch):
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    window.answer = (1, "My Work")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert [a["message"] for a in alerts] == [
+        "Names cannot contain spaces (they are used on the command line); use - or _"
+    ]
+    assert getattr(app.switcher, "renames", []) == []
+
+
+
+def test_the_prompt_drops_invisible_characters(app, window):
+    # Owner report: "Personal" was refused; the text carried a zero width space.
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    window.answer = (1, "Personal\u200b")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert app.switcher.renames == [("set", "1", "Personal", "a@x.com", None)]
+
+
+def test_the_prompt_turns_off_text_substitutions():
+    # Replacement, correction, completion and inline prediction can all put
+    # text into the field that the user did not type.
+    AppKit.NSApplication.sharedApplication()
+    prompt = rumps.Window(title="t", message="m", default_text="", ok="OK", dimensions=(320, 24))
+    menubar.plain_text_entry(prompt)
+    field, win = prompt._textfield, prompt._alert.window()
+    win.makeFirstResponder_(field)
+    editor = win.fieldEditor_forObject_(False, field)
+    assert not editor.isAutomaticTextReplacementEnabled()
+    assert not editor.isAutomaticSpellingCorrectionEnabled()
+    assert not editor.isAutomaticTextCompletionEnabled()
+    assert not editor.isAutomaticQuoteSubstitutionEnabled()
+    assert not editor.isAutomaticDashSubstitutionEnabled()
+    if editor.respondsToSelector_("inlinePredictionType"):  # macOS 14 and later
+        assert editor.inlinePredictionType() == AppKit.NSTextInputTraitTypeNo
+
+
+
+def test_the_rename_prompt_is_a_plain_text_entry(app, monkeypatch):
+    AppKit.NSApplication.sharedApplication()
+    shown = []
+
+    def run(self):
+        shown.append(self)
+        return rumps.rumps.Response(0, "")  # cancelled
+
+    monkeypatch.setattr(rumps.rumps.Window, "run", run)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    _choose_rename(app, 0)
+    (prompt,) = shown
+    field, win = prompt._textfield, prompt._alert.window()
+    win.makeFirstResponder_(field)
+    editor = win.fieldEditor_forObject_(False, field)
+    assert not editor.isAutomaticTextReplacementEnabled()
+    if editor.respondsToSelector_("inlinePredictionType"):  # macOS 14 and later
+        assert editor.inlinePredictionType() == AppKit.NSTextInputTraitTypeNo
+
+
+@pytest.mark.parametrize("missing", ["editor", "window"])
+def test_a_prompt_without_a_field_editor_still_opens(missing):
+    # A nil editor (or window) leaves the field as it is: the prompt must open.
+    class Window:
+        def fieldEditor_forObject_(self, create, field):
+            return None
+
+    class Alert:
+        def window(self):
+            return None if missing == "window" else Window()
+
+    class Prompt:
+        _textfield = object()
+        _alert = Alert()
+
+    menubar.plain_text_entry(Prompt())  # returns without raising

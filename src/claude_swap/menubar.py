@@ -40,6 +40,7 @@ from claude_swap.exceptions import (
     LockError,
 )
 from claude_swap.locking import FileLock
+from claude_swap.models import clean_alias_text
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -983,6 +984,43 @@ def run(switcher) -> int:
     return 0
 
 
+def plain_text_entry(prompt) -> None:
+    """Keep a rumps prompt's field to what the user types.
+
+    Its field editor comes with text replacement, spelling correction and
+    completion on, and inline prediction at the system default; any of them
+    can put characters into a name that the user did not type (an owner's
+    "Personal" arrived with an invisible character). All are turned off
+    before the prompt runs. Anything else (a stand-in in tests, a rumps
+    without these internals, a nil field editor) is left as it is.
+    """
+    import AppKit
+
+    try:
+        field = prompt._textfield
+        window = prompt._alert.window()
+    except AttributeError:
+        return
+    editor = window.fieldEditor_forObject_(True, field) if window is not None else None
+    if field is None or editor is None:
+        return  # nothing to adjust; the prompt still opens
+    for setter in (
+        "setAutomaticTextReplacementEnabled_",
+        "setAutomaticSpellingCorrectionEnabled_",
+        "setAutomaticTextCompletionEnabled_",
+        "setAutomaticQuoteSubstitutionEnabled_",
+        "setAutomaticDashSubstitutionEnabled_",
+        "setAutomaticDataDetectionEnabled_",
+        "setAutomaticLinkDetectionEnabled_",
+        "setContinuousSpellCheckingEnabled_",
+    ):
+        getattr(editor, setter)(False)
+    if editor.respondsToSelector_("setInlinePredictionType:"):
+        editor.setInlinePredictionType_(getattr(AppKit, "NSTextInputTraitTypeNo", 1))
+    if field.respondsToSelector_("setAutomaticTextCompletionEnabled:"):
+        field.setAutomaticTextCompletionEnabled_(False)
+
+
 def create_app(switcher):
     """Build the menu bar app for ``switcher`` without starting its event loop.
 
@@ -1653,12 +1691,14 @@ def create_app(switcher):
                 # prompt can render blank (as with "From setup-token…").
                 import AppKit
                 AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-                response = rumps.Window(
+                prompt = rumps.Window(
                     title="Rename account",
                     message=f"Name for account {num} ({email}). Leave empty to remove the name.",
                     default_text=alias or "",
                     ok="Rename", cancel="Cancel", dimensions=(320, 24),
-                ).run()
+                )
+                plain_text_entry(prompt)
+                response = prompt.run()
                 if response.clicked != 1:
                     return
                 self._rename_account(num, email, response.text, org)
@@ -1675,7 +1715,7 @@ def create_app(switcher):
             account, not whatever now sits in slot ``num``. Outcomes are
             handled on the sync tick (``_drain_rename_outcomes``).
             """
-            job = (num, email, text.strip(), org)
+            job = (num, email, clean_alias_text(text), org)
             with self._event_lock:
                 self._rename_queue.append(job)
                 self._renames_in_flight += 1
@@ -1729,6 +1769,12 @@ def create_app(switcher):
             return "abandoned"
 
         def _run_rename(self, num, email, name, org):
+            if any(ch.isspace() for ch in name):
+                # The store would refuse it too, in CLI terms; say why here.
+                return (
+                    "rejected",
+                    "Names cannot contain spaces (they are used on the command line); use - or _",
+                )
             state = self._wait_for_the_account_lock()
             if state != "free":
                 return (state,)

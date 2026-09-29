@@ -1454,6 +1454,20 @@ class TestAliasCommand:
         out = capsys.readouterr().out
         assert "dev" in out
 
+    def test_a_mixed_case_alias_round_trips_through_set_list_and_switch(self, temp_home, capsys):
+        # Shown as typed, matched in any case (`cswap switch work` finds "Work").
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["2", "Work"])
+            capsys.readouterr()
+            cli._alias_command([])
+        assert "Work" in capsys.readouterr().out
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._get_sequence_data()["accounts"]["2"]["alias"] == "Work"
+        with patch.object(ClaudeAccountSwitcher, "_perform_switch") as switch:
+            switcher.switch_to("work")
+        assert switch.call_args.args[0] == "2"
+
     def test_missing_name_errors(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)
         with patch("os.geteuid", return_value=1000, create=True):

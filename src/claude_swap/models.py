@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,29 +23,69 @@ if TYPE_CHECKING:
 #: alias can never collide with a slot number in _resolve_account_identifier),
 #: and not leading with '-' (argparse would treat it as an option, making the
 #: alias impossible to pass back into any command once set).
-_ALIAS_RE = re.compile(r"^[a-z0-9_.-]+$")
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def clean_alias_text(text: str) -> str:
+    """``text`` without what cannot be seen, trimmed.
+
+    Text fields and pastes can carry characters that do not show: a zero
+    width space, a soft hyphen, a byte order mark, a no-break space. Left
+    in, an alias that reads "Personal" is refused as invalid with no way to
+    see why. Compatibility forms are folded (NFKC: a fullwidth letter
+    becomes the plain one), then every format, control and separator
+    character is dropped except the plain space, which stays so a name with
+    a real space is refused as such.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(
+        ch for ch in text
+        if ch == " " or unicodedata.category(ch) not in ("Cf", "Cc", "Zs", "Zl", "Zp")
+    ).strip()
+
+
+def _unsupported(chars: list[str]) -> str:
+    """Name characters by code point: a message must not quote text that looks valid."""
+    named = []
+    for ch in dict.fromkeys(chars):
+        try:
+            name = unicodedata.name(ch).lower()
+        except ValueError:
+            name = "unnamed"
+        named.append(f"U+{ord(ch):04X} ({name})")
+    noun = "an unsupported character" if len(named) == 1 else "unsupported characters"
+    return f"contains {noun} {', '.join(named)}"
 
 
 def normalize_alias(name: str) -> str:
-    """Lowercase and validate a proposed alias; raise ValueError if invalid.
+    """Validate a proposed alias and return it cleaned, in the case typed.
 
-    Shared by the CLI (``cswap alias``), ``cswap add --alias``, and import
-    validation so every path enforces identical rules.
+    ``clean_alias_text`` drops invisible characters first. An alias is shown
+    as typed but matched without regard to case (``alias_key``), so "Work"
+    set on one account makes "work" a duplicate and ``cswap switch work``
+    finds it. The checks run on that folded form. Shared by the CLI
+    (``cswap alias``), ``cswap add --alias``, and import validation so every
+    path enforces identical rules; raises ValueError if invalid.
     """
-    normalized = name.strip().lower()
-    if not normalized:
+    typed = clean_alias_text(name)
+    folded = alias_key(typed)
+    if not folded:
         raise ValueError("alias cannot be empty")
-    if normalized.isdigit():
-        raise ValueError(f"alias '{name}' cannot be purely numeric (reserved for slot numbers)")
-    if normalized.startswith("-"):
+    if folded.isdigit():
+        raise ValueError(f"alias '{typed}' cannot be purely numeric (reserved for slot numbers)")
+    if folded.startswith("-"):
         raise ValueError(
-            f"alias '{name}' cannot start with '-' (would be read as a command flag)"
+            f"alias '{typed}' cannot start with '-' (would be read as a command flag)"
         )
-    if not _ALIAS_RE.match(normalized):
-        raise ValueError(
-            f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
-        )
-    return normalized
+    bad = [ch for ch in typed if not _ALIAS_RE.match(ch)]
+    if bad:
+        raise ValueError(f"alias '{typed}' {_unsupported(bad)}")
+    return typed
+
+
+def alias_key(alias: str) -> str:
+    """The form aliases are compared in: case does not tell two apart."""
+    return alias.casefold()
 
 
 class Platform(Enum):

@@ -314,9 +314,35 @@ class TestAliasValidation:
             normalize_alias(alias)  # must not raise
 
     def test_invalid_aliases(self, temp_home: Path):
-        for alias in ["123", "dev@work", "dev work", "", "dev/work", "-dev"]:
+        for alias in ["123", "dev@work", "dev work", "", "dev/work", "-dev", "-Dev", "Dév"]:
             with pytest.raises(ValueError):
                 normalize_alias(alias)
+
+    def test_invisible_characters_are_dropped(self, temp_home: Path):
+        # Text fields and pastes can carry characters that do not show.
+        assert normalize_alias("Personal\u200b") == "Personal"  # zero width space
+        assert normalize_alias("Per\u00adsonal") == "Personal"  # soft hyphen
+        assert normalize_alias("\ufeffPersonal\u200d") == "Personal"  # BOM, zero width joiner
+        assert normalize_alias("\u00a0Personal\u2003") == "Personal"  # no-break and em spaces
+        assert normalize_alias("\uff30ersonal") == "Personal"  # fullwidth P, NFKC
+        assert normalize_alias("Per\u1680sonal") == "Personal"  # a space NFKC leaves as is
+        assert normalize_alias("\tPer\nsonal\r") == "Personal"  # control characters
+
+    def test_a_bad_character_is_named_by_code_point(self, temp_home: Path):
+        with pytest.raises(ValueError) as raised:
+            normalize_alias("Per/sonal")
+        assert str(raised.value) == (
+            "alias 'Per/sonal' contains an unsupported character U+002F (solidus)"
+        )
+        with pytest.raises(ValueError, match=r"U\+2800 \(braille pattern blank\)"):
+            normalize_alias("Per\u2800sonal")  # blank-looking, but not a format character
+        with pytest.raises(ValueError, match=r"unsupported characters U\+0040 \(commercial at\), U\+0020 \(space\)"):
+            normalize_alias("a@b c")
+
+    def test_the_typed_case_is_kept(self, temp_home: Path):
+        assert normalize_alias("Personal") == "Personal"
+        assert normalize_alias("  Team.B-2 ") == "Team.B-2"
+        assert normalize_alias("dev") == "dev"  # stored lowercase aliases read as before
 
 
 class TestResolveByAlias:
@@ -404,17 +430,40 @@ class TestAliasCommand:
         data = switcher._get_sequence_data()
         assert data["accounts"]["2"]["alias"] == "dev"
 
-    def test_set_alias_normalizes_to_lowercase(
+    def test_set_alias_keeps_the_typed_case(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        # Shown as typed; matched without regard to case (below).
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        _, normalized = switcher.set_alias("2", " Work ")
+
+        assert normalized == "Work"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["alias"] == "Work"
+        assert switcher._resolve_account_identifier("work") == "2"
+        assert switcher._resolve_account_identifier("WORK") == "2"
+
+    def test_the_same_alias_in_another_case_is_a_duplicate(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import ConfigError
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("1", "Work")
+        with pytest.raises(ConfigError, match="already used by account 1"):
+            switcher.set_alias("2", "work")
+        assert "alias" not in switcher._get_sequence_data()["accounts"]["2"]
+
+    def test_an_account_can_change_the_case_of_its_own_alias(
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
-
-        _, normalized = switcher.set_alias("2", "DEV")
-
-        assert normalized == "dev"
-        data = switcher._get_sequence_data()
-        assert data["accounts"]["2"]["alias"] == "dev"
+        switcher.set_alias("1", "work")
+        assert switcher.set_alias("1", "Work") == ("1", "Work")
 
     def test_set_alias_by_email(self, temp_home: Path, sample_sequence_data: dict):
         switcher = ClaudeAccountSwitcher()

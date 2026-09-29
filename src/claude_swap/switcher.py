@@ -61,6 +61,7 @@ from claude_swap.models import (
     Platform,
     SwitchTransaction,
     get_timestamp,
+    alias_key,
     normalize_alias,
 )
 from claude_swap.printer import (
@@ -3432,9 +3433,9 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if not data:
             return None
-        alias_key = alias.lower()
+        wanted = alias_key(alias)
         for num, account in data.get("accounts", {}).items():
-            if (account.get("alias") or "").lower() == alias_key:
+            if alias_key(account.get("alias") or "") == wanted:
                 return num
         return None
 
