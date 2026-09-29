@@ -133,6 +133,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --share-plugins
   cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
@@ -166,6 +167,20 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--share-plugins",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Share the plugin store (plugins/) from ~/.claude into the "
+            "session profile, so a plugin installed or updated in any "
+            "account is available in all of them. Plugins the profile "
+            "already accumulated are merged into ~/.claude first (existing "
+            "source entries win). --no-share-plugins reverts to a "
+            "per-account store, re-installing on demand — already-merged "
+            "plugins stay in ~/.claude. Not supported on Windows."
+        ),
+    )
+    parser.add_argument(
         "--require-session",
         action="store_true",
         help=(
@@ -195,6 +210,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_plugins=args.share_plugins,
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -207,6 +223,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_plugins=args.share_plugins,
                 require_session=args.require_session,
             )
             return  # only reachable in tests
