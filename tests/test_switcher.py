@@ -507,6 +507,303 @@ class TestAliasCommand:
         assert switcher.list_aliases() == []
 
 
+class TestAliasWritesUnderTheSwitchLock:
+    """An alias change is a read-modify-write of sequence.json, like a switch.
+
+    Both must hold the account lock for the whole of it, or a rename racing
+    the auto-switch engine or the rotate daemon writes back a stale roster:
+    an undone switch, or a lost rename.
+    """
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @staticmethod
+    def _switch_to_2(switcher):
+        """What a concurrent switch does to the roster, under the same lock."""
+        from claude_swap.locking import FileLock
+
+        with FileLock(switcher.lock_file):
+            data = json.loads(switcher.sequence_file.read_text())
+            data["activeAccountNumber"] = 2
+            switcher._write_json(switcher.sequence_file, data)
+
+    @staticmethod
+    def _change(switcher, kind):
+        if kind == "set":
+            switcher.set_alias("1", "home")
+        else:
+            switcher.unset_alias("1")
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_switch_racing_a_rename_is_not_undone(
+        self, temp_home: Path, sample_sequence_data: dict, kind
+    ):
+        import threading
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "old"
+        switcher = self._setup(sample_sequence_data)
+        racer = threading.Thread(target=self._switch_to_2, args=(switcher,))
+        real_write = switcher._write_json
+
+        def write_with_a_racer(path, data):
+            # Between the rename's read and its write, a switch tries to land.
+            if path == switcher.sequence_file and not racer.is_alive() and racer.ident is None:
+                racer.start()
+                racer.join(timeout=0.5)  # with the lock held it must still be waiting
+            real_write(path, data)
+
+        switcher._write_json = write_with_a_racer
+        self._change(switcher, kind)
+        switcher._write_json = real_write
+        racer.join(timeout=10)
+        assert not racer.is_alive()
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["activeAccountNumber"] == 2  # the switch survived
+        expected = "home" if kind == "set" else None
+        assert data["accounts"]["1"].get("alias") == expected  # and so did the rename
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_rename_rereads_after_a_switch_that_landed_first(
+        self, temp_home: Path, sample_sequence_data: dict, kind, monkeypatch
+    ):
+        from claude_swap import locking
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "old"
+        switcher = self._setup(sample_sequence_data)
+        real_acquire = locking.FileLock.acquire
+        landed = []
+
+        def acquire(self_lock, *a, **k):
+            # The switch completes after the rename started, just before it
+            # gets the lock: the rename must build on what is on disk now.
+            if not landed:
+                landed.append(1)
+                data = json.loads(switcher.sequence_file.read_text())
+                data["activeAccountNumber"] = 2
+                real_write(switcher.sequence_file, data)
+            return real_acquire(self_lock, *a, **k)
+
+        real_write = switcher._write_json
+        monkeypatch.setattr(locking.FileLock, "acquire", acquire)
+        self._change(switcher, kind)
+        assert landed == [1]  # the rename took the lock
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["activeAccountNumber"] == 2
+        expected = "home" if kind == "set" else None
+        assert data["accounts"]["1"].get("alias") == expected
+
+    def test_rename_changes_only_the_alias(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        switcher._get_sequence_data_migrated()  # the roster migration's own, legitimate fields
+        before = json.loads(switcher.sequence_file.read_text())
+        switcher.set_alias("2", "dev")
+        after = json.loads(switcher.sequence_file.read_text())
+        before["accounts"]["2"]["alias"] = "dev"
+        after.pop("lastUpdated"), before.pop("lastUpdated")
+        assert after == before
+
+
+class TestAliasExpectedEmail:
+    """The menu bar names the account by slot and the email it showed.
+
+    A swap between opening the prompt and submitting it moves that email to
+    another slot; the change must follow the account, not the slot, and be
+    refused when the account is gone.
+    """
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _aliases(self, switcher):
+        data = json.loads(switcher.sequence_file.read_text())
+        return {n: a.get("alias") for n, a in data["accounts"].items()}
+
+    def test_set_follows_the_account_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        # The prompt was for slot 1 (account2@...), but a swap moved it to slot 2.
+        num, normalized = switcher.set_alias("1", "home", expected_email="account2@example.com")
+        assert (num, normalized) == ("2", "home")
+        assert self._aliases(switcher) == {"1": None, "2": "home"}
+
+    def test_unset_follows_the_account_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        sample_sequence_data["accounts"]["2"]["alias"] = "old"
+        sample_sequence_data["accounts"]["1"]["alias"] = "keep"
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.unset_alias("1", expected_email="account2@example.com") == "2"
+        assert self._aliases(switcher) == {"1": "keep", "2": None}
+
+    def test_slot_still_holding_the_email_is_used(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.set_alias("1", "home", expected_email="account1@example.com")[0] == "1"
+
+    def test_shared_email_uses_the_slot_that_still_holds_it(self, temp_home: Path, sample_sequence_data: dict):
+        # One person in two organizations: the email alone is ambiguous.
+        sample_sequence_data["accounts"]["3"] = dict(
+            sample_sequence_data["accounts"]["1"], uuid="uuid-3", organizationUuid="org-b"
+        )
+        sample_sequence_data["sequence"].append(3)
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.set_alias("3", "work", expected_email="account1@example.com")[0] == "3"
+        assert self._aliases(switcher)["3"] == "work"
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_account_gone_is_refused_and_nothing_changes(
+        self, temp_home: Path, sample_sequence_data: dict, kind
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "keep"
+        switcher = self._setup(sample_sequence_data)
+        switcher._get_sequence_data_migrated()  # the migration's own first-run write
+        before = switcher.sequence_file.read_text()
+        with pytest.raises(AccountNotFoundError):
+            if kind == "set":
+                switcher.set_alias("1", "home", expected_email="gone@example.com")
+            else:
+                switcher.unset_alias("1", expected_email="gone@example.com")
+        assert switcher.sequence_file.read_text() == before
+
+    def test_shared_email_moved_away_from_the_slot_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        for extra in ("3", "4"):
+            sample_sequence_data["accounts"][extra] = dict(
+                sample_sequence_data["accounts"]["2"], uuid=f"uuid-{extra}", email="shared@example.com"
+            )
+        switcher = self._setup(sample_sequence_data)
+        # Slot 1 no longer holds it and two slots do: which one is unknowable.
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias("1", "home", expected_email="shared@example.com")
+
+
+class TestAliasExpectedIdentity:
+    """The pin is the (email, organization) pair the prompt showed."""
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _org(self, data, num, org):
+        data["accounts"][num]["organizationUuid"] = org
+        data["accounts"][num]["organizationName"] = org
+
+    def test_same_email_readded_under_another_org_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        self._org(sample_sequence_data, "1", "org-b")  # slot 1 now holds the org-B login
+        self._org(sample_sequence_data, "2", "org-x")
+        switcher = self._setup(sample_sequence_data)
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias(
+                "1", "home", expected_email="account1@example.com", expected_org="org-a"
+            )
+
+    def test_original_replaced_and_a_surviving_same_email_other_org_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        # The prompt showed slot 1 = account1@ in org-a. It was removed; slot 3
+        # holds account1@ in org-b. Following by email alone would pick slot 3.
+        self._org(sample_sequence_data, "2", "org-x")
+        sample_sequence_data["accounts"]["3"] = dict(
+            sample_sequence_data["accounts"]["1"], uuid="uuid-3",
+            organizationUuid="org-b", organizationName="org-b",
+        )
+        del sample_sequence_data["accounts"]["1"]
+        sample_sequence_data["sequence"] = [2, 3]
+        switcher = self._setup(sample_sequence_data)
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias("1", "home", expected_email="account1@example.com", expected_org="org-a")
+
+    def test_follows_the_same_pair_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        self._org(sample_sequence_data, "1", "org-x")
+        self._org(sample_sequence_data, "2", "org-a")
+        switcher = self._setup(sample_sequence_data)
+        num, _ = switcher.set_alias("1", "home", expected_email="account2@example.com", expected_org="org-a")
+        assert num == "2"
+
+
+class TestWriteJsonTempFiles:
+    def test_each_write_uses_its_own_temp_file(self, temp_home: Path, monkeypatch):
+        # Two writers in one process must not share a temp path (a PID-named
+        # temp is the same for every thread of the menu bar).
+        from claude_swap import switcher as sw
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        sources = []
+        real_replace = sw.replace_with_retry  # Windows-aware: retries a scanner's brief lock
+        monkeypatch.setattr(sw, "replace_with_retry", lambda src, dst: sources.append(src) or real_replace(src, dst))
+        s._write_json(s.sequence_file, {"a": 1})
+        s._write_json(s.sequence_file, {"a": 2})
+        assert len(sources) == 2 and sources[0] != sources[1]
+        assert all(Path(p).parent == s.sequence_file.parent for p in sources)
+        assert not any(str(os.getpid()) + ".tmp" in str(p) for p in sources)
+        assert json.loads(s.sequence_file.read_text()) == {"a": 2}
+        assert sorted(p.name for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")) == []
+
+    def test_invalid_json_leaves_no_temp_file(self, temp_home: Path, monkeypatch):
+        from claude_swap import switcher as sw
+        from claude_swap.exceptions import ConfigError
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        monkeypatch.setattr(sw.json, "loads", lambda *_a, **_k: (_ for _ in ()).throw(json.JSONDecodeError("x", "", 0)))
+        with pytest.raises(ConfigError):
+            s._write_json(s.sequence_file, {"a": 1})
+        assert [p for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    @pytest.mark.parametrize("step", ["write", "chmod", "replace"])
+    def test_a_failed_step_leaves_no_temp_file(self, temp_home: Path, monkeypatch, step):
+        import errno
+        from claude_swap import switcher as sw
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, {"a": 1})
+        full = OSError(errno.ENOSPC, "No space left on device")
+
+        def boom(*_a, **_k):
+            raise full
+
+        if step == "write":
+            real_fdopen = sw.os.fdopen
+
+            def fdopen(fd, *a, **k):
+                fh = real_fdopen(fd, *a, **k)
+                fh.write = boom
+                return fh
+
+            monkeypatch.setattr(sw.os, "fdopen", fdopen)
+        elif step == "chmod":
+            if sys.platform == "win32":
+                pytest.skip("no chmod step on Windows")
+            monkeypatch.setattr(sw.os, "chmod", boom)
+        else:
+            from claude_swap import fsutil
+
+            monkeypatch.setattr(fsutil.os, "replace", boom)  # under replace_with_retry
+        with pytest.raises(OSError) as raised:
+            s._write_json(s.sequence_file, {"a": 2})
+        assert raised.value is full
+        assert [p.name for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")] == []
+        assert json.loads(s.sequence_file.read_text()) == {"a": 1}
+
+
 class TestDirectorySetup:
     """Test directory setup."""
 
