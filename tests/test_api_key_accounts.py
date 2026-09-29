@@ -1091,7 +1091,7 @@ class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
 
         monkeypatch.setattr(store, "_use_keychain", lambda: True)
         monkeypatch.setattr(
-            store, "_read_active_oauth_keychain", lambda: (None, True)
+            store, "_read_active_oauth_keychain", lambda: (None, True, None)
         )
         monkeypatch.setattr(store, "_read_managed_key", lambda: "")
 

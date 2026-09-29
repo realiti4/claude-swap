@@ -429,6 +429,47 @@ def read_config_dir_credentials(
         return None
 
 
+def _read_session_identity_state(
+    session_dir: Path,
+) -> tuple[tuple[str, str] | None, bool]:
+    """Tri-state read behind ``read_session_identity``: ``(identity, corrupt)``.
+
+    ``corrupt`` distinguishes two shapes ``read_session_identity`` collapses
+    to the same ``None``: no ``.claude.json`` was ever written (absent — a
+    dead-session profile that never logged in again, #96) versus one that
+    exists and cannot be trusted (unparseable, or missing the field a real
+    login always writes). Claude rewrites ``.claude.json`` on every login, so
+    there is a real window where the file is present and unreadable; a caller
+    that must fail closed on "unknown" needs to tell that apart from "there
+    never was one".
+    """
+    try:
+        text = (session_dir / ".claude.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, False  # no file at all — absent
+    except (OSError, ValueError):
+        # ValueError here is UnicodeDecodeError: undecodable bytes, raised by
+        # read_text itself. OSError covers permissions/races on a file that
+        # does exist.
+        return None, True  # present but unreadable/corrupt
+    try:
+        config = json.loads(text)
+    except ValueError:
+        # JSONDecodeError: present but unparseable.
+        return None, True
+    if not isinstance(config, dict):
+        return None, True
+    oauth_account = config.get("oauthAccount")
+    if not oauth_account:
+        return None, False  # no oauthAccount at all — absent
+    if not isinstance(oauth_account, dict):
+        return None, True
+    email = oauth_account.get("emailAddress") or ""
+    if not email:
+        return None, True  # oauthAccount present but unusable — corrupt
+    return (email, oauth_account.get("organizationUuid") or ""), False
+
+
 def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     """Best-effort read of the account identity a session profile is logged in as.
 
@@ -437,25 +478,27 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     profile's *current* identity — which an in-session ``/login`` can re-point
     at a different account than the slot the profile was created for. Returns
     ``(email, organization_uuid)`` with ``""`` for a missing org, or ``None``
-    when no identity is readable (missing dir/file/field).
+    when no identity is readable (missing dir/file/field) — callers that only
+    need "is there an identity" get the same answer as before
+    ``_read_session_identity_state`` existed; use that when absent-versus-
+    corrupt matters.
     """
-    try:
-        text = (session_dir / ".claude.json").read_text(encoding="utf-8")
-        config = json.loads(text)
-    except (OSError, ValueError):
-        # ValueError covers JSONDecodeError and UnicodeDecodeError alike: a
-        # byte-corrupt file is an unreadable identity, and the usage-fetch
-        # path this feeds must never raise.
-        return None
-    if not isinstance(config, dict):
-        return None
-    oauth_account = config.get("oauthAccount") or {}
-    if not isinstance(oauth_account, dict):
-        return None
-    email = oauth_account.get("emailAddress") or ""
-    if not email:
-        return None
-    return email, oauth_account.get("organizationUuid") or ""
+    identity, _corrupt = _read_session_identity_state(session_dir)
+    return identity
+
+
+def session_identity_unreadable(session_dir: Path) -> bool:
+    """Whether ``.claude.json`` exists but cannot be trusted as an identity.
+
+    True only for CORRUPT (present and unparseable, or missing the email a
+    real login always writes) — never for ABSENT (no file, or no
+    ``oauthAccount`` at all), which is the dead-session-profile shape #96
+    depends on. A write site that must refuse on "unknown" checks this
+    instead of inferring it from ``session_identity_drifted``'s boolean,
+    which cannot be told apart from a confirmed foreign identity.
+    """
+    _identity, corrupt = _read_session_identity_state(session_dir)
+    return corrupt
 
 
 def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bool:
@@ -465,11 +508,16 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     mid-session) re-points the profile's credential at another account while
     the profile directory keeps claiming the original slot. Comparison mirrors
     ``_is_session_valid``: the email must match, the org only when both sides
-    have a value. An unreadable identity is NOT drift — missing metadata
-    degrades to trusting the profile (its token family is normally the slot's
-    freshest) rather than abandoning it over a broken ``.claude.json``.
+    have a value. Neither ABSENT nor CORRUPT counts as drift here — missing
+    or unreadable metadata degrades to trusting the profile (its token
+    family is normally the slot's freshest) rather than abandoning it over a
+    broken ``.claude.json`` (``TestIsSessionValid::test_probe_timeout_lenient_
+    on_unreadable_identity`` pins this: failing closed here reopens the
+    destructive #224 cleanup on every loaded launch). A caller that must
+    fail closed on CORRUPT specifically (a write, not a reuse fallback) uses
+    ``session_identity_unreadable`` instead, alongside this check.
     """
-    identity = read_session_identity(session_dir)
+    identity, _corrupt = _read_session_identity_state(session_dir)
     if identity is None:
         return False
     profile_email, profile_org = identity
