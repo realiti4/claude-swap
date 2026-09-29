@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="580" viewBox="0 0 1440 580">
+  <rect width="1440" height="580" rx="18" fill="#1e1e1e"/>
+  <rect x="1" y="1" width="1438" height="578" rx="17" fill="none" stroke="#454545"/>
+  <circle cx="35" cy="32" r="10" fill="#ff5f57"/><circle cx="65" cy="32" r="10" fill="#febc2e"/><circle cx="95" cy="32" r="10" fill="#28c840"/>
+  <text x="720" y="39" text-anchor="middle" fill="#b9b9b9" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="18">cswap list</text>
+  <text x="720" y="94" text-anchor="middle" fill="#f2f2f2" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="21" font-weight="600">Claude Code quota</text>
+  <g fill="#d7d7d7" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="18">
+    <path d="M35 118h1370M35 163h1370M35 244h1370M35 325h1370M35 406h1370M35 487h1370" stroke="#5a5a5a" fill="none"/>
+    <path d="M35 118v369M86 118v369M455 118v369M654 118v369M781 118v369M980 118v369M1118 118v369M1330 118v369M1405 118v369" stroke="#5a5a5a" fill="none"/>
+    <text x="61" y="147" text-anchor="middle" font-weight="600">#</text>
+    <text x="106" y="147" font-weight="600">Account</text>
+    <text x="475" y="147" font-weight="600">5h limit</text>
+    <text x="674" y="147" font-weight="600">5h reset</text>
+    <text x="801" y="147" font-weight="600">Weekly limit</text>
+    <text x="1000" y="147" font-weight="600">Weekly reset</text>
+    <text x="1138" y="147" font-weight="600">Status</text>
+    <text x="61" y="205" text-anchor="middle">1</text><text x="106" y="205">personal@example.com</text>
+    <text x="475" y="205" fill="#f14c4c" font-weight="600">100% █████████</text><text x="674" y="205" fill="#a9a9a9">45m</text>
+    <text x="801" y="205" fill="#72c472">22% ██░░░░░░░</text><text x="1000" y="205" fill="#a9a9a9">6d 2h</text><text x="1138" y="205">ready</text>
+    <text x="61" y="286" text-anchor="middle">2</text><text x="106" y="286" font-weight="600">work@example.com</text>
+    <text x="475" y="286" fill="#e89c3c">72% ██████░░░</text><text x="674" y="286" fill="#a9a9a9">2h 34m</text>
+    <text x="801" y="286" fill="#e56262">94% ████████░</text><text x="1000" y="286" fill="#a9a9a9">3d 19h</text><text x="1138" y="286" fill="#72c472" font-weight="600">active</text>
+    <text x="61" y="367" text-anchor="middle">3</text><text x="106" y="367">client@example.com</text>
+    <text x="475" y="367" fill="#e7d36d">48% ████░░░░░</text><text x="674" y="367" fill="#a9a9a9">4h 8m</text>
+    <text x="801" y="367" fill="#72c472">11% █░░░░░░░░</text><text x="1000" y="367" fill="#a9a9a9">6d 5h</text><text x="1138" y="367">ready</text>
+    <text x="61" y="448" text-anchor="middle">4</text><text x="106" y="448">backup@example.com</text>
+    <text x="475" y="448" fill="#72c472"> 7% █░░░░░░░░</text><text x="674" y="448" fill="#a9a9a9">4h 41m</text>
+    <text x="801" y="448" fill="#e7d36d">58% █████░░░░</text><text x="1000" y="448" fill="#a9a9a9">5d 11h</text><text x="1138" y="448">ready</text>
+  </g>
+</svg>
