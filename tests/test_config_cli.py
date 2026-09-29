@@ -48,10 +48,12 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.threshold5h",
+            "autoswitch.threshold7d",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 11
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -67,7 +69,8 @@ class TestConfigList:
         _run(["set", "autoswitch.threshold", "90"], capsys)
         _, out, _ = _run([], capsys)
         threshold_line = next(
-            ln for ln in out.splitlines() if "threshold" in ln
+            ln for ln in out.splitlines()
+            if ln.split()[0] == "autoswitch.threshold"
         )
         assert "(default)" not in threshold_line
 
@@ -78,7 +81,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 11
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
