@@ -90,6 +90,7 @@ class AccountPanel:
     meta_text: str  # "active · 2m ago", "disabled", ... ("" when nothing to say)
     rows: tuple[WindowRow, ...]
     text_label: str  # the plain text row, for accessibility and type-select
+    alias: str | None = None  # kept so the accessibility label can name the email
 
 
 def usage_state(pct: float | None) -> str:
@@ -189,12 +190,13 @@ def age_text(fetched_at: float | None, now: float) -> str | None:
     return f"{format_duration(max(0.0, now - fetched_at))} ago"
 
 
-def build_account_panel(entry: tuple, now: float) -> AccountPanel:
+def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> AccountPanel:
     """Panel model for one snapshot account row.
 
     ``entry`` is ``(num, email, is_active, display_usage, last_good, alias,
     disabled, fetched_at)`` as ``menubar._adapt_snapshot`` builds it; the
-    panel reads the same display usage the text row reads.
+    panel reads the same display usage the text row reads. ``names_only``
+    is Settings → Show names only, applied exactly as the text row applies it.
     """
     # Fields past the eighth are for other readers; a wider row still builds.
     num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
@@ -208,15 +210,17 @@ def build_account_panel(entry: tuple, now: float) -> AccountPanel:
         meta.append(age)
     return AccountPanel(
         num=num,
-        title=account_identity(email, alias),
+        title=account_identity(email, alias, names_only=names_only),
         email=email,
         is_active=bool(is_active),
         disabled=bool(disabled),
         meta_text=" · ".join(meta),
         rows=tuple(window_rows(display, now, fetched_at)),
         text_label=format_account_label(
-            num, email, display, now, alias=alias, disabled=disabled, fetched_at=fetched_at
+            num, email, display, now, alias=alias, disabled=disabled,
+            fetched_at=fetched_at, names_only=names_only,
         ),
+        alias=alias,
     )
 
 
@@ -350,7 +354,9 @@ def _spoken_meta(meta_text: str) -> str:
 
 def accessibility_label(panel: AccountPanel) -> str:
     """What VoiceOver reads for a panel: who, their state, then every window."""
-    head = f"Account {panel.num}, {panel.title}"
+    # Always the full identity, whatever the display setting: a listener
+    # has no other way to tell which email an alias belongs to.
+    head = f"Account {panel.num}, {account_identity(panel.email, panel.alias)}"
     if panel.meta_text:
         head += f", {_spoken_meta(panel.meta_text)}"
     sentences = [head]

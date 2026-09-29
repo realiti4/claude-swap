@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 
 import pytest
 
@@ -39,12 +41,36 @@ class _FakeSwitcher:
     def switch_to(self, num):
         self.switched.append(num)
 
+    # The real store raises ValidationError / ConfigError (ClaudeSwitchError
+    # subclasses) with the CLI's own messages; tests queue one to replay it.
+    rename_error = None
+    rename_delay = 0.0  # seconds a store call blocks, as under lock contention
+    rename_lands_in = None  # the slot the store reports it changed (a swap moved it)
+
+    def set_alias(self, num, name, expected_email=None, expected_org=None):
+        self.renames = getattr(self, "renames", []) + [("set", num, name, expected_email, expected_org)]
+        time.sleep(self.rename_delay)
+        if self.rename_error is not None:
+            raise self.rename_error
+        return self.rename_lands_in or num, name.strip().lower()
+
+    def unset_alias(self, num, expected_email=None, expected_org=None):
+        self.renames = getattr(self, "renames", []) + [("unset", num, expected_email, expected_org)]
+        time.sleep(self.rename_delay)
+        if self.rename_error is not None:
+            raise self.rename_error
+        return self.rename_lands_in or num
+
 
 class _NoFetch:
     def __init__(self, _switcher):
         pass
 
     def take(self, **_kw):
+        # The app's startup refresh lands here. It takes a moment, as a real
+        # read does under load, so a test that starts before it finished
+        # fails every time instead of now and then.
+        time.sleep(0.05)
         raise RuntimeError("tests never fetch")
 
 
@@ -55,6 +81,12 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
     monkeypatch.setattr(rumps, "alert", lambda *a, **k: 1)
     built = menubar.create_app(_FakeSwitcher(tmp_path))
+    # The app starts a refresh as it opens. Tests that drive their own
+    # refresh start from an idle worker: one still running would swallow it.
+    deadline = time.monotonic() + 5
+    while built._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not built._refreshing
     yield built
     built.refresh_timer.stop()
     built.sync_timer.stop()
@@ -337,3 +369,657 @@ def test_wider_rows_still_build_the_menu(app, bars):
     app.rebuild_menu()
     assert [_title_num(i) for i in _account_items(app)] == ["1", "2"]
     app._log_usage(app.snapshot)
+
+
+# --- rename -------------------------------------------------------------------------
+
+def _entry_alias(num, email, alias, active=False):
+    usage = {"five_hour": {"pct": 10.0}}
+    return (num, email, active, usage, usage, alias, False, None)
+
+
+class _Window:
+    """Stands in for rumps.Window: records how it was built, returns a canned answer."""
+
+    made = []
+    answer = (1, "")
+
+    def __init__(self, message="", title="", default_text="", ok=None, cancel=None, dimensions=None, **_):
+        _Window.made.append({"message": message, "title": title, "default_text": default_text})
+
+    def run(self):
+        clicked, text = _Window.answer
+        return type("Response", (), {"clicked": clicked, "text": text})()
+
+
+@pytest.fixture
+def window(monkeypatch):
+    _Window.made = []
+    monkeypatch.setattr(rumps, "Window", _Window)
+    return _Window
+
+
+def _submenu(app, title):
+    for item in app.menu._menu.itemArray():
+        if item.title() == title:
+            return item.submenu()
+    return None
+
+
+def _root_titles(app):
+    return [i.title() for i in app.menu._menu.itemArray()]
+
+
+def test_rename_submenu_follows_disable_and_lists_every_account(app):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", None))
+    app.rebuild_menu()
+    titles = _root_titles(app)
+    assert titles.index("Rename account") == titles.index("Disable / enable account") + 1
+    assert [i.title() for i in _submenu(app, "Rename account").itemArray()] == [
+        "1  work  (a@x.com)", "2  b@x.com",
+    ]
+
+
+def _choose_rename(app, index):
+    item = _submenu(app, "Rename account").itemArray()[index]
+    item.target().callback_(item)
+
+
+def _settle(app, timeout=5.0):
+    """Tick until every rename worker has reported back (as the sync timer would)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.on_sync_tick(None)
+        if not app._renames_in_flight:
+            app.on_sync_tick(None)
+            return
+        time.sleep(0.02)
+    raise AssertionError("rename never reported back")
+
+
+def test_rename_prompt_is_prefilled_and_ok_stores_the_alias(app, window):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", None))
+    app.rebuild_menu()
+    window.answer = (1, "Home")
+    _choose_rename(app, 0)
+    assert window.made[0]["default_text"] == "work"
+    _settle(app)  # the change shows on the next tick
+    assert app.switcher.renames == [("set", "1", "Home", "a@x.com", None)]
+    assert _account_items(app)[0].title().startswith("1  home  (a@x.com)")
+
+
+def test_rename_prompt_for_an_account_without_alias_starts_empty(app, window):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    window.answer = (0, "ignored")
+    _choose_rename(app, 0)
+    assert window.made[0]["default_text"] == ""
+
+
+def test_empty_name_clears_the_alias(app, window):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True))
+    app.rebuild_menu()
+    window.answer = (1, "   ")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert app.switcher.renames == [("unset", "1", "a@x.com", None)]
+    assert _account_items(app)[0].title().startswith("1  a@x.com  ")
+
+
+def test_cancel_changes_nothing(app, window):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True))
+    app.rebuild_menu()
+    window.answer = (0, "other")
+    _choose_rename(app, 0)
+    assert getattr(app.switcher, "renames", []) == []
+
+
+def test_rejected_name_shows_the_stores_own_message(app, window, monkeypatch):
+    from claude_swap.exceptions import ConfigError
+
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry_alias("2", "b@x.com", "work"))
+    app.rebuild_menu()
+    app.switcher.rename_error = ConfigError("Alias 'work' is already used by account 2")
+    window.answer = (1, "work")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert [a["message"] for a in alerts] == ["Alias 'work' is already used by account 2"]
+    assert _account_items(app)[0].title().startswith("1  a@x.com  ")  # unchanged
+
+
+# --- names only ---------------------------------------------------------------------
+
+def test_names_only_shows_aliases_alone_in_rows_and_panels(app, monkeypatch):
+    monkeypatch.setattr(app.settings, "save", lambda _p: None)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", None))
+    app.on_toggle_names_only(None)
+    assert app.settings.show_names_only is True
+    items = _account_items(app)
+    assert items[0].title().startswith("1  work  5h")
+    assert items[1].title().startswith("2  b@x.com  5h")
+    assert items[0].view().panel.title == "work"
+    assert "a@x.com" in items[0].view().accessibilityLabel()
+    app.settings.show_usage_bars = False
+    app.rebuild_menu()
+    assert _account_items(app)[0].title().startswith("1  work  5h")
+
+
+def test_names_only_is_in_the_settings_menu(app):
+    app.rebuild_menu()
+    titles = [i.title() for i in _submenu(app, "Settings").itemArray()]
+    assert "Show names only" in titles
+
+
+def test_names_only_text_rows_still_name_the_email_to_assistive_tech(app, monkeypatch):
+    # AXTitle (what assistive technology reads for a menu item) must carry the
+    # email even when the visible row shows only the alias.
+    monkeypatch.setattr(app.settings, "save", lambda _p: None)
+    app.settings.show_usage_bars = False
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", None))
+    app.on_toggle_names_only(None)
+    first, second = _account_items(app)
+    assert first.title().startswith("1  work  5h")
+    assert first.accessibilityTitle().startswith("1  work  (a@x.com)  5h")
+    assert second.accessibilityTitle().startswith("2  b@x.com  5h")  # nothing hidden, nothing added
+    app.on_toggle_names_only(None)  # off again: the plain title is the accessible name
+    assert _account_items(app)[0].accessibilityTitle() == _account_items(app)[0].title()
+
+
+def test_names_only_rows_keep_the_email_for_assistive_tech_after_a_text_fallback(app, monkeypatch):
+    real = pv._set_item_view
+    calls = []
+
+    def flaky(nsitem, view):
+        calls.append(nsitem)
+        if len(calls) == 2:
+            raise RuntimeError("setView failed")
+        real(nsitem, view)
+
+    monkeypatch.setattr(pv, "_set_item_view", flaky)
+    app.settings.show_names_only = True
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", "dev"))
+    app.rebuild_menu()
+    items = _account_items(app)
+    assert all(i.view() is None for i in items)  # fell back to text rows
+    assert items[1].accessibilityTitle().startswith("2  dev  (b@x.com)")
+
+
+# --- rename: the account, off the main thread, not undone by a stale refresh --------
+
+def test_rename_follows_the_account_after_a_swap(app, window):
+    # The prompt showed slot 1 = a@x.com; before submit a swap moved it to slot 2.
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry_alias("2", "b@x.com", None))
+    app.rebuild_menu()
+    app.switcher.rename_lands_in = "2"
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    app.snapshot = _snap(_entry_alias("1", "b@x.com", None), _entry_alias("2", "a@x.com", None, active=True))
+    _settle(app)
+    assert app.switcher.renames == [("set", "1", "home", "a@x.com", None)]  # pinned by email
+    titles = [i.title() for i in _account_items(app)]
+    assert titles[0].startswith("1  b@x.com  ")
+    assert titles[1].startswith("2  home  (a@x.com)")
+
+
+def test_rename_of_an_account_that_is_gone_is_cancelled(app, window, monkeypatch):
+    from claude_swap.exceptions import AccountNotFoundError
+
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "keep", active=True))
+    app.rebuild_menu()
+    app.switcher.rename_error = AccountNotFoundError("Account a@x.com is no longer in slot 1")
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert [a["message"] for a in alerts] == ["Account changed, rename cancelled"]
+    assert _account_items(app)[0].title().startswith("1  keep  (a@x.com)")
+
+
+def test_rename_never_blocks_the_main_thread(app, window, monkeypatch):
+    from claude_swap.exceptions import LockError
+
+    notes = []
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: notes.append(a))
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    app.switcher.rename_delay = 2.0
+    app.switcher.rename_error = LockError("Failed to acquire lock - another instance may be running")
+    window.answer = (1, "home")
+    started = time.monotonic()
+    _choose_rename(app, 0)
+    assert time.monotonic() - started < 0.5  # the prompt closed and the menu is free
+    assert notes == []  # nothing yet: the store is still busy
+    _settle(app)
+    assert notes == [("claude-swap", "Could not rename", "Another cswap process is busy, try again")]
+
+
+def test_a_refresh_started_before_a_rename_cannot_undo_it(app, window, monkeypatch):
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    gate, calls = threading.Event(), []
+    old = _snap(_entry_alias("1", "a@x.com", "old", active=True))
+    fresh = _snap(_entry_alias("1", "a@x.com", "home", active=True))
+
+    class Source:
+        def take(self, **_kw):
+            calls.append(1)
+            if len(calls) == 1:
+                gate.wait(5)  # an in-flight refresh, still reading the old roster
+                return old
+            return fresh
+
+    app._snapshot_source = Source()
+    app.snapshot = old
+    app.rebuild_menu()
+    app.refresh_async()  # 1. refresh starts
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)  # 2. the rename commits and shows
+    assert app.snapshot["accounts"][0][5] == "home"
+    gate.set()  # 3. the old refresh completes
+    deadline = time.monotonic() + 5
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.snapshot["accounts"][0][5] == "home"  # its stale result was discarded
+    for _ in range(100):  # the follow-up refresh runs once, from the tick
+        app.on_sync_tick(None)
+        if len(calls) >= 2 and not app._refreshing:
+            break
+        time.sleep(0.02)
+    app.on_sync_tick(None)
+    assert len(calls) == 2
+    assert _account_items(app)[0].title().startswith("1  home  (a@x.com)")
+
+
+def test_follow_up_refresh_runs_even_if_the_in_flight_one_fails(app, window, monkeypatch):
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    gate, calls = threading.Event(), []
+    fresh = _snap(_entry_alias("1", "a@x.com", "home", active=True))
+
+    class Source:
+        def take(self, **_kw):
+            calls.append(1)
+            if len(calls) == 1:
+                gate.wait(5)
+                raise RuntimeError("network down")  # the in-flight refresh fails
+            return fresh
+
+    app._snapshot_source = Source()
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", "old", active=True))
+    app.rebuild_menu()
+    app.refresh_async()
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)
+    gate.set()
+    for _ in range(150):
+        app.on_sync_tick(None)
+        if len(calls) >= 2 and not app._refreshing:
+            break
+        time.sleep(0.02)
+    assert len(calls) == 2  # the store is still read back after the rename
+
+
+def test_rename_pins_the_rows_organization_too(app, window):
+    snap = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry_alias("2", "a@x.com", None))
+    snap["orgs"] = {"1": "org-a", "2": "org-b"}
+    app.snapshot = snap
+    app.rebuild_menu()
+    window.answer = (1, "home")
+    _choose_rename(app, 1)
+    _settle(app)
+    assert app.switcher.renames == [("set", "2", "home", "a@x.com", "org-b")]
+
+
+# --- P2-3: compare-generation-and-publish is one step ----------------------------
+
+def test_refresh_cannot_publish_between_its_check_and_a_rename(app, window, monkeypatch):
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    old = _snap(_entry_alias("1", "a@x.com", "old", active=True))
+
+    class Source:
+        def take(self, **_kw):
+            return old
+
+    gate, entered = threading.Event(), threading.Event()
+    real_log = app._log_usage
+
+    def gated_log(snap):
+        # The worker has read the old roster and passed any early check.
+        if threading.current_thread() is not threading.main_thread() and not entered.is_set():
+            entered.set()
+            gate.wait(5)
+        real_log(snap)
+
+    app._log_usage = gated_log
+    app._snapshot_source = Source()
+    app.snapshot = old
+    app.rebuild_menu()
+    app.refresh_async()
+    assert entered.wait(5)
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)  # the rename commits while the refresh sits in _log_usage
+    gate.set()
+    deadline = time.monotonic() + 5
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.snapshot["accounts"][0][5] == "home"
+
+
+# --- P2-4: one rename at a time, in order -----------------------------------------
+
+def test_renames_run_one_at_a_time_in_order(app):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    order = []
+    real_set = app.switcher.set_alias
+
+    def slow_set(num, name, **kw):
+        order.append(("start", name))
+        time.sleep(0.3 if name == "first" else 0.0)
+        order.append(("end", name))
+        return real_set(num, name, **kw)
+
+    app.switcher.set_alias = slow_set
+    app._rename_account("1", "a@x.com", "first")
+    app._rename_account("1", "a@x.com", "second")
+    _settle(app)
+    assert order == [("start", "first"), ("end", "first"), ("start", "second"), ("end", "second")]
+    assert app.snapshot["accounts"][0][5] == "second"
+
+
+def test_rename_submenu_is_disabled_while_a_rename_is_saving(app, window):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry_alias("2", "b@x.com", None))
+    app.rebuild_menu()
+    app.switcher.rename_delay = 1.0
+    window.answer = (1, "first")
+    _choose_rename(app, 0)
+    app.on_sync_tick(None)  # rebuilds with the rename pending
+    items = _submenu(app, "Rename account").itemArray()
+    assert all(not i.isEnabled() or i.action() is None for i in items)
+    assert all(i.title().endswith(" (saving…)") for i in items)
+    made_before = len(window.made)
+    item = items[1]
+    item.target().callback_(item) if item.action() else None  # a stale click
+    app._make_rename("2", "b@x.com", None)(None)  # or a direct call: no prompt either
+    assert len(window.made) == made_before
+    _settle(app)
+    items = _submenu(app, "Rename account").itemArray()
+    assert all(i.action() is not None and not i.title().endswith("(saving…)") for i in items)
+
+
+# --- P2-5: quitting with a rename pending ------------------------------------------
+
+def _quit(app, monkeypatch):
+    quits, alerts = [], []
+    monkeypatch.setattr(rumps, "quit_application", lambda: quits.append(1))
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    started = time.monotonic()
+    app.on_quit(None)
+    return quits, alerts, time.monotonic() - started
+
+
+def test_quit_waits_for_a_pending_rename_that_finishes(app, monkeypatch):
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.switcher.rename_delay = 1.0
+    app._rename_account("1", "a@x.com", "home")
+    quits, alerts, took = _quit(app, monkeypatch)
+    assert quits == [1] and alerts == []
+    assert 0.5 < took < 3.5
+    assert app.switcher.renames[-1][:3] == ("set", "1", "home")
+
+
+def test_quit_warns_when_a_pending_rename_cannot_finish(app, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.switcher.lock_file = app.switcher.backup_dir / ".lock"
+    holder = FileLock(app.switcher.lock_file)  # another cswap process, busy past the quit
+    assert holder.acquire()
+    try:
+        app._rename_account("1", "a@x.com", "home")
+        quits, alerts, took = _quit(app, monkeypatch)
+    finally:
+        holder.release()
+    assert quits == [1]
+    assert [a["message"] for a in alerts] == ["Rename not saved: another cswap process was busy"]
+    assert 2.5 < took < 4.5
+    assert getattr(app.switcher, "renames", []) == []  # abandoned before the store was called
+
+
+@pytest.fixture
+def real_app(temp_home, tmp_path, monkeypatch):
+    """The app over a real switcher and roster, so "saved" means on disk."""
+    import json
+
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.sequence_file.write_text(json.dumps({
+        "activeAccountNumber": 1, "lastUpdated": "t", "sequence": [1],
+        "accounts": {"1": {"email": "a@x.com", "uuid": "u", "organizationUuid": "",
+                           "organizationName": "", "added": "t"}},
+    }))
+    built = menubar.create_app(switcher)
+    deadline = time.monotonic() + 5
+    while built._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    yield built, switcher
+    built.refresh_timer.stop()
+    built.sync_timer.stop()
+
+
+def _alias_on_disk(switcher):
+    import json
+
+    return json.loads(switcher.sequence_file.read_text())["accounts"]["1"].get("alias")
+
+
+def _lock_held_for(switcher, seconds):
+    from claude_swap.locking import FileLock
+
+    holder = FileLock(switcher.lock_file)
+    assert holder.acquire()
+    releaser = threading.Timer(seconds, holder.release)
+    releaser.start()
+    return releaser
+
+
+def test_quit_abandons_a_rename_the_lock_holds_past_the_wait(real_app, monkeypatch):
+    app, switcher = real_app
+    releaser = _lock_held_for(switcher, 4.0)
+    app._rename_account("1", "a@x.com", "home")
+    _quits, alerts, _took = _quit(app, monkeypatch)
+    releaser.join()
+    time.sleep(0.5)  # past the release: a rename still alive would write now
+    assert [a["message"] for a in alerts] == ["Rename not saved: another cswap process was busy"]
+    assert _alias_on_disk(switcher) is None
+    assert not app._renames_in_flight
+
+
+def test_quit_keeps_a_rename_the_lock_lets_through_in_time(real_app, monkeypatch):
+    app, switcher = real_app
+    releaser = _lock_held_for(switcher, 1.0)
+    app._rename_account("1", "a@x.com", "home")
+    _quits, alerts, _took = _quit(app, monkeypatch)
+    releaser.join()
+    assert alerts == []
+    assert _alias_on_disk(switcher) == "home"
+
+
+def test_rename_after_a_swap_tags_the_row_with_the_same_organization(app, window):
+    # Same email in two orgs. The prompt showed slot 1 = a@x.com in org-a; a
+    # swap then put org-a's account in slot 2. The store renames org-a's
+    # account and reports slot 2, but the menu still shows the old snapshot,
+    # where slot 2 is org-b's account: the alias belongs on the org-a row.
+    snap = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry_alias("2", "a@x.com", None))
+    snap["orgs"] = {"1": "org-a", "2": "org-b"}
+    app.snapshot = snap
+    app.rebuild_menu()
+    app.switcher.rename_lands_in = "2"
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert app.switcher.renames == [("set", "1", "home", "a@x.com", "org-a")]
+    titles = [i.title() for i in _account_items(app)]
+    assert titles[0].startswith("1  home  (a@x.com)")
+    assert titles[1].startswith("2  a@x.com  ")
+
+
+def test_quit_right_after_a_rejected_rename_shows_the_rejection(app, monkeypatch):
+    from claude_swap.exceptions import ValidationError
+
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.switcher.rename_delay = 0.3  # still saving when Quit is chosen
+    app.switcher.rename_error = ValidationError("Alias 'work' is already used by account 2")
+    app._rename_account("1", "a@x.com", "work")
+    quits, alerts, _took = _quit(app, monkeypatch)
+    assert quits == [1]
+    assert [a["message"] for a in alerts] == ["Alias 'work' is already used by account 2"]
+
+
+def test_quit_before_the_tick_drained_a_finished_rejection_shows_it(app, monkeypatch):
+    from claude_swap.exceptions import ValidationError
+
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.switcher.rename_error = ValidationError("Alias 'work' is already used by account 2")
+    app._rename_account("1", "a@x.com", "work")
+    deadline = time.monotonic() + 5
+    while app._renames_in_flight and time.monotonic() < deadline:
+        time.sleep(0.02)  # finished, but no sync tick has run
+    quits, alerts, _took = _quit(app, monkeypatch)
+    assert quits == [1]
+    assert [a["message"] for a in alerts] == ["Alias 'work' is already used by account 2"]
+
+
+def test_rename_landing_between_the_refresh_check_and_publish_waits_for_it(app, monkeypatch):
+    # The refresh worker's generation check and its publish are one step
+    # under the snapshot lock: a rename cannot land in between.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    old = _snap(_entry_alias("1", "a@x.com", "old", active=True))
+    stored = _snap(_entry_alias("1", "a@x.com", "home", active=True))
+    reads = []
+
+    class Source:
+        def take(self, **_kw):
+            # First read predates the rename; later reads see it stored.
+            reads.append(1)
+            return old if len(reads) == 1 else stored
+
+    holder = {"value": 0, "fired": False}
+
+    def get_gen(self):
+        value = holder["value"]
+        if threading.current_thread() is not threading.main_thread() and not holder["fired"] \
+                and threading.current_thread().name != "rename-helper":
+            holder["fired"] = True
+            helper = threading.Thread(
+                target=app._apply_rename, args=("1", "a@x.com", None, "home"), name="rename-helper"
+            )
+            helper.start()
+            helper.join(0.5)  # a rename tries to land right after the check read
+        return value
+
+    def set_gen(self, v):
+        holder["value"] = v
+
+    monkeypatch.setattr(type(app), "_snapshot_gen", property(get_gen, set_gen), raising=False)
+    app._snapshot_source = Source()
+    app.snapshot = old
+    app.refresh_async()
+    deadline = time.monotonic() + 5
+    while (app._refreshing or app.snapshot["accounts"][0][5] != "home") and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert holder["fired"]
+    assert app.snapshot["accounts"][0][5] == "home"
+
+
+def test_rename_submenu_is_usable_again_after_a_failed_rename(app, window, monkeypatch):
+    from claude_swap.exceptions import ValidationError
+
+    monkeypatch.setattr(rumps, "alert", lambda **kw: 1)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    app.switcher.rename_error = ValidationError("alias 'x y' may only contain letters")
+    app.switcher.rename_delay = 0.3
+    window.answer = (1, "x y")
+    _choose_rename(app, 0)
+    app.on_sync_tick(None)  # rebuilt while saving
+    assert all(i.title().endswith("(saving…)") for i in _submenu(app, "Rename account").itemArray())
+    _settle(app)  # the failure comes back: nothing else would rebuild the menu
+    items = _submenu(app, "Rename account").itemArray()
+    assert all(i.action() is not None and not i.title().endswith("(saving…)") for i in items)
+
+
+def test_a_quit_during_the_lock_check_still_abandons(app, monkeypatch):
+    # Quit gives up on the rename in the moment the lock is found free:
+    # the rename must not go on to the store.
+    from claude_swap.locking import FileLock
+
+    app.switcher.lock_file = app.switcher.backup_dir / ".lock"
+    real_acquire = FileLock.acquire
+
+    def acquire(self, timeout=None):
+        got = real_acquire(self, timeout)
+        app._renames_abandoned = True
+        return got
+
+    monkeypatch.setattr(FileLock, "acquire", acquire)
+    outcome = app._run_rename("1", "a@x.com", "home", None)
+    assert outcome == ("abandoned",)
+    assert getattr(app.switcher, "renames", []) == []
+
+
+def test_an_unwritable_lock_file_fails_the_rename_and_frees_the_menu(app, window, monkeypatch):
+    import os
+
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    lock = app.switcher.backup_dir / ".lock"
+    lock.write_text("")
+    os.chmod(lock, 0o444)  # opening it for writing raises PermissionError
+    app.switcher.lock_file = lock
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    window.answer = (1, "home")
+    _choose_rename(app, 0)
+    _settle(app)
+    assert [a["message"] for a in alerts] == [
+        f"Could not rename: [Errno 13] Permission denied: '{lock}'"
+    ]
+    items = _submenu(app, "Rename account").itemArray()
+    assert all(i.action() is not None and not i.title().endswith("(saving…)") for i in items)
+    quits, quit_alerts, took = _quit(app, monkeypatch)
+    assert quits == [1] and quit_alerts == [] and took < 1.0
+
+
+def test_a_probe_that_fails_once_fails_only_that_rename(app, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    app.switcher.lock_file = app.switcher.backup_dir / ".lock"
+    real_acquire = FileLock.acquire
+    calls = []
+
+    def acquire(self, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(5, "Input/output error")
+        return real_acquire(self, timeout)
+
+    monkeypatch.setattr(FileLock, "acquire", acquire)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app._rename_account("1", "a@x.com", "home")
+    app._rename_account("1", "a@x.com", "work")
+    _settle(app)
+    assert [a["message"] for a in alerts] == ["Could not rename: [Errno 5] Input/output error"]
+    assert [r[:3] for r in app.switcher.renames] == [("set", "1", "work")]
+    assert not app._renames_in_flight

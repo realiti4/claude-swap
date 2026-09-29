@@ -429,3 +429,46 @@ def test_a_wider_row_still_builds_its_panel():
         _entry(usage, num=3, alias="work") + (1_900_000_000.0, False), _NOW
     )
     assert str(panel.num) == "3" and "work" in panel.title
+
+
+# --- names only --------------------------------------------------------------------
+
+def test_account_identity_names_only_uses_the_alias_alone():
+    assert menubar.account_identity("me@x.com", "work", names_only=True) == "work"
+    assert menubar.account_identity("me@x.com", None, names_only=True) == "me@x.com"
+    assert menubar.account_identity("me@x.com", "work") == "work  (me@x.com)"  # default unchanged
+
+
+def test_format_account_label_names_only():
+    usage = {"five_hour": {"pct": 1.0}}
+    assert menubar.format_account_label(4, "me@x.com", usage, _NOW, alias="work", names_only=True) == "4  work  5h 1%"
+    assert menubar.format_account_label(4, "me@x.com", usage, _NOW, alias=None, names_only=True) == "4  me@x.com  5h 1%"
+
+
+def test_panel_names_only_title_and_text_row_follow_the_setting():
+    usage = {"five_hour": {"pct": 1.0}}
+    entry = _entry(usage, num=4, email="me@x.com", alias="work")
+    panel = mp.build_account_panel(entry, _NOW, names_only=True)
+    assert panel.title == "work"
+    assert panel.text_label == menubar.format_account_label(4, "me@x.com", usage, _NOW, alias="work", names_only=True)
+    assert mp.build_account_panel(entry, _NOW).title == "work  (me@x.com)"
+
+
+def test_accessibility_label_always_includes_the_email():
+    entry = _entry({"five_hour": {"pct": 1.0}}, num=4, email="me@x.com", alias="work")
+    for names_only in (False, True):
+        label = mp.accessibility_label(mp.build_account_panel(entry, _NOW, names_only=names_only))
+        assert label.startswith("Account 4, work  (me@x.com)")
+
+
+def test_show_names_only_defaults_off_and_persists(tmp_path):
+    assert menubar.MenuBarSettings().show_names_only is False
+    path = tmp_path / "menubar_settings.json"
+    menubar.MenuBarSettings(show_names_only=True).save(path)
+    assert menubar.MenuBarSettings.load(path).show_names_only is True
+
+
+def test_title_prefers_the_alias():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert menubar.format_title("longname@x.com", {"five_hour": {"pct": 5.0}}, s, alias="work") == "⇄ work"
+    assert menubar.format_title("longname@x.com", {"five_hour": {"pct": 5.0}}, s) == "⇄ longname"

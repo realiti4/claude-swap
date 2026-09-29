@@ -33,7 +33,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import pace
-from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.exceptions import (
+    AccountNotFoundError,
+    ClaudeSwitchError,
+    CredentialReadError,
+    LockError,
+)
+from claude_swap.locking import FileLock
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -104,6 +110,7 @@ class MenuBarSettings:
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
     show_usage_bars: bool = True  # draw each account as a panel of usage bars
+    show_names_only: bool = False  # an aliased account shows its alias without the email
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -288,15 +295,25 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    names_only: bool = False,
 ) -> str:
     """Build one account row's menu label."""
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {account_identity(email, alias)}{marker}  {usage_summary(usage, now, fetched_at)}"
+    identity = account_identity(email, alias, names_only=names_only)
+    return f"{num}  {identity}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
-def account_identity(email: str, alias: str | None = None) -> str:
-    """How an account names itself in a menu row: ``alias  (email)`` or the email."""
-    return f"{alias}  ({email})" if alias else email
+def account_identity(email: str, alias: str | None = None, names_only: bool = False) -> str:
+    """How an account names itself in a menu row.
+
+    ``alias  (email)`` when it has an alias, else the email; with
+    ``names_only`` (Settings → Show names only) an aliased account is just
+    its alias. The single source for the text rows, the panels, the rename
+    submenu and the accessibility label.
+    """
+    if not alias:
+        return email
+    return alias if names_only else f"{alias}  ({email})"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -429,6 +446,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "orgs": {},  # account number -> organization uuid ("" = personal)
 }
 
 
@@ -443,10 +461,12 @@ def _adapt_snapshot(snap) -> dict:
     measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
+    orgs = {}
     active_email = None
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
+        orgs[acc.number] = getattr(acc, "org_uuid", "") or ""
         display = _account_display_usage(acc.usage)
         accounts.append(
             (
@@ -461,6 +481,7 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "orgs": orgs,
     }
 
 
@@ -1008,6 +1029,21 @@ def create_app(switcher):
             self._rebuild_pending = False  # a rebuild waiting for the menu to close
             self._bars_broken = False  # a panel failed to draw: text rows this session
             self._account_target = None
+            # Renames run off the main thread, one at a time in the order asked
+            # (a FIFO drained by a single worker); outcomes queue for the tick.
+            self._rename_queue: list = []
+            self._rename_worker_running = False
+            self._rename_outcomes: list = []
+            self._renames_in_flight = 0
+            # Set by Quit: a rename still waiting for the account lock gives up.
+            self._renames_abandoned = False
+            # Guards "compare generation, then publish" in the refresh worker
+            # against "apply rename, bump generation" on the main thread.
+            self._snapshot_lock = threading.Lock()
+            # Bumped by a local change to the snapshot (a rename); a refresh
+            # started under an older generation must not overwrite it.
+            self._snapshot_gen = 0
+            self._refresh_again = False  # a refresh asked for while one ran
             self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
@@ -1026,9 +1062,18 @@ def create_app(switcher):
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
-            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
+            threading.Thread(
+                target=self._worker, args=(full, self._snapshot_gen), daemon=True
+            ).start()
 
-        def _worker(self, full):
+        def _request_refresh(self):
+            """Refresh now, or right after the refresh already running."""
+            if self._refreshing:
+                self._refresh_again = True
+            else:
+                self.refresh_async()
+
+        def _worker(self, full, generation=0):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
             # runs it already paces all fetching, so the display reads store-only.
@@ -1043,9 +1088,15 @@ def create_app(switcher):
                     return
                 snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
-                self.snapshot = snap
-                self._snapshot_at = time.time()
-                self._dirty = True  # picked up by on_sync_tick on the main thread
+                with self._snapshot_lock:  # one step: nothing lands between check and publish
+                    if generation != self._snapshot_gen:
+                        # Read before a local change (a rename) landed: showing
+                        # it would undo that change. Drop it and read again.
+                        self._refresh_again = True
+                        return
+                    self.snapshot = snap
+                    self._snapshot_at = time.time()
+                    self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
 
@@ -1074,6 +1125,10 @@ def create_app(switcher):
                 self.rebuild_menu()  # defers again by itself while the menu is open
             self._detect_active_change()
             self._drain_engine_events()
+            self._drain_rename_outcomes()
+            if self._refresh_again and not self._refreshing:
+                self._refresh_again = False
+                self.refresh_async()
             dashboard_error = self._dashboard.take_error()
             if dashboard_error:
                 rumps.notification("claude-swap", "Could not open dashboard", dashboard_error)
@@ -1210,6 +1265,7 @@ def create_app(switcher):
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps, snap),
+                self._rename_menu(rumps, snap),
                 self._remove_menu(rumps, snap),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
@@ -1225,11 +1281,19 @@ def create_app(switcher):
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra in snap["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at, names_only=self.settings.show_names_only,
                     ),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
+                if self.settings.show_names_only and alias:
+                    # The visible row hides the email; the accessible name
+                    # (AXTitle, what VoiceOver reads) keeps the full row.
+                    item._menuitem.setAccessibilityTitle_(format_account_label(
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at,
+                    ))
                 rows.append((num, item))
             if not rows:
                 return [rumps.MenuItem("No managed accounts", callback=None)]
@@ -1253,7 +1317,11 @@ def create_app(switcher):
                 from claude_swap.menubar_panel import build_account_panel
 
                 now = time.time()
-                panels = {entry[0]: build_account_panel(entry, now) for entry in accounts}
+                names_only = self.settings.show_names_only
+                panels = {
+                    entry[0]: build_account_panel(entry, now, names_only=names_only)
+                    for entry in accounts
+                }
                 pv.attach_usage_panels(
                     [(item, panels[num]) for num, item in rows],
                     target=self._account_target,
@@ -1344,6 +1412,25 @@ def create_app(switcher):
                 menu.add(item)
             return menu
 
+        def _rename_menu(self, rumps, snap):
+            menu = rumps.MenuItem("Rename account")
+            accounts = snap["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            saving = bool(self._renames_in_flight)
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, *_extra in accounts:
+                # Always the full identity here: the email says which account.
+                title = f"{num}  {account_identity(email, alias)}"
+                if saving:
+                    # One rename at a time: the next prompt opens once this saved.
+                    menu.add(rumps.MenuItem(f"{title} (saving…)", callback=None))
+                    continue
+                menu.add(rumps.MenuItem(
+                    title,
+                    callback=self._make_rename(num, email, alias, snap.get("orgs", {}).get(num)),
+                ))
+            return menu
+
         def _history_menu(self, rumps):
             menu = rumps.MenuItem("Switch history")
             try:
@@ -1384,6 +1471,10 @@ def create_app(switcher):
             bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
             bars_item.state = 1 if self.settings.show_usage_bars else 0
             menu.add(bars_item)
+
+            names_item = rumps.MenuItem("Show names only", callback=self.on_toggle_names_only)
+            names_item.state = 1 if self.settings.show_names_only else 0
+            menu.add(names_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -1532,11 +1623,198 @@ def create_app(switcher):
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
+            # A rename still saving would be lost silently with the process.
+            deadline = time.monotonic() + 3.0
+            while self._renames_in_flight and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self._renames_in_flight:
+                # One still waiting for the account lock gives up now; one
+                # already in the store finishes on the store's terms (its lock
+                # wait is bounded). Either way the worker answers, so the
+                # alert below says what happened, never what might.
+                self._renames_abandoned = True
+                while self._renames_in_flight:
+                    time.sleep(0.05)
+            # Outcomes the sync tick has not shown yet (a rejected name) are
+            # shown now; after quit nothing would.
+            self._drain_rename_outcomes(quitting=True)
             self._stop_engine()
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
+            self._save_and_rebuild()
+
+        def _make_rename(self, num, email, alias, org=None):
+            def cb(_sender):
+                if self._renames_in_flight:
+                    return  # a rename is still saving: one at a time
+                # An accessory app is not frontmost; bring it forward or the
+                # prompt can render blank (as with "From setup-token…").
+                import AppKit
+                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                response = rumps.Window(
+                    title="Rename account",
+                    message=f"Name for account {num} ({email}). Leave empty to remove the name.",
+                    default_text=alias or "",
+                    ok="Rename", cancel="Cancel", dimensions=(320, 24),
+                ).run()
+                if response.clicked != 1:
+                    return
+                self._rename_account(num, email, response.text, org)
+            return cb
+
+        def _rename_account(self, num, email, text, org=None):
+            """Queue a rename of the account shown as ``(email, org)`` in slot ``num``.
+
+            The store call runs on a worker thread: it waits on the account
+            lock, which the rotate daemon or the auto-switch engine may hold
+            for seconds, and the menu must not freeze meanwhile. Renames run
+            one at a time in the order asked, so the last one asked is the
+            one that sticks. The pin makes a swap in between rename that
+            account, not whatever now sits in slot ``num``. Outcomes are
+            handled on the sync tick (``_drain_rename_outcomes``).
+            """
+            job = (num, email, text.strip(), org)
+            with self._event_lock:
+                self._rename_queue.append(job)
+                self._renames_in_flight += 1
+                start = not self._rename_worker_running
+                if start:
+                    self._rename_worker_running = True
+            self._dirty = True  # show the Rename submenu as saving
+            if start:
+                threading.Thread(target=self._rename_loop, daemon=True).start()
+
+        def _rename_loop(self):
+            while True:
+                with self._event_lock:
+                    if not self._rename_queue:
+                        self._rename_worker_running = False
+                        return
+                    job = self._rename_queue.pop(0)
+                # Every way out of a job (the lock wait, the store, anything
+                # unexpected) publishes exactly one outcome and ends the job,
+                # or the menu stays "saving" and Quit waits for it forever.
+                outcome = ("failed", "the rename stopped unexpectedly")
+                try:
+                    outcome = self._run_rename(*job)
+                except BaseException as e:
+                    self.switcher._logger.warning("rename failed", exc_info=True)
+                    outcome = ("failed", str(e) or type(e).__name__)
+                finally:
+                    with self._event_lock:
+                        self._rename_outcomes.append(outcome)
+                        self._renames_in_flight -= 1
+
+        def _wait_for_the_account_lock(self):
+            """``"free"``, ``"abandoned"`` (Quit gave up on it) or ``"busy"``.
+
+            The store call below takes the account lock and cannot be
+            interrupted while it waits, so the wait happens here, where Quit
+            can end it: renames abandoned by Quit never reach the store.
+            """
+            path = getattr(self.switcher, "lock_file", None)
+            deadline = time.monotonic() + 10.0  # the store's own lock timeout
+            while not self._renames_abandoned:
+                if path is None:
+                    return "free"
+                probe = FileLock(path)
+                if probe.acquire(timeout=0):
+                    probe.release()
+                    return "abandoned" if self._renames_abandoned else "free"
+                if time.monotonic() > deadline:
+                    return "busy"
+                time.sleep(0.05)
+            return "abandoned"
+
+        def _run_rename(self, num, email, name, org):
+            state = self._wait_for_the_account_lock()
+            if state != "free":
+                return (state,)
+            try:
+                if name:
+                    slot, alias = self.switcher.set_alias(
+                        str(num), name, expected_email=email, expected_org=org
+                    )
+                else:
+                    slot = self.switcher.unset_alias(
+                        str(num), expected_email=email, expected_org=org
+                    )
+                    alias = None
+                return ("ok", str(slot), email, org, alias)
+            except AccountNotFoundError:
+                return ("gone",)
+            except LockError:
+                return ("busy",)
+            except ClaudeSwitchError as e:
+                return ("rejected", str(e))
+            except Exception as e:  # never lose the outcome
+                self.switcher._logger.warning("rename failed", exc_info=True)
+                return ("rejected", str(e) or type(e).__name__)
+
+        def _drain_rename_outcomes(self, quitting=False):
+            with self._event_lock:
+                outcomes, self._rename_outcomes = self._rename_outcomes, []
+                idle = not self._renames_in_flight
+            if outcomes and idle:
+                self._dirty = True  # re-enable the Rename submenu
+            not_saved = False
+            for outcome in outcomes:
+                kind = outcome[0]
+                if kind == "ok":
+                    self._apply_rename(*outcome[1:])
+                elif kind == "gone":
+                    rumps.alert(title="claude-swap", message="Account changed, rename cancelled")
+                elif kind in ("busy", "abandoned"):
+                    not_saved = True
+                elif kind == "failed":
+                    rumps.alert(title="claude-swap", message=f"Could not rename: {outcome[1]}")
+                else:
+                    rumps.alert(title="claude-swap", message=outcome[1])
+            if not_saved and quitting:
+                # A notification would not outlive the process.
+                rumps.alert(
+                    title="claude-swap",
+                    message="Rename not saved: another cswap process was busy",
+                )
+            elif not_saved:
+                rumps.notification(
+                    "claude-swap", "Could not rename", "Another cswap process is busy, try again"
+                )
+
+        def _apply_rename(self, slot, email, org, alias):
+            # Show it now, on the row showing the renamed account: the next
+            # tick rebuilds from this snapshot. The generation bump makes any
+            # refresh already in flight discard its older reading, and a
+            # fresh refresh reads the store back.
+            with self._snapshot_lock:  # one step with the refresh's compare-and-publish
+                snap = dict(self.snapshot)
+                orgs = snap.get("orgs") or {}
+
+                def renamed(entry):
+                    # An account is its email and organization together: the
+                    # same email can sit in two rows, and after a swap the
+                    # store's slot need not be this snapshot's slot for it.
+                    if entry[1] != email:
+                        return False
+                    if org is None:  # a caller that never saw the organization
+                        return str(entry[0]) == slot
+                    return (orgs.get(str(entry[0])) or "") == (org or "")
+
+                snap["accounts"] = [
+                    entry[:5] + (alias,) + entry[6:] if renamed(entry) else entry
+                    for entry in snap["accounts"]
+                ]
+                if any(entry[2] and renamed(entry) for entry in snap["accounts"]):
+                    snap["active_alias"] = alias
+                self._snapshot_gen += 1
+                self.snapshot = snap
+            self._dirty = True
+            self._request_refresh()
+
+        def on_toggle_names_only(self, _sender):
+            self.settings.show_names_only = not self.settings.show_names_only
             self._save_and_rebuild()
 
         def on_toggle_scoped(self, _sender):

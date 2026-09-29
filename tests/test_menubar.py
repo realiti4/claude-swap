@@ -1714,3 +1714,12 @@ def test_a_slow_clean_dashboard_does_not_count_as_waiting(tmp_path: Path):
     waited, err = _pauses(tmp_path, _create_script(tmp_path, exe, cwd))
     assert not waited
     assert err == ""
+
+
+def test_adapt_snapshot_records_each_accounts_organization():
+    a = _FakeAcct("1", "a@x.com", True, _FakeEntry())
+    a.org_uuid = "org-a"
+    b = _FakeAcct("2", "a@x.com", False, _FakeEntry())
+    b.org_uuid = ""
+    snap = menubar._adapt_snapshot(_FakeSnap([a, b]))
+    assert snap["orgs"] == {"1": "org-a", "2": ""}
