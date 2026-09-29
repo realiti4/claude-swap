@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
+import os
 import plistlib
+import shlex
+import shutil
+import stat
+import subprocess
+import threading
 import sys
 from pathlib import Path
 
@@ -617,3 +624,1102 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- open dashboard -------------------------------------------------------------
+
+def _no_which(_name):
+    return None
+
+
+def test_dashboard_executable_uses_launching_cswap(tmp_path: Path):
+    exe = tmp_path / "venv" / "bin" / "cswap"
+    cmd = menubar.dashboard_executable(
+        argv0=str(exe), which=lambda _n: "/elsewhere/cswap", python="/py"
+    )
+    assert cmd == [str(exe), "watch"]
+
+
+def test_dashboard_executable_accepts_claude_swap_name(tmp_path: Path):
+    exe = tmp_path / "bin" / "claude-swap"
+    cmd = menubar.dashboard_executable(argv0=str(exe), which=_no_which, python="/py")
+    assert cmd == [str(exe), "watch"]
+
+
+def test_dashboard_executable_makes_relative_argv0_absolute(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cmd = menubar.dashboard_executable(argv0="bin/cswap", which=_no_which, python="/py")
+    assert cmd == [str(tmp_path / "bin" / "cswap"), "watch"]
+
+
+def test_dashboard_executable_module_launch_beats_competing_path_install(tmp_path: Path):
+    # `/venv-A/bin/python -m claude_swap menubar` with venv B's cswap on PATH:
+    # the dashboard must stay on install A, so PATH is never consulted.
+    main_py = tmp_path / "venv-A" / "lib" / "site-packages" / "claude_swap" / "__main__.py"
+    seen = []
+
+    def which(name):
+        seen.append(name)
+        return "/venv-B/bin/cswap"
+
+    cmd = menubar.dashboard_executable(
+        argv0=str(main_py), which=which, python="/venv-A/bin/python"
+    )
+    assert cmd == ["/venv-A/bin/python", "-m", "claude_swap", "watch"]
+    assert seen == []
+
+
+def test_dashboard_executable_other_packages_main_uses_path():
+    # Only this package's __main__.py is a module launch of cswap; another
+    # tool's __main__.py (e.g. a test runner) falls through to PATH.
+    seen = []
+
+    def which(name):
+        seen.append(name)
+        return "/opt/bin/cswap" if name == "cswap" else None
+
+    cmd = menubar.dashboard_executable(
+        argv0="/usr/lib/python3/site-packages/pytest/__main__.py", which=which, python="/py"
+    )
+    assert cmd == [os.path.abspath("/opt/bin/cswap"), "watch"]
+    assert seen == ["cswap"]
+
+
+def test_dashboard_executable_path_lookup_is_made_absolute(tmp_path: Path, monkeypatch):
+    # PATH=.venv/bin:... makes which() return a relative path, which breaks
+    # once Terminal starts the command in $HOME.
+    monkeypatch.chdir(tmp_path)
+    cmd = menubar.dashboard_executable(
+        argv0="/x/python", which=lambda n: ".venv/bin/cswap" if n == "cswap" else None, python="/py"
+    )
+    assert cmd == [str(tmp_path / ".venv" / "bin" / "cswap"), "watch"]
+
+
+def test_dashboard_executable_bare_argv0_lookup_is_made_absolute(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cmd = menubar.dashboard_executable(
+        argv0="cswap", which=lambda n: "bin/cswap" if n == "cswap" else None, python="/py"
+    )
+    assert cmd == [str(tmp_path / "bin" / "cswap"), "watch"]
+
+
+def test_dashboard_executable_tries_claude_swap_after_cswap():
+    def which(name):
+        return "/opt/bin/claude-swap" if name == "claude-swap" else None
+
+    cmd = menubar.dashboard_executable(argv0="/x/python", which=which, python="/py")
+    assert cmd == [os.path.abspath("/opt/bin/claude-swap"), "watch"]
+
+
+def test_dashboard_executable_falls_back_to_python_module():
+    cmd = menubar.dashboard_executable(argv0="/x/python", which=_no_which, python="/v/bin/python")
+    assert cmd == ["/v/bin/python", "-m", "claude_swap", "watch"]
+
+
+def test_dashboard_executable_defaults_to_sys_argv0(monkeypatch, tmp_path: Path):
+    exe = tmp_path / "cswap"
+    monkeypatch.setattr(sys, "argv", [str(exe)])
+    assert menubar.dashboard_executable(which=_no_which, python="/py") == [str(exe), "watch"]
+
+
+class _Proc:
+    def __init__(self, returncode, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = ""
+
+
+_ENV_NONE = {"CLAUDE_CONFIG_DIR": None, "CLAUDE_SECURESTORAGE_CONFIG_DIR": None,
+             "XDG_DATA_HOME": None, "PYTHONPATH": None}
+
+
+def _open(script_dir: Path, run, create=None, cwd="/w", env=None):
+    kwargs = {} if create is None else {"create": create}
+    return menubar.open_dashboard_terminal(
+        ["/bin/cswap", "watch"], script_dir, cwd=cwd,
+        env=_ENV_NONE if env is None else env, run=run, **kwargs,
+    )
+
+
+def test_open_dashboard_terminal_writes_script_then_opens_it_in_terminal(tmp_path: Path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return _Proc(0)
+
+    ok, _msg = _open(tmp_path, run)
+    assert ok is True
+    argv, kwargs = calls[0]
+    # By bundle id, so a renamed Terminal.app still resolves.
+    assert argv[:3] == ["open", "-b", "com.apple.Terminal"]
+    script = Path(argv[3])
+    assert script.parent == tmp_path
+    assert script.name.startswith("open-dashboard.") and script.name.endswith(".command")
+    assert script.read_text() == menubar.dashboard_script(["/bin/cswap", "watch"], env=_ENV_NONE, cwd="/w")
+    assert kwargs.get("check") is False
+    assert kwargs.get("timeout") == 30
+
+
+def test_open_dashboard_terminal_uses_a_fresh_file_per_launch(tmp_path: Path):
+    # Two menu bars (different profiles, same backup dir) must never share a
+    # script: B's write could otherwise replace A's before Terminal reads it.
+    opened = []
+    run = lambda argv, **kw: opened.append(Path(argv[3])) or _Proc(0)  # noqa: E731
+    env_a = dict(_ENV_NONE, CLAUDE_CONFIG_DIR="/profile/a")
+    env_b = dict(_ENV_NONE, CLAUDE_CONFIG_DIR="/profile/b")
+    assert _open(tmp_path, run, cwd="/cwd/a", env=env_a)[0]
+    assert _open(tmp_path, run, cwd="/cwd/b", env=env_b)[0]
+    a, b = opened
+    assert a != b
+    assert a.read_text() == menubar.dashboard_script(["/bin/cswap", "watch"], env=env_a, cwd="/cwd/a")
+    assert b.read_text() == menubar.dashboard_script(["/bin/cswap", "watch"], env=env_b, cwd="/cwd/b")
+
+
+def _no_files(directory: Path) -> bool:
+    return list(directory.iterdir()) == []
+
+
+def test_open_dashboard_terminal_missing_terminal_reports_open_error(tmp_path: Path):
+    def run(argv, **kwargs):
+        return _Proc(1, stderr="Unable to find application with bundle identifier com.apple.Terminal\n")
+
+    ok, msg = _open(tmp_path, run)
+    assert ok is False
+    assert "Unable to find application" in msg
+    assert _no_files(tmp_path)  # nobody will ever run that script
+
+
+def test_open_dashboard_terminal_nonzero_exit_without_stderr(tmp_path: Path):
+    ok, msg = _open(tmp_path, lambda argv, **kw: _Proc(1))
+    assert ok is False
+    assert msg
+    assert _no_files(tmp_path)
+
+
+def test_open_dashboard_terminal_missing_open_command(tmp_path: Path):
+    def run(argv, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "open")
+
+    ok, msg = _open(tmp_path, run)
+    assert ok is False
+    assert "open" in msg
+    assert _no_files(tmp_path)
+
+
+def test_open_dashboard_terminal_timeout(tmp_path: Path):
+    def run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout") or 0)
+
+    ok, msg = _open(tmp_path, run)
+    assert ok is False
+    assert msg
+    assert _no_files(tmp_path)
+
+
+def test_open_dashboard_terminal_create_failure_never_runs_open(tmp_path: Path):
+    ran = []
+
+    def create(_directory, _text):
+        raise PermissionError(13, "Permission denied")
+
+    ok, msg = _open(tmp_path, lambda argv, **kw: ran.append(argv) or _Proc(0), create=create)
+    assert ok is False
+    assert "Permission denied" in msg
+    assert ran == []
+
+
+def test_open_dashboard_terminal_missing_backup_dir_fails_cleanly(tmp_path: Path):
+    ran = []
+    ok, msg = _open(tmp_path / "gone", lambda argv, **kw: ran.append(argv) or _Proc(0))
+    assert ok is False
+    assert "launcher script" in msg
+    assert ran == []
+
+
+def test_dashboard_executable_resolves_bare_argv0_on_path():
+    # A bare name has no directory to anchor it; abspath would invent one
+    # under the cwd, so it must be looked up on PATH instead.
+    cmd = menubar.dashboard_executable(
+        argv0="cswap", which=lambda n: "/opt/bin/cswap" if n == "cswap" else None, python="/py"
+    )
+    assert cmd == [os.path.abspath("/opt/bin/cswap"), "watch"]
+
+
+# --- dashboard environment ------------------------------------------------------
+
+_KEYS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME", "PYTHONPATH", "HOME")
+
+
+def test_dashboard_env_keys_are_exactly_the_profile_and_import_keys():
+    assert menubar.DASHBOARD_ENV_KEYS == _KEYS
+
+
+def test_dashboard_env_marks_every_key_set_or_unset():
+    environ = {
+        "CLAUDE_CONFIG_DIR": "/profiles/work",
+        "PATH": "/usr/bin",
+        "HOME": "/Users/x",
+        "TERM": "xterm-256color",
+    }
+    assert menubar.dashboard_env(environ) == {
+        "CLAUDE_CONFIG_DIR": "/profiles/work",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": None,
+        "XDG_DATA_HOME": None,
+        "PYTHONPATH": None,
+        "HOME": "/Users/x",
+    }
+
+
+def test_dashboard_env_forwards_home():
+    # The account store (~/.claude-swap-backup) and the default profile both
+    # resolve through HOME, so the dashboard must use the menu bar's.
+    assert menubar.dashboard_env({"HOME": "/Users/menu"})["HOME"] == "/Users/menu"
+    assert menubar.dashboard_env({})["HOME"] is None
+
+
+def test_dashboard_env_keeps_empty_value_as_set():
+    # An empty CLAUDE_SECURESTORAGE_CONFIG_DIR selects the default keychain
+    # service, which differs from it being unset.
+    env = menubar.dashboard_env({"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""})
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+
+
+def test_dashboard_env_forwards_pythonpath():
+    env = menubar.dashboard_env({"PYTHONPATH": "src"})
+    assert env["PYTHONPATH"] == "src"
+
+
+def test_dashboard_env_defaults_to_process_environment(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/from/process")
+    for key in _KEYS[1:]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HOME", "/from/process/home")
+    assert menubar.dashboard_env() == {
+        "CLAUDE_CONFIG_DIR": "/from/process",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": None,
+        "XDG_DATA_HOME": None,
+        "PYTHONPATH": None,
+        "HOME": "/from/process/home",
+    }
+
+
+def _exec_argv(script: str) -> list[str]:
+    # The command line between "then" and the status capture; quoted values
+    # may themselves contain newlines, so this is not a line-based split.
+    body = script.split("; then\n    ", 1)[1].split("\n    dashboard_status=$?", 1)[0]
+    return shlex.split(body)
+
+
+def test_dashboard_cwd_returns_current_directory():
+    assert menubar.dashboard_cwd(getcwd=lambda: "/work dir") == "/work dir"
+
+
+def test_dashboard_cwd_failure_returns_none():
+    def gone():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    assert menubar.dashboard_cwd(getcwd=gone) is None
+
+
+def test_dashboard_script_exact_text_for_awkward_cwd():
+    cwd = "/Users/o'brien/My \"50%\" dir\nété"
+    script = menubar.dashboard_script(["/bin/cswap", "watch"], env=_ENV_NONE, cwd=cwd)
+    quoted_cwd = "'/Users/o'\"'\"'brien/My \"50%\" dir\nété'"
+    assert script == (
+        "#!/bin/sh\n"
+        'rm -f -- "$0"\n'
+        f"if cd {quoted_cwd}; then\n"
+        "    /usr/bin/env -u CLAUDE_CONFIG_DIR -u CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        " -u XDG_DATA_HOME -u PYTHONPATH /bin/cswap watch\n"
+        "    dashboard_status=$?\n"
+        '    if [ "$dashboard_status" -ne 0 ]; then\n'
+        "        printf '%s\\n' \"cswap: the dashboard exited with status $dashboard_status."
+        " Run: cswap watch\" >&2\n"
+        "        printf '%s\\n' 'Press Return to close this window.' >&2\n"
+        "        read -r _ || :\n"
+        "    fi\n"
+        "else\n"
+        "    printf '%s\\n' 'cswap: cannot open the dashboard from "
+        "/Users/o'\"'\"'brien/My \"50%\" dir\nété "
+        "(Terminal may not have access to it). Run: cswap watch' >&2\n"
+        "    printf '%s\\n' 'Press Return to close this window.' >&2\n"
+        "    read -r _ || :\n"
+        "fi\n"
+    )
+
+
+def test_dashboard_script_has_no_exit_or_exec():
+    # Nothing may end the window early, and the script must outlive the
+    # dashboard so it can report a failed start.
+    words = menubar.dashboard_script(["/bin/cswap", "watch"], env=_ENV_NONE, cwd="/w").split()
+    assert "exit" not in words
+    assert "exec" not in words
+
+
+def test_dashboard_script_unsets_missing_keys_and_sets_present_ones():
+    env = {"CLAUDE_CONFIG_DIR": "/p", "CLAUDE_SECURESTORAGE_CONFIG_DIR": None,
+           "XDG_DATA_HOME": "", "PYTHONPATH": None}
+    argv = _exec_argv(menubar.dashboard_script(["/bin/cswap", "watch"], env=env, cwd="/w"))
+    assert argv == [
+        "/usr/bin/env",
+        "-u", "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "-u", "PYTHONPATH",
+        "CLAUDE_CONFIG_DIR=/p",
+        "XDG_DATA_HOME=",
+        "/bin/cswap", "watch",
+    ]
+
+
+def test_dashboard_script_routes_exe_with_equals_sign_through_sh():
+    # env takes its first NAME=value operand as an assignment, so a program
+    # path containing "=" must not be env's utility operand.
+    argv = _exec_argv(menubar.dashboard_script(["/opt/a=b/cswap", "watch"], env=_ENV_NONE, cwd="/w"))
+    assert argv[-5:] == ["/bin/sh", "-c", 'exec "$0" "$@"', "/opt/a=b/cswap", "watch"]
+
+
+@pytest.mark.parametrize(
+    "value, path",
+    [
+        ('/p "q" \\x', '/Users/a b/"q"/cswap'),
+        ("/it's 100%", "/Users/o'brien/cswap"),
+        ("/line1\nline2", "/tmp/new\nline/cswap"),
+        ("/Profils/été 日本", "/Users/üñî/\U0001f600/cswap"),
+        ("", "/bin/cswap"),
+    ],
+)
+def test_dashboard_script_quotes_values_and_paths(value, path):
+    env = dict(_ENV_NONE, CLAUDE_CONFIG_DIR=value)
+    argv = _exec_argv(menubar.dashboard_script([path, "watch"], env=env, cwd="/w"))
+    assert argv == [
+        "/usr/bin/env",
+        "-u", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "-u", "XDG_DATA_HOME", "-u", "PYTHONPATH",
+        f"CLAUDE_CONFIG_DIR={value}", path, "watch",
+    ]
+
+
+def test_create_dashboard_script_is_owner_only_executable(tmp_path: Path):
+    path = menubar.create_dashboard_script(tmp_path, "#!/bin/sh\necho hi\n")
+    assert path.parent == tmp_path
+    assert path.name.startswith("open-dashboard.") and path.name.endswith(".command")
+    assert path.read_text() == "#!/bin/sh\necho hi\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+def test_create_dashboard_script_never_reuses_a_name(tmp_path: Path):
+    paths = {menubar.create_dashboard_script(tmp_path, f"{i}\n") for i in range(20)}
+    assert len(paths) == 20
+    assert all(p.read_text() == f"{i}\n" for i, p in enumerate(sorted(paths, key=lambda p: int(p.read_text()))))
+
+
+def test_create_dashboard_script_write_failure_leaves_no_file(tmp_path: Path, monkeypatch):
+    real_fdopen = os.fdopen
+
+    class _Broken:
+        def __init__(self, f):
+            self._f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+            return False
+
+        def write(self, _text):
+            raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(menubar.os, "fdopen", lambda fd, *a, **k: _Broken(real_fdopen(fd, *a, **k)))
+    with pytest.raises(OSError):
+        menubar.create_dashboard_script(tmp_path, "x\n")
+    assert _no_files(tmp_path)
+
+
+def test_create_dashboard_script_chmod_failure_leaves_no_file(tmp_path: Path, monkeypatch):
+    def broken_chmod(*_a, **_k):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(menubar.os, "chmod", broken_chmod)
+    with pytest.raises(OSError):
+        menubar.create_dashboard_script(tmp_path, "x\n")
+    assert _no_files(tmp_path)
+
+
+def test_create_dashboard_script_missing_directory_raises(tmp_path: Path):
+    with pytest.raises(OSError):
+        menubar.create_dashboard_script(tmp_path / "gone", "x\n")
+
+
+def _fake_exe(directory: Path, exit_code: int = 0) -> Path:
+    directory.mkdir(parents=True)
+    exe = directory / "cswap"
+    exe.write_text(
+        "#!/bin/sh\n"
+        'printf "cwd=%s\\n" "$(pwd -P)"\n'
+        'printf "args=%s\\n" "$*"\n'
+        "env\n"
+        f"exit {exit_code}\n"
+    )
+    exe.chmod(0o755)
+    return exe
+
+
+def _shell(shell: str) -> str:
+    if sys.platform == "win32":
+        pytest.skip("POSIX shells and /usr/bin/env")
+    path = shutil.which(shell)
+    if path is None:
+        pytest.skip(f"{shell} not installed")
+    return path
+
+
+# The environment Terminal's shell would have: its own HOME, and rc files that
+# export a different profile and a secure-storage override the menu bar never
+# had.
+def _rc_environment(home: Path) -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        "CLAUDE_CONFIG_DIR": "/rc/profile",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/rc/secure",
+        "PYTHONPATH": "/rc/pythonpath",
+    }
+
+
+_MENU_HOME = "/Users/menu bar's home"
+_MENU_ENV = {"CLAUDE_CONFIG_DIR": "profiles/work", "CLAUDE_SECURESTORAGE_CONFIG_DIR": None,
+             "XDG_DATA_HOME": "", "PYTHONPATH": "src", "HOME": _MENU_HOME}
+_AWKWARD_CWD = "menu bar's \"50%\" cwd é"
+
+
+def _create_script(tmp_path: Path, exe: Path, cwd: Path, env=None) -> Path:
+    backup = tmp_path / "backup dir"
+    backup.mkdir(exist_ok=True)
+    return menubar.create_dashboard_script(
+        backup,
+        menubar.dashboard_script([str(exe), "watch"], env=_MENU_ENV if env is None else env, cwd=str(cwd)),
+    )
+
+
+def _run_script(shell_path, script, tmp_path, stdin=subprocess.DEVNULL):
+    return subprocess.run(
+        [shell_path, str(script)], env=_rc_environment(tmp_path), cwd=str(tmp_path),
+        stdin=stdin, capture_output=True, text=True, check=False,
+    )
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash"])
+@pytest.mark.parametrize("exe_dir", ["bin dir", "a=b dir"])
+def test_dashboard_script_file_runs_with_menu_bar_profile_and_cwd(tmp_path: Path, shell, exe_dir):
+    shell_path = _shell(shell)
+    exe = _fake_exe(tmp_path / exe_dir)
+    cwd = tmp_path / _AWKWARD_CWD
+    cwd.mkdir()
+    script = _create_script(tmp_path, exe, cwd)
+    proc = _run_script(shell_path, script, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert f"cwd={os.path.realpath(cwd)}" in lines
+    assert "args=watch" in lines
+    assert "CLAUDE_CONFIG_DIR=profiles/work" in lines
+    assert "XDG_DATA_HOME=" in lines
+    assert "PYTHONPATH=src" in lines
+    assert not any(l.startswith("CLAUDE_SECURESTORAGE_CONFIG_DIR=") for l in lines)
+    assert f"HOME={_MENU_HOME}" in lines  # the menu bar's HOME, not Terminal's
+    assert "HOME=" + str(tmp_path) not in lines
+    assert "PATH=" + _rc_environment(tmp_path)["PATH"] in lines  # the rest passes through
+    assert proc.stderr == ""  # a clean exit reports nothing
+    assert not script.exists()  # the script removed itself
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash"])
+def test_dashboard_script_file_removes_home_the_menu_bar_lacked(tmp_path: Path, shell):
+    shell_path = _shell(shell)
+    exe = _fake_exe(tmp_path / "bin dir")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    script = _create_script(tmp_path, exe, cwd, env=dict(_MENU_ENV, HOME=None))
+    proc = _run_script(shell_path, script, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert "args=watch" in lines
+    assert not any(l.startswith("HOME=") for l in lines)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shebang")
+def test_dashboard_script_file_runs_directly_by_its_shebang(tmp_path: Path):
+    # Terminal executes the file itself, so the shebang and mode must work.
+    exe = _fake_exe(tmp_path / "bin dir")
+    cwd = tmp_path / _AWKWARD_CWD
+    cwd.mkdir()
+    script = _create_script(tmp_path, exe, cwd)
+    proc = subprocess.run(
+        [str(script)], env=_rc_environment(tmp_path), cwd=str(tmp_path),
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "args=watch" in proc.stdout.splitlines()
+    assert not script.exists()
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash"])
+@pytest.mark.parametrize("failure", ["missing", "no access"])
+def test_dashboard_script_file_reports_unenterable_cwd(tmp_path: Path, shell, failure):
+    shell_path = _shell(shell)
+    if failure == "no access" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root enters any directory")
+    exe = _fake_exe(tmp_path / "bin dir")
+    cwd = tmp_path / _AWKWARD_CWD
+    script = _create_script(tmp_path, exe, cwd)
+    try:
+        if failure == "no access":
+            cwd.mkdir()
+            cwd.chmod(0)  # inside the try, so the finally always restores it
+        proc = _run_script(shell_path, script, tmp_path)
+    finally:
+        if cwd.exists():
+            cwd.chmod(0o755)
+    assert f"cswap: cannot open the dashboard from {cwd}" in proc.stderr
+    assert "Run: cswap watch" in proc.stderr
+    assert "Press Return to close this window." in proc.stderr
+    assert "args=" not in proc.stdout  # the dashboard never started
+    assert not script.exists()
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash"])
+@pytest.mark.parametrize("case", ["exits 3", "missing exe", "not executable"])
+def test_dashboard_script_file_reports_failed_dashboard(tmp_path: Path, shell, case):
+    shell_path = _shell(shell)
+    if case == "exits 3":
+        exe, expected = _fake_exe(tmp_path / "bin dir", exit_code=3), 3
+    elif case == "missing exe":
+        exe, expected = tmp_path / "gone" / "cswap", 127
+    else:
+        exe = _fake_exe(tmp_path / "bin dir")
+        exe.chmod(0o644)
+        expected = 126
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    script = _create_script(tmp_path, exe, cwd)
+    proc = _run_script(shell_path, script, tmp_path)
+    assert f"cswap: the dashboard exited with status {expected}. Run: cswap watch" in proc.stderr
+    assert "Press Return to close this window." in proc.stderr
+    assert not script.exists()
+
+
+def _pauses(tmp_path: Path, script: Path) -> tuple[bool, str]:
+    """Whether the script stops for Return, and its stderr once answered.
+
+    No clock decides it: stderr is read to the end, and the script counts as
+    waiting when it prints the prompt and then blocks on its read, which
+    this answers. A script that exits cleanly just closes stderr. The
+    watchdog only bounds a hang (a read with no prompt), and a hang fails.
+    """
+    proc = subprocess.Popen(
+        ["/bin/sh", str(script)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True, env=_rc_environment(tmp_path),
+    )
+    watchdog = threading.Timer(10, proc.kill)
+    watchdog.start()
+    waited, err = False, []
+    try:
+        for line in proc.stderr:
+            err.append(line)
+            if "Press Return to close this window." in line:
+                waited = True
+                proc.stdin.write("\n")
+                proc.stdin.close()
+        proc.wait(timeout=10)
+    finally:
+        watchdog.cancel()
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode >= 0, "the script hung and was killed"
+    return waited, "".join(err)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shells")
+def test_dashboard_script_waits_for_return_after_unenterable_cwd(tmp_path: Path):
+    # Terminal runs "<file> ; exit;", and a profile may close the window when
+    # the shell exits, so the message must stay up until the user answers.
+    script = _create_script(tmp_path, _fake_exe(tmp_path / "bin dir"), tmp_path / "missing")
+    waited, err = _pauses(tmp_path, script)
+    assert waited
+    assert "Press Return to close this window." in err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shells")
+@pytest.mark.parametrize("exit_code", [3, 127])
+def test_dashboard_script_waits_for_return_after_failed_dashboard(tmp_path: Path, exit_code):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    exe = _fake_exe(tmp_path / "bin dir", exit_code=3) if exit_code == 3 else tmp_path / "gone" / "cswap"
+    waited, err = _pauses(tmp_path, _create_script(tmp_path, exe, cwd))
+    assert waited
+    assert f"exited with status {exit_code}" in err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shells")
+def test_dashboard_script_does_not_wait_after_clean_exit(tmp_path: Path):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    waited, err = _pauses(tmp_path, _create_script(tmp_path, _fake_exe(tmp_path / "bin dir"), cwd))
+    assert not waited
+    assert err == ""
+
+
+def test_launcher_default_open_uses_process_env_cwd_and_script_dir(monkeypatch, tmp_path: Path):
+    seen = {}
+
+    def fake_open(cmd, script_dir, cwd, env=None):
+        seen.update(cmd=cmd, script_dir=script_dir, env=env, cwd=cwd)
+        return True, "ok"
+
+    monkeypatch.setattr(menubar, "open_dashboard_terminal", fake_open)
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: {"CLAUDE_CONFIG_DIR": "/x"})
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: "/menu/cwd")
+    launcher = menubar.DashboardLauncher(_Logger(), tmp_path, start_thread=lambda target: target())
+    launcher.start()
+    assert seen == {
+        "cmd": ["/bin/cswap", "watch"],
+        "script_dir": tmp_path,
+        "env": {"CLAUDE_CONFIG_DIR": "/x"},
+        "cwd": "/menu/cwd",
+    }
+
+
+def test_launcher_refuses_to_open_without_a_working_directory(monkeypatch, tmp_path: Path):
+    # Without the cd, relative profile and PYTHONPATH values would resolve
+    # against Terminal's directory: a different profile or package. Fail closed.
+    opened = []
+    monkeypatch.setattr(menubar, "open_dashboard_terminal", lambda *a, **k: opened.append(1) or (True, "ok"))
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: {"CLAUDE_CONFIG_DIR": "rel"})
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: None)
+    logger = _Logger()
+    launcher = menubar.DashboardLauncher(logger, tmp_path, start_thread=lambda target: target())
+    launcher.start()
+    assert opened == []
+    error = launcher.take_error()
+    assert error == menubar.DASHBOARD_CWD_GONE
+    assert "working directory" in error and "restart the menu bar" in error
+    assert logger.warnings == [f"Could not open dashboard: {error}"]
+
+
+def test_launcher_refuses_when_the_script_cannot_be_written(monkeypatch, tmp_path: Path):
+    ran = []
+    monkeypatch.setattr(menubar.subprocess, "run", lambda *a, **k: ran.append(a) or _Proc(0))
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: dict(_ENV_NONE))
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: "/menu/cwd")
+    logger = _Logger()
+    launcher = menubar.DashboardLauncher(
+        logger, tmp_path / "no such dir", start_thread=lambda target: target()
+    )
+    launcher.start()
+    assert ran == []  # Terminal was never asked to open anything
+    error = launcher.take_error()
+    assert error and "launcher script" in error
+    assert logger.warnings == [f"Could not open dashboard: {error}"]
+
+
+# --- stale launcher sweep ---------------------------------------------------------
+
+def _dead_pid() -> int:
+    """A pid that belonged to a process which has exited and been reaped."""
+    proc = subprocess.Popen(["sleep", "30"])
+    proc.terminate()
+    proc.wait(timeout=5)
+    return proc.pid
+
+
+def _launcher(directory: Path, pid, rest: str = "x1y2z3") -> Path:
+    path = directory / f"open-dashboard.{pid}.{rest}.command"
+    path.write_text("x\n")
+    return path
+
+
+def test_create_dashboard_script_name_carries_the_creating_pid(tmp_path: Path):
+    path = menubar.create_dashboard_script(tmp_path, "x\n")
+    assert path.name.startswith(f"open-dashboard.{os.getpid()}.")
+    assert path.name.endswith(".command")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_removes_launchers_of_dead_instances(tmp_path: Path):
+    dead = _launcher(tmp_path, _dead_pid())
+    removed = menubar.sweep_stale_dashboard_scripts(tmp_path)
+    assert removed == 1
+    assert not dead.exists()
+
+
+def test_sweep_keeps_this_instances_launchers(tmp_path: Path):
+    mine = _launcher(tmp_path, os.getpid())
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+    assert mine.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_keeps_launchers_of_another_live_instance(tmp_path: Path):
+    other = subprocess.Popen(["sleep", "30"])
+    try:
+        theirs = _launcher(tmp_path, other.pid)
+        assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+        assert theirs.exists()
+    finally:
+        other.terminate()
+        other.wait(timeout=5)
+
+
+def test_sweep_keeps_launchers_of_a_pid_it_may_not_signal(tmp_path: Path, monkeypatch):
+    # kill(pid, 0) raising PermissionError means the process exists.
+    def kill(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(menubar.os, "kill", kill)
+    theirs = _launcher(tmp_path, 424242)
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+    assert theirs.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_keeps_names_without_a_parsable_pid(tmp_path: Path):
+    names = [
+        "open-dashboard.abc123.command",   # no pid segment (older naming)
+        "open-dashboard.12ab.x.command",
+        "open-dashboard..x.command",
+        "open-dashboard.-5.x.command",
+        "open-dashboard. 7.x.command",
+    ]
+    for name in names:
+        (tmp_path / name).write_text("x\n")
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(names)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_keeps_unrelated_names_even_with_a_dead_pid(tmp_path: Path):
+    pid = _dead_pid()
+    unrelated = [
+        tmp_path / "accounts.json",
+        tmp_path / f"backup.{pid}.x.command",           # right suffix, wrong prefix
+        # Same length as the real prefix, so slicing the prefix off would
+        # still find the dead pid: only the prefix check keeps it.
+        tmp_path / f"other-launcher.{pid}.x.command",
+        tmp_path / f"open-dashboard.{pid}.x.txt",       # right prefix, wrong suffix
+    ]
+    for p in unrelated:
+        p.write_text("x\n")
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+    assert all(p.exists() for p in unrelated)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_skips_non_regular_entries(tmp_path: Path):
+    pid = _dead_pid()
+    target = tmp_path / "keep-me.txt"
+    target.write_text("x\n")
+    link = tmp_path / f"open-dashboard.{pid}.link.command"
+    link.symlink_to(target)
+    folder = tmp_path / f"open-dashboard.{pid}.dir.command"
+    folder.mkdir()
+    menubar.sweep_stale_dashboard_scripts(tmp_path)
+    assert link.is_symlink() and target.exists()
+    assert folder.is_dir()
+
+
+def test_sweep_missing_directory_is_a_no_op(tmp_path: Path):
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path / "gone") == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_unlink_error_does_not_stop_the_others(tmp_path: Path, monkeypatch):
+    pid = _dead_pid()
+    stuck = _launcher(tmp_path, pid, "stuck")
+    others = [_launcher(tmp_path, pid, f"o{i}") for i in range(3)]
+    real_unlink = os.unlink
+
+    def unlink(path, *a, **k):
+        if os.fspath(path) == str(stuck):
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(path, *a, **k)
+
+    monkeypatch.setattr(menubar.os, "unlink", unlink)
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 3
+    assert stuck.exists()
+    assert not any(p.exists() for p in others)
+
+
+def test_launcher_sweeps_stale_scripts_before_creating_a_new_one(monkeypatch, tmp_path: Path):
+    order = []
+    monkeypatch.setattr(
+        menubar, "sweep_stale_dashboard_scripts",
+        lambda directory, **k: order.append(("sweep", directory)) or 0,
+    )
+    monkeypatch.setattr(
+        menubar, "open_dashboard_terminal",
+        lambda cmd, script_dir, cwd, env=None: order.append(("open", script_dir)) or (True, "ok"),
+    )
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: dict(_ENV_NONE))
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: "/menu/cwd")
+    launched_on = []
+    launcher = menubar.DashboardLauncher(
+        _Logger(), tmp_path,
+        start_thread=lambda target: launched_on.append(1) or target(),
+    )
+    launcher.start()
+    assert order == [("sweep", tmp_path), ("open", tmp_path)]
+    assert launched_on == [1]  # it ran inside the worker, not on the click
+
+
+def test_launcher_real_sweep_keeps_a_pending_launch(monkeypatch, tmp_path: Path):
+    # A launch Terminal has not picked up yet belongs to a live instance (this
+    # one) and must survive the next click's sweep, however the clock moves.
+    pending = menubar.create_dashboard_script(tmp_path, "x\n")
+    old = 1_000_000_000
+    os.utime(pending, (old, old))
+    monkeypatch.setattr(menubar, "open_dashboard_terminal", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: dict(_ENV_NONE))
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: "/menu/cwd")
+    menubar.DashboardLauncher(_Logger(), tmp_path, start_thread=lambda t: t()).start()
+    assert pending.exists()
+
+
+def test_launcher_pid_accepts_up_to_pid_t_max():
+    assert menubar._launcher_pid("open-dashboard.2147483647.x.command") == 2**31 - 1
+    assert menubar._launcher_pid("open-dashboard.1.x.command") == 1
+
+
+def test_launcher_pid_rejects_values_above_pid_t_max():
+    assert menubar._launcher_pid("open-dashboard.2147483648.x.command") is None
+    assert menubar._launcher_pid("open-dashboard.99999999999999999999.x.command") is None
+
+
+def test_pid_alive_treats_unrepresentable_pid_as_alive():
+    # os.kill raises OverflowError past C int range, outside OSError.
+    assert menubar._pid_alive(2**31) is True
+    assert menubar._pid_alive(2**64) is True
+
+
+def test_sweep_keeps_oversized_pid_file_and_continues(tmp_path: Path):
+    oversized = _launcher(tmp_path, 2**31)
+    mine = _launcher(tmp_path, os.getpid())
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+    assert oversized.exists() and mine.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pids and sleep")
+def test_sweep_survives_an_unexpected_error_on_one_entry(tmp_path: Path, monkeypatch, caplog):
+    pid = _dead_pid()
+    broken = _launcher(tmp_path, 7777777)
+    others = [_launcher(tmp_path, pid, f"o{i}") for i in range(2)]
+    real_alive = menubar._pid_alive
+
+    def alive(p):
+        if p == 7777777:
+            raise RuntimeError("unexpected")
+        return real_alive(p)
+
+    monkeypatch.setattr(menubar, "_pid_alive", alive)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 2
+    assert broken.exists()
+    assert not any(p.exists() for p in others)
+    assert any("unexpected" in r.getMessage() or r.exc_info for r in caplog.records)
+
+
+def test_sweep_never_raises_even_if_listing_breaks(tmp_path: Path, monkeypatch):
+    def scandir(_d):
+        raise RuntimeError("listing broke")
+
+    monkeypatch.setattr(menubar.os, "scandir", scandir)
+    assert menubar.sweep_stale_dashboard_scripts(tmp_path) == 0
+
+
+def _launch_with_real_sweep(monkeypatch, tmp_path: Path):
+    opened = []
+    monkeypatch.setattr(
+        menubar, "open_dashboard_terminal",
+        lambda *a, **k: opened.append(1) or (True, "ok"),
+    )
+    monkeypatch.setattr(menubar, "dashboard_executable", lambda: ["/bin/cswap", "watch"])
+    monkeypatch.setattr(menubar, "dashboard_env", lambda: dict(_ENV_NONE))
+    monkeypatch.setattr(menubar, "dashboard_cwd", lambda: "/menu/cwd")
+    launcher = menubar.DashboardLauncher(_Logger(), tmp_path, start_thread=lambda t: t())
+    launcher.start()
+    return opened, launcher.take_error()
+
+
+def test_oversized_pid_file_never_blocks_the_launch(monkeypatch, tmp_path: Path):
+    oversized = _launcher(tmp_path, 2**31)
+    for _ in range(2):  # and not on the next click either
+        opened, error = _launch_with_real_sweep(monkeypatch, tmp_path)
+        assert opened == [1] and error is None
+    assert oversized.exists()
+
+
+def test_broken_entry_never_blocks_the_launch(monkeypatch, tmp_path: Path):
+    _launcher(tmp_path, 7777777)
+
+    def alive(_p):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(menubar, "_pid_alive", alive)
+    opened, error = _launch_with_real_sweep(monkeypatch, tmp_path)
+    assert opened == [1] and error is None
+
+
+def test_sweep_takes_no_clock():
+    import inspect
+
+    params = inspect.signature(menubar.sweep_stale_dashboard_scripts).parameters
+    assert "max_age_s" not in params and "now" not in params
+    assert not hasattr(menubar, "DASHBOARD_SCRIPT_MAX_AGE")
+
+
+def test_launcher_requires_a_script_dir_without_open_fn():
+    with pytest.raises(ValueError):
+        menubar.DashboardLauncher(_Logger())
+
+
+# --- dashboard launcher (off the main thread) -----------------------------------
+
+class _Logger:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, fmt, *args):
+        self.warnings.append(fmt % args)
+
+
+class _ManualThreads:
+    """Captures thread targets so a test decides when the worker runs."""
+
+    def __init__(self):
+        self.targets = []
+
+    def __call__(self, target):
+        self.targets.append(target)
+
+    def run_all(self):
+        targets, self.targets = self.targets, []
+        for t in targets:
+            t()
+
+
+def test_launcher_runs_open_off_the_calling_thread():
+    opened_on = []
+    main = threading.get_ident()
+
+    def open_fn():
+        opened_on.append(threading.get_ident())
+        return True, "ok"
+
+    launcher = menubar.DashboardLauncher(_Logger(), open_fn=open_fn)
+    assert launcher.start() is True
+    deadline = __import__("time").monotonic() + 5
+    while launcher.in_flight and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
+    assert opened_on and opened_on[0] != main
+    assert launcher.take_error() is None
+
+
+def test_launcher_start_returns_before_open_finishes():
+    threads = _ManualThreads()
+    calls = []
+    launcher = menubar.DashboardLauncher(
+        _Logger(), open_fn=lambda: calls.append(1) or (True, "ok"), start_thread=threads
+    )
+    launcher.start()
+    assert calls == []  # the click returned before Terminal was asked
+    threads.run_all()
+    assert calls == [1]
+
+
+def test_launcher_ignores_second_click_while_in_flight():
+    threads = _ManualThreads()
+    calls = []
+    launcher = menubar.DashboardLauncher(
+        _Logger(), open_fn=lambda: calls.append(1) or (True, "ok"), start_thread=threads
+    )
+    assert launcher.start() is True
+    assert launcher.start() is False
+    assert len(threads.targets) == 1
+    threads.run_all()
+    assert calls == [1]
+    assert launcher.in_flight is False
+    assert launcher.start() is True  # a later click works again
+
+
+def test_launcher_failure_is_logged_and_handed_to_main_thread_once():
+    threads = _ManualThreads()
+    logger = _Logger()
+    launcher = menubar.DashboardLauncher(
+        logger, open_fn=lambda: (False, "Not authorized (-1743)"), start_thread=threads
+    )
+    launcher.start()
+    assert launcher.take_error() is None  # nothing until the worker finishes
+    threads.run_all()
+    assert logger.warnings == ["Could not open dashboard: Not authorized (-1743)"]
+    assert launcher.take_error() == "Not authorized (-1743)"
+    assert launcher.take_error() is None
+
+
+def test_launcher_success_hands_back_nothing():
+    threads = _ManualThreads()
+    logger = _Logger()
+    launcher = menubar.DashboardLauncher(logger, open_fn=lambda: (True, "ok"), start_thread=threads)
+    launcher.start()
+    threads.run_all()
+    assert launcher.take_error() is None
+    assert logger.warnings == []
+
+
+def test_launcher_worker_exception_is_reported_and_clears_flag():
+    threads = _ManualThreads()
+
+    def boom():
+        raise RuntimeError("boom")
+
+    launcher = menubar.DashboardLauncher(_Logger(), open_fn=boom, start_thread=threads)
+    launcher.start()
+    threads.run_all()  # must not raise
+    assert launcher.in_flight is False
+    assert launcher.take_error() == "boom"
+
+
+def test_launcher_thread_start_failure_does_not_raise_or_wedge():
+    def no_threads(_target):
+        raise RuntimeError("can't start new thread")
+
+    launcher = menubar.DashboardLauncher(
+        _Logger(), open_fn=lambda: (True, "ok"), start_thread=no_threads
+    )
+    launcher.start()
+    assert launcher.in_flight is False
+    assert launcher.take_error() == "can't start new thread"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shells")
+def test_a_slow_clean_dashboard_does_not_count_as_waiting(tmp_path: Path):
+    # A busy machine (a parallel test run) can make a clean exit slow: that
+    # must still read as "did not wait", so no clock may decide it.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    exe = _fake_exe(tmp_path / "bin dir")
+    exe.write_text("#!/bin/sh\nsleep 1\nexit 0\n")
+    waited, err = _pauses(tmp_path, _create_script(tmp_path, exe, cwd))
+    assert not waited
+    assert err == ""
+
+
+def test_adapt_snapshot_records_each_accounts_organization():
+    a = _FakeAcct("1", "a@x.com", True, _FakeEntry())
+    a.org_uuid = "org-a"
+    b = _FakeAcct("2", "a@x.com", False, _FakeEntry())
+    b.org_uuid = ""
+    snap = menubar._adapt_snapshot(_FakeSnap([a, b]))
+    assert snap["orgs"] == {"1": "org-a", "2": ""}
