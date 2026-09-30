@@ -57,6 +57,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Pre-limit escape, binding-window utilization. At or above it the active
+    # account is left for the account with the most headroom (at least
+    # ESCAPE_MIN_GAIN_PCT more), without waiting for the cooldown or for a
+    # sooner reset. 100 = off: the engine then escapes only at the limit.
+    escape_pct: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "escapePct", "escape_pct", "float", 50.0, 100.0,
+            help="Leave a nearly spent account from this pct on (100 = off)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,

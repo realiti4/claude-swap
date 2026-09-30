@@ -74,6 +74,17 @@ class TestLoadSettings:
         assert loaded.hysteresis_pct == 0.0
         assert loaded.unhealthy_ticks == 1
 
+    def test_escape_pct_is_off_by_default_and_clamped(self, tmp_path: Path):
+        assert AutoSwitchSettings().escape_pct == 100.0
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"escapePct": 20}})
+        )
+        assert load_settings(tmp_path).escape_pct == 50.0
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"escapePct": 150}})
+        )
+        assert load_settings(tmp_path).escape_pct == 100.0
+
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
             "autoswitch": {"threshold": "high", "includeApiKeyAccounts": 1}

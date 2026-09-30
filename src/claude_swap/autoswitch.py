@@ -149,6 +149,18 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# Pre-limit escape (``autoswitch.escapePct``, off at 100). The at-limit escape
+# fires at 100%, which is when a running Claude Code session has already taken
+# its 429 — and its retry timer comes from the headers it already holds, so no
+# credential swap shortens it. Worse, with every account above the threshold
+# the recovery ranking holds the active account whenever it resets soonest,
+# however much room the others have, and rides it into that limit. From
+# ``escape_pct`` on the engine leaves for the account with the most headroom
+# instead, if that account has at least this many points more. One-way by
+# construction: the active burns and the account it left does not, so going
+# back needs that account to be ahead by the same margin again.
+ESCAPE_MIN_GAIN_PCT = 3.0
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -362,7 +374,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "pre-limit" | "at-limit" | "failover" | "consume-first"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1046,7 +1058,20 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        # Pre-limit escape (see ESCAPE_MIN_GAIN_PCT): skips the cooldown and
+        # ranks first. A tick that finds no clearly better account falls back
+        # to the ordinary proactive rules below, cooldown included.
+        pre_limit = (
+            trigger == "proactive"
+            and active_headroom is not None
+            and active_headroom <= 100.0 - settings.escape_pct
+        )
+
+        if (
+            trigger in ("proactive", "consume-first")
+            and not pre_limit
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1174,17 +1199,36 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        ordered: list[str] = []
+        if pre_limit:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger="pre-limit",
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
+            if ordered:
+                trigger = "pre-limit"
+            elif self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+        if not ordered:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1835,6 +1879,11 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            if (
+                trigger == "pre-limit"
+                and h < (active_headroom or 0.0) + ESCAPE_MIN_GAIN_PCT
+            ):
+                continue  # not clearly better than where we are
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
@@ -1880,6 +1929,17 @@ class AutoSwitchEngine:
                         # impossible: the target must come back meaningfully
                         # sooner than where we are.
                         if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                            continue
+                        # With the pre-limit escape on, holding is safe — the
+                        # escape leaves before the limit — so a sooner reset
+                        # alone is no reason to trade headroom away. Without
+                        # this a peer at 97% of its 5h window beat a healthy
+                        # active whose weekly window was over the threshold
+                        # (#342).
+                        if (
+                            settings.escape_pct < 100.0
+                            and h < (active_headroom or 0.0)
+                        ):
                             continue
                     else:
                         # Headroom axis, with a RATIO margin. Also a rate bound,
@@ -1938,7 +1998,7 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first:
+            elif consume_first and trigger != "pre-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)

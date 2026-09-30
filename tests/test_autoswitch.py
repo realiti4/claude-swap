@@ -13,6 +13,7 @@ import pytest
 
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
+    ESCAPE_MIN_GAIN_PCT,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
@@ -6894,3 +6895,245 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+def _windows(now: float, p5: float, r5: float, p7: float, r7: float) -> dict:
+    """Both windows, each reset given in seconds from ``now``."""
+    return {
+        "five_hour": {"pct": p5, "resets_at": _iso_at(now + r5)},
+        "seven_day": {"pct": p7, "resets_at": _iso_at(now + r7)},
+    }
+
+
+class TestPreLimitEscape:
+    """``autoswitch.escapePct``: leave a nearly spent account before its limit.
+
+    The measured shape (0.26.0, threshold 75, four accounts): every account
+    sat over the threshold, one of them only through its weekly window. The
+    active account's 5h window reset soonest, so the recovery ranking held it
+    while the three others had 21-25 points left. It rode to 100% and every
+    running session stopped; the at-limit escape then moved, too late to
+    help them. ``test_a_busy_walk_never_rides_into_the_limit`` replays that
+    fleet through ``tick()``.
+
+    Off at the default of 100, which leaves every other test untouched.
+    """
+
+    H = 3600.0
+    D = 86400.0
+
+    def _harness(self, temp_home: Path, **settings) -> EngineHarness:
+        h = EngineHarness(temp_home, **settings)
+        for num, email in enumerate(("a", "b", "c", "d"), start=1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _switch(self, harness: EngineHarness) -> SwitchEvent:
+        return next(e for e in harness.events if isinstance(e, SwitchEvent))
+
+    def test_leaves_before_the_limit_for_the_most_headroom(self, temp_home):
+        h = self._harness(temp_home, threshold=75.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 97, 35 * 60, 52, 6 * D),  # active, back soonest
+            "2": _windows(now, 76, 3.4 * H, 64, 6 * D),  # 24 points left
+            "3": _windows(now, 83, 1.8 * H, 22, 7 * D),  # 17 left
+            "4": _windows(now, 4, 3.6 * H, 79, 5 * D),   # 21 left, weekly-bound
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "pre-limit"
+
+    def test_the_escape_does_not_wait_for_the_cooldown(self, temp_home):
+        """The cooldown bounds the proactive switch rate. Waiting it out here
+        is waiting for the limit."""
+        h = self._harness(temp_home, threshold=75.0, escape_pct=92.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 97, 35 * 60, 52, 6 * D),
+            "2": _windows(now, 76, 3.4 * H, 64, 6 * D),
+            "3": _windows(now, 100, 1.8 * H, 22, 7 * D),
+            "4": _windows(now, 100, 3.6 * H, 79, 5 * D),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_most_headroom_beats_the_soonest_reset(self, temp_home):
+        """Three points last a few minutes under a busy fleet; landing there
+        takes the limit before the reset arrives."""
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 95, 1 * H, 10, 6 * D),   # active, 5 left
+            "2": _windows(now, 97, 5 * 60, 10, 6 * D),  # 3 left, back in 5 min
+            "3": _windows(now, 90, 3 * H, 10, 6 * D),   # 10 left
+            "4": _windows(now, 100, 2 * H, 10, 6 * D),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert self._switch(h).trigger == "pre-limit"
+
+    def test_it_needs_a_clear_gain(self, temp_home):
+        """Two points better is not worth a swap; the proactive rules decide."""
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 93, 2 * H, 10, 6 * D),   # active, 7 left
+            "2": _windows(now, 91, 3 * H, 10, 6 * D),   # 9 left, later reset
+            "3": _windows(now, 100, 1 * H, 10, 6 * D),
+            "4": _windows(now, 100, 1 * H, 10, 6 * D),
+        })
+        assert 9.0 < 7.0 + ESCAPE_MIN_GAIN_PCT
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_it_does_not_go_back_without_a_real_gain(self, temp_home):
+        """The active burns and the account it left does not, so the pair
+        cannot trade places on the escape."""
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        H, D = self.H, self.D
+
+        def fleet(two: float) -> dict:
+            now = h.clock.now
+            return {
+                "1": _windows(now, 93, 2 * H, 10, 6 * D),
+                "2": _windows(now, two, 3 * H, 10, 6 * D),
+                "3": _windows(now, 100, 1 * H, 10, 6 * D),
+                "4": _windows(now, 100, 1 * H, 10, 6 * D),
+            }
+
+        assert h.tick_with_usage(fleet(80)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        for burned in (93, 95, 97):
+            h.clock.advance(60.0)
+            h.tick_with_usage(fleet(burned))
+            assert h.active_number() == 2, f"went back at {burned}%"
+
+    def test_below_the_escape_line_the_ordinary_rules_decide(self, temp_home):
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 90, 3 * H, 10, 6 * D),   # active, 10 left
+            "2": _windows(now, 84, 4 * H, 10, 6 * D),   # 16 left: under hysteresis
+            "3": _windows(now, 100, 1 * H, 10, 6 * D),
+            "4": _windows(now, 100, 1 * H, 10, 6 * D),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_a_sooner_reset_does_not_trade_headroom_away(self, temp_home):
+        """Every weekly window over the threshold puts the fleet in the
+        all-above ranking, where a peer at 91% of its 5h window came back
+        soonest and beat a healthy active. With the escape on, holding is
+        safe, so a sooner reset alone no longer justifies the move."""
+        h = self._harness(temp_home, threshold=60.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 25, 4.5 * H, 64, 3 * D),  # active, 36 left
+            "2": _windows(now, 91, 1 * H, 69, 3 * D),    # 9 left, back in 1h
+            "3": _windows(now, 33, 4 * H, 64, 4 * D),
+            "4": _windows(now, 28, 4 * H, 70, 2 * D),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_a_sooner_reset_with_as_much_room_still_wins(self, temp_home):
+        """The recovery ranking keeps the moves that cost nothing."""
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 90, 3 * H, 10, 6 * D),    # active, 10 left
+            "2": _windows(now, 88, 30 * 60, 10, 6 * D),  # 12 left, back in 30m
+            "3": _windows(now, 100, 2 * H, 10, 6 * D),
+            "4": _windows(now, 100, 2 * H, 10, 6 * D),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "proactive"
+
+    def test_consume_first_escapes_by_headroom_too(self, temp_home):
+        """consume-first orders targets by weekly reset. At the brink the
+        question is which account lasts, whatever the strategy."""
+        h = self._harness(
+            temp_home, threshold=85.0, escape_pct=92.0, strategy="consume-first"
+        )
+        now, H, D = h.clock.now, self.H, self.D
+        outcome = h.tick_with_usage({
+            "1": _windows(now, 95, 1 * H, 10, 6 * D),   # active, 5 left
+            "2": _windows(now, 88, 3 * H, 10, 1 * D),   # 12 left, weekly soonest
+            "3": _windows(now, 70, 3 * H, 10, 6 * D),   # 30 left
+            "4": _windows(now, 100, 2 * H, 10, 6 * D),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert self._switch(h).trigger == "pre-limit"
+
+    def test_nothing_clearly_better_leaves_the_cooldown_in_force(self, temp_home):
+        """Without a clear gain the tick falls back to the proactive rules,
+        and those keep their cooldown."""
+        h = self._harness(temp_home, threshold=85.0, escape_pct=92.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        H, D = self.H, self.D
+
+        def fleet() -> dict:
+            now = h.clock.now
+            return {
+                "1": _windows(now, 95, 3 * H, 10, 6 * D),     # active, 5 left
+                "2": _windows(now, 94, 10 * 60, 10, 6 * D),   # 6 left, back soon
+                "3": _windows(now, 100, 2 * H, 10, 6 * D),
+                "4": _windows(now, 100, 2 * H, 10, 6 * D),
+            }
+
+        assert h.tick_with_usage(fleet()) is TickOutcome.NO_ACTION
+        assert h.kinds()[-1] == "no-switch"
+        assert h.events[-1].reason == "cooldown"
+        h.clock.advance(h.settings.cooldown_seconds)
+        assert h.tick_with_usage(fleet()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "proactive"
+
+    def test_a_busy_walk_never_rides_into_the_limit(self, temp_home):
+        """The incident fleet through ``tick()``: the active burns two points
+        a minute (a half on its weekly window), one tick a minute, for an
+        hour. With the escape off this walk sits at 100% in minutes 13, 27
+        and 40 while a peer has 20 points left."""
+        h = self._harness(
+            temp_home, threshold=75.0, escape_pct=92.0, cooldown_seconds=180.0
+        )
+        H, D, t0 = self.H, self.D, h.clock.now
+        # [5h pct, 5h reset, 7d pct, 7d reset]
+        fleet = {
+            "1": [73.0, t0 + 3.4 * H, 64.0, t0 + 6 * D],
+            "2": [3.0, t0 + 3.6 * H, 79.0, t0 + 5 * D],
+            "3": [79.0, t0 + 2.1 * H, 21.0, t0 + 7 * D],
+            "4": [75.0, t0 + 0.9 * H, 47.0, t0 + 6 * D],
+        }
+        departures = []
+        for minute in range(60):
+            for w in fleet.values():
+                if h.clock.now >= w[1]:
+                    w[0], w[1] = 0.0, w[1] + 5 * H
+            active = str(h.active_number())
+            fleet[active][0] = min(100.0, fleet[active][0] + 2.0)
+            fleet[active][2] = min(100.0, fleet[active][2] + 0.5)
+            level = max(fleet[active][0], fleet[active][2])
+            best_peer = max(
+                100.0 - max(w[0], w[2]) for n, w in fleet.items() if n != active
+            )
+            assert not (level >= 100.0 and best_peer >= 10.0), (
+                f"minute {minute}: account {active} at the limit while a "
+                f"peer had {best_peer:.0f} points left"
+            )
+            if h.tick_with_usage({
+                n: {
+                    "five_hour": {"pct": w[0], "resets_at": _iso_at(w[1])},
+                    "seven_day": {"pct": w[2], "resets_at": _iso_at(w[3])},
+                }
+                for n, w in fleet.items()
+            }) is TickOutcome.SWITCHED:
+                departures.append(level)
+            h.clock.advance(60.0)
+        assert departures, "the walk must move at least once"
+        assert max(departures) <= 94.0, departures
