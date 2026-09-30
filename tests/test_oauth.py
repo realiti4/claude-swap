@@ -1050,6 +1050,276 @@ class TestTryFetchUsageOutcome:
         assert outcome.error == "no-access-token"
 
 
+def _headers(values: dict):
+    import email.message
+    hdrs = email.message.Message()
+    for key, value in values.items():
+        hdrs[key] = value
+    return hdrs
+
+
+# Shape measured on a live setup-token account (values illustrative).
+_UNIFIED_HEADERS = {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.34",
+    "anthropic-ratelimit-unified-5h-reset": "1790766000",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.6",
+    "anthropic-ratelimit-unified-7d-reset": "1791154800",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+}
+
+
+class TestIsSetupToken:
+    def test_add_token_shape(self):
+        assert oauth.is_setup_token(
+            {"accessToken": "t", "scopes": ["user:inference"]}
+        )
+
+    def test_login_with_refresh_token_is_not(self):
+        assert not oauth.is_setup_token({
+            "accessToken": "t",
+            "refreshToken": "r",
+            "scopes": ["user:inference"],
+        })
+
+    def test_profile_scope_is_not(self):
+        assert not oauth.is_setup_token({
+            "accessToken": "t",
+            "scopes": ["user:inference", "user:profile"],
+        })
+
+    def test_missing_scopes_is_not(self):
+        # Unknown provenance: keep the endpoint's answer, don't spend quota.
+        assert not oauth.is_setup_token({"accessToken": "t"})
+        assert not oauth.is_setup_token(None)
+
+
+class TestParseUnifiedRatelimitHeaders:
+    def test_maps_fractions_and_epochs_to_usage_api_shape(self):
+        data = oauth.parse_unified_ratelimit_headers(_headers(_UNIFIED_HEADERS))
+        assert data["five_hour"]["utilization"] == 34.0
+        assert data["seven_day"]["utilization"] == 60.0
+        assert datetime.fromisoformat(
+            data["five_hour"]["resets_at"]
+        ).timestamp() == 1790766000
+        # Feeds build_usage_result unchanged.
+        usage = oauth.build_usage_result(data)
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        assert "clock" in usage["seven_day"]
+        assert "scoped" not in usage
+
+    def test_missing_window_is_left_out(self):
+        values = {
+            k: v for k, v in _UNIFIED_HEADERS.items() if "-7d-" not in k
+        }
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert set(data) == {"five_hour"}
+
+    @pytest.mark.parametrize("bad", ["nan", "inf", "-0.1", "", "high"])
+    def test_unusable_utilization_is_dropped(self, bad):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-5h-utilization"] = bad
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert "five_hour" not in data
+        assert "seven_day" in data
+
+    def test_unusable_reset_keeps_utilization(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-5h-reset"] = "soon"
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert data["five_hour"] == {"utilization": 34.0}
+
+    def test_no_headers(self):
+        assert oauth.parse_unified_ratelimit_headers(_headers({})) == {}
+
+
+class TestSetupTokenHeaderProbe:
+    """Setup-token accounts: the usage endpoint refuses them, so usage is
+    read from the rate-limit headers of a 1-token model request."""
+
+    TOKEN = "sk-ant-oat01-secret-token"
+    USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+    def _creds(self) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": self.TOKEN, "scopes": ["user:inference"],
+        }})
+
+    def _endpoint_error(self, code: int = 429):
+        return urllib.error.HTTPError(
+            self.USAGE_URL, code, "Too Many",
+            hdrs=_headers({"Retry-After": "318"}), fp=None,
+        )
+
+    @staticmethod
+    def _ok(headers: dict):
+        resp = MagicMock()
+        resp.headers = _headers(headers)
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _route(self, endpoint, probe):
+        """urlopen fake: ``endpoint``/``probe`` are a response or an
+        exception for the usage GET and the messages POST respectively."""
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            result = probe if req.full_url == oauth.USAGE_PROBE_URL else endpoint
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return fake_urlopen, calls
+
+    def _fetch(self, fake_urlopen, creds=None, header_probe=True, **kw):
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            return oauth.try_fetch_usage_for_account(
+                "3", "a@b.c", creds or self._creds(),
+                is_active=kw.pop("is_active", False),
+                header_probe=header_probe, **kw,
+            )
+
+    def test_endpoint_429_falls_back_to_probe(self, caplog):
+        import logging
+        fake, calls = self._route(
+            self._endpoint_error(), self._ok(_UNIFIED_HEADERS)
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = self._fetch(fake)
+
+        assert outcome.error is None
+        assert outcome.retry_after_s is None
+        assert outcome.usage["five_hour"]["pct"] == 34.0
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert [c.full_url for c in calls] == [self.USAGE_URL, oauth.USAGE_PROBE_URL]
+        probe = calls[1]
+        assert probe.get_method() == "POST"
+        assert probe.get_header("Authorization") == f"Bearer {self.TOKEN}"
+        assert probe.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        assert probe.get_header("Anthropic-version") == "2023-06-01"
+        body = json.loads(probe.data)
+        assert body["model"] == oauth.USAGE_PROBE_MODEL
+        assert body["max_tokens"] == 1
+        # Not the endpoint budget's 429: no misleading warning, and the
+        # token never reaches the log.
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        )
+        assert not any(self.TOKEN in m for m in messages)
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_auth_refusals_also_fall_back(self, code):
+        fake, calls = self._route(
+            self._endpoint_error(code), self._ok(_UNIFIED_HEADERS)
+        )
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 34.0
+
+    def test_active_account_falls_back_too(self):
+        fake, _ = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, is_active=True)
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+
+    def test_exhausted_account_reads_headers_off_the_429(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["anthropic-ratelimit-unified-5h-utilization"] = "1.0"
+        exhausted = urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many",
+            hdrs=_headers(values), fp=None,
+        )
+        fake, _ = self._route(self._endpoint_error(), exhausted)
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 100.0
+        assert oauth.account_headroom(outcome.usage) == 0.0
+
+    def test_probe_429_without_headers_is_a_429(self, caplog):
+        import logging
+        limited = urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many",
+            hdrs=_headers({"Retry-After": "30"}), fp=None,
+        )
+        fake, _ = self._route(self._endpoint_error(), limited)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = self._fetch(fake)
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 30.0
+        line = next(r.getMessage() for r in caplog.records)
+        assert "header probe" in line and "account 3" in line
+        assert "a@b.c" not in line and self.TOKEN not in line
+
+    def test_revoked_token_surfaces_the_probe_401(self):
+        revoked = urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 401, "Unauthorized", hdrs=_headers({}), fp=None,
+        )
+        fake, _ = self._route(self._endpoint_error(), revoked)
+        outcome = self._fetch(fake)
+        assert outcome.error == "http-401"
+
+    def test_response_without_headers_is_bad_response(self):
+        fake, _ = self._route(self._endpoint_error(), self._ok({}))
+        outcome = self._fetch(fake)
+        assert outcome.usage is None
+        assert outcome.error == "bad-response"
+
+    def test_probe_network_error_is_classified(self):
+        fake, _ = self._route(
+            self._endpoint_error(), urllib.error.URLError(TimeoutError())
+        )
+        assert self._fetch(fake).error == "timeout"
+
+    def test_disabled_keeps_the_endpoint_error(self):
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, header_probe=False)
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 318.0
+        assert len(calls) == 1
+
+    def test_login_credentials_never_probe(self):
+        """A normal login's 429 is the endpoint budget: back off, don't
+        spend the account's quota."""
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "r", "expiresAt": future_ms,
+            "scopes": ["user:inference", "user:profile"],
+        }})
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, creds=creds)
+        assert outcome.error == "http-429"
+        assert len(calls) == 1
+
+    def test_endpoint_timeout_does_not_probe(self):
+        fake, calls = self._route(
+            urllib.error.URLError(TimeoutError()), self._ok(_UNIFIED_HEADERS)
+        )
+        assert self._fetch(fake).error == "timeout"
+        assert len(calls) == 1
+
+    def test_endpoint_success_does_not_probe(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        fake, calls = self._route(resp, self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake)
+        assert outcome.usage["five_hour"]["pct"] == 12.0
+        assert len(calls) == 1
+
+
 class TestInvalidGrantPropagation:
     """A dead refresh-token lineage surfaces as error='invalid_grant', distinct
     from a transient 'refresh-failed', so the store can quarantine the account."""
