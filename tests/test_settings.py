@@ -16,9 +16,11 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    UsageSettings,
     effective_settings,
     load_settings,
     load_ui_settings,
+    load_usage_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -152,6 +154,32 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestUsageSettings:
+    def test_missing_file_enables_header_probe(self, tmp_path: Path):
+        assert load_usage_settings(tmp_path) == UsageSettings(header_probe=True)
+
+    def test_reads_false(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": False}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is False
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        # A string "false" is not False: never bool(str).
+        settings_path(tmp_path).write_text(
+            json.dumps({"usage": {"headerProbe": "false"}})
+        )
+        assert load_usage_settings(tmp_path).header_probe is True
+
+    def test_set_and_unset_header_probe(self, tmp_path: Path):
+        assert set_setting(tmp_path, "usage.headerProbe", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "usage": {"headerProbe": False}}
+        assert load_usage_settings(tmp_path).header_probe is False
+        assert unset_setting(tmp_path, "usage.headerProbe") is True
+        assert load_usage_settings(tmp_path).header_probe is True
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +191,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["usage"] == {
+            f.name for f in UsageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "usage": UsageSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
