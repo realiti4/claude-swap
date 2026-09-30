@@ -274,6 +274,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set usage.headerProbe false  # no header probe for setup-token usage (see "add-token")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -370,6 +371,13 @@ cswap add-token --email user@example.com     # optional label override
 
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+
+**Setup-token usage.** The usage endpoint does not answer setup-tokens, so for
+these accounts cswap reads the 5h/7d utilization from the rate-limit headers of a
+1-output-token Haiku request instead, sent at the normal poll cadence. Per-model
+weekly windows and extra-usage spend are not in those headers, so they stay blank
+for these accounts. Each probe is a real (tiny) request on that account's quota;
+`cswap config set usage.headerProbe false` turns it off.
 
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth

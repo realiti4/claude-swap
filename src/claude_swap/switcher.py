@@ -85,7 +85,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -103,7 +108,7 @@ KEYRING_SERVICE = "claude-code"
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
-SETUP_TOKEN_SCOPES = ("user:inference",)
+SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -333,6 +338,8 @@ class ClaudeAccountSwitcher:
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, usage.headerProbe) — see _header_probe_enabled.
+        self._header_probe_cache: tuple[float | None, bool] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1821,6 +1828,21 @@ class ClaudeAccountSwitcher:
         inputs = (loaded.threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _header_probe_enabled(self) -> bool:
+        """``usage.headerProbe`` from the settings file (reloaded only when it
+        changes — one stat per fetch)."""
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        cache = getattr(self, "_header_probe_cache", None)
+        if cache is not None and cache[0] == mtime:
+            return cache[1]
+        enabled = load_usage_settings(self.backup_dir).header_probe
+        self._header_probe_cache = (mtime, enabled)
+        return enabled
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -4138,6 +4160,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                header_probe=self._header_probe_enabled(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4621,6 +4644,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            header_probe=self._header_probe_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -4891,6 +4915,7 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
+            header_probe=self._header_probe_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -4912,7 +4937,10 @@ class ClaudeAccountSwitcher:
         stamp = oauth.access_token_fingerprint(creds)
         if stamp is not None and stamp == rejected_fp:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        outcome = oauth.try_fetch_usage_for_account(num, email, creds, is_active=True)
+        outcome = oauth.try_fetch_usage_for_account(
+            num, email, creds, is_active=True,
+            header_probe=self._header_probe_enabled(),
+        )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
         return FetchRecord(

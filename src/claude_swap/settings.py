@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
+``autoswitch``, ``ui`` and ``usage`` sections; other sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -67,7 +67,25 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class UsageSettings:
+    """Usage collection preferences (``usage`` section).
+
+    ``header_probe``: the usage endpoint never answers a setup-token account
+    (``cswap add-token``), so read its 5h/7d utilization from the rate-limit
+    headers of a 1-output-token Haiku request instead. Each probe is a real,
+    if tiny, request against that account's quota, sent at the normal poll
+    cadence; off leaves such accounts at "usage unavailable".
+    """
+
+    header_probe: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "usage": UsageSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -79,7 +97,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "ui", "usage")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -138,6 +156,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "usage", "headerProbe", "header_probe", "bool",
+            help="Read setup-token usage from a 1-token Haiku request's rate-limit headers",
         ),
     )
 }
@@ -246,6 +268,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_usage_settings(backup_root: Path) -> UsageSettings:
+    """Load the usage section; missing/corrupt file or non-bool → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("usage")
+    default = UsageSettings()
+    if not isinstance(section, dict):
+        return default
+    header_probe = section.get("headerProbe", default.header_probe)
+    if not isinstance(header_probe, bool):
+        _logger.warning(
+            "settings.json: usage.headerProbe must be true or false, got %r; "
+            "using %r", header_probe, default.header_probe,
+        )
+        return default
+    return UsageSettings(header_probe=header_probe)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +451,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "usage": load_usage_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
