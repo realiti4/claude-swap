@@ -116,6 +116,32 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Keep Remote Control connected across switches
+
+Claude Code stops [Remote Control](https://code.claude.com/docs/en/remote-control) whenever the signed-in account changes, and waits for you to run `/remote-control` again. With `cswap auto` swapping accounts in the background, that means every switch silently takes your sessions off your phone. `cswap rc` launches Claude Code on the default login and runs that command for you:
+
+```bash
+cswap rc                        # plain claude, reconnecting Remote Control after a switch
+cswap rc -- --remote-control    # everything after '--' is forwarded to claude
+alias claude='cswap rc --'      # do it for every claude you start
+```
+
+It only acts in sessions that had Remote Control on. About 30 seconds after the switch, once Claude is idle, not waiting on a question or permission prompt, and you haven't typed for a few seconds, it runs `/remote-control` and the session reappears in the Claude app under the newly active account. A half-written prompt is kept: it's stashed with Claude Code's own `Ctrl+S`, and Claude Code puts it back as soon as the command has run. If you run `/remote-control` yourself first, it stays out of the way.
+
+<details>
+<summary>How it works & limits</summary>
+
+- Claude Code writes the "account or organization changed" notice, and later the "/remote-control is active" status, into the session's transcript, and keeps its busy/idle state in `~/.claude/sessions/<pid>.json` (both under `CLAUDE_CONFIG_DIR` when set). `cswap rc` runs claude behind a pseudo-terminal relay, follows those files, and types into the session. Nothing touches your credentials or network traffic.
+- It waits about 30 seconds after the switch because Claude Code is still closing the old connection at first: `/remote-control` then opens the Remote Control panel (*Disconnect this session / Show QR code / Continue*) instead of reconnecting. If the panel opens anyway, it's closed with `Esc`, which also puts your draft back, and the command runs again 30 seconds later. The same retry follows if the "active" status doesn't show up within 20 seconds. At most 3 tries run per 15 minutes per session.
+- The reconnected session belongs to the newly active account, the same as if you had typed the command: in the Claude app it shows up under that account.
+- If Claude is in the middle of a turn, the reconnect waits for the turn to finish.
+- It relies on the default `ctrl+s` binding for `chat:stash` and the default input mode: if you rebound `chat:stash` or use vim mode, it isn't supported.
+- If you stashed a prompt yourself (`Ctrl+S`) and haven't sent a message since, its own `Ctrl+S` would bring your stash back mid-command, so it leaves that session alone and logs why.
+- Notices that need you (Remote Control ended from another device, or a `/login` is needed) are left alone. Everything it does is logged to `claude-swap.log`.
+- macOS, Linux and WSL only (the relay needs a pty). Without a terminal, such as `claude -p` in a pipe, it runs claude unchanged. If the terminal closes, claude is hung up with it.
+
+</details>
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
