@@ -542,6 +542,94 @@ def test_format_title_reflects_passed_weekly_reset():
     assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
 
 
+# --- all-accounts title -------------------------------------------------------
+
+def _row(num, email, *, active=False, usage=None, alias=None, disabled=False, display=None):
+    """An ``_adapt_snapshot`` account row; ``display`` defaults to ``usage``
+    (a sentinel note string stands in for an expired/unavailable account)."""
+    return (num, email, active, usage if display is None else display, usage, alias, disabled, None)
+
+
+def test_settings_title_style_defaults_to_active(tmp_path: Path):
+    assert menubar.MenuBarSettings.load(tmp_path / "nope.json").title_style == "active"
+
+
+def test_settings_title_style_round_trip(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    menubar.MenuBarSettings(title_style="all").save(path)
+    assert menubar.MenuBarSettings.load(path).title_style == "all"
+
+
+def test_usage_level_buckets():
+    assert menubar.usage_level(None, 90) == "unknown"
+    assert menubar.usage_level(49.0, 90) == "ok"
+    assert menubar.usage_level(50.0, 90) == "warn"
+    assert menubar.usage_level(89.0, 90) == "warn"
+    assert menubar.usage_level(90.0, 90) == "high"
+    # red follows the auto-switch threshold, not a fixed number
+    assert menubar.usage_level(85.0, 80) == "high"
+
+
+def test_title_cells_one_per_enabled_account_in_order():
+    rows = [
+        _row(1, "work@example.com", alias="work", usage={"five_hour": {"pct": 66.0}, "seven_day": {"pct": 70.0}}),
+        _row(2, "home@example.com", alias="home", active=True, usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 2.0}}),
+        _row(3, "off@x.com", disabled=True, usage=_USAGE),
+    ]
+    cells = menubar.title_cells(rows, _NOW)
+    assert [(c.label, c.five_hour, c.seven_day, c.active) for c in cells] == [
+        ("work", 66.0, 70.0, False),
+        ("home", 5.0, 2.0, True),
+    ]
+
+
+def test_title_cells_label_falls_back_to_short_local_part():
+    cells = menubar.title_cells([_row(1, "averylongname@x.com", usage=_USAGE)], _NOW)
+    assert cells[0].label == "averylo*"
+
+
+def test_title_cells_long_alias_is_shortened_too():
+    cells = menubar.title_cells([_row(1, "a@x.com", alias="personal-account", usage=_USAGE)], _NOW)
+    assert cells[0].label == "persona*"
+
+
+def test_title_cells_expired_account_keeps_last_numbers_but_is_stale():
+    rows = [_row(1, "a@x.com", usage=_USAGE, display="token expired")]
+    cell = menubar.title_cells(rows, _NOW)[0]
+    assert (cell.five_hour, cell.seven_day, cell.stale) == (42.0, 18.0, True)
+    assert menubar.title_cells([_row(1, "a@x.com", usage=_USAGE)], _NOW)[0].stale is False
+
+
+def test_title_cells_keeps_a_disabled_account_while_it_is_in_use():
+    rows = [_row(1, "a@x.com", usage=_USAGE, disabled=True, active=True)]
+    assert [c.label for c in menubar.title_cells(rows, _NOW)] == ["a"]
+
+
+def test_title_cells_unmeasured_account_shows_unknowns():
+    cells = menubar.title_cells([_row(1, "a@x.com", usage=None)], _NOW)
+    assert (cells[0].five_hour, cells[0].seven_day) == (None, None)
+
+
+def test_title_cells_reflect_passed_weekly_reset():
+    usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
+    cells = menubar.title_cells([_row(1, "a@x.com", usage=usage)], _NOW)
+    assert cells[0].seven_day == 0.0
+
+
+def test_format_all_title_stars_active_account():
+    cells = [
+        menubar.TitleCell("home", 5.0, 2.0, False),
+        menubar.TitleCell("work", 8.0, 85.0, True),
+        menubar.TitleCell("side", None, None, False),
+        menubar.TitleCell("old", 40.0, 60.0, False, stale=True),
+    ]
+    assert menubar.format_all_title(cells) == "⇄ home 5·2  *work 8·85  side –·–  old 40·60?"
+
+
+def test_format_all_title_no_accounts_is_bare_icon():
+    assert menubar.format_all_title([]) == "⇄"
+
+
 # --- run() app glue ------------------------------------------------------------
 
 def test_run_without_rumps_raises_clean_error(monkeypatch):
@@ -617,3 +705,85 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- usage cards (Settings → Dropdown shows → Usage cards) ---------------------
+
+def test_settings_menu_style_defaults_to_text(tmp_path: Path):
+    assert menubar.MenuBarSettings.load(tmp_path / "missing.json").menu_style == "text"
+
+
+def test_account_cards_one_per_account_disabled_included():
+    rows = [
+        _row(1, "work@example.com", alias="work", active=True, usage=_USAGE),
+        _row(2, "off@x.com", disabled=True, usage=_USAGE),
+    ]
+    cards = menubar.account_cards(rows, 90, _NOW)
+    assert [(c.name, c.email, c.active, c.disabled) for c in cards] == [
+        ("work", "work@example.com", True, False),
+        ("off", None, False, True),
+    ]
+    assert [(w.label, w.pct, w.level) for w in cards[0].windows] == [
+        ("Session", 42.0, "ok"),
+        ("Weekly", 18.0, "ok"),
+    ]
+
+
+def test_account_cards_levels_follow_the_threshold():
+    usage = {"five_hour": {"pct": 60.0}, "seven_day": {"pct": 92.0}}
+    card = menubar.account_cards([_row(1, "a@x.com", usage=usage)], 90, _NOW)[0]
+    assert [w.level for w in card.windows] == ["warn", "high"]
+    assert card.full is None
+
+
+def test_account_cards_full_when_session_or_weekly_is_used_up():
+    usage = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 40.0},
+             "scoped": [{"name": "Fable", "pct": 100.0}]}
+    assert menubar.account_cards([_row(1, "a@x.com", usage=usage)], 90, _NOW)[0].full == "Full"
+
+
+def test_account_cards_names_a_used_up_model_limit():
+    usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 40.0},
+             "scoped": [{"name": "Fable", "pct": 100.0}]}
+    card = menubar.account_cards([_row(1, "a@x.com", usage=usage)], 90, _NOW)[0]
+    assert card.full == "Fable full"
+    assert [w.label for w in card.windows] == ["Session", "Weekly", "Fable"]
+
+
+def test_account_cards_expired_account_is_grey_with_its_note():
+    rows = [_row(1, "a@x.com", usage=_USAGE, display="token expired")]
+    card = menubar.account_cards(rows, 90, _NOW)[0]
+    assert card.note == "token expired"
+    assert {w.level for w in card.windows} == {"unknown"}
+
+
+def test_account_cards_unmeasured_account_says_so():
+    card = menubar.account_cards([_row(1, "a@x.com", usage=None)], 90, _NOW)[0]
+    assert (card.windows, card.note) == ((), "usage unavailable")
+
+
+def test_account_cards_roll_a_passed_weekly_reset_to_zero():
+    usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
+    card = menubar.account_cards([_row(1, "a@x.com", usage=usage)], 90, _NOW)[0]
+    assert card.windows[1].pct == 0.0
+
+
+def test_reset_text_today_tomorrow_and_later():
+    now = _dt.datetime(2026, 9, 30, 13, 0).timestamp()  # local time
+
+    def window(**kw):
+        return {"resets_at": (_dt.datetime(2026, 9, 30, 13, 0) + _dt.timedelta(**kw)).astimezone().isoformat()}
+
+    assert menubar._reset_text(window(hours=2, minutes=10), now) == "Resets 3:10 PM"
+    assert menubar._reset_text(window(hours=13), now) == "Resets tomorrow 2:00 AM"
+    assert menubar._reset_text(window(days=4, hours=-9), now) == "Resets Oct 4, 4:00 AM"
+    assert menubar._reset_text(window(minutes=-1), now) is None
+    assert menubar._reset_text(None, now) is None
+
+
+def test_card_height_grows_with_bars_and_note():
+    base = menubar.AccountCard("a", None, False, False, None, None, ())
+    one = menubar.AccountCard("a", None, False, False, None, None,
+                              (menubar.CardWindow("Session", 1.0, "ok", None),))
+    noted = menubar.AccountCard("a", None, False, False, None, "token expired", one.windows)
+    assert menubar.card_height(base) < menubar.card_height(one) < menubar.card_height(noted)
