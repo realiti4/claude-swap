@@ -17,7 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, elapsed_reset_clock
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -79,7 +79,9 @@ def usage_bar(
     text = Text()
     text.append(f"{label} ", style=palette.muted)
     text.append(bar_cells(pct, width, stale=stale, threshold=threshold, palette=palette))
-    if pct is None:
+    if pct is None and suffix:
+        text.append(f" {'--':>4}", style=palette.muted)
+    elif pct is None:
         text.append("  usage unknown", style=palette.muted)
     else:
         color = palette.severity(pct)
@@ -108,9 +110,13 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
     return "(ahead of pace)" if result and result.ahead else ""
 
 
+def _awaiting_refresh(clock: str) -> str:
+    return f"reset {clock} · awaiting refresh"
+
+
 def usage_rows(
     last_good: dict | None, now: float, fetched_at: float | None = None
-) -> list[tuple[str, float, str, str]]:
+) -> list[tuple[str, float | None, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
     ``_format_usage_lines``.
 
@@ -121,13 +127,18 @@ def usage_rows(
     the CLI: spend, 5h, 7d, then per-model scoped windows (e.g. "Fable"),
     the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
-    week's expected usage (issue #125) — never the 5h row.
+    week's expected usage (issue #125) — never the 5h row. A window whose
+    reset has already passed has pct None and an "awaiting refresh" suffix:
+    its cached figure predates the rollover (same rule as the CLI).
     """
     if not isinstance(last_good, dict):
         return []
-    rows: list[tuple[str, float, str, str]] = []
+    rows: list[tuple[str, float | None, str, str]] = []
     spend = last_good.get("spend")
-    if spend:
+    elapsed = elapsed_reset_clock(spend, now) if spend else None
+    if elapsed is not None:
+        rows.append(("$$", None, _awaiting_refresh(elapsed), _awaiting_refresh(elapsed)))
+    elif spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
@@ -135,7 +146,10 @@ def usage_rows(
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
-        if window:
+        elapsed = elapsed_reset_clock(window, now) if window else None
+        if elapsed is not None:
+            rows.append((label, None, _awaiting_refresh(elapsed), _awaiting_refresh(elapsed)))
+        elif window:
             reset, reset_full = _reset_parts(window, now)
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
@@ -145,6 +159,12 @@ def usage_rows(
                     suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
+        elapsed = elapsed_reset_clock(window, now)
+        if elapsed is not None:
+            rows.append(
+                (window["name"], None, _awaiting_refresh(elapsed), _awaiting_refresh(elapsed))
+            )
+            continue
         pct = float(window["pct"])
         suffix, suffix_full = _reset_parts(window, now)
         suffix, suffix_full = suffix or "", suffix_full or ""
@@ -276,9 +296,14 @@ def mini_account_text(
         window = last_good.get(key) if isinstance(last_good, dict) else None
         if not window:
             continue
-        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
+        if elapsed_reset_clock(window, now) is not None:
+            text.append(f"{label} ", style=palette.muted)
+            text.append("--", style=palette.muted)
+            parts += 1
+            continue
+        pct = float(window["pct"])
         color = palette.severity(pct)
         text.append(f"{label} ", style=palette.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
@@ -294,7 +319,7 @@ def mini_account_text(
     maxed = [
         w["name"]
         for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
+        if float(w["pct"]) >= 100 and elapsed_reset_clock(w, now) is None
     ]
     for name in maxed:
         if parts:

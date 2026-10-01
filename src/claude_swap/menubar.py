@@ -31,7 +31,7 @@ from pathlib import Path
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
-from claude_swap.switcher import SENTINEL_NOTES
+from claude_swap.switcher import SENTINEL_NOTES, elapsed_reset_clock, usage_stale_note
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -228,6 +228,11 @@ def usage_summary(
     ``fetched_at`` is the underlying measurement's fetch time (may be older
     than ``now`` when serving last-good data) — used only to flag a weekly
     window that's meaningfully ahead of pace (issue #125), never the 5h one.
+
+    A 5h (or spend) window whose reset has passed shows ``--``: it was zeroed
+    server-side and its next state is unknown until a refetch, the same rule
+    as the CLI's ``switcher.elapsed_reset_clock``. Weekly windows instead roll
+    forward on their fixed cadence (``_rolled_weekly_window``).
     """
     if isinstance(usage, str):
         return usage
@@ -247,6 +252,9 @@ def usage_summary(
             # computing pace pre-roll would otherwise pair last cycle's high
             # pct with this cycle's freshly-reset 0% display.
             pace_result = pace.compute_pace(window, fetched_at=fetched_at)
+        elif isinstance(window, dict) and elapsed_reset_clock(window, now) is not None:
+            parts.append(f"{label} --")
+            continue
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
             if key == "seven_day" and pace_result and pace_result.ahead:
@@ -270,7 +278,9 @@ def usage_summary(
                 seg += f" ({countdown})"
             parts.append(seg)
     spend = usage.get("spend")
-    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+    if isinstance(spend, dict) and elapsed_reset_clock(spend, now) is not None:
+        parts.append("$ --")
+    elif isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
         parts.append(f"$ {spend['pct']:.0f}%")
     return " · ".join(parts) if parts else "usage unavailable"
 
@@ -283,11 +293,19 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    stale_note: str | None = None,
 ) -> str:
-    """Build one account row's menu label."""
+    """Build one account row's menu label.
+
+    ``stale_note`` (from ``switcher.usage_stale_note``) is appended when the
+    reading is old, e.g. ``· 3h ago · rate-limited, retries 15:21``.
+    """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    summary = usage_summary(usage, now, fetched_at)
+    if stale_note:
+        summary += f" · {stale_note}"
+    return f"{num}  {label}{marker}  {summary}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -304,32 +322,44 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    stale: bool = False,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    ``stale`` marks a reading older than ``switcher._USAGE_AGE_NOTE_S``: every
+    percentage gets a leading ``~`` (e.g. ``~1% · ~60%``) — one character per
+    figure, read as "approximately", so the bar itself signals the numbers may
+    be old. A 5h window whose reset has passed shows ``--`` rather than its
+    obsolete pct (kept as a placeholder so "both" stays positional).
+    """
     if active_email is None:
         return ICON
     if now is None:
         now = time.time()
+    mark = "~" if stale else ""
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
     if settings.title_pct in ("5h", "both"):
+        five = active_usage.get("five_hour") if isinstance(active_usage, dict) else None
         p = _window_pct(active_usage, "five_hour")
-        if p is not None:
-            segments.append(f"{p:.0f}%")
+        if isinstance(five, dict) and elapsed_reset_clock(five, now) is not None:
+            segments.append("--")
+        elif p is not None:
+            segments.append(f"{mark}{p:.0f}%")
     if settings.title_pct in ("7d", "both"):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{mark}{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
         for window in active_usage.get("scoped") or []:
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {window['pct']:.0f}%")
+                segments.append(f"{window['name']} {mark}{window['pct']:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -405,38 +435,47 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "active_stale": False,
 }
 
 
-def _adapt_snapshot(snap) -> dict:
+def _adapt_snapshot(snap, now: float | None = None) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
-    "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at,
+    stale_note), ...], "active_email": str | None, "active_usage": dict | str | None,
+    "active_alias": str | None, "active_stale": bool}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
+    ``stale_note`` is ``switcher.usage_stale_note`` (age, plus the backoff
+    cause and retry time) or None for a current reading; ``active_stale`` is
+    whether the active account's note is set.
     """
+    now = time.time() if now is None else now
     accounts = []
     active_email = None
     active_usage = None
     active_alias = None
+    active_stale = False
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
+        stale_note = usage_stale_note(acc.usage, now)
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
-                acc.alias, acc.disabled, acc.usage.fetched_at,
+                acc.alias, acc.disabled, acc.usage.fetched_at, stale_note,
             )
         )
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
+            active_stale = stale_note is not None
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "active_stale": active_stale,
     }
 
 
@@ -624,7 +663,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, _stale in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -738,6 +777,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                stale=self.snapshot.get("active_stale", False),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -760,10 +800,11 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at, stale_note in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at, stale_note=stale_note,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -802,7 +843,7 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, _stale in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
@@ -812,7 +853,7 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, _stale in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)

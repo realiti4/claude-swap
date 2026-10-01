@@ -12,6 +12,7 @@ import datetime as _dt
 import json
 import plistlib
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -403,9 +404,9 @@ def test_usage_summary_live_countdown_from_resets_at():
 
 
 def test_usage_summary_omits_countdown_when_passed_or_missing():
-    # 5h reset already passed (stale data) -> omit; 7d has no resets_at -> omit
+    # 5h reset already passed (stale data) -> "--", no obsolete pct; 7d has no resets_at -> omit
     usage = {"five_hour": {"pct": 53.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 8.0}}
-    assert menubar.usage_summary(usage, _NOW) == "5h 53% · 7d 8%"
+    assert menubar.usage_summary(usage, _NOW) == "5h -- · 7d 8%"
 
 
 # --- switch-history log parsing ------------------------------------------------
@@ -446,6 +447,9 @@ class _FakeEntry:
         self.sentinel = sentinel
         self.last_good = last_good
         self.fetched_at = fetched_at
+        self.age_s = None
+        self.last_error = None
+        self.backoff_until = None
 
 
 class _FakeAcct:
@@ -484,11 +488,11 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, stale_note)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, None)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None, None,
     )
 
 
@@ -540,6 +544,141 @@ def test_format_title_reflects_passed_weekly_reset():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
     assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+
+
+# --- elapsed 5h reset / stale readings (parity with the CLI) -------------------
+
+def test_usage_summary_five_hour_past_reset_shows_dashes():
+    usage = {
+        "five_hour": {"pct": 92.0, "resets_at": _iso(-3600)},
+        "seven_day": {"pct": 41.0, "resets_at": _iso(2 * 86400)},
+    }
+    assert menubar.usage_summary(usage, _NOW) == "5h -- · 7d 41% (2d 0h)"
+
+
+def test_usage_summary_spend_past_reset_shows_dashes():
+    usage = {"spend": {"pct": 30.0, "resets_at": _iso(-60)}}
+    assert menubar.usage_summary(usage, _NOW) == "$ --"
+    usage = {"spend": {"pct": 30.0, "resets_at": _iso(60)}}
+    assert menubar.usage_summary(usage, _NOW) == "$ 30%"
+
+
+def test_usage_summary_weekly_and_scoped_still_roll_forward_beside_reset_5h():
+    usage = {
+        "five_hour": {"pct": 92.0, "resets_at": _iso(-60)},
+        "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
+        "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}],
+    }
+    assert menubar.usage_summary(usage, _NOW) == "5h -- · 7d 0% (6d 0h) · Fable 0% (6d 0h)"
+
+
+def _stale_entry(age_s, last_error=None, backoff_until=None):
+    from claude_swap.usage_store import UsageEntry
+
+    now = time.time()
+    return UsageEntry(
+        last_good={"five_hour": {"pct": 1.0}},
+        fetched_at=now - age_s,
+        age_s=age_s,
+        last_error=last_error,
+        backoff_until=backoff_until,
+    )
+
+
+def test_stale_note_fresh_reading_has_none():
+    from claude_swap import switcher
+
+    entry = _stale_entry(switcher._USAGE_AGE_NOTE_S - 1)
+    assert switcher.usage_stale_note(entry, time.time()) is None
+    snap = menubar._adapt_snapshot(_FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]))
+    assert snap["accounts"][0][8] is None
+    assert snap["active_stale"] is False
+    label = menubar.format_account_label(1, "a@x.com", entry.last_good, stale_note=None)
+    assert label == "1  a@x.com  5h 1%"
+
+
+def test_stale_note_without_backoff():
+    entry = _stale_entry(3 * 3600 + 60)
+    snap = menubar._adapt_snapshot(_FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]))
+    note = snap["accounts"][0][8]
+    assert note == "3h ago"
+    assert snap["active_stale"] is True
+    label = menubar.format_account_label(1, "a@x.com", entry.last_good, stale_note=note)
+    assert label == "1  a@x.com  5h 1% · 3h ago"
+
+
+def test_stale_note_with_backoff_matches_cli_wording():
+    from claude_swap import oauth
+
+    now = time.time()
+    retry_at = now + 600
+    entry = _stale_entry(3 * 3600 + 60, last_error="http-429", backoff_until=retry_at)
+    snap = menubar._adapt_snapshot(
+        _FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]), now=now
+    )
+    clock = oauth.reset_clock_string(
+        _dt.datetime.fromtimestamp(retry_at, tz=_dt.timezone.utc),
+        _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc),
+    )
+    note = snap["accounts"][0][8]
+    assert note == f"3h ago · rate-limited, retries {clock}"
+    label = menubar.format_account_label(1, "a@x.com", entry.last_good, stale_note=note)
+    assert label == f"1  a@x.com  5h 1% · 3h ago · rate-limited, retries {clock}"
+
+
+def test_stale_note_backoff_expired_drops_cause():
+    entry = _stale_entry(3 * 3600 + 60, last_error="http-429", backoff_until=time.time() - 1)
+    snap = menubar._adapt_snapshot(_FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]))
+    assert snap["accounts"][0][8] == "3h ago"
+
+
+def test_stale_note_never_on_sentinel_rows():
+    from claude_swap.usage_store import UsageEntry
+
+    entry = UsageEntry(
+        sentinel=USAGE_API_KEY, last_good={"five_hour": {"pct": 1.0}},
+        fetched_at=time.time() - 3 * 3600, age_s=3 * 3600,
+    )
+    snap = menubar._adapt_snapshot(_FakeSnap([_FakeAcct("1", "a@x.com", True, entry)]))
+    assert snap["accounts"][0][8] is None
+    assert snap["active_stale"] is False
+
+
+def test_active_stale_tracks_active_account_only():
+    accts = [
+        _FakeAcct("1", "a@x.com", True, _stale_entry(10)),
+        _FakeAcct("2", "b@x.com", False, _stale_entry(3 * 3600)),
+    ]
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+    assert snap["active_stale"] is False
+    assert snap["accounts"][1][8] == "3h ago"
+
+
+def test_format_title_stale_marks_percentages():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_scoped=True)
+    usage = {
+        "five_hour": {"pct": 1.0},
+        "seven_day": {"pct": 60.0},
+        "scoped": [{"name": "Fable", "pct": 19.0}],
+    }
+    assert menubar.format_title("eng@x.com", usage, s, _NOW, stale=True) == "⇄ eng · ~1% · ~60% · Fable ~19%"
+    assert menubar.format_title("eng@x.com", usage, s, _NOW) == "⇄ eng · 1% · 60% · Fable 19%"
+
+
+def test_format_title_five_hour_past_reset_hides_old_pct():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    usage = {"five_hour": {"pct": 92.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 60.0}}
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ -- · 60%"
+    assert menubar.format_title("a@x.com", usage, s, _NOW, stale=True) == "⇄ -- · ~60%"
+
+
+def test_format_title_weekly_roll_forward_unchanged_with_reset_5h():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    usage = {
+        "five_hour": {"pct": 92.0, "resets_at": _iso(-60)},
+        "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
+    }
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ -- · 0%"
 
 
 # --- run() app glue ------------------------------------------------------------

@@ -12,6 +12,7 @@ import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -122,22 +123,53 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
-def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
+def elapsed_reset_clock(window: dict, now: float) -> str | None:
+    """Local clock of a window's reset once it has passed, else None.
+
+    A window whose reset has elapsed was zeroed server-side, so its cached
+    pct no longer describes it until the next fetch. Public: the TUI applies
+    the same rule so both surfaces withhold the same obsolete figures.
+    """
+    ts = poll_policy.parse_reset_ts(window.get("resets_at"))
+    if ts is None or ts > now:
+        return None
+    return oauth.reset_clock_string(
+        datetime.fromtimestamp(ts, tz=timezone.utc),
+        datetime.fromtimestamp(now, tz=timezone.utc),
+    )
+
+
+def _awaiting_refresh_body(clock: str) -> str:
+    # "  --" matches the width of f"{pct:>3.0f}%" so the columns stay aligned.
+    return f"{'--':>4}   reset {clock}  · awaiting refresh"
+
+
+def _format_usage_lines(
+    usage: dict, fetched_at: float | None = None, now: float | None = None
+) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+    now = time.time() if now is None else now
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
+        elapsed = elapsed_reset_clock(spend, now)
         cell = oauth.fresh_reset_strings(spend)
-        if cell:
+        if elapsed is not None:
+            rows.append(("$$", _awaiting_refresh_body(elapsed)))
+        elif cell:
             rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
         else:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            elapsed = elapsed_reset_clock(w, now)
+            if elapsed is not None:
+                rows.append((label, _awaiting_refresh_body(elapsed)))
+                continue
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
             marker = _pace_marker(w, fetched_at) if label == "7d" else ""
             cell = oauth.fresh_reset_strings(w)
@@ -147,6 +179,10 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             else:
                 rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
     for w in usage.get("scoped") or []:
+        elapsed = elapsed_reset_clock(w, now)
+        if elapsed is not None:
+            rows.append((w["name"], _awaiting_refresh_body(elapsed)))
+            continue
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
@@ -196,6 +232,12 @@ ERROR_NOTES = {
     ),
 }
 
+# Short causes for the stale-measurement note while a fetch failure is being
+# backed off (fallback: ERROR_NOTES, then the raw error kind).
+BACKOFF_NOTES = {
+    "http-429": "rate-limited",
+}
+
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
@@ -222,12 +264,53 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
-def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+def _backoff_note(entry: UsageEntry, now: float) -> str | None:
+    """"rate-limited, retries 18:13" while the entry backs off a failure."""
+    if (
+        not entry.last_error
+        or entry.backoff_until is None
+        or not entry.in_backoff(now)
+    ):
+        return None
+    cause = BACKOFF_NOTES.get(
+        entry.last_error, ERROR_NOTES.get(entry.last_error, entry.last_error)
+    )
+    retry = oauth.reset_clock_string(
+        datetime.fromtimestamp(entry.backoff_until, tz=timezone.utc),
+        datetime.fromtimestamp(now, tz=timezone.utc),
+    )
+    return f"{cause}, retries {retry}"
+
+
+def usage_stale_note(entry: UsageEntry, now: float) -> str | None:
+    """"3h ago · rate-limited, retries 15:21" for a measurement served stale.
+
+    None unless the entry renders a measurement older than
+    ``_USAGE_AGE_NOTE_S``. Public: the menu bar appends the same note to its
+    account rows, so both surfaces flag an old reading identically.
+    """
+    if (
+        entry.sentinel is not None
+        or entry.last_good is None
+        or entry.age_s is None
+        or entry.age_s <= _USAGE_AGE_NOTE_S
+        or entry.fetched_at is None
+    ):
+        return None
+    note = format_age(int(entry.fetched_at * 1000))
+    backoff = _backoff_note(entry, now)
+    if backoff is not None:
+        note += f" · {backoff}"
+    return note
+
+
+def _usage_entry_lines(entry: UsageEntry, now: float | None = None) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
     line when an older measurement exists. Measurements render as usual, age-
-    annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
+    annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served, plus the
+    failure and retry time while backing off); an account
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     """
@@ -238,14 +321,11 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good, entry.fetched_at)
-        if (
-            lines
-            and entry.age_s is not None
-            and entry.age_s > _USAGE_AGE_NOTE_S
-            and entry.fetched_at is not None
-        ):
-            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        now = time.time() if now is None else now
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at, now)
+        stale = usage_stale_note(entry, now)
+        if lines and stale is not None:
+            lines[-1] += f" · {stale}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)

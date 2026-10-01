@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -35,6 +37,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    _usage_entry_lines,
 )
 
 
@@ -1287,8 +1290,8 @@ class TestListAccountsUsage:
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
 
         usage_response = {
-            "five_hour": {"utilization": 10.0, "resets_at": "2026-01-01T00:00:00Z"},
-            "seven_day": {"utilization": 50.0, "resets_at": "2026-01-02T00:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 50.0, "resets_at": "2099-01-02T00:00:00Z"},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -1348,7 +1351,7 @@ class TestListAccountsUsage:
 
         usage_response = {
             "five_hour": {"utilization": 0.0, "resets_at": None},
-            "seven_day": {"utilization": 100.0, "resets_at": "2026-04-03T02:59:59Z"},
+            "seven_day": {"utilization": 100.0, "resets_at": "2099-04-03T02:59:59Z"},
         }
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps(usage_response).encode()
@@ -6717,7 +6720,7 @@ class TestFormatUsageLines:
         now = 1_700_000_000.0
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
-        line = _format_usage_lines(usage, now)[0]
+        line = _format_usage_lines(usage, now, now)[0]
         assert "(ahead of pace)" in line
 
     def test_five_hour_never_shows_pace_marker(self):
@@ -6727,7 +6730,7 @@ class TestFormatUsageLines:
         now = 1_700_000_000.0
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)
         usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at.isoformat()}}
-        line = _format_usage_lines(usage, now)[0]
+        line = _format_usage_lines(usage, now, now)[0]
         assert "pace" not in line
 
     def test_scoped_ahead_of_pace_marker_when_under_limit(self):
@@ -6736,7 +6739,7 @@ class TestFormatUsageLines:
         now = 1_700_000_000.0
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
         usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
-        line = _format_usage_lines(usage, now)[0]
+        line = _format_usage_lines(usage, now, now)[0]
         assert "(ahead of pace)" in line
         assert "(!)" not in line
 
@@ -6757,8 +6760,149 @@ class TestFormatUsageLines:
         now = 1_700_000_000.0
         resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
-        line = _format_usage_lines(usage, now)[0]
+        line = _format_usage_lines(usage, now, now)[0]
         assert "pace" not in line
+
+    @staticmethod
+    def _iso(ts: float) -> str:
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def test_past_reset_window_withholds_pct(self):
+        # Rolled-over window: the cached pct describes the previous window,
+        # so it is replaced by a placeholder and "awaiting refresh".
+        now = 1_700_000_000.0
+        usage = {
+            "five_hour": {"pct": 74.0, "resets_at": self._iso(now - 600)},
+            "seven_day": {"pct": 15.0, "resets_at": self._iso(now + 86400 * 6)},
+        }
+        lines = _format_usage_lines(usage, now - 3600, now)
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(now - 600, tz=timezone.utc),
+            datetime.fromtimestamp(now, tz=timezone.utc),
+        )
+        assert lines[0] == f"5h:   --   reset {clock}  · awaiting refresh"
+        assert "74%" not in lines[0]
+        assert lines[1].startswith("7d:  15%   resets ")
+        assert lines[0].index("--") + 1 == lines[1].index("%")
+
+    def test_future_reset_window_unchanged(self):
+        now = 1_700_000_000.0
+        usage = {"five_hour": {"pct": 74.0, "resets_at": self._iso(now + 600)}}
+        line = _format_usage_lines(usage, None, now)[0]
+        assert line.startswith("5h:  74%   resets ")
+        assert "awaiting refresh" not in line
+
+    def test_past_reset_boundary_counts_as_elapsed(self):
+        now = 1_700_000_000.0
+        usage = {"five_hour": {"pct": 74.0, "resets_at": self._iso(now)}}
+        assert "awaiting refresh" in _format_usage_lines(usage, None, now)[0]
+
+    def test_past_reset_scoped_window_drops_pct_and_markers(self):
+        now = 1_700_000_000.0
+        usage = {
+            "seven_day": {"pct": 15.0, "resets_at": self._iso(now + 86400 * 6)},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "resets_at": self._iso(now - 60)},
+            ],
+        }
+        lines = _format_usage_lines(usage, now - 3600, now)
+        fable = lines[1]
+        assert fable.startswith("Fable:   --   reset ")
+        assert fable.endswith("· awaiting refresh")
+        assert "100%" not in fable
+        assert "(!)" not in fable
+        assert len({line.index("--") + 1 if "--" in line else line.index("%") for line in lines}) == 1
+
+    def test_past_reset_weekly_drops_pace_marker(self):
+        now = 1_700_000_000.0
+        usage = {"seven_day": {"pct": 90.0, "resets_at": self._iso(now - 60)}}
+        line = _format_usage_lines(usage, now - 86400, now)[0]
+        assert "pace" not in line
+        assert "awaiting refresh" in line
+
+    def test_past_reset_spend_drops_pct_and_amounts(self):
+        now = 1_700_000_000.0
+        usage = {
+            "spend": {
+                "used": 1.0,
+                "limit": 10.0,
+                "pct": 10.0,
+                "currency": "USD",
+                "resets_at": self._iso(now - 60),
+            }
+        }
+        line = _format_usage_lines(usage, None, now)[0]
+        assert line.startswith("$$:   --   reset ")
+        assert "$1.00" not in line
+
+
+class TestUsageEntryLines:
+    """Age note on stale-served measurements, and why they are stale."""
+
+    _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+    def _plain(self, entry: UsageEntry, now: float) -> list[str]:
+        return [self._ANSI.sub("", line) for line in _usage_entry_lines(entry, now)]
+
+    @staticmethod
+    def _clock(ts: float, now: float) -> str:
+        return oauth.reset_clock_string(
+            datetime.fromtimestamp(ts, tz=timezone.utc),
+            datetime.fromtimestamp(now, tz=timezone.utc),
+        )
+
+    def _entry(self, now: float, **kw) -> UsageEntry:
+        fetched_at = now - 3900
+        last_good = {
+            "five_hour": {"pct": 74.0, "resets_at": TestFormatUsageLines._iso(now - 660)},
+            "seven_day": {"pct": 15.0, "resets_at": TestFormatUsageLines._iso(now + 86400 * 6)},
+        }
+        return UsageEntry(
+            last_good=last_good, fetched_at=fetched_at, age_s=now - fetched_at, **kw
+        )
+
+    def test_rate_limited_backoff_extends_age_note(self):
+        now = time.time()
+        backoff_until = now + 720
+        entry = self._entry(
+            now, last_error="http-429", consecutive_failures=1,
+            backoff_until=backoff_until,
+        )
+        lines = self._plain(entry, now)
+        assert "awaiting refresh" in lines[0]
+        assert lines[-1].endswith(
+            f" · 1h ago · rate-limited, retries {self._clock(backoff_until, now)}"
+        )
+
+    def test_other_error_in_backoff_uses_error_notes_or_raw_kind(self):
+        now = time.time()
+        entry = self._entry(
+            now, last_error="timeout", backoff_until=now + 300,
+        )
+        assert self._plain(entry, now)[-1].endswith(
+            f" · 1h ago · timeout, retries {self._clock(now + 300, now)}"
+        )
+
+    def test_stale_without_backoff_keeps_plain_age_note(self):
+        now = time.time()
+        entry = self._entry(now, last_error="http-429", backoff_until=now - 1)
+        assert self._plain(entry, now)[-1].endswith(" · 1h ago")
+
+    def test_stale_without_error_keeps_plain_age_note(self):
+        now = time.time()
+        assert self._plain(self._entry(now), now)[-1].endswith(" · 1h ago")
+
+    def test_fresh_entry_in_backoff_has_no_note(self):
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 15.0, "resets_at": TestFormatUsageLines._iso(now + 86400)}},
+            fetched_at=now, age_s=0.0, last_error="http-429", backoff_until=now + 600,
+        )
+        line = self._plain(entry, now)[-1]
+        assert "ago" not in line
+        assert "rate-limited" not in line
 
 
 def _read_safety_copy(switcher, entry_id: str) -> str:

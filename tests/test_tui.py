@@ -624,8 +624,75 @@ class TestUsageRows:
         narrow = account_card_text(acc, 40).plain
         assert " · " not in narrow
 
+    def test_past_reset_window_withholds_pct(self):
+        # Same rule as the CLI: a rolled-over window's cached pct is obsolete.
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 74.0, "resets_at": _iso_in(-600)},
+            "seven_day": {"pct": 15.0, "resets_at": _iso_in(86400 * 6)},
+        }
+        rows = usage_rows(last_good, now, now - 3600)
+        label, pct, suffix, suffix_full = rows[0]
+        assert (label, pct) == ("5h", None)
+        assert suffix.startswith("reset ")
+        assert suffix.endswith("· awaiting refresh")
+        assert suffix_full == suffix
+        assert rows[1][1] == 15.0
+
+    def test_past_reset_scoped_window_drops_limit_marker(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(-60)}]}
+        name, pct, suffix, _full = usage_rows(last_good, now, now)[0]
+        assert (name, pct) == ("Fable", None)
+        assert "(!)" not in suffix
+        assert "awaiting refresh" in suffix
+
+    def test_card_renders_placeholder_for_past_reset(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 74.0, "resets_at": _iso_in(-600)},
+                "seven_day": {"pct": 15.0, "resets_at": _iso_in(86400 * 6)},
+            },
+            fetched_at=now - 3600,
+            age_s=3600.0,
+        )
+        acc = make_account(1, active=True, entry=entry)
+        lines = account_card_text(acc, 100, now=now).plain.splitlines()
+        five = next(line for line in lines if line.lstrip().startswith("5h"))
+        seven = next(line for line in lines if line.lstrip().startswith("7d"))
+        assert "74%" not in five
+        assert "usage unknown" not in five
+        assert "awaiting refresh" in five
+        assert five.index("--") + 1 == seven.index("%")
+
 
 class TestMiniAccountText:
+    def test_past_reset_window_withholds_pct(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 74.0, "resets_at": _iso_in(-600)},
+                "seven_day": {"pct": 15.0, "resets_at": _iso_in(86400 * 6)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(-600)}],
+            },
+            fetched_at=now - 3600,
+            age_s=3600.0,
+        )
+        plain = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "5h --" in plain
+        assert "74%" not in plain
+        assert "7d 15%" in plain
+        assert "Fable (!)" not in plain
+
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
