@@ -112,8 +112,11 @@ def _active_oauth_keychain_services() -> list[str]:
 # new security items coexist during migration (safe write → verify → delete).
 SECURITY_SERVICE = "claude-swap"
 
-# Service name of Claude Code's *active* OAuth credential in the macOS Keychain
-# (read by Claude Code itself; we read/write it when switching accounts).
+# Service name of the *default* profile's active OAuth credential in the macOS
+# Keychain. Only the default profile's item is unsuffixed: under a custom
+# CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR claude hashes the dir into
+# the name, so every read AND write of the active credential must resolve the
+# service through _active_oauth_keychain_services() rather than this constant.
 CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 # Service name of Claude Code's *active* managed API key (``/login`` with an
@@ -787,9 +790,10 @@ class CredentialStore:
         if self._host.platform != Platform.MACOS:
             return True
         try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
+            for service in _active_oauth_keychain_services():
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
         except Exception:
             return False  # best-effort; a down Keychain can't be cleaned now
         return True
@@ -975,7 +979,7 @@ class CredentialStore:
             try:
                 self._kc_call(
                     macos_keychain.set_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
+                    _active_oauth_keychain_services()[0],
                     macos_keychain.keychain_account_name(),
                     credentials,
                 )
