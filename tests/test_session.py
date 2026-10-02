@@ -163,7 +163,9 @@ def refresh_rotates(monkeypatch):
     def fake_gate(self, account_num: str, email: str, snapshot: str):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
-        self._write_account_credentials(account_num, email, ROTATED_CREDS)
+        self._write_account_credentials(
+            account_num, email, ROTATED_CREDS, attributed=True
+        )
         return oauth_mod.RefreshOutcome(ROTATED_CREDS, None)
 
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -410,7 +412,9 @@ class TestBootstrap:
         token_creds = json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-ant-oat01-x", "expiresAt": 0}}
         )
-        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds, attributed=True
+        )
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
@@ -1625,7 +1629,7 @@ class TestGuards:
         block_real_keychain.set_password(service, account, "stale")
 
         seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True
         )
 
         assert not (session_dir / ".credentials.json").exists()
@@ -1769,7 +1773,7 @@ class TestGuards:
         try:
             with caplog.at_level(logging.WARNING, logger="claude-swap"):
                 seeded_switcher._write_account_credentials(
-                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True
                 )
         finally:
             if not marker_lands:
@@ -1804,9 +1808,14 @@ class TestGuards:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         # Unexpired, so the read-only request is made; an expired copy under
-        # a live session is not requested at all.
+        # a live session is not requested at all. attributed=True: this is
+        # test setup standing in for the slot's own prior rotation, exactly
+        # like every other ROTATED_CREDS seed in this file — the fork's
+        # write-attribution guard (absent upstream, where this line
+        # originated) refuses an unattested cross-lineage overwrite of a
+        # populated slot otherwise.
         seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS, attributed=True,
         )
         make_live(session_dir)
         seen: dict[str, bool] = {}
@@ -2632,7 +2641,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         # The gate rotates the backup, exactly as the real one does.
         def fake_gate(self, num, email, snapshot):
-            self._write_account_credentials(num, email, ROTATED_CREDS)
+            self._write_account_credentials(
+                num, email, ROTATED_CREDS, attributed=True,
+            )
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
         monkeypatch.setattr(
@@ -2684,7 +2695,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         def fake_gate(self, num, email, snapshot):
-            self._write_account_credentials(num, email, ROTATED_CREDS)
+            self._write_account_credentials(
+                num, email, ROTATED_CREDS, attributed=True,
+            )
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
         monkeypatch.setattr(

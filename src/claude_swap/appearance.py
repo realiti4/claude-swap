@@ -168,6 +168,21 @@ def resolve_theme(setting: str, detect=detect_terminal_background) -> str:
     return detect() or "dark"
 
 
+# The `cswap pin` invocations read by a script or an rc hook rather than by a
+# person. One set, two consumers: this module refuses to probe the terminal for
+# them, and `cli.main` keeps the native-TLS fallback warning off their stderr.
+_PIN_SCRIPT_FLAGS = frozenset({"--ensure", "--get_port", "--get_certdir"})
+
+
+def pin_invocation_is_script_consumed(argv) -> bool:
+    """Is this `cswap pin ...` answering a script rather than a human?
+
+    ON THE FLAG, NOT ON `pin`: `cswap pin 2` renders to a human and keeps its
+    theme, and is entitled to a warning on stderr.
+    """
+    return argv[:1] == ["pin"] and bool(_PIN_SCRIPT_FLAGS.intersection(argv))
+
+
 def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
     """Whether the CLI should probe the terminal background before dispatch.
 
@@ -181,6 +196,14 @@ def cli_should_probe(argv: list[str], *, colors_enabled: bool) -> bool:
     if argv and argv[0] == "run":
         return False
     if "--json" in argv:
+        return False
+    # The pin's launch flags. `--ensure` promises silence and is budgeted in
+    # fractions of a second, while the probe below puts the terminal into
+    # cbreak, writes OSC 11 to stdout and select-waits 1.0s -- larger on its
+    # own than the whole budget that launch path exists to protect.
+    # `--get_port` and `--get_certdir` print a bare value for a script to read,
+    # which is the `--json` reason under a different spelling.
+    if pin_invocation_is_script_consumed(argv):
         return False
     return True
 
