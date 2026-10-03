@@ -582,6 +582,80 @@ class TestAddAccountRefresh:
         assert "new-token" in stored["creds"]
 
 
+class TestAddAccountKeepsOrgName:
+    """Re-adding a known account keeps the roster's organizationName."""
+
+    def _add(self, temp_home: Path, switcher, server_org: str, **kwargs):
+        """add_account() with the live login naming ``server_org``."""
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "test@example.com",
+            "accountUuid": "test-uuid-1234",
+            "organizationUuid": "org-uuid-1",
+            "organizationName": server_org,
+        }}))
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(**kwargs)
+
+    def _seeded(self, temp_home: Path, stored: str):
+        """A switcher whose slot 1 holds the account under the stored name."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        self._add(temp_home, switcher, "Server Org", slot=1)
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["organizationName"] = stored
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @pytest.mark.parametrize("slot", [1, None])
+    def test_readd_keeps_stored_name(self, temp_home: Path, capsys, slot):
+        switcher = self._seeded(temp_home, "Stored Org")
+        capsys.readouterr()
+
+        self._add(temp_home, switcher, "Server Org", slot=slot)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["organizationName"] == "Stored Org"
+        out = capsys.readouterr().out
+        assert "Stored Org" in out and "Server Org" not in out
+
+    def test_move_to_other_slot_keeps_stored_name(self, temp_home: Path):
+        switcher = self._seeded(temp_home, "Stored Org")
+
+        self._add(temp_home, switcher, "Server Org", slot=2)
+
+        accounts = switcher._get_sequence_data()["accounts"]
+        assert list(accounts) == ["2"]
+        assert accounts["2"]["organizationName"] == "Stored Org"
+
+    def test_new_account_takes_server_name(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        self._add(temp_home, switcher, "Server Org", slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["organizationName"] == "Server Org"
+
+    def test_empty_stored_name_takes_server_name(self, temp_home: Path):
+        switcher = self._seeded(temp_home, "")
+
+        self._add(temp_home, switcher, "Server Org", slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["organizationName"] == "Server Org"
+
+    def test_other_accounts_stored_name_is_not_inherited(self, temp_home: Path):
+        switcher = self._seeded(temp_home, "Stored Org")
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["email"] = "other@example.com"
+        switcher._write_json(switcher.sequence_file, data)
+
+        self._add(temp_home, switcher, "Server Org", slot=1, assume_yes=True)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["organizationName"] == "Server Org"
+
+
 class TestGetNextAccountNumber:
     """Test getting next account number."""
 
@@ -5157,6 +5231,22 @@ class TestAddAccountFromToken:
         assert len(data["accounts"]) == 1
         out = capsys.readouterr().out
         assert "Updated token" in out
+
+    @pytest.mark.parametrize("new_slot", [3, 4])
+    def test_readd_with_slot_keeps_stored_org_name(self, temp_home, new_slot):
+        """A slot-named re-add (same slot, or moving) keeps the roster's org name."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "user@example.com", slot=3)
+            data = switcher._get_sequence_data()
+            data["accounts"]["3"]["organizationName"] = "Stored Org"
+            switcher._write_json(switcher.sequence_file, data)
+            switcher.add_account_from_token("token-v2", "user@example.com", slot=new_slot)
+
+        accounts = switcher._get_sequence_data()["accounts"]
+        assert list(accounts) == [str(new_slot)]
+        assert accounts[str(new_slot)]["organizationName"] == "Stored Org"
 
     def test_update_in_place_writes_scopes(self, temp_home):
         """Refreshing an existing account in place must also seed default scopes."""
