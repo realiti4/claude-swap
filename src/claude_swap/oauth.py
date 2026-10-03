@@ -411,7 +411,8 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
+    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``,
+    ``"oauth_not_allowed_for_organization"`` (a 403 whose body says so), or the
     exception type name as a fallback). ``retry_after_s`` is the parsed
     ``Retry-After`` header when the server sent one (seconds form only — the
     HTTP-date form is rare enough to ignore).
@@ -424,6 +425,16 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
                 retry_after = max(0.0, float(raw.strip()))
             except ValueError:
                 pass
+        if e.code == 403:
+            # The org-policy 403 (a lapsed plan) names its cause only in the
+            # body, so it is the one status whose body is read. This runs
+            # inside `except` handlers: it must never raise.
+            try:
+                code = json.loads(e.read(4096))["error"]["details"]["error_code"]
+            except Exception:
+                code = None
+            if code == "oauth_not_allowed_for_organization":
+                return code, retry_after
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
