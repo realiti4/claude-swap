@@ -40,15 +40,19 @@ class AutoSwitchSettings:
     candidate must itself sit below the threshold (never land somewhere that
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    ping-pong while a strictly better account is always taken. This is
+    ``best``'s rule; ``consume-first`` and ``dynamic`` read the threshold
+    differently (see ``SETTING_SPECS["autoswitch.threshold"].help`` and the
+    README).
     """
 
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    strategy: str = "consume-first"  # "best" (most headroom), "consume-first" (soonest weekly reset, default), or "dynamic" (consume-first's ranking, fixed ~97% switch bar)
     include_api_key_accounts: bool = False
+    decision_log: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -57,6 +61,17 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # `dynamic` only (#375): how long a departed account's cached org
+    # context stays "warm" — a candidate never touched inside this window
+    # is "cold" and pays the re-write cost on landing.
+    cache_ttl_seconds: float = 3600.0
+    # `dynamic` only: the least headroom a COLD candidate needs to be worth
+    # the re-write cost (measured: one cold landing cost ~19 5h-points on a
+    # 19-session fleet).
+    cold_switch_cost_pct: float = 20.0
+    # `dynamic` only: how long a healthy active is held before rotating to a
+    # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
+    alternation_chunk_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -104,7 +119,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when the binding 5h/7d window reaches this pct "
+            "(dynamic: fixed near 97% instead; still gates blackout/cadence)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -120,12 +136,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "dynamic"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "decisionLog", "decision_log", "bool",
+            help="Record why each tick switched or did not, to its own log file",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
@@ -134,6 +154,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "cacheTtlSeconds", "cache_ttl_seconds", "float", 60.0, 86400.0,
+            help="dynamic: how long a departed account's cache stays warm",
+        ),
+        SettingSpec(
+            "autoswitch", "coldSwitchCostPct", "cold_switch_cost_pct", "float", 0.0, 100.0,
+            help="dynamic: headroom a cold candidate needs to be admitted",
+        ),
+        SettingSpec(
+            "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",
+            "float", 60.0, 3600.0,
+            help="dynamic: how long to sit before rotating to a warm partner",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
