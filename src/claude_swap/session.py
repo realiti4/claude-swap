@@ -60,7 +60,7 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_detection import ClaudeSession, process_config_dir, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -486,10 +486,27 @@ def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
     nothing is running. Renamed from ``live_sessions_for`` deliberately -- the
     old name returned a bare list, and a call site left on it would read a
     tuple as unconditionally truthy.
+
+    A profile whose ``sessions/`` is a symlink shares its registry with other
+    profiles, which is how agents on different accounts see each other for
+    peer messaging (claude discovers peers only in its own config dir's
+    ``sessions/``). There every record would count as live for every profile,
+    so each account looks busy for as long as any claude is open and its
+    backup is never refreshed or resynced. A record is dropped only when its
+    process is known to run against another config dir; an unknowable one
+    stays live.
     """
     if not session_dir.exists():
         return [], 0
-    return scan_sessions(claude_dir=session_dir)
+    sessions, unreadable = scan_sessions(claude_dir=session_dir)
+    if sessions and (session_dir / "sessions").is_symlink():
+        profile = os.path.realpath(session_dir)
+        sessions = [
+            session for session in sessions
+            if (config_dir := process_config_dir(session.pid)) is None
+            or os.path.realpath(config_dir) == profile
+        ]
+    return sessions, unreadable
 
 
 def profile_is_quiescent(session_dir: Path) -> bool:
