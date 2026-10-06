@@ -25,6 +25,13 @@ consecutive ticks, the engine fails over to any healthy candidate.
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
+
+Lifecycle hooks: three optional user commands (``autoswitch.preSwapCmd``,
+``postSwapCmd``, ``imminentCmd``) let an external policy see — and for the
+pre-swap hook, veto — a switch without wrapping the CLI. Each is run as an
+argv (``shlex.split``, no shell) with one JSON object on stdin and a
+``HOOK_TIMEOUT_S`` deadline, outside the state lock and never in dry-run.
+The payload carries account refs and utilization only — no credentials.
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ import json
 import logging
 import math
 import random
+import shlex
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -102,6 +111,12 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Lifecycle hook deadline and the one exit code that means something. A hook
+# that is slow, missing, or crashes never stops the engine: it proceeds as if
+# unhooked. Only the pre-swap hook's ``HOOK_VETO_EXIT`` changes the outcome.
+HOOK_TIMEOUT_S = 10.0
+HOOK_VETO_EXIT = 3
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -391,6 +406,37 @@ class SwitchEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class VetoEvent(AutoSwitchEvent):
+    """``preSwapCmd`` exited ``HOOK_VETO_EXIT``: the switch it was shown did
+    not happen and no cooldown started, so the next tick re-evaluates."""
+
+    kind: ClassVar[str] = "vetoed"
+    trigger: str
+    from_ref: dict | None
+    to_ref: dict | None
+    hook: str = "preSwapCmd"
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "from": self.from_ref,
+            "to": self.to_ref,
+            "hook": self.hook,
+        }
+
+    def human(self) -> str:
+        src = (
+            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
+        )
+        dst = (
+            f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
+            if self.to_ref
+            else "?"
+        )
+        return f"switch {src} -> {dst} ({self.trigger}) vetoed by {self.hook}"
+
+
+@dataclass(frozen=True)
 class NoSwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "no-switch"
     reason: str
@@ -614,6 +660,61 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold for h in measured)
 
 
+def _usage_summary(
+    usage: dict | str | None, models: tuple[str, ...]
+) -> dict | None:
+    """The hook-payload view of one account's usage: its binding pct and the
+    same decision windows ``PollEvent`` shows, each with its reset time.
+    None when the engine has no readable usage for it."""
+    if not isinstance(usage, dict):
+        return None
+    windows = {
+        name: {"pct": pct, "resetsAt": resets_at}
+        for name, pct, resets_at in oauth.relevant_windows(usage, models)
+    }
+    if not windows:
+        return None
+    return {"bindingPct": binding_pct(usage, models), "windows": windows}
+
+
+def _run_hook(name: str, command: str, payload: dict) -> int | None:
+    """Run one lifecycle hook with ``payload`` as JSON on stdin.
+
+    Returns its exit code, or None when it could not be run to completion
+    (unparseable command, missing binary, timeout) — every such case is
+    logged and treated by callers as "proceed". ``shlex.split`` without a
+    shell, matching every other subprocess in this codebase: a settings.json
+    value is data, and must not become a shell program. Output is captured
+    so a chatty hook cannot corrupt ``--json`` on stdout.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        _logger.warning("%s: cannot parse command %r (%s); proceeding", name, command, e)
+        return None
+    if not argv:
+        return None
+    try:
+        result = subprocess.run(
+            argv,
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=HOOK_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        _logger.warning(
+            "%s: %s timed out after %.0fs; proceeding", name, argv[0], HOOK_TIMEOUT_S
+        )
+        return None
+    except OSError as e:
+        _logger.warning("%s: could not run %s (%s); proceeding", name, argv[0], e)
+        return None
+    if result.returncode and result.stderr.strip():
+        _logger.debug("%s exited %d: %s", name, result.returncode, result.stderr.strip())
+    return result.returncode
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -684,6 +785,10 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Accounts whose ``imminentCmd`` already fired for the current
+        # crossing; an account leaves the set when it drops back below the
+        # line, so the hook fires once per account per crossing.
+        self._imminent_fired: set[str] = set()
 
     # -- state file ---------------------------------------------------------
 
@@ -977,6 +1082,7 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
+            self._track_imminent(current, active_ref, usage.get(current), utilization)
             if utilization < settings.threshold:
                 if settings.strategy != "consume-first":
                     self._emit(
@@ -1335,7 +1441,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, usage=usage)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1472,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, usage=usage)
 
         if systemic or transient_failure:
             self._emit(
@@ -2102,19 +2208,62 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        *,
+        usage: dict[str, dict | str | None] | None = None,
     ) -> TickOutcome:
-        if self.dry_run:
+        hooked = bool(self.settings.pre_swap_cmd or self.settings.post_swap_cmd)
+        if self.dry_run or hooked:
+            # Dry-run has no switch result to name the departure; hooks need
+            # it before any result exists. Unhooked real switches skip the
+            # extra reads and report `result["from"]` as before.
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
+            from_ref = _ref(current, current_email) if current else None
+            to_ref = _ref(number, email)
+        if self.dry_run:
+            # Dry-run runs no hooks either: a user command is a side effect
+            # the engine cannot take back, and the decision alone is what
+            # dry-run reports.
             self._emit(
                 SwitchEvent(
                     trigger=trigger,
-                    from_ref=_ref(current, current_email) if current else None,
-                    to_ref=_ref(number, email),
+                    from_ref=from_ref,
+                    to_ref=to_ref,
                     dry_run=True,
                 )
             )
             return TickOutcome.SWITCHED
+
+        hook_payload = None
+        if hooked:
+            usage = usage or {}
+            hook_payload = {
+                "trigger": trigger,
+                "from": from_ref,
+                "to": to_ref,
+                "fromUsage": (
+                    _usage_summary(usage.get(current), self._models) if current else None
+                ),
+                "toUsage": _usage_summary(usage.get(number), self._models),
+                "threshold": self.settings.threshold,
+            }
+        # The pre-swap hook runs BEFORE the state lock, so a slow policy
+        # script never holds up another engine or the menu bar. The window
+        # that opens between its answer and the lock is the same one the
+        # under-lock cooldown recheck below already covers.
+        if self.settings.pre_swap_cmd:
+            rc = _run_hook(
+                "preSwapCmd",
+                self.settings.pre_swap_cmd,
+                self._hook_envelope("pre_swap", hook_payload),
+            )
+            if rc == HOOK_VETO_EXIT:
+                # No state write: no cooldown starts, so the next tick asks
+                # again (the hook may say yes once its reason has passed).
+                self._emit(
+                    VetoEvent(trigger=trigger, from_ref=from_ref, to_ref=to_ref)
+                )
+                return TickOutcome.NO_ACTION
 
         # Hold the state lock across the whole recheck -> switch -> record
         # sequence so two concurrent engines (loop + cron --once) make one
@@ -2169,7 +2318,66 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
             )
         )
+        # Post-swap hook: after the lock is released and after the event is
+        # out, so a hanging hook delays neither other engines nor --json
+        # readers. Its exit code means nothing.
+        if self.settings.post_swap_cmd:
+            _run_hook(
+                "postSwapCmd",
+                self.settings.post_swap_cmd,
+                self._hook_envelope(
+                    "post_swap",
+                    {**hook_payload, "warnings": result.get("warnings", [])},
+                ),
+            )
         return TickOutcome.SWITCHED
+
+    # -- lifecycle hooks ------------------------------------------------------
+
+    @staticmethod
+    def _hook_envelope(event: str, body: dict) -> dict:
+        """The stdin object every hook receives: the same envelope as the
+        ``--json`` event stream, so one consumer can read both."""
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "event": event,
+            "ts": _now_iso(),
+            **body,
+        }
+
+    def _track_imminent(
+        self,
+        current: str,
+        active_ref: dict,
+        active_usage: dict | str | None,
+        utilization: float,
+    ) -> None:
+        """Fire ``imminentCmd`` once when the active account's binding
+        utilization reaches ``threshold - imminentLeadPct``; re-arm when it
+        drops back below. Nothing is tracked when the hook is unset, and
+        dry-run runs no hooks (see ``_perform``)."""
+        if not self.settings.imminent_cmd or self.dry_run:
+            return
+        line = self.settings.threshold - self.settings.imminent_lead_pct
+        if utilization < line:
+            self._imminent_fired.discard(current)
+            return
+        if current in self._imminent_fired:
+            return
+        self._imminent_fired.add(current)
+        _run_hook(
+            "imminentCmd",
+            self.settings.imminent_cmd,
+            self._hook_envelope(
+                "swap_imminent",
+                {
+                    "active": active_ref,
+                    "activeUsage": _usage_summary(active_usage, self._models),
+                    "threshold": self.settings.threshold,
+                    "leadPct": self.settings.imminent_lead_pct,
+                },
+            ),
+        )
 
     # -- helpers --------------------------------------------------------------
 

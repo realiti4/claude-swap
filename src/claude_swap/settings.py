@@ -57,6 +57,17 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Lifecycle hooks: user commands the engine runs around a switch, each
+    # fed one JSON object on stdin (see autoswitch.py "Lifecycle hooks").
+    # None = off; the engine behaves exactly as before when all are unset.
+    # ``pre_swap_cmd`` may veto the switch by exiting 3; ``post_swap_cmd``
+    # runs after a successful switch; ``imminent_cmd`` fires once when the
+    # active account's binding utilization reaches
+    # ``threshold - imminent_lead_pct``, re-arming when it drops back below.
+    pre_swap_cmd: str | None = None
+    post_swap_cmd: str | None = None
+    imminent_cmd: str | None = None
+    imminent_lead_pct: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "preSwapCmd", "pre_swap_cmd", "string",
+            help="Command run before a switch (JSON on stdin); exit 3 vetoes it",
+        ),
+        SettingSpec(
+            "autoswitch", "postSwapCmd", "post_swap_cmd", "string",
+            help="Command run after a successful switch (JSON on stdin)",
+        ),
+        SettingSpec(
+            "autoswitch", "imminentCmd", "imminent_cmd", "string",
+            help="Command run once when the active account nears the threshold",
+        ),
+        SettingSpec(
+            "autoswitch", "imminentLeadPct", "imminent_lead_pct", "float", 0.0, 50.0,
+            help="imminentCmd fires this many pct below the threshold",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
