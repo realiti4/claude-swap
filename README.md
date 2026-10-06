@@ -114,6 +114,43 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
+#### Lifecycle hooks
+
+Three optional commands let an outside policy watch — and veto — the engine's switches, whether it runs as `cswap auto`, in the TUI, or in the menu bar. Each is run as a plain argv (no shell) with one JSON object on stdin and a 10 s deadline; stdout/stderr are captured. Unset = off, with no change to the engine's behavior.
+
+| Setting | When it runs | Exit code |
+|---|---|---|
+| `autoswitch.preSwapCmd` | right before a switch, after the target is chosen | **3 = veto**: no switch this tick, a `vetoed` event is emitted, no cooldown starts (the next tick asks again). Anything else, a timeout, or a missing command: the switch proceeds. |
+| `autoswitch.postSwapCmd` | after a successful switch, once the `switch` event is out | ignored |
+| `autoswitch.imminentCmd` | once, when the active account's binding (5h/7d) utilization reaches `threshold - imminentLeadPct` (default lead 10) — re-arms when it drops back below | ignored |
+
+`--dry-run` runs none of them. The payload shares the `--json` envelope (`schemaVersion`, `event`, `ts`) and carries account refs and utilization only — never tokens:
+
+```json
+{"schemaVersion": 1, "event": "pre_swap", "ts": "2026-10-06T14:03:11Z",
+ "trigger": "proactive", "threshold": 90.0,
+ "from": {"number": 1, "email": "a@example.com"},
+ "to":   {"number": 2, "email": "b@example.com"},
+ "fromUsage": {"bindingPct": 95.0, "windows": {"5h": {"pct": 95.0, "resetsAt": "2026-10-06T16:00:00Z"}, "7d": {"pct": 40.0, "resetsAt": "2026-10-09T00:00:00Z"}}},
+ "toUsage":   {"bindingPct": 10.0, "windows": {"5h": {"pct": 10.0, "resetsAt": null}, "7d": {"pct": 2.0, "resetsAt": null}}}}
+```
+
+`post_swap` adds `"warnings": [...]` from the switch; `swap_imminent` carries `active`, `activeUsage`, `threshold` and `leadPct` instead of `from`/`to`. A `fromUsage`/`toUsage` is `null` when the engine has no readable usage for that account. A veto script that holds a swap while a Claude Code session is mid-turn, unless the account is already at its limit:
+
+```bash
+cswap config set autoswitch.preSwapCmd "$HOME/bin/cswap-veto"
+```
+
+```bash
+#!/bin/sh
+# ~/bin/cswap-veto — exit 3 = don't switch yet
+payload=$(cat)
+trigger=$(printf '%s' "$payload" | jq -r .trigger)
+[ "$trigger" = "at-limit" ] && exit 0            # out of quota: always let it through
+pgrep -qf 'claude --resume' && exit 3            # a warm session: wait for the next tick
+exit 0
+```
+
 </details>
 
 ### Run multiple accounts at the same time (session mode)
