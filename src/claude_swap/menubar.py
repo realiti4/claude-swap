@@ -38,6 +38,10 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
+# How long an identical engine error stays quiet after being surfaced. The
+# engine retries every tick, so an unconditional notification is a storm; an
+# unconditional drop is how a broken auto-switch looked healthy for two days.
+ENGINE_ERROR_REPEAT_S = 3600.0
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 
 
@@ -371,6 +375,22 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
 
 
+def should_surface_engine_error(
+    event, last_message: str | None, last_at: float, now: float
+) -> bool:
+    """Whether a hosted engine's error event should reach the log and the user.
+
+    A new message always does. The same message again only once
+    ``ENGINE_ERROR_REPEAT_S`` has passed since it was last surfaced.
+    """
+    message = getattr(event, "message", None)
+    if not message:
+        return False
+    if message != last_message:
+        return True
+    return now - last_at >= ENGINE_ERROR_REPEAT_S
+
+
 def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
     """Recent account switches from the log, most-recent first.
 
@@ -577,6 +597,8 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            self._last_engine_error: str | None = None
+            self._last_engine_error_at = 0.0
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -723,6 +745,18 @@ def run(switcher) -> int:
                     # engine emits it once per run; dropping it would leave a
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
+                elif ev.kind == "error":
+                    # A failed tick. The engine retries by itself, so dropping
+                    # this hid a switch that could never succeed; say it once
+                    # per distinct message, then stay quiet for a while.
+                    now = time.time()
+                    if should_surface_engine_error(
+                        ev, self._last_engine_error, self._last_engine_error_at, now
+                    ):
+                        self._last_engine_error = ev.message
+                        self._last_engine_error_at = now
+                        self.switcher._logger.warning("auto-switch %s", ev.human())
+                        rumps.notification("claude-swap", "Auto-switch error", ev.human())
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""

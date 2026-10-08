@@ -17,7 +17,9 @@ from pathlib import Path
 import pytest
 
 from claude_swap import menubar
+from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
 from claude_swap.switcher import USAGE_API_KEY
 
 
@@ -617,3 +619,32 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- engine errors must not vanish -------------------------------------------
+#
+# The hosted auto-switch engine reports a failed tick as an ErrorEvent. The
+# menu bar dropped those: nothing in the log, nothing on screen. Field case —
+# every tick's switch raised "Current account credential is empty" for two
+# days while the icon sat there looking healthy.
+
+
+def test_engine_error_is_surfaced_the_first_time():
+    ev = ErrorEvent(message="Current account credential is empty")
+    assert should_surface_engine_error(ev, None, 0.0, now=1000.0) is True
+
+
+def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
+    ev = ErrorEvent(message="Current account credential is empty")
+    assert should_surface_engine_error(ev, ev.message, 1000.0, now=1060.0) is False
+
+
+def test_engine_error_resurfaces_after_the_quiet_period():
+    ev = ErrorEvent(message="Current account credential is empty")
+    later = 1000.0 + ENGINE_ERROR_REPEAT_S
+    assert should_surface_engine_error(ev, ev.message, 1000.0, now=later) is True
+
+
+def test_a_different_engine_error_is_surfaced_at_once():
+    ev = ErrorEvent(message="Claude config file not found")
+    assert should_surface_engine_error(ev, "something else", 1000.0, now=1001.0) is True
