@@ -382,6 +382,8 @@ class CredentialStore:
         self._pinned_to_oauth_file: bool = False
         # The menu bar's display worker and its engine thread share one store;
         # the lift's check-then-reset must not interleave with a fresh pin.
+        # Held around every pin and every flag change outside __init__; never
+        # taken inside _pin_file_mode itself, so callers can hold it across it.
         self._pin_lock = threading.Lock()
         self._last_active_credentials_backend: str | None = None
         # Per-slot cache for DISPLAY reads of backup Keychain items (see
@@ -965,7 +967,8 @@ class CredentialStore:
             # MANAGED one, and nothing deleted it — ``_clear_oauth_credential``
             # above removes the OAuth item, a different service. Unverified, so
             # the conservative verdict is the true one.
-            self._pin_file_mode(residual_cleared=False)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=False)
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -1026,7 +1029,8 @@ class CredentialStore:
         having moved the credential to the Keychain — the premise
         ``_lift_pin_if_oauth_file_gone`` rests on. Disarm the lift first.
         """
-        self._pinned_to_oauth_file = False
+        with self._pin_lock:
+            self._pinned_to_oauth_file = False
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
