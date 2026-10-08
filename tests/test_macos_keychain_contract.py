@@ -1297,3 +1297,71 @@ class TestPinnedFileModeEndsWhenTheFileIsGone:
         active = store._read_active_credentials()
         assert active.value == ""
         assert active.keychain_unavailable is True
+
+    def test_an_empty_file_lifts_the_pin_like_a_missing_one(
+        self, macos_switcher, monkeypatch
+    ):
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.paths import get_credentials_path
+
+        store = macos_switcher._store
+        self._pin_through_a_failed_write(store, monkeypatch, delete_ok=True)
+        get_credentials_path().write_text("", encoding="utf-8")
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: "rotated-by-claude")
+
+        assert store._read_active_credentials().value == "rotated-by-claude"
+
+    def test_an_unstattable_file_keeps_the_pin(self, macos_switcher, monkeypatch):
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        self._pin_through_a_failed_write(store, monkeypatch, delete_ok=True)
+
+        def cannot_tell():
+            raise OSError("stale NFS handle")
+
+        monkeypatch.setattr("claude_swap.credentials.get_credentials_path", cannot_tell)
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: "residual")
+        store._lift_pin_if_oauth_file_gone()
+        assert store._use_keychain() is False
+
+    def test_a_managed_key_repin_is_not_lifted_by_a_stale_oauth_flag(
+        self, macos_switcher, monkeypatch
+    ):
+        """Review finding: an OAuth pin, then a switch to an API-key account.
+
+        The managed-key write removes ``.credentials.json`` itself and re-pins
+        over a possibly-surviving "Claude Code" Keychain item. That pin is
+        about ``primaryApiKey``; the missing OAuth file must not lift it, or
+        the stale managed key in the Keychain is read over the fresh one.
+        """
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.paths import get_credentials_path
+
+        store = macos_switcher._store
+        self._pin_through_a_failed_write(store, monkeypatch, delete_ok=True)
+        store._write_managed_credentials("sk-ant-api03-" + "f" * 40)
+        assert not get_credentials_path().exists(), "premise: we removed it"
+        monkeypatch.setattr(
+            _kc, "get_password", lambda *_a, **_kw: "sk-ant-api03-" + "s" * 40
+        )
+
+        store._read_active_credentials()
+        assert store._use_keychain() is False, (
+            "the managed-key pin was lifted by the OAuth pin's leftover flag"
+        )
+
+    def test_our_own_oauth_clear_does_not_lift_the_pin(
+        self, macos_switcher, monkeypatch
+    ):
+        """WE removed the file, so nothing says Claude Code moved anything."""
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        self._pin_through_a_failed_write(store, monkeypatch, delete_ok=False)
+        store._clear_oauth_credential()
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: "residual")
+
+        store._read_active_credentials()
+        assert store._use_keychain() is False
+

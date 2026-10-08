@@ -375,20 +375,22 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
 
 
-def should_surface_engine_error(
-    event, last_message: str | None, last_at: float, now: float
-) -> bool:
+def should_surface_engine_error(event, surfaced: dict, now: float) -> bool:
     """Whether a hosted engine's error event should reach the log and the user.
 
-    A new message always does. The same message again only once
-    ``ENGINE_ERROR_REPEAT_S`` has passed since it was last surfaced.
+    ``surfaced`` maps each message to when it was last surfaced (monotonic
+    seconds) and is updated when this returns True. A message not seen within
+    ``ENGINE_ERROR_REPEAT_S`` is surfaced; otherwise it stays quiet — per
+    message, so two errors alternating tick by tick can't defeat the limit.
     """
     message = getattr(event, "message", None)
     if not message:
         return False
-    if message != last_message:
-        return True
-    return now - last_at >= ENGINE_ERROR_REPEAT_S
+    last = surfaced.get(message)
+    if last is not None and now - last < ENGINE_ERROR_REPEAT_S:
+        return False
+    surfaced[message] = now
+    return True
 
 
 def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
@@ -597,8 +599,7 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
-            self._last_engine_error: str | None = None
-            self._last_engine_error_at = 0.0
+            self._engine_errors_surfaced: dict[str, float] = {}
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -749,12 +750,9 @@ def run(switcher) -> int:
                     # A failed tick. The engine retries by itself, so dropping
                     # this hid a switch that could never succeed; say it once
                     # per distinct message, then stay quiet for a while.
-                    now = time.time()
                     if should_surface_engine_error(
-                        ev, self._last_engine_error, self._last_engine_error_at, now
+                        ev, self._engine_errors_surfaced, time.monotonic()
                     ):
-                        self._last_engine_error = ev.message
-                        self._last_engine_error_at = now
                         self.switcher._logger.warning("auto-switch %s", ev.human())
                         rumps.notification("claude-swap", "Auto-switch error", ev.human())
 

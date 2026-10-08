@@ -631,20 +631,29 @@ class TestFrameworkBuildWarning:
 
 def test_engine_error_is_surfaced_the_first_time():
     ev = ErrorEvent(message="Current account credential is empty")
-    assert should_surface_engine_error(ev, None, 0.0, now=1000.0) is True
+    assert should_surface_engine_error(ev, {}, now=1000.0) is True
 
 
 def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
     ev = ErrorEvent(message="Current account credential is empty")
-    assert should_surface_engine_error(ev, ev.message, 1000.0, now=1060.0) is False
+    seen: dict = {}
+    assert should_surface_engine_error(ev, seen, now=1000.0) is True
+    assert should_surface_engine_error(ev, seen, now=1060.0) is False
 
 
 def test_engine_error_resurfaces_after_the_quiet_period():
     ev = ErrorEvent(message="Current account credential is empty")
-    later = 1000.0 + ENGINE_ERROR_REPEAT_S
-    assert should_surface_engine_error(ev, ev.message, 1000.0, now=later) is True
+    seen: dict = {}
+    should_surface_engine_error(ev, seen, now=1000.0)
+    assert should_surface_engine_error(ev, seen, now=1000.0 + ENGINE_ERROR_REPEAT_S) is True
 
 
-def test_a_different_engine_error_is_surfaced_at_once():
-    ev = ErrorEvent(message="Claude config file not found")
-    assert should_surface_engine_error(ev, "something else", 1000.0, now=1001.0) is True
+def test_two_alternating_engine_errors_are_each_limited():
+    a = ErrorEvent(message="Current account credential is empty")
+    b = ErrorEvent(message="Claude config file not found")
+    seen: dict = {}
+    surfaced = [
+        should_surface_engine_error(ev, seen, now=1000.0 + 60 * i)
+        for i, ev in enumerate([a, b, a, b, a, b])
+    ]
+    assert surfaced == [True, True, False, False, False, False]
